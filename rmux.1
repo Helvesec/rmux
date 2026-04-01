@@ -1,0 +1,196 @@
+.TH RMUX 1 "2026-04-25" "RMUX 0.0.1" "RMUX Manual"
+.SH NAME
+rmux \- tmux-compatible terminal multiplexer CLI
+.SH SYNOPSIS
+.B rmux
+.RB [ -2CDhlNuVv ]
+.RB [ -c " shell-command" ]
+.RB [ -f " file" ]
+.RB [ -L " socket-name" ]
+.RB [ -S " socket-path" ]
+.RB [ -T " features" ]
+.RI [ command " [" flags ]]
+.SH DESCRIPTION
+RMUX is a Linux-only terminal multiplexer built around a Unix-socket client and
+server architecture.
+It preserves tmux-compatible command-line behavior while keeping RMUX product
+labels in binary output, help text, and status text.
+.SH TOP-LEVEL OPTIONS
+.TP
+.B -2
+Accept the tmux-compatible 256-colour compatibility flag.
+.TP
+.B -C
+Enter tmux text control mode.
+.TP
+.B -D
+Run the hidden server in the foreground.
+.TP
+.B -h
+Print the tmux-style top-level usage line to standard output and exit 0.
+.TP
+.B -l
+Accept the tmux-compatible login-shell flag.
+.TP
+.B -N
+Disable automatic server startup for commands that otherwise auto-start.
+.TP
+.B -u
+Force UTF-8 mode for the client process.
+.TP
+.B -V
+Print
+.B rmux 0.0.1
+and exit 0.
+In short-option clusters,
+.B -V
+stops the
+.B -h
+scan, so
+.B -Vh
+prints the version.
+.TP
+.B -v
+Accept the tmux-compatible verbose flag.
+.TP
+.BI "-c " shell-command
+Start or connect to the rmux server, then execute the resolved shell with
+.B "-c shell-command"
+using the current terminal.
+.TP
+.BI "-f " file
+Load the given configuration file.
+.TP
+.BI "-L " socket-name
+Use the named socket below the rmux UID socket directory.
+.TP
+.BI "-S " socket-path
+Use the given absolute socket path.
+.TP
+.BI "-T " features
+Accept tmux-compatible terminal feature declarations.
+.SH COMMAND HELP
+Command help uses
+.BR "rmux <command> --help" .
+Short
+.B -h
+remains available for tmux command semantics such as
+.BR "rmux split-window -h" .
+.SH LIST-COMMANDS
+.B list-commands
+is client-local and does not contact the server.
+With no arguments it prints one line per implemented command in tmux command
+table order.
+.PP
+.B list-keys
+can render the compiled default key table without a running server when no
+runtime key-table mutations are available.
+.SH IMPLEMENTED COMMAND SURFACE
+The public CLI dispatches 90 commands:
+.nf
+attach-session (attach)
+bind-key (bind)
+break-pane (breakp)
+capture-pane (capturep)
+choose-buffer
+choose-client
+choose-tree
+clear-history (clearhist)
+clear-prompt-history (clearphist)
+clock-mode
+command-prompt
+confirm-before (confirm)
+copy-mode
+customize-mode
+delete-buffer (deleteb)
+detach-client (detach)
+display-menu (menu)
+display-message (display)
+display-popup (popup)
+display-panes (displayp)
+find-window (findw)
+has-session (has)
+if-shell (if)
+join-pane (joinp)
+kill-pane (killp)
+kill-server
+kill-session
+kill-window (killw)
+last-pane (lastp)
+last-window (last)
+link-window (linkw)
+list-buffers (lsb)
+list-clients (lsc)
+list-commands (lscm)
+list-keys (lsk)
+list-panes (lsp)
+list-sessions (ls)
+list-windows (lsw)
+load-buffer (loadb)
+lock-client (lockc)
+lock-server (lock)
+lock-session (locks)
+move-pane (movep)
+move-window (movew)
+new-session (new)
+new-window (neww)
+next-layout (nextl)
+next-window (next)
+paste-buffer (pasteb)
+pipe-pane (pipep)
+previous-layout (prevl)
+previous-window (prev)
+refresh-client (refresh)
+rename-session (rename)
+rename-window (renamew)
+resize-pane (resizep)
+resize-window (resizew)
+respawn-pane (respawnp)
+respawn-window (respawnw)
+rotate-window (rotatew)
+run-shell (run)
+save-buffer (saveb)
+select-layout (selectl)
+select-pane (selectp)
+select-window (selectw)
+send-keys (send)
+send-prefix
+server-access
+set-buffer (setb)
+set-environment (setenv)
+set-hook
+set-option (set)
+set-window-option (setw)
+show-buffer (showb)
+show-environment (showenv)
+show-hooks
+show-messages (showmsgs)
+show-options (show)
+show-prompt-history (showphist)
+show-window-options (showw)
+source-file (source)
+split-window (splitw)
+start-server (start)
+suspend-client (suspendc)
+swap-pane (swapp)
+swap-window (swapw)
+switch-client (switchc)
+unbind-key (unbind)
+unlink-window (unlinkw)
+wait-for (wait)
+.fi
+.SH BUILT-IN COMMAND ALIASES
+.TP
+.B choose-session
+Expands to
+.BR "choose-tree -s" .
+.TP
+.B choose-window
+Expands to
+.BR "choose-tree -w" .
+.SH NOTES
+.B link-window
+and
+.B unlink-window
+ship in the public CLI surface with tmux-style shared window links across
+sessions, including linked-window format variables and hook context.
