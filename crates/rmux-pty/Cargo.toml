@@ -1,0 +1,8 @@
+[package]
+name = "rmux-pty"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rustix = { version = "1.1.4", features = ["process", "termios", "pty", "fs"] }
