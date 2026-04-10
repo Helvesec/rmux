@@ -1,0 +1,576 @@
+use std::env;
+use std::fs;
+use std::io;
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
+use std::os::unix::net::UnixStream as StdUnixStream;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
+
+use tokio::net::UnixListener;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use tracing::debug;
+
+use crate::listener;
+
+const DEFAULT_SOCKET_LABEL: &str = "default";
+const FALLBACK_SOCKET_ROOT: &str = "/tmp";
+const RMUX_SOCK_PERM: u32 = 0o007;
+const SOCKET_DIR_PREFIX: &str = "rmux";
+const RMUX_TMPDIR_ENV: &str = "RMUX_TMPDIR";
+
+/// Computes the default RMUX daemon socket path.
+///
+/// The path uses an rmux-specific per-user directory so it cannot collide with
+/// a real tmux server socket.
+pub fn default_socket_path() -> io::Result<PathBuf> {
+    let tmpdir = socket_root_from_env(env::var_os(RMUX_TMPDIR_ENV).as_deref())?;
+    let user_id = real_user_id()?;
+
+    Ok(tmpdir
+        .join(format!("{SOCKET_DIR_PREFIX}-{user_id}"))
+        .join(DEFAULT_SOCKET_LABEL))
+}
+
+fn socket_root_from_env(tmpdir: Option<&std::ffi::OsStr>) -> io::Result<PathBuf> {
+    let tmpdir = tmpdir
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .into_iter();
+    let candidates = tmpdir.chain(std::iter::once(PathBuf::from(FALLBACK_SOCKET_ROOT)));
+
+    for candidate in candidates {
+        if let Ok(resolved) = fs::canonicalize(&candidate) {
+            return Ok(resolved);
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "no suitable rmux socket directory",
+    ))
+}
+
+/// Daemon configuration for a single RMUX server instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonConfig {
+    socket_path: PathBuf,
+    config_load: ConfigLoadOptions,
+}
+
+impl DaemonConfig {
+    /// Builds a daemon configuration for the given socket path.
+    #[must_use]
+    pub fn new(socket_path: PathBuf) -> Self {
+        Self {
+            socket_path,
+            config_load: ConfigLoadOptions::disabled(),
+        }
+    }
+
+    /// Builds a daemon configuration using the default spec socket path.
+    pub fn with_default_socket_path() -> io::Result<Self> {
+        Ok(Self::new(default_socket_path()?))
+    }
+
+    /// Returns the configured Unix socket path.
+    #[must_use]
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    /// Returns the startup config loading policy.
+    #[must_use]
+    pub const fn config_load(&self) -> &ConfigLoadOptions {
+        &self.config_load
+    }
+
+    /// Enables RMUX default startup config loading.
+    #[must_use]
+    pub fn with_default_config_load(mut self, quiet: bool, cwd: Option<PathBuf>) -> Self {
+        self.config_load = ConfigLoadOptions {
+            selection: ConfigFileSelection::Default,
+            quiet,
+            cwd,
+        };
+        self
+    }
+
+    /// Enables explicit `-f` startup config loading.
+    #[must_use]
+    pub fn with_config_files(
+        mut self,
+        files: Vec<PathBuf>,
+        quiet: bool,
+        cwd: Option<PathBuf>,
+    ) -> Self {
+        self.config_load = ConfigLoadOptions {
+            selection: ConfigFileSelection::Files(files),
+            quiet,
+            cwd,
+        };
+        self
+    }
+}
+
+/// Startup config loading policy for a daemon.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigLoadOptions {
+    selection: ConfigFileSelection,
+    quiet: bool,
+    cwd: Option<PathBuf>,
+}
+
+impl ConfigLoadOptions {
+    /// Builds a config policy that performs no startup config loading.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            selection: ConfigFileSelection::Disabled,
+            quiet: true,
+            cwd: None,
+        }
+    }
+
+    /// Returns the selected config files mode.
+    #[must_use]
+    pub const fn selection(&self) -> &ConfigFileSelection {
+        &self.selection
+    }
+
+    /// Returns whether missing files should be suppressed.
+    #[must_use]
+    pub const fn quiet(&self) -> bool {
+        self.quiet
+    }
+
+    /// Returns the startup client's current working directory.
+    #[must_use]
+    pub fn cwd(&self) -> Option<&Path> {
+        self.cwd.as_deref()
+    }
+}
+
+/// Config file selection mode for daemon startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigFileSelection {
+    /// Do not load config files.
+    Disabled,
+    /// Load tmux's default config search path.
+    Default,
+    /// Load the explicit `-f` files in order.
+    Files(Vec<PathBuf>),
+}
+
+/// RMUX daemon launcher — call [`bind`](Self::bind) to start listening.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerDaemon {
+    config: DaemonConfig,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ShutdownHandle {
+    sender: Arc<StdMutex<Option<oneshot::Sender<()>>>>,
+}
+
+impl ShutdownHandle {
+    pub(crate) fn new() -> (Self, oneshot::Receiver<()>) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            Self {
+                sender: Arc::new(StdMutex::new(Some(sender))),
+            },
+            receiver,
+        )
+    }
+
+    pub(crate) fn request_shutdown(&self) {
+        if let Some(sender) = self.sender.lock().expect("shutdown sender").take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+impl ServerDaemon {
+    /// Creates a daemon launcher for the given configuration.
+    #[must_use]
+    pub fn new(config: DaemonConfig) -> Self {
+        Self { config }
+    }
+
+    /// Binds the Unix socket, starts accepting requests, and returns a handle.
+    pub async fn bind(self) -> io::Result<ServerHandle> {
+        prepare_socket_path(self.config.socket_path())?;
+        let listener = UnixListener::bind(self.config.socket_path())?;
+        let (shutdown_handle, shutdown_receiver) = ShutdownHandle::new();
+        let socket_path = self.config.socket_path().to_path_buf();
+        let owner_uid = real_user_id()?;
+
+        let task = tokio::spawn(listener::serve(
+            listener,
+            socket_path.clone(),
+            shutdown_handle.clone(),
+            shutdown_receiver,
+            self.config.config_load().clone(),
+            owner_uid,
+        ));
+
+        Ok(ServerHandle {
+            socket_path,
+            shutdown_handle,
+            task: Some(task),
+        })
+    }
+}
+
+/// Handle to a running RMUX daemon; dropping it triggers shutdown.
+#[derive(Debug)]
+pub struct ServerHandle {
+    socket_path: PathBuf,
+    shutdown_handle: ShutdownHandle,
+    task: Option<JoinHandle<io::Result<()>>>,
+}
+
+impl ServerHandle {
+    /// Returns the bound Unix socket path for the running daemon.
+    #[must_use]
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    /// Waits for the daemon task to exit after an external shutdown request.
+    pub async fn wait(mut self) -> io::Result<()> {
+        if let Some(task) = self.task.take() {
+            return task.await.map_err(io::Error::other)?;
+        }
+
+        Ok(())
+    }
+
+    /// Requests shutdown and waits for socket cleanup to complete.
+    pub async fn shutdown(mut self) -> io::Result<()> {
+        self.request_shutdown();
+
+        if let Some(task) = self.task.take() {
+            return task.await.map_err(io::Error::other)?;
+        }
+
+        Ok(())
+    }
+
+    fn request_shutdown(&mut self) {
+        self.shutdown_handle.request_shutdown();
+    }
+}
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        self.request_shutdown();
+    }
+}
+
+fn prepare_socket_path(socket_path: &Path) -> io::Result<()> {
+    let parent = socket_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "socket path '{}' has no parent directory",
+                socket_path.display()
+            ),
+        )
+    })?;
+
+    ensure_parent_directory(parent)?;
+    remove_stale_socket_if_needed(socket_path)
+}
+
+fn ensure_parent_directory(parent: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    builder.mode(0o700);
+    match builder.create(parent) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            if !fs::metadata(parent)?.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("'{}' exists and is not a directory", parent.display()),
+                ));
+            }
+        }
+        Err(error) => return Err(error),
+    }
+
+    ensure_directory(parent)?;
+    if let Some(managed_parent) = managed_rmux_socket_directory(parent)? {
+        ensure_safe_rmux_socket_directory(&managed_parent)?;
+    }
+
+    Ok(())
+}
+
+fn ensure_directory(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("'{}' exists and is not a directory", path.display()),
+    ))
+}
+
+fn managed_rmux_socket_directory(path: &Path) -> io::Result<Option<PathBuf>> {
+    let expected = format!("{SOCKET_DIR_PREFIX}-{}", real_user_id()?);
+    Ok(path.ancestors().find_map(|ancestor| {
+        ancestor
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| *name == expected)
+            .map(|_| ancestor.to_path_buf())
+    }))
+}
+
+fn ensure_safe_rmux_socket_directory(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("{} is not a directory", path.display()),
+        ));
+    }
+
+    let user_id = real_user_id()?;
+    if metadata.uid() != user_id || (metadata.mode() & RMUX_SOCK_PERM) != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("directory {} has unsafe permissions", path.display()),
+        ));
+    }
+
+    Ok(())
+}
+
+fn remove_stale_socket_if_needed(socket_path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(socket_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    if !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "socket path '{}' exists but is not a Unix socket",
+                socket_path.display()
+            ),
+        ));
+    }
+
+    match StdUnixStream::connect(socket_path) {
+        Ok(_stream) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("socket '{}' is already in use", socket_path.display()),
+        )),
+        Err(error) if indicates_stale_socket(&error) => {
+            debug!(
+                "removing stale socket '{}' after failed connect probe: {error}",
+                socket_path.display()
+            );
+            match fs::remove_file(socket_path) {
+                Ok(()) => Ok(()),
+                Err(remove_error) if remove_error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(remove_error) => Err(remove_error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn indicates_stale_socket(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+    )
+}
+
+pub(crate) fn real_user_id() -> io::Result<u32> {
+    let status = fs::read_to_string("/proc/self/status")?;
+    parse_real_user_id(&status)
+}
+
+fn parse_real_user_id(status: &str) -> io::Result<u32> {
+    let uid_line = status
+        .lines()
+        .find(|line| line.starts_with("Uid:"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing Uid line"))?;
+    let uid = uid_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing real uid"))?;
+
+    uid.parse::<u32>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        default_socket_path, parse_real_user_id, remove_stale_socket_if_needed,
+        socket_root_from_env, DaemonConfig,
+    };
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn default_socket_path_uses_the_spec_layout() {
+        let path = default_socket_path().expect("default socket path");
+        let path_string = path.to_string_lossy();
+
+        assert!(path_string.ends_with("/default"));
+        assert!(path_string.contains("/rmux-"));
+    }
+
+    #[test]
+    fn unresolved_rmux_tmpdir_falls_back_to_tmp() {
+        assert_eq!(
+            socket_root_from_env(Some(OsStr::new(
+                "relative-rmux-test-path-that-does-not-exist"
+            )))
+            .expect("socket root"),
+            fs::canonicalize("/tmp").expect("canonical /tmp")
+        );
+    }
+
+    #[test]
+    fn real_uid_parser_uses_the_real_uid_field() {
+        let status = "\
+Name:\trmux\n\
+Uid:\t1000\t2000\t3000\t4000\n\
+Gid:\t1000\t1000\t1000\t1000\n";
+
+        assert_eq!(parse_real_user_id(status).expect("real uid"), 1000);
+    }
+
+    #[test]
+    fn real_uid_parser_requires_a_uid_line() {
+        let error = parse_real_user_id("Name:\trmux\n").expect_err("missing uid line");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn daemon_config_returns_the_configured_path() {
+        let path = PathBuf::from("/tmp/rmux-test/default");
+        let config = DaemonConfig::new(path.clone());
+
+        assert_eq!(config.socket_path(), path.as_path());
+    }
+
+    #[test]
+    fn stale_socket_probe_removes_unreachable_socket_files() {
+        let socket_path = unique_socket_path("stale-socket");
+        let parent = socket_path.parent().expect("socket parent");
+        let _ = fs::remove_file(&socket_path);
+        let _ = fs::remove_dir_all(parent);
+        fs::create_dir_all(parent).expect("create socket parent");
+        let listener = StdUnixListener::bind(&socket_path).expect("bind stale socket");
+        drop(listener);
+        wait_until_socket_is_stale(&socket_path).expect("dropped listener becomes unreachable");
+
+        remove_stale_socket_if_needed(&socket_path).expect("remove stale socket");
+
+        assert!(!socket_path.exists());
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn unsafe_managed_rmux_socket_directory_is_rejected() {
+        let user_id = super::real_user_id().expect("real uid");
+        let root = unique_socket_path("permissions")
+            .parent()
+            .expect("socket parent")
+            .to_path_buf();
+        let socket_path = root.join(format!("rmux-{user_id}")).join("default");
+        let parent = socket_path.parent().expect("socket parent");
+        fs::create_dir_all(parent).expect("create managed socket parent");
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).expect("set perms");
+
+        let error = super::ensure_parent_directory(parent).expect_err("unsafe parent should fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unsafe_managed_rmux_socket_directory_ancestor_is_rejected() {
+        let user_id = super::real_user_id().expect("real uid");
+        let root = unique_socket_path("nested-permissions")
+            .parent()
+            .expect("socket parent")
+            .to_path_buf();
+        let managed = root.join(format!("rmux-{user_id}"));
+        let nested_parent = managed.join("nested");
+        fs::create_dir_all(&nested_parent).expect("create nested socket parent");
+        fs::set_permissions(&managed, fs::Permissions::from_mode(0o755)).expect("set perms");
+
+        let error = super::ensure_parent_directory(&nested_parent)
+            .expect_err("unsafe managed ancestor should fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let _ = fs::set_permissions(&managed, fs::Permissions::from_mode(0o700));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stale_socket_removal_leaves_non_socket_paths_untouched() {
+        let socket_path = unique_socket_path("not-a-socket");
+        let parent = socket_path.parent().expect("socket parent");
+        fs::create_dir_all(parent).expect("create socket parent");
+        fs::write(&socket_path, "not a socket").expect("write regular file");
+
+        let error = remove_stale_socket_if_needed(&socket_path).expect_err("must fail");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(fs::symlink_metadata(&socket_path)
+            .expect("metadata")
+            .file_type()
+            .is_file());
+        let _ = fs::remove_file(&socket_path);
+        let _ = fs::remove_dir_all(parent);
+    }
+
+    fn unique_socket_path(label: &str) -> PathBuf {
+        let unique_id = UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
+        let process_id = std::process::id();
+        std::env::temp_dir()
+            .join(format!("rmux-server-{label}-{process_id}-{unique_id}"))
+            .join("default.sock")
+    }
+
+    fn wait_until_socket_is_stale(socket_path: &std::path::Path) -> std::io::Result<()> {
+        for _ in 0..100 {
+            match StdUnixStream::connect(socket_path) {
+                Err(error) if super::indicates_stale_socket(&error) => return Ok(()),
+                Err(error) => return Err(error),
+                Ok(stream) => drop(stream),
+            }
+
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("socket '{}' stayed reachable", socket_path.display()),
+        ))
+    }
+}
