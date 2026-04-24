@@ -1,0 +1,154 @@
+use super::*;
+
+#[test]
+fn argv_semicolons_build_an_ordered_command_queue() {
+    let cli = parse_args(&["list-sessions;", "display-message", "-p", "ok"]).unwrap();
+    let commands = cli.into_command_queue();
+
+    assert_eq!(commands.len(), 2);
+    assert!(matches!(
+        &commands[0],
+        super::super::Command::ListSessions(_)
+    ));
+    assert!(matches!(
+        &commands[1],
+        super::super::Command::DisplayMessage(_)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn command_arguments_reject_invalid_utf8_without_lossy_replacement() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let error = parse(vec![
+        OsString::from("rmux"),
+        OsString::from("display-message"),
+        OsString::from_vec(vec![0xff]),
+    ])
+    .unwrap_err();
+
+    assert_eq!(error.kind(), clap::error::ErrorKind::InvalidUtf8);
+    assert!(error.to_string().contains("invalid UTF-8"));
+}
+
+#[test]
+fn move_window_accepts_reindex_with_a_session_target() {
+    let cli = parse_args(&["move-window", "-r", "-t", "alpha"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::MoveWindow(args) => {
+            assert!(args.reindex);
+            assert_eq!(args.source, None);
+            assert_eq!(
+                args.target.as_ref().expect("target exists").to_string(),
+                "alpha"
+            );
+        }
+        _ => panic!("expected MoveWindow command"),
+    }
+}
+
+#[test]
+fn move_window_accepts_reindex_without_a_target() {
+    let cli = parse_args(&["move-window", "-r"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::MoveWindow(args) => {
+            assert!(args.reindex);
+            assert_eq!(args.source, None);
+            assert_eq!(args.target, None);
+        }
+        _ => panic!("expected MoveWindow command"),
+    }
+}
+
+#[test]
+fn move_window_accepts_source_destination_and_kill_flags() {
+    let cli = parse_args(&["move-window", "-k", "-d", "-s", "alpha:2", "-t", "beta:5"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::MoveWindow(args) => {
+            assert!(!args.reindex);
+            assert!(args.kill_target);
+            assert!(args.detached);
+            assert_eq!(args.source.expect("source exists").to_string(), "alpha:2");
+            assert_eq!(
+                args.target.as_ref().expect("target exists").to_string(),
+                "beta:5"
+            );
+        }
+        _ => panic!("expected MoveWindow command"),
+    }
+}
+
+#[test]
+fn swap_window_preserves_session_targets_for_runtime_resolution() {
+    let cli = parse_args(&["swap-window", "-s", "alpha", "-t", "beta:1"]).unwrap();
+    match cli.command.expect("parsed command") {
+        super::super::Command::SwapWindow(args) => {
+            assert_eq!(args.source.to_string(), "alpha");
+            assert_eq!(args.target.as_ref().expect("target").to_string(), "beta:1");
+        }
+        _ => panic!("expected SwapWindow command"),
+    }
+}
+
+#[test]
+fn rotate_window_defaults_to_up_direction() {
+    let cli = parse_args(&["rotate-window", "-t", "alpha:2"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::RotateWindow(args) => {
+            assert_eq!(args.target.as_ref().expect("target").to_string(), "alpha:2");
+            assert_eq!(args.direction(), rmux_proto::RotateWindowDirection::Up);
+        }
+        _ => panic!("expected RotateWindow command"),
+    }
+}
+
+#[test]
+fn rotate_window_accepts_zoom_restore_flag() {
+    let cli = parse_args(&["rotate-window", "-Z", "-t", "alpha:2"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::RotateWindow(args) => {
+            assert_eq!(args.target.as_ref().expect("target").to_string(), "alpha:2");
+            assert!(args.restore_zoom);
+        }
+        _ => panic!("expected RotateWindow command"),
+    }
+}
+
+#[test]
+fn rotate_window_rejects_both_directions() {
+    let error = parse_args(&["rotate-window", "-D", "-U", "-t", "alpha:2"]).unwrap_err();
+    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+}
+
+#[test]
+fn next_window_accepts_alert_navigation_flag() {
+    let cli = parse_args(&["next-window", "-a", "-t", "alpha"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::NextWindow(args) => {
+            assert!(args.alerts_only);
+            assert_eq!(args.target.expect("target exists").to_string(), "alpha");
+        }
+        _ => panic!("expected NextWindow command"),
+    }
+}
+
+#[test]
+fn show_messages_accepts_tmux_flags() {
+    let cli = parse_args(&["show-messages", "-J", "-T", "-t", "="]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::ShowMessages(args) => {
+            assert!(args.jobs);
+            assert!(args.terminals);
+            assert_eq!(args.target_client.as_deref(), Some("="));
+        }
+        _ => panic!("expected ShowMessages command"),
+    }
+}
