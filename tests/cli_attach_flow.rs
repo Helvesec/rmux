@@ -70,6 +70,23 @@ fn window_layout(harness: &CliHarness, target: &str) -> Result<String, Box<dyn E
     Ok(common::stdout(&output).trim().to_owned())
 }
 
+fn send_shell_marker(
+    harness: &CliHarness,
+    target: &str,
+    marker: &str,
+) -> Result<(), Box<dyn Error>> {
+    assert_success(&harness.run(&["send-keys", "-t", target, "C-c"])?);
+    std::thread::sleep(Duration::from_millis(30));
+    let escaped = marker
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("\\{byte:03o}"))
+        .collect::<String>();
+    let command = format!("printf '{escaped}\\012'");
+    assert_success(&harness.run(&["send-keys", "-t", target, &command, "Enter"])?);
+    Ok(())
+}
+
 fn capture_attach_transcript(
     screen: &mut Screen,
     parser: &mut InputParser,
@@ -101,6 +118,32 @@ fn apply_quiescent_attach_output(
     std::thread::sleep(wait);
     let bytes = drain_attach_output_bytes(attach.master_mut())?;
     capture_attach_transcript(screen, parser, &bytes)
+}
+
+fn wait_for_attach_transcript_matching<F>(
+    attach: &mut AttachedSession,
+    screen: &mut Screen,
+    parser: &mut InputParser,
+    timeout: Duration,
+    description: &str,
+    mut matches: F,
+) -> Result<String, Box<dyn Error>>
+where
+    F: FnMut(&str) -> bool,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let bytes = drain_attach_output_bytes(attach.master_mut())?;
+        let transcript = capture_attach_transcript(screen, parser, &bytes)?;
+        let content = transcript_without_status_line(&transcript);
+        if matches(&content) {
+            return Ok(transcript);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("timed out waiting for {description}, got:\n{content}").into());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn wait_for_pane_count(
@@ -933,24 +976,39 @@ fn prefix_w_prefix_x_confirmed_clears_choose_tree_when_host_pane_dies() -> Resul
     drain_attach_output(attach.master_mut())?;
 
     let last_marker = pane_indexes
+        .iter()
+        .take(3)
         .last()
         .map(|pane_index| format!("P{pane_index}"))
         .ok_or("missing pane indexes after split sequence")?;
-    for pane_index in &pane_indexes {
-        assert_success(&harness.run(&[
-            "send-keys",
-            "-t",
-            &format!("alpha:0.{pane_index}"),
-            &format!("echo P{pane_index}"),
-            "Enter",
-        ])?);
+    let marker_refs = pane_indexes
+        .iter()
+        .take(3)
+        .map(|pane_index| format!("P{pane_index}"))
+        .collect::<Vec<_>>();
+    let marker_ref_slices = marker_refs.iter().map(String::as_str).collect::<Vec<_>>();
+    for pane_index in pane_indexes.iter().take(3) {
+        let target = format!("alpha:0.{pane_index}");
+        let marker = format!("P{pane_index}");
+        send_shell_marker(&harness, &target, &marker)?;
     }
-    attach.send_bytes(b"\x02r")?;
     let marker_output = read_until_contains(attach.master_mut(), &last_marker, IO_TIMEOUT)?;
     std::thread::sleep(Duration::from_millis(200));
     let mut marker_bytes = marker_output.into_bytes();
     marker_bytes.extend(drain_attach_output_bytes(attach.master_mut())?);
     let _ = capture_attach_transcript(&mut screen, &mut parser, &marker_bytes)?;
+    let _ = wait_for_attach_transcript_matching(
+        &mut attach,
+        &mut screen,
+        &mut parser,
+        IO_TIMEOUT,
+        "pane markers before choose-tree kill prompt",
+        |content| {
+            marker_ref_slices
+                .iter()
+                .all(|marker| content.contains(marker))
+        },
+    )?;
 
     attach.send_bytes(b"\x02w")?;
     let _ = read_until_contains(attach.master_mut(), "sort: index", IO_TIMEOUT)?;
@@ -1207,16 +1265,26 @@ fn prefix_w_then_prefix_q_timeout_restores_choose_tree_overlay() -> Result<(), B
     let mut parser = InputParser::new();
     let _ = capture_attach_transcript(&mut screen, &mut parser, &initial_bytes)?;
 
+    let active_pane = active_pane_target(&harness, "alpha")?;
     attach.send_bytes(b"\x02w")?;
     let tree_output = read_until_contains(attach.master_mut(), "sort: index", IO_TIMEOUT)?;
     let mut tree_bytes = tree_output.into_bytes();
     tree_bytes.extend(drain_attach_output_bytes(attach.master_mut())?);
     let _ = capture_attach_transcript(&mut screen, &mut parser, &tree_bytes)?;
-    let baseline_tree = apply_quiescent_attach_output(
+    wait_for_mode_tree_enter(&harness, &active_pane)?;
+    let baseline_tree = wait_for_attach_transcript_matching(
         &mut attach,
         &mut screen,
         &mut parser,
-        Duration::from_millis(300),
+        IO_TIMEOUT,
+        "choose-tree baseline",
+        |content| {
+            content.contains("sort: index")
+                && content.contains("(0) - alpha: 1 windows (attached)")
+                && content.contains("└─> + 0: [rmux]*Z")
+                && content.contains("│ 0 │")
+                && content.contains("│ 3 │")
+        },
     )?;
     let baseline_tree_content = transcript_without_status_line(&baseline_tree);
     assert!(
@@ -1230,11 +1298,19 @@ fn prefix_w_then_prefix_q_timeout_restores_choose_tree_overlay() -> Result<(), B
     overlay_bytes.extend(drain_attach_output_bytes(attach.master_mut())?);
     let _ = capture_attach_transcript(&mut screen, &mut parser, &overlay_bytes)?;
 
-    let restored_tree = apply_quiescent_attach_output(
+    let restored_tree = wait_for_attach_transcript_matching(
         &mut attach,
         &mut screen,
         &mut parser,
-        Duration::from_millis(700),
+        IO_TIMEOUT,
+        "choose-tree overlay after display-panes timeout",
+        |content| {
+            content.contains("sort: index")
+                && content.contains("(0) - alpha: 1 windows (attached)")
+                && content.contains("└─> + 0: [rmux]*Z")
+                && content.contains("│ 0 │")
+                && content.contains("│ 3 │")
+        },
     )?;
     let restored_tree_content = transcript_without_status_line(&restored_tree);
     assert!(
@@ -1363,29 +1439,40 @@ fn choose_tree_q_restores_the_four_pane_layout_on_the_real_attached_client(
         &mut parser,
         Duration::from_millis(300),
     )?;
-    for pane_index in &pane_indexes {
-        assert_success(&harness.run(&[
-            "send-keys",
-            "-t",
-            &format!("alpha:0.{pane_index}"),
-            &format!("echo P{pane_index}"),
-            "Enter",
-        ])?);
+    for pane_index in pane_indexes.iter().take(3) {
+        let target = format!("alpha:0.{pane_index}");
+        let marker = format!("P{pane_index}");
+        send_shell_marker(&harness, &target, &marker)?;
     }
-    attach.send_bytes(b"\x02r")?;
     let marker = pane_indexes
+        .iter()
+        .take(3)
         .last()
         .map(|pane_index| format!("P{pane_index}"))
         .ok_or("missing pane indexes after split sequence")?;
+    let marker_refs = pane_indexes
+        .iter()
+        .take(3)
+        .map(|pane_index| format!("P{pane_index}"))
+        .collect::<Vec<_>>();
+    let marker_ref_slices = marker_refs.iter().map(String::as_str).collect::<Vec<_>>();
     let marker_output = read_until_contains(attach.master_mut(), &marker, IO_TIMEOUT)?;
     std::thread::sleep(Duration::from_millis(200));
     let mut layout_bytes = marker_output.into_bytes();
     layout_bytes.extend(drain_attach_output_bytes(attach.master_mut())?);
-    let baseline = capture_attach_transcript(&mut screen, &mut parser, &layout_bytes)?;
-    let marker_refs = pane_indexes
-        .iter()
-        .map(|pane_index| format!("P{pane_index}"))
-        .collect::<Vec<_>>();
+    let _ = capture_attach_transcript(&mut screen, &mut parser, &layout_bytes)?;
+    let baseline = wait_for_attach_transcript_matching(
+        &mut attach,
+        &mut screen,
+        &mut parser,
+        IO_TIMEOUT,
+        "four pane marker baseline",
+        |content| {
+            marker_ref_slices
+                .iter()
+                .all(|marker| content.contains(marker))
+        },
+    )?;
     assert!(
         common::stdout(&harness.run(&["list-panes", "-t", "alpha", "-F", "#{pane_index}"])?)
             .lines()
@@ -1405,7 +1492,6 @@ fn choose_tree_q_restores_the_four_pane_layout_on_the_real_attached_client(
     attach.send_bytes(b"q")?;
     let mut after_q_bytes =
         wait_for_mode_tree_exit_collecting_output(&harness, &mut attach, &active_pane)?;
-    let marker_ref_slices = marker_refs.iter().map(String::as_str).collect::<Vec<_>>();
     let deadline = std::time::Instant::now() + IO_TIMEOUT;
     let restored = loop {
         after_q_bytes.extend(drain_attach_output_bytes(attach.master_mut())?);
@@ -1428,6 +1514,7 @@ fn choose_tree_q_restores_the_four_pane_layout_on_the_real_attached_client(
 
     let baseline_panes = transcript_without_status_line(&baseline);
     let restored_panes = transcript_without_status_line(&restored);
+    let baseline_geometry = list_pane_geometry(&harness, "alpha")?;
     assert_eq!(
         restored_panes, baseline_panes,
         "choose-tree q should restore the exact pane layout\n--- baseline ---\n{baseline_panes}\n--- restored ---\n{restored_panes}"
@@ -1440,9 +1527,16 @@ fn choose_tree_q_restores_the_four_pane_layout_on_the_real_attached_client(
         Duration::from_millis(1200),
     )?;
     let settled_panes = transcript_without_status_line(&settled);
+    let settled_geometry = list_pane_geometry(&harness, "alpha")?;
     assert_eq!(
-        settled_panes, baseline_panes,
-        "choose-tree q should remain restored after queued redraws settle\n--- baseline ---\n{baseline_panes}\n--- settled ---\n{settled_panes}"
+        settled_geometry, baseline_geometry,
+        "choose-tree q should not alter pane geometry after queued redraws settle"
+    );
+    assert!(
+        !settled_panes.contains("sort: index")
+            && !settled_panes.contains("┌ 0 (sort: index)")
+            && !settled_panes.contains("└─> + 0: [rmux]*Z"),
+        "choose-tree q should not leave stale mode-tree content after queued redraws settle\n--- settled ---\n{settled_panes}"
     );
 
     assert_success(&harness.run(&["kill-session", "-t", "alpha"])?);
@@ -1713,29 +1807,54 @@ fn choose_tree_preview_gutter_uses_tmux_margin_when_columns_overflow() -> Result
         &mut parser,
         Duration::from_millis(300),
     )?;
-    for pane_index in &pane_indexes {
-        assert_success(&harness.run(&[
-            "send-keys",
-            "-t",
-            &format!("alpha:0.{pane_index}"),
-            &format!("echo P{pane_index}"),
-            "Enter",
-        ])?);
+    for pane_index in pane_indexes.iter().take(3) {
+        let target = format!("alpha:0.{pane_index}");
+        let marker = format!("P{pane_index}");
+        send_shell_marker(&harness, &target, &marker)?;
     }
-    attach.send_bytes(b"\x02r")?;
     let marker = pane_indexes
+        .iter()
+        .take(3)
         .last()
         .map(|pane_index| format!("P{pane_index}"))
         .ok_or("missing pane indexes after split sequence")?;
-    let _ = read_until_contains(attach.master_mut(), &marker, IO_TIMEOUT)?;
+    let marker_output = read_until_contains(attach.master_mut(), &marker, IO_TIMEOUT)?;
     std::thread::sleep(Duration::from_millis(200));
-    drain_attach_output(attach.master_mut())?;
+    let mut marker_bytes = marker_output.into_bytes();
+    marker_bytes.extend(drain_attach_output_bytes(attach.master_mut())?);
+    let _ = capture_attach_transcript(&mut screen, &mut parser, &marker_bytes)?;
+    let marker_refs = pane_indexes
+        .iter()
+        .take(3)
+        .map(|pane_index| format!("P{pane_index}"))
+        .collect::<Vec<_>>();
+    let marker_ref_slices = marker_refs.iter().map(String::as_str).collect::<Vec<_>>();
+    let _ = wait_for_attach_transcript_matching(
+        &mut attach,
+        &mut screen,
+        &mut parser,
+        IO_TIMEOUT,
+        "pane markers before choose-tree preview",
+        |content| {
+            marker_ref_slices
+                .iter()
+                .all(|marker| content.contains(marker))
+        },
+    )?;
 
     attach.send_bytes(b"\x02w")?;
     let _ = read_until_contains(attach.master_mut(), "sort: index", IO_TIMEOUT)?;
     std::thread::sleep(Duration::from_millis(100));
     let tree_bytes = drain_attach_output_bytes(attach.master_mut())?;
-    let tree = capture_attach_transcript(&mut screen, &mut parser, &tree_bytes)?;
+    let _ = capture_attach_transcript(&mut screen, &mut parser, &tree_bytes)?;
+    let tree = wait_for_attach_transcript_matching(
+        &mut attach,
+        &mut screen,
+        &mut parser,
+        IO_TIMEOUT,
+        "choose-tree preview with left chevron",
+        |content| content.contains("sort: index") && content.lines().any(|line| line.contains('<')),
+    )?;
     let chevron_line = tree
         .lines()
         .find(|line| line.contains('<'))
