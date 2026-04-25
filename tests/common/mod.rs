@@ -291,12 +291,10 @@ pub(crate) fn pane_tty_paths() -> Result<BTreeSet<PathBuf>, Box<dyn Error>> {
     let mut paths = BTreeSet::new();
 
     for pid in pane_child_pids()? {
-        let target = match fs::read_link(format!("/proc/{pid}/fd/0")) {
-            Ok(target) => target,
-            Err(_) => continue,
+        let Some(target) = stdin_tty_path(pid)? else {
+            continue;
         };
-
-        if is_pts_device(&target) {
+        if is_pty_device(&target) {
             paths.insert(target);
         }
     }
@@ -305,6 +303,24 @@ pub(crate) fn pane_tty_paths() -> Result<BTreeSet<PathBuf>, Box<dyn Error>> {
 }
 
 pub(crate) fn pane_child_pids() -> Result<BTreeSet<u32>, Box<dyn Error>> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_pane_child_pids()
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        macos_pane_child_pids()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Ok(BTreeSet::new())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_pane_child_pids() -> Result<BTreeSet<u32>, Box<dyn Error>> {
     let task_directory = format!("/proc/{}/task", std::process::id());
     let tasks = match fs::read_dir(task_directory) {
         Ok(tasks) => tasks,
@@ -328,6 +344,70 @@ pub(crate) fn pane_child_pids() -> Result<BTreeSet<u32>, Box<dyn Error>> {
     }
 
     Ok(pids)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_pane_child_pids() -> Result<BTreeSet<u32>, Box<dyn Error>> {
+    let output = Command::new("ps").args(["-axo", "pid=,ppid="]).output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "ps failed while listing pane children: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+
+    let parent_pid = std::process::id();
+    let mut pids = BTreeSet::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.split_whitespace();
+        let Some(pid) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(ppid) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+            continue;
+        };
+        if ppid == parent_pid {
+            pids.insert(pid);
+        }
+    }
+
+    Ok(pids)
+}
+
+#[cfg(target_os = "linux")]
+fn stdin_tty_path(pid: u32) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    match fs::read_link(format!("/proc/{pid}/fd/0")) {
+        Ok(target) => Ok(Some(target)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn stdin_tty_path(pid: u32) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    let output = Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "0", "-Fn"])
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix('n').map(PathBuf::from)))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn stdin_tty_path(_pid: u32) -> Result<Option<PathBuf>, Box<dyn Error>> {
+    Ok(None)
 }
 
 pub(crate) fn tty_size(path: &Path) -> Result<TerminalSize, Box<dyn Error>> {
@@ -591,11 +671,20 @@ fn socket_directory_entries(socket_path: &Path) -> Result<Vec<String>, Box<dyn E
         .map_err(Into::into)
 }
 
-fn is_pts_device(path: &Path) -> bool {
-    path.parent() == Some(Path::new("/dev/pts"))
-        && path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.chars().all(|character| character.is_ascii_digit()))
-            .unwrap_or(false)
+fn is_pty_device(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+
+    if parent == Path::new("/dev/pts") {
+        return name.chars().all(|character| character.is_ascii_digit());
+    }
+
+    parent == Path::new("/dev")
+        && name.strip_prefix("ttys").is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_hexdigit())
+        })
 }
