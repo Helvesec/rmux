@@ -100,7 +100,7 @@ where
 {
     // This helper runs while the caller's `RawTerminal` guard is still alive,
     // which keeps termios restoration as the last drop on every return path.
-    let signal_mask = SignalMaskGuard::block_winch().map_err(ClientError::from)?;
+    let _signal_mask = SignalMaskGuard::block_winch().map_err(ClientError::from)?;
     let (resize_tx, resize_rx) = mpsc::channel();
     let initial_size = terminal_size_from_fd(terminal).map_err(ClientError::from)?;
     let terminal_fd = terminal
@@ -124,7 +124,6 @@ where
         resize_rx,
     );
     drop(resize_watcher);
-    drop(signal_mask);
     attach_result
 }
 
