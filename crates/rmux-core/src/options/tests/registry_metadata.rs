@@ -1,5 +1,7 @@
 use super::*;
 
+const FROZEN_OPTIONS_TABLE_PATH: &str = "/opt/rmux/reference/tmux/options-table.c";
+
 #[test]
 fn option_registry_is_closed_unique_and_contains_full_frozen_inventory() {
     let metadata = registry::registry();
@@ -19,8 +21,9 @@ fn option_registry_is_closed_unique_and_contains_full_frozen_inventory() {
 
 #[test]
 fn option_registry_matches_frozen_tmux_option_names() {
-    let source = fs::read_to_string("/opt/rmux/reference/tmux/options-table.c")
-        .expect("frozen tmux options-table.c is readable");
+    let Some(source) = frozen_options_table_source() else {
+        return;
+    };
     let tmux_names = source
         .lines()
         .filter_map(|line| {
@@ -134,8 +137,9 @@ fn style_and_array_metadata_capture_tmux_specific_defaults() {
 
 #[test]
 fn style_parse_effect_inventory_matches_tmux_style_option_count() {
-    let source = fs::read_to_string("/opt/rmux/reference/tmux/options-table.c")
-        .expect("frozen tmux options-table.c is readable");
+    let Some(source) = frozen_options_table_source() else {
+        return;
+    };
     let lines = source.lines().collect::<Vec<_>>();
     let tmux_style_options = lines
         .iter()
@@ -159,4 +163,20 @@ fn style_parse_effect_inventory_matches_tmux_style_option_count() {
         .collect::<HashSet<_>>();
 
     assert_eq!(registry_style_options, tmux_style_options);
+}
+
+fn frozen_options_table_source() -> Option<String> {
+    match fs::read_to_string(FROZEN_OPTIONS_TABLE_PATH) {
+        Ok(source) => Some(source),
+        Err(error) if cfg!(target_os = "linux") => panic!(
+            "frozen tmux options-table.c is readable at {FROZEN_OPTIONS_TABLE_PATH}: {error}"
+        ),
+        Err(error) => {
+            eprintln!(
+                "skipping frozen tmux options-table assertions: \
+                 {FROZEN_OPTIONS_TABLE_PATH} unavailable: {error}"
+            );
+            None
+        }
+    }
 }
