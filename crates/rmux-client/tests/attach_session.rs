@@ -391,6 +391,7 @@ fn assert_termios_eq(expected: &Termios, actual: &Termios) {
     assert_eq!(actual.output_modes, expected.output_modes);
     assert_eq!(actual.control_modes, expected.control_modes);
     assert_eq!(actual.local_modes, expected.local_modes);
+    #[cfg(target_os = "linux")]
     assert_eq!(actual.line_discipline, expected.line_discipline);
     assert_eq!(
         format!("{:?}", actual.special_codes),
