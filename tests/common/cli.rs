@@ -211,7 +211,7 @@ fn clear_stale_cli_command_lock(path: &Path) -> Result<bool, Box<dyn Error>> {
             let owner_pid = owner_pid.trim();
             let parsed = owner_pid.parse::<u32>().ok();
             if let Some(owner_pid) = parsed {
-                if Path::new(&format!("/proc/{owner_pid}")).exists() {
+                if process_id_exists(owner_pid) {
                     return Ok(false);
                 }
             } else if !lock_dir_is_stale(path)? {
@@ -247,6 +247,20 @@ fn clear_stale_cli_command_lock(path: &Path) -> Result<bool, Box<dyn Error>> {
             }
         }
     }
+}
+
+fn process_id_exists(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+
+    // SAFETY: `kill(pid, 0)` does not send a signal; it only asks the kernel
+    // whether the process exists and whether this process may signal it.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 fn lock_dir_is_stale(path: &Path) -> Result<bool, Box<dyn Error>> {
