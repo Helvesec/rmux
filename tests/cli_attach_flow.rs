@@ -978,7 +978,7 @@ fn prefix_w_prefix_x_confirmed_clears_choose_tree_when_host_pane_dies() -> Resul
     let last_marker = pane_indexes
         .iter()
         .take(3)
-        .last()
+        .nth(2)
         .map(|pane_index| format!("P{pane_index}"))
         .ok_or("missing pane indexes after split sequence")?;
     let marker_refs = pane_indexes
@@ -1447,7 +1447,7 @@ fn choose_tree_q_restores_the_four_pane_layout_on_the_real_attached_client(
     let marker = pane_indexes
         .iter()
         .take(3)
-        .last()
+        .nth(2)
         .map(|pane_index| format!("P{pane_index}"))
         .ok_or("missing pane indexes after split sequence")?;
     let marker_refs = pane_indexes
@@ -1822,7 +1822,7 @@ fn choose_tree_preview_gutter_uses_tmux_margin_when_columns_overflow() -> Result
     let marker = pane_indexes
         .iter()
         .take(3)
-        .last()
+        .nth(2)
         .map(|pane_index| format!("P{pane_index}"))
         .ok_or("missing pane indexes after split sequence")?;
     let marker_output = read_until_contains(attach.master_mut(), &marker, IO_TIMEOUT)?;

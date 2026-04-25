@@ -45,7 +45,7 @@ fn resize_watcher_reports_sigwinch_updates() -> Result<(), Box<dyn std::error::E
     let (_master, slave) = pair.into_split();
     let terminal = File::from(slave.into_owned_fd());
     let resize_target = terminal.try_clone()?;
-    let signal_mask = SignalMaskGuard::block_winch()?;
+    let _signal_mask = SignalMaskGuard::block_winch()?;
     let (resize_tx, resize_rx) = mpsc::channel();
     let watcher = ResizeWatcher::spawn(terminal.as_fd().try_clone_to_owned()?, resize_tx)?;
 
@@ -69,7 +69,6 @@ fn resize_watcher_reports_sigwinch_updates() -> Result<(), Box<dyn std::error::E
     );
 
     drop(watcher);
-    drop(signal_mask);
     Ok(())
 }
 
