@@ -221,6 +221,7 @@ fn attach_with_terminal_restores_mouse_off_after_protocol_error(
     let (master, slave) = pair.into_split();
     let mut master = File::from(master.into_owned_fd());
     let terminal = File::from(slave.into_owned_fd());
+    let _slave_keepalive = terminal.try_clone()?;
     let input = terminal.try_clone()?;
     let output = terminal.try_clone()?;
     let (client_stream, mut server_stream) = UnixStream::pair()?;
@@ -269,7 +270,7 @@ fn attach_with_terminal_restores_mouse_off_after_protocol_error(
         collected
             .windows(b"\x1b[?1000l\x1b[?1002l\x1b[?1006l".len())
             .any(|window| window == b"\x1b[?1000l\x1b[?1002l\x1b[?1006l"),
-        "client fallback should disable mouse on protocol errors"
+        "client fallback should disable mouse on protocol errors, collected={collected:?}"
     );
     assert!(
         collected
