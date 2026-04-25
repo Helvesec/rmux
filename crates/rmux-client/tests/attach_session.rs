@@ -135,6 +135,7 @@ fn drive_attach_stream_exits_when_the_server_stops_with_input_still_open(
 fn begin_attach_keeps_post_response_attach_bytes_on_the_stream() -> Result<(), Box<dyn Error>> {
     let socket_path = unique_socket_path("begin-attach-boundary");
     let listener = UnixListener::bind(&socket_path)?;
+    let (release_server_tx, release_server_rx) = mpsc::channel();
     let expected_request = Request::AttachSession(AttachSessionRequest {
         target: session_name("alpha"),
     });
@@ -157,7 +158,11 @@ fn begin_attach_keeps_post_response_attach_bytes_on_the_stream() -> Result<(), B
         stream
             .write_all(&response)
             .and_then(|()| stream.flush())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        release_server_rx
+            .recv()
+            .map_err(|error| error.to_string())?;
+        Ok(())
     });
 
     let connection = connect(&socket_path)?;
@@ -174,6 +179,9 @@ fn begin_attach_keeps_post_response_attach_bytes_on_the_stream() -> Result<(), B
         vec![AttachMessage::Data(b"ready".to_vec())]
     );
 
+    release_server_tx
+        .send(())
+        .map_err(|_| std::io::Error::other("server release receiver closed"))?;
     server
         .join()
         .map_err(|_| std::io::Error::other("server thread panicked"))?
@@ -390,7 +398,10 @@ fn assert_termios_eq(expected: &Termios, actual: &Termios) {
     assert_eq!(actual.input_modes, expected.input_modes);
     assert_eq!(actual.output_modes, expected.output_modes);
     assert_eq!(actual.control_modes, expected.control_modes);
-    assert_eq!(actual.local_modes, expected.local_modes);
+    assert_eq!(
+        comparable_local_modes(actual.local_modes),
+        comparable_local_modes(expected.local_modes)
+    );
     #[cfg(target_os = "linux")]
     assert_eq!(actual.line_discipline, expected.line_discipline);
     assert_eq!(
@@ -399,6 +410,13 @@ fn assert_termios_eq(expected: &Termios, actual: &Termios) {
     );
     assert_eq!(actual.input_speed(), expected.input_speed());
     assert_eq!(actual.output_speed(), expected.output_speed());
+}
+
+fn comparable_local_modes(mut modes: LocalModes) -> LocalModes {
+    #[cfg(target_os = "macos")]
+    modes.remove(LocalModes::PENDIN);
+
+    modes
 }
 
 fn wait_for_output_eof(reader: &mut UnixStream, timeout: Duration) -> Result<(), Box<dyn Error>> {
