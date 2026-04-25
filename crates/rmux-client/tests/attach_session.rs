@@ -8,6 +8,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -25,9 +26,11 @@ use rustix::termios::{
 const READ_TIMEOUT: Duration = Duration::from_secs(1);
 const ATTACH_OUTPUT_TIMEOUT: Duration = Duration::from_secs(5);
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
+static ATTACH_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn begin_attach_upgrades_a_live_connection() -> Result<(), Box<dyn Error>> {
+    let _guard = serialize_attach_tests();
     let harness = TestHarness::new("begin-attach");
     let mut server = start_server(&harness)?;
     let mut connection = connect(harness.socket_path())?;
@@ -57,6 +60,7 @@ fn begin_attach_upgrades_a_live_connection() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn drive_attach_stream_forwards_data_and_resize_messages() -> Result<(), Box<dyn Error>> {
+    let _guard = serialize_attach_tests();
     let (client_stream, mut server_stream) = UnixStream::pair()?;
     let (mut input_writer, input_reader) = UnixStream::pair()?;
     let (mut output_reader, output_writer) = UnixStream::pair()?;
@@ -111,6 +115,7 @@ fn drive_attach_stream_forwards_data_and_resize_messages() -> Result<(), Box<dyn
 #[test]
 fn drive_attach_stream_exits_when_the_server_stops_with_input_still_open(
 ) -> Result<(), Box<dyn Error>> {
+    let _guard = serialize_attach_tests();
     let (client_stream, mut server_stream) = UnixStream::pair()?;
     let (_input_writer, input_reader) = UnixStream::pair()?;
     let (_output_reader, output_writer) = UnixStream::pair()?;
@@ -133,6 +138,7 @@ fn drive_attach_stream_exits_when_the_server_stops_with_input_still_open(
 
 #[test]
 fn begin_attach_keeps_post_response_attach_bytes_on_the_stream() -> Result<(), Box<dyn Error>> {
+    let _guard = serialize_attach_tests();
     let socket_path = unique_socket_path("begin-attach-boundary");
     let listener = UnixListener::bind(&socket_path)?;
     let (release_server_tx, release_server_rx) = mpsc::channel();
@@ -192,6 +198,7 @@ fn begin_attach_keeps_post_response_attach_bytes_on_the_stream() -> Result<(), B
 
 #[test]
 fn attach_with_terminal_restores_termios_after_repeated_detach() -> Result<(), Box<dyn Error>> {
+    let _guard = serialize_attach_tests();
     let harness = TestHarness::new("attach-lifecycle");
     let mut server = start_server(&harness)?;
     let mut setup_connection = connect(harness.socket_path())?;
@@ -218,6 +225,12 @@ fn attach_with_terminal_restores_termios_after_repeated_detach() -> Result<(), B
 
     server.shutdown()?;
     Ok(())
+}
+
+fn serialize_attach_tests() -> MutexGuard<'static, ()> {
+    ATTACH_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn read_attach_messages(
