@@ -5,6 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+libc = "0.2.185"
 rmux-core = { path = "../rmux-core" }
 rmux-proto = { path = "../rmux-proto" }
 rustix = { version = "1.1.4", features = ["event", "net", "process", "runtime", "termios", "thread"] }

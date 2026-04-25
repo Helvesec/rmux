@@ -378,6 +378,7 @@ dependencies = [
 name = "rmux-client"
 version = "0.0.2"
 dependencies = [
+ "libc",
  "rmux-core",
  "rmux-proto",
  "rmux-pty",

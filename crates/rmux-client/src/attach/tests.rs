@@ -11,12 +11,11 @@ use rmux_core::alternate_screen_exit_sequence;
 use rmux_proto::{encode_attach_message, AttachFrameDecoder, AttachMessage, AttachedKeystroke};
 use rmux_pty::PtyPair;
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
-use rustix::runtime::tkill;
 use rustix::termios::{tcsetwinsize, Winsize};
 
 use super::{
     attach_with_terminal, fallback_attach_stop_sequence, input_loop, output_loop,
-    AttachScreenTracker, RawTerminal, ResizeWatcher, Signal, SignalMaskGuard, TerminalSize,
+    AttachScreenTracker, RawTerminal, ResizeWatcher, SignalMaskGuard, TerminalSize,
 };
 
 #[test]
@@ -39,8 +38,7 @@ fn resize_watcher_reports_sigwinch_updates() -> Result<(), Box<dyn std::error::E
         },
     )?;
 
-    // SAFETY: `watcher.tid` is the watcher thread created above and SIGWINCH is the signal it is waiting for.
-    unsafe { tkill(watcher.tid, Signal::WINCH) }?;
+    watcher.notify_for_test()?;
     assert_eq!(
         resize_rx.recv_timeout(Duration::from_secs(1))?,
         TerminalSize {
