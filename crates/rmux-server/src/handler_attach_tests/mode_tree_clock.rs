@@ -97,7 +97,7 @@ async fn attached_compact_prefix_wq_uses_choose_tree_before_the_following_key() 
             "#{window_name}|#{pane_in_mode}|#{pane_mode}"
         )
         .await,
-        "bash|0|\n"
+        default_shell_pane_status()
     );
 }
 
@@ -121,6 +121,6 @@ async fn attached_compact_prefix_tq_uses_clock_mode_before_the_following_key() {
             "#{window_name}|#{pane_in_mode}|#{pane_mode}"
         )
         .await,
-        "bash|0|\n"
+        default_shell_pane_status()
     );
 }

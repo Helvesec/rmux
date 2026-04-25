@@ -257,7 +257,7 @@ async fn attached_copy_mode_updates_automatic_window_name_on_entry_and_exit() {
             "#{window_name}|#{pane_in_mode}|#{pane_mode}"
         )
         .await,
-        "bash|0|\n"
+        default_shell_pane_status()
     );
     assert!(matches!(
         handler
@@ -296,7 +296,7 @@ async fn attached_copy_mode_updates_automatic_window_name_on_entry_and_exit() {
             "#{window_name}|#{pane_in_mode}|#{pane_mode}"
         )
         .await,
-        "bash|0|\n"
+        default_shell_pane_status()
     );
 }
 

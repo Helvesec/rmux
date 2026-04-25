@@ -51,10 +51,12 @@ async fn attached_remain_on_exit_strips_the_submitted_exit_line_from_dead_pane_c
         !capture.contains("PROMPT> exit"),
         "attached remain-on-exit capture must not keep the submitted exit line, got {capture:?}"
     );
-    assert!(
-        capture.contains("logout"),
-        "dead pane capture should preserve post-exit shell output, got {capture:?}"
-    );
+    if default_shell_window_name() == "bash" {
+        assert!(
+            capture.contains("logout"),
+            "dead pane capture should preserve bash post-exit output, got {capture:?}"
+        );
+    }
     assert!(
         capture.contains("Pane is dead"),
         "dead pane capture should include remain-on-exit status, got {capture:?}"
