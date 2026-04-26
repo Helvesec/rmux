@@ -6,7 +6,8 @@
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod client_flags;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+#[cfg_attr(windows, allow(dead_code))]
 mod clock_mode;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
