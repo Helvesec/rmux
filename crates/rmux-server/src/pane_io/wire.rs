@@ -5,6 +5,7 @@ use rmux_ipc::LocalStream;
 use rmux_proto::{encode_attach_message, AttachFrameDecoder, AttachMessage};
 #[cfg(unix)]
 use rmux_pty::PtyIo;
+#[cfg(unix)]
 use rmux_pty::PtyMaster;
 #[cfg(unix)]
 use tokio::io::unix::AsyncFd;

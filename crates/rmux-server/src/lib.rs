@@ -41,7 +41,8 @@ mod mouse;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod outer_terminal;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+#[cfg_attr(windows, allow(dead_code))]
 mod pane_io;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]

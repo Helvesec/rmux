@@ -1,10 +1,17 @@
+#[cfg(unix)]
 use rmux_ipc::LocalStream;
+#[cfg(unix)]
 use rmux_proto::{AttachFrameDecoder, AttachMessage};
-use std::collections::VecDeque;
-use std::io;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, AtomicU64};
+#[cfg(unix)]
 use std::sync::Arc;
-use tokio::sync::{mpsc, watch};
+#[cfg(unix)]
+use std::{collections::VecDeque, io, sync::atomic::Ordering};
+#[cfg(unix)]
+use tokio::sync::mpsc;
+#[cfg(unix)]
+use tokio::sync::watch;
 
 const READ_BUFFER_SIZE: usize = 8192;
 mod control;
@@ -14,11 +21,13 @@ mod reader;
 mod types;
 mod wire;
 
+#[cfg(unix)]
 use control::{
     apply_pending_attach_controls, recv_attach_control,
     redraw_after_persistent_overlay_state_advance, should_emit_overlay, switch_attach_target,
     PendingAttachAction,
 };
+#[cfg(unix)]
 use persistent_overlay::{
     accept_persistent_overlay_state, advance_persistent_overlay_state, clear_then_base_frame,
     discard_stale_persistent_overlays, is_stale_persistent_switch,
@@ -27,11 +36,13 @@ use persistent_overlay::{
 };
 #[cfg(unix)]
 pub(crate) use reader::spawn_pane_output_reader;
+#[cfg(unix)]
 pub(crate) use types::{
     pane_output_channel, AttachControl, AttachTarget, HandleOutcome, LiveAttachInputContext,
     OverlayFrame, PaneAlertCallback, PaneAlertEvent, PaneExitCallback, PaneExitEvent,
     PaneOutputSender,
 };
+#[cfg(unix)]
 use wire::{
     emit_attach_bytes, emit_attach_frame, emit_attach_message, emit_attach_stop,
     emit_detached_message, emit_exited_message, emit_render_frame, invalid_attach_message,
@@ -40,6 +51,7 @@ use wire::{
 };
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(unix)]
 pub(crate) async fn forward_attach(
     stream: LocalStream,
     target: AttachTarget,
@@ -380,6 +392,7 @@ pub(crate) async fn forward_attach(
     result
 }
 
+#[cfg(unix)]
 async fn process_socket_messages(
     decoder: &mut AttachFrameDecoder,
     stream: &LocalStream,
@@ -469,5 +482,5 @@ async fn process_socket_messages(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
