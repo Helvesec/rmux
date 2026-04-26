@@ -85,7 +85,7 @@ async fn serve_connection(
     mut shutdown: watch::Receiver<()>,
     shutdown_handle: ShutdownHandle,
 ) -> io::Result<()> {
-    let Some(access_mode) = handler.access_mode_for_uid(requester.uid) else {
+    let Some(access_mode) = handler.access_mode_for_peer(&requester) else {
         let mut conn = Connection::new(stream);
         conn.write_response(&Response::Error(ErrorResponse {
             error: rmux_proto::RmuxError::Server("access not allowed".to_owned()),

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 
+use rmux_os::identity::UserIdentity;
 use rmux_proto::{AttachSessionExtRequest, CommandOutput, Request, RmuxError, ServerAccessRequest};
 
 use crate::daemon::real_user_id;
@@ -35,16 +36,26 @@ pub(crate) struct ResolvedUser {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServerAccessStore {
     owner_uid: u32,
-    entries: BTreeMap<u32, AccessMode>,
+    owner_identity: UserIdentity,
+    entries: BTreeMap<UserIdentity, AccessMode>,
 }
 
 impl ServerAccessStore {
     #[must_use]
     pub(crate) fn new(owner_uid: u32) -> Self {
+        Self::new_for_identity(owner_uid, UserIdentity::Uid(owner_uid))
+    }
+
+    #[must_use]
+    pub(crate) fn new_for_identity(owner_uid: u32, owner_identity: UserIdentity) -> Self {
         let mut entries = BTreeMap::new();
-        entries.insert(0, AccessMode::ReadWrite);
-        entries.insert(owner_uid, AccessMode::ReadWrite);
-        Self { owner_uid, entries }
+        entries.insert(UserIdentity::Uid(0), AccessMode::ReadWrite);
+        entries.insert(owner_identity.clone(), AccessMode::ReadWrite);
+        Self {
+            owner_uid,
+            owner_identity,
+            entries,
+        }
     }
 
     #[must_use]
@@ -53,41 +64,47 @@ impl ServerAccessStore {
     }
 
     #[must_use]
-    pub(crate) fn mode_for_uid(&self, uid: u32) -> Option<AccessMode> {
-        self.entries.get(&uid).copied()
+    pub(crate) fn mode_for_identity(&self, identity: &UserIdentity) -> Option<AccessMode> {
+        self.entries.get(identity).copied()
     }
 
     pub(crate) fn set_mode(&mut self, uid: u32, mode: AccessMode) -> Result<(), RmuxError> {
-        self.ensure_mutable_uid(uid)?;
-        self.entries.insert(uid, mode);
+        let identity = UserIdentity::Uid(uid);
+        self.ensure_mutable_identity(&identity)?;
+        self.entries.insert(identity, mode);
         Ok(())
     }
 
     pub(crate) fn remove_uid(&mut self, uid: u32) -> Result<(), RmuxError> {
-        self.ensure_mutable_uid(uid)?;
-        self.entries.remove(&uid);
+        let identity = UserIdentity::Uid(uid);
+        self.ensure_mutable_identity(&identity)?;
+        self.entries.remove(&identity);
         Ok(())
     }
 
     #[must_use]
     pub(crate) fn contains_uid(&self, uid: u32) -> bool {
-        self.entries.contains_key(&uid)
+        self.entries.contains_key(&UserIdentity::Uid(uid))
     }
 
     pub(crate) fn render_list(&self) -> CommandOutput {
         let mut stdout = Vec::new();
-        for (&uid, mode) in &self.entries {
-            if uid == 0 {
+        for (identity, mode) in &self.entries {
+            if *identity == UserIdentity::Uid(0) {
                 continue;
             }
-            let line = format!("{} ({})\n", user_name_for_uid(uid), mode.display_suffix());
+            let line = format!(
+                "{} ({})\n",
+                user_name_for_identity(identity),
+                mode.display_suffix()
+            );
             stdout.extend_from_slice(line.as_bytes());
         }
         CommandOutput::from_stdout(stdout)
     }
 
-    fn ensure_mutable_uid(&self, uid: u32) -> Result<(), RmuxError> {
-        if uid == 0 || uid == self.owner_uid {
+    fn ensure_mutable_identity(&self, identity: &UserIdentity) -> Result<(), RmuxError> {
+        if *identity == UserIdentity::Uid(0) || *identity == self.owner_identity {
             return Err(RmuxError::Server(
                 "root and the server owner cannot be modified".to_owned(),
             ));
@@ -131,6 +148,14 @@ pub(crate) fn user_name_for_uid(uid: u32) -> String {
         .find(|entry| entry.uid == uid)
         .map(|entry| entry.name)
         .unwrap_or_else(|| uid.to_string())
+}
+
+#[must_use]
+fn user_name_for_identity(identity: &UserIdentity) -> String {
+    match identity {
+        UserIdentity::Uid(uid) => user_name_for_uid(*uid),
+        UserIdentity::Sid(sid) => sid.to_string(),
+    }
 }
 
 pub(crate) fn apply_access_policy(request: Request, can_write: bool) -> Result<Request, RmuxError> {
@@ -255,4 +280,21 @@ fn parse_passwd_entry(line: &str) -> Option<PasswdEntry> {
     let _password = fields.next()?;
     let uid = fields.next()?.parse::<u32>().ok()?;
     Some(PasswdEntry { uid, name })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_store_can_key_owner_by_windows_sid() {
+        let owner = UserIdentity::Sid("S-1-5-21-1000".into());
+        let store = ServerAccessStore::new_for_identity(0, owner.clone());
+
+        assert_eq!(store.mode_for_identity(&owner), Some(AccessMode::ReadWrite));
+        assert_eq!(
+            store.mode_for_identity(&UserIdentity::Sid("S-1-5-21-2000".into())),
+            None
+        );
+    }
 }

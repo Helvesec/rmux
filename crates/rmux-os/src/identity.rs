@@ -15,7 +15,7 @@ use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, 
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// Platform user identity.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum UserIdentity {
     /// Unix user id.
     Uid(u32),

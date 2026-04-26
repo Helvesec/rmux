@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::sync::{Arc, Weak};
 
+use rmux_ipc::PeerIdentity;
 use rmux_proto::{KillServerResponse, Response, RmuxError, TerminalSize, WindowTarget};
 use tokio::sync::{broadcast, Mutex};
 
@@ -289,11 +290,11 @@ impl RequestHandler {
             .expect("shutdown handle mutex must not be poisoned") = Some(shutdown_handle);
     }
 
-    pub(crate) fn access_mode_for_uid(&self, uid: u32) -> Option<AccessMode> {
+    pub(crate) fn access_mode_for_peer(&self, peer: &PeerIdentity) -> Option<AccessMode> {
         self.server_access
             .lock()
             .ok()
-            .and_then(|server_access| server_access.mode_for_uid(uid))
+            .and_then(|server_access| server_access.mode_for_identity(&peer.user))
     }
 
     pub(crate) fn request_shutdown_if_pending(&self) -> bool {
