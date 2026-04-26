@@ -256,7 +256,6 @@ mod tests {
     };
     use std::ffi::OsString;
     use std::fs;
-    use std::os::unix::fs::symlink;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -383,8 +382,11 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn usable_shell_path_rejects_symlink_to_the_current_executable() {
+        use std::os::unix::fs::symlink;
+
         let current_exe = std::env::current_exe().expect("current executable path");
         let dir = unique_test_dir("shell-symlink");
         fs::create_dir_all(&dir).expect("create temp dir");

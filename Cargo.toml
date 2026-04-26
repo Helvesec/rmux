@@ -27,6 +27,7 @@ clap = { version = "4.5.39", features = ["derive"] }
 libc = "0.2"
 rmux-client = { path = "crates/rmux-client" }
 rmux-core = { path = "crates/rmux-core" }
+rmux-os = { path = "crates/rmux-os" }
 rmux-proto = { path = "crates/rmux-proto" }
 # The root binary owns the hidden internal daemon mode, so it links the server
 # and Tokio runtime directly for that top-level re-exec path.

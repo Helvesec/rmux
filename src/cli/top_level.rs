@@ -1,7 +1,7 @@
 use std::ffi::OsString;
-use std::os::unix::ffi::OsStrExt;
 
 use crate::cli_args::Cli;
+use crate::os_string::os_str_bytes;
 
 use super::ExitFailure;
 
@@ -12,7 +12,7 @@ pub(super) fn top_level_parse_failure(args: &[OsString]) -> Option<ExitFailure> 
     let mut index = 0;
 
     while let Some(argument) = args.get(index) {
-        let bytes = argument.as_bytes();
+        let bytes = os_str_bytes(argument);
         if bytes == b"--" {
             return None;
         }
@@ -22,17 +22,17 @@ pub(super) fn top_level_parse_failure(args: &[OsString]) -> Option<ExitFailure> 
         if bytes.starts_with(b"--") {
             return Some(ExitFailure::new(1, RMUX_LONG_OPTION_USAGE));
         }
-        if short_option_cluster_requests_usage(bytes) {
+        if short_option_cluster_requests_usage(&bytes) {
             return Some(ExitFailure::new_stdout(0, RMUX_USAGE));
         }
-        if let Some(flag) = invalid_short_option_in_cluster(bytes) {
+        if let Some(flag) = invalid_short_option_in_cluster(&bytes) {
             let flag = char::from(flag);
             return Some(ExitFailure::new(
                 1,
                 format!("rmux: unknown option -- {flag}\n{RMUX_USAGE}"),
             ));
         }
-        if short_option_consumes_next_argument(bytes) {
+        if short_option_consumes_next_argument(&bytes) {
             index += 1;
         }
 

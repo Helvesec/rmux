@@ -367,6 +367,7 @@ dependencies = [
  "libc",
  "rmux-client",
  "rmux-core",
+ "rmux-os",
  "rmux-proto",
  "rmux-pty",
  "rmux-server",
@@ -403,7 +404,9 @@ name = "rmux-os"
 version = "3.9.2"
 dependencies = [
  "libc",
+ "rmux-types",
  "rustix",
+ "windows-sys",
 ]
 
 [[package]]

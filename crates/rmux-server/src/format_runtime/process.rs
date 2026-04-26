@@ -48,5 +48,5 @@ impl RuntimeFormatContext<'_> {
 }
 
 fn process_foreground_pid(fd: BorrowedFd<'_>) -> Option<u32> {
-    process::foreground_pid(fd)
+    process::unix::foreground_pid(fd)
 }

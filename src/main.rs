@@ -13,12 +13,12 @@
 mod cli;
 mod cli_args;
 mod cli_response;
+mod os_string;
 mod process_locale;
 
 use std::env;
 use std::ffi::OsString;
 use std::io::{self, ErrorKind, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use rmux_client::INTERNAL_DAEMON_FLAG;
@@ -101,7 +101,7 @@ where
     let mut config_cwd = None;
 
     if let Some(first) = args.next() {
-        if first.as_os_str().as_bytes().starts_with(b"--") {
+        if os_string::os_str_bytes(first.as_os_str()).starts_with(b"--") {
             parse_internal_flag(
                 first,
                 &mut args,
@@ -115,7 +115,7 @@ where
     }
 
     while let Some(argument) = args.next() {
-        if !argument.as_os_str().as_bytes().starts_with(b"--") {
+        if !os_string::os_str_bytes(argument.as_os_str()).starts_with(b"--") {
             return Err("unexpected extra arguments for hidden daemon mode".to_owned());
         }
         parse_internal_flag(

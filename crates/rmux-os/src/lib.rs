@@ -7,3 +7,4 @@
 
 pub mod identity;
 pub mod process;
+pub mod terminal;
