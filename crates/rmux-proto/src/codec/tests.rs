@@ -664,7 +664,7 @@ fn decoder_handles_partial_reads() {
 #[test]
 fn decoder_rejects_zero_length_payloads() {
     let mut decoder = FrameDecoder::new();
-    decoder.push_bytes(&0_u32.to_le_bytes());
+    decoder.push_bytes(&test_frame_header(0));
     assert_eq!(
         decoder.next_frame::<Request>(),
         Err(crate::RmuxError::EmptyFrame)
@@ -674,8 +674,7 @@ fn decoder_rejects_zero_length_payloads() {
 #[test]
 fn decoder_rejects_oversized_frames() {
     let mut decoder = FrameDecoder::with_max_frame_length(8);
-    decoder.push_bytes(&16_u32.to_le_bytes());
-    decoder.push_bytes(&[0; 4]);
+    decoder.push_bytes(&test_frame_header(16));
 
     assert_eq!(
         decoder.next_frame::<Request>(),
@@ -688,7 +687,7 @@ fn decoder_rejects_oversized_frames() {
 
 #[test]
 fn decode_frame_rejects_truncated_payloads() {
-    let mut frame = 4_u32.to_le_bytes().to_vec();
+    let mut frame = test_frame_header(4);
     frame.extend_from_slice(&[1, 2]);
 
     assert_eq!(
@@ -717,12 +716,18 @@ fn decode_frame_rejects_trailing_bytes() {
 #[test]
 fn decode_frame_rejects_header_only() {
     assert_eq!(
-        decode_frame::<Request>(&[0, 0]),
+        decode_frame::<Request>(&[crate::RMUX_FRAME_MAGIC, crate::RMUX_WIRE_VERSION as u8]),
         Err(crate::RmuxError::IncompleteFrame {
-            expected: 4,
+            expected: 6,
             received: 2,
         })
     );
+}
+
+fn test_frame_header(length: u32) -> Vec<u8> {
+    let mut frame = vec![crate::RMUX_FRAME_MAGIC, crate::RMUX_WIRE_VERSION as u8];
+    frame.extend_from_slice(&length.to_le_bytes());
+    frame
 }
 
 #[test]

@@ -6,6 +6,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::RmuxError;
+pub use rmux_types::TerminalSize;
 
 #[path = "types/hooks.rs"]
 mod hooks;
@@ -299,15 +300,6 @@ impl fmt::Display for PaneTarget {
             self.session_name, self.window_index, self.pane_index
         )
     }
-}
-
-/// A terminal geometry request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TerminalSize {
-    /// The requested column count.
-    pub cols: u16,
-    /// The requested row count.
-    pub rows: u16,
 }
 
 /// A global-or-session selector used by detached mutations.

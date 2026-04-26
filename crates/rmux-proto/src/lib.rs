@@ -6,6 +6,7 @@
 pub mod attach;
 pub mod codec;
 pub mod control;
+pub mod envelope;
 pub mod error;
 pub mod request;
 pub mod response;
@@ -21,6 +22,7 @@ pub use control::{
     ControlMode, ControlModeRequest, ControlModeResponse, CONTROL_BUFFER_HIGH, CONTROL_BUFFER_LOW,
     CONTROL_CONTROL_END, CONTROL_CONTROL_START, CONTROL_MAXIMUM_AGE_MS, CONTROL_WRITE_MINIMUM,
 };
+pub use envelope::{RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION};
 pub use error::RmuxError;
 pub use request::*;
 pub use response::*;
@@ -28,4 +30,4 @@ pub use types::OptionScopeSelector;
 pub use types::*;
 
 /// Detached request/response protocol revision.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = RMUX_WIRE_VERSION as u16;

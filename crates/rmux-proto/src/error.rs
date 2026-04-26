@@ -49,6 +49,19 @@ pub enum RmuxError {
     /// A codec frame announced an empty payload.
     #[error("codec frame payloads must not be empty")]
     EmptyFrame,
+    /// A frame did not start with the RMUX frame magic byte.
+    #[error("bad RMUX frame magic: expected 0x52, got 0x{0:02x}")]
+    BadFrameMagic(u8),
+    /// A frame used a wire version this build does not support.
+    #[error("unsupported RMUX wire version {got}; supported range is {minimum}..={maximum}")]
+    UnsupportedWireVersion {
+        /// The wire version advertised by the frame.
+        got: u32,
+        /// The minimum supported wire version.
+        minimum: u32,
+        /// The maximum supported wire version.
+        maximum: u32,
+    },
     /// A full frame was requested but the buffer stopped early.
     #[error("incomplete frame: expected {expected} payload bytes, received {received}")]
     IncompleteFrame {
@@ -129,6 +142,19 @@ mod tests {
         assert_eq!(
             RmuxError::EmptyFrame.to_string(),
             "codec frame payloads must not be empty"
+        );
+        assert_eq!(
+            RmuxError::BadFrameMagic(0).to_string(),
+            "bad RMUX frame magic: expected 0x52, got 0x00"
+        );
+        assert_eq!(
+            RmuxError::UnsupportedWireVersion {
+                got: 2,
+                minimum: 1,
+                maximum: 1,
+            }
+            .to_string(),
+            "unsupported RMUX wire version 2; supported range is 1..=1"
         );
         assert_eq!(
             RmuxError::IncompleteFrame {

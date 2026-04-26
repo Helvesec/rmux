@@ -3,12 +3,16 @@
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use crate::envelope::{
+    decode_varint_u32, encode_varint_u32, RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION,
+    SUPPORTED_WIRE_VERSION,
+};
 use crate::RmuxError;
 
 /// Default maximum detached frame payload length in bytes.
 pub const DEFAULT_MAX_FRAME_LENGTH: usize = 1024 * 1024;
 
-/// Encodes a detached message as a length-prefixed bincode frame.
+/// Encodes a detached message as a versioned length-prefixed bincode frame.
 pub fn encode_frame<T>(value: &T) -> Result<Vec<u8>, RmuxError>
 where
     T: Serialize,
@@ -32,7 +36,9 @@ where
         maximum: u32::MAX as usize,
     })?;
 
-    let mut frame = Vec::with_capacity(4 + payload.len());
+    let mut frame = Vec::with_capacity(1 + 5 + 4 + payload.len());
+    frame.push(RMUX_FRAME_MAGIC);
+    encode_varint_u32(RMUX_WIRE_VERSION, &mut frame);
     frame.extend_from_slice(&frame_length.to_le_bytes());
     frame.extend_from_slice(&payload);
     Ok(frame)
@@ -43,14 +49,32 @@ pub fn decode_frame<T>(frame: &[u8]) -> Result<T, RmuxError>
 where
     T: DeserializeOwned,
 {
-    if frame.len() < 4 {
+    if frame.is_empty() {
         return Err(RmuxError::IncompleteFrame {
-            expected: 4,
+            expected: 1,
+            received: frame.len(),
+        });
+    }
+    if frame[0] != RMUX_FRAME_MAGIC {
+        return Err(RmuxError::BadFrameMagic(frame[0]));
+    }
+
+    let Some((version, version_len)) = decode_varint_u32(&frame[1..])? else {
+        return Err(RmuxError::IncompleteFrame {
+            expected: 2,
+            received: frame.len(),
+        });
+    };
+    ensure_supported_version(version)?;
+    let header_start = 1 + version_len;
+    if frame.len() < header_start + 4 {
+        return Err(RmuxError::IncompleteFrame {
+            expected: header_start + 4,
             received: frame.len(),
         });
     }
 
-    let length = frame_length(frame)?;
+    let length = frame_length(&frame[header_start..])?;
     if length == 0 {
         return Err(RmuxError::EmptyFrame);
     }
@@ -62,11 +86,11 @@ where
         });
     }
 
-    let required = 4 + length;
+    let required = header_start + 4 + length;
     if frame.len() < required {
         return Err(RmuxError::IncompleteFrame {
             expected: length,
-            received: frame.len() - 4,
+            received: frame.len() - header_start - 4,
         });
     }
 
@@ -76,7 +100,7 @@ where
         ));
     }
 
-    decode_payload(&frame[4..required])
+    decode_payload(&frame[header_start + 4..required])
 }
 
 /// Incremental detached frame decoder for partial socket reads.
@@ -112,13 +136,26 @@ impl FrameDecoder {
     where
         T: DeserializeOwned,
     {
-        if self.buffer.len() < 4 {
+        if self.buffer.is_empty() {
+            return Ok(None);
+        }
+        if self.buffer[0] != RMUX_FRAME_MAGIC {
+            let magic = self.buffer[0];
+            self.buffer.clear();
+            return Err(RmuxError::BadFrameMagic(magic));
+        }
+        let Some((version, version_len)) = decode_varint_u32(&self.buffer[1..])? else {
+            return Ok(None);
+        };
+        ensure_supported_version(version)?;
+        let header_start = 1 + version_len;
+        if self.buffer.len() < header_start + 4 {
             return Ok(None);
         }
 
-        let length = frame_length(&self.buffer)?;
+        let length = frame_length(&self.buffer[header_start..])?;
         if length == 0 {
-            self.buffer.drain(..4);
+            self.buffer.drain(..header_start + 4);
             return Err(RmuxError::EmptyFrame);
         }
 
@@ -130,13 +167,13 @@ impl FrameDecoder {
             });
         }
 
-        let required = 4 + length;
+        let required = header_start + 4 + length;
         if self.buffer.len() < required {
             return Ok(None);
         }
 
         let frame: Vec<u8> = self.buffer.drain(..required).collect();
-        decode_payload(&frame[4..])
+        decode_payload(&frame[header_start + 4..])
             .map(Some)
             .map_err(|error| match error {
                 RmuxError::Decode(_) => {
@@ -153,6 +190,18 @@ impl FrameDecoder {
     pub fn remaining_bytes(&self) -> &[u8] {
         &self.buffer
     }
+}
+
+fn ensure_supported_version(version: u32) -> Result<(), RmuxError> {
+    if SUPPORTED_WIRE_VERSION.contains(&version) {
+        return Ok(());
+    }
+
+    Err(RmuxError::UnsupportedWireVersion {
+        got: version,
+        minimum: *SUPPORTED_WIRE_VERSION.start(),
+        maximum: *SUPPORTED_WIRE_VERSION.end(),
+    })
 }
 
 impl Default for FrameDecoder {

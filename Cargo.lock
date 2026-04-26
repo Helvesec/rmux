@@ -411,6 +411,7 @@ name = "rmux-proto"
 version = "3.9.2"
 dependencies = [
  "bincode",
+ "rmux-types",
  "serde",
  "thiserror",
 ]
@@ -437,6 +438,13 @@ dependencies = [
  "rustix",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "rmux-types"
+version = "3.9.2"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

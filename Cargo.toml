@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "crates/rmux-types",
     "crates/rmux-proto",
     "crates/rmux-pty",
     "crates/rmux-os",
