@@ -63,7 +63,8 @@ mod renderer;
 mod server_access;
 #[cfg(unix)]
 mod terminal;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+#[cfg_attr(windows, allow(dead_code))]
 mod wait_for;
 #[cfg(windows)]
 mod windows_runtime;
