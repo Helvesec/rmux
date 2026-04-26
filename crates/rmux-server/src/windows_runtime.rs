@@ -3,7 +3,10 @@
 use std::io;
 
 use rmux_ipc::{LocalListener, LocalStream};
-use rmux_proto::{encode_frame, ErrorResponse, FrameDecoder, Request, Response, RmuxError};
+use rmux_proto::{
+    encode_frame, CommandOutput, ErrorResponse, FrameDecoder, ListClientsResponse,
+    ListPanesResponse, ListSessionsResponse, ListWindowsResponse, Request, Response, RmuxError,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::oneshot;
 use tokio::task::{JoinError, JoinSet};
@@ -61,8 +64,26 @@ async fn serve_connection(stream: LocalStream, shutdown_handle: ShutdownHandle) 
 fn dispatch_minimal_windows_request(request: Request) -> Response {
     match request {
         Request::KillServer(_) => Response::KillServer(rmux_proto::KillServerResponse),
+        Request::ListSessions(_) => Response::ListSessions(ListSessionsResponse {
+            output: empty_output(),
+        }),
+        Request::ListWindows(_) => Response::ListWindows(ListWindowsResponse {
+            windows: Vec::new(),
+            output: empty_output(),
+        }),
+        Request::ListPanes(_) => Response::ListPanes(ListPanesResponse {
+            output: empty_output(),
+        }),
+        Request::ListClients(_) => Response::ListClients(ListClientsResponse {
+            output: empty_output(),
+            match_count: 0,
+        }),
         _ => unsupported_response(),
     }
+}
+
+fn empty_output() -> CommandOutput {
+    CommandOutput::from_stdout(Vec::new())
 }
 
 fn unsupported_response() -> Response {

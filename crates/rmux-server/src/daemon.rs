@@ -592,8 +592,9 @@ mod tests {
 mod tests {
     use super::{DaemonConfig, ServerDaemon};
     use rmux_proto::{
-        encode_frame, ErrorResponse, FrameDecoder, KillServerRequest, ListSessionsRequest, Request,
-        Response, RmuxError,
+        encode_frame, ErrorResponse, FrameDecoder, KillServerRequest, ListClientsRequest,
+        ListPanesRequest, ListSessionsRequest, ListWindowsRequest, LockServerRequest, Request,
+        Response, RmuxError, SessionName,
     };
     use std::io::{self, Read, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -611,12 +612,7 @@ mod tests {
 
         let response = tokio::task::spawn_blocking(move || {
             let mut stream = rmux_ipc::connect_blocking(&endpoint, Duration::from_secs(5))?;
-            let request = Request::ListSessions(ListSessionsRequest {
-                format: None,
-                filter: None,
-                sort_order: None,
-                reversed: false,
-            });
+            let request = Request::LockServer(LockServerRequest);
             let frame = encode_frame(&request).map_err(io::Error::other)?;
             stream.write_all(&frame)?;
             read_response(&mut stream)
@@ -656,9 +652,77 @@ mod tests {
         handle.wait().await
     }
 
+    #[tokio::test]
+    async fn windows_daemon_empty_listing_requests_succeed() -> io::Result<()> {
+        let endpoint = unique_endpoint()?;
+        let socket_path = endpoint.clone().into_path();
+        let handle = ServerDaemon::new(DaemonConfig::new(socket_path))
+            .bind()
+            .await?;
+
+        let responses = tokio::task::spawn_blocking(move || {
+            let requests = vec![
+                Request::ListSessions(ListSessionsRequest {
+                    format: None,
+                    filter: None,
+                    sort_order: None,
+                    reversed: false,
+                }),
+                Request::ListWindows(ListWindowsRequest {
+                    target: SessionName::new("alpha").expect("valid session"),
+                    format: None,
+                }),
+                Request::ListPanes(ListPanesRequest {
+                    target: SessionName::new("alpha").expect("valid session"),
+                    target_window_index: None,
+                    format: None,
+                }),
+                Request::ListClients(ListClientsRequest {
+                    format: None,
+                    filter: None,
+                    sort_order: None,
+                    reversed: false,
+                    target_session: None,
+                }),
+            ];
+
+            requests
+                .into_iter()
+                .map(|request| roundtrip(&endpoint, request))
+                .collect::<io::Result<Vec<_>>>()
+        })
+        .await
+        .map_err(io::Error::other)??;
+
+        for response in responses {
+            match response {
+                Response::ListSessions(response) => assert!(response.output.stdout().is_empty()),
+                Response::ListWindows(response) => {
+                    assert!(response.windows.is_empty());
+                    assert!(response.output.stdout().is_empty());
+                }
+                Response::ListPanes(response) => assert!(response.output.stdout().is_empty()),
+                Response::ListClients(response) => {
+                    assert_eq!(response.match_count, 0);
+                    assert!(response.output.stdout().is_empty());
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+
+        handle.shutdown().await
+    }
+
     fn unique_endpoint() -> io::Result<rmux_ipc::LocalEndpoint> {
         let unique_id = UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
         rmux_ipc::endpoint_for_label(format!("server-windows-{}-{unique_id}", std::process::id()))
+    }
+
+    fn roundtrip(endpoint: &rmux_ipc::LocalEndpoint, request: Request) -> io::Result<Response> {
+        let mut stream = rmux_ipc::connect_blocking(endpoint, Duration::from_secs(5))?;
+        let frame = encode_frame(&request).map_err(io::Error::other)?;
+        stream.write_all(&frame)?;
+        read_response(&mut stream)
     }
 
     fn read_response(stream: &mut rmux_ipc::BlockingLocalStream) -> io::Result<Response> {
