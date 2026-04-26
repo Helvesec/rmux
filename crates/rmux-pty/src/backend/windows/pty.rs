@@ -10,6 +10,7 @@ use windows_sys::Win32::System::Console::{
 use crate::{Result, TerminalSize};
 
 use super::io::create_pipe;
+use super::DsrBootstrap;
 
 #[derive(Debug)]
 pub(crate) struct WindowsPty {
@@ -17,6 +18,7 @@ pub(crate) struct WindowsPty {
     input_write: OwnedHandle,
     output_read: OwnedHandle,
     size: Mutex<TerminalSize>,
+    dsr_bootstrap: Mutex<Option<DsrBootstrap>>,
 }
 
 impl WindowsPty {
@@ -25,11 +27,35 @@ impl WindowsPty {
     }
 
     pub(crate) fn read(&self, buffer: &mut [u8]) -> io::Result<usize> {
-        super::io::read(&self.output_read, buffer)
+        let bytes_read = super::io::read(&self.output_read, buffer)?;
+        let mut dsr_bootstrap = self
+            .dsr_bootstrap
+            .lock()
+            .map_err(|_| io::Error::other("ConPTY DSR mutex poisoned"))?;
+        let Some(dsr) = dsr_bootstrap.as_mut() else {
+            return Ok(bytes_read);
+        };
+
+        let filtered = dsr.filter(&mut buffer[..bytes_read]);
+        let len = filtered.bytes.len();
+        if let Some(response) = filtered.response {
+            super::io::write_all(&self.input_write, response)?;
+            *dsr_bootstrap = None;
+        }
+        Ok(len)
     }
 
     pub(crate) fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
         super::io::write_all(&self.input_write, bytes)
+    }
+
+    pub(crate) fn enable_dsr_bootstrap(&self) -> io::Result<()> {
+        let mut dsr = self
+            .dsr_bootstrap
+            .lock()
+            .map_err(|_| io::Error::other("ConPTY DSR mutex poisoned"))?;
+        *dsr = Some(DsrBootstrap::from_env());
+        Ok(())
     }
 }
 
@@ -49,6 +75,7 @@ pub(crate) fn open_pty_pair(size: TerminalSize) -> Result<WindowsPty> {
         input_write: input.write,
         output_read: output.read,
         size: Mutex::new(size),
+        dsr_bootstrap: Mutex::new(None),
     })
 }
 

@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::{ChildCommand, ProcessId, Result, Signal};
 
-use super::WindowsPty;
+use super::{should_enable_dsr_bootstrap, WindowsPty};
 
 #[derive(Debug)]
 pub(crate) struct WindowsChild {
@@ -47,6 +47,10 @@ impl WindowsChild {
 }
 
 pub(crate) fn spawn_child(command: ChildCommand, pty: Arc<WindowsPty>) -> Result<WindowsChild> {
+    if should_enable_dsr_bootstrap(&command.program) {
+        pty.enable_dsr_bootstrap()?;
+    }
+
     let job = JobObjectGuard::new()?;
     let process = create_suspended_process(&command, &pty, 0)?;
 
