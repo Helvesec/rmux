@@ -1,21 +1,30 @@
+#[cfg(unix)]
 use std::fs;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+#[cfg(unix)]
 use tracing::debug;
 
-use rmux_ipc::{LocalEndpoint, LocalListener};
+use rmux_ipc::LocalEndpoint;
+#[cfg(unix)]
+use rmux_ipc::LocalListener;
 
+#[cfg(unix)]
 use crate::listener;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 const FALLBACK_SOCKET_ROOT: &str = "/tmp";
+#[cfg(unix)]
 const RMUX_SOCK_PERM: u32 = 0o007;
+#[cfg(unix)]
 const SOCKET_DIR_PREFIX: &str = "rmux";
 
 /// Computes the default RMUX daemon socket path.
@@ -26,7 +35,7 @@ pub fn default_socket_path() -> io::Result<PathBuf> {
     rmux_ipc::default_endpoint().map(LocalEndpoint::into_path)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn socket_root_from_env(tmpdir: Option<&std::ffi::OsStr>) -> io::Result<PathBuf> {
     let tmpdir = tmpdir
         .filter(|value| !value.is_empty())
@@ -68,7 +77,7 @@ impl DaemonConfig {
         Ok(Self::new(default_socket_path()?))
     }
 
-    /// Returns the configured Unix socket path.
+    /// Returns the configured local IPC endpoint path.
     #[must_use]
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
@@ -169,6 +178,7 @@ pub(crate) struct ShutdownHandle {
 }
 
 impl ShutdownHandle {
+    #[cfg(unix)]
     pub(crate) fn new() -> (Self, oneshot::Receiver<()>) {
         let (sender, receiver) = oneshot::channel();
         (
@@ -193,29 +203,41 @@ impl ServerDaemon {
         Self { config }
     }
 
-    /// Binds the Unix socket, starts accepting requests, and returns a handle.
+    /// Binds the local IPC endpoint, starts accepting requests, and returns a handle.
     pub async fn bind(self) -> io::Result<ServerHandle> {
-        prepare_socket_path(self.config.socket_path())?;
-        let endpoint = LocalEndpoint::from_path(self.config.socket_path().to_path_buf());
-        let listener = LocalListener::bind(&endpoint)?;
-        let (shutdown_handle, shutdown_receiver) = ShutdownHandle::new();
-        let socket_path = self.config.socket_path().to_path_buf();
-        let owner_uid = real_user_id()?;
+        #[cfg(unix)]
+        {
+            prepare_socket_path(self.config.socket_path())?;
+            let endpoint = LocalEndpoint::from_path(self.config.socket_path().to_path_buf());
+            let listener = LocalListener::bind(&endpoint)?;
+            let (shutdown_handle, shutdown_receiver) = ShutdownHandle::new();
+            let socket_path = self.config.socket_path().to_path_buf();
+            let owner_uid = real_user_id()?;
 
-        let task = tokio::spawn(listener::serve(
-            listener,
-            socket_path.clone(),
-            shutdown_handle.clone(),
-            shutdown_receiver,
-            self.config.config_load().clone(),
-            owner_uid,
-        ));
+            let task = tokio::spawn(listener::serve(
+                listener,
+                socket_path.clone(),
+                shutdown_handle.clone(),
+                shutdown_receiver,
+                self.config.config_load().clone(),
+                owner_uid,
+            ));
 
-        Ok(ServerHandle {
-            socket_path,
-            shutdown_handle,
-            task: Some(task),
-        })
+            Ok(ServerHandle {
+                socket_path,
+                shutdown_handle,
+                task: Some(task),
+            })
+        }
+
+        #[cfg(windows)]
+        {
+            let _ = self;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "rmux-server runtime is not enabled on Windows yet",
+            ))
+        }
     }
 }
 
@@ -228,7 +250,7 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
-    /// Returns the bound Unix socket path for the running daemon.
+    /// Returns the bound local IPC endpoint path for the running daemon.
     #[must_use]
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
@@ -265,6 +287,7 @@ impl Drop for ServerHandle {
     }
 }
 
+#[cfg(unix)]
 fn prepare_socket_path(socket_path: &Path) -> io::Result<()> {
     let parent = socket_path.parent().ok_or_else(|| {
         io::Error::new(
@@ -280,6 +303,7 @@ fn prepare_socket_path(socket_path: &Path) -> io::Result<()> {
     remove_stale_socket_if_needed(socket_path)
 }
 
+#[cfg(unix)]
 fn ensure_parent_directory(parent: &Path) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
@@ -305,6 +329,7 @@ fn ensure_parent_directory(parent: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn ensure_directory(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.is_dir() {
@@ -317,6 +342,7 @@ fn ensure_directory(path: &Path) -> io::Result<()> {
     ))
 }
 
+#[cfg(unix)]
 fn managed_rmux_socket_directory(path: &Path) -> io::Result<Option<PathBuf>> {
     let expected = format!("{SOCKET_DIR_PREFIX}-{}", real_user_id()?);
     Ok(path.ancestors().find_map(|ancestor| {
@@ -328,6 +354,7 @@ fn managed_rmux_socket_directory(path: &Path) -> io::Result<Option<PathBuf>> {
     }))
 }
 
+#[cfg(unix)]
 fn ensure_safe_rmux_socket_directory(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir() {
@@ -348,6 +375,7 @@ fn ensure_safe_rmux_socket_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn remove_stale_socket_if_needed(socket_path: &Path) -> io::Result<()> {
     let metadata = match fs::symlink_metadata(socket_path) {
         Ok(metadata) => metadata,
@@ -385,6 +413,7 @@ fn remove_stale_socket_if_needed(socket_path: &Path) -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn indicates_stale_socket(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -392,10 +421,12 @@ fn indicates_stale_socket(error: &io::Error) -> bool {
     )
 }
 
+#[cfg(unix)]
 pub(crate) fn real_user_id() -> io::Result<u32> {
     Ok(rmux_os::identity::real_user_id())
 }
 
+#[cfg(unix)]
 #[cfg(test)]
 mod tests {
     use super::{

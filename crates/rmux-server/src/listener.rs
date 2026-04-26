@@ -1,10 +1,12 @@
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rmux_ipc::{LocalListener, LocalStream, PeerIdentity};
 use rmux_proto::{encode_frame, ErrorResponse, FrameDecoder, Request, Response};
+#[cfg(unix)]
 use rustix::net::RecvFlags;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, watch};
@@ -220,6 +222,11 @@ async fn serve_connection(
 }
 
 async fn wait_for_peer_close(stream: &LocalStream) -> io::Result<()> {
+    wait_for_peer_close_impl(stream).await
+}
+
+#[cfg(unix)]
+async fn wait_for_peer_close_impl(stream: &LocalStream) -> io::Result<()> {
     loop {
         if let Err(error) = stream.readable().await {
             if is_peer_disconnect(&error) {
@@ -237,6 +244,11 @@ async fn wait_for_peer_close(stream: &LocalStream) -> io::Result<()> {
             Err(error) => return Err(io::Error::from(error)),
         }
     }
+}
+
+#[cfg(windows)]
+async fn wait_for_peer_close_impl(_stream: &LocalStream) -> io::Result<()> {
+    std::future::pending().await
 }
 
 fn is_peer_disconnect(error: &io::Error) -> bool {
@@ -301,22 +313,36 @@ impl Connection {
     }
 }
 
+#[cfg(unix)]
 struct SocketCleanup {
     socket_path: PathBuf,
 }
 
+#[cfg(unix)]
 impl SocketCleanup {
     fn new(socket_path: PathBuf) -> Self {
         Self { socket_path }
     }
 }
 
+#[cfg(unix)]
 impl Drop for SocketCleanup {
     fn drop(&mut self) {
         let _ = remove_socket_file_if_present(&self.socket_path);
     }
 }
 
+#[cfg(windows)]
+struct SocketCleanup;
+
+#[cfg(windows)]
+impl SocketCleanup {
+    fn new(_socket_path: PathBuf) -> Self {
+        Self
+    }
+}
+
+#[cfg(unix)]
 fn remove_socket_file_if_present(path: &Path) -> io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(path),

@@ -3,30 +3,54 @@
 
 //! Tokio-based detached RPC server for RMUX.
 
+#[cfg(unix)]
 mod clock_mode;
+#[cfg(unix)]
 mod control;
+#[cfg(unix)]
 mod control_notifications;
+#[cfg(unix)]
 mod copy_mode;
 mod daemon;
+#[cfg(unix)]
 mod format_runtime;
+#[cfg(unix)]
 mod handler;
+#[cfg(unix)]
 mod handler_support;
+#[cfg(unix)]
 mod hook_compat;
+#[cfg(unix)]
 mod hook_runtime;
+#[cfg(unix)]
 mod input_keys;
+#[cfg(unix)]
 mod key_table;
+#[cfg(unix)]
 mod keys;
+#[cfg(unix)]
 mod listener;
+#[cfg(unix)]
 mod mouse;
+#[cfg(unix)]
 mod outer_terminal;
+#[cfg(unix)]
 mod pane_io;
+#[cfg(unix)]
 mod pane_terminal_lookup;
+#[cfg(unix)]
 mod pane_terminal_process;
+#[cfg(unix)]
 mod pane_terminals;
+#[cfg(unix)]
 mod pane_transcript;
+#[cfg(unix)]
 mod renderer;
+#[cfg(unix)]
 mod server_access;
+#[cfg(unix)]
 mod terminal;
+#[cfg(unix)]
 mod wait_for;
 
 pub use daemon::{
