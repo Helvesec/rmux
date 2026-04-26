@@ -51,6 +51,18 @@ fn conpty_force_kill_reaps_child() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[test]
+fn conpty_resize_after_child_exit_is_not_fatal() -> Result<(), Box<dyn std::error::Error>> {
+    let mut spawned = ChildCommand::new("C:\\Windows\\System32\\cmd.exe")
+        .args(["/C", "exit 0"])
+        .size(TerminalSize::new(80, 24))
+        .spawn()?;
+
+    assert!(spawned.child_mut().wait()?.success());
+    spawned.master().resize(TerminalSize::new(90, 25))?;
+    Ok(())
+}
+
 fn read_until(
     master: &PtyMaster,
     needle: &[u8],

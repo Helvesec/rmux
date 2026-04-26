@@ -2,7 +2,7 @@ use std::io;
 use std::os::windows::io::{AsRawHandle, OwnedHandle};
 use std::sync::Mutex;
 
-use windows_sys::Win32::Foundation::{GetLastError, HANDLE, S_OK};
+use windows_sys::Win32::Foundation::{GetLastError, E_HANDLE, ERROR_BROKEN_PIPE, HANDLE, S_OK};
 use windows_sys::Win32::System::Console::{
     ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
 };
@@ -64,6 +64,9 @@ pub(crate) fn apply_size(pty: &WindowsPty, size: TerminalSize) -> Result<()> {
     let coord = coord_from_size(size)?;
     let hr = unsafe { ResizePseudoConsole(pty.hpc.raw(), coord) };
     if hr != S_OK {
+        if is_benign_resize_after_exit(hr) {
+            return Ok(());
+        }
         return Err(hresult_error(hr).into());
     }
 
@@ -119,6 +122,18 @@ impl Drop for OwnedHpcon {
 
 fn hresult_error(hr: i32) -> io::Error {
     io::Error::from_raw_os_error(hr)
+}
+
+fn is_benign_resize_after_exit(hr: i32) -> bool {
+    hr == E_HANDLE || hr == hresult_from_win32(ERROR_BROKEN_PIPE)
+}
+
+fn hresult_from_win32(error: u32) -> i32 {
+    if error == 0 {
+        error as i32
+    } else {
+        ((error & 0x0000_FFFF) | 0x8007_0000) as i32
+    }
 }
 
 #[allow(dead_code)]
