@@ -60,6 +60,12 @@ impl WindowsPty {
 }
 
 pub(crate) fn open_pty_pair(size: TerminalSize) -> Result<WindowsPty> {
+    tracing::debug!(
+        target: "rmux::conpty",
+        cols = size.cols,
+        rows = size.rows,
+        "creating ConPTY"
+    );
     let input = create_pipe(64 * 1024)?;
     let output = create_pipe(64 * 1024)?;
     let hpc = create_pseudo_console(
@@ -69,6 +75,12 @@ pub(crate) fn open_pty_pair(size: TerminalSize) -> Result<WindowsPty> {
     )?;
     drop(input.read);
     drop(output.write);
+    tracing::debug!(
+        target: "rmux::conpty",
+        cols = size.cols,
+        rows = size.rows,
+        "ConPTY created"
+    );
 
     Ok(WindowsPty {
         hpc,
@@ -88,12 +100,28 @@ pub(crate) fn query_size(pty: &WindowsPty) -> Result<TerminalSize> {
 }
 
 pub(crate) fn apply_size(pty: &WindowsPty, size: TerminalSize) -> Result<()> {
+    tracing::trace!(
+        target: "rmux::conpty",
+        cols = size.cols,
+        rows = size.rows,
+        "resizing ConPTY"
+    );
     let coord = coord_from_size(size)?;
     let hr = unsafe { ResizePseudoConsole(pty.hpc.raw(), coord) };
     if hr != S_OK {
         if is_benign_resize_after_exit(hr) {
+            tracing::debug!(
+                target: "rmux::conpty",
+                hresult = hr,
+                "ignoring ConPTY resize after child exit"
+            );
             return Ok(());
         }
+        tracing::warn!(
+            target: "rmux::conpty",
+            hresult = hr,
+            "ConPTY resize failed"
+        );
         return Err(hresult_error(hr).into());
     }
 
@@ -109,6 +137,11 @@ fn create_pseudo_console(size: TerminalSize, input: HANDLE, output: HANDLE) -> R
     let mut hpc = 0_isize;
     let hr = unsafe { CreatePseudoConsole(coord_from_size(size)?, input, output, 0, &mut hpc) };
     if hr != S_OK {
+        tracing::warn!(
+            target: "rmux::conpty",
+            hresult = hr,
+            "CreatePseudoConsole failed"
+        );
         return Err(hresult_error(hr).into());
     }
     Ok(OwnedHpcon(hpc))
@@ -142,6 +175,7 @@ impl OwnedHpcon {
 impl Drop for OwnedHpcon {
     fn drop(&mut self) {
         if self.0 != 0 {
+            tracing::trace!(target: "rmux::conpty", "closing ConPTY");
             unsafe { ClosePseudoConsole(self.0) };
         }
     }

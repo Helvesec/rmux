@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 rmux-types = { path = "../rmux-types" }
+tracing = "0.1.44"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.185"

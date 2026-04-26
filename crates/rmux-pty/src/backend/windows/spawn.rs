@@ -47,6 +47,10 @@ impl WindowsChild {
 
 pub(crate) fn spawn_child(command: ChildCommand, pty: Arc<WindowsPty>) -> Result<WindowsChild> {
     if should_enable_dsr_bootstrap(&command.program) {
+        tracing::debug!(
+            target: "rmux::conpty",
+            "enabling one-shot DSR bootstrap for PowerShell child"
+        );
         pty.enable_dsr_bootstrap()?;
     }
 
@@ -56,6 +60,10 @@ pub(crate) fn spawn_child(command: ChildCommand, pty: Arc<WindowsPty>) -> Result
     match job.assign(&process.process) {
         Ok(()) => resume_as_child(process, Some(job), pty),
         Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+            tracing::debug!(
+                target: "rmux::conpty",
+                "job assignment denied; retrying child with breakaway flag"
+            );
             let _ = terminate_process(&process.process, 1);
             spawn_child_breakaway(command, pty)
         }
@@ -72,6 +80,10 @@ fn spawn_child_breakaway(command: ChildCommand, pty: Arc<WindowsPty>) -> Result<
         Ok(process) => match job.assign(&process.process) {
             Ok(()) => resume_as_child(process, Some(job), pty),
             Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+                tracing::warn!(
+                    target: "rmux::conpty",
+                    "breakaway job assignment denied; falling back to direct process cleanup"
+                );
                 resume_as_child(process, None, pty)
             }
             Err(error) => {
@@ -80,6 +92,10 @@ fn spawn_child_breakaway(command: ChildCommand, pty: Arc<WindowsPty>) -> Result<
             }
         },
         Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+            tracing::warn!(
+                target: "rmux::conpty",
+                "breakaway process creation denied; falling back to direct process cleanup"
+            );
             let process = create_suspended_process(&command, &pty, 0)?;
             resume_as_child(process, None, pty)
         }
@@ -151,6 +167,12 @@ fn resume_as_child(
     }
 
     let pid = ProcessId::new(process.pid)?;
+    tracing::debug!(
+        target: "rmux::conpty",
+        pid = pid.as_u32(),
+        job_guarded = job.is_some(),
+        "resumed ConPTY child"
+    );
     Ok(WindowsChild {
         process: process.process,
         thread: process.thread,
