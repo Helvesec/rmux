@@ -7,6 +7,8 @@ use std::io;
 #[cfg(windows)]
 use std::io::Read;
 #[cfg(windows)]
+use std::io::Write;
+#[cfg(windows)]
 use std::mem::size_of;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
@@ -46,6 +48,10 @@ fn main() {
 #[cfg(windows)]
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> io::Result<()> {
+    if let Some(bytes) = emit_payload_arg() {
+        return emit_payload(bytes);
+    }
+
     let args = Args::parse();
     match args.mode {
         Mode::TokioNamedPipe => run_tokio_named_pipe(args).await,
@@ -59,7 +65,8 @@ async fn main() -> io::Result<()> {
 async fn run_tokio_named_pipe(args: Args) -> io::Result<()> {
     let before_handles = current_process_handle_count()?;
     let started = Instant::now();
-    let mut conpty = TokioNamedPipeConpty::spawn(args.cols, args.rows, args.lines).await?;
+    let mut conpty =
+        TokioNamedPipeConpty::spawn(args.cols, args.rows, args.lines, args.payload_bytes).await?;
     let launch_elapsed = started.elapsed();
 
     let mut first_byte_latency = None;
@@ -94,8 +101,7 @@ async fn run_tokio_named_pipe(args: Args) -> io::Result<()> {
 
     println!("rmux ConPTY spike");
     println!("  mode: tokio-named-pipe-overlapped");
-    println!("  command: cmd.exe");
-    println!("  lines requested: {}", args.lines);
+    print_payload(&args);
     println!("  exit code: {}", status);
     println!("  launch_ms: {:.3}", millis(launch_elapsed));
     println!(
@@ -122,7 +128,12 @@ async fn run_tokio_named_pipe(args: Args) -> io::Result<()> {
 async fn run_blocking_anonymous_pipe(args: Args) -> io::Result<()> {
     let before_handles = current_process_handle_count()?;
     let started = Instant::now();
-    let mut conpty = BlockingAnonymousPipeConpty::spawn(args.cols, args.rows, args.lines)?;
+    let mut conpty = BlockingAnonymousPipeConpty::spawn(
+        args.cols,
+        args.rows,
+        args.lines,
+        args.payload_bytes,
+    )?;
     let launch_elapsed = started.elapsed();
 
     let read_started = Instant::now();
@@ -148,8 +159,7 @@ async fn run_blocking_anonymous_pipe(args: Args) -> io::Result<()> {
 
     println!("rmux ConPTY spike");
     println!("  mode: blocking-anonymous-pipe");
-    println!("  command: cmd.exe");
-    println!("  lines requested: {}", args.lines);
+    print_payload(&args);
     println!("  exit code: {}", status);
     println!("  launch_ms: {:.3}", millis(launch_elapsed));
     println!(
@@ -186,7 +196,8 @@ fn run_plain_startupinfoex(args: Args) -> io::Result<()> {
 fn run_process_control(mode: &str, args: Args, extended_startup: bool) -> io::Result<()> {
     let before_handles = current_process_handle_count()?;
     let started = Instant::now();
-    let (process, _thread) = spawn_cmd_control(args.lines, extended_startup)?;
+    let (process, _thread) =
+        spawn_cmd_control(args.lines, args.payload_bytes, extended_startup)?;
     let launch_elapsed = started.elapsed();
     let status = wait_for_process(&process)?;
     drop(process);
@@ -194,8 +205,7 @@ fn run_process_control(mode: &str, args: Args, extended_startup: bool) -> io::Re
 
     println!("rmux ConPTY spike");
     println!("  mode: {mode}");
-    println!("  command: cmd.exe");
-    println!("  lines requested: {}", args.lines);
+    print_payload(&args);
     println!("  exit code: {}", status);
     println!("  launch_ms: {:.3}", millis(launch_elapsed));
     println!(
@@ -211,6 +221,7 @@ fn run_process_control(mode: &str, args: Args, extended_startup: bool) -> io::Re
 struct Args {
     mode: Mode,
     lines: u32,
+    payload_bytes: Option<usize>,
     cols: i16,
     rows: i16,
 }
@@ -229,6 +240,7 @@ impl Args {
     fn parse() -> Self {
         let mut mode = Mode::TokioNamedPipe;
         let mut lines = 10_000;
+        let mut payload_bytes = None;
         let mut cols = 120;
         let mut rows = 40;
         let mut args = std::env::args().skip(1);
@@ -237,6 +249,7 @@ impl Args {
             match arg.as_str() {
                 "--mode" => mode = parse_mode(&mut args),
                 "--lines" => lines = parse_next(&mut args, "--lines"),
+                "--payload-bytes" => payload_bytes = Some(parse_next(&mut args, "--payload-bytes")),
                 "--cols" => cols = parse_next(&mut args, "--cols"),
                 "--rows" => rows = parse_next(&mut args, "--rows"),
                 "--help" | "-h" => {
@@ -254,6 +267,7 @@ impl Args {
         Self {
             mode,
             lines,
+            payload_bytes,
             cols,
             rows,
         }
@@ -270,17 +284,18 @@ struct TokioNamedPipeConpty {
     #[allow(dead_code)]
     thread: OwnedHandle,
     #[allow(dead_code)]
-    input_server: NamedPipeServer,
-    #[allow(dead_code)]
-    output_server: NamedPipeServer,
-    #[allow(dead_code)]
     input: NamedPipeClient,
     output: NamedPipeClient,
 }
 
 #[cfg(windows)]
 impl TokioNamedPipeConpty {
-    async fn spawn(cols: i16, rows: i16, lines: u32) -> io::Result<Self> {
+    async fn spawn(
+        cols: i16,
+        rows: i16,
+        lines: u32,
+        payload_bytes: Option<usize>,
+    ) -> io::Result<Self> {
         let input = anonymous_overlapped_pipe(PipeDirection::ClientToServer)?;
         let output = anonymous_overlapped_pipe(PipeDirection::ServerToClient)?;
         input.server.connect().await?;
@@ -291,14 +306,12 @@ impl TokioNamedPipeConpty {
             output.server.as_raw_handle() as HANDLE,
         )?;
         let mut attributes = AttributeList::with_pseudoconsole(hpc.raw())?;
-        let (process, thread) = spawn_cmd(attributes.as_mut_ptr(), lines)?;
+        let (process, thread) = spawn_child(attributes.as_mut_ptr(), lines, payload_bytes)?;
         Ok(Self {
             hpc,
             attributes,
             process,
             thread,
-            input_server: input.server,
-            output_server: output.server,
             input: input.client,
             output: output.client,
         })
@@ -325,7 +338,12 @@ struct BlockingAnonymousPipeConpty {
 
 #[cfg(windows)]
 impl BlockingAnonymousPipeConpty {
-    fn spawn(cols: i16, rows: i16, lines: u32) -> io::Result<Self> {
+    fn spawn(
+        cols: i16,
+        rows: i16,
+        lines: u32,
+        payload_bytes: Option<usize>,
+    ) -> io::Result<Self> {
         let input = anonymous_blocking_pipe()?;
         let output = anonymous_blocking_pipe()?;
         let hpc = OwnedHpcon::create(
@@ -337,7 +355,7 @@ impl BlockingAnonymousPipeConpty {
         drop(output.write);
 
         let mut attributes = AttributeList::with_pseudoconsole(hpc.raw())?;
-        let (process, thread) = spawn_cmd(attributes.as_mut_ptr(), lines)?;
+        let (process, thread) = spawn_child(attributes.as_mut_ptr(), lines, payload_bytes)?;
         Ok(Self {
             hpc,
             attributes,
@@ -515,9 +533,10 @@ impl Drop for AttributeList {
 }
 
 #[cfg(windows)]
-fn spawn_cmd(
+fn spawn_child(
     attributes: LPPROC_THREAD_ATTRIBUTE_LIST,
     lines: u32,
+    payload_bytes: Option<usize>,
 ) -> io::Result<(OwnedHandle, OwnedHandle)> {
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
@@ -525,14 +544,7 @@ fn spawn_cmd(
     startup.lpAttributeList = attributes;
 
     let mut process_info = PROCESS_INFORMATION::default();
-    let cmd_path = std::env::var_os("COMSPEC")
-        .unwrap_or_else(|| OsString::from("C:\\Windows\\System32\\cmd.exe"));
-    let command = format!(
-        "\"{}\" /C \"echo RMUX_CONPTY_READY&for /L %i in (1,1,{lines}) do @echo rmux-spike-%i\"",
-        cmd_path.to_string_lossy()
-    );
-    let program = wide_null(cmd_path);
-    let mut command_line = wide_null(OsString::from(command));
+    let (program, mut command_line) = child_command(lines, payload_bytes)?;
     let created = unsafe {
         CreateProcessW(
             program.as_ptr(),
@@ -559,6 +571,7 @@ fn spawn_cmd(
 #[cfg(windows)]
 fn spawn_cmd_control(
     lines: u32,
+    payload_bytes: Option<usize>,
     extended_startup: bool,
 ) -> io::Result<(OwnedHandle, OwnedHandle)> {
     let mut startup = STARTUPINFOEXW::default();
@@ -569,14 +582,7 @@ fn spawn_cmd_control(
     };
 
     let mut process_info = PROCESS_INFORMATION::default();
-    let cmd_path = std::env::var_os("COMSPEC")
-        .unwrap_or_else(|| OsString::from("C:\\Windows\\System32\\cmd.exe"));
-    let command = format!(
-        "\"{}\" /C \"echo RMUX_CONPTY_READY&for /L %i in (1,1,{lines}) do @echo rmux-spike-%i\"",
-        cmd_path.to_string_lossy()
-    );
-    let program = wide_null(cmd_path);
-    let mut command_line = wide_null(OsString::from(command));
+    let (program, mut command_line) = child_command(lines, payload_bytes)?;
     let creation_flags = if extended_startup {
         EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT
     } else {
@@ -654,6 +660,65 @@ where
 }
 
 #[cfg(windows)]
+fn emit_payload_arg() -> Option<usize> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--emit-payload" {
+            return Some(parse_next(&mut args, "--emit-payload"));
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn emit_payload(bytes: usize) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(b"RMUX_CONPTY_READY\r\n")?;
+
+    let chunk = vec![b'x'; 64 * 1024];
+    let mut remaining = bytes;
+    while remaining > 0 {
+        let len = remaining.min(chunk.len());
+        stdout.write_all(&chunk[..len])?;
+        remaining -= len;
+    }
+    stdout.write_all(b"\r\n")?;
+    stdout.flush()
+}
+
+#[cfg(windows)]
+fn child_command(
+    lines: u32,
+    payload_bytes: Option<usize>,
+) -> io::Result<(Vec<u16>, Vec<u16>)> {
+    if let Some(bytes) = payload_bytes {
+        let exe = std::env::current_exe()?;
+        let exe = exe.into_os_string();
+        let command = format!("\"{}\" --emit-payload {bytes}", exe.to_string_lossy());
+        return Ok((wide_null(exe), wide_null(OsString::from(command))));
+    }
+
+    let cmd_path = std::env::var_os("COMSPEC")
+        .unwrap_or_else(|| OsString::from("C:\\Windows\\System32\\cmd.exe"));
+    let command = format!(
+        "\"{}\" /C \"echo RMUX_CONPTY_READY&for /L %i in (1,1,{lines}) do @echo rmux-spike-%i\"",
+        cmd_path.to_string_lossy()
+    );
+    Ok((wide_null(cmd_path), wide_null(OsString::from(command))))
+}
+
+#[cfg(windows)]
+fn print_payload(args: &Args) {
+    if let Some(bytes) = args.payload_bytes {
+        println!("  command: conpty_spike.exe --emit-payload");
+        println!("  payload_bytes requested: {bytes}");
+    } else {
+        println!("  command: cmd.exe");
+        println!("  lines requested: {}", args.lines);
+    }
+}
+
+#[cfg(windows)]
 fn parse_mode(args: &mut impl Iterator<Item = String>) -> Mode {
     let value = args.next().unwrap_or_else(|| {
         eprintln!("missing value for --mode");
@@ -676,7 +741,7 @@ fn parse_mode(args: &mut impl Iterator<Item = String>) -> Mode {
 #[cfg(windows)]
 fn print_usage() {
     eprintln!(
-        "usage: cargo run -p rmux-pty --example conpty_spike -- [--mode MODE] [--lines N] [--cols N] [--rows N]\n\nmodes:\n  tokio-named-pipe-overlapped\n  blocking-anonymous-pipe\n  plain-create-process\n  plain-startupinfoex"
+        "usage: cargo run -p rmux-pty --example conpty_spike -- [--mode MODE] [--lines N] [--payload-bytes N] [--cols N] [--rows N]\n\nmodes:\n  tokio-named-pipe-overlapped\n  blocking-anonymous-pipe\n  plain-create-process\n  plain-startupinfoex"
     );
 }
 
