@@ -7,6 +7,9 @@
 mod clock_mode;
 #[cfg(unix)]
 mod control;
+#[cfg(any(unix, windows))]
+#[cfg_attr(windows, allow(dead_code))]
+mod control_mode;
 #[cfg(unix)]
 mod control_notifications;
 #[cfg(unix)]

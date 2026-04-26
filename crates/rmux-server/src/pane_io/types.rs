@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::control::ControlModeUpgrade;
+use crate::control_mode::ControlModeUpgrade;
 use crate::handler::attach_support::ClientFlags;
 use crate::handler::RequestHandler;
 use crate::outer_terminal::OuterTerminal;

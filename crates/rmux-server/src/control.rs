@@ -7,25 +7,19 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use rmux_ipc::LocalStream;
 use rmux_proto::{
     format_exit_line, format_extended_output_line, format_guard_line, format_output_line,
-    format_pause_line, ControlGuardKind, ControlMode, SessionName, CONTROL_BUFFER_HIGH,
+    format_pause_line, ControlGuardKind, SessionName, CONTROL_BUFFER_HIGH,
 };
 use tokio::io::{AsyncReadExt, WriteHalf};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
+pub(crate) use crate::control_mode::ControlModeUpgrade;
 use crate::daemon::ShutdownHandle;
 use crate::handler::RequestHandler;
-use crate::outer_terminal::OuterTerminalContext;
 
 #[path = "control/output_queue.rs"]
 mod output_queue;
 use output_queue::{ensure_control_newline, flush_output_queue, ControlOutputQueue};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ControlModeUpgrade {
-    pub(crate) mode: ControlMode,
-    pub(crate) terminal_context: OuterTerminalContext,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct ControlClientFlags {
