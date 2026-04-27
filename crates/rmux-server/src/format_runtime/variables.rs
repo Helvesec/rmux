@@ -173,19 +173,10 @@ impl FormatVariables for RuntimeFormatContext<'_> {
                 .or_else(|| self.environment_value_by_name("PWD"))
                 .or_else(|| self.environment_value_by_name("HOME")),
             "pane_current_command" => self.pane_current_command(),
-            "pane_dead" => Some(bool_string(self.pane_exit_metadata().is_some())),
-            "pane_dead_signal" => self
-                .pane_exit_metadata()
-                .and_then(|metadata| metadata.signal.map(|signal| signal.to_string()))
-                .or_else(|| Some(String::new())),
-            "pane_dead_status" => self
-                .pane_exit_metadata()
-                .and_then(|metadata| metadata.status.map(|status| status.to_string()))
-                .or_else(|| Some(String::new())),
-            "pane_dead_time" => self
-                .pane_exit_metadata()
-                .map(|metadata| metadata.time.to_string())
-                .or_else(|| Some(String::new())),
+            "pane_dead" => Some(bool_string(self.pane_dead())),
+            "pane_dead_signal" => self.pane_dead_signal(),
+            "pane_dead_status" => self.pane_dead_status(),
+            "pane_dead_time" => self.pane_dead_time(),
             "pane_flags" => self.pane.map(|pane| {
                 let mut flags = String::new();
                 if self
@@ -207,11 +198,7 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "pane_format" => Some(bool_string(self.pane.is_some())),
             "pane_in_mode" => Some(bool_string(self.pane_in_mode())),
             "pane_marked" => self.pane_marked(),
-            "pane_marked_set" => Some(bool_string(
-                self.state
-                    .and_then(|state| state.marked_pane_target())
-                    .is_some(),
-            )),
+            "pane_marked_set" => Some(bool_string(self.marked_pane_set())),
             "pane_last" => self.pane.map(|pane| {
                 bool_string(
                     self.window
@@ -337,12 +324,7 @@ impl FormatVariables for RuntimeFormatContext<'_> {
                 .and_then(Session::last_attached_at)
                 .map(|timestamp| timestamp.to_string()),
             "session_many_attached" => Some(bool_string(self.session_attached_count() > 1)),
-            "session_marked" => Some(bool_string(self.session_name().is_some_and(
-                |session_name| {
-                    self.state
-                        .is_some_and(|state| state.session_has_marked_pane(session_name))
-                },
-            ))),
+            "session_marked" => Some(bool_string(self.session_marked())),
             "socket_path" => Some(String::new()),
             "start_time" => Some(server_start_time().to_string()),
             "uid" => std::env::var("UID").ok(),
@@ -373,15 +355,7 @@ impl FormatVariables for RuntimeFormatContext<'_> {
                 )
             }),
             "window_format" => Some(bool_string(self.window.is_some() && self.pane.is_none())),
-            "window_marked_flag" => Some(bool_string(
-                self.session_name().zip(self.window_index).is_some_and(
-                    |(session_name, window_index)| {
-                        self.state.is_some_and(|state| {
-                            state.window_has_marked_pane(session_name, window_index)
-                        })
-                    },
-                ),
-            )),
+            "window_marked_flag" => Some(bool_string(self.window_marked())),
             "window_offset_x" | "window_offset_y" => Some("0".to_owned()),
             "window_start_flag" => self.window_index.map(|window_index| {
                 bool_string(

@@ -21,7 +21,8 @@ mod control_notifications;
 #[cfg_attr(windows, allow(dead_code))]
 mod copy_mode;
 mod daemon;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+#[cfg_attr(windows, allow(dead_code))]
 mod format_runtime;
 #[cfg(unix)]
 mod handler;
