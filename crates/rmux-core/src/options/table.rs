@@ -50,6 +50,10 @@ const STATUS_FORMAT1: &str = "#[align=left range=left #{E:status-left-style}]#[p
 const STATUS_FORMAT2: &str = "#[align=left]#{R: ,#{n:#{session_name}}}P: #[norange default]#[list=on align=#{status-justify}]#[list=left-marker]<#[list=right-marker]>#[list=on]#{P:#[range=pane|#{pane_id} #{E:pane-status-style}]#[push-default]#P[#{pane_width}x#{pane_height}]#[pop-default]#[norange list=on default]  ,#[range=pane|#{pane_id} list=focus #{?#{!=:#{E:pane-status-current-style},default},#{E:pane-status-current-style},#{E:pane-status-style}}]#[push-default]#P[#{pane_width}x#{pane_height}]*#[pop-default]#[norange list=on default] }";
 const STATUS_FORMAT3: &str = "#[align=left]#{R: ,#{n:#{session_name}}}S: #[norange default]#[list=on align=#{status-justify}]#[list=left-marker]<#[list=right-marker]>#[list=on]#{S:#[range=session|#{session_id} #{E:session-status-style}]#[push-default]#S#{session_alert}#[pop-default]#[norange list=on default]  ,#[range=session|#{session_id} list=focus #{?#{!=:#{E:session-status-current-style},default},#{E:session-status-current-style},#{E:session-status-style}}]#[push-default]#S*#{session_alert}#[pop-default]#[norange list=on default] }";
 const STATUS_FORMAT_DEFAULT: &[&str] = &[STATUS_FORMAT1, STATUS_FORMAT2, STATUS_FORMAT3];
+#[cfg(unix)]
+const DEFAULT_SHELL: &str = "/bin/bash";
+#[cfg(windows)]
+const DEFAULT_SHELL: &str = "cmd.exe";
 
 pub(super) const OPTIONS: &[OptionMetadata] = &[
     option(
@@ -528,7 +532,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         SCOPE_SESSION,
         GlobalRoot::Session,
         OptionValueType::String,
-        DefaultValue::Scalar("/bin/bash"),
+        DefaultValue::Scalar(DEFAULT_SHELL),
         "",
         false,
         EFFECT_NONE,
