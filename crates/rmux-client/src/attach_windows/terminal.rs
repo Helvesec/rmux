@@ -60,37 +60,20 @@ impl From<io::Error> for AttachError {
 #[derive(Debug)]
 #[must_use = "keep the guard alive for as long as raw terminal mode is required"]
 pub struct RawTerminal {
-    input: Option<ConsoleMode>,
-    output: Option<ConsoleMode>,
+    inner: RawTerminalGuard<Win32Console>,
 }
 
 impl RawTerminal {
     /// Enters raw mode for process stdin/stdout console handles.
     pub fn enter() -> Result<Self> {
-        let input = ConsoleMode::for_std_handle(STD_INPUT_HANDLE)?;
-        let output = ConsoleMode::for_std_handle(STD_OUTPUT_HANDLE)?;
-
-        if let Some(input) = &input {
-            let raw = (input.original | ENABLE_VIRTUAL_TERMINAL_INPUT)
-                & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
-            input.set(raw)?;
-        }
-        if let Some(output) = &output {
-            output.set(output.original | ENABLE_VIRTUAL_TERMINAL_PROCESSING)?;
-        }
-
-        Ok(Self { input, output })
+        Ok(Self {
+            inner: RawTerminalGuard::enter(Win32Console)?,
+        })
     }
 
     /// Restores the terminal settings captured when the guard was created.
     pub fn restore(&self) -> Result<()> {
-        if let Some(input) = &self.input {
-            input.restore()?;
-        }
-        if let Some(output) = &self.output {
-            output.restore()?;
-        }
-        Ok(())
+        self.inner.restore()
     }
 
     pub(super) fn restore_attach_terminal_state(&self) -> Result<()> {
@@ -102,39 +85,122 @@ impl RawTerminal {
     }
 
     pub(super) fn flush_pending_input(&self) -> Result<()> {
-        let Some(input) = &self.input else {
-            return Ok(());
-        };
-        let ok = unsafe {
-            // SAFETY: input.handle is a valid console input handle captured by ConsoleMode.
-            FlushConsoleInputBuffer(input.handle)
-        };
-        if ok == 0 {
-            return Err(AttachError::Io(io::Error::last_os_error()));
-        }
-        Ok(())
+        self.inner.flush_pending_input()
     }
 }
 
-impl Drop for RawTerminal {
+#[derive(Debug)]
+struct RawTerminalGuard<C: ConsoleApi> {
+    console: C,
+    input: Option<ConsoleMode<C::Handle>>,
+    output: Option<ConsoleMode<C::Handle>>,
+}
+
+impl<C: ConsoleApi> RawTerminalGuard<C> {
+    fn enter(console: C) -> Result<Self> {
+        let input = ConsoleMode::for_std_handle(&console, STD_INPUT_HANDLE)?;
+        let output = ConsoleMode::for_std_handle(&console, STD_OUTPUT_HANDLE)?;
+        let guard = Self {
+            console,
+            input,
+            output,
+        };
+
+        if let Some(input) = &guard.input {
+            input.set(&guard.console, raw_input_mode(input.original))?;
+        }
+        if let Some(output) = &guard.output {
+            output.set(&guard.console, raw_output_mode(output.original))?;
+        }
+
+        Ok(guard)
+    }
+
+    fn restore(&self) -> Result<()> {
+        if let Some(input) = &self.input {
+            input.restore(&self.console)?;
+        }
+        if let Some(output) = &self.output {
+            output.restore(&self.console)?;
+        }
+        Ok(())
+    }
+
+    fn flush_pending_input(&self) -> Result<()> {
+        let Some(input) = &self.input else {
+            return Ok(());
+        };
+        self.console.flush_console_input(input.handle)
+    }
+}
+
+impl<C: ConsoleApi> Drop for RawTerminalGuard<C> {
     fn drop(&mut self) {
         let _ = self.restore();
     }
 }
 
 #[derive(Debug)]
-struct ConsoleMode {
-    handle: HANDLE,
+struct ConsoleMode<Handle> {
+    handle: Handle,
     original: u32,
 }
 
-impl ConsoleMode {
-    fn for_std_handle(handle_id: u32) -> Result<Option<Self>> {
-        let handle = std_handle(handle_id)?;
+impl<Handle: Copy> ConsoleMode<Handle> {
+    fn for_std_handle<C>(console: &C, handle_id: u32) -> Result<Option<Self>>
+    where
+        C: ConsoleApi<Handle = Handle>,
+    {
+        let handle = console.std_handle(handle_id)?;
         let Some(handle) = handle else {
             return Ok(None);
         };
 
+        let Some(mode) = console.get_console_mode(handle)? else {
+            return Ok(None);
+        };
+
+        Ok(Some(Self {
+            handle,
+            original: mode,
+        }))
+    }
+
+    fn set<C>(&self, console: &C, mode: u32) -> Result<()>
+    where
+        C: ConsoleApi<Handle = Handle>,
+    {
+        console.set_console_mode(self.handle, mode)
+    }
+
+    fn restore<C>(&self, console: &C) -> Result<()>
+    where
+        C: ConsoleApi<Handle = Handle>,
+    {
+        self.set(console, self.original)
+    }
+}
+
+trait ConsoleApi: std::fmt::Debug {
+    type Handle: Copy + std::fmt::Debug;
+
+    fn std_handle(&self, handle_id: u32) -> Result<Option<Self::Handle>>;
+    fn get_console_mode(&self, handle: Self::Handle) -> Result<Option<u32>>;
+    fn set_console_mode(&self, handle: Self::Handle, mode: u32) -> Result<()>;
+    fn flush_console_input(&self, handle: Self::Handle) -> Result<()>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Win32Console;
+
+impl ConsoleApi for Win32Console {
+    type Handle = HANDLE;
+
+    fn std_handle(&self, handle_id: u32) -> Result<Option<Self::Handle>> {
+        std_handle(handle_id)
+    }
+
+    fn get_console_mode(&self, handle: Self::Handle) -> Result<Option<u32>> {
         let mut mode = 0;
         let ok = unsafe {
             // SAFETY: handle is a valid std handle and mode points to writable storage.
@@ -143,17 +209,13 @@ impl ConsoleMode {
         if ok == 0 {
             return console_mode_absent_or_error();
         }
-
-        Ok(Some(Self {
-            handle,
-            original: mode,
-        }))
+        Ok(Some(mode))
     }
 
-    fn set(&self, mode: u32) -> Result<()> {
+    fn set_console_mode(&self, handle: Self::Handle, mode: u32) -> Result<()> {
         let ok = unsafe {
-            // SAFETY: self.handle is a console handle and mode is a bitmask accepted by Win32.
-            SetConsoleMode(self.handle, mode)
+            // SAFETY: handle is a console handle and mode is a bitmask accepted by Win32.
+            SetConsoleMode(handle, mode)
         };
         if ok == 0 {
             return Err(AttachError::Io(io::Error::last_os_error()));
@@ -161,8 +223,15 @@ impl ConsoleMode {
         Ok(())
     }
 
-    fn restore(&self) -> Result<()> {
-        self.set(self.original)
+    fn flush_console_input(&self, handle: Self::Handle) -> Result<()> {
+        let ok = unsafe {
+            // SAFETY: handle is a valid console input handle captured by ConsoleMode.
+            FlushConsoleInputBuffer(handle)
+        };
+        if ok == 0 {
+            return Err(AttachError::Io(io::Error::last_os_error()));
+        }
+        Ok(())
     }
 }
 
@@ -223,6 +292,15 @@ fn console_mode_absent_or_error<T>() -> Result<Option<T>> {
     )))
 }
 
+const fn raw_input_mode(original: u32) -> u32 {
+    (original | ENABLE_VIRTUAL_TERMINAL_INPUT)
+        & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT)
+}
+
+const fn raw_output_mode(original: u32) -> u32 {
+    original | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+}
+
 fn fallback_attach_stop_sequence(term: &str) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(RESET_CURSOR_COLOUR_FALLBACK);
@@ -236,3 +314,7 @@ fn fallback_attach_stop_sequence(term: &str) -> Vec<u8> {
     bytes.extend_from_slice(alternate_screen_exit_sequence(term));
     bytes
 }
+
+#[cfg(test)]
+#[path = "terminal_tests.rs"]
+mod tests;
