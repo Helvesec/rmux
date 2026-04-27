@@ -27,9 +27,11 @@ mod status;
 #[cfg(test)]
 use borders::{border_cells, BorderCell, BorderStyle};
 use borders::{content_pane_geometry, render_cells, runtime_border_cells};
+#[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use clock_mode::{
     render_clock_overlay, render_clock_restore_frame, ClockPaneRestoreData,
 };
+#[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use display_panes::{
     display_pane_targets, display_panes_label_count, render_display_panes_clear,
     render_display_panes_clear_with_base, render_display_panes_overlay,
@@ -391,10 +393,10 @@ fn apply_runtime_style_overlay(
 }
 
 fn push_range(
-    ranges: &mut Vec<crate::mouse::StatusRange>,
+    ranges: &mut Vec<crate::status_ranges::StatusRange>,
     start: usize,
     end: usize,
-    kind: crate::mouse::StatusRangeType,
+    kind: crate::status_ranges::StatusRangeType,
 ) {
     if start > end {
         return;
@@ -405,7 +407,7 @@ fn push_range(
     let Ok(end) = u16::try_from(end) else {
         return;
     };
-    ranges.push(crate::mouse::StatusRange {
+    ranges.push(crate::status_ranges::StatusRange {
         x: start..=end,
         kind,
     });

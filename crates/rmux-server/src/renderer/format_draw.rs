@@ -7,7 +7,7 @@ use rmux_core::{
     StyleCell, StyleDefaultType, StyleList, StyleRange, Utf8Config, COLOUR_DEFAULT,
 };
 
-use crate::mouse::{StatusRange, StatusRangeType};
+use crate::status_ranges::{StatusRange, StatusRangeType};
 
 use super::{cursor_position_bytes, style_sgr_bytes};
 

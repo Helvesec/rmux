@@ -5,7 +5,7 @@ use rmux_proto::TerminalSize;
 
 use super::{RenderedPrompt, StatusGeometry};
 use crate::format_runtime::RuntimeFormatContext;
-use crate::mouse::{StatusLineLayout, StatusRange, StatusRangeType};
+use crate::status_ranges::{StatusLineLayout, StatusRange, StatusRangeType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct OverlayRect {

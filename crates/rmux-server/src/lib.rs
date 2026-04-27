@@ -64,11 +64,15 @@ mod pane_terminals;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod pane_transcript;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+#[cfg_attr(windows, allow(dead_code))]
 mod renderer;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod server_access;
+#[cfg(any(unix, windows))]
+#[cfg_attr(windows, allow(dead_code))]
+mod status_ranges;
 #[cfg(unix)]
 mod terminal;
 #[cfg(any(unix, windows))]

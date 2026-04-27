@@ -4,6 +4,7 @@ use rmux_core::{PaneGeometry, PaneId};
 use rmux_proto::PaneTarget;
 
 use crate::input_keys::MouseForwardEvent;
+pub(crate) use crate::status_ranges::{StatusLineLayout, StatusRange, StatusRangeType};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum MouseLocation {
@@ -115,30 +116,6 @@ impl PaneScrollbar {
             slider_h: slider_h as u16,
         })
     }
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum StatusRangeType {
-    None,
-    Left,
-    Right,
-    Pane(PaneId),
-    Window(u32),
-    Session(u32),
-    User,
-    Control(u8),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StatusRange {
-    pub(crate) x: std::ops::RangeInclusive<u16>,
-    pub(crate) kind: StatusRangeType,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StatusLineLayout {
-    pub(crate) ranges: Vec<StatusRange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

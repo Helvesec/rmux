@@ -16,10 +16,12 @@ mod hit;
 mod types;
 
 use hit::{hit_to_attached_event, resolve_mouse_hit};
+#[allow(unused_imports)]
+pub(crate) use types::StatusRange;
 pub(crate) use types::{
     AttachedMouseEvent, ClassifiedMouseEvent, ClientMouseState, MouseEventKind, MouseLayout,
     MouseLocation, PaneBorderStatus, PaneMouseTarget, PaneScrollbar, PaneScrollbarsMode,
-    ScrollbarPosition, StatusLineLayout, StatusRange, StatusRangeType,
+    ScrollbarPosition, StatusLineLayout, StatusRangeType,
 };
 #[cfg(test)]
 pub(crate) use types::{BorderControlRange, MouseDragHandler};

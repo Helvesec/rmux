@@ -239,15 +239,15 @@ fn status_layout_marks_left_window_and_right_ranges() {
     assert!(layout
         .ranges
         .iter()
-        .any(|range| matches!(range.kind, crate::mouse::StatusRangeType::Left)));
+        .any(|range| matches!(range.kind, crate::status_ranges::StatusRangeType::Left)));
     assert!(layout
         .ranges
         .iter()
-        .any(|range| matches!(range.kind, crate::mouse::StatusRangeType::Window(_))));
+        .any(|range| matches!(range.kind, crate::status_ranges::StatusRangeType::Window(_))));
     assert!(layout
         .ranges
         .iter()
-        .any(|range| matches!(range.kind, crate::mouse::StatusRangeType::Right)));
+        .any(|range| matches!(range.kind, crate::status_ranges::StatusRangeType::Right)));
 }
 
 #[test]
@@ -281,14 +281,12 @@ fn status_layout_tracks_inline_range_changes_inside_status_left() {
 
     let layout = status_line_layout(&session, &options, 0, None).expect("layout exists");
 
-    assert!(layout
-        .ranges
-        .iter()
-        .any(
-            |range| matches!(range.kind, crate::mouse::StatusRangeType::Left) && range.x == (0..=0)
-        ));
     assert!(layout.ranges.iter().any(|range| matches!(
         range.kind,
-        crate::mouse::StatusRangeType::Control(7)
+        crate::status_ranges::StatusRangeType::Left
+    ) && range.x == (0..=0)));
+    assert!(layout.ranges.iter().any(|range| matches!(
+        range.kind,
+        crate::status_ranges::StatusRangeType::Control(7)
     ) && range.x == (1..=1)));
 }

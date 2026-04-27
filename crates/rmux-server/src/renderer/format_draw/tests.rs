@@ -1,5 +1,5 @@
 use super::{format_draw_line, render_formatted_line};
-use crate::mouse::StatusRangeType;
+use crate::status_ranges::StatusRangeType;
 use rmux_core::{Style, Utf8Config};
 
 fn render(expanded: &str, base: &str, available: usize) -> String {
