@@ -44,7 +44,7 @@ mod key_table;
 mod keys;
 #[cfg(unix)]
 mod listener;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod mouse;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]

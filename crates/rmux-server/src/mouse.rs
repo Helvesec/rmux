@@ -21,10 +21,12 @@ pub(crate) use types::StatusRange;
 pub(crate) use types::{
     AttachedMouseEvent, ClassifiedMouseEvent, ClientMouseState, MouseEventKind, MouseLayout,
     MouseLocation, PaneBorderStatus, PaneMouseTarget, PaneScrollbar, PaneScrollbarsMode,
-    ScrollbarPosition, StatusLineLayout, StatusRangeType,
+    ScrollbarPosition,
 };
 #[cfg(test)]
 pub(crate) use types::{BorderControlRange, MouseDragHandler};
+#[cfg_attr(windows, allow(unused_imports))]
+pub(crate) use types::{StatusLineLayout, StatusRangeType};
 
 const KEYC_CLICK_TIMEOUT: Duration = Duration::from_millis(300);
 
