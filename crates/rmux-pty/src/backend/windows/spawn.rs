@@ -124,6 +124,9 @@ fn create_suspended_process(
         .map(|path| wide_null(path.as_os_str()));
     let mut process_info = PROCESS_INFORMATION::default();
 
+    // SAFETY: All UTF-16 buffers are NUL-terminated and remain alive for the
+    // duration of the call, `startup` and `process_info` point to initialized
+    // stack values, and handle inheritance is disabled.
     let created = unsafe {
         CreateProcessW(
             application.as_ptr(),
@@ -147,6 +150,8 @@ fn create_suspended_process(
         return Err(last_os_error());
     }
 
+    // SAFETY: `CreateProcessW` succeeded, so these returned handles are owned
+    // by this function and are transferred exactly once into `OwnedHandle`.
     let process = unsafe { OwnedHandle::from_raw_handle(process_info.hProcess as _) };
     let thread = unsafe { OwnedHandle::from_raw_handle(process_info.hThread as _) };
     Ok(SuspendedProcess {
@@ -161,6 +166,8 @@ fn resume_as_child(
     job: Option<JobObjectGuard>,
     pty: Arc<WindowsPty>,
 ) -> Result<WindowsChild> {
+    // SAFETY: `process.thread` is the primary thread handle returned by
+    // `CreateProcessW` in suspended mode and is still owned here.
     let resume = unsafe { ResumeThread(process.thread.as_raw_handle() as HANDLE) };
     if resume == u32::MAX {
         let _ = terminate_process(&process.process, 1);
@@ -190,6 +197,8 @@ struct SuspendedProcess {
 }
 
 pub(crate) fn wait_child(child: &mut WindowsChild) -> Result<ExitStatus> {
+    // SAFETY: `child.process` is a live process handle owned by `WindowsChild`;
+    // waiting on it does not invalidate the handle.
     let wait = unsafe { WaitForSingleObject(child.process.as_raw_handle() as HANDLE, u32::MAX) };
     if wait == WAIT_FAILED {
         return Err(last_os_error().into());
@@ -198,6 +207,8 @@ pub(crate) fn wait_child(child: &mut WindowsChild) -> Result<ExitStatus> {
 }
 
 pub(crate) fn try_wait_child(child: &mut WindowsChild) -> Result<Option<ExitStatus>> {
+    // SAFETY: `child.process` is a live process handle owned by `WindowsChild`;
+    // a zero-timeout wait only observes the process state.
     let wait = unsafe { WaitForSingleObject(child.process.as_raw_handle() as HANDLE, 0) };
     match wait {
         WAIT_OBJECT_0 => Ok(Some(exit_status(&child.process)?)),
@@ -237,6 +248,8 @@ pub(crate) fn kill_child(child: &WindowsChild, signal: Signal) -> Result<()> {
 }
 
 fn terminate_process(process: &OwnedHandle, exit_code: u32) -> io::Result<()> {
+    // SAFETY: `process` is a live process handle owned by the caller; the API
+    // does not take ownership of the handle.
     let ok = unsafe { TerminateProcess(process.as_raw_handle() as HANDLE, exit_code) };
     if ok == 0 {
         return Err(last_os_error());
@@ -245,8 +258,12 @@ fn terminate_process(process: &OwnedHandle, exit_code: u32) -> io::Result<()> {
 }
 
 fn duplicate_handle(handle: &OwnedHandle) -> io::Result<OwnedHandle> {
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle for the current
+    // process and has no preconditions.
     let current_process = unsafe { GetCurrentProcess() };
     let mut duplicated: HANDLE = null_mut();
+    // SAFETY: `handle` is valid, `duplicated` is a valid out-pointer, and the
+    // source and target process handles intentionally reference this process.
     let ok = unsafe {
         DuplicateHandle(
             current_process,
@@ -261,11 +278,15 @@ fn duplicate_handle(handle: &OwnedHandle) -> io::Result<OwnedHandle> {
     if ok == 0 {
         return Err(last_os_error());
     }
+    // SAFETY: `DuplicateHandle` succeeded and returned a new owned handle that
+    // is transferred exactly once into `OwnedHandle`.
     Ok(unsafe { OwnedHandle::from_raw_handle(duplicated as _) })
 }
 
 fn exit_status(process: &OwnedHandle) -> Result<ExitStatus> {
     let mut exit_code = 0_u32;
+    // SAFETY: `process` is a live process handle and `exit_code` is a valid
+    // out-pointer for the duration of the call.
     let ok = unsafe { GetExitCodeProcess(process.as_raw_handle() as HANDLE, &mut exit_code) };
     if ok == 0 {
         return Err(last_os_error().into());
@@ -280,13 +301,20 @@ struct JobObjectGuard {
 
 impl JobObjectGuard {
     fn new() -> io::Result<Self> {
+        // SAFETY: Null security attributes and name request the default unnamed
+        // job object; the returned handle is checked before ownership transfer.
         let handle = unsafe { CreateJobObjectW(null(), null()) };
         if handle.is_null() {
             return Err(last_os_error());
         }
+        // SAFETY: `CreateJobObjectW` returned a non-null owned handle and this
+        // function transfers it exactly once into `OwnedHandle`.
         let handle = unsafe { OwnedHandle::from_raw_handle(handle as _) };
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: `handle` is a live job handle, `limits` points to an
+        // initialized structure of the declared size, and the API borrows it
+        // only for the duration of the call.
         let ok = unsafe {
             SetInformationJobObject(
                 handle.as_raw_handle() as HANDLE,
@@ -302,6 +330,8 @@ impl JobObjectGuard {
     }
 
     fn assign(&self, process: &OwnedHandle) -> io::Result<()> {
+        // SAFETY: Both handles are live and owned by their wrappers; the API
+        // associates the process with the job without taking ownership.
         let ok = unsafe {
             AssignProcessToJobObject(
                 self.handle.as_raw_handle() as HANDLE,
@@ -315,6 +345,8 @@ impl JobObjectGuard {
     }
 
     fn terminate(&self, exit_code: u32) -> io::Result<()> {
+        // SAFETY: `self.handle` is a live job handle owned by this guard; the
+        // API does not take ownership of it.
         let ok = unsafe { TerminateJobObject(self.handle.as_raw_handle() as HANDLE, exit_code) };
         if ok == 0 {
             return Err(last_os_error());
@@ -330,6 +362,8 @@ struct AttributeList {
 impl AttributeList {
     fn with_pseudoconsole(hpc: isize) -> io::Result<Self> {
         let mut size = 0_usize;
+        // SAFETY: The first call follows the documented sizing pattern: null
+        // list pointer, attribute count one, and a valid size out-pointer.
         unsafe {
             InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size);
         }
@@ -340,11 +374,15 @@ impl AttributeList {
         let slots = size.div_ceil(size_of::<usize>());
         let mut storage = vec![0_usize; slots];
         let list = storage.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+        // SAFETY: `storage` is sized from the API-provided byte count and stays
+        // alive inside `AttributeList`; `list` points into that storage.
         let initialized = unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) };
         if initialized == 0 {
             return Err(last_os_error());
         }
 
+        // SAFETY: `list` is initialized, `hpc` is a live ConPTY handle, and the
+        // attribute value pointer is valid for the duration of the call.
         let updated = unsafe {
             UpdateProcThreadAttribute(
                 list,
@@ -357,6 +395,8 @@ impl AttributeList {
             )
         };
         if updated == 0 {
+            // SAFETY: `list` was initialized successfully above and is cleaned
+            // up before returning the error.
             unsafe { DeleteProcThreadAttributeList(list) };
             return Err(last_os_error());
         }
@@ -371,6 +411,8 @@ impl AttributeList {
 
 impl Drop for AttributeList {
     fn drop(&mut self) {
+        // SAFETY: `AttributeList` only exists after successful initialization,
+        // and `Drop` runs exactly once for the backing storage.
         unsafe { DeleteProcThreadAttributeList(self.as_mut_ptr()) };
     }
 }
@@ -445,6 +487,8 @@ fn wide_null(value: &OsStr) -> Vec<u16> {
 }
 
 fn last_os_error() -> io::Error {
+    // SAFETY: `GetLastError` reads the calling thread's last-error slot and has
+    // no preconditions.
     let code = unsafe { GetLastError() };
     io::Error::from_raw_os_error(code as i32)
 }

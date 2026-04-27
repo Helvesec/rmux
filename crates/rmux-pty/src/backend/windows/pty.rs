@@ -107,6 +107,8 @@ pub(crate) fn apply_size(pty: &WindowsPty, size: TerminalSize) -> Result<()> {
         "resizing ConPTY"
     );
     let coord = coord_from_size(size)?;
+    // SAFETY: `pty.hpc` is an owned live ConPTY handle for the lifetime of
+    // `pty`, and `coord` was range-checked from `TerminalSize`.
     let hr = unsafe { ResizePseudoConsole(pty.hpc.raw(), coord) };
     if hr != S_OK {
         if is_benign_resize_after_exit(hr) {
@@ -135,6 +137,9 @@ pub(crate) fn apply_size(pty: &WindowsPty, size: TerminalSize) -> Result<()> {
 
 fn create_pseudo_console(size: TerminalSize, input: HANDLE, output: HANDLE) -> Result<OwnedHpcon> {
     let mut hpc = 0_isize;
+    // SAFETY: `input` and `output` are valid pipe handles owned by the caller,
+    // `hpc` is a valid out-pointer, and `coord_from_size` range-checks the
+    // dimensions before the API call.
     let hr = unsafe { CreatePseudoConsole(coord_from_size(size)?, input, output, 0, &mut hpc) };
     if hr != S_OK {
         tracing::warn!(
@@ -176,6 +181,8 @@ impl Drop for OwnedHpcon {
     fn drop(&mut self) {
         if self.0 != 0 {
             tracing::trace!(target: "rmux::conpty", "closing ConPTY");
+            // SAFETY: `OwnedHpcon` owns a non-null ConPTY handle and closes it
+            // exactly once from `Drop`.
             unsafe { ClosePseudoConsole(self.0) };
         }
     }
@@ -199,6 +206,8 @@ fn hresult_from_win32(error: u32) -> i32 {
 
 #[allow(dead_code)]
 fn last_os_error() -> io::Error {
+    // SAFETY: `GetLastError` reads the calling thread's last-error slot and has
+    // no preconditions.
     let code = unsafe { GetLastError() };
     io::Error::from_raw_os_error(code as i32)
 }

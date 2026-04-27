@@ -14,6 +14,7 @@ trap 'rm -f "$tmp"' EXIT
 
 find src crates -type f -name '*.rs' 2>/dev/null \
   | grep -v '/target/' \
+  | grep -v '/examples/' \
   | grep -v '/tests/' \
   | grep -v '/test/' \
   | grep -v '/src/.*tests' \
