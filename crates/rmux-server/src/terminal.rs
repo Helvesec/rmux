@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 #[cfg(windows)]
 use std::env;
+#[cfg(windows)]
 use std::ffi::OsString;
 #[cfg(unix)]
 use std::fs;
@@ -14,6 +15,10 @@ use rmux_pty::{ChildCommand, PtyChild, PtyMaster, TerminalSize as PtyTerminalSiz
 #[cfg(unix)]
 use rustix::process::getuid;
 use tokio::runtime::Handle;
+
+mod shell_spec;
+
+use shell_spec::ShellSpec;
 
 /// Immutable pane-spawn metadata captured when a pane terminal is created.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,90 +220,12 @@ pub(crate) fn spawn_pane_process(
 }
 
 fn spawn_command(profile: &TerminalProfile, command: Option<&[String]>) -> ChildCommand {
+    let shell = ShellSpec::new(profile.shell());
     match command {
-        Some([single]) => shell_child_command(profile, single),
+        Some([single]) => shell.command_child(profile.cwd(), single),
         Some(argv) if !argv.is_empty() => ChildCommand::new(&argv[0]).args(&argv[1..]),
-        #[cfg(unix)]
-        _ => ChildCommand::new(profile.shell()).arg0(login_shell_argv0(profile.shell())),
-        #[cfg(windows)]
-        _ => interactive_shell_child_command(profile),
+        _ => shell.interactive_child(profile.cwd()),
     }
-}
-
-#[cfg(unix)]
-fn shell_child_command(profile: &TerminalProfile, command: &str) -> ChildCommand {
-    ChildCommand::new(profile.shell()).arg("-c").arg(command)
-}
-
-#[cfg(windows)]
-fn shell_child_command(profile: &TerminalProfile, command: &str) -> ChildCommand {
-    match windows_shell_kind(profile.shell()) {
-        WindowsShellKind::PowerShell => ChildCommand::new(profile.shell())
-            .arg("-NoProfile")
-            .arg("-Command")
-            .arg(format!(
-                "Set-Location -LiteralPath {}; {command}",
-                powershell_single_quoted(profile.cwd())
-            )),
-        WindowsShellKind::Cmd => ChildCommand::new(profile.shell())
-            .arg("/D")
-            .arg("/S")
-            .arg("/C")
-            .arg(command),
-        WindowsShellKind::Other => ChildCommand::new(profile.shell()).arg("/C").arg(command),
-    }
-}
-
-#[cfg(windows)]
-fn interactive_shell_child_command(profile: &TerminalProfile) -> ChildCommand {
-    match windows_shell_kind(profile.shell()) {
-        WindowsShellKind::PowerShell => ChildCommand::new(profile.shell())
-            .arg("-NoExit")
-            .arg("-Command")
-            .arg(format!(
-                "Set-Location -LiteralPath {}",
-                powershell_single_quoted(profile.cwd())
-            )),
-        WindowsShellKind::Cmd => ChildCommand::new(profile.shell()).arg("/D").arg("/K"),
-        WindowsShellKind::Other => ChildCommand::new(profile.shell()),
-    }
-}
-
-#[cfg(windows)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WindowsShellKind {
-    Cmd,
-    PowerShell,
-    Other,
-}
-
-#[cfg(windows)]
-fn windows_shell_kind(shell: &Path) -> WindowsShellKind {
-    match executable_name(shell)
-        .as_deref()
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("cmd.exe" | "cmd") => WindowsShellKind::Cmd,
-        Some("powershell.exe" | "powershell" | "pwsh.exe" | "pwsh") => WindowsShellKind::PowerShell,
-        _ => WindowsShellKind::Other,
-    }
-}
-
-#[cfg(windows)]
-fn powershell_single_quoted(path: &Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "''"))
-}
-
-#[cfg(unix)]
-fn login_shell_argv0(shell: &Path) -> OsString {
-    let name = shell
-        .file_name()
-        .unwrap_or(shell.as_os_str())
-        .to_os_string();
-    let mut login_name = OsString::from("-");
-    login_name.push(name);
-    login_name
 }
 
 pub(crate) fn spawn_hook_command(command: String) -> io::Result<()> {

@@ -9,7 +9,9 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 use tokio::time::sleep;
 
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
