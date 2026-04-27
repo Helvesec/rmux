@@ -15,7 +15,8 @@ mod control;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod control_mode;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+#[cfg_attr(windows, allow(dead_code))]
 mod control_notifications;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
