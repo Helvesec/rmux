@@ -196,7 +196,13 @@ fn run_hidden_daemon(args: InternalDaemonArgs) -> io::Result<()> {
             config.with_config_files(files, args.config_quiet, args.config_cwd)
         }
     };
+    #[cfg(unix)]
     let runtime = Builder::new_current_thread().enable_all().build()?;
+    #[cfg(windows)]
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
 
     runtime.block_on(async move {
         let server = ServerDaemon::new(config).bind().await?;

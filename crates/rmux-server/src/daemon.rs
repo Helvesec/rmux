@@ -597,7 +597,8 @@ mod tests {
     use rmux_proto::{
         encode_frame, ErrorResponse, FrameDecoder, HasSessionRequest, KillServerRequest,
         KillSessionRequest, ListClientsRequest, ListPanesRequest, ListSessionsRequest,
-        ListWindowsRequest, LockServerRequest, Request, Response, RmuxError, SessionName,
+        ListWindowsRequest, LockServerRequest, NewSessionRequest, Request, Response, RmuxError,
+        SessionName, TerminalSize,
     };
     use std::io::{self, Read, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -691,6 +692,32 @@ mod tests {
             }) if name == "missing"
         ));
 
+        handle.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn windows_daemon_creates_detached_session() -> io::Result<()> {
+        let endpoint = unique_endpoint()?;
+        let socket_path = endpoint.clone().into_path();
+        let handle = ServerDaemon::new(DaemonConfig::new(socket_path))
+            .bind()
+            .await?;
+
+        let response = tokio::task::spawn_blocking(move || {
+            roundtrip(
+                &endpoint,
+                Request::NewSession(NewSessionRequest {
+                    session_name: SessionName::new("alpha").expect("valid session"),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }),
+            )
+        })
+        .await
+        .map_err(io::Error::other)??;
+
+        assert!(matches!(response, Response::NewSession(_)));
         handle.shutdown().await
     }
 

@@ -58,24 +58,26 @@ pub(crate) fn spawn_pane_output_reader(
     pane_alert_callback: Option<PaneAlertCallback>,
     pane_exit_callback: Option<PaneExitCallback>,
 ) {
-    tokio::task::spawn_blocking(move || {
-        if let Err(error) = read_pane_output_blocking(
-            pane_master,
-            session_name.clone(),
-            pane_id,
-            transcript,
-            pane_output,
-            generation,
-            pane_alert_callback,
-            pane_exit_callback,
-        ) {
-            warn!(
-                session = %session_name,
-                pane_id = pane_id.as_u32(),
-                "pane output reader stopped: {error}"
-            );
-        }
-    });
+    let _ = std::thread::Builder::new()
+        .name(format!("rmux-pane-reader-{}", pane_id.as_u32()))
+        .spawn(move || {
+            if let Err(error) = read_pane_output_blocking(
+                pane_master,
+                session_name.clone(),
+                pane_id,
+                transcript,
+                pane_output,
+                generation,
+                pane_alert_callback,
+                pane_exit_callback,
+            ) {
+                warn!(
+                    session = %session_name,
+                    pane_id = pane_id.as_u32(),
+                    "pane output reader stopped: {error}"
+                );
+            }
+        });
 }
 
 #[allow(clippy::too_many_arguments)]
