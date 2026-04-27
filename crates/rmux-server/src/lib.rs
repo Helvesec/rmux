@@ -37,7 +37,8 @@ mod hook_compat;
 mod hook_runtime;
 #[cfg(any(unix, windows))]
 mod input_keys;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+#[cfg_attr(windows, allow(dead_code))]
 mod key_table;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
