@@ -179,11 +179,11 @@ fn begin_attach_keeps_post_response_attach_bytes_on_the_stream() -> Result<(), B
         AttachTransition::Upgraded(attach) => attach,
         other => panic!("unexpected attach transition: {other:?}"),
     };
-    let mut stream = attach.into_stream();
+    let (mut stream, initial_bytes) = attach.into_parts();
     stream.set_read_timeout(Some(READ_TIMEOUT))?;
 
     assert_eq!(
-        read_attach_messages(&mut stream, 1)?,
+        read_attach_messages_after_initial(&mut stream, initial_bytes, 1)?,
         vec![AttachMessage::Data(b"ready".to_vec())]
     );
 
@@ -239,9 +239,19 @@ fn read_attach_messages(
     stream: &mut UnixStream,
     count: usize,
 ) -> Result<Vec<AttachMessage>, Box<dyn Error>> {
+    read_attach_messages_after_initial(stream, Vec::new(), count)
+}
+
+fn read_attach_messages_after_initial(
+    stream: &mut UnixStream,
+    initial_bytes: Vec<u8>,
+    count: usize,
+) -> Result<Vec<AttachMessage>, Box<dyn Error>> {
     let mut decoder = AttachFrameDecoder::new();
+    decoder.push_bytes(&initial_bytes);
     let mut buffer = [0_u8; 256];
     let mut messages = Vec::with_capacity(count);
+    let deadline = Instant::now() + READ_TIMEOUT;
 
     loop {
         if let Some(message) = decoder.next_message()? {
@@ -253,7 +263,24 @@ fn read_attach_messages(
             continue;
         }
 
-        let bytes_read = stream.read(&mut buffer)?;
+        let bytes_read = match stream.read(&mut buffer) {
+            Ok(bytes_read) => bytes_read,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "timed out reading attach messages after receiving {} of {count}",
+                            messages.len()
+                        ),
+                    )
+                    .into());
+                }
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
         if bytes_read == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -301,11 +328,13 @@ fn write_attach_stop(stream: &mut UnixStream) -> Result<(), Box<dyn Error>> {
 
 fn unique_socket_path(label: &str) -> PathBuf {
     let unique_id = UNIQUE_ID.fetch_add(1, Ordering::Relaxed);
-    PathBuf::from("/tmp").join(format!(
+    let path = PathBuf::from("/tmp").join(format!(
         "rxc-{}-{unique_id}-{}.sock",
         std::process::id(),
         compact_label(label)
-    ))
+    ));
+    let _ = fs::remove_file(&path);
+    path
 }
 
 fn compact_label(label: &str) -> String {

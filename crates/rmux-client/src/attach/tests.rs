@@ -113,7 +113,7 @@ fn input_loop_emits_typed_keystroke_frame() -> Result<(), Box<dyn std::error::Er
 fn output_loop_errors_when_server_hangs_up_before_attach_stop(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (client_stream, server_stream) = UnixStream::pair()?;
-    let mut output = Vec::new();
+    let output = Vec::new();
     let closed = Arc::new(AtomicBool::new(false));
     let locked = Arc::new(AtomicBool::new(false));
     let (action_tx, _action_rx) = mpsc::channel();
@@ -122,7 +122,8 @@ fn output_loop_errors_when_server_hangs_up_before_attach_stop(
     drop(server_stream);
     let error = output_loop(
         client_stream,
-        &mut output,
+        Vec::new(),
+        output,
         closed,
         locked,
         screen_tracker,

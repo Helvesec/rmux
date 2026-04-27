@@ -117,11 +117,26 @@ mod tests {
         );
         assert_eq!(
             error.to_string(),
-            "attach error: terminal descriptor operation failed: dup failed"
+            expected_attach_error_display("dup failed")
         );
         assert!(
             error.source().is_some(),
             "wrapped attach error should chain"
         );
+    }
+
+    #[cfg(unix)]
+    fn expected_attach_error_display(message: &str) -> String {
+        format!("attach error: terminal descriptor operation failed: {message}")
+    }
+
+    #[cfg(windows)]
+    fn expected_attach_error_display(message: &str) -> String {
+        format!("attach error: terminal console operation failed: {message}")
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn expected_attach_error_display(message: &str) -> String {
+        format!("attach error: terminal descriptor operation failed: {message}")
     }
 }
