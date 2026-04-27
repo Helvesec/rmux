@@ -33,7 +33,7 @@ fn direct_copy_mode_command(commands: &ParsedCommands) -> Option<DirectCopyModeC
     let [command] = commands.commands() else {
         return None;
     };
-    if command.name() != "send-keys" {
+    if !matches!(command.name(), "send" | "send-keys") {
         return None;
     }
 
@@ -573,5 +573,19 @@ mod parsed_command_prompt_block_tests {
             .parse_one_group("display-panes -b")
             .unwrap();
         assert!(!parsed_commands_block_for_prompt(&parsed));
+    }
+
+    #[test]
+    fn direct_copy_mode_command_accepts_send_alias() {
+        use rmux_core::command_parser::CommandParser;
+
+        let parsed = CommandParser::new()
+            .parse_one_group("send -N3 -X cancel")
+            .unwrap();
+        let command = direct_copy_mode_command(&parsed).unwrap();
+
+        assert_eq!(command.command, "cancel");
+        assert_eq!(command.args, Vec::<String>::new());
+        assert_eq!(command.repeat_count, 3);
     }
 }

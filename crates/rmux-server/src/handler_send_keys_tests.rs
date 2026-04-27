@@ -30,3 +30,7 @@ mod live_attach;
 
 #[path = "handler_send_keys_tests/mouse_copy_mode.rs"]
 mod mouse_copy_mode;
+
+async fn handle_boxed(handler: &RequestHandler, request: Request) -> Response {
+    Box::pin(handler.handle(request)).await
+}
