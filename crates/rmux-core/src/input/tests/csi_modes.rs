@@ -174,4 +174,26 @@ fn sm_private_sync_output() {
     assert!(w.has_call("start_sync()"));
 }
 
+#[test]
+fn sm_private_win32_console_input_mode_is_suppressed() {
+    let (p, w) = parse(b"before\x1b[?9001hafter");
+
+    assert_eq!(w.chars.iter().collect::<String>(), "beforeafter");
+    assert_eq!(w.mode, MODE_CURSOR | MODE_WRAP);
+    assert!(p.reply_buf.is_empty());
+    assert!(!w.has_call("mode_set("));
+    assert!(!w.has_call("mode_clear("));
+}
+
+#[test]
+fn rm_private_win32_console_input_mode_is_suppressed() {
+    let (p, w) = parse(b"before\x1b[?9001lafter");
+
+    assert_eq!(w.chars.iter().collect::<String>(), "beforeafter");
+    assert_eq!(w.mode, MODE_CURSOR | MODE_WRAP);
+    assert!(p.reply_buf.is_empty());
+    assert!(!w.has_call("mode_set("));
+    assert!(!w.has_call("mode_clear("));
+}
+
 // ─── SGR tests ─────────────────────────────────────────────────────

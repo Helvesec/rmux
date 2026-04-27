@@ -4,6 +4,8 @@ use super::mode;
 use super::writer::ScreenWriter;
 use super::InputParser;
 
+const WIN32_CONSOLE_INPUT_MODE: i32 = 9001;
+
 pub(super) fn dispatch_sm(parser: &mut InputParser, writer: &mut dyn ScreenWriter) {
     for i in 0..parser.param_list.len() {
         match parser.param_list.get(i, 0, -1) {
@@ -68,6 +70,7 @@ pub(super) fn dispatch_sm_private(parser: &mut InputParser, writer: &mut dyn Scr
             2004 => writer.mode_set(mode::MODE_BRACKETPASTE),
             2026 => writer.start_sync(),
             2031 => writer.mode_set(mode::MODE_THEME_UPDATES),
+            WIN32_CONSOLE_INPUT_MODE => {}
             _ => {}
         }
     }
@@ -106,6 +109,7 @@ pub(super) fn dispatch_rm_private(parser: &mut InputParser, writer: &mut dyn Scr
             2004 => writer.mode_clear(mode::MODE_BRACKETPASTE),
             2026 => writer.stop_sync(),
             2031 => writer.mode_clear(mode::MODE_THEME_UPDATES),
+            WIN32_CONSOLE_INPUT_MODE => {}
             _ => {}
         }
     }
