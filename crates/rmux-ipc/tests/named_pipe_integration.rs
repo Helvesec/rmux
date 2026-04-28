@@ -4,7 +4,7 @@ use std::io::ErrorKind;
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use rmux_ipc::{connect_blocking, endpoint_for_label, LocalListener};
+use rmux_ipc::{connect_blocking, endpoint_for_label, wait_for_peer_close, LocalListener};
 use rmux_os::identity::{IdentityResolver, UserIdentity};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::ServerOptions;
@@ -56,6 +56,41 @@ async fn named_pipe_roundtrip_uses_bound_endpoint() -> std::io::Result<()> {
     .await
     .expect("client roundtrip timed out")
     .expect("client roundtrip task")?;
+
+    timeout(Duration::from_secs(2), accept)
+        .await
+        .expect("accept task timed out")
+        .expect("accept task")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn wait_for_peer_close_resolves_when_named_pipe_client_disconnects() -> std::io::Result<()> {
+    let endpoint = endpoint_for_label(format!("peer-close-{}", std::process::id()))?;
+    let listener = LocalListener::bind(&endpoint)?;
+
+    let accept = tokio::spawn(async move {
+        let (stream, _peer) = listener.accept().await?;
+        timeout(Duration::from_secs(2), wait_for_peer_close(&stream))
+            .await
+            .expect("peer close wait timed out")?;
+        std::io::Result::Ok(())
+    });
+
+    tokio::task::yield_now().await;
+
+    let endpoint_for_client = endpoint.clone();
+    timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            let client = connect_blocking(&endpoint_for_client, Duration::from_secs(2))?;
+            drop(client);
+            std::io::Result::Ok(())
+        }),
+    )
+    .await
+    .expect("client connect/drop timed out")
+    .expect("client connect/drop task")?;
 
     timeout(Duration::from_secs(2), accept)
         .await
