@@ -464,11 +464,24 @@ pub(crate) async fn forward_attach(
                                 .as_mut()
                                 .map(|pane| pane.render_delta_from_transcript())
                             {
-                                Some(PaneRenderDelta::Incremental(frame)) => {
+                                Some(PaneRenderDelta::Incremental(delta)) => {
+                                    if let Some(cursor_style) = delta.cursor_style() {
+                                        if let Some(sequence) = current_target
+                                            .outer_terminal
+                                            .render_cursor_style_transition(
+                                                Some(current_target.cursor_style),
+                                                cursor_style,
+                                            )
+                                        {
+                                            emit_attach_bytes(&stream, sequence.as_bytes())
+                                                .await?;
+                                        }
+                                        current_target.cursor_style = cursor_style;
+                                    }
                                     emit_render_frame(
                                         &stream,
                                         &current_target.outer_terminal,
-                                        &frame,
+                                        delta.frame(),
                                     )
                                     .await?;
                                 }

@@ -7,8 +7,24 @@ use super::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PaneRenderDelta {
-    Incremental(Vec<u8>),
+    Incremental(PaneRenderDeltaFrame),
     RequiresFullRefresh,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PaneRenderDeltaFrame {
+    frame: Vec<u8>,
+    cursor_style: Option<u32>,
+}
+
+impl PaneRenderDeltaFrame {
+    pub(crate) fn frame(&self) -> &[u8] {
+        &self.frame
+    }
+
+    pub(crate) fn cursor_style(&self) -> Option<u32> {
+        self.cursor_style
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,19 +147,14 @@ impl PaneRenderSnapshot {
             frame.extend_from_slice(&next.cursor);
         }
 
-        PaneRenderDelta::Incremental(frame)
+        PaneRenderDelta::Incremental(PaneRenderDeltaFrame {
+            frame,
+            cursor_style: (self.cursor_style != next.cursor_style).then_some(next.cursor_style),
+        })
     }
 
     fn requires_full_refresh(&self, next: &Self) -> bool {
-        self.x != next.x
-            || self.y != next.y
-            || self.rows != next.rows
-            || self.cols != next.cols
-            || self.cursor_style != next.cursor_style
-            || self.title != next.title
-            || self.path != next.path
-            || self.mode != next.mode
-            || self.alternate_on != next.alternate_on
+        self.x != next.x || self.y != next.y || self.rows != next.rows || self.cols != next.cols
     }
 }
 
@@ -180,7 +191,7 @@ mod tests {
         let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
             panic!("line update should not require a full refresh");
         };
-        let text = String::from_utf8(delta).expect("delta is utf8");
+        let text = String::from_utf8(delta.frame().to_vec()).expect("delta is utf8");
 
         assert!(text.contains("\u{1b}[1;1H"));
         assert!(text.contains("abcd"));
@@ -190,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_delta_requests_full_refresh_for_title_changes() {
+    fn pane_delta_keeps_title_changes_incremental() {
         let session = Session::new(session_name("alpha"), TerminalSize { cols: 10, rows: 4 });
         let pane = session.window().active_pane().expect("active pane");
         let options = OptionStore::new();
@@ -202,7 +213,13 @@ mod tests {
         let after =
             PaneRenderSnapshot::capture(&session, &options, pane, &after).expect("after snapshot");
 
-        assert_eq!(before.diff_to(&after), PaneRenderDelta::RequiresFullRefresh);
+        assert_eq!(
+            before.diff_to(&after),
+            PaneRenderDelta::Incremental(super::PaneRenderDeltaFrame {
+                frame: Vec::new(),
+                cursor_style: None,
+            })
+        );
     }
 
     #[test]
@@ -220,7 +237,7 @@ mod tests {
         let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
             panic!("new shell prompt lines should not force a full refresh");
         };
-        let text = String::from_utf8(delta).expect("delta is utf8");
+        let text = String::from_utf8(delta.frame().to_vec()).expect("delta is utf8");
 
         assert!(text.contains("\u{1b}[2;1H"));
         assert!(text.contains("def"));
