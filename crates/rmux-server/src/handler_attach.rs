@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rmux_proto::{AttachedKeystroke, KeyDispatched, TerminalSize};
+use rmux_proto::{AttachedKeystroke, KeyDispatched, PaneTarget, TerminalSize};
 #[cfg(test)]
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -14,7 +14,7 @@ use super::RequestHandler;
 use crate::handler_support::attached_client_required;
 use crate::mouse::ClientMouseState;
 use crate::outer_terminal::{CursorScope, OuterTerminal, OuterTerminalContext};
-use crate::pane_io::{AttachControl, AttachTarget, OverlayFrame};
+use crate::pane_io::{AttachControl, AttachTarget, LivePaneRender, OverlayFrame};
 use crate::pane_terminals::{session_not_found, HandlerState};
 use crate::renderer;
 #[cfg(test)]
@@ -512,6 +512,8 @@ fn attach_target_for_session_with_prompt(
             }
         }
     }
+    let live_pane =
+        live_pane_render_for_target(state, session, &state.options, session_name, prompt);
     if prompt.is_none() {
         if let Some(active_pane) = session.window().active_pane().cloned() {
             let active_screen = state
@@ -534,7 +536,32 @@ fn attach_target_for_session_with_prompt(
         outer_terminal,
         cursor_style,
         persistent_overlay_state_id: None,
+        live_pane,
     })
+}
+
+fn live_pane_render_for_target(
+    state: &HandlerState,
+    session: &rmux_core::Session,
+    options: &rmux_core::OptionStore,
+    session_name: &rmux_proto::SessionName,
+    prompt: Option<&renderer::RenderedPrompt>,
+) -> Option<Box<LivePaneRender>> {
+    if prompt.is_some() {
+        return None;
+    }
+    let pane = session.window().active_pane()?.clone();
+    if state.pane_in_mode(session_name, pane.id()) {
+        return None;
+    }
+    let screen = state.pane_render_screen(session_name, pane.id())?;
+    let target = PaneTarget::with_window(
+        session_name.clone(),
+        session.active_window_index(),
+        pane.index(),
+    );
+    let transcript = state.transcript_handle(&target).ok()?;
+    LivePaneRender::new(transcript, session.clone(), options.clone(), pane, &screen)
 }
 
 pub(super) fn option_affects_attached_rendering(option: rmux_proto::OptionName) -> bool {

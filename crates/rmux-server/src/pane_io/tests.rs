@@ -181,6 +181,7 @@ async fn forward_attach_emits_stop_sequence_when_processing_errors() {
         outer_terminal,
         cursor_style: 0,
         persistent_overlay_state_id: None,
+        live_pane: None,
     };
     let invalid_initial_socket_bytes =
         encode_attach_message(&AttachMessage::Lock("unexpected".to_owned()))
@@ -251,6 +252,7 @@ fn test_attach_target(
         ),
         cursor_style: 0,
         persistent_overlay_state_id,
+        live_pane: None,
     }
 }
 
@@ -458,6 +460,7 @@ async fn forward_attach_emits_display_panes_overlay_for_prefix_q_keystrokes() {
         ),
         cursor_style: 0,
         persistent_overlay_state_id: None,
+        live_pane: None,
     };
 
     let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");

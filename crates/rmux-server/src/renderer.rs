@@ -22,6 +22,8 @@ mod display_panes;
 mod format_draw;
 #[path = "renderer/overlay.rs"]
 mod overlay;
+#[path = "renderer/pane_delta.rs"]
+mod pane_delta;
 #[path = "renderer/status.rs"]
 mod status;
 #[cfg(test)]
@@ -45,6 +47,7 @@ pub(crate) use overlay::{
     MenuRenderItem, MenuRenderSpec, OverlayMousePosition, OverlayPositionContext, OverlayRect,
     PopupRenderSpec,
 };
+pub(crate) use pane_delta::{PaneRenderDelta, PaneRenderSnapshot};
 #[cfg(test)]
 use status::status_bar_runs;
 use status::{

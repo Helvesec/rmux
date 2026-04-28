@@ -11,6 +11,8 @@ use crate::control_mode::ControlModeUpgrade;
 use crate::handler::RequestHandler;
 use crate::outer_terminal::OuterTerminal;
 
+use super::live_render::LivePaneRender;
+
 const PANE_OUTPUT_BUFFER: usize = 256;
 
 #[derive(Debug)]
@@ -111,6 +113,7 @@ pub(crate) struct AttachTarget {
     pub(crate) outer_terminal: OuterTerminal,
     pub(crate) cursor_style: u32,
     pub(crate) persistent_overlay_state_id: Option<u64>,
+    pub(crate) live_pane: Option<Box<LivePaneRender>>,
 }
 
 #[cfg(any(unix, windows))]
@@ -184,6 +187,7 @@ pub(super) struct OpenAttachTarget {
     pub(super) outer_terminal: OuterTerminal,
     pub(super) cursor_style: u32,
     pub(super) persistent_overlay_state_id: Option<u64>,
+    pub(super) live_pane: Option<Box<LivePaneRender>>,
 }
 
 pub(crate) type PaneOutputSender = broadcast::Sender<Vec<u8>>;

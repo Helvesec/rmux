@@ -17,6 +17,7 @@ use tokio::sync::watch;
 
 const READ_BUFFER_SIZE: usize = 8192;
 mod control;
+mod live_render;
 mod persistent_overlay;
 mod reader;
 mod refresh_scheduler;
@@ -24,11 +25,14 @@ mod types;
 mod wire;
 
 #[cfg(any(unix, windows))]
+use crate::renderer::PaneRenderDelta;
+#[cfg(any(unix, windows))]
 use control::{
     apply_pending_attach_controls, recv_attach_control,
     redraw_after_persistent_overlay_state_advance, should_emit_overlay, switch_attach_target,
     PendingAttachAction,
 };
+pub(crate) use live_render::LivePaneRender;
 #[cfg(any(unix, windows))]
 use persistent_overlay::{
     accept_persistent_overlay_state, advance_persistent_overlay_state, clear_then_base_frame,
@@ -451,7 +455,27 @@ pub(crate) async fn forward_attach(
                                 let _ = emit_attach_stop(&stream, &current_target).await;
                                 return Ok(());
                             }
-                            pane_refresh.schedule_now();
+                            if persistent_overlay_visible || persistent_overlay.is_some() {
+                                pane_refresh.schedule_now();
+                                continue;
+                            }
+                            match current_target
+                                .live_pane
+                                .as_mut()
+                                .map(|pane| pane.render_delta_from_transcript())
+                            {
+                                Some(PaneRenderDelta::Incremental(frame)) => {
+                                    emit_render_frame(
+                                        &stream,
+                                        &current_target.outer_terminal,
+                                        &frame,
+                                    )
+                                    .await?;
+                                }
+                                Some(PaneRenderDelta::RequiresFullRefresh) | None => {
+                                    pane_refresh.schedule_now();
+                                }
+                            }
                         }
                     }
                 }

@@ -25,6 +25,7 @@ pub(super) fn open_attach_target(target: AttachTarget) -> io::Result<OpenAttachT
         outer_terminal,
         cursor_style,
         persistent_overlay_state_id,
+        live_pane,
     } = target;
     Ok(OpenAttachTarget {
         session_name,
@@ -34,6 +35,7 @@ pub(super) fn open_attach_target(target: AttachTarget) -> io::Result<OpenAttachT
         outer_terminal,
         cursor_style,
         persistent_overlay_state_id,
+        live_pane,
     })
 }
 
