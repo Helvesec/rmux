@@ -64,6 +64,28 @@ fn explicit_restore_and_drop_restore_original_modes() -> Result<()> {
 }
 
 #[test]
+fn reapply_raw_mode_restores_raw_flags_after_explicit_restore() -> Result<()> {
+    let input_original =
+        ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | PRESERVED_INPUT_FLAG;
+    let output_original = PRESERVED_OUTPUT_FLAG;
+    let console = FakeConsole::new(Some(input_original), Some(output_original));
+    let guard = RawTerminalGuard::enter(console.clone())?;
+
+    guard.restore()?;
+    guard.reapply_raw_mode()?;
+
+    assert_eq!(
+        console.mode(INPUT_HANDLE),
+        Some(PRESERVED_INPUT_FLAG | ENABLE_VIRTUAL_TERMINAL_INPUT)
+    );
+    assert_eq!(
+        console.mode(OUTPUT_HANDLE),
+        Some(PRESERVED_OUTPUT_FLAG | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+    );
+    Ok(())
+}
+
+#[test]
 fn drop_restores_original_modes_after_panic() {
     let input_original = ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT;
     let output_original = PRESERVED_OUTPUT_FLAG;
@@ -139,6 +161,18 @@ fn resize_deduper_reports_only_real_size_changes() {
         })),
         None
     );
+}
+
+#[test]
+fn windows_command_shell_preserves_command_payload_as_one_arg() {
+    let command = "echo lock command && exit /b 0";
+    let child = windows_command_shell(command);
+    let args = child
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+    assert_eq!(args, vec!["/D", "/C", command]);
 }
 
 #[derive(Clone, Debug)]

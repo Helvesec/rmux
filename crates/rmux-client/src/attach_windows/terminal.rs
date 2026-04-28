@@ -2,11 +2,13 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io::{self, Write};
 use std::mem::MaybeUninit;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use rmux_core::{alternate_screen_enter_sequence, alternate_screen_exit_sequence};
 use rmux_proto::TerminalSize;
 use tokio::sync::mpsc;
 use windows_sys::Win32::Foundation::{
@@ -63,6 +65,14 @@ pub struct RawTerminal {
     inner: RawTerminalGuard<Win32Console>,
 }
 
+// SAFETY: RawTerminal stores process-wide Win32 console HANDLE values and
+// immutable mode snapshots only. The attach lifecycle serializes semantic
+// ownership by joining the action worker before dropping the guard.
+unsafe impl Send for RawTerminal {}
+// SAFETY: RawTerminal methods operate through Win32 console APIs using shared
+// references; there is no Rust-managed mutable state behind those references.
+unsafe impl Sync for RawTerminal {}
+
 impl RawTerminal {
     /// Enters raw mode for process stdin/stdout console handles.
     pub fn enter() -> Result<Self> {
@@ -74,6 +84,31 @@ impl RawTerminal {
     /// Restores the terminal settings captured when the guard was created.
     pub fn restore(&self) -> Result<()> {
         self.inner.restore()
+    }
+
+    pub(super) fn run_lock_command(&self, command: &str) -> Result<()> {
+        self.restore()?;
+        let command_result = run_shell_command(command);
+        let raw_result = self.inner.reapply_raw_mode();
+        if let Err(error) = command_result {
+            raw_result?;
+            return Err(error);
+        }
+        raw_result?;
+        Ok(())
+    }
+
+    pub(super) fn suspend_self(&self) -> Result<()> {
+        self.restore()?;
+        // Windows has no SIGTSTP/job-control equivalent for console clients.
+        // Re-enter raw mode immediately so the server observes the same
+        // lock/unlock lifecycle without inventing extra tmux behavior.
+        self.inner.reapply_raw_mode()
+    }
+
+    pub(super) fn run_detach_exec_command(&self, command: &str) -> Result<()> {
+        self.restore()?;
+        run_shell_command(command)
     }
 
     pub(super) fn restore_attach_terminal_state(&self) -> Result<()> {
@@ -122,6 +157,16 @@ impl<C: ConsoleApi> RawTerminalGuard<C> {
         }
         if let Some(output) = &self.output {
             output.restore(&self.console)?;
+        }
+        Ok(())
+    }
+
+    fn reapply_raw_mode(&self) -> Result<()> {
+        if let Some(input) = &self.input {
+            input.set(&self.console, raw_input_mode(input.original))?;
+        }
+        if let Some(output) = &self.output {
+            output.set(&self.console, raw_output_mode(output.original))?;
         }
         Ok(())
     }
@@ -413,6 +458,32 @@ const fn raw_input_mode(original: u32) -> u32 {
 
 const fn raw_output_mode(original: u32) -> u32 {
     original | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+}
+
+fn run_shell_command(command: &str) -> Result<()> {
+    let mut stdout = io::stdout();
+    let term = std::env::var("TERM").unwrap_or_default();
+
+    stdout.write_all(alternate_screen_enter_sequence(&term))?;
+    stdout.flush()?;
+
+    let status_result = windows_command_shell(command)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
+
+    stdout.write_all(alternate_screen_exit_sequence(&term))?;
+    stdout.flush()?;
+    status_result.map_err(AttachError::Io)?;
+    Ok(())
+}
+
+fn windows_command_shell(command: &str) -> Command {
+    let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+    let mut child = Command::new(shell);
+    child.arg("/D").arg("/C").arg(command);
+    child
 }
 
 #[cfg(test)]

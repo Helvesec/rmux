@@ -2,6 +2,9 @@
 
 use std::io::{self, Read, Write};
 use std::os::windows::io::AsRawHandle;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
 use std::thread;
 
 use rmux_ipc::BlockingLocalStream;
@@ -10,6 +13,8 @@ use tokio::sync::mpsc;
 
 use crate::ClientError;
 
+#[path = "attach_windows/action.rs"]
+mod action;
 #[path = "attach_windows/input.rs"]
 mod input;
 #[path = "attach_windows/metrics.rs"]
@@ -71,13 +76,13 @@ where
     Input: Read + AsRawHandle + Send + 'static,
     Output: Write + Send + 'static,
 {
-    let raw_terminal = RawTerminal::enter().map_err(ClientError::from)?;
+    let raw_terminal = Arc::new(RawTerminal::enter().map_err(ClientError::from)?);
     let _ = raw_terminal.flush_pending_input();
     let screen_tracker = AttachScreenTracker::default();
     let result = drive_attach_stream_with_terminal_state(
         stream,
         initial_bytes,
-        &raw_terminal,
+        Arc::clone(&raw_terminal),
         &screen_tracker,
         input,
         output,
@@ -93,7 +98,7 @@ where
 fn drive_attach_stream_with_terminal_state<Input, Output>(
     mut stream: BlockingLocalStream,
     initial_bytes: Vec<u8>,
-    _raw_terminal: &RawTerminal,
+    raw_terminal: Arc<RawTerminal>,
     screen_tracker: &AttachScreenTracker,
     input: Input,
     output: Output,
@@ -116,6 +121,7 @@ where
         input,
         output,
         resize_rx,
+        action::ManagedTerminalActions::new(raw_terminal),
     )
 }
 
@@ -136,23 +142,32 @@ where
         input,
         output,
         closed_resize_rx(),
+        action::StreamOnlyActions,
     )
 }
 
-fn drive_attach_stream_inner<Input, Output>(
+fn drive_attach_stream_inner<Input, Output, Actions>(
     stream: BlockingLocalStream,
     initial_bytes: Vec<u8>,
     screen_tracker: AttachScreenTracker,
     input: Input,
     output: Output,
     resize_rx: mpsc::UnboundedReceiver<TerminalSize>,
+    actions: Actions,
 ) -> std::result::Result<(), ClientError>
 where
     Input: Read + AsRawHandle + Send + 'static,
     Output: Write + Send + 'static,
+    Actions: action::AttachActionExecutor + Send + 'static,
 {
     let (input_tx, input_rx) = mpsc::unbounded_channel();
-    let input_thread = thread::spawn(move || input_loop(input, input_tx));
+    let locked = Arc::new(AtomicBool::new(false));
+    let input_locked = Arc::clone(&locked);
+    let input_thread = thread::spawn(move || input_loop(input, input_tx, input_locked));
+    let (action_tx, action_rx) = std_mpsc::channel();
+    let (action_completion_tx, action_completion_rx) = mpsc::unbounded_channel();
+    let action_thread =
+        thread::spawn(move || action_loop(actions, action_rx, action_completion_tx));
     let (pipe, runtime) = stream.into_async_parts();
     let output_result = runtime.block_on(async {
         let (reader, writer) = tokio::io::split(pipe);
@@ -160,23 +175,50 @@ where
             reader,
             writer,
             initial_bytes,
-            input_rx,
-            resize_rx,
             output,
             screen_tracker,
+            stream::AttachAsyncChannels::new(
+                input_rx,
+                resize_rx,
+                action_tx,
+                action_completion_rx,
+                locked,
+            ),
         )
         .await
     });
 
     let input_result = join_attach_thread(input_thread)?;
+    let action_result = join_attach_thread(action_thread)?;
 
     output_result?;
+    action_result?;
     input_result
+}
+
+fn action_loop<Actions>(
+    mut actions: Actions,
+    action_rx: std_mpsc::Receiver<action::AttachAction>,
+    completion_tx: mpsc::UnboundedSender<
+        std::result::Result<action::AttachActionOutcome, ClientError>,
+    >,
+) -> std::result::Result<(), ClientError>
+where
+    Actions: action::AttachActionExecutor,
+{
+    while let Ok(request) = action_rx.recv() {
+        let result = action::run_attach_action(&mut actions, request);
+        if completion_tx.send(result).is_err() {
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 fn input_loop<Input>(
     mut input: Input,
     input_tx: mpsc::UnboundedSender<Vec<u8>>,
+    locked: Arc<AtomicBool>,
 ) -> std::result::Result<(), ClientError>
 where
     Input: Read + AsRawHandle,
@@ -185,6 +227,14 @@ where
     let input_handle = input.as_raw_handle();
 
     loop {
+        if locked.load(Ordering::SeqCst) {
+            if input_tx.is_closed() {
+                return Ok(());
+            }
+            thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+
         if !terminal::wait_for_key_input(input_handle, 50).map_err(ClientError::Io)? {
             if input_tx.is_closed() {
                 return Ok(());

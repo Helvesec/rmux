@@ -164,7 +164,7 @@ impl RemoteProcess {
     }
 
     fn read_unicode_string(&self, value: RemoteUnicodeString) -> io::Result<Option<String>> {
-        if value.length == 0 || value.buffer == 0 || value.length % 2 != 0 {
+        if value.length == 0 || value.buffer == 0 || !value.length.is_multiple_of(2) {
             return Ok(None);
         }
         let units = usize::from(value.length) / 2;
