@@ -6,7 +6,7 @@ publish.workspace = true
 
 [dependencies]
 rmux-os = { path = "../rmux-os" }
-tokio = { version = "1.48.0", features = ["io-util", "net", "rt", "sync"] }
+tokio = { version = "1.48.0", features = ["io-util", "net", "rt", "sync", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.185"

@@ -219,9 +219,7 @@ pub(super) fn persistent_overlay_replacement_pending(
         return false;
     };
     controls.iter().any(|control| match control {
-        AttachControl::Switch(target) => target
-            .persistent_overlay_state_id
-            .is_some_and(|state_id| state_id >= current_state_id),
+        AttachControl::Switch(_) => true,
         AttachControl::Overlay(overlay) => {
             overlay.persistent
                 && !overlay.frame.is_empty()
@@ -231,6 +229,14 @@ pub(super) fn persistent_overlay_replacement_pending(
         }
         _ => false,
     })
+}
+
+pub(super) fn defer_persistent_clear(
+    persistent_clear: bool,
+    controls: &VecDeque<AttachControl>,
+    current_state_id: Option<u64>,
+) -> bool {
+    persistent_clear && persistent_overlay_replacement_pending(controls, current_state_id)
 }
 
 #[cfg(test)]

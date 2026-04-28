@@ -59,8 +59,10 @@ pub(crate) fn spawn_pane_exit_watcher(
     let Some(pane_exit_callback) = pane_exit_callback else {
         return;
     };
-    let _ = std::thread::Builder::new()
-        .name(format!("rmux-pane-exit-{}", pane_id.as_u32()))
+    let thread_name = format!("rmux-pane-exit-{}", pane_id.as_u32());
+    let session_for_log = session_name.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name(thread_name.clone())
         .spawn(move || {
             let _ = child.wait();
             pane_exit_callback(PaneExitEvent {
@@ -68,7 +70,15 @@ pub(crate) fn spawn_pane_exit_watcher(
                 pane_id,
                 generation,
             });
-        });
+        })
+    {
+        warn!(
+            session = %session_for_log,
+            pane_id = pane_id.as_u32(),
+            thread = %thread_name,
+            "failed to spawn pane exit watcher: {error}"
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -83,8 +93,10 @@ pub(crate) fn spawn_pane_output_reader(
     pane_alert_callback: Option<PaneAlertCallback>,
     pane_exit_callback: Option<PaneExitCallback>,
 ) {
-    let _ = std::thread::Builder::new()
-        .name(format!("rmux-pane-reader-{}", pane_id.as_u32()))
+    let thread_name = format!("rmux-pane-reader-{}", pane_id.as_u32());
+    let session_for_log = session_name.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name(thread_name.clone())
         .spawn(move || {
             if let Err(error) = read_pane_output_blocking(
                 pane_master,
@@ -102,7 +114,15 @@ pub(crate) fn spawn_pane_output_reader(
                     "pane output reader stopped: {error}"
                 );
             }
-        });
+        })
+    {
+        warn!(
+            session = %session_for_log,
+            pane_id = pane_id.as_u32(),
+            thread = %thread_name,
+            "failed to spawn pane output reader: {error}"
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

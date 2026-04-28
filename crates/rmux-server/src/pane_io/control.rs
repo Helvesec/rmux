@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 use super::persistent_overlay::{
     accept_persistent_overlay_state, advance_persistent_overlay_state, clear_then_base_frame,
-    discard_stale_persistent_overlays, is_stale_persistent_switch,
+    defer_persistent_clear, discard_stale_persistent_overlays, is_stale_persistent_switch,
     persistent_overlay_replacement_pending, replacement_persistent_overlay_frame,
     switch_requires_screen_clear, take_pending_persistent_overlay_for_state,
     update_persistent_overlay_cache,
@@ -230,13 +230,20 @@ pub(super) async fn apply_pending_attach_controls(
                 if persistent_clear
                     || should_emit_overlay(*render_generation, overlay_generation, &overlay)
                 {
-                    let clear_frame =
-                        persistent_clear.then(|| clear_then_base_frame(current_target));
                     update_persistent_overlay_cache(
                         persistent_overlay,
                         persistent_overlay_visible,
                         &overlay,
                     );
+                    if defer_persistent_clear(
+                        persistent_clear,
+                        deferred_controls,
+                        *persistent_overlay_state_id,
+                    ) {
+                        continue;
+                    }
+                    let clear_frame =
+                        persistent_clear.then(|| clear_then_base_frame(current_target));
                     emit_render_frame(
                         stream,
                         &current_target.outer_terminal,
@@ -284,9 +291,9 @@ pub(super) async fn redraw_after_persistent_overlay_state_advance(
     }
 
     if replacement_pending {
-        // State advance is only an ordering barrier when a replacement overlay
-        // is queued. Keep the current overlay on screen to avoid flashing the
-        // base pane between choose-tree frames.
+        // State advance is only an ordering barrier when a replacement repaint
+        // is queued. Keep the current overlay on screen to avoid flashing a
+        // stale base pane between choose-tree frames.
         return Ok(());
     }
 

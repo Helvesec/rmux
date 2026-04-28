@@ -19,12 +19,17 @@ use std::time::Instant;
 use crate::LocalEndpoint;
 use rmux_os::identity::UserIdentity;
 
+#[cfg(unix)]
+use rustix::net::RecvFlags;
 #[cfg(windows)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_PIPE_BUSY, HANDLE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, LocalFree, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_BUSY,
+    ERROR_PIPE_NOT_CONNECTED, HANDLE,
+};
 #[cfg(windows)]
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 #[cfg(windows)]
@@ -32,7 +37,9 @@ use windows_sys::Win32::Security::{
     GetTokenInformation, RevertToSelf, TokenUser, TOKEN_QUERY, TOKEN_USER,
 };
 #[cfg(windows)]
-use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, ImpersonateNamedPipeClient};
+use windows_sys::Win32::System::Pipes::{
+    GetNamedPipeClientProcessId, ImpersonateNamedPipeClient, PeekNamedPipe,
+};
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
@@ -64,6 +71,93 @@ pub type LocalStream = tokio::net::windows::named_pipe::NamedPipeServer;
 pub struct BlockingLocalStream {
     inner: NamedPipeClient,
     runtime: tokio::runtime::Runtime,
+}
+
+/// Waits for the connected local peer to disappear without consuming protocol bytes.
+pub async fn wait_for_peer_close(stream: &LocalStream) -> io::Result<()> {
+    wait_for_peer_close_impl(stream).await
+}
+
+#[cfg(unix)]
+async fn wait_for_peer_close_impl(stream: &LocalStream) -> io::Result<()> {
+    loop {
+        if let Err(error) = stream.readable().await {
+            if is_peer_disconnect(&error) {
+                return Ok(());
+            }
+            return Err(error);
+        }
+        let mut probe = [0_u8; 1];
+
+        match rustix::net::recv(stream, &mut probe, RecvFlags::PEEK) {
+            Ok((_initialized, 0)) => return Ok(()),
+            Ok((_initialized, _available)) => return std::future::pending().await,
+            Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => continue,
+            Err(rustix::io::Errno::PIPE | rustix::io::Errno::CONNRESET) => return Ok(()),
+            Err(error) => return Err(io::Error::from(error)),
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_peer_close_impl(stream: &LocalStream) -> io::Result<()> {
+    loop {
+        if let Err(error) = stream.readable().await {
+            if is_peer_disconnect(&error) {
+                return Ok(());
+            }
+            return Err(error);
+        }
+
+        let mut available = 0_u32;
+        let ok = unsafe {
+            // SAFETY: `stream` is a connected named-pipe server handle and
+            // `available` is a valid out pointer. Passing a null buffer peeks
+            // byte counts only and does not consume protocol data.
+            PeekNamedPipe(
+                stream.as_raw_handle() as HANDLE,
+                null_mut(),
+                0,
+                null_mut(),
+                &mut available,
+                null_mut(),
+            )
+        };
+        if ok == 0 {
+            let error = io::Error::last_os_error();
+            if is_peer_disconnect(&error) {
+                return Ok(());
+            }
+            return Err(error);
+        }
+        if available > 0 {
+            return std::future::pending().await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn is_peer_disconnect(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+    ) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        if matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_BROKEN_PIPE as i32
+                    || code == ERROR_PIPE_NOT_CONNECTED as i32
+                    || code == ERROR_NO_DATA as i32
+        ) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(windows)]

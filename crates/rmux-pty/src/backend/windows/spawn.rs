@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::{ChildCommand, ProcessId, Result, Signal};
 
-use super::{should_enable_dsr_bootstrap, WindowsPty};
+use super::{process_tree, should_enable_dsr_bootstrap, WindowsPty};
 
 #[derive(Debug)]
 pub(crate) struct WindowsChild {
@@ -240,7 +240,7 @@ pub(crate) fn kill_child(child: &WindowsChild, signal: Signal) -> Result<()> {
             if let Some(job) = &child.job {
                 job.terminate(1)?;
             } else {
-                terminate_process(&child.process, 1)?;
+                process_tree::terminate_process_tree(child.pid, &child.process, 1)?;
             }
             Ok(())
         }

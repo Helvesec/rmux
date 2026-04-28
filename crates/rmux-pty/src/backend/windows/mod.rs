@@ -1,5 +1,6 @@
 mod dsr;
 mod io;
+mod process_tree;
 mod pty;
 mod spawn;
 

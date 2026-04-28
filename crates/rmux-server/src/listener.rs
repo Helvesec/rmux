@@ -6,10 +6,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rmux_ipc::{LocalListener, LocalStream, PeerIdentity};
+use rmux_ipc::{wait_for_peer_close, LocalListener, LocalStream, PeerIdentity};
 use rmux_proto::{encode_frame, ErrorResponse, FrameDecoder, Request, Response};
-#[cfg(unix)]
-use rustix::net::RecvFlags;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinError, JoinSet};
@@ -221,43 +219,6 @@ async fn serve_connection(
             }
         }
     }
-}
-
-async fn wait_for_peer_close(stream: &LocalStream) -> io::Result<()> {
-    wait_for_peer_close_impl(stream).await
-}
-
-#[cfg(unix)]
-async fn wait_for_peer_close_impl(stream: &LocalStream) -> io::Result<()> {
-    loop {
-        if let Err(error) = stream.readable().await {
-            if is_peer_disconnect(&error) {
-                return Ok(());
-            }
-            return Err(error);
-        }
-        let mut probe = [0_u8; 1];
-
-        match rustix::net::recv(stream, &mut probe, RecvFlags::PEEK) {
-            Ok((_initialized, 0)) => return Ok(()),
-            Ok((_initialized, _available)) => return std::future::pending().await,
-            Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => continue,
-            Err(rustix::io::Errno::PIPE | rustix::io::Errno::CONNRESET) => return Ok(()),
-            Err(error) => return Err(io::Error::from(error)),
-        }
-    }
-}
-
-#[cfg(windows)]
-async fn wait_for_peer_close_impl(_stream: &LocalStream) -> io::Result<()> {
-    std::future::pending().await
-}
-
-fn is_peer_disconnect(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
-    )
 }
 
 fn log_connection_task_result(result: Result<io::Result<()>, JoinError>) {

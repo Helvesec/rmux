@@ -1,8 +1,16 @@
-use std::time::Duration;
+use std::{future::pending, time::Duration};
 
 use tokio::time::Instant;
 
 const ATTACH_REFRESH_COALESCE: Duration = Duration::from_millis(16);
+
+pub(super) async fn wait_for_refresh_deadline(deadline: Option<Instant>) {
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(deadline).await;
+    } else {
+        pending::<()>().await;
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct AttachRefreshScheduler {

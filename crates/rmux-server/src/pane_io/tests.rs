@@ -18,6 +18,8 @@ use super::{
 use crate::handler::RequestHandler;
 use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
 
+mod persistent_overlay;
+
 #[test]
 fn overlay_generation_rejects_stale_clears_after_switches_or_newer_overlays() {
     let mut current_overlay_generation = 0;
