@@ -7,6 +7,9 @@ pub(crate) const SESSION_WORKFLOW_STEP_COUNT: usize = 20;
 pub(crate) const WORKFLOW_TRUECOLOR_FEATURES: &str =
     ",xterm-256color:RGB,tmux-256color:RGB,screen-256color:RGB,screen:RGB";
 
+/// Shell command used to prove the pane inherited the session COLORTERM value.
+pub(crate) const WORKFLOW_COLORTERM_PRINT_COMMAND: &str = "printf \"%s\\n\" \"$COLORTERM\"";
+
 pub(crate) struct WorkflowStep {
     /// Stable step label used by fixture verification and test assertions.
     pub(crate) label: &'static str,
@@ -128,7 +131,7 @@ pub(crate) const CANONICAL_SESSION_WORKFLOW: [WorkflowStep; SESSION_WORKFLOW_STE
             "send-keys",
             "-t",
             "workflow:0.1",
-            "printf \"$COLORTERM\"",
+            WORKFLOW_COLORTERM_PRINT_COMMAND,
             "Enter",
         ],
         runtime_argv: false,
@@ -296,7 +299,7 @@ pub(crate) fn verify_fixture_coherence() {
             "send-keys",
             "-t",
             "workflow:0.1",
-            "printf \"$COLORTERM\"",
+            WORKFLOW_COLORTERM_PRINT_COMMAND,
             "Enter",
         ]
     );

@@ -277,6 +277,12 @@ async fn attached_prefix_q_inside_choose_tree_restores_the_tree_overlay_without_
         .execute_parsed_commands_for_test(requester_pid, commands)
         .await
         .expect("choose-tree activates");
+    let initial_tree_overlay =
+        recv_overlay_frame(&mut control_rx, "initial choose-tree overlay").await;
+    assert!(
+        initial_tree_overlay.contains("sort: index"),
+        "choose-tree precondition should render the tree overlay, got: {initial_tree_overlay:?}"
+    );
     drain_attach_controls(&mut control_rx);
 
     handler

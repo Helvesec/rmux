@@ -40,6 +40,7 @@ pub(crate) use tmux_compat::{
 };
 pub(crate) use workflow_fixture::{
     verify_fixture_coherence, WorkflowStep, CANONICAL_SESSION_WORKFLOW, EXPECTED_LABELS,
+    WORKFLOW_COLORTERM_PRINT_COMMAND,
 };
 
 pub(crate) const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);

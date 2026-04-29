@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use common::{
     assert_only_default_socket, assert_success, child_process_states, read_until_contains,
     read_until_contains_all, stderr, stdout, verify_fixture_coherence, AttachedSession, CliHarness,
-    BINARY_OVERRIDE_ENV, CANONICAL_SESSION_WORKFLOW,
+    BINARY_OVERRIDE_ENV, CANONICAL_SESSION_WORKFLOW, WORKFLOW_COLORTERM_PRINT_COMMAND,
 };
 use rmux_pty::TerminalSize;
 
@@ -104,7 +104,8 @@ fn canonical_session_workflow_runs_end_to_end() -> Result<(), Box<dyn Error>> {
                     .expect("attach-session step must complete before send-keys-env");
                 let output = read_until_contains(attach.master_mut(), "truecolor", ATTACH_TIMEOUT)?;
                 assert!(
-                    output.contains("printf \"$COLORTERM\"") && output.contains("truecolor"),
+                    output.contains(WORKFLOW_COLORTERM_PRINT_COMMAND)
+                        && output.contains("truecolor"),
                     "send-keys-env should surface the pane's inherited COLORTERM value"
                 );
             }
