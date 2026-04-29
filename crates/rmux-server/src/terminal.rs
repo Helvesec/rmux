@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::io;
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -265,12 +267,35 @@ pub(crate) fn shell_tokio_command(
     cwd: &Path,
     command: &str,
 ) -> tokio::process::Command {
-    ShellSpec::new(shell).command_tokio_child(cwd, command)
+    let mut command = ShellSpec::new(shell).command_tokio_child(cwd, command);
+    configure_hidden_tokio_helper(&mut command);
+    command
 }
 
 pub(crate) fn shell_std_command(shell: &Path, cwd: &Path, command: &str) -> Command {
-    ShellSpec::new(shell).command_std_child(cwd, command)
+    let mut command = ShellSpec::new(shell).command_std_child(cwd, command);
+    configure_hidden_std_helper(&mut command);
+    command
 }
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[cfg(windows)]
+fn configure_hidden_tokio_helper(command: &mut tokio::process::Command) {
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn configure_hidden_tokio_helper(_command: &mut tokio::process::Command) {}
+
+#[cfg(windows)]
+fn configure_hidden_std_helper(command: &mut Command) {
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn configure_hidden_std_helper(_command: &mut Command) {}
 
 #[cfg(test)]
 pub(crate) fn spawn_hook_command(command: String) -> io::Result<()> {

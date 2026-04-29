@@ -43,18 +43,23 @@ impl WindowsPty {
                 .map_err(|_| io::Error::other("ConPTY state lock poisoned"))?;
             let bytes_read = super::io::read(&state.output_read, buffer)?;
             drop(state);
-            let mut dsr_bootstrap = self
-                .dsr_bootstrap
-                .lock()
-                .map_err(|_| io::Error::other("ConPTY DSR mutex poisoned"))?;
-            let Some(dsr) = dsr_bootstrap.as_mut() else {
-                return Ok(bytes_read);
-            };
+            let filtered = {
+                let mut dsr_bootstrap = self
+                    .dsr_bootstrap
+                    .lock()
+                    .map_err(|_| io::Error::other("ConPTY DSR mutex poisoned"))?;
+                let Some(dsr) = dsr_bootstrap.as_mut() else {
+                    return Ok(bytes_read);
+                };
 
-            let filtered = dsr.filter(buffer, bytes_read);
+                let filtered = dsr.filter(buffer, bytes_read);
+                if filtered.response.is_some() {
+                    *dsr_bootstrap = None;
+                }
+                filtered
+            };
             if let Some(response) = filtered.response {
                 self.write_all(response)?;
-                *dsr_bootstrap = None;
             }
             if filtered.len > 0 || bytes_read == 0 {
                 return Ok(filtered.len);

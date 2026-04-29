@@ -25,6 +25,16 @@ impl RuntimeFormatContext<'_> {
 
     #[cfg(windows)]
     pub(super) fn pane_current_path(&self) -> Option<String> {
+        let process_cwd = || {
+            let state = self.state?;
+            let session_name = self.session_name()?;
+            let window_index = self.window_index?;
+            let pane = self.pane?;
+            state
+                .pane_pid_in_window(session_name, window_index, pane.index())
+                .ok()
+                .and_then(process::current_path)
+        };
         let profile_cwd = || {
             let state = self.state?;
             let session_name = self.session_name()?;
@@ -36,6 +46,7 @@ impl RuntimeFormatContext<'_> {
                 .map(|profile| profile.cwd().to_string_lossy().into_owned())
         };
         self.pane_screen_path()
+            .or_else(process_cwd)
             .or_else(profile_cwd)
             .or_else(|| self.environment_value_by_name("PWD"))
             .or_else(|| self.environment_value_by_name("USERPROFILE"))

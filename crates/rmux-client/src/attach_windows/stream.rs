@@ -247,7 +247,7 @@ where
 }
 
 pub(super) struct AttachAsyncChannels {
-    input_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    input_rx: mpsc::Receiver<Vec<u8>>,
     resize_rx: mpsc::UnboundedReceiver<TerminalSize>,
     action_tx: std_mpsc::Sender<AttachAction>,
     action_completion_rx:
@@ -257,7 +257,7 @@ pub(super) struct AttachAsyncChannels {
 
 impl AttachAsyncChannels {
     pub(super) const fn new(
-        input_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        input_rx: mpsc::Receiver<Vec<u8>>,
         resize_rx: mpsc::UnboundedReceiver<TerminalSize>,
         action_tx: std_mpsc::Sender<AttachAction>,
         action_completion_rx: mpsc::UnboundedReceiver<

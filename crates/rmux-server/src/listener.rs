@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rmux_ipc::{LocalListener, LocalStream, PeerIdentity};
-use rmux_proto::{encode_frame, ErrorResponse, FrameDecoder, Request, Response};
+use rmux_ipc::{wait_for_peer_close, LocalListener, LocalStream, PeerIdentity};
+use rmux_proto::{encode_frame, ErrorResponse, FrameDecoder, Request, Response, WaitForMode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinError, JoinSet};
@@ -47,6 +47,8 @@ pub(crate) async fn serve(
     });
 
     loop {
+        drain_finished_connection_tasks(&mut connection_tasks);
+
         tokio::select! {
             result = listener.accept() => {
                 let (stream, requester) = match result {
@@ -64,9 +66,6 @@ pub(crate) async fn serve(
                 connection_tasks.spawn(async move {
                     serve_connection(stream, requester, handler, connection_shutdown, shutdown_handle).await
                 });
-            }
-            Some(result) = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
-                log_connection_task_result(result);
             }
             _ = &mut shutdown => {
                 debug!("shutdown requested");
@@ -119,6 +118,7 @@ async fn serve_connection(
                     }
                 };
 
+                let cancel_on_peer_disconnect = request_cancels_on_peer_disconnect(&request);
                 debug!("dispatching {}", request.command_name());
                 let outcome = tokio::select! {
                     outcome = handler.dispatch(requester.pid, request) => outcome,
@@ -128,7 +128,7 @@ async fn serve_connection(
                         }
                         return Ok(());
                     }
-                    result = conn.read_until_peer_close() => {
+                    result = wait_for_peer_close(&conn.stream), if cancel_on_peer_disconnect => {
                         result?;
                         debug!("closing client connection after peer disconnect");
                         return Ok(());
@@ -229,6 +229,20 @@ async fn serve_connection(
     }
 }
 
+fn request_cancels_on_peer_disconnect(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::WaitFor(wait)
+            if matches!(wait.mode, WaitForMode::Wait | WaitForMode::Lock)
+    )
+}
+
+fn drain_finished_connection_tasks(tasks: &mut JoinSet<io::Result<()>>) {
+    while let Some(result) = tasks.try_join_next() {
+        log_connection_task_result(result);
+    }
+}
+
 fn log_connection_task_result(result: Result<io::Result<()>, JoinError>) {
     match result {
         Ok(Ok(())) => {}
@@ -269,16 +283,6 @@ impl Connection {
                 return Ok(None);
             }
 
-            self.decoder.push_bytes(&self.read_buffer[..bytes_read]);
-        }
-    }
-
-    async fn read_until_peer_close(&mut self) -> io::Result<()> {
-        loop {
-            let bytes_read = self.stream.read(&mut self.read_buffer).await?;
-            if bytes_read == 0 {
-                return Ok(());
-            }
             self.decoder.push_bytes(&self.read_buffer[..bytes_read]);
         }
     }

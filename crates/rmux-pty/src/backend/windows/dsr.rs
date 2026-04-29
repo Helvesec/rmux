@@ -7,6 +7,7 @@ const MIN_TIMEOUT_MS: u64 = 50;
 const MAX_TIMEOUT_MS: u64 = 2_000;
 const DSR_REQUEST: &[u8] = b"\x1b[6n";
 const DSR_RESPONSE: &[u8] = b"\x1b[1;1R";
+const MAX_DEFERRED_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct DsrBootstrap {
@@ -135,7 +136,8 @@ fn emit_output(
     let len = output.len().min(buffer.len());
     buffer[..len].copy_from_slice(&output[..len]);
     deferred.clear();
-    deferred.extend_from_slice(&output[len..]);
+    let remaining = &output[len..];
+    deferred.extend_from_slice(&remaining[..remaining.len().min(MAX_DEFERRED_BYTES)]);
     DsrFilter { len, response }
 }
 
@@ -216,5 +218,17 @@ mod tests {
 
         assert_eq!(&second[..filtered.len], b"\x1b[XX");
         assert_eq!(filtered.response, None);
+    }
+
+    #[test]
+    fn deferred_output_is_bounded() {
+        let mut buffer = [0_u8; 1];
+        let mut deferred = Vec::new();
+        let output = vec![b'x'; MAX_DEFERRED_BYTES + 32];
+
+        let filtered = emit_output(&mut buffer, &mut deferred, &output, None);
+
+        assert_eq!(filtered.len, 1);
+        assert_eq!(deferred.len(), MAX_DEFERRED_BYTES);
     }
 }

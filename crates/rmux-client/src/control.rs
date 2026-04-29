@@ -13,6 +13,8 @@ use rmux_proto::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 #[cfg(windows)]
 use tokio::sync::mpsc as tokio_mpsc;
+#[cfg(windows)]
+use tokio::time::{self, Duration};
 
 use crate::{
     connection::{read_response_frame_exact, Connection, ControlModeUpgrade, ControlTransition},
@@ -120,6 +122,11 @@ where
 }
 
 #[cfg(windows)]
+const CONTROL_STDIN_QUEUE_CAPACITY: usize = 256;
+#[cfg(windows)]
+const CONTROL_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[cfg(windows)]
 fn drive_control_stream<R, W>(
     stream: BlockingLocalStream,
     initial_commands: &[String],
@@ -130,7 +137,7 @@ where
     R: Read + Send + 'static,
     W: Write,
 {
-    let (input_tx, input_rx) = tokio_mpsc::unbounded_channel();
+    let (input_tx, input_rx) = tokio_mpsc::channel(CONTROL_STDIN_QUEUE_CAPACITY);
     let (stdin_done_tx, stdin_done_rx) = mpsc::sync_channel(1);
     let stdin_thread = thread::spawn(move || {
         let result = copy_control_input(input, input_tx);
@@ -221,10 +228,7 @@ fn shutdown_write(stream: &BlockingLocalStream) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn copy_control_input<R>(
-    mut input: R,
-    input_tx: tokio_mpsc::UnboundedSender<Vec<u8>>,
-) -> io::Result<()>
+fn copy_control_input<R>(mut input: R, input_tx: tokio_mpsc::Sender<Vec<u8>>) -> io::Result<()>
 where
     R: Read,
 {
@@ -237,7 +241,10 @@ where
             Err(error) => return Err(error),
         };
 
-        if input_tx.send(buffer[..bytes_read].to_vec()).is_err() {
+        if input_tx
+            .blocking_send(buffer[..bytes_read].to_vec())
+            .is_err()
+        {
             return Ok(());
         }
     }
@@ -247,7 +254,7 @@ where
 async fn drive_async_control<Stream, W>(
     stream: Stream,
     initial_commands: &[String],
-    mut input_rx: tokio_mpsc::UnboundedReceiver<Vec<u8>>,
+    mut input_rx: tokio_mpsc::Receiver<Vec<u8>>,
     output: &mut W,
 ) -> io::Result<()>
 where
@@ -258,6 +265,7 @@ where
     let mut submitted_commands = initial_commands.len();
     let mut completed_commands = 0_usize;
     let mut input_closed = false;
+    let mut all_commands_completed = false;
     let (mut reader, mut writer) = tokio::io::split(stream);
     write_async_initial_commands(&mut writer, initial_commands).await?;
     let mut buffer = [0_u8; 8192];
@@ -274,9 +282,7 @@ where
                     None => {
                         writer.flush().await?;
                         input_closed = true;
-                        if submitted_commands == 0 {
-                            return Ok(());
-                        }
+                        all_commands_completed = completed_commands >= submitted_commands;
                     }
                 }
             }
@@ -285,13 +291,17 @@ where
                 if bytes_read == 0 {
                     return Ok(());
                 }
-                completed_commands = completed_commands
-                    .saturating_add(completion_tracker.observe(&buffer[..bytes_read]));
+                let observed = completion_tracker.observe(&buffer[..bytes_read]);
+                completed_commands = completed_commands.saturating_add(observed.completed);
                 output.write_all(&buffer[..bytes_read])?;
                 output.flush()?;
-                if input_closed && completed_commands >= submitted_commands {
+                if observed.exited {
                     return Ok(());
                 }
+                all_commands_completed = input_closed && completed_commands >= submitted_commands;
+            }
+            _ = time::sleep(CONTROL_EXIT_DRAIN_TIMEOUT), if all_commands_completed => {
+                return Ok(());
             }
         }
     }
@@ -305,17 +315,27 @@ struct ControlCompletionTracker {
 
 #[cfg(windows)]
 impl ControlCompletionTracker {
-    fn observe(&mut self, bytes: &[u8]) -> usize {
+    fn observe(&mut self, bytes: &[u8]) -> ControlOutputObservation {
         self.pending.extend_from_slice(bytes);
-        let mut completed = 0;
+        let mut observation = ControlOutputObservation::default();
         while let Some(position) = self.pending.iter().position(|byte| *byte == b'\n') {
             let line = self.pending.drain(..=position).collect::<Vec<_>>();
             if is_control_completion_line(&line) {
-                completed += 1;
+                observation.completed += 1;
+            }
+            if is_control_exit_line(&line) {
+                observation.exited = true;
             }
         }
-        completed
+        observation
     }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ControlOutputObservation {
+    completed: usize,
+    exited: bool,
 }
 
 #[cfg(windows)]
@@ -326,6 +346,11 @@ fn count_complete_control_lines(bytes: &[u8]) -> usize {
 #[cfg(windows)]
 fn is_control_completion_line(line: &[u8]) -> bool {
     line.starts_with(b"%end ") || line.starts_with(b"%error ")
+}
+
+#[cfg(windows)]
+fn is_control_exit_line(line: &[u8]) -> bool {
+    line == b"%exit\n" || line.starts_with(b"%exit ")
 }
 
 #[cfg(windows)]
@@ -433,9 +458,10 @@ mod windows_tests {
     async fn control_input_eof_waits_for_completed_command_without_empty_line(
     ) -> std::io::Result<()> {
         let (client, mut server) = tokio::io::duplex(4096);
-        let (input_tx, input_rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
+        let (input_tx, input_rx) = tokio_mpsc::channel::<Vec<u8>>(1);
         input_tx
             .send(b"list-sessions\n".to_vec())
+            .await
             .expect("send input");
         drop(input_tx);
         let mut output = Vec::new();
@@ -456,6 +482,37 @@ mod windows_tests {
 
         tokio::try_join!(drive, server_peer)?;
         assert_eq!(output, b"%begin 1 1 1\n%end 1 1 1\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn control_input_eof_drains_exit_after_completed_command() -> std::io::Result<()> {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let (input_tx, input_rx) = tokio_mpsc::channel::<Vec<u8>>(1);
+        input_tx
+            .send(b"list-sessions\n".to_vec())
+            .await
+            .expect("send input");
+        drop(input_tx);
+        let mut output = Vec::new();
+
+        let drive = drive_async_control(client, &[], input_rx, &mut output);
+        let server_peer = async {
+            let mut received = Vec::new();
+            let mut buffer = [0_u8; 32];
+            while !received.ends_with(b"\n") {
+                let bytes_read = server.read(&mut buffer).await?;
+                assert_ne!(bytes_read, 0, "client closed before sending command");
+                received.extend_from_slice(&buffer[..bytes_read]);
+            }
+            server.write_all(b"%begin 1 1 1\n%end 1 1 1\n").await?;
+            tokio::task::yield_now().await;
+            server.write_all(b"%exit\n").await?;
+            Ok::<(), std::io::Error>(())
+        };
+
+        tokio::try_join!(drive, server_peer)?;
+        assert_eq!(output, b"%begin 1 1 1\n%end 1 1 1\n%exit\n");
         Ok(())
     }
 }

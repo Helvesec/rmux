@@ -10,6 +10,7 @@ use rmux_ipc::BlockingLocalStream;
 use rmux_proto::{encode_attach_message, AttachMessage, TerminalSize};
 use tokio::sync::mpsc;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_CHAR};
 
 use crate::ClientError;
 
@@ -21,6 +22,8 @@ mod input;
 mod lock_state;
 #[path = "attach_windows/metrics.rs"]
 mod metrics;
+#[path = "attach_windows/output.rs"]
+mod output;
 #[path = "attach/screen.rs"]
 mod screen;
 #[path = "attach_windows/stream.rs"]
@@ -35,6 +38,7 @@ use screen::AttachScreenTracker;
 pub use terminal::{AttachError, RawTerminal, Result};
 
 const READ_BUFFER_SIZE: usize = 8192;
+const ATTACH_INPUT_QUEUE_CAPACITY: usize = 256;
 
 /// Runs the attach loop using the process stdin/stdout streams.
 pub fn attach_terminal(stream: BlockingLocalStream) -> std::result::Result<(), ClientError> {
@@ -47,7 +51,7 @@ pub fn attach_terminal_with_initial_bytes(
     initial_bytes: Vec<u8>,
 ) -> std::result::Result<(), ClientError> {
     let input = io::stdin();
-    let output = io::stdout();
+    let output = output::AttachStdout::new(io::stdout());
 
     attach_with_stdio(stream, initial_bytes, input, output)
 }
@@ -161,7 +165,8 @@ where
     Output: Write + Send + 'static,
     Actions: action::AttachActionExecutor + Send + 'static,
 {
-    let (input_tx, input_rx) = mpsc::unbounded_channel();
+    let input_join_policy = input_join_policy(input.as_raw_handle());
+    let (input_tx, input_rx) = mpsc::channel(ATTACH_INPUT_QUEUE_CAPACITY);
     let lock_state = Arc::new(AttachLockState::default());
     let input_lock_state = Arc::clone(&lock_state);
     let input_thread = thread::spawn(move || input_loop(input, input_tx, input_lock_state));
@@ -190,7 +195,10 @@ where
     });
 
     lock_state.close();
-    let input_result = join_attach_thread(input_thread)?;
+    let input_result = match input_join_policy {
+        InputJoinPolicy::JoinOnClose => join_attach_thread(input_thread)?,
+        InputJoinPolicy::DetachOnClose => Ok(()),
+    };
     let action_result = join_attach_thread(action_thread)?;
 
     output_result?;
@@ -219,7 +227,7 @@ where
 
 fn input_loop<Input>(
     mut input: Input,
-    input_tx: mpsc::UnboundedSender<Vec<u8>>,
+    input_tx: mpsc::Sender<Vec<u8>>,
     lock_state: Arc<AttachLockState>,
 ) -> std::result::Result<(), ClientError>
 where
@@ -256,10 +264,35 @@ where
             continue;
         }
 
-        if input_tx.send(read_buffer[..bytes_read].to_vec()).is_err() {
+        if input_tx
+            .blocking_send(read_buffer[..bytes_read].to_vec())
+            .is_err()
+        {
             return Ok(());
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputJoinPolicy {
+    JoinOnClose,
+    DetachOnClose,
+}
+
+fn input_join_policy(handle: RawHandle) -> InputJoinPolicy {
+    if is_absent_input_handle(handle) || is_console_input_handle(handle) {
+        InputJoinPolicy::JoinOnClose
+    } else {
+        InputJoinPolicy::DetachOnClose
+    }
+}
+
+fn is_console_input_handle(handle: RawHandle) -> bool {
+    let file_type = unsafe {
+        // SAFETY: GetFileType only observes the borrowed OS handle.
+        GetFileType(handle)
+    };
+    file_type == FILE_TYPE_CHAR
 }
 
 fn is_absent_input_handle(handle: RawHandle) -> bool {
@@ -286,4 +319,40 @@ fn join_attach_thread(
     thread
         .join()
         .map_err(|_| ClientError::Io(io::Error::other("attach thread panicked")))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+
+    use super::{input_join_policy, InputJoinPolicy};
+
+    #[test]
+    fn pipe_stdin_handles_are_detached_on_attach_close() {
+        let mut read: HANDLE = std::ptr::null_mut();
+        let mut write: HANDLE = std::ptr::null_mut();
+        let ok = unsafe {
+            // SAFETY: read/write point to writable HANDLE slots and the default
+            // security descriptor is acceptable for this local test pipe.
+            CreatePipe(&mut read, &mut write, std::ptr::null_mut(), 0)
+        };
+        assert_ne!(ok, 0, "CreatePipe failed: {}", io::Error::last_os_error());
+        let read = unsafe {
+            // SAFETY: read is owned by this test after a successful CreatePipe call.
+            OwnedHandle::from_raw_handle(read)
+        };
+        let _write = unsafe {
+            // SAFETY: write is owned by this test after a successful CreatePipe call.
+            OwnedHandle::from_raw_handle(write)
+        };
+
+        assert_eq!(
+            input_join_policy(read.as_raw_handle()),
+            InputJoinPolicy::DetachOnClose
+        );
+    }
 }

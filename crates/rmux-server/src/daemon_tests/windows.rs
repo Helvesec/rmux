@@ -232,10 +232,16 @@ fn unique_endpoint() -> io::Result<rmux_ipc::LocalEndpoint> {
 }
 
 fn roundtrip(endpoint: &rmux_ipc::LocalEndpoint, request: Request) -> io::Result<Response> {
+    let command_name = request.command_name();
     let mut stream = rmux_ipc::connect_blocking(endpoint, Duration::from_secs(5))?;
     let frame = encode_frame(&request).map_err(io::Error::other)?;
     stream.write_all(&frame)?;
-    read_response(&mut stream)
+    read_response(&mut stream).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("request {command_name} failed while reading response: {error}"),
+        )
+    })
 }
 
 fn read_response(stream: &mut rmux_ipc::BlockingLocalStream) -> io::Result<Response> {

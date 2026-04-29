@@ -126,6 +126,7 @@ async fn keystrokes_received_while_locked_are_dropped_after_unlock(
         .await?;
     input_tx
         .send(b"secret".to_vec())
+        .await
         .expect("send locked input");
 
     assert_eq!(
@@ -134,6 +135,7 @@ async fn keystrokes_received_while_locked_are_dropped_after_unlock(
     );
     input_tx
         .send(b"visible".to_vec())
+        .await
         .expect("send unlocked input");
 
     assert_eq!(
@@ -192,14 +194,14 @@ struct AttachScenario {
     actions: RecordingActions,
     output: SharedOutput,
     server: Option<tokio::io::DuplexStream>,
-    input_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    input_tx: Option<mpsc::Sender<Vec<u8>>>,
 }
 
 impl AttachScenario {
     fn new(actions: RecordingActions) -> Self {
         let (client_stream, server) = tokio::io::duplex(4096);
         let (reader, writer) = tokio::io::split(client_stream);
-        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (input_tx, input_rx) = mpsc::channel(8);
         let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
         let locked = Arc::new(AttachLockState::default());
         let client_actions = actions.clone();
@@ -245,7 +247,7 @@ impl AttachScenario {
         self.server.take().expect("server stream should be present")
     }
 
-    fn input_tx(&self) -> mpsc::UnboundedSender<Vec<u8>> {
+    fn input_tx(&self) -> mpsc::Sender<Vec<u8>> {
         self.input_tx
             .as_ref()
             .expect("input sender should be present")

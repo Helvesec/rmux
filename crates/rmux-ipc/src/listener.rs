@@ -96,19 +96,10 @@ async fn accept_impl(listener: &LocalListener) -> io::Result<(LocalStream, PeerI
 #[cfg(windows)]
 async fn accept_pending_server(listener: &LocalListener) -> io::Result<NamedPipeServer> {
     loop {
-        let mut pending = listener.pending.lock().await;
-        let server = pending
-            .front_mut()
-            .ok_or_else(|| io::Error::other("named-pipe backlog was exhausted"))?;
+        let server = take_pending_server(listener).await?;
         match server.connect().await {
-            Ok(()) => {
-                return pending
-                    .pop_front()
-                    .ok_or_else(|| io::Error::other("named-pipe backlog was exhausted"));
-            }
+            Ok(()) => return Ok(server),
             Err(error) if is_peer_disconnect(&error) => {
-                let _ = pending.pop_front();
-                drop(pending);
                 tracing::debug!(
                     pipe = ?listener.pipe_name,
                     "discarding abandoned named-pipe instance before accept: {error}"
@@ -121,8 +112,6 @@ async fn accept_pending_server(listener: &LocalListener) -> io::Result<NamedPipe
                 }
             }
             Err(error) => {
-                let _ = pending.pop_front();
-                drop(pending);
                 if let Err(replenish_error) = replenish_pending_server(listener).await {
                     tracing::warn!(
                         pipe = ?listener.pipe_name,
@@ -133,6 +122,17 @@ async fn accept_pending_server(listener: &LocalListener) -> io::Result<NamedPipe
             }
         }
     }
+}
+
+#[cfg(windows)]
+async fn take_pending_server(listener: &LocalListener) -> io::Result<NamedPipeServer> {
+    let mut pending = listener.pending.lock().await;
+    if pending.is_empty() {
+        pending.push_back(create_server(&listener.pipe_name, false)?);
+    }
+    pending
+        .pop_front()
+        .ok_or_else(|| io::Error::other("named-pipe backlog was exhausted"))
 }
 
 #[cfg(windows)]
