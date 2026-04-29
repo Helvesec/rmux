@@ -18,7 +18,8 @@ use common::{session_name, start_server, TestHarness};
 use rmux_client::{attach_with_terminal, connect, drive_attach_stream, AttachTransition};
 use rmux_proto::{
     encode_attach_message, encode_frame, AttachFrameDecoder, AttachMessage, AttachSessionRequest,
-    AttachSessionResponse, AttachedKeystroke, NewSessionRequest, Request, Response, TerminalSize,
+    AttachSessionResponse, AttachedKeystroke, NewSessionExtRequest, NewSessionRequest, Request,
+    Response, TerminalSize,
 };
 use rmux_pty::PtyPair;
 use rustix::termios::{
@@ -27,6 +28,7 @@ use rustix::termios::{
 
 const READ_TIMEOUT: Duration = Duration::from_secs(1);
 const ATTACH_OUTPUT_TIMEOUT: Duration = Duration::from_secs(5);
+const ATTACH_READY_MARKER: &str = "rmux-attach-ready";
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
 static ATTACH_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -205,15 +207,35 @@ fn attach_with_terminal_restores_termios_after_repeated_detach() -> Result<(), B
     let mut server = start_server(&harness)?;
     let mut setup_connection = connect(harness.socket_path())?;
 
-    for session in ["alpha", "beta"] {
-        let created = setup_connection.roundtrip(&Request::NewSession(NewSessionRequest {
-            session_name: session_name(session),
-            detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
-            environment: None,
-        }))?;
-        assert!(matches!(created, Response::NewSession(_)));
-    }
+    let created = setup_connection.roundtrip(&Request::NewSessionExt(NewSessionExtRequest {
+        session_name: Some(session_name("alpha")),
+        working_directory: None,
+        detached: true,
+        size: Some(TerminalSize { cols: 80, rows: 24 }),
+        environment: None,
+        group_target: None,
+        attach_if_exists: false,
+        detach_other_clients: false,
+        kill_other_clients: false,
+        flags: None,
+        window_name: None,
+        print_session_info: false,
+        print_format: None,
+        command: Some(vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            format!("printf '{}\\n'; exec sleep 60", ATTACH_READY_MARKER),
+        ]),
+    }))?;
+    assert!(matches!(created, Response::NewSession(_)));
+
+    let created = setup_connection.roundtrip(&Request::NewSession(NewSessionRequest {
+        session_name: session_name("beta"),
+        detached: true,
+        size: Some(TerminalSize { cols: 80, rows: 24 }),
+        environment: None,
+    }))?;
+    assert!(matches!(created, Response::NewSession(_)));
 
     let terminal_pair = PtyPair::open()?;
     let terminal = terminal_pair.slave().try_clone()?;
@@ -366,7 +388,11 @@ fn run_attach_cycle(
     });
 
     wait_for_raw_mode(terminal)?;
-    wait_for_attach_output(&mut output_reader, ATTACH_OUTPUT_TIMEOUT)?;
+    wait_for_attach_output_containing(
+        &mut output_reader,
+        ATTACH_READY_MARKER.as_bytes(),
+        ATTACH_OUTPUT_TIMEOUT,
+    )?;
     input_writer.write_all(b"\x02d")?;
     input_writer.flush()?;
 
@@ -379,12 +405,14 @@ fn run_attach_cycle(
     Ok(())
 }
 
-fn wait_for_attach_output(
+fn wait_for_attach_output_containing(
     reader: &mut UnixStream,
+    expected: &[u8],
     timeout: Duration,
 ) -> Result<(), Box<dyn Error>> {
     let deadline = Instant::now() + timeout;
     let mut output_buffer = [0_u8; 256];
+    let mut output = Vec::new();
 
     loop {
         match reader.read(&mut output_buffer) {
@@ -395,7 +423,15 @@ fn wait_for_attach_output(
                 )
                 .into());
             }
-            Ok(_) => return Ok(()),
+            Ok(bytes_read) => {
+                output.extend_from_slice(&output_buffer[..bytes_read]);
+                if output
+                    .windows(expected.len())
+                    .any(|window| window == expected)
+                {
+                    return Ok(());
+                }
+            }
             Err(error)
                 if matches!(
                     error.kind(),
@@ -407,9 +443,13 @@ fn wait_for_attach_output(
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
+                let captured = String::from_utf8_lossy(&output);
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "timed out waiting for attach output",
+                    format!(
+                        "timed out waiting for attach output containing {:?}; captured {captured:?}",
+                        String::from_utf8_lossy(expected)
+                    ),
                 )
                 .into());
             }
