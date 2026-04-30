@@ -95,6 +95,10 @@ pub(crate) fn render_with_attached_count_prompt_and_pane_title(
     let geometry = StatusGeometry::for_session(session, options);
     let mut frame = Vec::new();
 
+    if session.window().is_zoomed() {
+        frame.extend_from_slice(b"\x1b[0m\x1b[H\x1b[2J");
+    }
+
     if !session.window().is_zoomed() && session.window().pane_count() > 1 {
         frame.extend_from_slice(
             render_cells(runtime_border_cells(session, options, geometry).as_slice()).as_slice(),

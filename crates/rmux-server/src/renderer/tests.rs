@@ -3,8 +3,8 @@ use super::{
 };
 use rmux_core::{OptionStore, Session, Style, Utf8Config};
 use rmux_proto::{
-    OptionName, ScopeSelector, SessionName, SetOptionMode, SplitDirection, TerminalSize,
-    WindowTarget,
+    OptionName, ResizePaneAdjustment, ScopeSelector, SessionName, SetOptionMode, SplitDirection,
+    TerminalSize, WindowTarget,
 };
 
 fn session_name(value: &str) -> SessionName {
@@ -151,6 +151,21 @@ fn sessions_without_visible_borders_emit_status_only_when_enabled() {
         .expect("split succeeds");
     zero_height.resize_terminal(TerminalSize { cols: 80, rows: 0 });
     assert!(render(&zero_height, &OptionStore::new()).is_empty());
+}
+
+#[test]
+fn zoomed_sessions_clear_before_redrawing_active_pane() {
+    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
+    session.split_active_pane().expect("split succeeds");
+    session
+        .resize_pane(0, ResizePaneAdjustment::Zoom)
+        .expect("zoom succeeds");
+
+    let frame = render(&session, &OptionStore::new());
+    assert!(
+        frame.starts_with(b"\x1b[0m\x1b[H\x1b[2J"),
+        "zoom repaint must clear stale non-active pane cells before drawing"
+    );
 }
 
 #[test]
