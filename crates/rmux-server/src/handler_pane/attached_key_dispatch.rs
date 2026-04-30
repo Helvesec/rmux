@@ -4,10 +4,7 @@ use rmux_core::key_code_lookup_bits;
 use rmux_proto::{ErrorResponse, OptionName, PaneTarget, Response, RmuxError, Target};
 use tracing::warn;
 
-use super::super::{
-    scripting_support::{spawn_background_async, QueueExecutionContext},
-    RequestHandler,
-};
+use super::super::RequestHandler;
 use super::{attached_status_message_for_error, display_time, AttachedKeyDispatch};
 use crate::key_table::{
     default_key_table_name, lookup_attached_key_table_binding, lookup_key_table_binding,
@@ -17,9 +14,12 @@ use crate::key_table::{
 use crate::pane_terminals::session_not_found;
 use crate::renderer;
 
+#[path = "attached_key_dispatch/commands.rs"]
+mod commands;
 #[path = "attached_key_dispatch/copy_mode.rs"]
 mod copy_mode;
 
+use commands::{execute_attached_binding_commands, AttachedBindingCommandContext};
 use copy_mode::direct_copy_mode_command;
 
 impl RequestHandler {
@@ -298,55 +298,19 @@ impl RequestHandler {
         }
 
         let dispatch_target = current_target.unwrap_or_else(|| Target::Pane(target.clone()));
-        let context = QueueExecutionContext::without_caller_cwd()
-            .with_current_target(Some(dispatch_target.clone()))
-            .with_mouse_target(mouse_target);
-        if parsed_commands_block_for_prompt(binding.commands()) {
-            let handler = self.clone();
-            let commands = binding.commands().clone();
-            spawn_background_async("rmux-attached-prompt", move || async move {
-                let _ = handler
-                    .execute_parsed_commands(requester_pid, commands, context)
-                    .await;
-            });
-        } else {
-            match Box::pin(self.execute_parsed_commands(
+        Box::pin(execute_attached_binding_commands(
+            self,
+            AttachedBindingCommandContext {
+                attach_pid,
                 requester_pid,
-                binding.commands().clone(),
-                context,
-            ))
-            .await
-            {
-                Ok(output) => {
-                    if attached_live_input
-                        && parsed_commands_open_attached_output(binding.commands())
-                    {
-                        if let Err(error) = self
-                            .show_attached_command_output_popup(
-                                attach_pid,
-                                requester_pid,
-                                dispatch_target,
-                                "list-keys (q/Esc=close)",
-                                &output,
-                            )
-                            .await
-                        {
-                            self.report_attached_command_error(&session_name, attach_pid, &error)
-                                .await;
-                            return Ok(true);
-                        }
-                    }
-                }
-                Err(error) => {
-                    if attached_live_input {
-                        self.report_attached_command_error(&session_name, attach_pid, &error)
-                            .await;
-                        return Ok(true);
-                    }
-                    return Err(error);
-                }
-            }
-        }
+                session_name: session_name.clone(),
+                attached_live_input,
+                dispatch_target,
+                mouse_target,
+                commands: binding.commands().clone(),
+            },
+        ))
+        .await?;
         Ok(true)
     }
 
@@ -469,79 +433,5 @@ impl RequestHandler {
                 }
             }
         }
-    }
-}
-
-fn parsed_commands_block_for_prompt(commands: &rmux_core::command_parser::ParsedCommands) -> bool {
-    commands
-        .commands()
-        .iter()
-        .any(parsed_command_blocks_for_prompt)
-}
-
-fn parsed_command_blocks_for_prompt(command: &rmux_core::command_parser::ParsedCommand) -> bool {
-    match command.name() {
-        "display-panes" => !command
-            .arguments()
-            .iter()
-            .filter_map(rmux_core::command_parser::CommandArgument::as_string)
-            .any(|argument| argument.starts_with('-') && argument.contains('b')),
-        "command-prompt" => !command
-            .arguments()
-            .iter()
-            .filter_map(rmux_core::command_parser::CommandArgument::as_string)
-            .any(|argument| {
-                argument.starts_with('-') && (argument.contains('b') || argument.contains('i'))
-            }),
-        "confirm-before" => !command
-            .arguments()
-            .iter()
-            .filter_map(rmux_core::command_parser::CommandArgument::as_string)
-            .any(|argument| argument.starts_with('-') && argument.contains('b')),
-        _ => false,
-    }
-}
-
-fn parsed_commands_open_attached_output(
-    commands: &rmux_core::command_parser::ParsedCommands,
-) -> bool {
-    commands
-        .commands()
-        .iter()
-        .any(|command| command.name() == "list-keys")
-}
-
-#[cfg(test)]
-mod parsed_command_prompt_block_tests {
-    use super::*;
-
-    #[test]
-    fn block_detection_handles_combined_flags() {
-        use rmux_core::command_parser::CommandParser;
-
-        let parsed = CommandParser::new()
-            .parse_one_group("command-prompt -bF { display-message hi }")
-            .unwrap();
-        assert!(!parsed_commands_block_for_prompt(&parsed));
-
-        let parsed = CommandParser::new()
-            .parse_one_group("command-prompt -p test { display-message hi }")
-            .unwrap();
-        assert!(parsed_commands_block_for_prompt(&parsed));
-
-        let parsed = CommandParser::new()
-            .parse_one_group("confirm-before -by { kill-window }")
-            .unwrap();
-        assert!(!parsed_commands_block_for_prompt(&parsed));
-
-        let parsed = CommandParser::new()
-            .parse_one_group("display-panes")
-            .unwrap();
-        assert!(parsed_commands_block_for_prompt(&parsed));
-
-        let parsed = CommandParser::new()
-            .parse_one_group("display-panes -b")
-            .unwrap();
-        assert!(!parsed_commands_block_for_prompt(&parsed));
     }
 }
