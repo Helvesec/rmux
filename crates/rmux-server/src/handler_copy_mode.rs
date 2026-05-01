@@ -13,10 +13,12 @@ use rmux_proto::{
     SendKeysResponse,
 };
 
+#[path = "handler_copy_mode/input.rs"]
+mod input;
 #[path = "handler_copy_mode/search.rs"]
 mod search;
 
-use search::AttachedCopyModeSearchDirection;
+use input::{attached_copy_mode_input_action, AttachedCopyModeInputAction};
 
 impl RequestHandler {
     pub(super) async fn handle_copy_mode(
@@ -222,51 +224,17 @@ impl RequestHandler {
             copy_mode_context(&state, &target, None, None).mode_keys
         };
 
-        let vi_search_forward = mode_keys == ModeKeys::Vi
-            && match &event {
-                PromptInputEvent::Char('/') => true,
-                PromptInputEvent::KeyName(name) if name == "/" => true,
-                _ => false,
-            };
-        let vi_search_backward = mode_keys == ModeKeys::Vi
-            && match &event {
-                PromptInputEvent::Char('?') => true,
-                PromptInputEvent::KeyName(name) if name == "?" => true,
-                _ => false,
-            };
-
-        if vi_search_forward {
-            self.start_copy_mode_search_prompt(
-                attach_pid,
-                target,
-                AttachedCopyModeSearchDirection::Forward,
-            )
-            .await?;
-            return Ok(true);
-        }
-        if vi_search_backward {
-            self.start_copy_mode_search_prompt(
-                attach_pid,
-                target,
-                AttachedCopyModeSearchDirection::Backward,
-            )
-            .await?;
-            return Ok(true);
-        }
-
-        let command = match event {
-            PromptInputEvent::Char(' ') => "begin-selection",
-            PromptInputEvent::KeyName(ref name) if name == "Space" || name == " " => {
-                "begin-selection"
+        match attached_copy_mode_input_action(mode_keys, &event) {
+            AttachedCopyModeInputAction::Search(direction) => {
+                self.start_copy_mode_search_prompt(attach_pid, target, direction)
+                    .await?;
             }
-            PromptInputEvent::Enter => "copy-selection-no-clear",
-            PromptInputEvent::Char('q') | PromptInputEvent::Escape => "cancel",
-            PromptInputEvent::KeyName(ref name) if name == "q" => "cancel",
-            _ => return Ok(false),
-        };
-
-        self.execute_copy_mode_command(attach_pid, target, command, &[], 1)
-            .await?;
+            AttachedCopyModeInputAction::Command(command) => {
+                self.execute_copy_mode_command(attach_pid, target, command, &[], 1)
+                    .await?;
+            }
+            AttachedCopyModeInputAction::Ignore => return Ok(false),
+        }
         Ok(true)
     }
 

@@ -495,6 +495,9 @@ mod copy_mode_keys;
 #[path = "handler_attach_tests/copy_mode_render.rs"]
 mod copy_mode_render;
 
+#[path = "handler_attach_tests/copy_mode_motion.rs"]
+mod copy_mode_motion;
+
 #[path = "handler_attach_tests/mode_tree_clock.rs"]
 mod mode_tree_clock;
 

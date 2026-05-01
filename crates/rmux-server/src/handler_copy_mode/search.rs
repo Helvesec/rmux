@@ -10,7 +10,7 @@ use super::super::RequestHandler;
 
 const COPY_MODE_PROMPT_TEMPLATE: &str = "display-message -p -- '%%'";
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AttachedCopyModeSearchDirection {
     Forward,
     Backward,
