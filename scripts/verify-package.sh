@@ -31,6 +31,32 @@ sha256_file() {
   fi
 }
 
+verify_checksum_manifest() {
+  local root manifest line hash relative path actual
+  root="$1"
+  manifest="$2"
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    hash="${line%%  *}"
+    relative="${line#*  }"
+    [ "$hash" != "$line" ] || die "invalid checksum line: $line"
+    case "$hash" in
+      *[!0-9a-fA-F]*|"") die "invalid checksum hash: $line" ;;
+    esac
+    [ "${#hash}" -eq 64 ] || die "invalid checksum hash length: $line"
+    case "$relative" in
+      /*|../*|*/../*|*\\*|*[A-Za-z]:*) die "non-portable checksum path: $relative" ;;
+    esac
+
+    path="$root/$relative"
+    [ -f "$path" ] || die "checksum target is missing: $relative"
+    actual="$(sha256_file "$path")"
+    [ "$actual" = "$(printf '%s' "$hash" | tr 'A-F' 'a-f')" ] ||
+      die "checksum mismatch for $relative"
+  done < "$manifest"
+}
+
 archive=""
 checksums=""
 run_binary=0
@@ -88,23 +114,25 @@ tar -xzf "$archive_abs" -C "$tmpdir"
 package_root="$tmpdir/${archive_name%.tar.gz}"
 [ -d "$package_root" ] || die "archive root directory is missing: ${archive_name%.tar.gz}"
 
-for required in rmux public overview release notes docs/artifact-metadata.json docs/diagnose.txt docs/platform-support.txt; do
+for required in bin/rmux public overview release notes SHA256SUMS.txt docs/artifact-metadata.json docs/diagnose.txt docs/platform-support.txt share/man/man1/rmux.1; do
   [ -e "$package_root/$required" ] || die "missing package file: $required"
 done
-[ -x "$package_root/rmux" ] || die "packaged rmux is not executable"
+[ -x "$package_root/bin/rmux" ] || die "packaged rmux is not executable"
+verify_checksum_manifest "$package_root" "$package_root/SHA256SUMS.txt"
 
 metadata="$package_root/docs/artifact-metadata.json"
 metadata_binary_hash="$(sed -n 's/.*"binary_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$metadata" | head -n 1 | tr 'A-F' 'a-f')"
 [ -n "$metadata_binary_hash" ] || die "metadata binary_sha256 is missing or invalid"
-packaged_binary_hash="$(sha256_file "$package_root/rmux")"
+packaged_binary_hash="$(sha256_file "$package_root/bin/rmux")"
 [ "$metadata_binary_hash" = "$packaged_binary_hash" ] || die "metadata binary_sha256 does not match packaged binary"
 
 grep -q '"artifact_kind"[[:space:]]*:[[:space:]]*"unix-package-binary"' "$metadata" || die "metadata artifact_kind is not unix-package-binary"
 grep -q '"git_commit"[[:space:]]*:' "$metadata" || die "metadata git_commit is missing"
+grep -q '"package_layout"[[:space:]]*:[[:space:]]*"rmux-package-v1"' "$metadata" || die "metadata package_layout is not rmux-package-v1"
 
 if [ "$run_binary" -eq 1 ]; then
-  "$package_root/rmux" -V >/dev/null
-  "$package_root/rmux" diagnose --json >/dev/null
+  "$package_root/bin/rmux" -V >/dev/null
+  "$package_root/bin/rmux" diagnose --json >/dev/null
 fi
 
 printf 'archive=%s\n' "$archive_abs"

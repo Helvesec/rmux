@@ -39,6 +39,39 @@ json_escape() {
   sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
+commit_time_iso() {
+  git show -s --format=%cI HEAD
+}
+
+commit_touch_timestamp() {
+  local epoch
+  epoch="$(git show -s --format=%ct HEAD)"
+  if date -u -r "$epoch" +%Y%m%d%H%M.%S >/dev/null 2>&1; then
+    date -u -r "$epoch" +%Y%m%d%H%M.%S
+  else
+    date -u -d "@$epoch" +%Y%m%d%H%M.%S
+  fi
+}
+
+write_package_checksums() {
+  local root output file hash relative
+  root="$1"
+  output="$2"
+
+  (
+    cd "$root"
+    find . -type f ! -path './SHA256SUMS.txt' | LC_ALL=C sort |
+      while IFS= read -r file; do
+        relative="${file#./}"
+        case "$relative" in
+          /*|../*|*/../*|*\\*) die "non-portable package checksum path: $relative" ;;
+        esac
+        hash="$(sha256_file "$file")"
+        printf '%s  %s\n' "$hash" "$relative"
+      done
+  ) > "$output"
+}
+
 workspace_version() {
   awk '
     /^\[workspace\.package\]$/ { in_workspace = 1; next }
@@ -161,10 +194,11 @@ checksums_path="$dist_dir/SHA256SUMS.txt"
 
 case "$stage_dir" in "$dist_dir"/*) ;; *) die "stage path escapes output dir" ;; esac
 rm -rf "$stage_dir"
-mkdir -p "$stage_dir/docs"
+mkdir -p "$stage_dir/bin" "$stage_dir/docs" "$stage_dir/share/man/man1"
 
-cp "$binary" "$stage_dir/rmux"
+cp "$binary" "$stage_dir/bin/rmux"
 cp public overview release notes "$stage_dir/"
+cp rmux.1 "$stage_dir/share/man/man1/rmux.1"
 for doc in diagnose.txt macos-validation.txt platform-support.txt release-packaging.txt; do
   cp "docs/$doc" "$stage_dir/docs/$doc"
 done
@@ -183,10 +217,10 @@ if [ -n "$(git status --porcelain)" ]; then
   git_dirty=true
 fi
 release_reference=true
-if [ "$skip_build" -eq 1 ]; then
+if [ "$skip_build" -eq 1 ] || [ "$git_dirty" = true ]; then
   release_reference=false
 fi
-generated_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+generated_at_utc="$(commit_time_iso)"
 
 cat > "$stage_dir/docs/artifact-metadata.json" <<EOF
 {
@@ -201,14 +235,33 @@ cat > "$stage_dir/docs/artifact-metadata.json" <<EOF
   "target": "$target",
   "platform_label": "$platform_label",
   "configuration": "$configuration",
+  "package_schema": 1,
+  "package_name": "$package_name",
+  "package_target": "$target",
+  "package_target_label": "$platform_label",
+  "package_layout": "rmux-package-v1",
+  "archive_format": "tar.gz",
+  "archive_reproducibility": "normalized-mtime-gzip-no-name",
   "skip_build": $([ "$skip_build" -eq 1 ] && printf true || printf false),
   "release_reference": $release_reference,
   "generated_at_utc": "$generated_at_utc"
 }
 EOF
 
+write_package_checksums "$stage_dir" "$stage_dir/SHA256SUMS.txt"
+touch_stamp="$(commit_touch_timestamp)"
+find "$stage_dir" -exec touch -t "$touch_stamp" {} +
+
 rm -f "$archive_path"
-COPYFILE_DISABLE=1 tar -czf "$archive_path" -C "$dist_dir" "$package_name"
+if command -v gzip >/dev/null 2>&1; then
+  tmp_tar="$archive_path.tmp.tar"
+  rm -f "$tmp_tar"
+  COPYFILE_DISABLE=1 tar -cf "$tmp_tar" -C "$dist_dir" "$package_name"
+  gzip -n -c "$tmp_tar" > "$archive_path"
+  rm -f "$tmp_tar"
+else
+  COPYFILE_DISABLE=1 tar -czf "$archive_path" -C "$dist_dir" "$package_name"
+fi
 archive_sha256="$(sha256_file "$archive_path")"
 printf '%s  %s\n' "$archive_sha256" "$(basename "$archive_path")" > "$checksums_path"
 
