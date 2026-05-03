@@ -87,38 +87,82 @@ attach_paste_and_detach() {
     local payload_file="$1"
 
     log 'attach-session, paste bracketed payload, EOF cat, then detach'
-    RMUX_BIN="$RMUX" RMUX_SESSION="$SESSION" PAYLOAD_FILE="$payload_file" expect <<'EXPECT'
-set timeout 8
-set payload_fd [open $env(PAYLOAD_FILE) rb]
-fconfigure $payload_fd -translation binary -encoding binary
-set payload [read $payload_fd]
-close $payload_fd
+    python3 - "$RMUX" "$SESSION" "$payload_file" <<'PY'
+import os
+import pty
+import select
+import signal
+import sys
+import time
 
-spawn $env(RMUX_BIN) attach-session -t $env(RMUX_SESSION)
-fconfigure $spawn_id -translation binary -encoding binary
-expect {
-    "$env(RMUX_SESSION)" {}
-    timeout { exit 2 }
-}
-send -- $payload
-send "\004\004"
-expect {
-    "RMUX_P4C_CAT_DONE" {}
-    timeout { exit 3 }
-}
-send "\002d"
-expect {
-    eof {}
-    timeout { exit 4 }
-}
-EXPECT
+rmux_bin, session, payload_path = sys.argv[1:4]
+with open(payload_path, "rb") as payload_file:
+    payload = payload_file.read()
+
+pid, fd = pty.fork()
+if pid == 0:
+    os.execlp(rmux_bin, rmux_bin, "attach-session", "-t", session)
+
+seen = bytearray()
+
+
+def pump_until(needle: bytes, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        readable, _, _ = select.select([fd], [], [], min(0.1, remaining))
+        if fd in readable:
+            try:
+                data = os.read(fd, 8192)
+            except OSError:
+                return needle in seen
+            if not data:
+                return needle in seen
+            os.write(1, data)
+            seen.extend(data)
+            if needle in seen:
+                return True
+        try:
+            child_pid, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return needle in seen
+        if child_pid == pid:
+            return needle in seen
+    return False
+
+
+try:
+    if not pump_until(session.encode(), 8):
+        sys.exit(2)
+    os.write(fd, payload)
+    os.write(fd, b"\x04\x04")
+    if not pump_until(b"RMUX_P4C_CAT_DONE", 8):
+        sys.exit(3)
+    os.write(fd, b"\x02d")
+    if not pump_until(b"[detached", 8):
+        sys.exit(4)
+    sys.exit(0)
+finally:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        pass
+PY
 }
 
 cd "$ROOT"
 
-require_tool expect
 require_tool shasum
 require_tool cmp
+require_tool python3
 
 run cargo build --locked
 
