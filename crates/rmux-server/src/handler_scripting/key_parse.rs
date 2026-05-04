@@ -45,6 +45,11 @@ pub(super) fn parse_send_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
                 let _ = args.optional();
                 repeat_count = Some(parse_usize("send-keys", "-N", &args.required("-N count")?)?);
             }
+            value if value.starts_with("-N") && value.len() > 2 => {
+                let count = value[2..].to_owned();
+                let _ = args.optional();
+                repeat_count = Some(parse_usize("send-keys", "-N", &count)?);
+            }
             "-R" => {
                 let _ = args.optional();
                 reset_terminal = true;
@@ -270,4 +275,30 @@ pub(super) fn parse_send_prefix(mut args: CommandTokens) -> Result<Request, Rmux
         target,
         secondary,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token(value: &str) -> String {
+        value.to_owned()
+    }
+
+    #[test]
+    fn parse_send_keys_accepts_tmux_compact_repeat_count() {
+        let request = parse_send_keys(CommandTokens::new(vec![
+            token("-N5"),
+            token("-X"),
+            token("scroll-up"),
+        ]))
+        .expect("compact repeat send-keys parses");
+
+        let Request::SendKeysExt(request) = request else {
+            panic!("compact repeat must use extended send-keys request");
+        };
+        assert_eq!(request.repeat_count, Some(5));
+        assert!(request.copy_mode_command);
+        assert_eq!(request.keys, vec!["scroll-up"]);
+    }
 }
