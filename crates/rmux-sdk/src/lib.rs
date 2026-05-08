@@ -24,7 +24,7 @@ pub mod spec;
 pub mod types;
 
 pub use command::{RmuxCommand, RmuxCommandKind};
-pub use error::{Result, RmuxError};
+pub use error::{CollectError, Result, RmuxError};
 pub use events::{
     PaneCommandStatus, PaneCommandSummary, PaneDisconnectReason, PaneEvent, PaneExitReason,
     PaneNotification, PanePermissionScope,
