@@ -294,7 +294,7 @@ fn status_window_format_body(
         );
         rendered.push_str(&format!(
             "#[range=window|{}{} {}]",
-            window.id(),
+            window.id().as_u32(),
             if active { " list=focus" } else { "" },
             rmux_core::style_tostring(&style)
         ));

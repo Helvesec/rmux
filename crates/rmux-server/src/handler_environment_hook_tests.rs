@@ -378,7 +378,7 @@ async fn pane_exited_hooks_fire_with_removed_pane_context_before_pane_hooks_are_
             .expect("alpha session exists");
         let window = session.window_at(0).expect("window 0 exists");
         let pane = window.pane(1).expect("pane 1 exists");
-        (pane.id().as_u32(), window.id())
+        (pane.id().as_u32(), window.id().as_u32())
     };
 
     assert!(matches!(
@@ -443,6 +443,7 @@ async fn window_unlinked_hooks_keep_removed_window_name_and_id() {
             .window_at(success.target.window_index())
             .expect("logs window exists")
             .id()
+            .as_u32()
     };
 
     assert!(matches!(

@@ -70,8 +70,8 @@ fn explicit_standalone_grouped_session_uses_reserved_session_id() {
     let session = store
         .session(&grouped.session_name)
         .expect("grouped session exists");
-    assert_eq!(session.id(), 3);
-    assert_eq!(store.next_session_id(), 4);
+    assert_eq!(session.id(), crate::SessionId::new(3));
+    assert_eq!(store.next_session_id(), crate::SessionId::new(4));
 }
 
 #[test]

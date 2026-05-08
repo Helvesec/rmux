@@ -518,7 +518,8 @@ impl Session {
     }
 
     fn bump_allocators_for_window(&mut self, window: &Window) {
-        self.next_window_id.bump_to(window.id().saturating_add(1));
+        self.next_window_id
+            .bump_to(window.id().as_u32().saturating_add(1));
         self.next_pane_id = self.next_pane_id.max(
             window
                 .panes()

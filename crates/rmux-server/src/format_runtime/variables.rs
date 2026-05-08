@@ -152,7 +152,7 @@ impl FormatVariables for RuntimeFormatContext<'_> {
                 .map(|value| value.to_string()),
             "next_session_id" => self
                 .session_store
-                .map(|sessions| sessions.next_session_id().to_string()),
+                .map(|sessions| sessions.next_session_id().as_u32().to_string()),
             "pane_at_left" => self.pane.map(|pane| bool_string(pane.geometry().x() == 0)),
             "pane_at_right" => self.pane.map(|pane| {
                 bool_string(self.window.is_some_and(|window| {
@@ -320,7 +320,7 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "session_group_many_attached" => Some(bool_string(self.session_attached_count() > 1)),
             "session_group_size" => Some(self.session_group_members().len().to_string()),
             "session_grouped" => Some(bool_string(self.session_group_name().is_some())),
-            "session_id" => self.session.map(|session| format!("${}", session.id())),
+            "session_id" => self.session.map(|session| session.id().to_string()),
             "session_last_attached" => self
                 .session
                 .and_then(Session::last_attached_at)

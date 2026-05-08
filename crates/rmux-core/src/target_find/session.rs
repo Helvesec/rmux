@@ -1,6 +1,6 @@
 use rmux_proto::{RmuxError, SessionName};
 
-use crate::{Pane, SessionStore, Window};
+use crate::{Pane, SessionId, SessionStore, Window};
 
 use super::matching::{
     parse_prefixed_id, target_not_found, unique_match, MatchMode, ResolvedParts,
@@ -15,7 +15,7 @@ impl SessionStore {
     ) -> Result<SessionName, RmuxError> {
         if let Some(session_id) = parse_prefixed_id(value, '$')? {
             return self
-                .session_by_id(session_id)
+                .session_by_id(SessionId::new(session_id))
                 .map(|session| session.name().clone())
                 .ok_or_else(|| target_not_found(value, "session"));
         }

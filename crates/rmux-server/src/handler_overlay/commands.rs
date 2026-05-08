@@ -434,7 +434,7 @@ impl RequestHandler {
                 state
                     .sessions
                     .session(&session_name)
-                    .map(rmux_core::Session::id),
+                    .map(|session| session.id().as_u32()),
                 &self.socket_path(),
                 !self.config_loading_active(),
                 rendered_start_directory.as_deref(),

@@ -64,7 +64,7 @@ async fn copy_mode_begin_selection_with_mouse_context_preserves_the_original_anc
                 ignore: false,
             },
             session_id: 0,
-            window_id: Some(window_id),
+            window_id: Some(window_id.as_u32()),
             pane_id: Some(pane_id),
             pane_target: Some(target.clone()),
             location: MouseLocation::Pane,

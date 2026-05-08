@@ -109,7 +109,7 @@ impl RequestHandler {
                             &LifecycleEvent::PaneExited {
                                 target: target.clone(),
                                 pane_id: Some(pane_id),
-                                window_id: Some(window_id),
+                                window_id: Some(window_id.as_u32()),
                                 window_name: Some(window_name.clone()),
                             },
                         );
@@ -136,7 +136,7 @@ impl RequestHandler {
                                 &mut state,
                                 &LifecycleEvent::SessionClosed {
                                     session_name: target.session_name().clone(),
-                                    session_id: Some(removed_session.id()),
+                                    session_id: Some(removed_session.id().as_u32()),
                                 },
                             );
                             let _ = state.options.remove_session(target.session_name());

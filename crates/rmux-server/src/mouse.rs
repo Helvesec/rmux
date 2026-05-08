@@ -133,7 +133,7 @@ pub(crate) fn layout_for_session(
     };
 
     Some(MouseLayout {
-        session_id: session.id(),
+        session_id: session.id().as_u32(),
         status_at,
         status_lines,
         status: crate::renderer::status_line_layout(session, &state.options, attached_count, None),
@@ -178,7 +178,7 @@ pub(crate) fn layout_for_session(
                         window_index,
                         pane.index(),
                     )),
-                    window_id: window.id(),
+                    window_id: window.id().as_u32(),
                     geometry: pane.geometry(),
                     scrollbar,
                     border_controls: Vec::new(),

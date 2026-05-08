@@ -121,6 +121,7 @@ async fn session_id(handler: &RequestHandler, session_name: &SessionName) -> u32
         .session(session_name)
         .expect("session exists")
         .id()
+        .as_u32()
 }
 
 async fn window_id(handler: &RequestHandler, target: &WindowTarget) -> u32 {
@@ -131,6 +132,7 @@ async fn window_id(handler: &RequestHandler, target: &WindowTarget) -> u32 {
         .and_then(|session| session.window_at(target.window_index()))
         .expect("window exists")
         .id()
+        .as_u32()
 }
 
 async fn dispatch_as(handler: &RequestHandler, requester_pid: u32, request: Request) -> Response {

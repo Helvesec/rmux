@@ -1,6 +1,6 @@
 use rmux_proto::{PaneTarget, RmuxError, SessionName, Target, WindowTarget};
 
-use crate::{Pane, Session, Window};
+use crate::{Pane, PaneId, Session, Window};
 
 use super::TargetFindType;
 
@@ -180,12 +180,12 @@ pub(super) fn unique_window_name_match(
     unique_match(matches, value, "window")
 }
 
-pub(super) fn find_pane_id_in_session(session: &Session, pane_id: u32) -> Option<(u32, u32)> {
+pub(super) fn find_pane_id_in_session(session: &Session, pane_id: PaneId) -> Option<(u32, u32)> {
     session.windows().iter().find_map(|(window_index, window)| {
         window
             .panes()
             .iter()
-            .find(|pane| pane.id().as_u32() == pane_id)
+            .find(|pane| pane.id() == pane_id)
             .map(|pane| (*window_index, pane.index()))
     })
 }

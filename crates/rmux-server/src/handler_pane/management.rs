@@ -542,7 +542,7 @@ fn join_pane_unlinked_window_snapshot(
             request.source.session_name().clone(),
             request.source.window_index(),
         ),
-        window_id: window.id(),
+        window_id: window.id().as_u32(),
         window_name: window.name().unwrap_or_default().to_owned(),
     })
 }

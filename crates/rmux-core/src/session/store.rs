@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use rmux_proto::{RmuxError, SessionName, TerminalSize};
+use rmux_proto::{RmuxError, SessionId, SessionName, TerminalSize};
 
 use super::{Session, WindowIdAllocator};
 
@@ -60,7 +60,8 @@ impl SessionStore {
 
     /// Returns the session with the store-assigned `$N` identity.
     #[must_use]
-    pub fn session_by_id(&self, session_id: u32) -> Option<&Session> {
+    pub fn session_by_id(&self, session_id: impl Into<SessionId>) -> Option<&Session> {
+        let session_id = session_id.into();
         self.sessions
             .values()
             .find(|session| session.id() == session_id)
@@ -181,14 +182,15 @@ impl SessionStore {
         session_name: SessionName,
         size: TerminalSize,
         base_index: u32,
-        session_id: u32,
+        session_id: SessionId,
     ) -> Result<(), RmuxError> {
         if self.sessions.contains_key(&session_name) {
             return Err(RmuxError::DuplicateSession(session_name.to_string()));
         }
         if self.session_by_id(session_id).is_some() {
             return Err(RmuxError::Server(format!(
-                "session id {session_id} already exists"
+                "session id {} already exists",
+                session_id.as_u32()
             )));
         }
 
@@ -203,7 +205,9 @@ impl SessionStore {
         );
         session.rebind_window_id_allocator(self.next_window_id.clone());
         session.set_id(session_id);
-        self.next_session_id = self.next_session_id.max(session_id.saturating_add(1));
+        self.next_session_id = self
+            .next_session_id
+            .max(session_id.as_u32().saturating_add(1));
         self.sessions.insert(session_name, session);
         Ok(())
     }
@@ -256,14 +260,15 @@ impl SessionStore {
         size: TerminalSize,
         base_index: u32,
         group_target: SessionName,
-        session_id: u32,
+        session_id: SessionId,
     ) -> Result<GroupedSessionCreation, RmuxError> {
         if self.sessions.contains_key(&session_name) {
             return Err(RmuxError::DuplicateSession(session_name.to_string()));
         }
         if self.session_by_id(session_id).is_some() {
             return Err(RmuxError::Server(format!(
-                "session id {session_id} already exists"
+                "session id {} already exists",
+                session_id.as_u32()
             )));
         }
 
@@ -346,7 +351,9 @@ impl SessionStore {
                     .clone_as_group_member(session_name.clone(), group_name.clone(), session_id);
                 let replaced = self.sessions.insert(session_name.clone(), grouped);
                 debug_assert!(replaced.is_none());
-                self.next_session_id = self.next_session_id.max(session_id.saturating_add(1));
+                self.next_session_id = self
+                    .next_session_id
+                    .max(session_id.as_u32().saturating_add(1));
                 Ok(GroupedSessionCreation {
                     session_name,
                     group_name,
@@ -366,7 +373,9 @@ impl SessionStore {
                 );
                 session.rebind_window_id_allocator(self.next_window_id.clone());
                 session.set_id(session_id);
-                self.next_session_id = self.next_session_id.max(session_id.saturating_add(1));
+                self.next_session_id = self
+                    .next_session_id
+                    .max(session_id.as_u32().saturating_add(1));
                 session.set_group_name(Some(group_name.clone()));
                 let replaced = self.sessions.insert(session_name.clone(), session);
                 debug_assert!(replaced.is_none());
@@ -396,7 +405,10 @@ impl SessionStore {
         unreachable!("u32 loop must eventually yield an unused grouped session name")
     }
 
-    fn next_automatic_session_identity(&self, prefix: Option<&SessionName>) -> (SessionName, u32) {
+    fn next_automatic_session_identity(
+        &self,
+        prefix: Option<&SessionName>,
+    ) -> (SessionName, SessionId) {
         let mut session_id = self.next_session_id;
 
         loop {
@@ -407,7 +419,7 @@ impl SessionStore {
                     .expect("generated default session name must be valid"),
             };
             if !self.contains_session(&candidate) {
-                return (candidate, session_id);
+                return (candidate, SessionId::new(session_id));
             }
             session_id = session_id
                 .checked_add(1)
@@ -441,7 +453,9 @@ impl SessionStore {
             session.set_id(self.allocate_session_id());
         }
         session.rebind_window_id_allocator(self.next_window_id.clone());
-        self.next_session_id = self.next_session_id.max(session.id().saturating_add(1));
+        self.next_session_id = self
+            .next_session_id
+            .max(session.id().as_u32().saturating_add(1));
         self.bump_next_pane_id_from_session(&session);
         if let Some(group_name) = session.group_name().cloned() {
             match self.group_runtime_owners.get(&group_name) {
@@ -466,14 +480,14 @@ impl SessionStore {
 
     /// Returns the next session id that will be allocated.
     #[must_use]
-    pub const fn next_session_id(&self) -> u32 {
-        self.next_session_id
+    pub const fn next_session_id(&self) -> SessionId {
+        SessionId::new(self.next_session_id)
     }
 
     /// Returns the next globally visible pane id that will be allocated.
     #[must_use]
-    pub const fn next_pane_id(&self) -> u32 {
-        self.next_pane_id
+    pub const fn next_pane_id(&self) -> crate::PaneId {
+        crate::PaneId::new(self.next_pane_id)
     }
 
     /// Renames the addressed session by updating both the stored key and the session's internal name.
@@ -507,13 +521,14 @@ impl SessionStore {
         Ok(())
     }
 
-    fn allocate_session_id(&mut self) -> u32 {
+    fn allocate_session_id(&mut self) -> SessionId {
         let mut next_session_id = self.next_session_id;
 
         loop {
-            if self.session_by_id(next_session_id).is_none() {
+            let session_id = SessionId::new(next_session_id);
+            if self.session_by_id(session_id).is_none() {
                 self.next_session_id = next_session_id.saturating_add(1);
-                return next_session_id;
+                return session_id;
             }
 
             assert_ne!(next_session_id, u32::MAX, "session id space exhausted");
@@ -528,7 +543,7 @@ impl SessionStore {
         pane_id
     }
 
-    fn allocate_window_id(&mut self) -> u32 {
+    fn allocate_window_id(&mut self) -> crate::WindowId {
         self.next_window_id.allocate()
     }
 

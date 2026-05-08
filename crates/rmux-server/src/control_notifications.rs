@@ -81,7 +81,7 @@ pub(crate) fn collect_control_notifications(
                 session
                     .window_at(session.active_window_index())
                     .map(|window| {
-                        format!("%session-window-changed ${} @{}", session.id(), window.id())
+                        format!("%session-window-changed {} {}", session.id(), window.id())
                     })
             });
             broadcast_line(clients, line)
@@ -168,7 +168,7 @@ fn window_pane_changed_notifications(
         .and_then(|(_session, window)| {
             window.active_pane().map(|pane| {
                 format!(
-                    "%window-pane-changed @{} %{}",
+                    "%window-pane-changed {} %{}",
                     window.id(),
                     pane.id().as_u32()
                 )
@@ -283,7 +283,7 @@ fn render_layout_change_line(state: &HandlerState, target: &WindowTarget) -> Opt
     }
 
     Some((
-        window.id(),
+        window.id().as_u32(),
         render_runtime_template(LAYOUT_CHANGE_TEMPLATE, &runtime, false),
     ))
 }
@@ -292,14 +292,17 @@ fn event_window_id(state: &HandlerState, event: &LifecycleEvent) -> Option<u32> 
     event.window_id().or_else(|| {
         event
             .window_target()
-            .and_then(|target| resolve_window(state, &target).map(Window::id))
+            .and_then(|target| resolve_window(state, &target).map(|window| window.id().as_u32()))
     })
 }
 
 fn event_window_id_and_name(state: &HandlerState, event: &LifecycleEvent) -> Option<(u32, String)> {
     if let Some(target) = event.window_target() {
         if let Some(window) = resolve_window(state, &target) {
-            return Some((window.id(), window.name().unwrap_or_default().to_owned()));
+            return Some((
+                window.id().as_u32(),
+                window.name().unwrap_or_default().to_owned(),
+            ));
         }
     }
 
@@ -343,10 +346,10 @@ fn session_contains_window_id(
         session
             .windows()
             .values()
-            .any(|window| window.id() == window_id)
+            .any(|window| window.id().as_u32() == window_id)
     })
 }
 
 fn session_identity(session: &Session) -> String {
-    format!("${} {}", session.id(), session.name())
+    format!("{} {}", session.id(), session.name())
 }

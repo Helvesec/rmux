@@ -1,7 +1,7 @@
 use rmux_proto::TerminalSize;
 
 use super::{bool_value, window_raw_flags};
-use crate::{Pane, PaneId, Session, Window};
+use crate::{Pane, PaneId, Session, Window, WindowId};
 
 /// The default `list-windows` line format.
 pub const DEFAULT_LIST_WINDOWS_FORMAT: &str =
@@ -399,7 +399,7 @@ pub struct FormatContext {
     session_attached: Option<usize>,
     session_size: Option<TerminalSize>,
     window_index: Option<u32>,
-    window_id: Option<u32>,
+    window_id: Option<WindowId>,
     window_name: Option<String>,
     window_panes: Option<usize>,
     window_size: Option<TerminalSize>,
@@ -499,7 +499,7 @@ impl FormatVariables for FormatContext {
             FormatVariable::SessionWidth => self.session_size.map(|size| size.cols.to_string()),
             FormatVariable::SessionHeight => self.session_size.map(|size| size.rows.to_string()),
             FormatVariable::WindowIndex => self.window_index.map(|value| value.to_string()),
-            FormatVariable::WindowId => self.window_id.map(|value| format!("@{value}")),
+            FormatVariable::WindowId => self.window_id.map(|value| value.to_string()),
             FormatVariable::WindowName => self.window_name.clone(),
             FormatVariable::WindowRawFlags => {
                 if self.window_active.is_some() || self.window_last_flag.is_some() {
@@ -521,7 +521,7 @@ impl FormatVariables for FormatContext {
             FormatVariable::WindowActive => self.window_active.map(bool_value),
             FormatVariable::WindowLastFlag => self.window_last_flag.map(bool_value),
             FormatVariable::PaneIndex => self.pane_index.map(|value| value.to_string()),
-            FormatVariable::PaneId => self.pane_id.map(|value| format!("%{}", value.as_u32())),
+            FormatVariable::PaneId => self.pane_id.map(|value| value.to_string()),
             FormatVariable::PaneActive => self.pane_active.map(bool_value),
             FormatVariable::PaneWidth => self.pane_size.map(|size| size.cols.to_string()),
             FormatVariable::PaneHeight => self.pane_size.map(|size| size.rows.to_string()),

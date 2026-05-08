@@ -357,7 +357,7 @@ impl RequestHandler {
                 .and_then(|session| session.window_at(request.target.window_index()))
                 .map(|window| UnlinkedWindowSnapshot {
                     target: request.target.clone(),
-                    window_id: window.id(),
+                    window_id: window.id().as_u32(),
                     window_name: window.name().unwrap_or_default().to_owned(),
                 })
         };
@@ -562,7 +562,7 @@ fn move_window_unlinked_window_snapshot(
         .window_at(source.window_index())?;
     Some(UnlinkedWindowSnapshot {
         target: source.clone(),
-        window_id: window.id(),
+        window_id: window.id().as_u32(),
         window_name: window.name().unwrap_or_default().to_owned(),
     })
 }

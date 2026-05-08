@@ -169,7 +169,7 @@ impl RequestHandler {
                 state
                     .sessions
                     .session(target.session_name())
-                    .map(|session| (Some(target.session_name()), Some(session.id())))
+                    .map(|session| (Some(target.session_name()), Some(session.id().as_u32())))
             })
             .unwrap_or((None, None));
 
@@ -196,7 +196,7 @@ impl RequestHandler {
                 state
                     .sessions
                     .session(target.session_name())
-                    .map(|session| (Some(target.session_name()), Some(session.id())))
+                    .map(|session| (Some(target.session_name()), Some(session.id().as_u32())))
             })
             .unwrap_or((None, None));
 
@@ -386,7 +386,7 @@ impl RequestHandler {
                 state
                     .sessions
                     .session(target.session_name())
-                    .map(|session| (Some(target.session_name()), Some(session.id())))
+                    .map(|session| (Some(target.session_name()), Some(session.id().as_u32())))
             })
             .unwrap_or((None, None));
 

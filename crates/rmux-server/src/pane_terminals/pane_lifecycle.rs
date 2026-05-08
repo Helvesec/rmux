@@ -51,7 +51,7 @@ impl HandlerState {
             &self.environment,
             &self.options,
             session_name,
-            session_id,
+            session_id.as_u32(),
             socket_path,
             true,
             environment_overrides,
@@ -138,7 +138,7 @@ impl HandlerState {
             &self.environment,
             &self.options,
             session_name,
-            session_id,
+            session_id.as_u32(),
             spawn.socket_path,
             true,
             spawn.environment_overrides,
@@ -251,7 +251,7 @@ impl HandlerState {
             &self.environment,
             &self.options,
             &session_name,
-            session_id,
+            session_id.as_u32(),
             socket_path,
             true,
             environment_overrides,
@@ -371,7 +371,7 @@ impl HandlerState {
             let hook_context = KilledPaneHookContext {
                 target: target.clone(),
                 pane_id: pane_id.as_u32(),
-                window_id: window.id(),
+                window_id: window.id().as_u32(),
                 window_name: window.name().unwrap_or_default().to_owned(),
             };
             let removed_option_targets = if kill_all_except {
@@ -419,7 +419,7 @@ impl HandlerState {
                 },
                 hook_context,
                 session_destroyed: true,
-                removed_session_id: Some(removed_session.id()),
+                removed_session_id: Some(removed_session.id().as_u32()),
             });
         }
 
@@ -551,7 +551,7 @@ impl HandlerState {
             &self.environment,
             &self.options,
             &session_name,
-            session_id,
+            session_id.as_u32(),
             socket_path,
             true,
             environment.as_deref(),

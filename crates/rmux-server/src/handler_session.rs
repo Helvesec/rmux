@@ -375,7 +375,7 @@ impl RequestHandler {
                             &mut state,
                             &LifecycleEvent::SessionClosed {
                                 session_name: session_name.clone(),
-                                session_id: Some(removed_session.id()),
+                                session_id: Some(removed_session.id().as_u32()),
                             },
                         ));
                         let _ = state.options.remove_session(session_name);
@@ -489,7 +489,7 @@ impl RequestHandler {
             .iter()
             .map(|(session_name, session)| ListSessionSnapshot {
                 name: session_name.clone(),
-                id: session.id(),
+                id: session.id().as_u32(),
                 created_at: session.created_at(),
                 activity_at: session.activity_at(),
             })

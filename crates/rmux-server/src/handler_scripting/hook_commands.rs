@@ -76,7 +76,7 @@ impl RequestHandler {
         let session_name = target_session_name(current_target);
         let session_id = session_name
             .and_then(|name| state.sessions.session(name))
-            .map(|session| session.id());
+            .map(|session| session.id().as_u32());
 
         TerminalProfile::for_run_shell(
             &state.environment,

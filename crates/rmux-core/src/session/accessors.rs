@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use rmux_proto::SessionName;
 
 use super::{current_unix_timestamp, synchronized_active_window, Session, WindowIdAllocator};
-use crate::{AlertFlags, Pane, PaneId, Window, WINLINK_ALERTFLAGS};
+use crate::{AlertFlags, Pane, PaneId, SessionId, Window, WINLINK_ALERTFLAGS};
 
 impl Session {
     /// Returns the stable validated session name.
@@ -21,7 +21,7 @@ impl Session {
 
     /// Returns the store-assigned session identity used by `$N` targets.
     #[must_use]
-    pub const fn id(&self) -> u32 {
+    pub const fn id(&self) -> SessionId {
         self.id
     }
 
@@ -49,7 +49,7 @@ impl Session {
         self.cwd.as_deref()
     }
 
-    pub(crate) fn set_id(&mut self, id: u32) {
+    pub(crate) fn set_id(&mut self, id: SessionId) {
         self.id = id;
     }
 
@@ -57,7 +57,7 @@ impl Session {
         let next_after_windows = self
             .windows
             .values()
-            .map(|window| window.id().saturating_add(1))
+            .map(|window| window.id().as_u32().saturating_add(1))
             .max()
             .unwrap_or_else(|| allocator.peek());
         self.next_window_id = allocator;
@@ -97,7 +97,7 @@ impl Session {
         &self,
         name: SessionName,
         group_name: SessionName,
-        session_id: u32,
+        session_id: SessionId,
     ) -> Self {
         let now = current_unix_timestamp();
         let mut cloned = self.clone();

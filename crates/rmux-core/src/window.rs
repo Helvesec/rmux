@@ -1,7 +1,7 @@
 use rmux_proto::{LayoutName, RmuxError, RotateWindowDirection, SplitDirection, TerminalSize};
 
 use crate::layout::{LayoutDirection, LayoutTree};
-use crate::{Pane, PaneGeometry, PaneId};
+use crate::{Pane, PaneGeometry, PaneId, WindowId};
 
 /// Runtime alert flag bitset shared by window queue state and winlink-visible state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -77,7 +77,7 @@ pub const WINLINK_ALERTFLAGS: AlertFlags =
 /// window-local display indices, which may contain gaps after deletion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Window {
-    id: u32,
+    id: WindowId,
     panes: Vec<Pane>,
     next_pane_index: u32,
     active_pane: u32,
@@ -115,10 +115,10 @@ impl Window {
     /// Creates the single V1 window with its initial pane.
     #[must_use]
     pub fn new(size: TerminalSize) -> Self {
-        Self::new_with_initial_pane(size, PaneId::new(0), 0)
+        Self::new_with_initial_pane(size, PaneId::new(0), WindowId::new(0))
     }
 
-    pub(crate) fn new_with_initial_pane(size: TerminalSize, pane_id: PaneId, id: u32) -> Self {
+    pub(crate) fn new_with_initial_pane(size: TerminalSize, pane_id: PaneId, id: WindowId) -> Self {
         let mut window = Self {
             id,
             panes: vec![Pane::new_with_id(
@@ -150,7 +150,7 @@ impl Window {
 
     /// Returns the stable internal window identity.
     #[must_use]
-    pub const fn id(&self) -> u32 {
+    pub const fn id(&self) -> WindowId {
         self.id
     }
 

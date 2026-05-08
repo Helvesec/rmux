@@ -38,7 +38,9 @@ pub(super) fn find_window_target_by_id(
     session
         .windows()
         .iter()
-        .find_map(|(window_index, window)| (window.id() == window_id).then_some(*window_index))
+        .find_map(|(window_index, window)| {
+            (window.id().as_u32() == window_id).then_some(*window_index)
+        })
         .map(|window_index| WindowTarget::with_window(session_name.clone(), window_index))
 }
 
@@ -47,7 +49,7 @@ pub(super) fn find_session_name_by_id(
     session_id: u32,
 ) -> Option<rmux_proto::SessionName> {
     state.sessions.iter().find_map(|(session_name, session)| {
-        (session.id() == session_id).then_some(session_name.clone())
+        (session.id().as_u32() == session_id).then_some(session_name.clone())
     })
 }
 

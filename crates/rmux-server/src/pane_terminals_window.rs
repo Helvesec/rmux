@@ -133,7 +133,7 @@ impl HandlerState {
                             session_name.clone(),
                             planned_window.window_index,
                         ),
-                        window_id: window.id(),
+                        window_id: window.id().as_u32(),
                         window_name: window.name().unwrap_or_default().to_owned(),
                     })
                 })
@@ -448,7 +448,7 @@ fn collect_window_entries(
 
             WindowListEntry {
                 target: WindowTarget::with_window(session_name.clone(), *window_index),
-                window_id: format!("@{}", window.id()),
+                window_id: window.id().to_string(),
                 name: window.name().map(str::to_owned),
                 pane_count: u32::try_from(window.pane_count()).expect("pane count fits in u32"),
                 size: window.size(),

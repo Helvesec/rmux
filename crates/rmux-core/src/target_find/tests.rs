@@ -124,7 +124,7 @@ fn resolves_session_window_and_pane_id_forms() {
     assert_eq!(
         resolve(
             &store,
-            &format!("alpha:@{alpha_window_id}"),
+            &format!("alpha:{alpha_window_id}"),
             TargetFindType::Window,
         )
         .expect("window id resolves"),
@@ -169,7 +169,7 @@ fn window_ids_remain_unique_after_other_sessions_are_removed() {
     assert_eq!(
         store
             .resolve_unresolved_target(
-                &UnresolvedTarget::new(format!("@{beta_new_window_id}")),
+                &UnresolvedTarget::new(beta_new_window_id.to_string()),
                 TargetFindType::Window,
                 TargetFindFlags::NONE,
                 &TargetFindContext::new(None),

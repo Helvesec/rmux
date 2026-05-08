@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmux_proto::{ResizePaneAdjustment, RmuxError, SessionName, SplitDirection, TerminalSize};
 
-use crate::{AlertFlags, Pane, PaneId, Window};
+use crate::{AlertFlags, Pane, PaneId, SessionId, Window, WindowId};
 
 #[path = "session/accessors.rs"]
 mod accessors;
@@ -36,7 +36,7 @@ pub use types::{
 /// A single detached RMUX session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
-    id: u32,
+    id: SessionId,
     name: SessionName,
     group_name: Option<SessionName>,
     windows: BTreeMap<u32, Window>,
@@ -55,7 +55,7 @@ impl Session {
     /// Creates a new session with its initial pane active.
     #[must_use]
     pub fn new(name: SessionName, size: TerminalSize) -> Self {
-        Self::new_with_initial_window(name, size, 0, PaneId::new(0), 0)
+        Self::new_with_initial_window(name, size, 0, PaneId::new(0), WindowId::new(0))
     }
 
     /// Creates a new session with an explicitly seeded initial window and pane identity.
@@ -65,11 +65,11 @@ impl Session {
         size: TerminalSize,
         window_index: u32,
         pane_id: PaneId,
-        window_id: u32,
+        window_id: WindowId,
     ) -> Self {
         let now = current_unix_timestamp();
         Self {
-            id: 0,
+            id: SessionId::new(0),
             name,
             group_name: None,
             windows: BTreeMap::from([(
@@ -80,7 +80,7 @@ impl Session {
             active_window: window_index,
             last_window: None,
             next_pane_id: pane_id.as_u32().saturating_add(1),
-            next_window_id: WindowIdAllocator::new(window_id.saturating_add(1)),
+            next_window_id: WindowIdAllocator::new(window_id.as_u32().saturating_add(1)),
             created_at: now,
             activity_at: now,
             last_attached_at: None,
@@ -479,7 +479,7 @@ impl Session {
         })
     }
 
-    fn allocate_window_id(&self) -> u32 {
+    fn allocate_window_id(&self) -> WindowId {
         self.next_window_id.allocate()
     }
 }

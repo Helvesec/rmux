@@ -256,7 +256,7 @@ impl SessionStore {
             .ok_or_else(|| target_not_found(session_name.as_str(), "session"))?;
 
         if value.starts_with('@') {
-            let window_id = parse_required_prefixed_id(value, '@')?;
+            let window_id = crate::WindowId::new(parse_required_prefixed_id(value, '@')?);
             let Some(window_index) = session
                 .windows()
                 .iter()
@@ -322,7 +322,7 @@ impl SessionStore {
         value: &str,
         context: &TargetFindContext,
     ) -> Result<ResolvedParts, RmuxError> {
-        let window_id = parse_required_prefixed_id(value, '@')?;
+        let window_id = crate::WindowId::new(parse_required_prefixed_id(value, '@')?);
         if let Ok(current) = self.current_parts(context) {
             if let Some(window) = self
                 .session(&current.session_name)
@@ -428,7 +428,7 @@ impl SessionStore {
         value: &str,
     ) -> Result<ResolvedParts, RmuxError> {
         if value.starts_with('%') {
-            let pane_id = parse_required_prefixed_id(value, '%')?;
+            let pane_id = crate::PaneId::new(parse_required_prefixed_id(value, '%')?);
             let session = self
                 .session(session_name)
                 .ok_or_else(|| target_not_found(session_name.as_str(), "session"))?;
@@ -464,12 +464,8 @@ impl SessionStore {
             .ok_or_else(|| target_not_found(&format!("{session_name}:{window_index}"), "window"))?;
 
         if value.starts_with('%') {
-            let pane_id = parse_required_prefixed_id(value, '%')?;
-            let Some(pane) = window
-                .panes()
-                .iter()
-                .find(|pane| pane.id().as_u32() == pane_id)
-            else {
+            let pane_id = crate::PaneId::new(parse_required_prefixed_id(value, '%')?);
+            let Some(pane) = window.panes().iter().find(|pane| pane.id() == pane_id) else {
                 return Err(target_not_found(value, "pane"));
             };
             return Ok(ResolvedParts::pane(
@@ -538,14 +534,14 @@ impl SessionStore {
         value: &str,
         context: &TargetFindContext,
     ) -> Result<ResolvedParts, RmuxError> {
-        let pane_id = parse_required_prefixed_id(value, '%')?;
+        let pane_id = crate::PaneId::new(parse_required_prefixed_id(value, '%')?);
         if let Ok(current) = self.current_parts(context) {
             if let Some(pane) = self
                 .session(&current.session_name)
                 .and_then(|session| session.window_at(current.window_index))
                 .and_then(|window| window.pane(current.pane_index))
             {
-                if pane.id().as_u32() == pane_id {
+                if pane.id() == pane_id {
                     return Ok(current);
                 }
             }
@@ -561,7 +557,7 @@ impl SessionStore {
                         window
                             .panes()
                             .iter()
-                            .filter(move |pane| pane.id().as_u32() == pane_id)
+                            .filter(move |pane| pane.id() == pane_id)
                             .map(move |pane| {
                                 ResolvedParts::pane(
                                     session_name.clone(),

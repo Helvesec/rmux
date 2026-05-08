@@ -282,7 +282,7 @@ impl RequestHandler {
         let session_id = state
             .sessions
             .session(session_name)
-            .map(|session| session.id());
+            .map(|session| session.id().as_u32());
         let profile = TerminalProfile::for_run_shell(
             &state.environment,
             &state.options,

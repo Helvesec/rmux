@@ -422,7 +422,7 @@ fn lifecycle_hook_formats(
     }
     if let Some(session_name) = event.session_name() {
         if let Some(session) = state.sessions.session(session_name) {
-            formats.push(("hook_session".to_owned(), format!("${}", session.id())));
+            formats.push(("hook_session".to_owned(), session.id().to_string()));
             formats.push(("hook_session_name".to_owned(), session.name().to_string()));
         } else {
             if let Some(session_id) = event.session_id() {
@@ -435,7 +435,7 @@ fn lifecycle_hook_formats(
         let mut resolved_window = false;
         if let Some(session) = state.sessions.session(window_target.session_name()) {
             if let Some(window) = session.window_at(window_target.window_index()) {
-                formats.push(("hook_window".to_owned(), format!("@{}", window.id())));
+                formats.push(("hook_window".to_owned(), window.id().to_string()));
                 formats.push((
                     "hook_window_name".to_owned(),
                     window.name().unwrap_or_default().to_owned(),

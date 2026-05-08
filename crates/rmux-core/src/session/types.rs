@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use rmux_proto::{PaneSplitSize, PaneTarget, SplitDirection};
 
-use crate::PaneId;
+use crate::{PaneId, WindowId};
 
 #[derive(Clone, Default)]
 pub(crate) struct WindowIdAllocator {
@@ -21,7 +21,7 @@ impl WindowIdAllocator {
         self.next.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn allocate(&self) -> u32 {
+    pub(crate) fn allocate(&self) -> WindowId {
         let next = self
             .next
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
@@ -29,7 +29,7 @@ impl WindowIdAllocator {
             })
             .expect("window id space exhausted");
         assert_ne!(next, u32::MAX, "window id space exhausted");
-        next
+        WindowId::new(next)
     }
 
     pub(crate) fn bump_to(&self, next: u32) {

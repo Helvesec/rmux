@@ -119,7 +119,7 @@ async fn send_keys_m_forwards_the_current_mouse_event_to_the_pane() {
         active.mouse.current_event = Some(AttachedMouseEvent {
             raw,
             session_id: 0,
-            window_id: Some(window_id),
+            window_id: Some(window_id.as_u32()),
             pane_id: Some(pane_id),
             pane_target: Some(pane_target.clone()),
             location: MouseLocation::Pane,

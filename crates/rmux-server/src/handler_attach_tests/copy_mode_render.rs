@@ -112,7 +112,7 @@ async fn attached_mouse_drag_copy_mode_refresh_keeps_prompt_visible() {
             ignore: false,
         },
         session_id: 0,
-        window_id: Some(window_id),
+        window_id: Some(window_id.as_u32()),
         pane_id: Some(pane_id),
         pane_target: Some(target.clone()),
         location: MouseLocation::Pane,
