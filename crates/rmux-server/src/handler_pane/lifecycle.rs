@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use rmux_core::events::OutputCursorItem;
 use rmux_core::LifecycleEvent;
 use rmux_proto::{OptionName, PaneTarget, RmuxError, Target, WindowTarget};
 
@@ -7,10 +8,9 @@ use super::super::{
     prepare_lifecycle_event, scripting_support::format_context_for_target, RequestHandler,
 };
 use crate::format_runtime::render_runtime_template;
-use crate::pane_io::{PaneExitCallback, PaneExitEvent};
+use crate::pane_io::{PaneExitCallback, PaneExitEvent, PaneOutputReceiver};
 use crate::pane_terminal_lookup::missing_pane_terminal;
 use crate::pane_terminals::{session_not_found, HandlerState, PaneExitMetadata};
-use tokio::sync::broadcast;
 use tracing::warn;
 
 const PANE_EXIT_STATUS_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -337,16 +337,15 @@ impl RequestHandler {
     }
 }
 
-async fn wait_for_pane_output_eof(output_rx: Option<broadcast::Receiver<Vec<u8>>>) {
+async fn wait_for_pane_output_eof(output_rx: Option<PaneOutputReceiver>) {
     let Some(mut output_rx) = output_rx else {
         return;
     };
     let _ = tokio::time::timeout(DEAD_PANE_OUTPUT_DRAIN_TIMEOUT, async move {
         loop {
             match output_rx.recv().await {
-                Ok(bytes) if bytes.is_empty() => break,
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(broadcast::error::RecvError::Closed) => break,
+                OutputCursorItem::Event(event) if event.bytes().is_empty() => break,
+                OutputCursorItem::Event(_) | OutputCursorItem::Gap(_) => {}
             }
         }
     })

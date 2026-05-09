@@ -1,4 +1,6 @@
 #[cfg(any(unix, windows))]
+use rmux_core::events::OutputCursorItem;
+#[cfg(any(unix, windows))]
 use rmux_ipc::LocalStream;
 #[cfg(any(unix, windows))]
 use rmux_proto::{AttachFrameDecoder, AttachMessage};
@@ -44,12 +46,15 @@ pub(crate) use reader::spawn_pane_exit_watcher;
 pub(crate) use reader::spawn_pane_output_reader;
 #[cfg(any(unix, windows))]
 use refresh_scheduler::{wait_for_refresh_deadline, AttachRefreshScheduler};
+#[cfg(test)]
+pub(crate) use types::pane_output_channel_with_limits;
 #[cfg(any(unix, windows))]
 pub(crate) use types::LiveAttachInputContext;
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use types::{
     pane_output_channel, AttachControl, AttachTarget, HandleOutcome, OverlayFrame,
-    PaneAlertCallback, PaneAlertEvent, PaneExitCallback, PaneExitEvent, PaneOutputSender,
+    PaneAlertCallback, PaneAlertEvent, PaneExitCallback, PaneExitEvent, PaneOutputReceiver,
+    PaneOutputSender,
 };
 #[cfg(any(unix, windows))]
 use wire::{
@@ -422,9 +427,16 @@ pub(crate) async fn forward_attach(
                     }
                 }
                 result = recv_pane_output_optional(current_target.pane_output.as_mut()) => {
-                    let Some(bytes) = result? else {
+                    let Some(item) = result? else {
                         current_target.pane_output = None;
                         continue;
+                    };
+                    let bytes = match item {
+                        OutputCursorItem::Event(event) => event.into_bytes(),
+                        OutputCursorItem::Gap(_) => {
+                            pane_refresh.schedule_now();
+                            continue;
+                        }
                     };
                     if bytes.is_empty() {
                         current_target.pane_output = None;

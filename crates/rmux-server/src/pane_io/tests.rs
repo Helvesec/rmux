@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rmux_core::events::OutputCursorItem;
 use rmux_core::OptionStore;
 use rmux_proto::{
     encode_attach_message, AttachFrameDecoder, AttachMessage, AttachedKeystroke, KeyDispatched,
@@ -11,9 +12,10 @@ use rmux_pty::PtyPair;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 
+use super::wire::recv_pane_output;
 use super::{
-    forward_attach, pane_output_channel, process_socket_messages, should_emit_overlay,
-    AttachControl, AttachTarget, LiveAttachInputContext, OverlayFrame,
+    forward_attach, pane_output_channel, pane_output_channel_with_limits, process_socket_messages,
+    should_emit_overlay, AttachControl, AttachTarget, LiveAttachInputContext, OverlayFrame,
 };
 use crate::handler::RequestHandler;
 use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
@@ -52,6 +54,38 @@ fn overlay_generation_rejects_stale_clears_after_switches_or_newer_overlays() {
         &mut current_overlay_generation,
         &OverlayFrame::new(Vec::new(), 0, 3)
     ));
+}
+
+#[tokio::test]
+async fn pane_output_receiver_reports_lag_and_resumes_from_oldest_retained_event() {
+    let sender = pane_output_channel_with_limits(1, 32);
+    let mut receiver = sender.subscribe();
+
+    sender.send(b"first".to_vec());
+    sender.send(b"second".to_vec());
+
+    let OutputCursorItem::Gap(gap) = recv_pane_output(&mut receiver)
+        .await
+        .expect("receive explicit output gap")
+    else {
+        panic!("slow receiver should observe a cursor gap");
+    };
+    assert_eq!(gap.expected_sequence(), 0);
+    assert_eq!(gap.resume_sequence(), 1);
+    assert_eq!(gap.missed_events(), 1);
+    assert_eq!(gap.missed_range(), 0..1);
+    assert_eq!(gap.recent_snapshot().bytes(), b"firstsecond");
+    assert_eq!(gap.recent_snapshot().oldest_sequence(), Some(0));
+    assert_eq!(gap.recent_snapshot().newest_sequence(), Some(1));
+
+    let OutputCursorItem::Event(event) = recv_pane_output(&mut receiver)
+        .await
+        .expect("receive oldest retained output event")
+    else {
+        panic!("receiver should resume with the oldest retained event");
+    };
+    assert_eq!(event.sequence(), 1);
+    assert_eq!(event.bytes(), b"second");
 }
 
 #[tokio::test]

@@ -1,6 +1,7 @@
 use std::future::pending;
 use std::io;
 
+use rmux_core::events::OutputCursorItem;
 use rmux_ipc::{is_peer_disconnect, LocalStream};
 use rmux_proto::{encode_attach_message, AttachFrameDecoder, AttachMessage};
 #[cfg(unix)]
@@ -9,7 +10,6 @@ use rmux_pty::PtyIo;
 use rmux_pty::PtyMaster;
 #[cfg(unix)]
 use tokio::io::unix::AsyncFd;
-use tokio::sync::broadcast;
 use tracing::warn;
 
 use crate::outer_terminal::OuterTerminal;
@@ -115,26 +115,27 @@ pub(super) async fn emit_attach_frame(
 
 pub(super) async fn recv_pane_output(
     pane_output: &mut PaneOutputReceiver,
-) -> io::Result<Option<Vec<u8>>> {
-    loop {
-        match pane_output.recv().await {
-            Ok(bytes) => return Ok(Some(bytes)),
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                warn!(
-                    skipped,
-                    "attach pane output receiver lagged; dropping bytes"
-                );
-            }
-            Err(broadcast::error::RecvError::Closed) => return Ok(None),
+) -> io::Result<OutputCursorItem> {
+    match pane_output.recv().await {
+        OutputCursorItem::Event(event) => Ok(OutputCursorItem::Event(event)),
+        OutputCursorItem::Gap(gap) => {
+            warn!(
+                expected_sequence = gap.expected_sequence(),
+                resume_sequence = gap.resume_sequence(),
+                missed_events = gap.missed_events(),
+                recent_bytes = gap.recent_snapshot().len(),
+                "attach pane output receiver lagged"
+            );
+            Ok(OutputCursorItem::Gap(gap))
         }
     }
 }
 
 pub(super) async fn recv_pane_output_optional(
     pane_output: Option<&mut PaneOutputReceiver>,
-) -> io::Result<Option<Vec<u8>>> {
+) -> io::Result<Option<OutputCursorItem>> {
     match pane_output {
-        Some(pane_output) => recv_pane_output(pane_output).await,
+        Some(pane_output) => recv_pane_output(pane_output).await.map(Some),
         None => pending().await,
     }
 }

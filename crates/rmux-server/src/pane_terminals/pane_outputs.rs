@@ -194,7 +194,7 @@ impl HandlerState {
         &self,
         runtime_session_name: &SessionName,
         pane_id: PaneId,
-    ) -> Option<tokio::sync::broadcast::Receiver<Vec<u8>>> {
+    ) -> Option<crate::pane_io::PaneOutputReceiver> {
         self.pane_outputs
             .get(runtime_session_name)
             .and_then(|panes| panes.get(&pane_id))
@@ -335,6 +335,7 @@ impl HandlerState {
             .entry(pane_id)
             .or_insert_with(pane_output_channel)
             .clone();
+        pane_output.clear_retained();
         let generation = self.advance_pane_output_generation(session_name, pane_id);
         if let Some(dead_panes) = self.dead_panes.get_mut(session_name) {
             let _ = dead_panes.remove(&pane_id);

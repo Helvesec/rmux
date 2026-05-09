@@ -2,13 +2,14 @@ use std::collections::HashMap;
 use std::io;
 use std::process::Stdio;
 
+use rmux_core::events::OutputCursorItem;
 use rmux_core::PaneId;
 use rmux_proto::{RmuxError, SessionName};
 use rmux_pty::PtyMaster;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::watch;
 
-use crate::pane_io::PaneOutputSender;
+use crate::pane_io::{PaneOutputReceiver, PaneOutputSender};
 use crate::terminal::TerminalProfile;
 
 #[derive(Default)]
@@ -309,7 +310,7 @@ async fn wait_for_pipe_stop(stop_rx: &mut watch::Receiver<bool>) {
 
 async fn forward_pane_output_to_pipe(
     mut stop_rx: watch::Receiver<bool>,
-    mut pane_output: broadcast::Receiver<Vec<u8>>,
+    mut pane_output: PaneOutputReceiver,
     mut stdin: tokio::process::ChildStdin,
 ) {
     loop {
@@ -317,13 +318,16 @@ async fn forward_pane_output_to_pipe(
             _ = wait_for_pipe_stop(&mut stop_rx) => break,
             next = pane_output.recv() => {
                 match next {
-                    Ok(bytes) => {
+                    OutputCursorItem::Event(event) => {
+                        let bytes = event.into_bytes();
+                        if bytes.is_empty() {
+                            break;
+                        }
                         if stdin.write_all(&bytes).await.is_err() {
                             break;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
+                    OutputCursorItem::Gap(_) => continue,
                 }
             }
         }

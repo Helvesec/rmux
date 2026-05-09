@@ -10,6 +10,8 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(any(unix, windows))]
+use rmux_core::events::OutputCursorItem;
+#[cfg(any(unix, windows))]
 use rmux_ipc::LocalStream;
 use rmux_proto::SessionName;
 #[cfg(windows)]
@@ -22,9 +24,11 @@ use rmux_proto::{
 #[cfg(any(unix, windows))]
 use tokio::io::{AsyncReadExt, WriteHalf};
 #[cfg(any(unix, windows))]
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 #[cfg(any(unix, windows))]
 use tokio::task::JoinHandle;
+#[cfg(any(unix, windows))]
+use tracing::warn;
 
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use crate::control_mode::ControlModeUpgrade;
@@ -483,7 +487,12 @@ enum PaneEvent {
         bytes: Vec<u8>,
         received_at: Instant,
     },
-    Lagged,
+    Lagged {
+        pane_id: u32,
+        expected_sequence: u64,
+        resume_sequence: u64,
+        missed_events: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -532,20 +541,23 @@ async fn refresh_subscriptions(
             loop {
                 tokio::select! {
                     _ = &mut stop_rx => return,
-                    result = receiver.recv() => {
-                        match result {
-                            Ok(bytes) => {
+                    item = receiver.recv() => {
+                        match item {
+                            OutputCursorItem::Event(event) => {
                                 let _ = pane_event_tx.send(PaneEvent::Data {
                                     pane_id,
-                                    bytes,
+                                    bytes: event.into_bytes(),
                                     received_at: Instant::now(),
                                 });
                             }
-                            Err(broadcast::error::RecvError::Lagged(_)) => {
-                                let _ = pane_event_tx.send(PaneEvent::Lagged);
-                                return;
+                            OutputCursorItem::Gap(gap) => {
+                                let _ = pane_event_tx.send(PaneEvent::Lagged {
+                                    pane_id,
+                                    expected_sequence: gap.expected_sequence(),
+                                    resume_sequence: gap.resume_sequence(),
+                                    missed_events: gap.missed_events(),
+                                });
                             }
-                            Err(broadcast::error::RecvError::Closed) => return,
                         }
                     }
                 }
@@ -604,8 +616,19 @@ fn handle_pane_event(
             };
             output_queue.enqueue_line(line.into_bytes(), true);
         }
-        PaneEvent::Lagged => {
-            return Err(io::Error::other("too far behind"));
+        PaneEvent::Lagged {
+            pane_id,
+            expected_sequence,
+            resume_sequence,
+            missed_events,
+        } => {
+            warn!(
+                pane_id,
+                expected_sequence,
+                resume_sequence,
+                missed_events,
+                "control pane output cursor lagged"
+            );
         }
     }
 

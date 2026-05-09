@@ -1,9 +1,13 @@
+use rmux_core::events::{
+    OutputCursor, OutputCursorItem, OutputRing, DEFAULT_OUTPUT_RING_CAPACITY,
+    DEFAULT_RECENT_LIVE_BUFFER_CAPACITY,
+};
 use rmux_core::PaneId;
 use rmux_proto::{AttachShellCommand, TerminalSize};
 use rmux_pty::PtyMaster;
 use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, Notify};
 
 use crate::client_flags::ClientFlags;
 use crate::control_mode::ControlModeUpgrade;
@@ -12,8 +16,6 @@ use crate::handler::RequestHandler;
 use crate::outer_terminal::OuterTerminal;
 
 use super::live_render::LivePaneRender;
-
-const PANE_OUTPUT_BUFFER: usize = 256;
 
 #[derive(Debug)]
 pub(crate) enum AttachControl {
@@ -190,10 +192,104 @@ pub(super) struct OpenAttachTarget {
     pub(super) live_pane: Option<Box<LivePaneRender>>,
 }
 
-pub(crate) type PaneOutputSender = broadcast::Sender<Vec<u8>>;
-pub(super) type PaneOutputReceiver = broadcast::Receiver<Vec<u8>>;
+#[derive(Clone)]
+pub(crate) struct PaneOutputSender {
+    inner: Arc<PaneOutputInner>,
+}
+
+struct PaneOutputInner {
+    ring: Mutex<OutputRing>,
+    notify: Notify,
+}
+
+pub(crate) struct PaneOutputReceiver {
+    inner: Arc<PaneOutputInner>,
+    cursor: OutputCursor,
+}
+
+impl std::fmt::Debug for PaneOutputSender {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PaneOutputSender")
+            .finish_non_exhaustive()
+    }
+}
+
+impl PaneOutputSender {
+    pub(crate) fn send(&self, bytes: Vec<u8>) -> u64 {
+        let sequence = {
+            let mut ring = self
+                .inner
+                .ring
+                .lock()
+                .expect("pane output ring mutex must not be poisoned");
+            ring.push(bytes).sequence()
+        };
+        self.inner.notify.notify_waiters();
+        sequence
+    }
+
+    pub(crate) fn subscribe(&self) -> PaneOutputReceiver {
+        let cursor = self
+            .inner
+            .ring
+            .lock()
+            .expect("pane output ring mutex must not be poisoned")
+            .cursor_from_now();
+        PaneOutputReceiver {
+            inner: Arc::clone(&self.inner),
+            cursor,
+        }
+    }
+
+    pub(crate) fn clear_retained(&self) {
+        self.inner
+            .ring
+            .lock()
+            .expect("pane output ring mutex must not be poisoned")
+            .clear_retained();
+        self.inner.notify.notify_waiters();
+    }
+}
+
+impl PaneOutputReceiver {
+    pub(crate) async fn recv(&mut self) -> OutputCursorItem {
+        loop {
+            let inner = Arc::clone(&self.inner);
+            let notified = inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(item) = self.try_recv() {
+                return item;
+            }
+            notified.await;
+        }
+    }
+
+    fn try_recv(&mut self) -> Option<OutputCursorItem> {
+        self.inner
+            .ring
+            .lock()
+            .expect("pane output ring mutex must not be poisoned")
+            .poll_cursor(&mut self.cursor)
+    }
+}
 
 pub(crate) fn pane_output_channel() -> PaneOutputSender {
-    let (sender, _receiver) = broadcast::channel(PANE_OUTPUT_BUFFER);
-    sender
+    pane_output_channel_with_limits(
+        DEFAULT_OUTPUT_RING_CAPACITY,
+        DEFAULT_RECENT_LIVE_BUFFER_CAPACITY,
+    )
+}
+
+pub(crate) fn pane_output_channel_with_limits(
+    event_capacity: usize,
+    recent_byte_capacity: usize,
+) -> PaneOutputSender {
+    PaneOutputSender {
+        inner: Arc::new(PaneOutputInner {
+            ring: Mutex::new(OutputRing::new(event_capacity, recent_byte_capacity)),
+            notify: Notify::new(),
+        }),
+    }
 }

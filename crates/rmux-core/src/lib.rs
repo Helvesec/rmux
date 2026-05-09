@@ -11,6 +11,8 @@ mod buffers;
 pub mod command_parser;
 pub mod command_queue;
 mod environment;
+/// Bounded event buffers and cursor accounting.
+pub mod events;
 pub mod formats;
 mod glob;
 mod grid;
