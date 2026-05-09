@@ -22,10 +22,14 @@ use rmux_proto::{
     ControlModeRequest, ControlModeResponse, DetachClientRequest, ErrorResponse, FrameDecoder,
     FrameDirection, FrameFeature, FrameKind, FrameStatus, HandshakeRequest, HandshakeResponse,
     HasSessionRequest, HasSessionResponse, HookLifecycle, HookName, KillServerResponse,
-    KillSessionRequest, ListBuffersRequest, NewSessionResponse, OptionName, PaneTarget, Request,
-    ResolveTargetRequest, ResolveTargetType, Response, RmuxError, ScopeSelector, SendKeysRequest,
-    SendKeysResponse, SessionName, SetHookRequest, SetOptionMode, SetOptionRequest, TerminalSize,
-    WindowTarget, RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION, V1_FRAME_LEDGER,
+    KillSessionRequest, ListBuffersRequest, NewSessionResponse, OptionName, PaneOutputCursor,
+    PaneOutputCursorRequest, PaneOutputCursorResponse, PaneOutputEvent, PaneOutputLagNotice,
+    PaneOutputLagResponse, PaneOutputSubscriptionId, PaneOutputSubscriptionStart, PaneRecentOutput,
+    PaneTarget, Request, ResolveTargetRequest, ResolveTargetType, Response, RmuxError,
+    ScopeSelector, SendKeysRequest, SendKeysResponse, SessionName, SetHookRequest, SetOptionMode,
+    SetOptionRequest, SubscribePaneOutputRequest, SubscribePaneOutputResponse, TerminalSize,
+    UnsubscribePaneOutputRequest, UnsubscribePaneOutputResponse, WindowTarget, RMUX_FRAME_MAGIC,
+    RMUX_WIRE_VERSION, V1_FRAME_LEDGER,
 };
 
 fn fixture_root() -> PathBuf {
@@ -483,11 +487,26 @@ fn cross_section_requests() -> Vec<Request> {
             prefer_unattached: false,
         }),
         Request::Handshake(HandshakeRequest::current()),
+        Request::SubscribePaneOutput(SubscribePaneOutputRequest {
+            target: pane.clone(),
+            start: PaneOutputSubscriptionStart::Now,
+        }),
+        Request::UnsubscribePaneOutput(UnsubscribePaneOutputRequest {
+            subscription_id: PaneOutputSubscriptionId::new(7),
+        }),
+        Request::PaneOutputCursor(PaneOutputCursorRequest {
+            subscription_id: PaneOutputSubscriptionId::new(7),
+            max_events: Some(4),
+        }),
     ]
 }
 
 fn cross_section_responses() -> Vec<Response> {
     let alpha = alpha();
+    let cursor = PaneOutputCursor {
+        next_sequence: 2,
+        missed_events: 0,
+    };
     vec![
         Response::HasSession(HasSessionResponse { exists: true }),
         Response::NewSession(NewSessionResponse {
@@ -504,6 +523,43 @@ fn cross_section_responses() -> Vec<Response> {
             mode: ControlMode::ControlControl,
         }),
         Response::Handshake(HandshakeResponse::current()),
+        Response::SubscribePaneOutput(SubscribePaneOutputResponse {
+            subscription_id: PaneOutputSubscriptionId::new(7),
+            target: pane_alpha_2(),
+            pane_id: rmux_proto::PaneId::new(2),
+            cursor,
+        }),
+        Response::UnsubscribePaneOutput(UnsubscribePaneOutputResponse {
+            subscription_id: PaneOutputSubscriptionId::new(7),
+            removed: true,
+        }),
+        Response::PaneOutputCursor(PaneOutputCursorResponse {
+            subscription_id: PaneOutputSubscriptionId::new(7),
+            cursor,
+            events: vec![PaneOutputEvent {
+                sequence: 1,
+                bytes: b"x".to_vec(),
+            }],
+            limited: false,
+        }),
+        Response::PaneOutputLag(PaneOutputLagResponse {
+            subscription_id: PaneOutputSubscriptionId::new(7),
+            cursor: PaneOutputCursor {
+                next_sequence: 10,
+                missed_events: 8,
+            },
+            lag: PaneOutputLagNotice {
+                expected_sequence: 2,
+                resume_sequence: 10,
+                missed_events: 8,
+                newest_sequence: 12,
+                recent: PaneRecentOutput {
+                    bytes: b"recent".to_vec(),
+                    oldest_sequence: Some(10),
+                    newest_sequence: Some(12),
+                },
+            },
+        }),
     ]
 }
 
@@ -551,8 +607,8 @@ fn ledger_active_size_matches_request_and_response_variant_count() {
         .iter()
         .filter(|entry| matches!(entry.status, FrameStatus::Active))
         .count();
-    // Active entries = 95 Request variants + 81 Response variants.
-    assert_eq!(active_count, 95 + 81, "active ledger size mismatch");
+    // Active entries = 98 Request variants + 85 Response variants.
+    assert_eq!(active_count, 98 + 85, "active ledger size mismatch");
 }
 
 #[test]

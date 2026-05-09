@@ -21,10 +21,12 @@ pub use layout::{
 mod pane;
 pub use pane::{
     BreakPaneRequest, DisplayPanesRequest, JoinPaneRequest, KillPaneRequest, LastPaneRequest,
-    MovePaneRequest, PaneSnapshotRequest, PaneSplitSize, PipePaneRequest, ResizePaneRequest,
-    RespawnPaneRequest, SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneMarkRequest,
-    SelectPaneRequest, SendKeysExtRequest, SendKeysRequest, SplitWindowExtRequest,
-    SplitWindowRequest, SplitWindowTarget, SwapPaneDirection, SwapPaneRequest,
+    MovePaneRequest, PaneOutputCursorRequest, PaneOutputSubscriptionStart, PaneSnapshotRequest,
+    PaneSplitSize, PipePaneRequest, ResizePaneRequest, RespawnPaneRequest,
+    SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneMarkRequest, SelectPaneRequest,
+    SendKeysExtRequest, SendKeysRequest, SplitWindowExtRequest, SplitWindowRequest,
+    SplitWindowTarget, SubscribePaneOutputRequest, SwapPaneDirection, SwapPaneRequest,
+    UnsubscribePaneOutputRequest,
 };
 
 #[path = "request/window.rs"]
@@ -278,6 +280,12 @@ pub enum Request {
     Handshake(HandshakeRequest),
     /// Internal daemon-backed structured pane snapshot endpoint.
     PaneSnapshot(PaneSnapshotRequest),
+    /// Internal daemon-backed pane output subscription endpoint.
+    SubscribePaneOutput(SubscribePaneOutputRequest),
+    /// Internal daemon-backed pane output unsubscription endpoint.
+    UnsubscribePaneOutput(UnsubscribePaneOutputRequest),
+    /// Internal daemon-backed pane output cursor polling endpoint.
+    PaneOutputCursor(PaneOutputCursorRequest),
 }
 
 impl Request {
@@ -332,6 +340,9 @@ impl Request {
             Self::SaveBuffer(_) => "save-buffer",
             Self::CapturePane(_) => "capture-pane",
             Self::PaneSnapshot(_) => "pane-snapshot",
+            Self::SubscribePaneOutput(_) => "subscribe-pane-output",
+            Self::UnsubscribePaneOutput(_) => "unsubscribe-pane-output",
+            Self::PaneOutputCursor(_) => "pane-output-cursor",
             Self::DisplayMessage(_) => "display-message",
             Self::ResolveTarget(_) => "resolve-target",
             Self::RunShell(_) => "run-shell",

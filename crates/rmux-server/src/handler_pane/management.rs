@@ -334,8 +334,17 @@ impl RequestHandler {
     ) -> Response {
         let session_name = request.target.session_name().clone();
         let target = request.target.clone();
-        let (response, queued_pane_exited, queued_session_closed, session_destroyed) = {
+        let (
+            response,
+            queued_pane_exited,
+            queued_session_closed,
+            session_destroyed,
+            removed_subscription_keys,
+        ) = {
             let mut state = self.state.lock().await;
+            let removed_subscription_keys = state
+                .pane_output_subscription_keys_for_kill(&request.target, request.kill_all_except)
+                .unwrap_or_default();
             match state.kill_pane_with_options(request.target, request.kill_all_except) {
                 Ok(result) => {
                     let queued_pane = prepare_lifecycle_event(
@@ -373,9 +382,16 @@ impl RequestHandler {
                         Some(queued_pane),
                         queued_session,
                         result.session_destroyed,
+                        removed_subscription_keys,
                     )
                 }
-                Err(error) => (Response::Error(ErrorResponse { error }), None, None, false),
+                Err(error) => (
+                    Response::Error(ErrorResponse { error }),
+                    None,
+                    None,
+                    false,
+                    Vec::new(),
+                ),
             }
         };
 
@@ -386,6 +402,8 @@ impl RequestHandler {
             self.emit_prepared(event);
         }
         if matches!(response, Response::KillPane(_)) {
+            self.cleanup_pane_output_subscriptions(&removed_subscription_keys)
+                .await;
             if session_destroyed {
                 self.exit_attached_session(&session_name).await;
                 self.cancel_session_silence_timers(&session_name).await;

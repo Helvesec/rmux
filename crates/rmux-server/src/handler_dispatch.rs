@@ -40,9 +40,22 @@ impl RequestHandler {
         outcome.response
     }
 
+    #[cfg(test)]
     pub(crate) async fn dispatch(&self, requester_pid: u32, request: Request) -> HandleOutcome {
+        self.dispatch_for_connection(requester_pid, u64::from(requester_pid), request)
+            .await
+    }
+
+    pub(crate) async fn dispatch_for_connection(
+        &self,
+        requester_pid: u32,
+        connection_id: u64,
+        request: Request,
+    ) -> HandleOutcome {
         let request_for_hooks = request.clone();
-        let (outcome, inline_hooks) = self.dispatch_captured(requester_pid, request).await;
+        let (outcome, inline_hooks) = self
+            .dispatch_captured(requester_pid, connection_id, request)
+            .await;
         self.run_inline_hooks(requester_pid, inline_hooks, None)
             .await;
         self.run_request_hooks(requester_pid, &request_for_hooks, &outcome.response, None)
@@ -53,12 +66,23 @@ impl RequestHandler {
     pub(crate) async fn dispatch_captured(
         &self,
         requester_pid: u32,
+        connection_id: u64,
         request: Request,
     ) -> (HandleOutcome, Vec<PendingInlineHook>) {
-        capture_inline_hooks(self.dispatch_request(requester_pid, request)).await
+        capture_inline_hooks(Box::pin(self.dispatch_request(
+            requester_pid,
+            connection_id,
+            request,
+        )))
+        .await
     }
 
-    async fn dispatch_request(&self, requester_pid: u32, request: Request) -> HandleOutcome {
+    async fn dispatch_request(
+        &self,
+        requester_pid: u32,
+        connection_id: u64,
+        request: Request,
+    ) -> HandleOutcome {
         if let Request::Handshake(request) = request {
             let response = if let Err(error) = request.validate_against(SUPPORTED_CAPABILITIES) {
                 Response::Error(ErrorResponse { error })
@@ -300,6 +324,17 @@ impl RequestHandler {
             Request::PaneSnapshot(request) => {
                 HandleOutcome::response(self.handle_pane_snapshot(request).await)
             }
+            Request::SubscribePaneOutput(request) => HandleOutcome::response(
+                self.handle_subscribe_pane_output(connection_id, request)
+                    .await,
+            ),
+            Request::UnsubscribePaneOutput(request) => HandleOutcome::response(
+                self.handle_unsubscribe_pane_output(connection_id, request)
+                    .await,
+            ),
+            Request::PaneOutputCursor(request) => HandleOutcome::response(
+                self.handle_pane_output_cursor(connection_id, request).await,
+            ),
             Request::ClearHistory(request) => {
                 HandleOutcome::response(self.handle_clear_history(request).await)
             }

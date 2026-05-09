@@ -41,8 +41,8 @@ pub use frame_kind::{
 pub use identity::{PaneId, SessionId, SessionName, WindowId};
 pub use request::*;
 pub use response::*;
-pub use types::OptionScopeSelector;
 pub use types::*;
+pub use types::{OptionScopeSelector, PaneOutputSubscriptionId};
 
 /// Detached request/response protocol revision.
 pub const PROTOCOL_VERSION: u16 = RMUX_WIRE_VERSION as u16;

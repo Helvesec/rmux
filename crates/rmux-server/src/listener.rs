@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rmux_core::events::SubscriptionLimits;
 use rmux_ipc::{wait_for_peer_close, LocalListener, LocalStream, PeerIdentity};
 use rmux_proto::{encode_frame, ErrorResponse, FrameDecoder, Request, Response, WaitForMode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,10 +29,14 @@ pub(crate) async fn serve(
     shutdown_handle: ShutdownHandle,
     mut shutdown: oneshot::Receiver<()>,
     config_load: ConfigLoadOptions,
+    subscription_limits: SubscriptionLimits,
     owner_uid: u32,
 ) -> io::Result<()> {
     let _cleanup_on_drop = SocketCleanup::new(socket_path.clone());
-    let handler = Arc::new(RequestHandler::with_owner_uid(owner_uid));
+    let handler = Arc::new(RequestHandler::with_owner_uid_and_subscription_limits(
+        owner_uid,
+        subscription_limits,
+    ));
     handler.install_shutdown_handle(shutdown_handle.clone());
     handler.set_socket_path(&socket_path);
     handler.load_startup_config(config_load).await;
@@ -64,7 +69,10 @@ pub(crate) async fn serve(
                 let shutdown_handle = shutdown_handle.clone();
 
                 connection_tasks.spawn(async move {
-                    serve_connection(stream, requester, handler, connection_shutdown, shutdown_handle).await
+                    let connection_id = handler.allocate_connection_id();
+                    let result = serve_connection(stream, requester, Arc::clone(&handler), connection_id, connection_shutdown, shutdown_handle).await;
+                    handler.cleanup_connection_subscriptions(connection_id).await;
+                    result
                 });
             }
             _ = &mut shutdown => {
@@ -91,6 +99,7 @@ async fn serve_connection(
     stream: LocalStream,
     requester: PeerIdentity,
     handler: Arc<RequestHandler>,
+    connection_id: u64,
     mut shutdown: watch::Receiver<()>,
     shutdown_handle: ShutdownHandle,
 ) -> io::Result<()> {
@@ -121,7 +130,7 @@ async fn serve_connection(
                 let cancel_on_peer_disconnect = request_cancels_on_peer_disconnect(&request);
                 debug!("dispatching {}", request.command_name());
                 let outcome = tokio::select! {
-                    outcome = handler.dispatch(requester.pid, request) => outcome,
+                    outcome = handler.dispatch_for_connection(requester.pid, connection_id, request) => outcome,
                     result = shutdown.changed() => {
                         if result.is_ok() {
                             debug!("closing client connection during shutdown");
@@ -546,19 +555,25 @@ mod tests {
         let handler = Arc::clone(handler);
         let (shutdown_tx, shutdown_rx) = watch::channel(());
         let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
+        let connection_id = handler.allocate_connection_id();
         let task = tokio::spawn(async move {
-            serve_connection(
+            let result = serve_connection(
                 server,
                 PeerIdentity {
                     pid: std::process::id(),
                     uid: rmux_os::identity::real_user_id(),
                     user: rmux_os::identity::UserIdentity::Uid(rmux_os::identity::real_user_id()),
                 },
-                handler,
+                Arc::clone(&handler),
+                connection_id,
                 shutdown_rx,
                 shutdown_handle,
             )
-            .await
+            .await;
+            handler
+                .cleanup_connection_subscriptions(connection_id)
+                .await;
+            result
         });
         Ok((client, shutdown_tx, task))
     }

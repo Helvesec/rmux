@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use rmux_core::events::OutputCursorItem;
+use rmux_core::events::{OutputCursorItem, PaneOutputSubscriptionKey};
 use rmux_core::LifecycleEvent;
 use rmux_proto::{OptionName, PaneTarget, RmuxError, Target, WindowTarget};
 
@@ -240,6 +240,7 @@ impl RequestHandler {
                 window_destroyed,
                 pane_event,
             } => {
+                self.cleanup_exited_pane_output_subscription(&event).await;
                 self.emit_prepared(pane_event);
                 self.sync_session_silence_timers(&session_name).await;
                 if !window_destroyed {
@@ -259,6 +260,7 @@ impl RequestHandler {
                 pane_event,
                 session_event,
             } => {
+                self.cleanup_exited_pane_output_subscription(&event).await;
                 self.exit_attached_session(&session_name).await;
                 self.cancel_session_silence_timers(&session_name).await;
                 self.emit_prepared(pane_event);
@@ -267,6 +269,12 @@ impl RequestHandler {
                 let _ = self.request_shutdown_if_server_empty().await;
             }
         }
+    }
+
+    async fn cleanup_exited_pane_output_subscription(&self, event: &PaneExitEvent) {
+        let key = PaneOutputSubscriptionKey::new(event.session_name.clone(), event.pane_id);
+        self.cleanup_pane_output_subscriptions(std::slice::from_ref(&key))
+            .await;
     }
 
     async fn prepare_kept_dead_pane_transcript(&self, event: &PaneExitEvent, target: &PaneTarget) {

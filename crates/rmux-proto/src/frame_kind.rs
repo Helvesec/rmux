@@ -1026,6 +1026,33 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         None,
         "Daemon-backed structured pane snapshot endpoint; pinned bincode tag 94.",
     ),
+    entry(
+        c2s(95),
+        FrameDirection::ClientToServer,
+        ACTIVE,
+        "SubscribePaneOutputRequest",
+        FrameFeature::Panes,
+        None,
+        "Milestone 26 pane output subscription endpoint; pinned bincode tag 95.",
+    ),
+    entry(
+        c2s(96),
+        FrameDirection::ClientToServer,
+        ACTIVE,
+        "UnsubscribePaneOutputRequest",
+        FrameFeature::Panes,
+        None,
+        "Milestone 26 pane output unsubscription endpoint; pinned bincode tag 96.",
+    ),
+    entry(
+        c2s(97),
+        FrameDirection::ClientToServer,
+        ACTIVE,
+        "PaneOutputCursorRequest",
+        FrameFeature::Panes,
+        None,
+        "Milestone 26 pane output cursor endpoint; pinned bincode tag 97.",
+    ),
     // Reserved client→server slot. Removed values must be listed and never reused.
     entry(
         c2s(0x7FFE),
@@ -1775,6 +1802,42 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         None,
         "Daemon-backed structured pane snapshot endpoint; pinned bincode tag 80.",
     ),
+    entry(
+        s2c(81),
+        FrameDirection::ServerToClient,
+        ACTIVE,
+        "SubscribePaneOutputResponse",
+        FrameFeature::Panes,
+        None,
+        "Milestone 26 pane output subscription response; pinned bincode tag 81.",
+    ),
+    entry(
+        s2c(82),
+        FrameDirection::ServerToClient,
+        ACTIVE,
+        "UnsubscribePaneOutputResponse",
+        FrameFeature::Panes,
+        None,
+        "Milestone 26 pane output unsubscription response; pinned bincode tag 82.",
+    ),
+    entry(
+        s2c(83),
+        FrameDirection::ServerToClient,
+        ACTIVE,
+        "PaneOutputCursorResponse",
+        FrameFeature::Panes,
+        None,
+        "Milestone 26 pane output cursor response; pinned bincode tag 83.",
+    ),
+    entry(
+        s2c(84),
+        FrameDirection::ServerToClient,
+        ACTIVE,
+        "PaneOutputLagResponse",
+        FrameFeature::Panes,
+        None,
+        "Milestone 26 pane output lag notice response; pinned bincode tag 84.",
+    ),
     // Reserved server→client slot. Removed values must be listed and never reused.
     entry(
         s2c(0x7FFE),
@@ -1899,6 +1962,9 @@ pub const fn frame_kind_for_request(request: &Request) -> FrameKind {
         Request::SplitWindowExt(_) => c2s(92),
         Request::Handshake(_) => c2s(93),
         Request::PaneSnapshot(_) => c2s(94),
+        Request::SubscribePaneOutput(_) => c2s(95),
+        Request::UnsubscribePaneOutput(_) => c2s(96),
+        Request::PaneOutputCursor(_) => c2s(97),
     }
 }
 
@@ -1987,6 +2053,10 @@ pub const fn frame_kind_for_response(response: &Response) -> FrameKind {
         Response::ResolveTarget(_) => s2c(78),
         Response::Handshake(_) => s2c(79),
         Response::PaneSnapshot(_) => s2c(80),
+        Response::SubscribePaneOutput(_) => s2c(81),
+        Response::UnsubscribePaneOutput(_) => s2c(82),
+        Response::PaneOutputCursor(_) => s2c(83),
+        Response::PaneOutputLag(_) => s2c(84),
     }
 }
 

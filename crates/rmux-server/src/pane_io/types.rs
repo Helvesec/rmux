@@ -242,6 +242,19 @@ impl PaneOutputSender {
         }
     }
 
+    pub(crate) fn subscribe_from_oldest(&self) -> PaneOutputReceiver {
+        let cursor = self
+            .inner
+            .ring
+            .lock()
+            .expect("pane output ring mutex must not be poisoned")
+            .cursor_from_oldest();
+        PaneOutputReceiver {
+            inner: Arc::clone(&self.inner),
+            cursor,
+        }
+    }
+
     pub(crate) fn clear_retained(&self) {
         self.inner
             .ring
@@ -266,12 +279,16 @@ impl PaneOutputReceiver {
         }
     }
 
-    fn try_recv(&mut self) -> Option<OutputCursorItem> {
+    pub(crate) fn try_recv(&mut self) -> Option<OutputCursorItem> {
         self.inner
             .ring
             .lock()
             .expect("pane output ring mutex must not be poisoned")
             .poll_cursor(&mut self.cursor)
+    }
+
+    pub(crate) const fn cursor(&self) -> &OutputCursor {
+        &self.cursor
     }
 }
 

@@ -21,6 +21,26 @@ mod options;
 pub use hooks::{HookLifecycle, HookName};
 pub use options::{OptionName, SetOptionMode};
 
+/// Stable identifier for one pane-output subscription on a live server
+/// connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PaneOutputSubscriptionId(u64);
+
+impl PaneOutputSubscriptionId {
+    /// Wraps a raw subscription identifier.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the raw subscription identifier.
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
 /// A parsed exact target.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Target {

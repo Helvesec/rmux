@@ -274,8 +274,12 @@ impl RequestHandler {
                 let can_write = self.requester_can_write(requester_pid).await;
                 let request = crate::server_access::apply_access_policy(request, can_write)?;
                 let request_for_hooks = request.clone();
-                let (outcome, inline_hooks) =
-                    Box::pin(self.dispatch_captured(requester_pid, request)).await;
+                let (outcome, inline_hooks) = Box::pin(self.dispatch_captured(
+                    requester_pid,
+                    u64::from(requester_pid),
+                    request,
+                ))
+                .await;
                 self.run_inline_hooks(requester_pid, inline_hooks, Some(&command_for_hooks))
                     .await;
                 self.run_request_hooks(

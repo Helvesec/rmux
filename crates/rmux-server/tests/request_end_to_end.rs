@@ -19,7 +19,7 @@ use rmux_proto::{
 };
 use tokio::time::sleep;
 
-const COMMAND_SURFACE_COUNT: usize = 75;
+const COMMAND_SURFACE_COUNT: usize = 78;
 const INTERNAL_REQUEST_COMMANDS: [&str; 20] = [
     "attach-session-ext",
     "attach-session-ext2",
@@ -115,6 +115,9 @@ const COMMAND_SURFACE: [&str; COMMAND_SURFACE_COUNT] = [
     "run-shell",
     "if-shell",
     "wait-for",
+    "subscribe-pane-output",
+    "unsubscribe-pane-output",
+    "pane-output-cursor",
     "rename-session",
     "list-sessions",
     "list-panes",

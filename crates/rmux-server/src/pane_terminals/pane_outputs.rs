@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 
-use rmux_core::{PaneGeometry, PaneId, Utf8Config};
+use rmux_core::{events::PaneOutputSubscriptionKey, PaneGeometry, PaneId, Utf8Config};
 use rmux_proto::{RmuxError, SessionName};
 #[cfg(windows)]
 use rmux_pty::PtyChild;
@@ -188,6 +188,56 @@ impl HandlerState {
             .and_then(|panes| panes.get(&pane_id))
             .cloned()
             .ok_or_else(|| missing_pane_terminal(session_name, window_index, pane_index))
+    }
+
+    pub(crate) fn pane_output_subscription_key_for_target(
+        &self,
+        target: &rmux_proto::PaneTarget,
+    ) -> Result<PaneOutputSubscriptionKey, RmuxError> {
+        let pane_id = pane_id_for_target(
+            &self.sessions,
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+        )?;
+        let runtime_session_name =
+            self.runtime_session_name_for_window(target.session_name(), target.window_index());
+        Ok(PaneOutputSubscriptionKey::new(
+            runtime_session_name,
+            pane_id,
+        ))
+    }
+
+    pub(crate) fn pane_output_subscription_keys_for_kill(
+        &self,
+        target: &rmux_proto::PaneTarget,
+        kill_all_except: bool,
+    ) -> Result<Vec<PaneOutputSubscriptionKey>, RmuxError> {
+        let session = self
+            .sessions
+            .session(target.session_name())
+            .ok_or_else(|| session_not_found(target.session_name()))?;
+        let window = session.window_at(target.window_index()).ok_or_else(|| {
+            RmuxError::invalid_target(
+                format!("{}:{}", target.session_name(), target.window_index()),
+                "window index does not exist in session",
+            )
+        })?;
+        let runtime_session_name =
+            self.runtime_session_name_for_window(target.session_name(), target.window_index());
+        let keys = window
+            .panes()
+            .iter()
+            .filter(|pane| {
+                if kill_all_except {
+                    pane.index() != target.pane_index()
+                } else {
+                    pane.index() == target.pane_index()
+                }
+            })
+            .map(|pane| PaneOutputSubscriptionKey::new(runtime_session_name.clone(), pane.id()))
+            .collect();
+        Ok(keys)
     }
 
     pub(crate) fn subscribe_runtime_pane_output(

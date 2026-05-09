@@ -35,9 +35,12 @@ pub use window::{
 mod pane;
 pub use pane::{
     BreakPaneResponse, DisplayPanesResponse, JoinPaneResponse, KillPaneResponse, LastPaneResponse,
-    ListPanesResponse, MovePaneResponse, PaneSnapshotCell, PaneSnapshotCursor,
-    PaneSnapshotResponse, PipePaneResponse, ResizePaneResponse, RespawnPaneResponse,
-    SelectPaneResponse, SendKeysResponse, SplitWindowResponse, SwapPaneResponse,
+    ListPanesResponse, MovePaneResponse, PaneOutputCursor, PaneOutputCursorResponse,
+    PaneOutputEvent, PaneOutputLagNotice, PaneOutputLagResponse, PaneRecentOutput,
+    PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotResponse, PipePaneResponse,
+    ResizePaneResponse, RespawnPaneResponse, SelectPaneResponse, SendKeysResponse,
+    SplitWindowResponse, SubscribePaneOutputResponse, SwapPaneResponse,
+    UnsubscribePaneOutputResponse,
 };
 
 #[path = "response/client.rs"]
@@ -226,6 +229,14 @@ pub enum Response {
     Handshake(HandshakeResponse),
     /// Success payload for the daemon-backed pane snapshot endpoint.
     PaneSnapshot(PaneSnapshotResponse),
+    /// Success payload for the daemon-backed pane output subscription endpoint.
+    SubscribePaneOutput(SubscribePaneOutputResponse),
+    /// Success payload for the daemon-backed pane output unsubscription endpoint.
+    UnsubscribePaneOutput(UnsubscribePaneOutputResponse),
+    /// Success payload for daemon-backed pane output cursor polling.
+    PaneOutputCursor(PaneOutputCursorResponse),
+    /// Lag notice for daemon-backed pane output cursor polling.
+    PaneOutputLag(PaneOutputLagResponse),
 }
 
 impl Response {
@@ -312,6 +323,10 @@ impl Response {
             Self::PipePane(_) => "pipe-pane",
             Self::RespawnPane(_) => "respawn-pane",
             Self::PaneSnapshot(_) => "pane-snapshot",
+            Self::SubscribePaneOutput(_) => "subscribe-pane-output",
+            Self::UnsubscribePaneOutput(_) => "unsubscribe-pane-output",
+            Self::PaneOutputCursor(_) => "pane-output-cursor",
+            Self::PaneOutputLag(_) => "pane-output-lag",
             Self::LinkWindow(_) => "link-window",
             Self::UnlinkWindow(_) => "unlink-window",
             Self::ResolveTarget(_) => "resolve-target",
@@ -353,6 +368,10 @@ impl Response {
             Self::ListClients(response) => Some(response.command_output()),
             Self::BreakPane(response) => response.command_output(),
             Self::Handshake(_) => None,
+            Self::SubscribePaneOutput(_)
+            | Self::UnsubscribePaneOutput(_)
+            | Self::PaneOutputCursor(_)
+            | Self::PaneOutputLag(_) => None,
             _ => None,
         }
     }

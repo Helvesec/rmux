@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 #[cfg(unix)]
 use tracing::debug;
 
+use rmux_core::events::SubscriptionLimits;
 #[cfg(windows)]
 use rmux_ipc::connect_blocking;
 use rmux_ipc::{LocalEndpoint, LocalListener};
@@ -71,6 +72,7 @@ fn socket_root_from_env(tmpdir: Option<&std::ffi::OsStr>) -> io::Result<PathBuf>
 pub struct DaemonConfig {
     socket_path: PathBuf,
     config_load: ConfigLoadOptions,
+    subscription_limits: SubscriptionLimits,
 }
 
 impl DaemonConfig {
@@ -80,6 +82,7 @@ impl DaemonConfig {
         Self {
             socket_path,
             config_load: ConfigLoadOptions::disabled(),
+            subscription_limits: SubscriptionLimits::default(),
         }
     }
 
@@ -100,6 +103,12 @@ impl DaemonConfig {
         &self.config_load
     }
 
+    /// Returns the pane-output subscription limits.
+    #[must_use]
+    pub fn subscription_limits(&self) -> SubscriptionLimits {
+        self.subscription_limits
+    }
+
     /// Enables RMUX default startup config loading.
     #[must_use]
     pub fn with_default_config_load(mut self, quiet: bool, cwd: Option<PathBuf>) -> Self {
@@ -108,6 +117,13 @@ impl DaemonConfig {
             quiet,
             cwd,
         };
+        self
+    }
+
+    /// Overrides pane-output subscription limits for this daemon.
+    #[must_use]
+    pub fn with_subscription_limits(mut self, subscription_limits: SubscriptionLimits) -> Self {
+        self.subscription_limits = subscription_limits;
         self
     }
 
@@ -231,6 +247,7 @@ impl ServerDaemon {
                 shutdown_handle.clone(),
                 shutdown_receiver,
                 self.config.config_load().clone(),
+                self.config.subscription_limits(),
                 owner_uid,
             ));
 
@@ -255,6 +272,7 @@ impl ServerDaemon {
                 shutdown_handle.clone(),
                 shutdown_receiver,
                 self.config.config_load().clone(),
+                self.config.subscription_limits(),
                 owner_uid,
             ));
 
