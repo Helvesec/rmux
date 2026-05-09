@@ -12,9 +12,10 @@ use crate::pane_terminal_lookup::{initial_pane, missing_pane_terminal};
 use crate::pane_terminal_process::{open_pane_terminal, PaneTerminal};
 use crate::terminal::TerminalProfile;
 
+use super::lifecycle_state::terminal_size_from_geometry;
 use super::{
     pane_terminal_geometry_for_session, session_not_found, HandlerState, KilledPaneHookContext,
-    KilledPaneResult, PaneOutputSpawn, WindowSpawnOptions,
+    KilledPaneResult, PaneLifecycleSpawn, PaneOutputSpawn, WindowSpawnOptions,
 };
 
 #[path = "pane_lifecycle/preview.rs"]
@@ -23,6 +24,12 @@ mod preview;
 use preview::{
     preview_kill_pane, preview_split, split_window_internal_direction, split_window_session_name,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneOutputMode {
+    Insert,
+    Reset,
+}
 
 impl HandlerState {
     pub(crate) fn insert_initial_session_terminal(
@@ -35,14 +42,22 @@ impl HandlerState {
         pane_exit_callback: Option<PaneExitCallback>,
     ) -> Result<(), RmuxError> {
         let pane = initial_pane(&self.sessions, session_name)?;
-        let runtime_session_name = self.runtime_session_name(session_name);
-        let (session_id, requested_cwd, pane_geometry) = {
+        let runtime_session_name =
+            self.runtime_session_name_for_window(session_name, pane.window_index);
+        let (session_id, window_id, requested_cwd, pane_geometry) = {
             let session = self
                 .sessions
                 .session(session_name)
                 .ok_or_else(|| session_not_found(session_name))?;
+            let window = session.window_at(pane.window_index).ok_or_else(|| {
+                RmuxError::invalid_target(
+                    format!("{session_name}:{}", pane.window_index),
+                    "window index does not exist in session",
+                )
+            })?;
             (
                 session.id(),
+                window.id(),
                 session.cwd(),
                 pane_terminal_geometry_for_session(session, &self.options, pane.geometry),
             )
@@ -60,8 +75,10 @@ impl HandlerState {
         )?;
         let automatic_window_name = profile.automatic_window_name(command);
         let runtime_window_name = profile.runtime_window_name(command);
+        let lifecycle_cwd = profile.cwd().to_path_buf();
         let terminal =
             open_pane_terminal(pane_geometry, profile, runtime_window_name.clone(), command)?;
+        let pid = terminal.pid();
         let output_reader = clone_terminal_for_output_reader(&terminal, session_name, pane.id)?;
         #[cfg(windows)]
         let exit_watcher = clone_terminal_for_exit_watcher(&terminal, session_name, pane.id)?;
@@ -85,6 +102,18 @@ impl HandlerState {
             let _ = self.terminals.remove_session(&runtime_session_name);
             return Err(error);
         }
+        self.record_pane_lifecycle_spawn(PaneLifecycleSpawn {
+            session_id,
+            window_id,
+            pane_id: pane.id,
+            command: command.map(<[String]>::to_vec),
+            working_directory: Some(lifecycle_cwd),
+            private_environment: environment_overrides.map(<[String]>::to_vec),
+            dimensions: terminal_size_from_geometry(pane.geometry),
+            pid: Some(pid),
+        });
+        let output_sequence = self.pane_output_generation(&runtime_session_name, pane.id);
+        self.update_pane_lifecycle_output_sequence(pane.id, output_sequence);
 
         Ok(())
     }
@@ -97,6 +126,7 @@ impl HandlerState {
                 .resize_session(&runtime_session_name, &pane_geometries)?;
             self.resize_transcripts(&runtime_session_name, &pane_geometries);
         }
+        self.sync_pane_lifecycle_dimensions_for_session(session_name);
         Ok(())
     }
 
@@ -106,28 +136,45 @@ impl HandlerState {
         window_index: u32,
         spawn: WindowSpawnOptions<'_>,
     ) -> Result<(), RmuxError> {
-        let runtime_session_name = self.runtime_session_name(session_name);
-        let (session_id, pane_id, pane_index, pane_geometry, requested_cwd) = {
+        self.spawn_window_terminal(session_name, window_index, spawn, PaneOutputMode::Insert)
+    }
+
+    pub(in crate::pane_terminals) fn reset_window_terminal(
+        &mut self,
+        session_name: &SessionName,
+        window_index: u32,
+        spawn: WindowSpawnOptions<'_>,
+    ) -> Result<(), RmuxError> {
+        self.spawn_window_terminal(session_name, window_index, spawn, PaneOutputMode::Reset)
+    }
+
+    fn spawn_window_terminal(
+        &mut self,
+        session_name: &SessionName,
+        window_index: u32,
+        spawn: WindowSpawnOptions<'_>,
+        output_mode: PaneOutputMode,
+    ) -> Result<(), RmuxError> {
+        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
+        let (session_id, window_id, pane_id, pane_index, pane_geometry, requested_cwd) = {
             let session = self
                 .sessions
                 .session(session_name)
                 .ok_or_else(|| session_not_found(session_name))?;
-            let pane = session
-                .window_at(window_index)
-                .ok_or_else(|| {
-                    RmuxError::invalid_target(
-                        format!("{session_name}:{window_index}"),
-                        "window index does not exist in session",
-                    )
-                })?
-                .pane(0)
-                .ok_or_else(|| {
-                    RmuxError::Server(format!(
-                        "initial pane missing for session {session_name}:{window_index}"
-                    ))
-                })?;
+            let window = session.window_at(window_index).ok_or_else(|| {
+                RmuxError::invalid_target(
+                    format!("{session_name}:{window_index}"),
+                    "window index does not exist in session",
+                )
+            })?;
+            let pane = window.pane(0).ok_or_else(|| {
+                RmuxError::Server(format!(
+                    "initial pane missing for session {session_name}:{window_index}"
+                ))
+            })?;
             (
                 session.id(),
+                window.id(),
                 pane.id(),
                 pane.index(),
                 pane_terminal_geometry_for_session(session, &self.options, pane.geometry()),
@@ -150,12 +197,14 @@ impl HandlerState {
         )?;
         let automatic_window_name = profile.automatic_window_name(spawn.command);
         let runtime_window_name = profile.runtime_window_name(spawn.command);
+        let lifecycle_cwd = profile.cwd().to_path_buf();
         let terminal = open_pane_terminal(
             pane_geometry,
             profile,
             runtime_window_name.clone(),
             spawn.command,
         )?;
+        let pid = terminal.pid();
         let output_reader = clone_terminal_for_output_reader(&terminal, session_name, pane_id)?;
         #[cfg(windows)]
         let exit_watcher = clone_terminal_for_exit_watcher(&terminal, session_name, pane_id)?;
@@ -169,21 +218,38 @@ impl HandlerState {
             pane_index,
             terminal,
         )?;
-        if let Err(error) = self.insert_pane_output(
-            &runtime_session_name,
-            pane_id,
-            PaneOutputSpawn {
-                geometry: pane_geometry,
-                output_reader,
-                #[cfg(windows)]
-                exit_watcher: Some(exit_watcher),
-                pane_alert_callback: spawn.pane_alert_callback,
-                pane_exit_callback: spawn.pane_exit_callback,
-            },
-        ) {
+        let output_spawn = PaneOutputSpawn {
+            geometry: pane_geometry,
+            output_reader,
+            #[cfg(windows)]
+            exit_watcher: Some(exit_watcher),
+            pane_alert_callback: spawn.pane_alert_callback,
+            pane_exit_callback: spawn.pane_exit_callback,
+        };
+        let output_result = match output_mode {
+            PaneOutputMode::Insert => {
+                self.insert_pane_output(&runtime_session_name, pane_id, output_spawn)
+            }
+            PaneOutputMode::Reset => {
+                self.reset_pane_output(&runtime_session_name, pane_id, output_spawn)
+            }
+        };
+        if let Err(error) = output_result {
             let _ = self.terminals.remove_pane(&runtime_session_name, pane_id);
             return Err(error);
         }
+        self.record_pane_lifecycle_spawn(PaneLifecycleSpawn {
+            session_id,
+            window_id,
+            pane_id,
+            command: spawn.command.map(<[String]>::to_vec),
+            working_directory: Some(lifecycle_cwd),
+            private_environment: spawn.environment_overrides.map(<[String]>::to_vec),
+            dimensions: terminal_size_from_geometry(pane_geometry),
+            pid: Some(pid),
+        });
+        let output_sequence = self.pane_output_generation(&runtime_session_name, pane_id);
+        self.update_pane_lifecycle_output_sequence(pane_id, output_sequence);
 
         Ok(())
     }
@@ -211,7 +277,7 @@ impl HandlerState {
         let runtime_session_name =
             self.runtime_session_name_for_window(&session_name, window_index);
         let new_pane_id = self.sessions.allocate_pane_id();
-        let (session_id, new_pane_id, new_pane_geometry, requested_cwd) = {
+        let (session_id, window_id, new_pane_id, new_pane_geometry, requested_cwd) = {
             let session = self
                 .sessions
                 .session_mut(&session_name)
@@ -245,7 +311,17 @@ impl HandlerState {
                 })
                 .ok_or_else(|| missing_pane_terminal(&session_name, window_index, committed_index))
                 .map(|(pane_id, pane_geometry)| {
-                    (session.id(), pane_id, pane_geometry, session.cwd())
+                    let window_id = session
+                        .window_at(window_index)
+                        .expect("split target window must exist")
+                        .id();
+                    (
+                        session.id(),
+                        window_id,
+                        pane_id,
+                        pane_geometry,
+                        session.cwd(),
+                    )
                 })
         }?;
         let profile = TerminalProfile::for_session(
@@ -260,12 +336,14 @@ impl HandlerState {
             requested_cwd,
         )?;
         let runtime_window_name = profile.runtime_window_name(command);
+        let lifecycle_cwd = profile.cwd().to_path_buf();
         let terminal = open_pane_terminal(
             new_pane_geometry,
             profile,
             runtime_window_name.clone(),
             command,
         )?;
+        let pid = terminal.pid();
         let output_reader =
             match clone_terminal_for_output_reader(&terminal, &session_name, new_pane_id) {
                 Ok(output_reader) => output_reader,
@@ -340,6 +418,19 @@ impl HandlerState {
         for synchronized_session in sessions_to_synchronize {
             self.synchronize_session_group_from(&synchronized_session)?;
         }
+        self.record_pane_lifecycle_spawn(PaneLifecycleSpawn {
+            session_id,
+            window_id,
+            pane_id: new_pane_id,
+            command: command.map(<[String]>::to_vec),
+            working_directory: Some(lifecycle_cwd),
+            private_environment: environment_overrides.map(<[String]>::to_vec),
+            dimensions: terminal_size_from_geometry(new_pane_geometry),
+            pid: Some(pid),
+        });
+        let output_sequence = self.pane_output_generation(&runtime_session_name, new_pane_id);
+        self.update_pane_lifecycle_output_sequence(new_pane_id, output_sequence);
+        self.sync_pane_lifecycle_dimensions_for_session(&session_name);
 
         Ok(SplitWindowResponse {
             pane: PaneTarget::with_window(session_name, window_index, new_pane_index),
@@ -475,8 +566,10 @@ impl HandlerState {
             )?;
             return Err(error);
         }
+        self.remove_pane_lifecycles(committed_outcome.removed_pane_ids());
 
         self.synchronize_session_group_from(&session_name)?;
+        self.sync_pane_lifecycle_dimensions_for_session(&session_name);
 
         if committed_outcome.window_destroyed() {
             let _ = self
@@ -521,7 +614,7 @@ impl HandlerState {
         let pane_index = target.pane_index();
         let runtime_session_name =
             self.runtime_session_name_for_window(&session_name, window_index);
-        let (session_id, pane_id, pane_geometry, requested_cwd) = {
+        let (session_id, window_id, pane_id, pane_geometry, requested_cwd) = {
             let session = self
                 .sessions
                 .session(&session_name)
@@ -540,6 +633,7 @@ impl HandlerState {
             })?;
             (
                 session.id(),
+                window.id(),
                 pane.id(),
                 pane_terminal_geometry_for_session(session, &self.options, pane.geometry()),
                 session.cwd(),
@@ -569,12 +663,14 @@ impl HandlerState {
         )?;
         let automatic_window_name = profile.automatic_window_name(command.as_deref());
         let runtime_window_name = profile.runtime_window_name(command.as_deref());
+        let lifecycle_cwd = profile.cwd().to_path_buf();
         let terminal = open_pane_terminal(
             pane_geometry,
             profile,
             runtime_window_name.clone(),
             command.as_deref(),
         )?;
+        let pid = terminal.pid();
         let output_reader = clone_terminal_for_output_reader(&terminal, &session_name, pane_id)?;
         #[cfg(windows)]
         let exit_watcher = clone_terminal_for_exit_watcher(&terminal, &session_name, pane_id)?;
@@ -603,6 +699,19 @@ impl HandlerState {
             },
         )?;
         self.apply_automatic_window_name(&session_name, window_index, automatic_window_name)?;
+        self.record_pane_lifecycle_spawn(PaneLifecycleSpawn {
+            session_id,
+            window_id,
+            pane_id,
+            command,
+            working_directory: Some(lifecycle_cwd),
+            private_environment: environment,
+            dimensions: terminal_size_from_geometry(pane_geometry),
+            pid: Some(pid),
+        });
+        let output_sequence = self.pane_output_generation(&runtime_session_name, pane_id);
+        self.update_pane_lifecycle_output_sequence(pane_id, output_sequence);
+        self.sync_pane_lifecycle_dimensions_for_session(&session_name);
 
         Ok(RespawnPaneResponse { target })
     }

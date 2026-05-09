@@ -112,6 +112,7 @@ impl HandlerState {
             self.terminals
                 .rename_session(session_name, next_runtime_owner)?;
             self.rename_runtime_session_state(session_name, next_runtime_owner)?;
+            self.sync_pane_lifecycle_dimensions_for_session(next_runtime_owner);
             return Ok(true);
         }
 
@@ -127,7 +128,13 @@ impl HandlerState {
         let _ = self.attached_submitted_rows.remove(session_name);
         self.auto_named_windows
             .retain(|(tracked_session, _)| tracked_session != session_name);
-        Ok(self.terminals.remove_session(session_name).is_some())
+        let removed_terminals = self.terminals.remove_session(session_name);
+        if let Some(panes) = removed_terminals.as_ref() {
+            for pane_id in panes.keys() {
+                self.remove_pane_lifecycle(*pane_id);
+            }
+        }
+        Ok(removed_terminals.is_some())
     }
 
     fn rename_runtime_session_state(

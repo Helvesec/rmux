@@ -240,6 +240,8 @@ impl HandlerState {
             return Err(error);
         }
         self.synchronize_session_group_from(&session_name)?;
+        self.remove_pane_lifecycles(&removed_pane_ids);
+        self.sync_pane_lifecycle_dimensions_for_session(&session_name);
 
         Ok(MoveWindowResponse {
             session_name: session_name.clone(),

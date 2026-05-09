@@ -161,6 +161,10 @@ impl HandlerState {
         if source_session_name != target_session_name {
             self.synchronize_session_group_from(&target_session_name)?;
         }
+        self.sync_pane_lifecycle_dimensions_for_session(&source_session_name);
+        if source_session_name != target_session_name {
+            self.sync_pane_lifecycle_dimensions_for_session(&target_session_name);
+        }
 
         Ok(SwapWindowResponse { source, target })
     }
@@ -351,6 +355,11 @@ impl HandlerState {
         self.synchronize_session_group_from(&source_session_name)?;
         if source_session_name != target_session_name {
             self.synchronize_session_group_from(&target_session_name)?;
+        }
+        self.remove_pane_lifecycles(&removed_target_pane_ids);
+        self.sync_pane_lifecycle_dimensions_for_session(&source_session_name);
+        if source_session_name != target_session_name {
+            self.sync_pane_lifecycle_dimensions_for_session(&target_session_name);
         }
 
         Ok(MoveWindowResponse {

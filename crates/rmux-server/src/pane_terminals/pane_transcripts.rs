@@ -202,6 +202,25 @@ impl HandlerState {
         })
     }
 
+    pub(crate) fn pane_output_sequence(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> Option<u64> {
+        let window_index = self
+            .sessions
+            .session(session_name)?
+            .window_index_for_pane_id(pane_id)?;
+        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
+        let transcript = self.transcripts.get(&runtime_session_name)?.get(&pane_id)?;
+        Some(
+            transcript
+                .lock()
+                .expect("pane transcript mutex must not be poisoned")
+                .output_sequence(),
+        )
+    }
+
     pub(crate) fn pane_screen_state(
         &self,
         session_name: &SessionName,

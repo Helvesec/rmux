@@ -2,12 +2,13 @@ use super::RequestHandler;
 use crate::pane_io::AttachControl;
 use rmux_proto::{
     HookLifecycle, HookName, KillWindowRequest, LastWindowRequest, LinkWindowRequest,
-    ListWindowsRequest, MoveWindowRequest, MoveWindowTarget, NewSessionExtRequest,
-    NewSessionRequest, NewWindowRequest, NextWindowRequest, OptionName, PreviousWindowRequest,
-    RenameWindowRequest, Request, ResizeWindowAdjustment, ResizeWindowRequest,
-    RespawnWindowRequest, Response, RotateWindowDirection, RotateWindowRequest, ScopeSelector,
-    SelectWindowRequest, SessionName, SetOptionMode, SplitWindowRequest, SplitWindowTarget,
-    SwapWindowRequest, TerminalSize, UnlinkWindowRequest, WindowTarget,
+    ListPanesRequest, ListWindowsRequest, MoveWindowRequest, MoveWindowTarget,
+    NewSessionExtRequest, NewSessionRequest, NewWindowRequest, NextWindowRequest, OptionName,
+    PreviousWindowRequest, RenameWindowRequest, Request, ResizeWindowAdjustment,
+    ResizeWindowRequest, RespawnWindowRequest, Response, RotateWindowDirection,
+    RotateWindowRequest, ScopeSelector, SelectWindowRequest, SessionName, SetOptionMode,
+    SplitWindowRequest, SplitWindowTarget, SwapWindowRequest, TerminalSize, UnlinkWindowRequest,
+    WindowTarget,
 };
 use std::path::Path;
 use tokio::sync::mpsc;

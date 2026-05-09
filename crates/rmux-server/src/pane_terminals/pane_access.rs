@@ -128,6 +128,7 @@ impl HandlerState {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn remove_pane_terminal(
         &mut self,
         session_name: &SessionName,
@@ -151,6 +152,7 @@ impl HandlerState {
         }
         self.clear_attached_submitted_line(runtime_session_name, pane_id);
         self.clear_marked_pane_if_id(pane_id);
+        self.remove_pane_lifecycle(pane_id);
         self.terminals
             .remove_pane(runtime_session_name, pane_id)
             .is_some()

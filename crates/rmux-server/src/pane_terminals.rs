@@ -16,6 +16,8 @@ use crate::pane_io::{PaneAlertCallback, PaneExitCallback, PaneOutputSender};
 use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::pane_transcript::SharedPaneTranscript;
 
+#[path = "pane_terminals/lifecycle_state.rs"]
+mod lifecycle_state;
 #[path = "pane_terminals/pane_access.rs"]
 mod pane_access;
 #[path = "pane_terminals/pane_lifecycle.rs"]
@@ -41,6 +43,10 @@ mod window_links;
 #[path = "pane_terminals_window.rs"]
 mod window_support;
 
+#[cfg(test)]
+pub(crate) use lifecycle_state::PaneLifecycleProcessState;
+use lifecycle_state::PaneLifecycleSpawn;
+pub(crate) use lifecycle_state::PaneLifecycleState;
 pub(crate) use pane_outputs::PaneExitMetadata;
 use pane_outputs::{AttachedSubmittedLine, PaneOutputSpawn, RemovedPaneOutputs};
 use pane_pipe::{ActivePanePipe, PanePipeStore};
@@ -84,6 +90,7 @@ pub(crate) struct HandlerState {
     transcripts: HashMap<SessionName, HashMap<PaneId, SharedPaneTranscript>>,
     pane_outputs: HashMap<SessionName, HashMap<PaneId, PaneOutputSender>>,
     pane_output_generations: HashMap<SessionName, HashMap<PaneId, u64>>,
+    pane_lifecycle: HashMap<PaneId, PaneLifecycleState>,
     attached_submitted_rows: HashMap<SessionName, HashMap<PaneId, AttachedSubmittedLine>>,
     #[cfg(all(test, windows))]
     pane_input_captures: StdMutex<HashMap<String, Vec<u8>>>,
@@ -153,6 +160,7 @@ impl HandlerState {
         self.auto_named_windows.clear();
         self.attached_submitted_rows.clear();
         self.dead_panes.clear();
+        self.pane_lifecycle.clear();
     }
 
     pub(crate) fn add_message(&mut self, message: impl Into<String>) {

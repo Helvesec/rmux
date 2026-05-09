@@ -83,6 +83,7 @@ impl HandlerState {
             .and_then(|panes| panes.get(&pane_id))
             .copied()
         {
+            self.mark_pane_lifecycle_exited(pane_id, metadata);
             return Ok(Some(metadata));
         }
 
@@ -101,6 +102,7 @@ impl HandlerState {
             .entry(runtime_session_name.clone())
             .or_default()
             .insert(pane_id, metadata);
+        self.mark_pane_lifecycle_exited(pane_id, metadata);
         Ok(Some(metadata))
     }
 
@@ -275,6 +277,7 @@ impl HandlerState {
         if let Some(dead_panes) = self.dead_panes.get_mut(session_name) {
             let _ = dead_panes.remove(&pane_id);
         }
+        self.update_pane_lifecycle_output_sequence(pane_id, generation);
         #[cfg(windows)]
         if let Some(exit_watcher) = spawn.exit_watcher {
             spawn_pane_exit_watcher(
@@ -336,6 +339,7 @@ impl HandlerState {
         if let Some(dead_panes) = self.dead_panes.get_mut(session_name) {
             let _ = dead_panes.remove(&pane_id);
         }
+        self.update_pane_lifecycle_output_sequence(pane_id, generation);
         #[cfg(windows)]
         if let Some(exit_watcher) = spawn.exit_watcher {
             spawn_pane_exit_watcher(
@@ -484,6 +488,18 @@ impl HandlerState {
             .wrapping_add(1);
         generations.insert(pane_id, next);
         next
+    }
+
+    pub(in crate::pane_terminals) fn pane_output_generation(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> u64 {
+        self.pane_output_generations
+            .get(session_name)
+            .and_then(|panes| panes.get(&pane_id))
+            .copied()
+            .unwrap_or(0)
     }
 
     pub(crate) fn move_pane_outputs_between_sessions(

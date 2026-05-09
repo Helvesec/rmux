@@ -129,6 +129,7 @@ impl HandlerState {
                     .terminals
                     .remove_pane_batch(&runtime_session_name, &pane_ids)?;
                 let _ = self.remove_pane_outputs(&runtime_session_name, &pane_ids);
+                self.remove_pane_lifecycles(&pane_ids);
             }
         }
 
@@ -145,6 +146,10 @@ impl HandlerState {
         self.synchronize_session_group_from(&target_session_name)?;
         if source_session_name != target_session_name {
             self.synchronize_session_group_from(&source_session_name)?;
+        }
+        self.sync_pane_lifecycle_dimensions_for_session(&target_session_name);
+        if source_session_name != target_session_name {
+            self.sync_pane_lifecycle_dimensions_for_session(&source_session_name);
         }
 
         Ok(LinkWindowResponse {

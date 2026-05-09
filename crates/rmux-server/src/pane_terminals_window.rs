@@ -98,6 +98,7 @@ impl HandlerState {
             Some(pane_id)
         );
         self.synchronize_session_group_from(session_name)?;
+        self.sync_pane_lifecycle_dimensions_for_session(session_name);
 
         Ok(NewWindowResponse {
             target: WindowTarget::with_window(session_name.clone(), window_index),
@@ -391,11 +392,17 @@ impl HandlerState {
             .first()
             .copied()
             .ok_or_else(|| RmuxError::Server("window has no panes".to_owned()))?;
+        let runtime_session_name =
+            self.runtime_session_name_for_window(&session_name, window_index);
 
-        // Kill all existing pane terminals.
-        for pane_id in &pane_ids {
-            self.remove_pane_terminal(&session_name, *pane_id);
+        // Kill terminals for panes that disappear with the old window layout.
+        for removed_pane_id in pane_ids.iter().copied().filter(|id| *id != pane_id) {
+            self.remove_pane_terminal_from_runtime(&runtime_session_name, removed_pane_id);
         }
+        if let Some(pipe) = self.remove_pane_pipe(&runtime_session_name, pane_id) {
+            pipe.stop();
+        }
+        let _ = self.terminals.remove_pane(&runtime_session_name, pane_id);
 
         // tmux respawns a window by retaining the first pane's identity and
         // destroying the rest, rather than allocating a new pane identity.
@@ -409,9 +416,10 @@ impl HandlerState {
         }
 
         // Spawn the new terminal for the single fresh pane.
-        self.insert_window_terminal(&session_name, window_index, spawn)?;
+        self.reset_window_terminal(&session_name, window_index, spawn)?;
 
         self.synchronize_session_group_from(&session_name)?;
+        self.sync_pane_lifecycle_dimensions_for_session(&session_name);
 
         Ok(rmux_proto::RespawnWindowResponse { target })
     }

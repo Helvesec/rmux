@@ -4,11 +4,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::RequestHandler;
 use crate::pane_io::AttachControl;
+use crate::pane_terminals::PaneLifecycleProcessState;
 use rmux_proto::{
-    BreakPaneRequest, DisplayPanesRequest, MovePaneRequest, NewSessionRequest, OptionName,
-    PaneTarget, PipePaneRequest, RenameWindowRequest, Request, RespawnPaneRequest, ScopeSelector,
+    BreakPaneRequest, DisplayPanesRequest, KillPaneRequest, ListPanesRequest, ListWindowsRequest,
+    MovePaneRequest, NewSessionExtRequest, NewSessionRequest, OptionName, PaneTarget,
+    PipePaneRequest, RenameWindowRequest, Request, RespawnPaneRequest, ScopeSelector,
     SelectPaneRequest, SendKeysRequest, SessionName, SetOptionMode, SetOptionRequest,
-    SplitDirection, SplitWindowRequest, SplitWindowTarget, TerminalSize, WindowTarget,
+    SplitDirection, SplitWindowExtRequest, SplitWindowRequest, SplitWindowTarget, TerminalSize,
+    WindowTarget,
 };
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
@@ -157,6 +160,367 @@ async fn wait_for_dead_pane(
         );
         sleep(Duration::from_millis(25)).await;
     }
+}
+
+async fn wait_for_lifecycle_exit(
+    handler: &RequestHandler,
+    pane_id: rmux_core::PaneId,
+    expected_status: i32,
+) -> (u64, u64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let observed = {
+            let state = handler.state.lock().await;
+            state.pane_lifecycle(pane_id).and_then(|lifecycle| {
+                lifecycle
+                    .exit_state
+                    .map(|exit| (lifecycle.generation, lifecycle.output_sequence, exit))
+            })
+        };
+        if let Some((generation, output_sequence, exit)) = observed {
+            assert_eq!(exit.status, Some(expected_status));
+            assert_eq!(exit.signal, None);
+            return (generation, output_sequence);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for pane {} lifecycle exit state",
+            pane_id.as_u32()
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("sticky");
+    let initial_cwd = unique_temp_path("sticky-initial-cwd");
+    let respawn_cwd = unique_temp_path("sticky-respawn-cwd");
+    fs::create_dir_all(&initial_cwd).expect("initial cwd");
+    fs::create_dir_all(&respawn_cwd).expect("respawn cwd");
+    let initial_command = pipe_discard_command();
+    let split_command = pipe_discard_command();
+    let respawn_command = pipe_discard_command();
+    let initial_secret = "RMUX_PRIVATE_INITIAL=alpha-secret".to_owned();
+    let split_secret = "RMUX_PRIVATE_SPLIT=beta-secret".to_owned();
+    let respawn_secret = "RMUX_PRIVATE_RESPAWN=gamma-secret".to_owned();
+
+    let created = handler
+        .handle(Request::NewSessionExt(NewSessionExtRequest {
+            session_name: Some(alpha.clone()),
+            working_directory: Some(initial_cwd.to_string_lossy().into_owned()),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: Some(vec![initial_secret.clone()]),
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(vec![initial_command.clone()]),
+        }))
+        .await;
+    assert!(matches!(created, rmux_proto::Response::NewSession(_)));
+
+    let (session_id, window_id, initial_pane_id, initial_output_sequence) = {
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&alpha).expect("session exists");
+        let window = session.window_at(0).expect("window exists");
+        let pane = window.pane(0).expect("pane exists");
+        let lifecycle = state
+            .pane_lifecycle(pane.id())
+            .expect("initial lifecycle exists");
+        assert_eq!(lifecycle.session_id, session.id());
+        assert_eq!(lifecycle.window_id, window.id());
+        assert_eq!(lifecycle.pane_id, pane.id());
+        assert_eq!(
+            lifecycle.command(),
+            Some(std::slice::from_ref(&initial_command))
+        );
+        assert_eq!(lifecycle.working_directory(), Some(initial_cwd.as_path()));
+        assert_eq!(
+            lifecycle.private_environment(),
+            std::slice::from_ref(&initial_secret)
+        );
+        assert!(lifecycle.tags().is_empty());
+        assert_eq!(lifecycle.dimensions(), TerminalSize { cols: 80, rows: 24 });
+        assert!(matches!(
+            lifecycle.process,
+            PaneLifecycleProcessState::Running { .. }
+        ));
+        assert!(lifecycle.generation >= 1);
+        assert!(lifecycle.revision >= 1);
+        assert!(lifecycle.output_sequence >= 1);
+        assert!(lifecycle.exit_state.is_none());
+        (
+            session.id(),
+            window.id(),
+            pane.id(),
+            lifecycle.output_sequence,
+        )
+    };
+
+    let split = handler
+        .handle(Request::SplitWindowExt(SplitWindowExtRequest {
+            target: SplitWindowTarget::Session(alpha.clone()),
+            direction: SplitDirection::Vertical,
+            environment: Some(vec![split_secret.clone()]),
+            command: Some(vec![split_command.clone()]),
+        }))
+        .await;
+    let split_target = match split {
+        rmux_proto::Response::SplitWindow(response) => response.pane,
+        response => panic!("expected split-window success, got {response:?}"),
+    };
+    let split_pane_id = {
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&alpha).expect("session exists");
+        let window = session.window_at(0).expect("window exists");
+        let pane = window
+            .pane(split_target.pane_index())
+            .expect("split pane exists");
+        let lifecycle = state
+            .pane_lifecycle(pane.id())
+            .expect("split lifecycle exists");
+        assert_eq!(lifecycle.session_id, session_id);
+        assert_eq!(lifecycle.window_id, window_id);
+        assert_eq!(
+            lifecycle.command(),
+            Some(std::slice::from_ref(&split_command))
+        );
+        assert_eq!(
+            lifecycle.private_environment(),
+            std::slice::from_ref(&split_secret)
+        );
+        assert!(lifecycle.dimensions().cols > 0);
+        assert!(lifecycle.dimensions().rows > 0);
+        assert!(lifecycle.output_sequence >= 1);
+        assert!(pane.id().as_u32() > initial_pane_id.as_u32());
+        pane.id()
+    };
+
+    let list_format = concat!(
+        "#{pane_id}\t#{pane_start_command}\t#{pane_start_path}\t",
+        "#{pane_lifecycle_generation}\t#{pane_output_sequence}\t",
+        "#{RMUX_PRIVATE_INITIAL}\t#{RMUX_PRIVATE_SPLIT}\t#{RMUX_PRIVATE_RESPAWN}"
+    )
+    .to_owned();
+    let listed = handler
+        .handle(Request::ListPanes(ListPanesRequest {
+            target: alpha.clone(),
+            target_window_index: None,
+            format: Some(list_format.clone()),
+        }))
+        .await;
+    let list_stdout = match listed {
+        rmux_proto::Response::ListPanes(response) => {
+            String::from_utf8(response.output.stdout).expect("list-panes utf8")
+        }
+        response => panic!("expected list-panes success, got {response:?}"),
+    };
+    assert!(list_stdout.contains(&initial_pane_id.to_string()));
+    assert!(list_stdout.contains(&split_pane_id.to_string()));
+    assert!(!list_stdout.contains(&initial_secret));
+    assert!(!list_stdout.contains(&split_secret));
+
+    let windows = handler
+        .handle(Request::ListWindows(ListWindowsRequest {
+            target: alpha.clone(),
+            format: Some(list_format),
+        }))
+        .await;
+    let windows_stdout = match windows {
+        rmux_proto::Response::ListWindows(response) => {
+            assert_eq!(response.windows.len(), 1);
+            String::from_utf8(response.output.stdout).expect("list-windows utf8")
+        }
+        response => panic!("expected list-windows success, got {response:?}"),
+    };
+    assert!(!windows_stdout.contains(&initial_secret));
+    assert!(!windows_stdout.contains(&split_secret));
+
+    let killed = handler
+        .handle(Request::KillPane(KillPaneRequest {
+            target: split_target,
+            kill_all_except: false,
+        }))
+        .await;
+    assert!(matches!(killed, rmux_proto::Response::KillPane(_)));
+    {
+        let state = handler.state.lock().await;
+        assert!(
+            state.pane_lifecycle(split_pane_id).is_none(),
+            "closed pane lifecycle state must be removed by pane id"
+        );
+    }
+
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
+                option: OptionName::RemainOnExit,
+                value: "on".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        rmux_proto::Response::SetOption(_)
+    ));
+    let dead_respawn = handler
+        .handle(Request::RespawnPane(RespawnPaneRequest {
+            target: PaneTarget::with_window(alpha.clone(), 0, 0),
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: Some(vec!["exit 7".to_owned()]),
+        }))
+        .await;
+    assert!(matches!(dead_respawn, rmux_proto::Response::RespawnPane(_)));
+    wait_for_dead_pane(&handler, &alpha, 0, 0).await;
+    let (dead_generation, dead_output_sequence) =
+        wait_for_lifecycle_exit(&handler, initial_pane_id, 7).await;
+
+    let respawned = handler
+        .handle(Request::RespawnPane(RespawnPaneRequest {
+            target: PaneTarget::with_window(alpha.clone(), 0, 0),
+            kill: true,
+            start_directory: Some(respawn_cwd.clone()),
+            environment: Some(vec![respawn_secret.clone()]),
+            command: Some(vec![respawn_command.clone()]),
+        }))
+        .await;
+    assert!(matches!(respawned, rmux_proto::Response::RespawnPane(_)));
+    {
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&alpha).expect("session exists");
+        let pane = session
+            .window_at(0)
+            .and_then(|window| window.pane(0))
+            .expect("respawned pane exists");
+        assert_eq!(pane.id(), initial_pane_id);
+        let lifecycle = state
+            .pane_lifecycle(initial_pane_id)
+            .expect("respawn lifecycle exists");
+        assert_eq!(
+            lifecycle.command(),
+            Some(std::slice::from_ref(&respawn_command))
+        );
+        assert_eq!(lifecycle.working_directory(), Some(respawn_cwd.as_path()));
+        assert_eq!(
+            lifecycle.private_environment(),
+            std::slice::from_ref(&respawn_secret)
+        );
+        assert!(!lifecycle.private_environment().contains(&initial_secret));
+        assert!(matches!(
+            lifecycle.process,
+            PaneLifecycleProcessState::Running { .. }
+        ));
+        assert!(lifecycle.exit_state.is_none());
+        assert!(lifecycle.generation > dead_generation);
+        assert!(lifecycle.output_sequence > dead_output_sequence);
+        assert!(lifecycle.output_sequence > initial_output_sequence);
+    }
+
+    let relisted = handler
+        .handle(Request::ListPanes(ListPanesRequest {
+            target: alpha,
+            target_window_index: Some(0),
+            format: Some(
+                concat!(
+                    "#{pane_id}\t#{pane_start_command}\t#{pane_start_path}\t",
+                    "#{pane_lifecycle_generation}\t#{pane_output_sequence}\t",
+                    "dead=#{pane_dead_status}\t#{RMUX_PRIVATE_INITIAL}\t",
+                    "#{RMUX_PRIVATE_SPLIT}\t#{RMUX_PRIVATE_RESPAWN}"
+                )
+                .to_owned(),
+            ),
+        }))
+        .await;
+    let relisted_stdout = match relisted {
+        rmux_proto::Response::ListPanes(response) => {
+            String::from_utf8(response.output.stdout).expect("list-panes utf8")
+        }
+        response => panic!("expected list-panes success, got {response:?}"),
+    };
+    assert!(relisted_stdout.contains(&initial_pane_id.to_string()));
+    assert!(!relisted_stdout.contains(&initial_secret));
+    assert!(!relisted_stdout.contains(&split_secret));
+    assert!(!relisted_stdout.contains(&respawn_secret));
+    assert!(!relisted_stdout.contains("dead=7"));
+    let _ = fs::remove_dir_all(initial_cwd);
+    let _ = fs::remove_dir_all(respawn_cwd);
+}
+
+#[tokio::test]
+async fn pane_output_sequence_advances_when_transcript_changes() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("sequence");
+    let created = handler
+        .handle(Request::NewSessionExt(NewSessionExtRequest {
+            session_name: Some(alpha.clone()),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(vec![pipe_discard_command()]),
+        }))
+        .await;
+    assert!(matches!(created, rmux_proto::Response::NewSession(_)));
+
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id())
+            .expect("initial pane exists")
+    };
+    let before = listed_output_sequence(&handler, &alpha).await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_runtime_pane_transcript(&alpha, pane_id, b"transcript output")
+            .expect("append to runtime transcript");
+    }
+    let after = listed_output_sequence(&handler, &alpha).await;
+
+    assert!(
+        after > before,
+        "pane_output_sequence should advance after pane output, before={before}, after={after}"
+    );
+}
+
+async fn listed_output_sequence(handler: &RequestHandler, session_name: &SessionName) -> u64 {
+    let listed = handler
+        .handle(Request::ListPanes(ListPanesRequest {
+            target: session_name.clone(),
+            target_window_index: Some(0),
+            format: Some("#{pane_output_sequence}".to_owned()),
+        }))
+        .await;
+    let stdout = match listed {
+        rmux_proto::Response::ListPanes(response) => {
+            String::from_utf8(response.output.stdout).expect("list-panes utf8")
+        }
+        response => panic!("expected list-panes success, got {response:?}"),
+    };
+    stdout
+        .trim()
+        .parse::<u64>()
+        .expect("pane_output_sequence is numeric")
 }
 
 #[tokio::test]

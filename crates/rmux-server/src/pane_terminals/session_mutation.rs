@@ -38,6 +38,7 @@ impl HandlerState {
         }
 
         self.synchronize_session_group_from(session_name)?;
+        self.sync_pane_lifecycle_dimensions_for_session(session_name);
 
         Ok(result)
     }

@@ -31,7 +31,9 @@ const PANE_LIST_FORMAT: &str = "#{window_index}:#{pane_index}:#{pane_id}";
 const PANE_INFO_FORMAT: &str =
     "#{pane_id}\t#{pane_pid}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_dead_signal}\
      \t#{pane_width}\t#{pane_height}\t#{cursor_x}\t#{cursor_y}\t#{cursor_flag}\
-     \t#{cursor_shape}\t#{history_bytes}\t#{history_size}\t#{pane_current_path}";
+     \t#{cursor_shape}\t#{history_bytes}\t#{history_size}\t#{pane_start_command}\
+     \t#{pane_lifecycle_generation}\t#{pane_lifecycle_revision}\t#{pane_output_sequence}\
+     \t#{pane_start_path}";
 
 /// Opaque handle for one daemon pane slot.
 ///
@@ -213,6 +215,10 @@ struct LiveDetails {
     cursor_style: u32,
     history_bytes: u64,
     history_size: u64,
+    start_command: Option<Vec<String>>,
+    generation: u64,
+    lifecycle_revision: u64,
+    output_sequence: u64,
     current_path: Option<String>,
 }
 
@@ -255,8 +261,15 @@ async fn pane_info_snapshot(client: &TransportClient, target: &PaneRef) -> Resul
     pane_info.size = pane_size_from_details(&details, &window.size);
     pane_info.process = derive_process_state(&details);
     pane_info.exit_state = derive_exit_state(&details);
+    pane_info.command = details.start_command.clone();
     pane_info.working_directory = details.current_path.clone();
-    pane_info.revision = revision_from_details(&details);
+    pane_info.generation = details.generation;
+    pane_info.revision = if details.lifecycle_revision == 0 {
+        revision_from_details(&details)
+    } else {
+        details.lifecycle_revision
+    };
+    pane_info.output_sequence = details.output_sequence;
 
     Ok(InfoSnapshot::new(
         vec![SessionInfo::new(session_id, session.name.clone())],
@@ -498,6 +511,10 @@ fn revision_from_details(details: &LiveDetails) -> u64 {
     details.dead_signal.hash(&mut hasher);
     details.history_bytes.hash(&mut hasher);
     details.history_size.hash(&mut hasher);
+    details.start_command.hash(&mut hasher);
+    details.generation.hash(&mut hasher);
+    details.lifecycle_revision.hash(&mut hasher);
+    details.output_sequence.hash(&mut hasher);
     details.cols.hash(&mut hasher);
     details.rows.hash(&mut hasher);
     details.cursor_x.hash(&mut hasher);
@@ -646,13 +663,13 @@ fn parse_details_line(line: &str) -> Result<LiveDetails> {
     if line.is_empty() {
         return Ok(LiveDetails::default());
     }
-    // The trailing field is `#{pane_current_path}`, which is a filesystem
+    // The trailing field is `#{pane_start_path}`, which is a filesystem
     // path. Tabs in such a path are valid bytes on Unix, so the parser
-    // anchors the leading 13 separators with `splitn` and treats the
+    // anchors the leading separators with `splitn` and treats the
     // remainder as the path verbatim instead of dropping characters past
     // an embedded tab.
-    let fields: Vec<&str> = line.splitn(14, '\t').collect();
-    if fields.len() < 14 {
+    let fields: Vec<&str> = line.splitn(18, '\t').collect();
+    if fields.len() < 18 {
         return Ok(LiveDetails::default());
     }
 
@@ -669,7 +686,11 @@ fn parse_details_line(line: &str) -> Result<LiveDetails> {
     let cursor_style = parse_optional_u32(fields[10]).unwrap_or(0);
     let history_bytes = parse_optional_u64(fields[11]).unwrap_or(0);
     let history_size = parse_optional_u64(fields[12]).unwrap_or(0);
-    let current_path = optional_string(fields[13]);
+    let start_command = decode_command_field(fields[13])?;
+    let generation = parse_optional_u64(fields[14]).unwrap_or(0);
+    let lifecycle_revision = parse_optional_u64(fields[15]).unwrap_or(0);
+    let output_sequence = parse_optional_u64(fields[16]).unwrap_or(0);
+    let current_path = optional_string(fields[17]);
 
     Ok(LiveDetails {
         pane_id,
@@ -685,6 +706,10 @@ fn parse_details_line(line: &str) -> Result<LiveDetails> {
         cursor_style,
         history_bytes,
         history_size,
+        start_command,
+        generation,
+        lifecycle_revision,
+        output_sequence,
         current_path,
     })
 }
@@ -861,6 +886,51 @@ fn optional_string(value: &str) -> Option<String> {
     }
 }
 
+fn decode_command_field(value: &str) -> Result<Option<Vec<String>>> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .split('\x1f')
+        .map(percent_decode_string)
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+fn percent_decode_string(value: &str) -> Result<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(parse_error("truncated percent escape in pane command"));
+            }
+            let high = hex_value(bytes[index + 1])?;
+            let low = hex_value(bytes[index + 2])?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded)
+        .map_err(|error| parse_error(format!("pane command was not utf-8: {error}")))
+}
+
+fn hex_value(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(parse_error(format!(
+            "invalid percent escape digit `{}` in pane command",
+            char::from(byte)
+        ))),
+    }
+}
+
 fn parse_error(message: impl Into<String>) -> RmuxError {
     RmuxError::protocol(rmux_proto::RmuxError::Server(message.into()))
 }
@@ -1014,7 +1084,7 @@ mod tests {
 
     #[test]
     fn parse_details_line_handles_empty_optional_fields() {
-        let line = "%2\t1234\t0\t\t\t80\t24\t10\t5\t1\t0\t128\t4\t/tmp";
+        let line = "%2\t1234\t0\t\t\t80\t24\t10\t5\t1\t0\t128\t4\t\t0\t0\t0\t/tmp";
         let details = parse_details_line(line).expect("parses");
         assert_eq!(details.pane_id.unwrap().to_string(), "%2");
         assert_eq!(details.pid, Some(1234));
@@ -1045,12 +1115,34 @@ mod tests {
 
     #[test]
     fn parse_details_line_preserves_tabs_inside_current_path() {
-        let line = "%2\t1234\t0\t\t\t80\t24\t10\t5\t1\t0\t128\t4\t/tmp/odd\tdir\twith\ttabs";
+        let line =
+            "%2\t1234\t0\t\t\t80\t24\t10\t5\t1\t0\t128\t4\t\t0\t0\t0\t/tmp/odd\tdir\twith\ttabs";
         let details = parse_details_line(line).expect("parses");
         assert_eq!(
             details.current_path.as_deref(),
             Some("/tmp/odd\tdir\twith\ttabs")
         );
+    }
+
+    #[test]
+    fn parse_details_line_decodes_sticky_lifecycle_fields_without_env() {
+        let line = "%2\t1234\t0\t\t\t80\t24\t10\t5\t1\t0\t128\t4\tprintf\x1falpha%09beta%25\
+             \t3\t5\t7\t/tmp/start";
+        let details = parse_details_line(line).expect("parses");
+        assert_eq!(
+            details.start_command.as_deref(),
+            Some(["printf".to_owned(), "alpha\tbeta%".to_owned()].as_slice())
+        );
+        assert_eq!(details.generation, 3);
+        assert_eq!(details.lifecycle_revision, 5);
+        assert_eq!(details.output_sequence, 7);
+        assert_eq!(details.current_path.as_deref(), Some("/tmp/start"));
+    }
+
+    #[test]
+    fn parse_details_line_rejects_malformed_encoded_command() {
+        let line = "%2\t1234\t0\t\t\t80\t24\t10\t5\t1\t0\t128\t4\tbad%XX\t1\t1\t1\t/tmp";
+        assert!(parse_details_line(line).is_err());
     }
 
     #[test]
@@ -1367,13 +1459,13 @@ mod tests {
 
     #[test]
     fn parse_details_line_rejects_malformed_pane_id_prefix() {
-        let line = "no-prefix\t1\t0\t\t\t1\t1\t0\t0\t1\t0\t0\t0\t";
+        let line = "no-prefix\t1\t0\t\t\t1\t1\t0\t0\t1\t0\t0\t0\t\t0\t0\t0\t/tmp";
         assert!(parse_details_line(line).is_err());
     }
 
     #[test]
     fn parse_details_line_treats_unset_cursor_visibility_as_visible() {
-        let line = "%1\t1\t0\t\t\t1\t1\t0\t0\t\t0\t0\t0\t";
+        let line = "%1\t1\t0\t\t\t1\t1\t0\t0\t\t0\t0\t0\t\t0\t0\t0\t/tmp";
         let details = parse_details_line(line).expect("parses");
         assert!(details.cursor_visible);
     }

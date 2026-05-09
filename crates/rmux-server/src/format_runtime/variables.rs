@@ -170,7 +170,7 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "mouse_sgr_flag" => self.pane_mode_flag(mode::MODE_MOUSE_SGR),
             "mouse_standard_flag" => self.pane_mode_flag(mode::MODE_MOUSE_STANDARD),
             "mouse_utf8_flag" => self.pane_mode_flag(mode::MODE_MOUSE_UTF8),
-            "pane_current_path" | "pane_path" | "pane_start_path" | "session_path" => self
+            "pane_current_path" | "pane_path" | "session_path" => self
                 .pane_current_path()
                 .or_else(|| self.environment_value_by_name("PWD"))
                 .or_else(|| self.environment_value_by_name("HOME")),
@@ -210,6 +210,9 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             }),
             "pane_left" => self.pane.map(|pane| pane.geometry().x().to_string()),
             "pane_mode" => self.pane_mode_name(),
+            "pane_lifecycle_generation" | "pane_generation" => self.pane_lifecycle_generation(),
+            "pane_lifecycle_revision" | "pane_revision" => self.pane_lifecycle_revision(),
+            "pane_output_sequence" => self.pane_output_sequence(),
             "pane_pid" => self.pane_pid(),
             "pane_right" => self.pane.map(|pane| {
                 (pane.geometry().x() + pane.geometry().cols())
@@ -219,6 +222,11 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "pane_search_string" => self
                 .pane_copy_mode_summary()
                 .map(|summary| summary.pane_search_string),
+            "pane_start_command" => self.pane_start_command(),
+            "pane_start_path" => self
+                .pane_start_path()
+                .or_else(|| self.environment_value_by_name("PWD"))
+                .or_else(|| self.environment_value_by_name("HOME")),
             "pane_tty" => self.pane_tty(),
             "pane_title" => self.pane_title(),
             "pane_top" => self.pane.map(|pane| pane.geometry().y().to_string()),

@@ -18,6 +18,7 @@ pub(crate) struct PaneTranscript {
     parser: InputParser,
     screen: Screen,
     mode: Option<PaneModeState>,
+    output_sequence: u64,
     next_clock_generation: u64,
     clear_on_dead_exit: bool,
     #[cfg(test)]
@@ -39,6 +40,7 @@ impl PaneTranscript {
             parser: InputParser::new(),
             screen: Screen::new(size, limit),
             mode: None,
+            output_sequence: 0,
             next_clock_generation: 1,
             clear_on_dead_exit: false,
             #[cfg(test)]
@@ -55,8 +57,15 @@ impl PaneTranscript {
     }
 
     pub(crate) fn append_bytes(&mut self, bytes: &[u8]) -> u64 {
+        if !bytes.is_empty() {
+            self.output_sequence = self.output_sequence.saturating_add(1);
+        }
         self.parser.parse(bytes, &mut self.screen);
         self.screen.take_bell_count()
+    }
+
+    pub(crate) const fn output_sequence(&self) -> u64 {
+        self.output_sequence
     }
 
     pub(crate) fn set_utf8_config(&mut self, utf8_config: Utf8Config) {

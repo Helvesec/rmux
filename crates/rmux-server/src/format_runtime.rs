@@ -321,6 +321,38 @@ impl<'a> RuntimeFormatContext<'a> {
         Some(stats.bytes.to_string())
     }
 
+    fn pane_lifecycle(&self) -> Option<&crate::pane_terminals::PaneLifecycleState> {
+        let pane = self.pane?;
+        self.state?.pane_lifecycle(pane.id())
+    }
+
+    fn pane_start_command(&self) -> Option<String> {
+        self.pane_lifecycle()?.encoded_command()
+    }
+
+    fn pane_start_path(&self) -> Option<String> {
+        self.pane_lifecycle()?
+            .working_directory()
+            .map(|path| path.to_string_lossy().into_owned())
+    }
+
+    fn pane_lifecycle_generation(&self) -> Option<String> {
+        Some(self.pane_lifecycle()?.generation.to_string())
+    }
+
+    fn pane_lifecycle_revision(&self) -> Option<String> {
+        Some(self.pane_lifecycle()?.revision.to_string())
+    }
+
+    fn pane_output_sequence(&self) -> Option<String> {
+        let session = self.session?;
+        let pane = self.pane?;
+        self.state?
+            .pane_output_sequence(session.name(), pane.id())
+            .or_else(|| self.pane_lifecycle().map(|state| state.output_sequence))
+            .map(|sequence| sequence.to_string())
+    }
+
     fn pane_cursor_position(&self) -> Option<(u32, u32)> {
         let session = self.session?;
         let pane = self.pane?;

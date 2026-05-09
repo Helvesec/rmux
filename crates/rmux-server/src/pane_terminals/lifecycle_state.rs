@@ -1,0 +1,316 @@
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use rmux_core::{PaneGeometry, PaneId};
+use rmux_proto::{SessionId, SessionName, TerminalSize, WindowId};
+
+use super::{HandlerState, PaneExitMetadata};
+
+#[derive(Clone, PartialEq, Eq, Default)]
+pub(in crate::pane_terminals) struct PrivatePaneEnvironment(Vec<String>);
+
+impl PrivatePaneEnvironment {
+    fn new(environment: Option<&[String]>) -> Self {
+        Self(environment.unwrap_or_default().to_vec())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for PrivatePaneEnvironment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PrivatePaneEnvironment")
+            .field("entry_count", &self.0.len())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PaneLifecycleProcessState {
+    #[default]
+    Unknown,
+    Running {
+        pid: Option<u32>,
+    },
+    Exited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaneLifecycleExitState {
+    pub(crate) status: Option<i32>,
+    pub(crate) signal: Option<i32>,
+    pub(crate) time: i64,
+}
+
+impl From<PaneExitMetadata> for PaneLifecycleExitState {
+    fn from(metadata: PaneExitMetadata) -> Self {
+        Self {
+            status: metadata.status,
+            signal: metadata.signal,
+            time: metadata.time,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct PaneLifecycleState {
+    pub(crate) session_id: SessionId,
+    pub(crate) window_id: WindowId,
+    pub(crate) pane_id: PaneId,
+    command: Option<Vec<String>>,
+    working_directory: Option<PathBuf>,
+    private_environment: PrivatePaneEnvironment,
+    tags: Vec<String>,
+    dimensions: TerminalSize,
+    pub(crate) process: PaneLifecycleProcessState,
+    pub(crate) generation: u64,
+    pub(crate) revision: u64,
+    pub(crate) output_sequence: u64,
+    pub(crate) exit_state: Option<PaneLifecycleExitState>,
+}
+
+impl fmt::Debug for PaneLifecycleState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PaneLifecycleState")
+            .field("session_id", &self.session_id)
+            .field("window_id", &self.window_id)
+            .field("pane_id", &self.pane_id)
+            .field("command", &self.command)
+            .field("working_directory", &self.working_directory)
+            .field("private_environment", &self.private_environment)
+            .field("tags", &self.tags)
+            .field("dimensions", &self.dimensions)
+            .field("process", &self.process)
+            .field("generation", &self.generation)
+            .field("revision", &self.revision)
+            .field("output_sequence", &self.output_sequence)
+            .field("exit_state", &self.exit_state)
+            .finish()
+    }
+}
+
+impl PaneLifecycleState {
+    #[cfg(test)]
+    pub(crate) fn command(&self) -> Option<&[String]> {
+        self.command.as_deref()
+    }
+
+    pub(crate) fn encoded_command(&self) -> Option<String> {
+        self.command.as_deref().map(encode_command_field)
+    }
+
+    pub(crate) fn working_directory(&self) -> Option<&Path> {
+        self.working_directory.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tags(&self) -> &[String] {
+        &self.tags
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn dimensions(&self) -> TerminalSize {
+        self.dimensions
+    }
+
+    #[cfg(test)]
+    pub(crate) fn private_environment(&self) -> &[String] {
+        self.private_environment.as_slice()
+    }
+}
+
+pub(in crate::pane_terminals) struct PaneLifecycleSpawn {
+    pub(in crate::pane_terminals) session_id: SessionId,
+    pub(in crate::pane_terminals) window_id: WindowId,
+    pub(in crate::pane_terminals) pane_id: PaneId,
+    pub(in crate::pane_terminals) command: Option<Vec<String>>,
+    pub(in crate::pane_terminals) working_directory: Option<PathBuf>,
+    pub(in crate::pane_terminals) private_environment: Option<Vec<String>>,
+    pub(in crate::pane_terminals) dimensions: TerminalSize,
+    pub(in crate::pane_terminals) pid: Option<u32>,
+}
+
+impl HandlerState {
+    pub(in crate::pane_terminals) fn record_pane_lifecycle_spawn(
+        &mut self,
+        spawn: PaneLifecycleSpawn,
+    ) {
+        let previous = self.pane_lifecycle.remove(&spawn.pane_id);
+        let generation = previous
+            .as_ref()
+            .map_or(1, |state| state.generation.saturating_add(1));
+        let revision = previous
+            .as_ref()
+            .map_or(1, |state| state.revision.saturating_add(1));
+        let output_sequence = previous.as_ref().map_or(0, |state| state.output_sequence);
+
+        self.pane_lifecycle.insert(
+            spawn.pane_id,
+            PaneLifecycleState {
+                session_id: spawn.session_id,
+                window_id: spawn.window_id,
+                pane_id: spawn.pane_id,
+                command: spawn.command,
+                working_directory: spawn.working_directory,
+                private_environment: PrivatePaneEnvironment::new(
+                    spawn.private_environment.as_deref(),
+                ),
+                tags: Vec::new(),
+                dimensions: spawn.dimensions,
+                process: PaneLifecycleProcessState::Running { pid: spawn.pid },
+                generation,
+                revision,
+                output_sequence,
+                exit_state: None,
+            },
+        );
+    }
+
+    pub(in crate::pane_terminals) fn update_pane_lifecycle_output_sequence(
+        &mut self,
+        pane_id: PaneId,
+        output_sequence: u64,
+    ) {
+        let Some(state) = self.pane_lifecycle.get_mut(&pane_id) else {
+            return;
+        };
+        if state.output_sequence != output_sequence {
+            state.output_sequence = output_sequence;
+            state.revision = state.revision.saturating_add(1);
+        }
+    }
+
+    pub(in crate::pane_terminals) fn mark_pane_lifecycle_exited(
+        &mut self,
+        pane_id: PaneId,
+        metadata: PaneExitMetadata,
+    ) {
+        let Some(state) = self.pane_lifecycle.get_mut(&pane_id) else {
+            return;
+        };
+        let exit_state = metadata.into();
+        if state.process == PaneLifecycleProcessState::Exited
+            && state.exit_state == Some(exit_state)
+        {
+            return;
+        }
+        state.process = PaneLifecycleProcessState::Exited;
+        state.exit_state = Some(exit_state);
+        state.generation = state.generation.saturating_add(1);
+        state.revision = state.revision.saturating_add(1);
+    }
+
+    pub(in crate::pane_terminals) fn remove_pane_lifecycle(&mut self, pane_id: PaneId) {
+        let _ = self.pane_lifecycle.remove(&pane_id);
+    }
+
+    pub(in crate::pane_terminals) fn remove_pane_lifecycles<'a>(
+        &mut self,
+        pane_ids: impl IntoIterator<Item = &'a PaneId>,
+    ) {
+        for pane_id in pane_ids {
+            self.remove_pane_lifecycle(*pane_id);
+        }
+    }
+
+    pub(in crate::pane_terminals) fn sync_pane_lifecycle_dimensions_for_session(
+        &mut self,
+        session_name: &SessionName,
+    ) {
+        let Some(session) = self.sessions.session(session_name) else {
+            return;
+        };
+        let session_id = session.id();
+        let updates = session
+            .windows()
+            .values()
+            .flat_map(|window| {
+                window.panes().iter().map(move |pane| {
+                    (
+                        pane.id(),
+                        session_id,
+                        window.id(),
+                        terminal_size_from_geometry(pane.geometry()),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for (pane_id, session_id, window_id, dimensions) in updates {
+            let Some(state) = self.pane_lifecycle.get_mut(&pane_id) else {
+                continue;
+            };
+            let changed = state.session_id != session_id
+                || state.window_id != window_id
+                || state.dimensions != dimensions;
+            if changed {
+                state.session_id = session_id;
+                state.window_id = window_id;
+                state.dimensions = dimensions;
+                state.revision = state.revision.saturating_add(1);
+            }
+        }
+    }
+
+    pub(crate) fn pane_lifecycle(&self, pane_id: PaneId) -> Option<&PaneLifecycleState> {
+        self.pane_lifecycle.get(&pane_id)
+    }
+}
+
+pub(crate) fn terminal_size_from_geometry(geometry: PaneGeometry) -> TerminalSize {
+    TerminalSize {
+        cols: geometry.cols(),
+        rows: geometry.rows(),
+    }
+}
+
+fn encode_command_field(command: &[String]) -> String {
+    command
+        .iter()
+        .map(|argument| percent_encode(argument.as_bytes()))
+        .collect::<Vec<_>>()
+        .join("\x1f")
+}
+
+fn percent_encode(bytes: &[u8]) -> String {
+    let mut encoded = String::new();
+    for byte in bytes {
+        match *byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'_'
+            | b'.'
+            | b'/'
+            | b':'
+            | b' '
+            | b'='
+            | b'+' => encoded.push(char::from(*byte)),
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encode_command_field;
+
+    #[test]
+    fn command_encoding_removes_record_separators_and_newlines() {
+        let encoded = encode_command_field(&[
+            "printf".to_owned(),
+            "alpha\tbeta\nsecret\x1fgamma%".to_owned(),
+        ]);
+
+        assert_eq!(encoded, "printf\u{1f}alpha%09beta%0Asecret%1Fgamma%25");
+        assert!(!encoded.contains('\t'));
+        assert!(!encoded.contains('\n'));
+    }
+}
