@@ -19,6 +19,7 @@ pub mod command;
 pub mod error;
 pub mod events;
 pub mod info;
+pub mod input;
 pub mod snapshot;
 pub mod spec;
 pub mod types;
@@ -30,6 +31,9 @@ pub use events::{
     PaneNotification, PanePermissionScope,
 };
 pub use info::{InfoSnapshot, PaneExitState, PaneInfo, PaneProcessState, SessionInfo, WindowInfo};
+pub use input::{
+    DetachChord, DetachDetector, DetachOutcome, KeyCode, KeyConversionError, KeyEvent, KeyModifiers,
+};
 pub use snapshot::{
     PaneAttributes, PaneCell, PaneColor, PaneCursor, PaneGlyph, PaneSnapshot,
     PaneSnapshotShapeError,
