@@ -1,7 +1,9 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::time::Instant;
 
 use rmux_core::input::mode;
+use rmux_core::PaneId;
 use rmux_proto::{
     ErrorResponse, PaneSnapshotCell, PaneSnapshotCursor, PaneSnapshotRequest, PaneSnapshotResponse,
     Response, RmuxError,
@@ -91,6 +93,14 @@ impl RequestHandler {
             pane_id.as_u32(),
         );
 
+        // Notification revisions are anchored to the same `u64` value the
+        // snapshot endpoint returns in `PaneSnapshotResponse.revision`. The
+        // coalescer is fed exactly this revision (not output ring sequences
+        // or attach render counters), preserving a single source of truth
+        // for revision identity across snapshot responses and any future
+        // notification path.
+        self.observe_pane_snapshot_revision(pane_id, revision, Instant::now());
+
         Response::PaneSnapshot(PaneSnapshotResponse {
             cols,
             rows,
@@ -98,6 +108,60 @@ impl RequestHandler {
             cursor,
             revision,
         })
+    }
+
+    /// Records a freshly observed pane snapshot revision in the per-pane
+    /// coalescer registry. Returns the revision the coalescer would emit to
+    /// notification subscribers right now, or `None` if the cap held the
+    /// revision back as pending or suppressed it as a duplicate.
+    ///
+    /// The revision passed in must be the same `u64` value returned by
+    /// `PaneSnapshotResponse.revision` for this pane, so the notification
+    /// stream and the snapshot endpoint share a single source of truth.
+    pub(crate) fn observe_pane_snapshot_revision(
+        &self,
+        pane_id: PaneId,
+        revision: u64,
+        now: Instant,
+    ) -> Option<u64> {
+        let mut coalescers = self
+            .pane_snapshot_coalescers
+            .lock()
+            .expect("pane snapshot coalescer mutex must not be poisoned");
+        coalescers.observe(pane_id, revision, now)
+    }
+
+    /// Drains a pending pane snapshot revision that is now eligible to be
+    /// emitted, if any. Used by polling notification consumers.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn poll_pane_snapshot_revision(&self, pane_id: PaneId, now: Instant) -> Option<u64> {
+        let mut coalescers = self
+            .pane_snapshot_coalescers
+            .lock()
+            .expect("pane snapshot coalescer mutex must not be poisoned");
+        coalescers.poll(pane_id, now)
+    }
+
+    /// Returns the most recent revision the coalescer emitted for a pane.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn last_emitted_pane_snapshot_revision(&self, pane_id: PaneId) -> Option<u64> {
+        let coalescers = self
+            .pane_snapshot_coalescers
+            .lock()
+            .expect("pane snapshot coalescer mutex must not be poisoned");
+        coalescers.last_emitted_revision(pane_id)
+    }
+
+    /// Drops coalescer state for panes that have been retired.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn forget_pane_snapshot_coalescers(&self, pane_ids: &[PaneId]) {
+        let mut coalescers = self
+            .pane_snapshot_coalescers
+            .lock()
+            .expect("pane snapshot coalescer mutex must not be poisoned");
+        for pane_id in pane_ids {
+            coalescers.forget(*pane_id);
+        }
     }
 }
 
@@ -351,5 +415,105 @@ mod tests {
         let a = compute_revision(80, 24, &cells, &cursor, 7, 1, 100, 9);
         let b = compute_revision(80, 24, &cells, &cursor, 7, 1, 100, 9);
         assert_eq!(a, b);
+    }
+
+    #[tokio::test]
+    async fn coalescer_caps_revision_notifications_to_60_per_second_per_pane() {
+        // Drive the per-pane snapshot coalescer at well above 60 Hz over a
+        // full simulated second. The cap is enforced by the coalescer
+        // registry that backs `observe_pane_snapshot_revision`; this test
+        // asserts the cap holds independently of the 16 ms attach refresh
+        // scheduler in `crates/rmux-server/src/pane_io/refresh_scheduler.rs`
+        // by feeding `Instant` values directly without invoking any tokio
+        // timer or scheduler.
+        let handler = RequestHandler::new();
+        let pane_id = PaneId::new(7);
+        let base = Instant::now();
+        let mut emitted: Vec<u64> = Vec::new();
+        let mut revision: u64 = 0;
+        // Observe at 1 kHz (1 ms spacing) for 1 s — 1,000 distinct revisions.
+        for tick_ms in 0..=1_000u64 {
+            revision = revision.wrapping_add(1);
+            let now = base + std::time::Duration::from_millis(tick_ms);
+            if let Some(value) = handler.observe_pane_snapshot_revision(pane_id, revision, now) {
+                emitted.push(value);
+            }
+        }
+        // Drain any tail value that the cap is currently holding pending.
+        if let Some(value) = handler
+            .poll_pane_snapshot_revision(pane_id, base + std::time::Duration::from_millis(1_001))
+        {
+            emitted.push(value);
+        }
+        assert!(
+            emitted.len() <= 60,
+            "snapshot coalescer emitted {} notifications in 1 s (cap is 60/s)",
+            emitted.len(),
+        );
+        // Last emitted revision is observable through the registry surface
+        // so future notification consumers can skip any revision they have
+        // already seen.
+        assert_eq!(
+            handler.last_emitted_pane_snapshot_revision(pane_id),
+            emitted.last().copied(),
+        );
+    }
+
+    #[tokio::test]
+    async fn coalescer_uses_response_revision_and_emits_monotonic_observed_order() {
+        // The coalescer must be fed the same revision value the snapshot
+        // endpoint puts on the wire, and it must deliver revisions in
+        // observation order even when bursty observations arrive faster
+        // than the cap allows.
+        let handler = RequestHandler::new();
+        let pane_id = PaneId::new(11);
+        let base = Instant::now();
+        // Three rapid observations inside one coalescing window; only the
+        // newest survives the cap.
+        assert_eq!(
+            handler.observe_pane_snapshot_revision(pane_id, 1, base),
+            Some(1),
+        );
+        assert_eq!(
+            handler.observe_pane_snapshot_revision(
+                pane_id,
+                2,
+                base + std::time::Duration::from_micros(100),
+            ),
+            None,
+        );
+        assert_eq!(
+            handler.observe_pane_snapshot_revision(
+                pane_id,
+                3,
+                base + std::time::Duration::from_micros(200),
+            ),
+            None,
+        );
+        // After the window opens, the freshest pending value (3) is
+        // delivered; revision 2 is dropped because it was superseded.
+        let after_window = base + std::time::Duration::from_millis(20);
+        assert_eq!(
+            handler.poll_pane_snapshot_revision(pane_id, after_window),
+            Some(3),
+        );
+        // A stale repeat of the latest emitted revision is suppressed.
+        assert_eq!(
+            handler.observe_pane_snapshot_revision(
+                pane_id,
+                3,
+                after_window + std::time::Duration::from_millis(50),
+            ),
+            None,
+        );
+        // Forgetting a pane drops its coalescer state but keeps others.
+        let other = PaneId::new(12);
+        assert_eq!(
+            handler.observe_pane_snapshot_revision(other, 99, base),
+            Some(99),
+        );
+        handler.forget_pane_snapshot_coalescers(&[pane_id]);
+        assert_eq!(handler.last_emitted_pane_snapshot_revision(pane_id), None);
+        assert_eq!(handler.last_emitted_pane_snapshot_revision(other), Some(99),);
     }
 }

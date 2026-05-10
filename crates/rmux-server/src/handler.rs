@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::sync::{Arc, Weak};
 
-use rmux_core::events::SubscriptionLimits;
+use rmux_core::events::{PaneSnapshotCoalescerRegistry, SubscriptionLimits};
 use rmux_ipc::PeerIdentity;
 use rmux_proto::{KillServerResponse, Response, RmuxError, TerminalSize, WindowTarget};
 use tokio::sync::{broadcast, Mutex};
@@ -111,6 +111,7 @@ pub(crate) struct RequestHandler {
     config_loading_depth: Arc<AtomicUsize>,
     next_connection_id: Arc<AtomicU64>,
     subscriptions: Arc<StdMutex<OutputSubscriptionState>>,
+    pane_snapshot_coalescers: Arc<StdMutex<PaneSnapshotCoalescerRegistry>>,
     #[cfg(test)]
     cleanup_on_drop: bool,
     #[cfg(test)]
@@ -135,6 +136,7 @@ impl Clone for RequestHandler {
             config_loading_depth: self.config_loading_depth.clone(),
             next_connection_id: self.next_connection_id.clone(),
             subscriptions: self.subscriptions.clone(),
+            pane_snapshot_coalescers: self.pane_snapshot_coalescers.clone(),
             #[cfg(test)]
             cleanup_on_drop: false,
             #[cfg(test)]
@@ -160,6 +162,7 @@ pub(crate) struct WeakRequestHandler {
     config_loading_depth: Weak<AtomicUsize>,
     next_connection_id: Weak<AtomicU64>,
     subscriptions: Weak<StdMutex<OutputSubscriptionState>>,
+    pane_snapshot_coalescers: Weak<StdMutex<PaneSnapshotCoalescerRegistry>>,
     #[cfg(test)]
     paste_buffer_delete_pause: Weak<StdMutex<Option<Arc<PasteBufferDeletePause>>>>,
 }
@@ -182,6 +185,7 @@ impl WeakRequestHandler {
             config_loading_depth: self.config_loading_depth.upgrade()?,
             next_connection_id: self.next_connection_id.upgrade()?,
             subscriptions: self.subscriptions.upgrade()?,
+            pane_snapshot_coalescers: self.pane_snapshot_coalescers.upgrade()?,
             #[cfg(test)]
             cleanup_on_drop: false,
             #[cfg(test)]
@@ -272,6 +276,9 @@ impl RequestHandler {
             subscriptions: Arc::new(StdMutex::new(OutputSubscriptionState::new(
                 subscription_limits,
             ))),
+            pane_snapshot_coalescers: Arc::new(StdMutex::new(
+                PaneSnapshotCoalescerRegistry::with_default_rate(),
+            )),
             #[cfg(test)]
             cleanup_on_drop: true,
             #[cfg(test)]
@@ -296,6 +303,7 @@ impl RequestHandler {
             config_loading_depth: Arc::downgrade(&self.config_loading_depth),
             next_connection_id: Arc::downgrade(&self.next_connection_id),
             subscriptions: Arc::downgrade(&self.subscriptions),
+            pane_snapshot_coalescers: Arc::downgrade(&self.pane_snapshot_coalescers),
             #[cfg(test)]
             paste_buffer_delete_pause: Arc::downgrade(&self.paste_buffer_delete_pause),
         }
