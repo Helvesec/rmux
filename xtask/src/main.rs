@@ -13,10 +13,13 @@
 //! - `feature-inventory --check` &mdash; fail if any generated public overview drifts from
 //!   the canonical source. Idempotent: running `feature-inventory` then
 //!   `feature-inventory --check` must always succeed.
+//! - `feature-inventory` &mdash; validate and render the public feature
+//!   inventory used by the v0.0.5/v1 readiness gates.
 
 use std::env;
 use std::process::ExitCode;
 
+mod feature_inventory;
 mod feature_inventory;
 
 const HELP: &str = "\
@@ -29,6 +32,12 @@ Commands:
     --help, -h, help            Print this help text.
     feature-inventory                      Regenerate v1 public overview files from xtask/assets/.
     feature-inventory --check              Fail if any generated public overview drifts from canon.
+    feature-inventory --check
+                                Validate docs/feature-inventory-v1.yaml.
+    feature-inventory --check-file-sizes
+                                Check tracked rmux-sdk source-size exceptions.
+    feature-inventory --render-markdown
+                                Render the YAML inventory as a Markdown table.
 ";
 
 fn main() -> ExitCode {
@@ -38,6 +47,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Command::Feature inventory { check }) => run_feature_inventory(check),
+        Ok(Command::FeatureInventory { mode }) => run_feature_inventory(mode),
         Err(message) => {
             eprintln!("{message}");
             eprintln!();
@@ -71,10 +81,26 @@ fn run_feature_inventory(check: bool) -> ExitCode {
     }
 }
 
+fn run_feature_inventory(mode: feature_inventory::Mode) -> ExitCode {
+    let repo_root = feature_inventory::repo_root_from_manifest_dir();
+    match feature_inventory::run(mode, &repo_root) {
+        Ok(Some(markdown)) => {
+            print!("{markdown}");
+            ExitCode::SUCCESS
+        }
+        Ok(None) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("xtask feature-inventory failed: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Help,
     Feature inventory { check: bool },
+    FeatureInventory { mode: feature_inventory::Mode },
 }
 
 fn parse_args<I>(args: I) -> Result<Command, String>
@@ -108,13 +134,35 @@ where
             }
             Ok(Command::Feature inventory { check })
         }
+        "feature-inventory" => {
+            let mut mode = None;
+            for extra in args {
+                let next_mode = match extra.as_str() {
+                    "--check" => feature_inventory::Mode::Check,
+                    "--check-file-sizes" => feature_inventory::Mode::CheckFileSizes,
+                    "--render-markdown" => feature_inventory::Mode::RenderMarkdown,
+                    other => {
+                        return Err(format!("unknown feature-inventory argument: {other}"));
+                    }
+                };
+                if mode.replace(next_mode).is_some() {
+                    return Err("feature-inventory accepts exactly one mode flag".to_owned());
+                }
+            }
+            Ok(Command::FeatureInventory {
+                mode: mode.ok_or_else(|| {
+                    "feature-inventory requires one of --check, --check-file-sizes, or --render-markdown"
+                        .to_owned()
+                })?,
+            })
+        }
         other => Err(format!("unknown xtask command: {other}")),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_args, Command};
+    use super::{feature_inventory, parse_args, Command};
 
     #[test]
     fn no_args_prints_help() {
@@ -162,6 +210,53 @@ mod tests {
         assert_eq!(
             parse_args(["feature-inventory", "--bogus"]).expect_err("unknown feature-inventory flag errors"),
             "unknown feature-inventory argument: --bogus"
+        );
+    }
+
+    #[test]
+    fn feature_inventory_check_flag_selects_check_mode() {
+        assert_eq!(
+            parse_args(["feature-inventory", "--check"]),
+            Ok(Command::FeatureInventory {
+                mode: feature_inventory::Mode::Check
+            })
+        );
+    }
+
+    #[test]
+    fn feature_inventory_file_size_flag_selects_file_size_mode() {
+        assert_eq!(
+            parse_args(["feature-inventory", "--check-file-sizes"]),
+            Ok(Command::FeatureInventory {
+                mode: feature_inventory::Mode::CheckFileSizes
+            })
+        );
+    }
+
+    #[test]
+    fn feature_inventory_render_flag_selects_markdown_mode() {
+        assert_eq!(
+            parse_args(["feature-inventory", "--render-markdown"]),
+            Ok(Command::FeatureInventory {
+                mode: feature_inventory::Mode::RenderMarkdown
+            })
+        );
+    }
+
+    #[test]
+    fn feature_inventory_requires_one_mode() {
+        assert_eq!(
+            parse_args(["feature-inventory"]).expect_err("missing mode errors"),
+            "feature-inventory requires one of --check, --check-file-sizes, or --render-markdown"
+        );
+    }
+
+    #[test]
+    fn feature_inventory_rejects_multiple_modes() {
+        assert_eq!(
+            parse_args(["feature-inventory", "--check", "--render-markdown"])
+                .expect_err("duplicate mode errors"),
+            "feature-inventory accepts exactly one mode flag"
         );
     }
 }
