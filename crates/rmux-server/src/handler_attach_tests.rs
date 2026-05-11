@@ -143,8 +143,24 @@ async fn create_quiet_attached_session(
     control_rx
 }
 
+#[cfg(unix)]
 async fn create_quiet_session(handler: &RequestHandler, session: &SessionName) {
     create_session_with_command(handler, session, quiet_attached_command()).await;
+}
+
+#[cfg(windows)]
+async fn create_quiet_session(handler: &RequestHandler, session: &SessionName) {
+    let marker = format!("RMUX_QUIET_READY_{}", std::process::id());
+    create_session_with_command(handler, session, quiet_ready_command(&marker)).await;
+    let target = PaneTarget::new(session.clone(), 0);
+    wait_for_capture_containing(
+        handler,
+        target.clone(),
+        &marker,
+        "quiet Windows attach fixture should reach a stable shell frame",
+    )
+    .await;
+    replace_transcript_contents(handler, &target, TerminalSize { cols: 80, rows: 24 }, b"").await;
 }
 
 async fn create_session_with_command(
@@ -198,24 +214,6 @@ fn quiet_ready_command(marker: &str) -> Vec<String> {
         "/bin/sh".to_owned(),
         "-c".to_owned(),
         format!("printf '{marker}\\n'; sleep 60"),
-    ]
-}
-
-#[cfg(windows)]
-fn quiet_attached_command() -> Vec<String> {
-    let system_root =
-        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
-    // Keep the PTY alive without PowerShell startup control frames racing
-    // synthetic transcript seeds in attach/copy-mode tests.
-    let cmd = std::path::PathBuf::from(system_root)
-        .join("System32")
-        .join("cmd.exe");
-    vec![
-        cmd.to_string_lossy().into_owned(),
-        "/d".to_owned(),
-        "/q".to_owned(),
-        "/c".to_owned(),
-        "ping -n 120 127.0.0.1 >NUL".to_owned(),
     ]
 }
 
