@@ -10,10 +10,10 @@
 //!
 //! * The mutex's security descriptor matches the running user's SID. A peer
 //!   started under a different identity cannot acquire or open the mutex.
-//! * `Created` is reported only when the calling process actually wins the
-//!   creation race. Subsequent callers always see `Opened` (or `Abandoned` if
-//!   the previous owner died holding the mutex) and waited on the existing
-//!   handle.
+//! * `Created` is reported only when the calling process wins creation of the
+//!   current kernel object. Win32 destroys a named mutex after the last handle is
+//!   closed, so a later non-contending caller may legitimately create a fresh
+//!   object and also see `Created`.
 //! * Releasing the mutex is tied to the guard's `Drop`, so a failure in the
 //!   caller's launch path cannot leak ownership across calls.
 //!
@@ -69,8 +69,10 @@ pub enum NamedMutexAcquire {
 }
 
 impl NamedMutexAcquire {
-    /// Returns whether this caller is the very first owner since the mutex
-    /// was created.
+    /// Returns whether this caller created the current kernel mutex object.
+    ///
+    /// This is not a durable "first process ever" flag: Windows removes named
+    /// mutex objects when their last handle closes.
     #[must_use]
     pub const fn is_creator(&self) -> bool {
         matches!(self, Self::Created(_))
@@ -399,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn first_caller_wins_creation_and_release_unblocks_second() {
+    fn first_caller_wins_creation_and_release_allows_later_acquire() {
         // Win32 mutexes are recursive: a single thread that already owns the
         // mutex can re-acquire it without blocking. To exercise the actual
         // cross-thread serialization contract we drive the second caller from
@@ -428,8 +430,7 @@ mod tests {
         release_tx.send(()).expect("signal owner to release");
         owner_thread.join().expect("owner thread joins");
 
-        let later = acquire_named_mutex(&name, Duration::from_millis(500))
-            .expect("second caller acquires after release");
-        assert!(!later.is_creator(), "second caller must not report Created");
+        let _later = acquire_named_mutex(&name, Duration::from_millis(500))
+            .expect("later caller acquires after release");
     }
 }

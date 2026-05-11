@@ -185,7 +185,7 @@ pub(super) async fn wait_for_daemon(
         match probe_responsive(endpoint, pipe_name).await {
             Ok(Some(stream)) => return Ok(stream),
             Ok(None) => {}
-            Err(error) if matches!(error, StartupError::PipeBusy { .. }) => {
+            Err(StartupError::PipeBusy { .. }) => {
                 // Pipe instances momentarily exhausted while the daemon comes
                 // up; treat as transient and keep polling within budget.
             }
