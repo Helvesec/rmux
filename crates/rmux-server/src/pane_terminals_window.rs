@@ -148,6 +148,10 @@ impl HandlerState {
             (removal_plan, removed_windows)
         };
         ensure_window_removal_terminals_exist(self, &removal_plan)?;
+        let removed_pane_ids = removal_plan
+            .iter()
+            .flat_map(|planned_window| planned_window.pane_ids.iter().copied())
+            .collect::<Vec<_>>();
 
         let sessions_to_synchronize = removal_plan
             .iter()
@@ -202,6 +206,7 @@ impl HandlerState {
                 target: WindowTarget::with_window(session_name, active_window),
             },
             removed_windows,
+            removed_pane_ids,
         })
     }
 

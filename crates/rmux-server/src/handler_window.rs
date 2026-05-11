@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use rmux_core::LifecycleEvent;
+use rmux_core::{LifecycleEvent, PaneId};
 use rmux_proto::{ErrorResponse, HookName, PaneTarget, Response, ScopeSelector, Target};
 
 use super::RequestHandler;
@@ -14,6 +14,8 @@ struct UnlinkedWindowSnapshot {
     target: rmux_proto::WindowTarget,
     window_id: u32,
     window_name: String,
+    pane_ids: Vec<PaneId>,
+    link_count: usize,
 }
 
 impl RequestHandler {
@@ -85,18 +87,24 @@ impl RequestHandler {
         request: rmux_proto::KillWindowRequest,
     ) -> Response {
         let session_name = request.target.session_name().clone();
-        let (response, removed_windows) = {
+        let (response, removed_windows, removed_pane_ids) = {
             let mut state = self.state.lock().await;
             match state.kill_window(request.target, request.kill_all_others) {
                 Ok(result) => (
                     Response::KillWindow(result.response),
                     result.removed_windows,
+                    result.removed_pane_ids,
                 ),
-                Err(error) => (Response::Error(ErrorResponse { error }), Vec::new()),
+                Err(error) => (
+                    Response::Error(ErrorResponse { error }),
+                    Vec::new(),
+                    Vec::new(),
+                ),
             }
         };
 
         if matches!(response, Response::KillWindow(_)) {
+            self.forget_pane_snapshot_coalescers(&removed_pane_ids);
             let mut affected_sessions = removed_windows
                 .iter()
                 .map(|removed_window| removed_window.target.session_name().clone())
@@ -302,6 +310,10 @@ impl RequestHandler {
     ) -> Response {
         let refresh_sessions =
             unique_sessions(request.source.session_name(), request.target.session_name());
+        let removed_destination_pane_ids = {
+            let state = self.state.lock().await;
+            link_window_replaced_destination_pane_ids(&state, &request)
+        };
         let response = {
             let mut state = self.state.lock().await;
             match state.link_window(request.clone()) {
@@ -311,6 +323,7 @@ impl RequestHandler {
         };
 
         if let Response::LinkWindow(success) = &response {
+            self.forget_pane_snapshot_coalescers(&removed_destination_pane_ids);
             self.emit(LifecycleEvent::WindowLinked {
                 session_name: success.target.session_name().clone(),
                 target: Some(success.target.clone()),
@@ -334,6 +347,10 @@ impl RequestHandler {
             let state = self.state.lock().await;
             move_window_unlinked_window_snapshot(&state, &request)
         };
+        let removed_destination_pane_ids = {
+            let state = self.state.lock().await;
+            move_window_replaced_destination_pane_ids(&state, &request)
+        };
         let response = {
             let mut state = self.state.lock().await;
             match state.move_window(request.clone()) {
@@ -343,6 +360,7 @@ impl RequestHandler {
         };
 
         if matches!(response, Response::MoveWindow(_)) {
+            self.forget_pane_snapshot_coalescers(&removed_destination_pane_ids);
             let lifecycle_events =
                 move_window_lifecycle_events(&response, &request, unlinked_window.as_ref());
             for event in lifecycle_events {
@@ -361,6 +379,7 @@ impl RequestHandler {
         &self,
         request: rmux_proto::UnlinkWindowRequest,
     ) -> Response {
+        let kill_if_last = request.kill_if_last;
         let removed_window = {
             let state = self.state.lock().await;
             state
@@ -371,6 +390,11 @@ impl RequestHandler {
                     target: request.target.clone(),
                     window_id: window.id().as_u32(),
                     window_name: window.name().unwrap_or_default().to_owned(),
+                    pane_ids: window_pane_ids(window),
+                    link_count: state.window_link_count(
+                        request.target.session_name(),
+                        request.target.window_index(),
+                    ),
                 })
         };
         let session_name = request.target.session_name().clone();
@@ -384,6 +408,9 @@ impl RequestHandler {
 
         if matches!(response, Response::UnlinkWindow(_)) {
             if let Some(removed_window) = removed_window {
+                if kill_if_last && removed_window.link_count == 1 {
+                    self.forget_pane_snapshot_coalescers(&removed_window.pane_ids);
+                }
                 self.emit(LifecycleEvent::WindowUnlinked {
                     session_name: session_name.clone(),
                     target: Some(removed_window.target),
@@ -576,7 +603,57 @@ fn move_window_unlinked_window_snapshot(
         target: source.clone(),
         window_id: window.id().as_u32(),
         window_name: window.name().unwrap_or_default().to_owned(),
+        pane_ids: window_pane_ids(window),
+        link_count: state.window_link_count(source.session_name(), source.window_index()),
     })
+}
+
+fn link_window_replaced_destination_pane_ids(
+    state: &HandlerState,
+    request: &rmux_proto::LinkWindowRequest,
+) -> Vec<PaneId> {
+    if !request.kill_destination || request.after || request.before {
+        return Vec::new();
+    }
+    if state.window_link_count(request.target.session_name(), request.target.window_index()) > 1 {
+        return Vec::new();
+    }
+    state
+        .sessions
+        .session(request.target.session_name())
+        .and_then(|session| session.window_at(request.target.window_index()))
+        .map(window_pane_ids)
+        .unwrap_or_default()
+}
+
+fn move_window_replaced_destination_pane_ids(
+    state: &HandlerState,
+    request: &rmux_proto::MoveWindowRequest,
+) -> Vec<PaneId> {
+    if request.renumber || !request.kill_destination {
+        return Vec::new();
+    }
+    let Some(source) = request.source.as_ref() else {
+        return Vec::new();
+    };
+    let rmux_proto::MoveWindowTarget::Window(target) = &request.target else {
+        return Vec::new();
+    };
+    if source.session_name() == target.session_name()
+        && source.window_index() == target.window_index()
+    {
+        return Vec::new();
+    }
+    state
+        .sessions
+        .session(target.session_name())
+        .and_then(|session| session.window_at(target.window_index()))
+        .map(window_pane_ids)
+        .unwrap_or_default()
+}
+
+fn window_pane_ids(window: &rmux_core::Window) -> Vec<PaneId> {
+    window.panes().iter().map(|pane| pane.id()).collect()
 }
 
 fn unique_sessions(

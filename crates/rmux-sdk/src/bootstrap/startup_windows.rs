@@ -41,7 +41,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rmux_ipc::{
     acquire_named_mutex, connect_blocking, BlockingLocalStream, LocalEndpoint, NamedMutexAcquire,
@@ -55,6 +55,8 @@ use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PIPE_BUSY,
     ERROR_PIPE_NOT_CONNECTED,
 };
+
+use crate::bootstrap::deadline::StartupDeadline;
 
 const PIPE_PREFIX: &str = r"\\.\pipe\";
 const STARTUP_MUTEX_PREFIX: &str = r"Local\rmux-startup-";
@@ -311,6 +313,25 @@ where
     L: FnOnce() -> F,
     F: Future<Output = io::Result<()>>,
 {
+    connect_or_start_with_timeout(pipe_name, launcher, Some(deadline), poll_interval).await
+}
+
+/// Variant of [`connect_or_start`] with an optional startup deadline.
+///
+/// `None` means no deadline for daemon readiness. The Win32 mutex primitive
+/// still receives a clamped `Duration::MAX` wait because its public API is
+/// duration-based.
+pub async fn connect_or_start_with_timeout<L, F>(
+    pipe_name: &Path,
+    launcher: L,
+    deadline: Option<Duration>,
+    poll_interval: Duration,
+) -> Result<StartupOutcome, StartupError>
+where
+    L: FnOnce() -> F,
+    F: Future<Output = io::Result<()>>,
+{
+    let deadline = StartupDeadline::from_timeout(deadline);
     validate_pipe_name(pipe_name)?;
     let endpoint = LocalEndpoint::from_path(pipe_name.to_path_buf());
 
@@ -443,7 +464,7 @@ impl Drop for StartupMutexHolder {
 async fn acquire_startup_mutex(
     pipe_name: &Path,
     mutex_name: &OsStr,
-    deadline: Duration,
+    deadline: StartupDeadline,
 ) -> Result<StartupMutexHolder, StartupError> {
     let pipe_owned = pipe_name.to_path_buf();
     let mutex_owned = mutex_name.to_owned();
@@ -453,7 +474,8 @@ async fn acquire_startup_mutex(
     let thread = thread::Builder::new()
         .name("rmux-startup-mutex".to_owned())
         .spawn(move || {
-            let outcome = acquire_named_mutex(&mutex_owned, deadline);
+            let mutex_wait = deadline.requested_timeout().unwrap_or(Duration::MAX);
+            let outcome = acquire_named_mutex(&mutex_owned, mutex_wait);
             match outcome {
                 Ok(NamedMutexAcquire::Created(guard))
                 | Ok(NamedMutexAcquire::Opened(guard))
@@ -504,12 +526,12 @@ async fn acquire_startup_mutex(
 fn map_named_mutex_error(
     error: NamedMutexError,
     pipe_name: &Path,
-    deadline: Duration,
+    deadline: StartupDeadline,
 ) -> StartupError {
     match error {
         NamedMutexError::TimedOut => StartupError::MutexTimeout {
             pipe_name: pipe_name.to_path_buf(),
-            waited: deadline,
+            waited: deadline.requested_timeout().unwrap_or(Duration::MAX),
         },
         NamedMutexError::AccessDenied(source) => StartupError::MutexAccessDenied {
             pipe_name: pipe_name.to_path_buf(),
@@ -687,13 +709,11 @@ fn classify_io_error(
 async fn wait_for_daemon(
     endpoint: &LocalEndpoint,
     pipe_name: &Path,
-    deadline: Duration,
+    deadline: StartupDeadline,
     poll_interval: Duration,
 ) -> Result<BlockingLocalStream, StartupError> {
     const MIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
-    let started = Instant::now();
-    let stop_at = started + deadline;
     let effective_poll = poll_interval.max(MIN_POLL_INTERVAL);
 
     loop {
@@ -707,15 +727,13 @@ async fn wait_for_daemon(
             Err(error) => return Err(error),
         }
 
-        let now = Instant::now();
-        if now >= stop_at {
+        if deadline.is_elapsed() {
             return Err(StartupError::StartupTimeout {
                 pipe_name: pipe_name.to_path_buf(),
-                waited: started.elapsed(),
+                waited: deadline.elapsed(),
             });
         }
-        let remaining = stop_at.saturating_duration_since(now);
-        sleep(effective_poll.min(remaining)).await;
+        sleep(deadline.sleep_for(effective_poll)).await;
     }
 }
 

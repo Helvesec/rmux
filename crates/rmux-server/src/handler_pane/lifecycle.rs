@@ -27,10 +27,12 @@ enum PaneExitPlan {
         session_name: rmux_proto::SessionName,
         target: PaneTarget,
         window_destroyed: bool,
+        removed_pane_ids: Vec<rmux_core::PaneId>,
         pane_event: super::super::QueuedLifecycleEvent,
     },
     RemoveSession {
         session_name: rmux_proto::SessionName,
+        removed_pane_ids: Vec<rmux_core::PaneId>,
         pane_event: super::super::QueuedLifecycleEvent,
         session_event: super::super::QueuedLifecycleEvent,
     },
@@ -155,6 +157,7 @@ impl RequestHandler {
                             }
                             Some(PaneExitPlan::RemoveSession {
                                 session_name: target.session_name().clone(),
+                                removed_pane_ids: vec![event.pane_id],
                                 pane_event,
                                 session_event,
                             })
@@ -174,6 +177,7 @@ impl RequestHandler {
                                         session_name: target.session_name().clone(),
                                         target,
                                         window_destroyed: result.response.window_destroyed,
+                                        removed_pane_ids: result.removed_pane_ids,
                                         pane_event,
                                     })
                                 }
@@ -238,8 +242,10 @@ impl RequestHandler {
                 session_name,
                 target,
                 window_destroyed,
+                removed_pane_ids,
                 pane_event,
             } => {
+                self.forget_pane_snapshot_coalescers(&removed_pane_ids);
                 self.cleanup_exited_pane_output_subscription(&event).await;
                 self.emit_prepared(pane_event);
                 self.sync_session_silence_timers(&session_name).await;
@@ -257,9 +263,11 @@ impl RequestHandler {
             }
             PaneExitPlan::RemoveSession {
                 session_name,
+                removed_pane_ids,
                 pane_event,
                 session_event,
             } => {
+                self.forget_pane_snapshot_coalescers(&removed_pane_ids);
                 self.cleanup_exited_pane_output_subscription(&event).await;
                 self.exit_attached_session(&session_name).await;
                 self.cancel_session_silence_timers(&session_name).await;

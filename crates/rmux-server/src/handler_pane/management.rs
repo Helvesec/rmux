@@ -340,6 +340,7 @@ impl RequestHandler {
             queued_session_closed,
             session_destroyed,
             removed_subscription_keys,
+            removed_pane_ids,
         ) = {
             let mut state = self.state.lock().await;
             let removed_subscription_keys = state
@@ -383,6 +384,7 @@ impl RequestHandler {
                         queued_session,
                         result.session_destroyed,
                         removed_subscription_keys,
+                        result.removed_pane_ids,
                     )
                 }
                 Err(error) => (
@@ -391,10 +393,14 @@ impl RequestHandler {
                     None,
                     false,
                     Vec::new(),
+                    Vec::new(),
                 ),
             }
         };
 
+        if !removed_pane_ids.is_empty() {
+            self.forget_pane_snapshot_coalescers(&removed_pane_ids);
+        }
         if let Some(event) = queued_pane_exited {
             self.emit_prepared(event);
         }

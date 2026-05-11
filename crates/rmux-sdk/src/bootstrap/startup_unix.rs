@@ -26,12 +26,13 @@ use std::io;
 use std::os::fd::AsFd;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rustix::fs::{flock, FlockOperation};
 use tokio::net::UnixStream;
 use tokio::time::sleep;
 
+use crate::bootstrap::deadline::StartupDeadline;
 use rmux_os::identity::real_user_id;
 
 /// Permission bits enforced for the per-endpoint startup lock file.
@@ -301,6 +302,25 @@ where
     L: FnOnce() -> F,
     F: Future<Output = io::Result<()>>,
 {
+    connect_or_start_with_timeout(socket_path, launcher, Some(deadline), poll_interval).await
+}
+
+/// Variant of [`connect_or_start`] with an optional startup deadline.
+///
+/// `None` means no deadline. This keeps the public `Duration`-based helper
+/// compatible while letting the SDK facade map `Duration::MAX` to an
+/// unbounded connect-or-start operation.
+pub async fn connect_or_start_with_timeout<L, F>(
+    socket_path: &Path,
+    launcher: L,
+    deadline: Option<Duration>,
+    poll_interval: Duration,
+) -> Result<StartupOutcome, StartupError>
+where
+    L: FnOnce() -> F,
+    F: Future<Output = io::Result<()>>,
+{
+    let deadline = StartupDeadline::from_timeout(deadline);
     let owner_uid = real_user_id();
 
     let parent = socket_path
@@ -418,15 +438,13 @@ fn validate_peer_credentials(
 async fn wait_for_daemon(
     socket_path: &Path,
     owner_uid: u32,
-    deadline: Duration,
+    deadline: StartupDeadline,
     poll_interval: Duration,
 ) -> Result<UnixStream, StartupError> {
     // The minimum poll interval keeps a misconfigured zero-interval caller
     // from spinning on the connect probe; anything below this is rounded up.
     const MIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
-    let started = Instant::now();
-    let stop_at = started + deadline;
     let effective_poll = poll_interval.max(MIN_POLL_INTERVAL);
     loop {
         match try_connect_validated(socket_path, owner_uid).await {
@@ -434,15 +452,13 @@ async fn wait_for_daemon(
             Ok(None) => {}
             Err(error) => return Err(error),
         }
-        let now = Instant::now();
-        if now >= stop_at {
+        if deadline.is_elapsed() {
             return Err(StartupError::StartupTimeout {
                 socket_path: socket_path.to_path_buf(),
-                waited: started.elapsed(),
+                waited: deadline.elapsed(),
             });
         }
-        let remaining = stop_at.saturating_duration_since(now);
-        sleep(effective_poll.min(remaining)).await;
+        sleep(deadline.sleep_for(effective_poll)).await;
     }
 }
 
@@ -633,7 +649,7 @@ impl StartupLock {
     async fn acquire(
         path: &Path,
         owner_uid: u32,
-        deadline: Duration,
+        deadline: StartupDeadline,
         poll_interval: Duration,
     ) -> Result<Self, StartupError> {
         if let Ok(metadata) = fs::symlink_metadata(path) {
@@ -712,13 +728,11 @@ fn validate_lock_metadata(
 async fn acquire_lock_with_deadline(
     path: &Path,
     file: &fs::File,
-    deadline: Duration,
+    deadline: StartupDeadline,
     poll_interval: Duration,
 ) -> Result<(), StartupError> {
     const MIN_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
-    let started = Instant::now();
-    let stop_at = started + deadline;
     let effective_poll = poll_interval.max(MIN_LOCK_POLL_INTERVAL);
 
     loop {
@@ -733,22 +747,20 @@ async fn acquire_lock_with_deadline(
                     });
                 }
 
-                let now = Instant::now();
-                if now >= stop_at {
+                if deadline.is_elapsed() {
                     return Err(StartupError::Lock {
                         path: path.to_path_buf(),
                         source: io::Error::new(
                             io::ErrorKind::TimedOut,
                             format!(
                                 "timed out after {}ms waiting for startup lock",
-                                started.elapsed().as_millis()
+                                deadline.elapsed().as_millis()
                             ),
                         ),
                     });
                 }
 
-                let remaining = stop_at.saturating_duration_since(now);
-                sleep(effective_poll.min(remaining)).await;
+                sleep(deadline.sleep_for(effective_poll)).await;
             }
         }
     }
@@ -876,7 +888,7 @@ mod tests {
         let result = StartupLock::acquire(
             &lock_path,
             real_user_id(),
-            Duration::from_millis(20),
+            StartupDeadline::from_timeout(Some(Duration::from_millis(20))),
             Duration::from_millis(5),
         )
         .await;

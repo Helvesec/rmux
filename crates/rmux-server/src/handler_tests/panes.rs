@@ -261,6 +261,15 @@ async fn kill_pane_removes_the_terminal_and_uses_last_pane_fallback() {
             session.window().pane(1).expect("pane 1 exists").id(),
         )
     };
+    let now = std::time::Instant::now();
+    assert_eq!(
+        handler.observe_pane_snapshot_revision(removed_pane_id, 1, now),
+        Some(1)
+    );
+    assert_eq!(
+        handler.observe_pane_snapshot_revision(surviving_pane_id, 7, now),
+        Some(7)
+    );
 
     let killed = handler
         .handle(Request::KillPane(KillPaneRequest {
@@ -294,6 +303,15 @@ async fn kill_pane_removes_the_terminal_and_uses_last_pane_fallback() {
             removed_pane_id.as_u32(),
             alpha
         )))
+    );
+    drop(state);
+    assert_eq!(
+        handler.last_emitted_pane_snapshot_revision(removed_pane_id),
+        None
+    );
+    assert_eq!(
+        handler.last_emitted_pane_snapshot_revision(surviving_pane_id),
+        Some(7)
     );
 }
 

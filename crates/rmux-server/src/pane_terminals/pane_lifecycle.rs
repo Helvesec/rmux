@@ -520,6 +520,7 @@ impl HandlerState {
                 hook_context,
                 session_destroyed: true,
                 removed_session_id: Some(removed_session.id().as_u32()),
+                removed_pane_ids: vec![pane_id],
             });
         }
 
@@ -539,6 +540,7 @@ impl HandlerState {
             }
         };
         debug_assert_eq!(committed_outcome, preview_outcome);
+        let removed_pane_ids = committed_outcome.removed_pane_ids().to_vec();
         for pane_id in committed_outcome.removed_pane_ids() {
             self.clear_marked_pane_if_id(*pane_id);
         }
@@ -593,6 +595,7 @@ impl HandlerState {
             hook_context,
             session_destroyed: false,
             removed_session_id: None,
+            removed_pane_ids,
         })
     }
 

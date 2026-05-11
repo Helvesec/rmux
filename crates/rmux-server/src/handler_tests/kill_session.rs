@@ -158,6 +158,18 @@ async fn kill_session_last_session_requests_shutdown() {
         }))
         .await;
     assert!(matches!(created, Response::NewSession(_)));
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session_name("alpha"))
+            .and_then(|session| session.active_pane_id())
+            .expect("new session has an active pane")
+    };
+    assert_eq!(
+        handler.observe_pane_snapshot_revision(pane_id, 1, std::time::Instant::now()),
+        Some(1)
+    );
 
     let response = handler
         .handle(Request::KillSession(KillSessionRequest {
@@ -174,6 +186,7 @@ async fn kill_session_last_session_requests_shutdown() {
         handler.request_shutdown_if_pending(),
         "last-session kill should queue shutdown after the response is ready"
     );
+    assert_eq!(handler.last_emitted_pane_snapshot_revision(pane_id), None);
     assert!(
         tokio::time::timeout(Duration::from_millis(50), shutdown_rx)
             .await

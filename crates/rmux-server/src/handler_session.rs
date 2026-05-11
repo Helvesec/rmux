@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 
 use rmux_core::{
     formats::{is_truthy, render_list_sessions_line, FormatContext},
-    LifecycleEvent, WINDOW_ALERTFLAGS,
+    LifecycleEvent, PaneId, WINDOW_ALERTFLAGS,
 };
 use rmux_proto::request::NewSessionExtRequest;
 use rmux_proto::{
@@ -345,9 +345,10 @@ impl RequestHandler {
             self.cancel_session_silence_timers(session_name).await;
         }
 
-        let (response, queued_session_closed) = {
+        let (response, queued_session_closed, removed_pane_ids) = {
             let mut state = self.state.lock().await;
             let mut queued_events = Vec::new();
+            let mut removed_pane_ids = Vec::new();
 
             for session_name in &sessions_to_remove {
                 if !state.sessions.contains_session(session_name) {
@@ -372,6 +373,7 @@ impl RequestHandler {
 
                 match state.sessions.remove_session(session_name) {
                     Ok(removed_session) => {
+                        removed_pane_ids.extend(session_pane_ids(&removed_session));
                         queued_events.push(prepare_lifecycle_event(
                             &mut state,
                             &LifecycleEvent::SessionClosed {
@@ -400,9 +402,13 @@ impl RequestHandler {
             (
                 Response::KillSession(KillSessionResponse { existed: true }),
                 queued_events,
+                removed_pane_ids,
             )
         };
 
+        if !removed_pane_ids.is_empty() {
+            self.forget_pane_snapshot_coalescers(&removed_pane_ids);
+        }
         for event in queued_session_closed {
             self.emit_prepared(event);
         }
@@ -581,4 +587,12 @@ impl RequestHandler {
         }
         should_shutdown
     }
+}
+
+fn session_pane_ids(session: &rmux_core::Session) -> Vec<PaneId> {
+    session
+        .windows()
+        .values()
+        .flat_map(|window| window.panes().iter().map(|pane| pane.id()))
+        .collect()
 }

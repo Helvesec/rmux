@@ -124,6 +124,7 @@ pub(crate) struct KilledPaneResult {
     pub(crate) hook_context: KilledPaneHookContext,
     pub(crate) session_destroyed: bool,
     pub(crate) removed_session_id: Option<u32>,
+    pub(crate) removed_pane_ids: Vec<PaneId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +138,7 @@ pub(crate) struct RemovedWindowHookContext {
 pub(crate) struct KilledWindowResult {
     pub(crate) response: KillWindowResponse,
     pub(crate) removed_windows: Vec<RemovedWindowHookContext>,
+    pub(crate) removed_pane_ids: Vec<PaneId>,
 }
 
 impl HandlerState {

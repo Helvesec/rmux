@@ -117,6 +117,34 @@ async fn kill_window_prefers_last_window_as_the_active_fallback() {
         session.select_window(2).expect("window 2 select succeeds");
         session.select_window(1).expect("window 1 select succeeds");
     }
+    let (removed_pane_id, surviving_pane_id) = {
+        let state = handler.state.lock().await;
+        let session = state
+            .sessions
+            .session(&alpha)
+            .expect("session should exist");
+        (
+            session
+                .window_at(1)
+                .and_then(|window| window.pane(0))
+                .map(|pane| pane.id())
+                .expect("removed window has a pane"),
+            session
+                .window_at(2)
+                .and_then(|window| window.pane(0))
+                .map(|pane| pane.id())
+                .expect("surviving window has a pane"),
+        )
+    };
+    let now = std::time::Instant::now();
+    assert_eq!(
+        handler.observe_pane_snapshot_revision(removed_pane_id, 1, now),
+        Some(1)
+    );
+    assert_eq!(
+        handler.observe_pane_snapshot_revision(surviving_pane_id, 9, now),
+        Some(9)
+    );
 
     let response = handler
         .handle(Request::KillWindow(KillWindowRequest {
@@ -143,6 +171,15 @@ async fn kill_window_prefers_last_window_as_the_active_fallback() {
     );
     assert_eq!(session.active_window_index(), 2);
     assert_eq!(session.last_window_index(), None);
+    drop(state);
+    assert_eq!(
+        handler.last_emitted_pane_snapshot_revision(removed_pane_id),
+        None
+    );
+    assert_eq!(
+        handler.last_emitted_pane_snapshot_revision(surviving_pane_id),
+        Some(9)
+    );
 }
 
 #[tokio::test]
