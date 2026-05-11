@@ -610,6 +610,7 @@ version = "0.1.0"
 dependencies = [
  "ratatui",
  "rmux-sdk",
+ "tokio",
 ]
 
 [[package]]
