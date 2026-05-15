@@ -8,7 +8,7 @@
 </a>
 
 
-**The Rust terminal multiplexer for the agentic era: detachable, scriptable, and inspectable, with a tmux-compatible CLI, daemon-backed SDK, and native [Ratatui](https://ratatui.rs) integration.**
+**Universal Rust multiplexer for the agentic era: detachable, scriptable, and inspectable, with a tmux-compatible CLI, daemon-backed SDK, and native [Ratatui](https://ratatui.rs) integration.**
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Workspace version 0.1.0](https://img.shields.io/badge/workspace-0.1.0-informational.svg)](#workspace)
