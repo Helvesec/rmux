@@ -7,9 +7,6 @@ on:
         description: Git tag to release, for example v0.1.1
         required: true
         type: string
-  push:
-    tags:
-      - "v*"
 
 permissions:
   contents: write
