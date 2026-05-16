@@ -1,6 +1,9 @@
 name: CI
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       windows_runtime_smoke:
