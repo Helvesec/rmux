@@ -13,6 +13,7 @@
 English · [Français](README.fr.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md)
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![Release validation](https://github.com/Helvesec/rmux/actions/workflows/ci.yml/badge.svg)](https://github.com/Helvesec/rmux/actions/workflows/ci.yml)
 [![rmux 0.1.1](https://img.shields.io/badge/rmux-0.1.1-informational.svg)](#install)
 [![Platform: Linux | macOS | Windows](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#platform-support)
 [![Unsafe policy](https://img.shields.io/badge/unsafe-restricted-success.svg)](#verification)
