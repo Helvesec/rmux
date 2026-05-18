@@ -11,7 +11,7 @@ the primary primitives.
 
 ```toml
 [dependencies]
-rmux-sdk = "0.1"
+rmux-sdk = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

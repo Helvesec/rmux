@@ -10,7 +10,7 @@ keywords = ["terminal", "multiplexer", "os"]
 categories = ["os", "command-line-interface"]
 
 [dependencies]
-rmux-types = { path = "../rmux-types", version = "0.1.2" }
+rmux-types = { path = "../rmux-types", version = "0.2.0" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.185"
