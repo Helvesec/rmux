@@ -36,8 +36,6 @@ RMUX 的出发点很简单：我相信 tmux 的使用场景还只被探索了一
 
 RMUX 可以给 agents 用，也可以给 headless CLI workflows 用，同样也适合人直接使用：你可以让终端应用获得可 detach 的执行方式，稍后重新连接，检查它们的状态，从代码驱动它们，或者只是把它当作普通的 tmux 风格终端工具。
 
-**完整文档：** [rmux.io/docs](https://rmux.io/docs/) · [快速开始](https://rmux.io/docs/get-started/) · [示例](https://rmux.io/docs/examples/) · [API](https://rmux.io/docs/api/) · [CLI](https://rmux.io/docs/cli/)
-
 <table>
   <tr>
     <td align="center" width="20%"><a href="https://rmux.io/#demo-orchestration"><img src="https://rmux.io/demos/demo-orchestration.png" width="150" alt="多智能体编排演示预览"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/demo-orchestration"><strong>多智能体编排</strong></a></sub><br><sub>≃ 514 lines</sub></td>
@@ -84,6 +82,10 @@ Rust 应用：
 cargo add rmux-sdk
 cargo add ratatui-rmux
 ```
+
+## Docs
+
+完整文档可在 [rmux.io/docs](https://rmux.io/docs/) 查看 · [快速开始](https://rmux.io/docs/get-started/) · [示例](https://rmux.io/docs/examples/) · [API](https://rmux.io/docs/api/) · [CLI](https://rmux.io/docs/cli/)。
 
 ## CLI 快速开始
 

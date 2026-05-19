@@ -36,8 +36,6 @@ So I rebuilt that idea from scratch in Rust: a blazing-fast, tmux-compatible mul
 
 RMUX is usable by agents, headless CLI workflows, and humans alike: you can give terminal apps detachable execution, reconnect later, inspect their state, drive them from code, or simply use it for normal tmux-style terminal work.
 
-**Full docs:** [rmux.io/docs](https://rmux.io/docs/) · [Get started](https://rmux.io/docs/get-started/) · [Examples](https://rmux.io/docs/examples/) · [API](https://rmux.io/docs/api/) · [CLI](https://rmux.io/docs/cli/)
-
 <table>
   <tr>
     <td align="center" width="20%"><a href="https://rmux.io/#demo-orchestration"><img src="https://rmux.io/demos/demo-orchestration.png" width="150" alt="Multi Agents Orchestration demo preview"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/demo-orchestration"><strong>Multi Agents Orchestration</strong></a></sub><br><sub>≃ 514 lines</sub></td>
@@ -82,6 +80,10 @@ For Rust applications:
 cargo add rmux-sdk
 cargo add ratatui-rmux
 ```
+
+## Docs
+
+Full documentation is available on [rmux.io/docs](https://rmux.io/docs/) · [Get started](https://rmux.io/docs/get-started/) · [Examples](https://rmux.io/docs/examples/) · [API](https://rmux.io/docs/api/) · [CLI](https://rmux.io/docs/cli/).
 
 ## CLI Quickstart
 

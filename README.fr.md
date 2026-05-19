@@ -36,8 +36,6 @@ J'ai donc reconstruit cette idee from scratch en Rust : un multiplexeur ultra-ra
 
 RMUX est utilisable par les agents, les workflows CLI headless et les humains : vous pouvez donner une execution detachable aux applications terminal, vous reconnecter plus tard, inspecter leur etat, les piloter depuis du code, ou simplement l'utiliser pour du travail terminal classique façon tmux.
 
-**Docs complètes :** [rmux.io/docs](https://rmux.io/docs/) · [Démarrer](https://rmux.io/docs/get-started/) · [Exemples](https://rmux.io/docs/examples/) · [API](https://rmux.io/docs/api/) · [CLI](https://rmux.io/docs/cli/)
-
 <table>
   <tr>
     <td align="center" width="20%"><a href="https://rmux.io/#demo-orchestration"><img src="https://rmux.io/demos/demo-orchestration.png" width="150" alt="Aperçu de la démo orchestration multi-agents"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/demo-orchestration"><strong>Orchestration multi-agents</strong></a></sub><br><sub>≃ 514 lines</sub></td>
@@ -84,6 +82,10 @@ Pour les applications Rust :
 cargo add rmux-sdk
 cargo add ratatui-rmux
 ```
+
+## Docs
+
+La documentation complète est disponible sur [rmux.io/docs](https://rmux.io/docs/) · [Démarrer](https://rmux.io/docs/get-started/) · [Exemples](https://rmux.io/docs/examples/) · [API](https://rmux.io/docs/api/) · [CLI](https://rmux.io/docs/cli/).
 
 ## Démarrage rapide CLI
 
