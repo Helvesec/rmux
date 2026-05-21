@@ -91,6 +91,8 @@ The full RMUX documentation is available at [rmux.io/docs](https://rmux.io/docs/
 
 It includes [installation guides](https://rmux.io/docs/get-started/), [CLI references](https://rmux.io/docs/cli/), [SDK examples](https://rmux.io/docs/examples/), [terminal automation examples](https://rmux.io/docs/examples/#/terminal-playwright), and [API documentation](https://rmux.io/docs/api/).
 
+For an ergonomic, human-oriented WSL profile that keeps native terminal selection intuitive while adding easier split bindings and clipboard integration, see [docs/wsl-human-ux.md](docs/wsl-human-ux.md).
+
 ## CLI Quickstart
 
 ```sh
