@@ -32,7 +32,7 @@
 
 RMUX は、tmux の使い道にはまだ十分に掘り下げられていない部分がある、という考えから生まれました。最初の動機は単純でした。SSH 越しに長時間動く agents を実行し、そのターミナルを失わずに、周囲の状態を検査し、スクリプト化し、編成したかったのです。
 
-そこで、その考えを Rust でゼロから作り直しました。超高速な tmux 互換マルチプレクサ、型付き SDK、永続セッション、構造化スナップショット、そして Linux、macOS、Windows のネイティブなローカル transport を備えています。Windows Named Pipes も含み、WSL は不要です。
+そこで、その考えを Rust でゼロから作り直しました。超高速な tmux 互換マルチプレクサ、型付き SDK、永続セッション、構造化スナップショット、そして Linux、macOS、Windows のネイティブなローカル transport を備えています。Windows Named Pipes も含みます。
 
 RMUX は agents、headless CLI workflows、人間のどれにも使えます。ターミナルアプリに detachable な実行を与え、あとから再接続し、状態を検査し、コードから操作できます。あるいは、普通の tmux 風ターミナル作業にもそのまま使えます。
 

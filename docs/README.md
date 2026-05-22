@@ -6,4 +6,4 @@ It includes [installation guides](https://rmux.io/docs/get-started/), [CLI refer
 
 Repository-local guides:
 
-- [Human-friendly WSL starter config](wsl-human-ux.md)
+- [Human-friendly starter config](human-friendly-config.md)

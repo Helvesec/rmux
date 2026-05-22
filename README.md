@@ -32,7 +32,7 @@ English · [Français](README.fr.md) · [简体中文](README.zh-CN.md) · [日�
 
 RMUX exists because I believe the tmux use case has only been partially explored. My own starting point was simple: I wanted to run long-lived agents over SSH without losing their terminals, while still being able to inspect, script, and orchestrate everything around them.
 
-So I rebuilt that idea from scratch in Rust: a blazing-fast, tmux-compatible multiplexer with a typed SDK, persistent sessions, structured snapshots, and native local transports on Linux, macOS, and Windows, including Windows Named Pipes. No WSL required.
+So I rebuilt that idea from scratch in Rust: a blazing-fast, tmux-compatible multiplexer with a typed SDK, persistent sessions, structured snapshots, and native local transports on Linux, macOS, and Windows, including Windows Named Pipes.
 
 RMUX is usable by agents, headless CLI workflows, and humans alike: you can give terminal apps detachable execution, reconnect later, inspect their state, drive them from code, or simply use it for normal tmux-style terminal work.
 
@@ -91,7 +91,7 @@ The full RMUX documentation is available at [rmux.io/docs](https://rmux.io/docs/
 
 It includes [installation guides](https://rmux.io/docs/get-started/), [CLI references](https://rmux.io/docs/cli/), [SDK examples](https://rmux.io/docs/examples/), [terminal automation examples](https://rmux.io/docs/examples/#/terminal-playwright), and [API documentation](https://rmux.io/docs/api/).
 
-For an ergonomic, human-oriented WSL profile that keeps native terminal selection intuitive while adding easier split bindings and clipboard integration, see [docs/wsl-human-ux.md](docs/wsl-human-ux.md).
+For an ergonomic, human-oriented profile that keeps native terminal selection intuitive while adding easier split bindings and clipboard integration, see [docs/human-friendly-config.md](docs/human-friendly-config.md).
 
 ## CLI Quickstart
 

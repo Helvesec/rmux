@@ -32,7 +32,7 @@
 
 RMUX 的出发点很简单：我相信 tmux 的使用场景还只被探索了一部分。我最初的需求是通过 SSH 运行长期存在的 agents，同时不丢失它们的终端，并且仍然能够检查、脚本化和编排它们周围的一切。
 
-所以我用 Rust 从头重建了这个想法：一个极快、兼容 tmux 的终端复用器，带有类型化 SDK、持久会话、结构化快照，以及 Linux、macOS 和 Windows 上的原生本地传输，包括 Windows Named Pipes。无需 WSL。
+所以我用 Rust 从头重建了这个想法：一个极快、兼容 tmux 的终端复用器，带有类型化 SDK、持久会话、结构化快照，以及 Linux、macOS 和 Windows 上的原生本地传输，包括 Windows Named Pipes。
 
 RMUX 可以给 agents 用，也可以给 headless CLI workflows 用，同样也适合人直接使用：你可以让终端应用获得可 detach 的执行方式，稍后重新连接，检查它们的状态，从代码驱动它们，或者只是把它当作普通的 tmux 风格终端工具。
 
