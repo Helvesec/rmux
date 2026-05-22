@@ -47,10 +47,11 @@ pub(in crate::cli) fn run_split_window(
         args.size.as_deref(),
     )?;
     let response = connection
-        .split_window_with_spawn(
+        .split_window_with_start_directory(
             target.clone(),
             direction,
             (!args.environment.is_empty()).then_some(args.environment),
+            args.start_directory,
             (!args.command.is_empty()).then_some(args.command),
         )
         .map_err(ExitFailure::from_client)?;

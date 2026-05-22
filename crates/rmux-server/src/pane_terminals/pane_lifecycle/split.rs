@@ -79,7 +79,7 @@ impl HandlerState {
             )?;
         }
 
-        let profile = TerminalProfile::for_session(
+        let profile = match TerminalProfile::for_session(
             &self.environment,
             &self.options,
             &session_name,
@@ -89,15 +89,27 @@ impl HandlerState {
             environment_overrides,
             Some(new_pane_id),
             start_directory.or(requested_cwd.as_deref()),
-        )?;
+        ) {
+            Ok(profile) => profile,
+            Err(error) => {
+                self.replace_session(&session_name, previous_session)?;
+                return Err(error);
+            }
+        };
         let runtime_window_name = profile.runtime_window_name(command);
         let lifecycle_cwd = profile.cwd().to_path_buf();
-        let terminal = open_pane_terminal(
+        let terminal = match open_pane_terminal(
             new_pane_geometry,
             profile,
             runtime_window_name.clone(),
             command,
-        )?;
+        ) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                self.replace_session(&session_name, previous_session)?;
+                return Err(error);
+            }
+        };
         let pid = terminal.pid();
         let output_reader =
             match clone_terminal_for_output_reader(&terminal, &session_name, new_pane_id) {

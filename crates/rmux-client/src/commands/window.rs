@@ -315,6 +315,33 @@ impl Connection {
         environment: Option<Vec<String>>,
         command: Option<Vec<String>>,
     ) -> Result<Response, ClientError> {
+        self.split_window_with_start_directory(target, direction, environment, None, command)
+    }
+
+    /// Sends a `split-window` request with an optional working-directory override.
+    ///
+    /// New pane is inserted *after* the target. To insert before (tmux `-b`),
+    /// use [`Connection::split_window_with_options`] without a start directory.
+    pub fn split_window_with_start_directory(
+        &mut self,
+        target: SplitWindowTarget,
+        direction: SplitDirection,
+        environment: Option<Vec<String>>,
+        start_directory: Option<std::path::PathBuf>,
+        command: Option<Vec<String>>,
+    ) -> Result<Response, ClientError> {
+        if command.is_some() || start_directory.is_some() {
+            return self.roundtrip(&Request::SplitWindowExt(SplitWindowExtRequest {
+                target,
+                direction,
+                before: false,
+                environment,
+                command,
+                process_command: None,
+                start_directory,
+                keep_alive_on_exit: None,
+            }));
+        }
         self.split_window_with_options(SplitWindowOptions {
             target,
             direction,

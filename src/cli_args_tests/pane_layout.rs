@@ -84,6 +84,34 @@ fn split_window_accepts_trailing_command_argv() {
 }
 
 #[test]
+fn split_window_accepts_start_directory_before_trailing_command() {
+    let cli = parse_args(&[
+        "split-window",
+        "-h",
+        "-c",
+        "/tmp/work",
+        "-t",
+        "alpha",
+        "sh",
+        "-c",
+        "pwd",
+    ])
+    .unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::SplitWindow(args) => {
+            assert!(args.horizontal);
+            assert_eq!(
+                args.start_directory.as_deref(),
+                Some(std::path::Path::new("/tmp/work"))
+            );
+            assert_eq!(args.command, ["sh", "-c", "pwd"].map(str::to_owned));
+        }
+        _ => panic!("expected SplitWindow command"),
+    }
+}
+
+#[test]
 fn swap_pane_accepts_relative_direction_without_a_source() {
     let cli = parse_args(&["swap-pane", "-D", "-t", "alpha:2.3"]).unwrap();
 

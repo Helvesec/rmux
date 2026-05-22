@@ -9,10 +9,10 @@ use rmux_core::LifecycleEvent;
 use rmux_proto::{
     BreakPaneRequest, DisplayPanesRequest, KillPaneRequest, ListPanesRequest, ListWindowsRequest,
     MovePaneRequest, NewSessionExtRequest, NewSessionRequest, OptionName, PaneSnapshotRequest,
-    PaneTarget, PipePaneRequest, RenameWindowRequest, Request, RespawnPaneRequest, ScopeSelector,
-    SelectPaneRequest, SendKeysRequest, SessionName, SetOptionMode, SetOptionRequest,
-    SplitDirection, SplitWindowExtRequest, SplitWindowRequest, SplitWindowTarget, TerminalSize,
-    WindowTarget,
+    PaneTarget, PipePaneRequest, ProcessCommand, RenameWindowRequest, Request, RespawnPaneRequest,
+    ScopeSelector, SelectPaneRequest, SendKeysRequest, SessionName, SetOptionMode,
+    SetOptionRequest, SplitDirection, SplitWindowExtRequest, SplitWindowRequest, SplitWindowTarget,
+    TerminalSize, WindowTarget,
 };
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
@@ -76,6 +76,19 @@ fn respawn_probe_command(output: &Path) -> String {
 fn respawn_probe_command(output: &Path) -> String {
     crate::test_shell::powershell_encoded_command(&format!(
         "[System.IO.File]::WriteAllText({}, ((Get-Location).Path + ':' + $env:RMUX_RESPAWN))",
+        crate::test_shell::powershell_quote_path(output)
+    ))
+}
+
+#[cfg(unix)]
+fn cwd_probe_command(output: &Path) -> String {
+    format!("printf '%s' \"$(pwd)\" > {}", shell_quote(output))
+}
+
+#[cfg(windows)]
+fn cwd_probe_command(output: &Path) -> String {
+    crate::test_shell::powershell_encoded_command(&format!(
+        "[System.IO.File]::WriteAllText({}, (Get-Location).Path)",
         crate::test_shell::powershell_quote_path(output)
     ))
 }
@@ -479,6 +492,71 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
     assert!(!relisted_stdout.contains("dead=7"));
     let _ = fs::remove_dir_all(initial_cwd);
     let _ = fs::remove_dir_all(respawn_cwd);
+}
+
+#[tokio::test]
+async fn split_window_ext_applies_start_directory_to_spawned_process() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("split-cwd");
+    let cwd = unique_temp_path("split-cwd");
+    let output = unique_temp_path("split-cwd-output");
+    fs::create_dir_all(&cwd).expect("split cwd");
+    create_session(&handler, &alpha).await;
+
+    let response = handler
+        .handle(Request::SplitWindowExt(SplitWindowExtRequest {
+            target: SplitWindowTarget::Session(alpha.clone()),
+            direction: SplitDirection::Vertical,
+            before: false,
+            environment: None,
+            command: Some(vec![cwd_probe_command(&output)]),
+            process_command: None,
+            start_directory: Some(cwd.clone()),
+            keep_alive_on_exit: None,
+        }))
+        .await;
+    let _split_target = match response {
+        rmux_proto::Response::SplitWindow(response) => response.pane,
+        response => panic!("expected split-window success, got {response:?}"),
+    };
+
+    let expected_cwd = expected_spawn_cwd(&cwd);
+    wait_for_file_contents(&output, &expected_cwd).await;
+
+    let _ = fs::remove_file(output);
+    let _ = fs::remove_dir_all(cwd);
+}
+
+#[tokio::test]
+async fn split_window_rolls_back_session_when_spawn_fails() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("split-spawn-fails");
+    create_session(&handler, &alpha).await;
+    let missing_program = unique_temp_path("missing-program");
+
+    let response = handler
+        .handle(Request::SplitWindowExt(SplitWindowExtRequest {
+            target: SplitWindowTarget::Session(alpha.clone()),
+            direction: SplitDirection::Vertical,
+            before: false,
+            environment: None,
+            command: None,
+            process_command: Some(ProcessCommand::Argv(vec![missing_program
+                .to_string_lossy()
+                .into_owned()])),
+            start_directory: None,
+            keep_alive_on_exit: None,
+        }))
+        .await;
+
+    assert!(
+        matches!(&response, rmux_proto::Response::Error(error) if error.error.to_string().contains("failed to spawn pane shell")),
+        "expected spawn failure, got {response:?}"
+    );
+
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("session exists");
+    assert_eq!(session.window_at(0).expect("window exists").pane_count(), 1);
 }
 
 #[tokio::test]

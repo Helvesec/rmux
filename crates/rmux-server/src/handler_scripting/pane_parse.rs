@@ -192,7 +192,9 @@ pub(super) fn parse_split_window(
             }
             "-c" => {
                 let _ = args.optional();
-                start_directory = Some(std::path::PathBuf::from(args.required("-c start-directory")?));
+                start_directory = Some(std::path::PathBuf::from(
+                    args.required("-c start-directory")?,
+                ));
             }
             "-t" => {
                 let _ = args.optional();

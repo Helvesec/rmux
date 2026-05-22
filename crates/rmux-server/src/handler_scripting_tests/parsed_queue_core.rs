@@ -329,6 +329,53 @@ async fn parsed_queue_uses_current_target_for_new_window_split_and_zoom() {
 }
 
 #[tokio::test]
+async fn parsed_queue_split_window_accepts_start_directory() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("split-cwd");
+    let cwd = temp_root("split-cwd");
+    fs::create_dir_all(&cwd).expect("split cwd");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let parsed = CommandParser::new()
+        .parse(&format!("split-window -c {}", shell_quote(&cwd)))
+        .expect("command parses");
+    handler
+        .execute_parsed_commands(
+            std::process::id(),
+            parsed,
+            QueueExecutionContext::without_caller_cwd().with_current_target(Some(Target::Pane(
+                PaneTarget::with_window(alpha.clone(), 0, 0),
+            ))),
+        )
+        .await
+        .expect("split-window -c succeeds");
+
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("session exists");
+    let pane = session
+        .window_at(0)
+        .expect("window exists")
+        .pane(1)
+        .expect("split pane exists");
+    let lifecycle = state
+        .pane_lifecycle(pane.id())
+        .expect("split lifecycle exists");
+    assert_eq!(lifecycle.working_directory(), Some(cwd.as_path()));
+
+    let _ = fs::remove_dir_all(cwd);
+}
+
+#[tokio::test]
 async fn parsed_queue_uses_current_target_for_display_panes_without_t() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");

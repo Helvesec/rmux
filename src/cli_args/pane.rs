@@ -108,6 +108,8 @@ pub(crate) struct SplitWindowArgs {
     pub(crate) horizontal: bool,
     #[arg(short = 'v', action = ArgAction::SetTrue, group = "direction")]
     pub(crate) vertical: bool,
+    #[arg(short = 'c', allow_hyphen_values = true)]
+    pub(crate) start_directory: Option<PathBuf>,
     #[arg(short = 'l', allow_hyphen_values = true)]
     pub(crate) size: Option<String>,
     #[arg(short = 't', value_parser = parse_target_spec)]
