@@ -13,7 +13,7 @@
 [English](README.md) · Français · [简体中文](README.zh-CN.md) · [日本語](README.ja.md)
 
 [![Licence : MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
-[![Validation release](https://github.com/Helvesec/rmux/actions/workflows/ci.yml/badge.svg)](https://github.com/Helvesec/rmux/actions/workflows/ci.yml)
+[![Validation de release](https://github.com/Helvesec/rmux/actions/workflows/ci.yml/badge.svg)](https://github.com/Helvesec/rmux/actions/workflows/ci.yml)
 [![rmux 0.2.0](https://img.shields.io/badge/rmux-0.2.0-informational.svg)](#install)
 [![Plateformes : Linux | macOS | Windows](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#platform-support)
 [![Politique unsafe](https://img.shields.io/badge/unsafe-restricted-success.svg)](#verification)
@@ -30,11 +30,11 @@
 
 ## Pourquoi RMUX
 
-RMUX existe parce que je crois que le cas d'usage de tmux n'a ete explore qu'en partie. Mon point de depart etait simple : je voulais lancer des agents longue duree via SSH sans perdre leurs terminaux, tout en pouvant inspecter, scripter et orchestrer ce qui les entoure.
+RMUX existe parce que je crois que le cas d'usage de tmux n'a été exploré qu'en partie. Mon point de départ était simple : lancer des agents longue durée via SSH sans perdre leurs terminaux, tout en pouvant inspecter, scripter et orchestrer ce qui les entoure.
 
-J'ai donc reconstruit cette idee from scratch en Rust : un multiplexeur ultra-rapide compatible tmux, avec SDK type, sessions persistantes, snapshots structures et transports locaux natifs sur Linux, macOS et Windows, y compris les Windows Named Pipes. Pas besoin de WSL.
+J'ai donc reconstruit cette idée à partir de zéro en Rust : un multiplexeur ultra-rapide compatible tmux, avec SDK typé, sessions persistantes, snapshots structurés et transports locaux natifs sur Linux, macOS et Windows, y compris les Windows Named Pipes. Pas besoin de WSL.
 
-RMUX est utilisable par les agents, les workflows CLI headless et les humains : vous pouvez donner une execution detachable aux applications terminal, vous reconnecter plus tard, inspecter leur etat, les piloter depuis du code, ou simplement l'utiliser pour du travail terminal classique façon tmux.
+RMUX est utilisable par les agents, les workflows CLI sans interface et les humains : il permet de donner une exécution détachable aux applications terminal, de se reconnecter plus tard, d'inspecter leur état, de les piloter depuis du code, ou simplement de s'en servir pour du travail terminal classique façon tmux.
 
 ## Démos
 
@@ -42,11 +42,11 @@ Quelques exemples courts et concrets de ce que l'on peut faire avec RMUX.
 
 <table>
   <tr>
-    <td align="center" width="20%"><a href="https://rmux.io/#demo-orchestration"><img src="https://rmux.io/demos/demo-orchestration.png" width="150" alt="Aperçu de la démo orchestration multi-agents"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/demo-orchestration"><strong>Orchestration multi-agents</strong></a></sub><br><sub>≃ 514 lines</sub></td>
-    <td align="center" width="20%"><a href="https://rmux.io/#demo-broadcast"><img src="https://rmux.io/demos/demo-broadcast.png" width="150" alt="Aperçu de la démo Agent Broadcast Arena"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/broadcast-demo"><strong>Agent Broadcast Arena</strong></a></sub><br><sub>≃ 2,171 lines</sub></td>
-    <td align="center" width="20%"><a href="https://rmux.io/#demo-zellij"><img src="https://rmux.io/demos/demo-zellij.png" width="150" alt="Aperçu de la démo Mini-Zellij"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/mini-zellij"><strong>Mini-Zellij</strong></a></sub><br><sub>≃ 944 lines</sub></td>
-    <td align="center" width="20%"><a href="https://rmux.io/#demo-mirroring"><img src="https://rmux.io/demos/demo-mirroring.png" width="150" alt="Aperçu de la démo miroir terminal navigateur"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/web-claude-demo"><strong>Miroir terminal &lt;&gt; navigateur</strong></a></sub><br><sub>≃ 649 lines</sub></td>
-    <td align="center" width="20%"><a href="https://rmux.io/#demo-playwright"><img src="https://rmux.io/demos/demo-playwright.png" width="150" alt="Aperçu de la démo tests Playwright"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/terminal-playwright-demo"><strong>Tests Playwright</strong></a></sub><br><sub>≃ 1,495 lines</sub></td>
+    <td align="center" width="20%"><a href="https://rmux.io/#demo-orchestration"><img src="https://rmux.io/demos/demo-orchestration.png" width="150" alt="Aperçu de la démo orchestration multi-agents"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/demo-orchestration"><strong>Orchestration multi-agents</strong></a></sub><br><sub>≃ 514 lignes</sub></td>
+    <td align="center" width="20%"><a href="https://rmux.io/#demo-broadcast"><img src="https://rmux.io/demos/demo-broadcast.png" width="150" alt="Aperçu de la démo Agent Broadcast Arena"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/broadcast-demo"><strong>Agent Broadcast Arena</strong></a></sub><br><sub>≃ 2,171 lignes</sub></td>
+    <td align="center" width="20%"><a href="https://rmux.io/#demo-zellij"><img src="https://rmux.io/demos/demo-zellij.png" width="150" alt="Aperçu de la démo Mini-Zellij"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/mini-zellij"><strong>Mini-Zellij</strong></a></sub><br><sub>≃ 944 lignes</sub></td>
+    <td align="center" width="20%"><a href="https://rmux.io/#demo-mirroring"><img src="https://rmux.io/demos/demo-mirroring.png" width="150" alt="Aperçu de la démo miroir terminal navigateur"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/web-claude-demo"><strong>Miroir terminal &lt;&gt; navigateur</strong></a></sub><br><sub>≃ 649 lignes</sub></td>
+    <td align="center" width="20%"><a href="https://rmux.io/#demo-playwright"><img src="https://rmux.io/demos/demo-playwright.png" width="150" alt="Aperçu de la démo tests Playwright"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/terminal-playwright-demo"><strong>Tests Playwright</strong></a></sub><br><sub>≃ 1,495 lignes</sub></td>
   </tr>
 </table>
 
