@@ -4,7 +4,7 @@ async fn create_attached_live_session(
     handler: &RequestHandler,
     name: &rmux_proto::SessionName,
     requester_pid: u32,
-) {
+) -> mpsc::UnboundedReceiver<crate::pane_io::AttachControl> {
     #[cfg(unix)]
     {
         let mut state = handler.state.lock().await;
@@ -29,10 +29,11 @@ async fn create_attached_live_session(
         .await;
     assert!(matches!(created, Response::NewSession(_)));
 
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
         .register_attach(requester_pid, name.clone(), control_tx)
         .await;
+    control_rx
 }
 
 #[tokio::test]
@@ -40,7 +41,7 @@ async fn live_attach_unterminated_bracketed_paste_is_bounded_without_pane_leak()
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
-    create_attached_live_session(&handler, &alpha, requester_pid).await;
+    let _control_rx = create_attached_live_session(&handler, &alpha, requester_pid).await;
 
     #[cfg(windows)]
     let capture_target = {
@@ -81,7 +82,7 @@ async fn live_attach_chunked_sgr_mouse_sequence_still_dispatches() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
-    create_attached_live_session(&handler, &alpha, requester_pid).await;
+    let _control_rx = create_attached_live_session(&handler, &alpha, requester_pid).await;
 
     {
         let mut state = handler.state.lock().await;
@@ -153,7 +154,7 @@ async fn live_attach_unterminated_sgr_mouse_is_bounded_without_pane_leak() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
-    create_attached_live_session(&handler, &alpha, requester_pid).await;
+    let _control_rx = create_attached_live_session(&handler, &alpha, requester_pid).await;
 
     #[cfg(windows)]
     let capture_target = {
