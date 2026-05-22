@@ -1,9 +1,27 @@
 use rmux_proto::types::OptionScopeSelector;
-use rmux_proto::{PaneTarget, SessionName, WindowTarget};
+use rmux_proto::{PaneTarget, RmuxError, SessionName, WindowTarget};
 
-use super::registry::{self, GlobalRoot, SHOW_PANE, SHOW_SERVER, SHOW_SESSION, SHOW_WINDOW};
+use super::registry::{
+    self, resolve_option_name, GlobalRoot, SHOW_PANE, SHOW_SERVER, SHOW_SESSION, SHOW_WINDOW,
+};
 use super::storage::OptionNode;
 use super::{OptionQuery, OptionStore};
+
+/// Returns the tmux-compatible global option tree for a string option name.
+///
+/// `set -g` and `show-options -g` are not always session-global in tmux:
+/// their global tree follows the option itself. User options keep rmux's
+/// existing session-global default because they do not have registry metadata.
+pub fn default_global_scope_for_option_name(name: &str) -> Result<OptionScopeSelector, RmuxError> {
+    let query = resolve_option_name(name)?;
+    Ok(
+        match query.metadata().map(|metadata| metadata.global_root()) {
+            Some(GlobalRoot::Server) => OptionScopeSelector::ServerGlobal,
+            Some(GlobalRoot::Session) | None => OptionScopeSelector::SessionGlobal,
+            Some(GlobalRoot::Window) => OptionScopeSelector::WindowGlobal,
+        },
+    )
+}
 
 pub(super) fn scope_allows_session(query: &OptionQuery) -> bool {
     query.is_user()

@@ -262,7 +262,15 @@ pub(super) fn parse_show_options(
         name = Some(argument);
     }
     args.no_extra(command_name)?;
-    let scope = resolve_show_options_scope(command_name, global, server, window, pane, target)?;
+    let scope = resolve_show_options_scope(
+        command_name,
+        global,
+        server,
+        window,
+        pane,
+        target,
+        name.as_deref(),
+    )?;
 
     Ok(Request::ShowOptions(ShowOptionsRequest {
         scope,
@@ -419,10 +427,10 @@ fn resolve_set_option_scope(
     }
 
     if global {
-        let scope = OptionScopeSelector::SessionGlobal;
+        let scope = rmux_core::default_global_scope_for_option_name(option)?;
         if !is_user && !supports_scope(&scope) {
             return Err(RmuxError::Server(
-                "session scope is not supported for this option".to_owned(),
+                "global scope is not supported for this option".to_owned(),
             ));
         }
         return Ok(scope);
@@ -480,6 +488,7 @@ fn resolve_show_options_scope(
     window: bool,
     pane: bool,
     target: Option<Target>,
+    name: Option<&str>,
 ) -> Result<OptionScopeSelector, RmuxError> {
     if global && pane {
         return Err(RmuxError::Server(format!(
@@ -517,7 +526,10 @@ fn resolve_show_options_scope(
             "{command} -p requires a pane target"
         ))),
         (false, true, None) => Err(RmuxError::Server(format!("{command} -p requires a target"))),
-        (false, false, _) if global => Ok(OptionScopeSelector::SessionGlobal),
+        (false, false, _) if global => match name {
+            Some(name) => rmux_core::default_global_scope_for_option_name(name),
+            None => Ok(OptionScopeSelector::SessionGlobal),
+        },
         (false, false, Some(Target::Session(session_name))) => {
             Ok(OptionScopeSelector::Session(session_name))
         }

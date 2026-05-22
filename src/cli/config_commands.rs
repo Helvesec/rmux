@@ -270,6 +270,35 @@ mod tests {
     };
     use rmux_proto::{OptionScopeSelector, PaneTarget, SessionName, Target, WindowTarget};
 
+    fn global_set_args(option: &str, value: &str) -> SetOptionArgs {
+        SetOptionArgs {
+            global: true,
+            server: false,
+            window: false,
+            pane: false,
+            append: false,
+            only_if_unset: false,
+            unset: false,
+            unset_pane_overrides: false,
+            target: None,
+            option: option.to_owned(),
+            value: Some(value.to_owned()),
+        }
+    }
+
+    fn show_global_args(name: Option<&str>) -> ShowOptionsArgs {
+        ShowOptionsArgs {
+            global: true,
+            server: false,
+            window: false,
+            pane: false,
+            quiet: false,
+            value_only: false,
+            target: None,
+            name: name.map(str::to_owned),
+        }
+    }
+
     #[test]
     fn set_window_option_uses_window_scope_for_window_targets() {
         let session = SessionName::new("alpha").expect("valid session");
@@ -293,6 +322,66 @@ mod tests {
         .expect("window-scoped set-window-option resolves");
 
         assert_eq!(resolved.scope, OptionScopeSelector::Window(window));
+    }
+
+    #[test]
+    fn set_option_global_flag_uses_the_named_option_global_root() {
+        for (option, value, expected) in [
+            ("message-limit", "77", OptionScopeSelector::ServerGlobal),
+            ("status", "off", OptionScopeSelector::SessionGlobal),
+            (
+                "mode-style",
+                "fg=black,bg=red",
+                OptionScopeSelector::WindowGlobal,
+            ),
+            (
+                "copy-mode-selection-style",
+                "fg=black,bg=cyan",
+                OptionScopeSelector::WindowGlobal,
+            ),
+        ] {
+            let resolved = resolve_set_option_args(
+                SetOptionCommandKind::SetOption,
+                global_set_args(option, value),
+            )
+            .expect("global set-option resolves");
+
+            assert_eq!(resolved.scope, expected, "{option} should choose its root");
+        }
+    }
+
+    #[test]
+    fn set_option_server_flag_still_rejects_window_scoped_options() {
+        let result = resolve_set_option_args(
+            SetOptionCommandKind::SetOption,
+            SetOptionArgs {
+                server: true,
+                ..global_set_args("mode-style", "fg=black,bg=red")
+            },
+        );
+        let error = match result {
+            Ok(_) => panic!("mode-style should not accept server scope"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.message(),
+            "server scope is not supported for this option"
+        );
+    }
+
+    #[test]
+    fn set_option_explicit_global_window_scope_still_wins() {
+        let resolved = resolve_set_option_args(
+            SetOptionCommandKind::SetOption,
+            SetOptionArgs {
+                window: true,
+                ..global_set_args("copy-mode-selection-style", "fg=black,bg=cyan")
+            },
+        )
+        .expect("set-option -gw resolves");
+
+        assert_eq!(resolved.scope, OptionScopeSelector::WindowGlobal);
     }
 
     #[test]
@@ -374,6 +463,45 @@ mod tests {
         assert_eq!(
             resolved.scope,
             OptionScopeSelector::Window(WindowTarget::with_window(session, 0))
+        );
+    }
+
+    #[test]
+    fn show_options_global_flag_uses_the_named_option_global_root() {
+        for (name, expected) in [
+            ("message-limit", OptionScopeSelector::ServerGlobal),
+            ("status", OptionScopeSelector::SessionGlobal),
+            ("mode-style", OptionScopeSelector::WindowGlobal),
+            (
+                "copy-mode-selection-style",
+                OptionScopeSelector::WindowGlobal,
+            ),
+        ] {
+            let scope = resolve_show_options_scope(
+                ShowOptionsCommandKind::ShowOptions,
+                &show_global_args(Some(name)),
+            )
+            .expect("show-options -g resolves");
+
+            assert_eq!(
+                scope,
+                ShowOptionsScope::Resolved(expected),
+                "{name} should show from its global option tree"
+            );
+        }
+    }
+
+    #[test]
+    fn show_options_global_flag_without_name_keeps_session_global_default() {
+        let scope = resolve_show_options_scope(
+            ShowOptionsCommandKind::ShowOptions,
+            &show_global_args(None),
+        )
+        .expect("show-options -g resolves");
+
+        assert_eq!(
+            scope,
+            ShowOptionsScope::Resolved(OptionScopeSelector::SessionGlobal)
         );
     }
 

@@ -1,6 +1,9 @@
 use std::{collections::HashSet, fs};
 
-use super::{registry, resolve_option_name, OptionStore, ShowOptionsMode};
+use super::{
+    default_global_scope_for_option_name, registry, resolve_option_name, OptionStore,
+    ShowOptionsMode,
+};
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
     OptionName, PaneTarget, RmuxError, ScopeSelector, SessionName, SetOptionMode, WindowTarget,
@@ -27,3 +30,6 @@ mod mutation_unset;
 
 #[path = "tests/effects_defaults.rs"]
 mod effects_defaults;
+
+#[path = "tests/scope_resolution.rs"]
+mod scope_resolution;

@@ -30,6 +30,7 @@ pub use registry::{
     OptionQuery,
 };
 use registry::{option_metadata, OptionChangeMask, OptionValueType};
+pub use scope::default_global_scope_for_option_name;
 use storage::{OptionEntry, OptionNode};
 
 /// Option rendering mode for `show-options`.

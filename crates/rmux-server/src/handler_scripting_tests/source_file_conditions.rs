@@ -190,8 +190,10 @@ async fn source_file_routes_window_show_commands_and_global_show_scope_compatibi
             stdin: Some(
                 "set-option -s message-limit 77\n\
 set-window-option -g pane-border-style fg=colour3\n\
+set-option -g copy-mode-selection-style bg=cyan,fg=black\n\
 	show-options -gqsv -t alpha message-limit\n\
-show-window-options -g -t alpha -v pane-border-style\n"
+show-window-options -g -t alpha -v pane-border-style\n\
+show-window-options -g -v copy-mode-selection-style\n"
                     .to_owned(),
             ),
         }))
@@ -202,7 +204,7 @@ show-window-options -g -t alpha -v pane-border-style\n"
             .command_output()
             .unwrap_or_else(|| panic!("queued show-options output, got {response:?}"))
             .stdout(),
-        b"77\nfg=colour3\n"
+        b"77\nfg=colour3\nbg=cyan,fg=black\n"
     );
 }
 

@@ -154,11 +154,12 @@ fn resolve_set_option_scope(
     }
 
     if global {
-        let scope = OptionScopeSelector::SessionGlobal;
+        let scope = rmux_core::default_global_scope_for_option_name(option)
+            .map_err(|error| ExitFailure::new(1, error.to_string()))?;
         if !is_user && !supports_scope(&scope) {
             return Err(ExitFailure::new(
                 1,
-                "session scope is not supported for this option",
+                "global scope is not supported for this option",
             ));
         }
         return Ok(scope);
@@ -270,7 +271,10 @@ pub(super) fn resolve_show_options_scope(
             1,
             format!("{command_name} -p requires a target"),
         )),
-        (false, false, _) if args.global => Ok(if force_window {
+        (false, false, _) if args.global => Ok(if let Some(name) = args.name.as_deref() {
+            rmux_core::default_global_scope_for_option_name(name)
+                .map_err(|error| ExitFailure::new(1, error.to_string()))?
+        } else if force_window {
             OptionScopeSelector::WindowGlobal
         } else {
             OptionScopeSelector::SessionGlobal
