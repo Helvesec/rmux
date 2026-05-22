@@ -223,6 +223,23 @@ fn render(snapshot: PaneSnapshot, area: Rect, buffer: &mut Buffer) {
 3. `%APPDATA%\rmux\rmux.conf`
 4. `%RMUX_CONFIG_FILE%`
 
+### `tmux.conf` 迁移回退
+
+当 RMUX 使用默认配置搜索启动，并且没有加载任何 RMUX 配置文件时，它可以读取经过过滤的
+`tmux.conf` 作为迁移回退。通过 `-f` 显式指定配置文件时，不会使用这个回退。
+
+回退查找位置：
+
+- Linux 和 macOS：`/etc/tmux.conf`、`~/.tmux.conf`、`$XDG_CONFIG_HOME/tmux/tmux.conf`、`~/.config/tmux/tmux.conf`
+- Windows：`%XDG_CONFIG_HOME%\tmux\tmux.conf`、`%USERPROFILE%\.tmux.conf`、`%APPDATA%\tmux\tmux.conf`
+
+导入范围刻意保持很窄：RMUX 只保留已支持的静态配置项和取消按键绑定，
+并跳过 tmux 按键绑定、环境或终端能力修改、插件用户配置项、hooks、
+shell 命令、命令块、条件块、`#(cmd)` 这样的格式任务、
+递归 `source-file` 条目，以及不支持的配置项，而不是执行它们。
+设置 `RMUX_DISABLE_TMUX_FALLBACK=1` 可以完全禁用该回退。
+回退文件按尽力原则读取；非普通文件和超过 1 MiB 的文件会被忽略。
+
 <a id="verification"></a>
 
 ## 验证

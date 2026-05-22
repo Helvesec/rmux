@@ -223,6 +223,26 @@ Sur Windows, RMUX lit également `.rmux.conf`, depuis les emplacements suivants 
 3. `%APPDATA%\rmux\rmux.conf`
 4. `%RMUX_CONFIG_FILE%`
 
+### Fallback de migration `tmux.conf`
+
+Quand RMUX démarre avec la recherche de configuration par défaut et qu'aucun
+fichier RMUX n'est chargé, il peut importer un `tmux.conf` filtré pour faciliter
+la migration. Un chargement explicite avec `-f` n'utilise pas ce fallback.
+
+Chemins de fallback :
+
+- Linux et macOS : `/etc/tmux.conf`, `~/.tmux.conf`, `$XDG_CONFIG_HOME/tmux/tmux.conf`, `~/.config/tmux/tmux.conf`
+- Windows : `%XDG_CONFIG_HOME%\tmux\tmux.conf`, `%USERPROFILE%\.tmux.conf`, `%APPDATA%\tmux\tmux.conf`
+
+L'import est volontairement limité : RMUX conserve les options statiques
+supportées et les suppressions de raccourcis, mais ignore les bindings tmux, les
+modifications d'environnement ou de capacités terminal, les options utilisateur
+de plugins, les hooks, les commandes shell, les blocs de commandes, les
+conditions, les jobs de format comme `#(cmd)`, les `source-file` récursifs et
+les options non supportées. Définissez `RMUX_DISABLE_TMUX_FALLBACK=1` pour le
+désactiver entièrement. Les fichiers de fallback sont lus au mieux : les fichiers
+non réguliers et les fichiers de plus de 1 MiB sont ignorés.
+
 <a id="verification"></a>
 
 ## Vérification

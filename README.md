@@ -221,15 +221,24 @@ On Windows, RMUX reads `.rmux.conf` as well, from the following locations:
 3. `%APPDATA%\rmux\rmux.conf`
 4. `%RMUX_CONFIG_FILE%`
 
-If none of the RMUX config files exist, RMUX can import compatible static
-settings from `tmux.conf` as a migration fallback. This import is intentionally
-filtered: RMUX keeps supported non-executable options and key unbindings, but
-skips tmux key bindings, environment or terminal capability mutations, plugin
-user options and hooks, shell commands, command blocks, conditionals, format
-jobs such as `#(cmd)`, recursive `source-file` entries, and unsupported options
-instead of executing them. Set `RMUX_DISABLE_TMUX_FALLBACK=1` to skip this
-fallback entirely. Fallback files are read best-effort: non-regular files and
-files larger than 1 MiB are ignored.
+### `tmux.conf` migration fallback
+
+When RMUX starts with the default config search and no RMUX config file is
+loaded, it can import a filtered `tmux.conf` as a migration fallback. Explicit
+config loading with `-f` does not use this fallback.
+
+Fallback paths:
+
+- Linux and macOS: `/etc/tmux.conf`, `~/.tmux.conf`, `$XDG_CONFIG_HOME/tmux/tmux.conf`, `~/.config/tmux/tmux.conf`
+- Windows: `%XDG_CONFIG_HOME%\tmux\tmux.conf`, `%USERPROFILE%\.tmux.conf`, `%APPDATA%\tmux\tmux.conf`
+
+The import is intentionally narrow: RMUX keeps supported static options and
+key unbindings, but skips tmux key bindings, environment or terminal capability
+mutations, plugin user options and hooks, shell commands, command blocks,
+conditionals, format jobs such as `#(cmd)`, recursive `source-file` entries,
+and unsupported options instead of executing them. Set
+`RMUX_DISABLE_TMUX_FALLBACK=1` to disable it entirely. Fallback files are read
+best-effort: non-regular files and files larger than 1 MiB are ignored.
 
 ## Verification
 
