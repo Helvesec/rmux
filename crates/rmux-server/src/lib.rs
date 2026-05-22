@@ -96,6 +96,8 @@ mod status_ranges;
 #[cfg_attr(windows, allow(dead_code))]
 mod terminal;
 #[cfg(test)]
+mod test_env;
+#[cfg(test)]
 mod test_shell;
 #[cfg(unix)]
 mod unix_socket;

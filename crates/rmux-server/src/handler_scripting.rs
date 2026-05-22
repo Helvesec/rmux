@@ -63,6 +63,8 @@ mod source_files;
 mod source_runtime;
 #[path = "handler_scripting/targets.rs"]
 mod targets;
+#[path = "handler_scripting/tmux_compat.rs"]
+mod tmux_compat;
 #[path = "handler_scripting/tokens.rs"]
 mod tokens;
 #[path = "handler_scripting/values.rs"]
@@ -528,45 +530,15 @@ fn command_parse_error_to_rmux(error: CommandParseError) -> RmuxError {
 
 #[cfg(test)]
 mod tests {
-    use super::source_files::default_config_paths;
+    use super::source_files::{default_config_paths, default_tmux_fallback_paths};
     #[cfg(windows)]
-    use super::source_files::source_inputs_for_path;
-    use std::sync::{Mutex, OnceLock};
-
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    struct EnvVarGuard {
-        name: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(name: &'static str, value: Option<&str>) -> Self {
-            let previous = std::env::var(name).ok();
-            match value {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-            Self { name, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            match &self.previous {
-                Some(value) => std::env::set_var(self.name, value),
-                None => std::env::remove_var(self.name),
-            }
-        }
-    }
+    use super::source_files::{source_inputs_for_path, SourceReadPolicy};
+    use crate::test_env::EnvVarGuard;
 
     #[cfg(unix)]
     #[test]
     fn default_config_paths_use_rmux_locations() {
-        let _lock = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock");
+        let _lock = crate::test_env::lock_blocking();
         let _home = EnvVarGuard::set("HOME", Some("/tmp/rmux-home"));
         let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", Some("/tmp/rmux-xdg"));
 
@@ -587,13 +559,43 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn tmux_fallback_paths_use_tmux_locations() {
+        let _lock = crate::test_env::lock_blocking();
+        let _disable = EnvVarGuard::set("RMUX_DISABLE_TMUX_FALLBACK", None);
+        let _home = EnvVarGuard::set("HOME", Some("/tmp/rmux-home"));
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", Some("/tmp/rmux-xdg"));
+
+        let paths = default_tmux_fallback_paths();
+
+        assert_eq!(
+            paths,
+            vec![
+                "/etc/tmux.conf".to_owned(),
+                "/tmp/rmux-home/.tmux.conf".to_owned(),
+                "/tmp/rmux-xdg/tmux/tmux.conf".to_owned(),
+                "/tmp/rmux-home/.config/tmux/tmux.conf".to_owned(),
+            ]
+        );
+        assert!(
+            paths.iter().all(|path| !path.ends_with("rmux.conf")),
+            "tmux fallback paths must not include rmux config files: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn tmux_fallback_paths_can_be_disabled_by_env() {
+        let _lock = crate::test_env::lock_blocking();
+        let _disable = EnvVarGuard::set("RMUX_DISABLE_TMUX_FALLBACK", Some("1"));
+
+        assert!(default_tmux_fallback_paths().is_empty());
+    }
+
     #[cfg(windows)]
     #[test]
     fn default_config_paths_use_documented_windows_locations() {
-        let _lock = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock");
+        let _lock = crate::test_env::lock_blocking();
         let _rmux_config = EnvVarGuard::set("RMUX_CONFIG_FILE", Some(r"C:\rmux\custom.conf"));
         let _appdata = EnvVarGuard::set("APPDATA", Some(r"C:\Users\tester\AppData\Roaming"));
         let _userprofile = EnvVarGuard::set("USERPROFILE", Some(r"C:\Users\tester"));
@@ -626,14 +628,41 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_nul_config_path_is_empty() {
-        let inputs = source_inputs_for_path("NUL", None, false, None)
-            .expect("NUL should behave like an empty config file");
-        assert!(inputs.is_empty());
+    fn tmux_fallback_paths_use_documented_windows_tmux_locations() {
+        let _lock = crate::test_env::lock_blocking();
+        let _disable = EnvVarGuard::set("RMUX_DISABLE_TMUX_FALLBACK", None);
+        let _appdata = EnvVarGuard::set("APPDATA", Some(r"C:\Users\tester\AppData\Roaming"));
+        let _userprofile = EnvVarGuard::set("USERPROFILE", Some(r"C:\Users\tester"));
+        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", Some(r"C:\Users\tester\.config"));
 
-        let inputs = source_inputs_for_path("nul", None, false, None)
+        let paths = default_tmux_fallback_paths();
+
+        assert_eq!(
+            paths,
+            vec![
+                path_string(r"C:\Users\tester\.config\tmux\tmux.conf"),
+                path_string(r"C:\Users\tester\.tmux.conf"),
+                path_string(r"C:\Users\tester\AppData\Roaming\tmux\tmux.conf"),
+            ]
+        );
+        assert!(
+            paths.iter().all(|path| !path.ends_with("rmux.conf")),
+            "tmux fallback paths must not include rmux config files: {paths:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_nul_config_path_is_empty() {
+        let inputs = source_inputs_for_path("NUL", None, false, None, SourceReadPolicy::Strict)
+            .expect("NUL should behave like an empty config file");
+        assert_eq!(inputs.len(), 1);
+        assert!(inputs[0].contents.is_empty());
+
+        let inputs = source_inputs_for_path("nul", None, false, None, SourceReadPolicy::Strict)
             .expect("nul should be case-insensitive");
-        assert!(inputs.is_empty());
+        assert_eq!(inputs.len(), 1);
+        assert!(inputs[0].contents.is_empty());
     }
 
     #[cfg(windows)]

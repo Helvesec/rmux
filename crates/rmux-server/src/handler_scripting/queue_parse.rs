@@ -11,6 +11,7 @@ use super::command_args::{
     command_argument_for_error, pop_command_list_argument, pop_string_argument, CommandListArgument,
 };
 use super::source_files::ParsedSourceFileCommand;
+use super::source_files::SourceSyntax;
 use super::targets::{
     implicit_session_name, implicit_window_target, parse_new_window_target_argument,
     parse_pane_target, parse_target_arg, resolve_queue_target_argument,
@@ -315,5 +316,6 @@ pub(super) fn parse_queued_source_file(
         caller_cwd: caller_cwd.map(Path::to_path_buf),
         stdin: None,
         current_file: None,
+        syntax: SourceSyntax::Rmux,
     })
 }

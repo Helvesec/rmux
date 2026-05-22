@@ -186,7 +186,7 @@ impl ConfigLoadOptions {
 pub enum ConfigFileSelection {
     /// Do not load config files.
     Disabled,
-    /// Load tmux's default config search path.
+    /// Load RMUX default config files, with a filtered tmux config fallback.
     Default,
     /// Load the explicit `-f` files in order.
     Files(Vec<PathBuf>),

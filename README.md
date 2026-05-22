@@ -221,6 +221,16 @@ On Windows, RMUX reads `.rmux.conf` as well, from the following locations:
 3. `%APPDATA%\rmux\rmux.conf`
 4. `%RMUX_CONFIG_FILE%`
 
+If none of the RMUX config files exist, RMUX can import compatible static
+settings from `tmux.conf` as a migration fallback. This import is intentionally
+filtered: RMUX keeps supported non-executable options and key unbindings, but
+skips tmux key bindings, environment or terminal capability mutations, plugin
+user options and hooks, shell commands, command blocks, conditionals, format
+jobs such as `#(cmd)`, recursive `source-file` entries, and unsupported options
+instead of executing them. Set `RMUX_DISABLE_TMUX_FALLBACK=1` to skip this
+fallback entirely. Fallback files are read best-effort: non-regular files and
+files larger than 1 MiB are ignored.
+
 ## Verification
 
 The workspace is designed to be checked from source with locked dependencies:
