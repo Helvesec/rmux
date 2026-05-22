@@ -9,11 +9,10 @@ pub(super) fn matches_mode_tree_filter(
     search_text: &str,
     format_filter: Option<&str>,
 ) -> bool {
-    if let Some(filter) = format_filter {
-        if !is_truthy(filter) {
+    if let Some(filter) = format_filter
+        && !is_truthy(filter) {
             return false;
         }
-    }
     let Some(filter) = mode.filter_text.as_deref() else {
         return true;
     };

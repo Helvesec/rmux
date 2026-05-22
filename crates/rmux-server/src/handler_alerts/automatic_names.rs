@@ -58,7 +58,8 @@ impl RequestHandler {
             return Vec::new();
         };
 
-        let sessions_to_refresh = {
+        
+        {
             let mut state = self.state.lock().await;
             let tracked =
                 state.tracks_auto_named_window(target.session_name(), target.window_index());
@@ -94,7 +95,6 @@ impl RequestHandler {
                     .synchronize_session_group_from(target.session_name())
                     .unwrap_or_else(|_| vec![target.session_name().clone()])
             }
-        };
-        sessions_to_refresh
+        }
     }
 }

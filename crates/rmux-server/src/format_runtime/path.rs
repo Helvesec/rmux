@@ -38,15 +38,14 @@ fn percent_decode(value: &str) -> String {
     let mut index = 0;
 
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let (Some(high), Some(low)) =
+        if bytes[index] == b'%' && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
                 (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
             {
                 decoded.push((high << 4) | low);
                 index += 3;
                 continue;
             }
-        }
 
         decoded.push(bytes[index]);
         index += 1;

@@ -283,11 +283,9 @@ impl Window {
         if let Some(last_pane) = self
             .last_pane
             .filter(|last_pane| *last_pane != removed_pane_index)
-        {
-            if let Some(pane_id) = self.pane(last_pane).map(Pane::id) {
+            && let Some(pane_id) = self.pane(last_pane).map(Pane::id) {
                 return pane_id;
             }
-        }
 
         if position > 0 {
             return self.panes[position - 1].id();

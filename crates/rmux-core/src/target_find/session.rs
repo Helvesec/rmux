@@ -20,11 +20,10 @@ impl SessionStore {
                 .ok_or_else(|| target_not_found(value, "session"));
         }
 
-        if let Ok(name) = SessionName::new(value.to_owned()) {
-            if let Some(session) = self.session(&name) {
+        if let Ok(name) = SessionName::new(value.to_owned())
+            && let Some(session) = self.session(&name) {
                 return Ok(session.name().clone());
             }
-        }
 
         if flags.contains(TargetFindFlags::EXACT_SESSION) {
             return Err(target_not_found(value, "session"));

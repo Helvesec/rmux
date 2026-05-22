@@ -127,10 +127,11 @@ fn default_socket_path_matches_server_path() {
 fn default_socket_path_matches_server_path_when_rmux_tmpdir_is_unresolved() {
     let _guard = RMUX_TMPDIR_ENV_LOCK.lock().expect("rmux tmpdir env lock");
     let original = std::env::var_os("RMUX_TMPDIR");
-    std::env::set_var(
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var(
         "RMUX_TMPDIR",
         "relative-rmux-test-path-that-does-not-exist",
-    );
+    ) };
 
     let client_path = super::default_socket_path().expect("client socket path");
     let server_path = rmux_server::default_socket_path().expect("server socket path");
@@ -144,8 +145,10 @@ fn default_socket_path_matches_server_path_when_rmux_tmpdir_is_unresolved() {
     );
 
     match original {
-        Some(value) => std::env::set_var("RMUX_TMPDIR", value),
-        None => std::env::remove_var("RMUX_TMPDIR"),
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        Some(value) => unsafe { std::env::set_var("RMUX_TMPDIR", value) },
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        None => unsafe { std::env::remove_var("RMUX_TMPDIR") },
     }
 }
 
@@ -153,7 +156,8 @@ fn default_socket_path_matches_server_path_when_rmux_tmpdir_is_unresolved() {
 fn resolve_socket_path_prefers_socket_path_over_socket_name_and_rmux_env() {
     let _guard = RMUX_TMPDIR_ENV_LOCK.lock().expect("rmux tmpdir env lock");
     let original_rmux = std::env::var_os("RMUX");
-    std::env::set_var("RMUX", "/tmp/from-rmux,1,0");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("RMUX", "/tmp/from-rmux,1,0") };
 
     let path = super::resolve_socket_path(
         Some(OsStr::new("named")),
@@ -163,8 +167,10 @@ fn resolve_socket_path_prefers_socket_path_over_socket_name_and_rmux_env() {
 
     assert_eq!(path, PathBuf::from("/tmp/from-flag"));
     match original_rmux {
-        Some(value) => std::env::set_var("RMUX", value),
-        None => std::env::remove_var("RMUX"),
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        Some(value) => unsafe { std::env::set_var("RMUX", value) },
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        None => unsafe { std::env::remove_var("RMUX") },
     }
 }
 
@@ -172,14 +178,17 @@ fn resolve_socket_path_prefers_socket_path_over_socket_name_and_rmux_env() {
 fn resolve_socket_path_uses_rmux_env_before_default_label() {
     let _guard = RMUX_TMPDIR_ENV_LOCK.lock().expect("rmux tmpdir env lock");
     let original_rmux = std::env::var_os("RMUX");
-    std::env::set_var("RMUX", "/tmp/rmux-1000/from-rmux,1,0");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("RMUX", "/tmp/rmux-1000/from-rmux,1,0") };
 
     let path = super::resolve_socket_path(None, None).expect("resolved socket path");
 
     assert_eq!(path, PathBuf::from("/tmp/rmux-1000/from-rmux"));
     match original_rmux {
-        Some(value) => std::env::set_var("RMUX", value),
-        None => std::env::remove_var("RMUX"),
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        Some(value) => unsafe { std::env::set_var("RMUX", value) },
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        None => unsafe { std::env::remove_var("RMUX") },
     }
 }
 
@@ -187,15 +196,18 @@ fn resolve_socket_path_uses_rmux_env_before_default_label() {
 fn resolve_socket_path_ignores_non_rmux_env_socket() {
     let _guard = RMUX_TMPDIR_ENV_LOCK.lock().expect("rmux tmpdir env lock");
     let original_rmux = std::env::var_os("RMUX");
-    std::env::set_var("RMUX", "/tmp/other-1000/default,1,0");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("RMUX", "/tmp/other-1000/default,1,0") };
 
     let path = super::resolve_socket_path(None, None).expect("resolved socket path");
     let default = super::default_socket_path().expect("default socket path");
 
     assert_eq!(path, default);
     match original_rmux {
-        Some(value) => std::env::set_var("RMUX", value),
-        None => std::env::remove_var("RMUX"),
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        Some(value) => unsafe { std::env::set_var("RMUX", value) },
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        None => unsafe { std::env::remove_var("RMUX") },
     }
 }
 
@@ -203,15 +215,18 @@ fn resolve_socket_path_ignores_non_rmux_env_socket() {
 fn resolve_socket_path_ignores_empty_rmux_env() {
     let _guard = RMUX_TMPDIR_ENV_LOCK.lock().expect("rmux tmpdir env lock");
     let original_rmux = std::env::var_os("RMUX");
-    std::env::set_var("RMUX", "");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("RMUX", "") };
 
     let path = super::resolve_socket_path(None, None).expect("resolved socket path");
     let default = super::default_socket_path().expect("default socket path");
 
     assert_eq!(path, default);
     match original_rmux {
-        Some(value) => std::env::set_var("RMUX", value),
-        None => std::env::remove_var("RMUX"),
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        Some(value) => unsafe { std::env::set_var("RMUX", value) },
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        None => unsafe { std::env::remove_var("RMUX") },
     }
 }
 
@@ -219,15 +234,18 @@ fn resolve_socket_path_ignores_empty_rmux_env() {
 fn resolve_socket_path_ignores_nonempty_malformed_rmux_env() {
     let _guard = RMUX_TMPDIR_ENV_LOCK.lock().expect("rmux tmpdir env lock");
     let original_rmux = std::env::var_os("RMUX");
-    std::env::set_var("RMUX", "malformed-rmux-value");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("RMUX", "malformed-rmux-value") };
 
     let path = super::resolve_socket_path(None, None).expect("resolved socket path");
     let default = super::default_socket_path().expect("default socket path");
 
     assert_eq!(path, default);
     match original_rmux {
-        Some(value) => std::env::set_var("RMUX", value),
-        None => std::env::remove_var("RMUX"),
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        Some(value) => unsafe { std::env::set_var("RMUX", value) },
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        None => unsafe { std::env::remove_var("RMUX") },
     }
 }
 

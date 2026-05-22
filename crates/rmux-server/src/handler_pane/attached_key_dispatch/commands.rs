@@ -50,8 +50,8 @@ pub(super) async fn execute_attached_binding_commands(
         .await
     {
         Ok(output) => {
-            if attached_live_input && parsed_commands_open_attached_output(&commands) {
-                if let Err(error) = handler
+            if attached_live_input && parsed_commands_open_attached_output(&commands)
+                && let Err(error) = handler
                     .show_attached_command_output_popup(
                         attach_pid,
                         requester_pid,
@@ -65,7 +65,6 @@ pub(super) async fn execute_attached_binding_commands(
                         .report_attached_command_error(&session_name, attach_pid, &error)
                         .await;
                 }
-            }
         }
         Err(error) => {
             if attached_live_input {

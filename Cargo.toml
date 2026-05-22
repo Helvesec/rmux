@@ -18,7 +18,8 @@ resolver = "2"
 
 [workspace.package]
 version = "0.2.5"
-edition = "2021"
+edition = "2024"
+rust-version = "1.95"
 publish = false
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/helvesec/rmux"
@@ -27,6 +28,7 @@ repository = "https://github.com/helvesec/rmux"
 name = "rmux"
 version = "0.2.5"
 edition.workspace = true
+rust-version.workspace = true
 publish = true
 license.workspace = true
 repository.workspace = true

@@ -108,11 +108,10 @@ impl ScreenWriter for Screen {
 
     fn linefeed(&mut self, wrapped: bool, bg: i32) {
         self.pending_wrap = false;
-        if wrapped {
-            if let Some(line) = self.current_line_mut() {
+        if wrapped
+            && let Some(line) = self.current_line_mut() {
                 line.set_wrapped(true);
             }
-        }
 
         if self.cursor_y == self.rlower {
             self.grid

@@ -509,12 +509,11 @@ impl SessionStore {
             .expect("prevalidated session must exist");
         let previous_group_name = session.group_name().cloned();
         session.rename(new_name.clone());
-        if let Some(group_name) = previous_group_name {
-            if self.group_runtime_owners.get(&group_name) == Some(session_name) {
+        if let Some(group_name) = previous_group_name
+            && self.group_runtime_owners.get(&group_name) == Some(session_name) {
                 self.group_runtime_owners
                     .insert(group_name, new_name.clone());
             }
-        }
         let replaced = sessions.insert(new_name, session);
         debug_assert!(replaced.is_none());
         self.sessions = sessions;

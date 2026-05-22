@@ -340,13 +340,11 @@ impl RequestHandler {
                         }
                     })
                 };
-                if let Some(popup) = popup {
-                    if let Some(job) = &popup.job {
-                        if let Some(bytes) = encode_mouse_event(mode, &event, x, y) {
+                if let Some(popup) = popup
+                    && let Some(job) = &popup.job
+                        && let Some(bytes) = encode_mouse_event(mode, &event, x, y) {
                             let _ = job.write(&bytes);
                         }
-                    }
-                }
             }
             PopupMouseOutcome::OpenMenu { x, y } => {
                 self.open_popup_internal_menu(attach_pid, x, y)

@@ -338,14 +338,13 @@ impl RequestHandler {
         mut content: Vec<u8>,
     ) -> Result<Vec<u8>, RmuxError> {
         let state = self.state.lock().await;
-        if let Some(name) = name {
-            if let Some(existing) = state.buffers.get(name) {
+        if let Some(name) = name
+            && let Some(existing) = state.buffers.get(name) {
                 let mut combined = Vec::with_capacity(existing.len() + content.len());
                 combined.extend_from_slice(existing);
                 combined.append(&mut content);
                 return Ok(combined);
             }
-        }
         Ok(content)
     }
 

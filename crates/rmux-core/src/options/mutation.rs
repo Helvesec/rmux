@@ -43,15 +43,14 @@ fn validate_query_mutation(
     value: Option<&str>,
     unset: bool,
 ) -> Result<(), RmuxError> {
-    if let Some(metadata) = query.metadata() {
-        if !metadata.supports_scope(scope) {
+    if let Some(metadata) = query.metadata()
+        && !metadata.supports_scope(scope) {
             return Err(RmuxError::InvalidSetOption(format!(
                 "{} is only supported at {} scope",
                 query.canonical_name(),
                 allowed_scope_message(metadata),
             )));
         }
-    }
 
     if mode == SetOptionMode::Append
         && !query.is_array()

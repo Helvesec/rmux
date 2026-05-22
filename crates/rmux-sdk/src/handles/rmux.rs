@@ -274,11 +274,10 @@ impl Rmux {
             .await?;
         match response {
             Response::KillServer(_) => {
-                if let Err(error) = client.shutdown().await {
-                    if !is_clean_shutdown_close(&error) {
+                if let Err(error) = client.shutdown().await
+                    && !is_clean_shutdown_close(&error) {
                         return Err(error);
                     }
-                }
                 Ok(())
             }
             Response::Error(error) => Err(error.into()),

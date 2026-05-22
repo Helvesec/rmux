@@ -307,48 +307,42 @@ fn merge_tags(pane: &[String], window: &[String], session: Option<&Vec<String>>)
 
 impl PaneFilters {
     fn matches(&self, pane: &DiscoveredPane) -> bool {
-        if let Some(title) = &self.title {
-            if pane.title.as_deref() != Some(title.as_str()) {
+        if let Some(title) = &self.title
+            && pane.title.as_deref() != Some(title.as_str()) {
                 return false;
             }
-        }
-        if let Some(prefix) = &self.title_prefix {
-            if !pane
+        if let Some(prefix) = &self.title_prefix
+            && !pane
                 .title
                 .as_deref()
                 .is_some_and(|title| title.starts_with(prefix))
             {
                 return false;
             }
-        }
-        if let Some(needle) = &self.command_contains {
-            if !pane
+        if let Some(needle) = &self.command_contains
+            && !pane
                 .command
                 .as_ref()
                 .is_some_and(|argv| argv.iter().any(|arg| arg.contains(needle)))
             {
                 return false;
             }
-        }
-        if let Some(needle) = &self.cwd_contains {
-            if !pane
+        if let Some(needle) = &self.cwd_contains
+            && !pane
                 .working_directory
                 .as_deref()
                 .is_some_and(|cwd| cwd.contains(needle))
             {
                 return false;
             }
-        }
-        if let Some(running) = self.running {
-            if !pane.process_matches(running) {
+        if let Some(running) = self.running
+            && !pane.process_matches(running) {
                 return false;
             }
-        }
-        if let Some(window_index) = self.window_index {
-            if pane.window_index != window_index {
+        if let Some(window_index) = self.window_index
+            && pane.window_index != window_index {
                 return false;
             }
-        }
         true
     }
 }

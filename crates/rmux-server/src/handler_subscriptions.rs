@@ -221,11 +221,10 @@ impl RequestHandler {
         match live_result {
             Ok(source) => Ok(source),
             Err(live_error) => {
-                if start == PaneOutputSubscriptionStart::Oldest {
-                    if let Some((target, retained)) = retained_lookup(self, target_ref, now)? {
+                if start == PaneOutputSubscriptionStart::Oldest
+                    && let Some((target, retained)) = retained_lookup(self, target_ref, now)? {
                         return Ok((target, retained.pane().clone(), retained.output().clone()));
                     }
-                }
                 Err(live_error)
             }
         }

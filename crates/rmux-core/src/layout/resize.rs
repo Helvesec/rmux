@@ -140,8 +140,8 @@ impl LayoutTree {
             let child_index = *cell_path.last()?;
             let parent_path = cell_path[..cell_path.len() - 1].to_vec();
             let parent = cell_at_path(&self.root, &parent_path)?;
-            if let LayoutKind::Split(parent_direction, children) = &parent.kind {
-                if *parent_direction == direction {
+            if let LayoutKind::Split(parent_direction, children) = &parent.kind
+                && *parent_direction == direction {
                     let handle_index = if child_index + 1 == children.len() {
                         child_index.checked_sub(1)
                     } else {
@@ -151,7 +151,6 @@ impl LayoutTree {
                         return Some((parent_path, handle_index));
                     }
                 }
-            }
 
             cell_path.pop();
         }

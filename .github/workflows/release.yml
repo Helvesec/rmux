@@ -57,7 +57,7 @@ jobs:
         with:
           ref: ${{ env.RELEASE_REF }}
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: ${{ matrix.target }}
 

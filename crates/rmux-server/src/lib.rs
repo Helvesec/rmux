@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![deny(missing_docs)]
 
 //! Tokio-based detached RPC server for RMUX.
@@ -96,6 +96,7 @@ mod status_ranges;
 #[cfg_attr(windows, allow(dead_code))]
 mod terminal;
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod test_env;
 #[cfg(test)]
 mod test_shell;

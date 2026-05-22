@@ -120,19 +120,17 @@ impl SnapshotCoalescer {
     /// `None` if the revision was held back, suppressed as a duplicate, or
     /// stored as pending for a future poll.
     pub fn observe(&mut self, revision: u64, now: Instant) -> Option<u64> {
-        if let Some(emitted) = self.last_emitted {
-            if emitted.revision == revision {
-                if let Some(pending) = self.pending {
-                    if pending.revision == revision {
+        if let Some(emitted) = self.last_emitted
+            && emitted.revision == revision {
+                if let Some(pending) = self.pending
+                    && pending.revision == revision {
                         // The pending slot only carries the newest unemitted
                         // revision; if it equals the last emitted value
                         // there is nothing left to deliver.
                         self.pending = None;
                     }
-                }
                 return None;
             }
-        }
 
         if self.may_emit_at(now) {
             self.commit_emission(revision, now);
@@ -159,12 +157,11 @@ impl SnapshotCoalescer {
         if !self.may_emit_at(now) {
             return None;
         }
-        if let Some(emitted) = self.last_emitted {
-            if emitted.revision == pending.revision {
+        if let Some(emitted) = self.last_emitted
+            && emitted.revision == pending.revision {
                 self.pending = None;
                 return None;
             }
-        }
         self.commit_emission(pending.revision, now);
         self.pending = None;
         Some(pending.revision)

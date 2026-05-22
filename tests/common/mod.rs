@@ -73,7 +73,8 @@ pub(crate) fn default_socket_path_in(tmpdir: &Path) -> Result<PathBuf, Box<dyn E
     let _guard = env_lock().lock().expect("env lock");
     let previous = std::env::var_os("RMUX_TMPDIR");
     let _restore = EnvVarGuard::new("RMUX_TMPDIR", previous);
-    std::env::set_var("RMUX_TMPDIR", tmpdir);
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("RMUX_TMPDIR", tmpdir) };
     Ok(default_socket_path()?)
 }
 
@@ -583,8 +584,10 @@ impl EnvVarGuard {
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
         match self.previous_value.as_ref() {
-            Some(value) => std::env::set_var(self.name, value),
-            None => std::env::remove_var(self.name),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(value) => unsafe { std::env::set_var(self.name, value) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var(self.name) },
         }
     }
 }

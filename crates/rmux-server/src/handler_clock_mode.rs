@@ -64,11 +64,11 @@ impl RequestHandler {
         let cleared = {
             let state = self.state.lock().await;
             let transcript = state.transcript_handle(target)?;
-            let cleared = transcript
+            
+            transcript
                 .lock()
                 .expect("pane transcript mutex must not be poisoned")
-                .clear_clock_mode();
-            cleared
+                .clear_clock_mode()
         };
         if !cleared {
             return Ok(false);
@@ -138,12 +138,12 @@ impl RequestHandler {
                     let Ok(transcript) = state.transcript_handle(&target) else {
                         return;
                     };
-                    let active = transcript
+                    
+                    transcript
                         .lock()
                         .expect("pane transcript mutex must not be poisoned")
                         .clock_mode_generation()
-                        == Some(generation);
-                    active
+                        == Some(generation)
                 };
                 if !active {
                     return;

@@ -57,8 +57,8 @@ where
     let mut index = 0_usize;
 
     while index < bytes.len() {
-        if bytes[index] == b'#' && bytes.get(index + 1) == Some(&b'[') {
-            if let Some(end_offset) = format_skip_delimiter(&line[index + 2..], b"]") {
+        if bytes[index] == b'#' && bytes.get(index + 1) == Some(&b'[')
+            && let Some(end_offset) = format_skip_delimiter(&line[index + 2..], b"]") {
                 let clause_start = index + 2;
                 let clause_end = clause_start + end_offset;
                 expanded.push_str("#[");
@@ -71,7 +71,6 @@ where
                 index = clause_end + 1;
                 continue;
             }
-        }
 
         let Some(ch) = line[index..].chars().next() else {
             break;

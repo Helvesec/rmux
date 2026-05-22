@@ -199,11 +199,10 @@ where
                 b'q' => {
                     if fm.argv.is_empty() {
                         flags |= MOD_QUOTE_SHELL;
-                    } else if let Some(arg) = fm.argv.first() {
-                        if arg.contains('e') || arg.contains('h') {
+                    } else if let Some(arg) = fm.argv.first()
+                        && (arg.contains('e') || arg.contains('h')) {
                             flags |= MOD_QUOTE_STYLE;
                         }
-                    }
                 }
                 b'E' => flags |= MOD_EXPAND,
                 b'T' => flags |= MOD_EXPAND_TIME,
@@ -235,11 +234,10 @@ where
         }
     }
 
-    if let Some(scope) = deferred_loop_scope {
-        if let Some(value) = variables.format_loop(scope, body, false) {
+    if let Some(scope) = deferred_loop_scope
+        && let Some(value) = variables.format_loop(scope, body, false) {
             return value;
         }
-    }
     if let Some(modifier) = name_exists {
         let scope = match modifier.argv.first().map(String::as_str) {
             None | Some("") | Some("w") => None,
@@ -376,11 +374,10 @@ where
     }
 
     // Basename.
-    if flags & MOD_BASENAME != 0 {
-        if let Some(pos) = result.rfind('/') {
+    if flags & MOD_BASENAME != 0
+        && let Some(pos) = result.rfind('/') {
             result = result[pos + 1..].to_owned();
         }
-    }
 
     // Dirname.
     if flags & MOD_DIRNAME != 0 {

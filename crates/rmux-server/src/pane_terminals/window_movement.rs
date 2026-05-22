@@ -55,13 +55,12 @@ impl HandlerState {
         if source.session_name() != target.session_name() {
             let sg_src = self.sessions.session_group_name(source.session_name());
             let sg_dst = self.sessions.session_group_name(target.session_name());
-            if let (Some(sg_src), Some(sg_dst)) = (sg_src, sg_dst) {
-                if sg_src == sg_dst {
+            if let (Some(sg_src), Some(sg_dst)) = (sg_src, sg_dst)
+                && sg_src == sg_dst {
                     return Err(RmuxError::Server(
                         "can't move window, sessions are grouped".to_owned(),
                     ));
                 }
-            }
         }
 
         if source.session_name() == target.session_name() {

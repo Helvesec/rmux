@@ -2,6 +2,7 @@
 name = "rmux-client"
 version = "0.2.5"
 edition.workspace = true
+rust-version.workspace = true
 publish = true
 license.workspace = true
 repository.workspace = true

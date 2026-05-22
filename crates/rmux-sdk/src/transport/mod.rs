@@ -172,11 +172,10 @@ impl DropGuard {
     }
 
     pub(crate) fn trigger(&mut self) {
-        if let DropAction::BestEffort { client, request } = &mut self.action {
-            if let Some(request) = request.take() {
+        if let DropAction::BestEffort { client, request } = &mut self.action
+            && let Some(request) = request.take() {
                 client.try_send_best_effort(*request);
             }
-        }
         self.action = DropAction::None;
     }
 }

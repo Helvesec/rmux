@@ -109,8 +109,8 @@ pub(super) fn append_grid_string_code(
         });
     }
 
-    if let Some(hyperlinks) = hyperlinks {
-        if lastgc.link() != gc.link() {
+    if let Some(hyperlinks) = hyperlinks
+        && lastgc.link() != gc.link() {
             if let Some(link) = hyperlinks.get(gc.link()) {
                 append_hyperlink(output, &link.internal_id, &link.uri, escape_sequences);
                 *has_link = true;
@@ -119,7 +119,6 @@ pub(super) fn append_grid_string_code(
                 *has_link = false;
             }
         }
-    }
 }
 
 fn append_colour_code(

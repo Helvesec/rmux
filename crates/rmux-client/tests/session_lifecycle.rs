@@ -358,7 +358,8 @@ fn assert_absent_server_does_not_spawn_daemon(label: &str) -> Result<(), Box<dyn
 
     fs::create_dir_all(&marker_dir)?;
     write_fake_launcher(&launcher_path, &marker_path)?;
-    std::env::set_var(BINARY_OVERRIDE_ENV, &launcher_path);
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var(BINARY_OVERRIDE_ENV, &launcher_path) };
 
     let result = connect_or_absent(harness.socket_path())?;
     assert!(matches!(result, ConnectResult::Absent));
@@ -404,8 +405,10 @@ impl EnvVarGuard {
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
         match self.previous_value.as_ref() {
-            Some(value) => std::env::set_var(self.name, value),
-            None => std::env::remove_var(self.name),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(value) => unsafe { std::env::set_var(self.name, value) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var(self.name) },
         }
     }
 }

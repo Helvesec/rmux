@@ -485,18 +485,14 @@ fn resolved_status_style(
 
     if let Some(colour) =
         parse_option_colour(options.resolve(Some(session_name), OptionName::StatusFg))
-    {
-        if !colour_inherits_base(colour) {
+        && !colour_inherits_base(colour) {
             style.cell.fg = colour;
         }
-    }
     if let Some(colour) =
         parse_option_colour(options.resolve(Some(session_name), OptionName::StatusBg))
-    {
-        if !colour_inherits_base(colour) {
+        && !colour_inherits_base(colour) {
             style.cell.bg = colour;
         }
-    }
 
     style
 }

@@ -277,11 +277,9 @@ impl RequestHandler {
         let previous = active.session_name.clone();
         if let (Some(previous_session), Some(next_session)) =
             (previous.as_ref(), next_session_name.as_ref())
-        {
-            if previous_session != next_session {
+            && previous_session != next_session {
                 active.last_session = Some(previous_session.clone());
             }
-        }
         active.session_name = next_session_name.clone();
         if active
             .event_tx

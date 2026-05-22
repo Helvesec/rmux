@@ -187,12 +187,11 @@ impl WaitForStore {
     }
 
     pub(crate) fn accept_lock(&mut self, channel: &str, waiter_id: u64) -> bool {
-        if let Some(state) = self.channels.get_mut(channel) {
-            if state.granted_lock_waiter == Some(waiter_id) {
+        if let Some(state) = self.channels.get_mut(channel)
+            && state.granted_lock_waiter == Some(waiter_id) {
                 state.granted_lock_waiter = None;
                 return true;
             }
-        }
 
         false
     }

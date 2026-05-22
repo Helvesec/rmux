@@ -446,11 +446,10 @@ fn run_bounded(
             break;
         }
         if Instant::now() >= deadline {
-            if let Err(error) = child.kill() {
-                if error.kind() != io::ErrorKind::InvalidInput {
+            if let Err(error) = child.kill()
+                && error.kind() != io::ErrorKind::InvalidInput {
                     return Err(error.into());
                 }
-            }
             timed_out = true;
             break;
         }

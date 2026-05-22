@@ -89,14 +89,13 @@ impl RequestHandler {
 
         self.activate_mode_tree_for_session(&session_name, &mode)
             .await?;
-        if let Some(target) = mode.host_pane.as_ref() {
-            if self.enter_mode_tree_for_target(target, mode.kind).await? {
+        if let Some(target) = mode.host_pane.as_ref()
+            && self.enter_mode_tree_for_target(target, mode.kind).await? {
                 self.emit(LifecycleEvent::PaneModeChanged {
                     target: target.clone(),
                 })
                 .await;
             }
-        }
         self.refresh_attached_session(&session_name).await;
 
         Ok(QueueCommandAction::Normal {
@@ -310,8 +309,8 @@ impl RequestHandler {
         let Some(mode) = removed else {
             return Ok(Vec::new());
         };
-        if let Some(target) = mode.host_pane.as_ref() {
-            if self.clear_mode_tree_for_target(target).await? {
+        if let Some(target) = mode.host_pane.as_ref()
+            && self.clear_mode_tree_for_target(target).await? {
                 self.sync_automatic_window_name_for_pane_target(target)
                     .await;
                 self.emit_without_attached_refresh(LifecycleEvent::PaneModeChanged {
@@ -319,7 +318,6 @@ impl RequestHandler {
                 })
                 .await;
             }
-        }
 
         let mut refresh = vec![mode.session_name.clone()];
         if let Some(target) = mode.zoom_restore {

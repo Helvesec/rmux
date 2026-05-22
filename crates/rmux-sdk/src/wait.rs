@@ -86,14 +86,12 @@ impl Future for ArmedWait {
             Poll::Pending => {}
         }
 
-        if let Some(duration) = self.timeout_duration {
-            if let Some(timeout) = self.timeout.as_mut() {
-                if timeout.as_mut().poll(cx).is_ready() {
+        if let Some(duration) = self.timeout_duration
+            && let Some(timeout) = self.timeout.as_mut()
+                && timeout.as_mut().poll(cx).is_ready() {
                     self.cancel_guard.trigger();
                     return Poll::Ready(Err(wait_timeout_error(self.operation, duration)));
                 }
-            }
-        }
 
         Poll::Pending
     }

@@ -23,7 +23,8 @@ fn timeout_resolution_uses_per_operation_builder_env_then_default() {
     let _env = EnvGuard::remove(SDK_TIMEOUT_MS_ENV);
 
     assert_eq!(resolve_timeout(None, None), Some(V1_DEFAULT_TIMEOUT));
-    env::set_var(SDK_TIMEOUT_MS_ENV, "1500");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { env::set_var(SDK_TIMEOUT_MS_ENV, "1500") };
     assert_eq!(
         resolve_timeout(None, None),
         Some(Duration::from_millis(1500))
@@ -126,7 +127,8 @@ fn unix_endpoint_precedence_uses_explicit_then_sdk_env_then_default() {
         .expect("owned socket root")
         .join("sdk-env.sock");
     let _listener = bind_unix_socket(&env_path);
-    env::set_var(SDK_ENDPOINT_ENV, &env_path);
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { env::set_var(SDK_ENDPOINT_ENV, &env_path) };
 
     assert_eq!(
         expect_unix_endpoint(RmuxBuilder::new().resolved_endpoint()),
@@ -175,7 +177,8 @@ fn unix_rmux_tmpdir_canonicalization_feeds_default_and_sdk_allowlist() {
     let owned_root = default_path.parent().expect("owned socket root");
     let env_path = owned_root.join("sdk-env.sock");
     let _listener = bind_unix_socket(&env_path);
-    env::set_var(SDK_ENDPOINT_ENV, &env_path);
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { env::set_var(SDK_ENDPOINT_ENV, &env_path) };
 
     assert_eq!(
         expect_unix_endpoint(RmuxBuilder::new().resolved_endpoint()),
@@ -192,7 +195,8 @@ fn unix_malformed_env_endpoint_falls_back_to_platform_default() {
     let _endpoint = EnvGuard::remove(SDK_ENDPOINT_ENV);
     let default_path = expect_unix_endpoint(RmuxBuilder::new().resolved_endpoint());
 
-    env::set_var(SDK_ENDPOINT_ENV, "relative.sock");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { env::set_var(SDK_ENDPOINT_ENV, "relative.sock") };
 
     assert_eq!(
         expect_unix_endpoint(RmuxBuilder::new().resolved_endpoint()),
@@ -212,7 +216,8 @@ fn unix_env_endpoint_accepts_missing_target_inside_owned_root() {
     std::fs::create_dir_all(owned_root).expect("create owned root");
 
     let env_path = owned_root.join("not-yet-bound.sock");
-    env::set_var(SDK_ENDPOINT_ENV, &env_path);
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { env::set_var(SDK_ENDPOINT_ENV, &env_path) };
 
     assert_eq!(
         expect_unix_endpoint(RmuxBuilder::new().resolved_endpoint()),
@@ -231,7 +236,8 @@ fn unix_disallowed_env_endpoint_falls_back_to_platform_default() {
 
     let disallowed = root.path().join("not-rmux-owned").join("sdk.sock");
     let _listener = bind_unix_socket(&disallowed);
-    env::set_var(SDK_ENDPOINT_ENV, &disallowed);
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { env::set_var(SDK_ENDPOINT_ENV, &disallowed) };
 
     assert_eq!(
         expect_unix_endpoint(RmuxBuilder::new().resolved_endpoint()),
@@ -253,7 +259,8 @@ fn unix_env_endpoint_rejects_parent_escape_and_symlinked_parent() {
     let escaped_socket = root.path().join("escaped").join("sdk.sock");
     let _escaped_listener = bind_unix_socket(&escaped_socket);
     let traversal_path = owned_root.join("..").join("escaped").join("sdk.sock");
-    env::set_var(SDK_ENDPOINT_ENV, &traversal_path);
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { env::set_var(SDK_ENDPOINT_ENV, &traversal_path) };
     assert_eq!(
         expect_unix_endpoint(RmuxBuilder::new().resolved_endpoint()),
         default_path
@@ -266,7 +273,8 @@ fn unix_env_endpoint_rejects_parent_escape_and_symlinked_parent() {
     let linked_socket = symlink_target.join("sdk.sock");
     let _linked_listener = bind_unix_socket(&linked_socket);
 
-    env::set_var(SDK_ENDPOINT_ENV, symlinked_parent.join("sdk.sock"));
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { env::set_var(SDK_ENDPOINT_ENV, symlinked_parent.join("sdk.sock")) };
     assert_eq!(
         expect_unix_endpoint(RmuxBuilder::new().resolved_endpoint()),
         default_path
@@ -286,7 +294,8 @@ fn unix_env_endpoint_rejects_symlink_and_regular_file_targets() {
 
     let regular = owned_root.join("regular-file.sock");
     std::fs::write(&regular, b"not a socket").expect("write regular file");
-    env::set_var(SDK_ENDPOINT_ENV, &regular);
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { env::set_var(SDK_ENDPOINT_ENV, &regular) };
     assert_eq!(
         expect_unix_endpoint(RmuxBuilder::new().resolved_endpoint()),
         default_path
@@ -296,7 +305,8 @@ fn unix_env_endpoint_rejects_symlink_and_regular_file_targets() {
     let _listener = bind_unix_socket(&real_socket);
     let symlink = owned_root.join("link.sock");
     std::os::unix::fs::symlink(&real_socket, &symlink).expect("create socket symlink");
-    env::set_var(SDK_ENDPOINT_ENV, &symlink);
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { env::set_var(SDK_ENDPOINT_ENV, &symlink) };
 
     assert_eq!(
         expect_unix_endpoint(RmuxBuilder::new().resolved_endpoint()),
@@ -385,13 +395,15 @@ impl EnvGuard {
 
     fn set_os(key: &'static str, value: &OsStr) -> Self {
         let previous = env::var_os(key);
-        env::set_var(key, value);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { env::set_var(key, value) };
         Self { key, previous }
     }
 
     fn remove(key: &'static str) -> Self {
         let previous = env::var_os(key);
-        env::remove_var(key);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { env::remove_var(key) };
         Self { key, previous }
     }
 }
@@ -399,8 +411,10 @@ impl EnvGuard {
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         match &self.previous {
-            Some(value) => env::set_var(self.key, value),
-            None => env::remove_var(self.key),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(value) => unsafe { env::set_var(self.key, value) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { env::remove_var(self.key) },
         }
     }
 }

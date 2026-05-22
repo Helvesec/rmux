@@ -138,11 +138,10 @@ impl CopyModeState {
     }
 
     pub(super) fn sync_selection_with_cursor(&mut self) {
-        if let Some(selection) = &mut self.selection {
-            if selection.active {
+        if let Some(selection) = &mut self.selection
+            && selection.active {
                 selection.end = self.cursor;
             }
-        }
     }
 
     pub(super) fn word_selection_range(&self, position: CopyPosition) -> CopyRange {

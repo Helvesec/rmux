@@ -62,11 +62,10 @@ impl HandlerState {
                 pending
             });
         }
-        if request.use_mode_screen {
-            if let Some(captured) = transcript.capture_copy_mode(request.range, request.options) {
+        if request.use_mode_screen
+            && let Some(captured) = transcript.capture_copy_mode(request.range, request.options) {
                 return Ok(captured);
             }
-        }
         if request.alternate {
             return transcript
                 .capture_saved(request.range, request.options)

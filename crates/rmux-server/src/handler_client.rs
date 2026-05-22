@@ -92,11 +92,10 @@ impl RequestHandler {
         }
 
         let active_control = self.active_control.lock().await;
-        if let Ok(pid) = target_client.parse::<u32>() {
-            if active_control.by_pid.contains_key(&pid) {
+        if let Ok(pid) = target_client.parse::<u32>()
+            && active_control.by_pid.contains_key(&pid) {
                 return Ok(ManagedClient::Control(pid));
             }
-        }
 
         Err(RmuxError::Server(format!(
             "can't find client: {target_client}"

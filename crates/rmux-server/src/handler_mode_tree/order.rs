@@ -62,12 +62,11 @@ pub(super) fn visible_tree_order(
     expanded: &BTreeSet<String>,
 ) -> Vec<String> {
     let mut order = vec![id.to_owned()];
-    if let Some(item) = items.get(id) {
-        if !item.children.is_empty() && expanded.contains(id) {
+    if let Some(item) = items.get(id)
+        && !item.children.is_empty() && expanded.contains(id) {
             for child in &item.children {
                 order.extend(visible_tree_order(items, child, expanded));
             }
         }
-    }
     order
 }

@@ -466,11 +466,10 @@ impl RequestHandler {
 }
 
 fn terminate_overlay_job(overlay: Option<super::overlay_support::ClientOverlayState>) {
-    if let Some(super::overlay_support::ClientOverlayState::Popup(popup)) = overlay {
-        if let Some(job) = popup.job {
+    if let Some(super::overlay_support::ClientOverlayState::Popup(popup)) = overlay
+        && let Some(job) = popup.job {
             job.terminate();
         }
-    }
 }
 
 pub(super) fn attach_target_for_session(
@@ -544,8 +543,8 @@ fn attach_target_for_session_with_prompt(
                 renderer::render_pane_screen(session, &state.options, pane, &screen).as_slice(),
             );
         }
-        if pane.index() == session.active_pane_index() && copy_screen.is_some() {
-            if let (Some(summary), Some(stats)) = (
+        if pane.index() == session.active_pane_index() && copy_screen.is_some()
+            && let (Some(summary), Some(stats)) = (
                 state.pane_copy_mode_summary(session_name, pane.id()),
                 state.pane_history_stats(session_name, pane.id()),
             ) {
@@ -561,12 +560,11 @@ fn attach_target_for_session_with_prompt(
                     .as_slice(),
                 );
             }
-        }
     }
     let live_pane =
         live_pane_render_for_target(state, session, &state.options, session_name, prompt);
-    if prompt.is_none() {
-        if let Some(active_pane) = active_pane.clone() {
+    if prompt.is_none()
+        && let Some(active_pane) = active_pane.clone() {
             let active_screen = state
                 .pane_copy_mode_render_screen(session_name, active_pane.id())
                 .or_else(|| state.pane_render_screen(session_name, active_pane.id()));
@@ -577,7 +575,6 @@ fn attach_target_for_session_with_prompt(
                 );
             }
         }
-    }
 
     let active_pane_geometry = active_pane.as_ref().map_or_else(
         || rmux_core::PaneGeometry::new(0, 0, 0, 0),

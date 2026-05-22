@@ -125,17 +125,21 @@ mod tests {
         let _guard = RMUX_ENV_LOCK.lock().expect("rmux env lock");
         let original = std::env::var_os("RMUX");
 
-        std::env::remove_var("RMUX");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("RMUX") };
         assert_eq!(super::detect_context(), ClientContext::Outside);
         assert_eq!(require_nested_context(), Err(NestedContextError));
 
-        std::env::set_var("RMUX", "/tmp/rmux-1000/default,1,0");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("RMUX", "/tmp/rmux-1000/default,1,0") };
         assert_eq!(super::detect_context(), ClientContext::Nested);
         assert_eq!(require_nested_context(), Ok(()));
 
         match original {
-            Some(value) => std::env::set_var("RMUX", value),
-            None => std::env::remove_var("RMUX"),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(value) => unsafe { std::env::set_var("RMUX", value) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var("RMUX") },
         }
     }
 }

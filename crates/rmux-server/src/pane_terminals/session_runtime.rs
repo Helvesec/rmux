@@ -85,12 +85,11 @@ impl HandlerState {
             completed.push(RenameSessionStep::Terminals);
         }
 
-        if runtime_session_name == *session_name {
-            if let Err(error) = self.rename_runtime_session_state(session_name, new_name) {
+        if runtime_session_name == *session_name
+            && let Err(error) = self.rename_runtime_session_state(session_name, new_name) {
                 self.rollback_session_rename(&completed, session_name, new_name, &error)?;
                 return Err(error);
             }
-        }
 
         if let Some(pixels) = self.attached_terminal_pixels.remove(session_name) {
             self.attached_terminal_pixels

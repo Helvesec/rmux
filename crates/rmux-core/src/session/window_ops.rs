@@ -487,11 +487,10 @@ impl Session {
         removed_index: u32,
         previous_last: Option<u32>,
     ) -> u32 {
-        if let Some(last_window) = previous_last {
-            if last_window != removed_index && self.windows.contains_key(&last_window) {
+        if let Some(last_window) = previous_last
+            && last_window != removed_index && self.windows.contains_key(&last_window) {
                 return last_window;
             }
-        }
 
         if let Some((window_index, _)) = self.windows.range(..removed_index).next_back() {
             return *window_index;

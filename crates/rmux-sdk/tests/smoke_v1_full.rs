@@ -973,7 +973,8 @@ struct EnvGuard {
 impl EnvGuard {
     fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
         let previous = std::env::var_os(key);
-        std::env::set_var(key, value);
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(key, value) };
         Self { key, previous }
     }
 }
@@ -981,8 +982,10 @@ impl EnvGuard {
 impl Drop for EnvGuard {
     fn drop(&mut self) {
         match &self.previous {
-            Some(value) => std::env::set_var(self.key, value),
-            None => std::env::remove_var(self.key),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var(self.key) },
         }
     }
 }

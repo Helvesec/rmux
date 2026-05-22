@@ -100,11 +100,10 @@ impl RequestHandler {
         {
             errors.push(error);
         }
-        if queue_errors {
-            if let Some(error) = super::aggregate_rmux_errors(errors) {
+        if queue_errors
+            && let Some(error) = super::aggregate_rmux_errors(errors) {
                 self.startup_config_errors.lock().await.push(error);
             }
-        }
         self.config_loading_depth.fetch_sub(1, Ordering::Relaxed);
     }
 

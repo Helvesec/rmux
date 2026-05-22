@@ -378,13 +378,11 @@ impl Screen {
         };
 
         let current_is_padding = line.is_padding_cell(x);
-        if current_is_padding {
-            if let Some(owner_x) = line.owning_cell_x(x).filter(|owner_x| *owner_x != x) {
-                if let Some(owner) = line.cell_mut(owner_x) {
+        if current_is_padding
+            && let Some(owner_x) = line.owning_cell_x(x).filter(|owner_x| *owner_x != x)
+                && let Some(owner) = line.cell_mut(owner_x) {
                     *owner = blank.clone();
                 }
-            }
-        }
 
         let clear_following_padding = width != 1
             || line

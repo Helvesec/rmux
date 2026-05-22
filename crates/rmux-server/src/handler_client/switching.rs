@@ -253,12 +253,11 @@ impl RequestHandler {
         session_name: rmux_proto::SessionName,
         skip_environment_update: bool,
     ) -> Response {
-        if !skip_environment_update {
-            if let Some(client_environment) = client_environment_snapshot(requester_pid) {
+        if !skip_environment_update
+            && let Some(client_environment) = client_environment_snapshot(requester_pid) {
                 let mut state = self.state.lock().await;
                 update_environment_from_client(&mut state, &session_name, &client_environment);
             }
-        }
         let attached_count = self
             .attached_count_after_switch(&session_name, client)
             .await;

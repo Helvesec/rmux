@@ -184,14 +184,13 @@ impl RequestHandler {
                 let _ = self.queue_shutdown_if_server_empty().await;
             } else {
                 self.sync_session_silence_timers(&session_name).await;
-                if let Response::KillPane(success) = &response {
-                    if !success.window_destroyed {
+                if let Response::KillPane(success) = &response
+                    && !success.window_destroyed {
                         self.emit(LifecycleEvent::WindowLayoutChanged {
                             target: WindowTarget::with_window(session_name.clone(), layout_window),
                         })
                         .await;
                     }
-                }
                 self.dismiss_mode_tree_for_session(&session_name).await;
                 self.refresh_attached_session(&session_name).await;
             }
@@ -212,8 +211,8 @@ impl RequestHandler {
                 Ok(target) => target,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
-            if let Some(keep_alive) = request.keep_alive_on_exit {
-                if let Err(error) = state.options.set(
+            if let Some(keep_alive) = request.keep_alive_on_exit
+                && let Err(error) = state.options.set(
                     ScopeSelector::Pane(target.clone()),
                     OptionName::RemainOnExit,
                     if keep_alive { "on" } else { "off" }.to_owned(),
@@ -221,7 +220,6 @@ impl RequestHandler {
                 ) {
                     return Response::Error(ErrorResponse { error });
                 }
-            }
             let request = rmux_proto::RespawnPaneRequest {
                 target,
                 kill: request.kill,

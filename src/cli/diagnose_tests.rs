@@ -20,8 +20,10 @@ impl EnvVarGuard {
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
         match self.value.as_ref() {
-            Some(value) => std::env::set_var(self.name, value),
-            None => std::env::remove_var(self.name),
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            Some(value) => unsafe { std::env::set_var(self.name, value) },
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var(self.name) },
         }
     }
 }
@@ -63,7 +65,8 @@ fn path_redaction_replaces_home_prefix() {
     let _guard = ENV_LOCK.lock().expect("env lock");
     let _home = EnvVarGuard::capture("HOME");
     let home = std::env::temp_dir().join("rmux-diagnose-home");
-    std::env::set_var("HOME", &home);
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("HOME", &home) };
 
     assert_eq!(redact_path(&home.join("rmux.conf")), "~/rmux.conf");
 }

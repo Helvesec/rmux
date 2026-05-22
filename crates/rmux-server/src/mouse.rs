@@ -541,11 +541,10 @@ fn parse_scrollbar_style(value: Option<&str>) -> (u16, u16) {
             if let Ok(parsed) = parsed.parse::<u16>() {
                 width = parsed;
             }
-        } else if let Some(parsed) = token.strip_prefix("pad=") {
-            if let Ok(parsed) = parsed.parse::<u16>() {
+        } else if let Some(parsed) = token.strip_prefix("pad=")
+            && let Ok(parsed) = parsed.parse::<u16>() {
                 pad = parsed;
             }
-        }
     }
     (width, pad)
 }

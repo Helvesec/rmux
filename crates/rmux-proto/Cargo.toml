@@ -2,6 +2,7 @@
 name = "rmux-proto"
 version = "0.2.5"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "RMUX detached IPC protocol DTOs, framing, and wire-safe error types."

@@ -85,21 +85,18 @@ impl RequestHandler {
             let should_add = request.add
                 || ((request.read_only || request.write)
                     && !server_access.contains_uid(resolved.uid));
-            if should_add {
-                if let Err(error) = server_access.set_mode(resolved.uid, AccessMode::ReadWrite) {
+            if should_add
+                && let Err(error) = server_access.set_mode(resolved.uid, AccessMode::ReadWrite) {
                     return Response::Error(ErrorResponse { error });
                 }
-            }
-            if request.write {
-                if let Err(error) = server_access.set_mode(resolved.uid, AccessMode::ReadWrite) {
+            if request.write
+                && let Err(error) = server_access.set_mode(resolved.uid, AccessMode::ReadWrite) {
                     return Response::Error(ErrorResponse { error });
                 }
-            }
-            if request.read_only {
-                if let Err(error) = server_access.set_mode(resolved.uid, AccessMode::ReadOnly) {
+            if request.read_only
+                && let Err(error) = server_access.set_mode(resolved.uid, AccessMode::ReadOnly) {
                     return Response::Error(ErrorResponse { error });
                 }
-            }
         }
 
         if request.write {

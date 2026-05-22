@@ -412,8 +412,8 @@ impl DetachDetector {
     /// internally.
     #[must_use]
     pub fn feed(&mut self, event: KeyEvent, now: Instant) -> DetachOutcome {
-        if let DetectorState::PrefixHeld { since } = self.state {
-            if now.saturating_duration_since(since) >= self.timeout {
+        if let DetectorState::PrefixHeld { since } = self.state
+            && now.saturating_duration_since(since) >= self.timeout {
                 self.state = DetectorState::Idle;
                 let mut forwarded = vec![self.chord.prefix];
                 match self.process_idle(event, now) {
@@ -428,7 +428,6 @@ impl DetachDetector {
                 }
                 return DetachOutcome::Forward(forwarded);
             }
-        }
 
         match self.state {
             DetectorState::Idle => self.process_idle(event, now),

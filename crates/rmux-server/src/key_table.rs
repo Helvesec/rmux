@@ -182,14 +182,13 @@ fn decode_escape_key(input: &[u8], backspace: Option<u8>) -> AttachedKeyDecode {
     }
 
     if input.len() < 3 {
-        if let Some(&byte) = input.get(1) {
-            if byte.is_ascii() && !byte.is_ascii_control() {
+        if let Some(&byte) = input.get(1)
+            && byte.is_ascii() && !byte.is_ascii_control() {
                 return AttachedKeyDecode::Matched {
                     size: 2,
                     key: u64::from(byte) | rmux_core::KEYC_META | rmux_core::KEYC_IMPLIED_META,
                 };
             }
-        }
         return AttachedKeyDecode::Partial;
     }
     let key = match &input[..3] {
@@ -204,14 +203,13 @@ fn decode_escape_key(input: &[u8], backspace: Option<u8>) -> AttachedKeyDecode {
         return AttachedKeyDecode::Matched { size: 3, key };
     }
 
-    if let Some(&byte) = input.get(1) {
-        if byte.is_ascii() && !byte.is_ascii_control() {
+    if let Some(&byte) = input.get(1)
+        && byte.is_ascii() && !byte.is_ascii_control() {
             return AttachedKeyDecode::Matched {
                 size: 2,
                 key: u64::from(byte) | rmux_core::KEYC_META | rmux_core::KEYC_IMPLIED_META,
             };
         }
-    }
 
     AttachedKeyDecode::Invalid
 }

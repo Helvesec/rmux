@@ -172,21 +172,18 @@ impl OuterTerminal {
         if let Some(sequence) = self.mouse_sequence().as_deref() {
             bytes.extend_from_slice(sequence.as_bytes());
         }
-        if self.focus_events_enabled {
-            if let Some(sequence) = &self.enable_focus {
+        if self.focus_events_enabled
+            && let Some(sequence) = &self.enable_focus {
                 bytes.extend_from_slice(sequence.as_bytes());
             }
-        }
-        if self.extended_keys_enabled {
-            if let Some(sequence) = &self.enable_extkeys {
+        if self.extended_keys_enabled
+            && let Some(sequence) = &self.enable_extkeys {
                 bytes.extend_from_slice(sequence.as_bytes());
             }
-        }
-        if self.supports_margins {
-            if let Some(sequence) = &self.enable_margins {
+        if self.supports_margins
+            && let Some(sequence) = &self.enable_margins {
                 bytes.extend_from_slice(sequence.as_bytes());
             }
-        }
         bytes
     }
 
@@ -198,21 +195,18 @@ impl OuterTerminal {
         if let Some(sequence) = self.render_cursor_style_reset().as_deref() {
             bytes.extend_from_slice(sequence.as_bytes());
         }
-        if self.focus_events_enabled {
-            if let Some(sequence) = &self.disable_focus {
+        if self.focus_events_enabled
+            && let Some(sequence) = &self.disable_focus {
                 bytes.extend_from_slice(sequence.as_bytes());
             }
-        }
-        if self.extended_keys_enabled {
-            if let Some(sequence) = &self.disable_extkeys {
+        if self.extended_keys_enabled
+            && let Some(sequence) = &self.disable_extkeys {
                 bytes.extend_from_slice(sequence.as_bytes());
             }
-        }
-        if self.supports_margins {
-            if let Some(sequence) = &self.disable_margins {
+        if self.supports_margins
+            && let Some(sequence) = &self.disable_margins {
                 bytes.extend_from_slice(sequence.as_bytes());
             }
-        }
         if let Some(sequence) = self.disable_mouse_sequence().as_deref() {
             bytes.extend_from_slice(sequence.as_bytes());
         }

@@ -18,14 +18,13 @@ pub(crate) fn dispatch_sgr(parser: &mut InputParser) {
     let mut i: u32 = 0;
     while i < parser.param_list.len() {
         // Check for colon-separated ISO form (InputParam::Str).
-        if let Some(param) = parser.param_list.param_at(i) {
-            if let ParamType::Str(s) = &param.ptype {
+        if let Some(param) = parser.param_list.param_at(i)
+            && let ParamType::Str(s) = &param.ptype {
                 let s = s.clone();
                 dispatch_sgr_colon(&mut parser.cell.cell, &s);
                 i += 1;
                 continue;
             }
-        }
 
         let n = parser.param_list.get(i, 0, 0);
         if n == -1 {

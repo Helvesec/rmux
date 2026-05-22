@@ -11,11 +11,10 @@ pub(super) fn selected_items<'a>(
         .values()
         .filter(|item| mode.tagged.contains(&item.id))
         .collect::<Vec<_>>();
-    if tagged.is_empty() {
-        if let Some(selected) = mode.selected_id.as_ref().and_then(|id| build.items.get(id)) {
+    if tagged.is_empty()
+        && let Some(selected) = mode.selected_id.as_ref().and_then(|id| build.items.get(id)) {
             tagged.push(selected);
         }
-    }
     tagged
 }
 
@@ -337,11 +336,9 @@ pub(super) fn clamp_scroll(mode: &mut ModeTreeClientState, build: &ModeTreeBuild
         .selected_id
         .as_ref()
         .and_then(|id| build.visible.iter().position(|visible| visible == id))
-    {
-        if selected < mode.scroll {
+        && selected < mode.scroll {
             mode.scroll = selected;
         }
-    }
 }
 
 pub(super) fn normalize_selection(mode: &mut ModeTreeClientState, build: &ModeTreeBuild) {

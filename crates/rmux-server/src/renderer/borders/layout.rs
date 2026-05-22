@@ -369,8 +369,8 @@ fn normalize_vertical_segments(
     let mut merged: Vec<VerticalBoundarySegment> = Vec::with_capacity(segments.len());
 
     for segment in segments {
-        if let Some(previous) = merged.last_mut() {
-            if previous.x == segment.x
+        if let Some(previous) = merged.last_mut()
+            && previous.x == segment.x
                 && previous.first_index == segment.first_index
                 && previous.second_index == segment.second_index
                 && segment.start <= previous.end.saturating_add(2)
@@ -378,7 +378,6 @@ fn normalize_vertical_segments(
                 previous.end = previous.end.max(segment.end);
                 continue;
             }
-        }
         merged.push(segment);
     }
 
@@ -392,8 +391,8 @@ fn normalize_horizontal_segments(
     let mut merged: Vec<HorizontalBoundarySegment> = Vec::with_capacity(segments.len());
 
     for segment in segments {
-        if let Some(previous) = merged.last_mut() {
-            if previous.y == segment.y
+        if let Some(previous) = merged.last_mut()
+            && previous.y == segment.y
                 && previous.first_index == segment.first_index
                 && previous.second_index == segment.second_index
                 && segment.start <= previous.end.saturating_add(2)
@@ -401,7 +400,6 @@ fn normalize_horizontal_segments(
                 previous.end = previous.end.max(segment.end);
                 continue;
             }
-        }
         merged.push(segment);
     }
 
@@ -427,8 +425,8 @@ fn border_cell_owner_and_activity(
         return (None, false);
     }
 
-    if indicators_colour && pane_geometries.len() == 2 {
-        if let Some((owner, active)) = two_pane_border_owner_and_activity(
+    if indicators_colour && pane_geometries.len() == 2
+        && let Some((owner, active)) = two_pane_border_owner_and_activity(
             x,
             y,
             adjacent_panes,
@@ -437,7 +435,6 @@ fn border_cell_owner_and_activity(
         ) {
             return (Some(owner), active);
         }
-    }
 
     if adjacent_panes.contains(&active_pane_index) {
         return (Some(active_pane_index), true);

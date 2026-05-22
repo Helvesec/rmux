@@ -297,14 +297,13 @@ fn event_window_id(state: &HandlerState, event: &LifecycleEvent) -> Option<u32> 
 }
 
 fn event_window_id_and_name(state: &HandlerState, event: &LifecycleEvent) -> Option<(u32, String)> {
-    if let Some(target) = event.window_target() {
-        if let Some(window) = resolve_window(state, &target) {
+    if let Some(target) = event.window_target()
+        && let Some(window) = resolve_window(state, &target) {
             return Some((
                 window.id().as_u32(),
                 window.name().unwrap_or_default().to_owned(),
             ));
         }
-    }
 
     Some((event.window_id()?, event.window_name_snapshot()?.to_owned()))
 }

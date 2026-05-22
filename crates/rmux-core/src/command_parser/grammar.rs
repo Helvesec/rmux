@@ -60,11 +60,10 @@ impl<'a> GrammarParser<'a> {
                     if let Some(assignment) = assignment {
                         commands.push_assignment(assignment);
                     }
-                    if active {
-                        if let Some(command) = command {
+                    if active
+                        && let Some(command) = command {
                             commands.push_command(command);
                         }
-                    }
                 }
                 LexToken::If => {
                     commands.append(self.parse_condition(active)?);

@@ -466,11 +466,10 @@ impl Session {
     }
 
     fn next_active_window_after_removal(&self, removed_index: u32) -> u32 {
-        if let Some(last_window) = self.last_window {
-            if last_window != removed_index && self.windows.contains_key(&last_window) {
+        if let Some(last_window) = self.last_window
+            && last_window != removed_index && self.windows.contains_key(&last_window) {
                 return last_window;
             }
-        }
 
         if let Some((window_index, _)) = self.windows.range(..removed_index).next_back() {
             return *window_index;
@@ -530,11 +529,10 @@ fn synchronized_active_window(
         return previous_active;
     }
 
-    if let Some(last_window) = previous_last {
-        if last_window != previous_active && windows.contains_key(&last_window) {
+    if let Some(last_window) = previous_last
+        && last_window != previous_active && windows.contains_key(&last_window) {
             return last_window;
         }
-    }
 
     if let Some((window_index, _)) = windows.range(..previous_active).next_back() {
         return *window_index;

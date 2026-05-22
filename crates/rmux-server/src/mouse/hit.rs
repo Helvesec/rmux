@@ -49,14 +49,13 @@ pub(super) fn resolve_mouse_hit(
     scrolling: bool,
     current: Option<&AttachedMouseEvent>,
 ) -> MouseHit {
-    if let Some(status_at) = layout.status_at {
-        if y >= status_at && y < status_at.saturating_add(layout.status_lines) {
+    if let Some(status_at) = layout.status_at
+        && y >= status_at && y < status_at.saturating_add(layout.status_lines) {
             if let Some(status) = &layout.status {
                 return status_hit(layout.session_id, status, x);
             }
             return MouseHit::status_default(layout.session_id);
         }
-    }
 
     if scrolling {
         return MouseHit {

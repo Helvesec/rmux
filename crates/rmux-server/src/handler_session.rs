@@ -69,8 +69,8 @@ impl RequestHandler {
             });
         }
 
-        if request.attach_if_exists && request.group_target.is_none() {
-            if let Some(existing) = request.session_name.as_ref() {
+        if request.attach_if_exists && request.group_target.is_none()
+            && let Some(existing) = request.session_name.as_ref() {
                 let session_exists = {
                     let state = self.state.lock().await;
                     state.sessions.contains_session(existing)
@@ -102,7 +102,6 @@ impl RequestHandler {
                     });
                 }
             }
-        }
 
         let size = request.size.unwrap_or(DEFAULT_SESSION_SIZE);
         let detached = request.detached;

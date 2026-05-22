@@ -351,11 +351,10 @@ pub(super) fn parse_new_window_target_argument(
     sessions: &SessionStore,
     find_context: &TargetFindContext,
 ) -> Result<(SessionName, Option<u32>), RmuxError> {
-    if let Some((session_name, window_part)) = value.split_once(':') {
-        if window_part.is_empty() {
+    if let Some((session_name, window_part)) = value.split_once(':')
+        && window_part.is_empty() {
             return Ok((parse_session_name(session_name.to_owned())?, None));
         }
-    }
 
     if new_window_target_is_session(&value) {
         let resolved = resolve_target_argument_with_spec(

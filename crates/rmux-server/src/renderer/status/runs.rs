@@ -74,12 +74,11 @@ pub(in crate::renderer::status) fn push_status_run(
     if text.is_empty() {
         return;
     }
-    if let Some(last) = runs.last_mut() {
-        if last.style == style {
+    if let Some(last) = runs.last_mut()
+        && last.style == style {
             last.text.push_str(&text);
             return;
         }
-    }
     runs.push(StatusRun { text, style });
 }
 

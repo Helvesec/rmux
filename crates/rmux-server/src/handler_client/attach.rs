@@ -80,14 +80,13 @@ impl RequestHandler {
             Ok(flags) => flags,
             Err(error) => return HandleOutcome::response(Response::Error(ErrorResponse { error })),
         };
-        if let Some(template) = request.working_directory.as_deref() {
-            if let Err(error) = self
+        if let Some(template) = request.working_directory.as_deref()
+            && let Err(error) = self
                 .update_session_cwd_from_template(&session_name, template)
                 .await
             {
                 return HandleOutcome::response(Response::Error(ErrorResponse { error }));
             }
-        }
         let client_environment = client_environment_snapshot(requester_pid);
         let client_terminal = effective_client_terminal_context(
             client_environment.as_ref(),
@@ -95,12 +94,11 @@ impl RequestHandler {
         );
         let terminal_context = OuterTerminalContext::from_environment(client_environment.as_ref())
             .with_client_terminal(&client_terminal);
-        if let Some(client_environment) = client_environment.as_ref() {
-            if !request.skip_environment_update {
+        if let Some(client_environment) = client_environment.as_ref()
+            && !request.skip_environment_update {
                 let mut state = self.state.lock().await;
                 update_environment_from_client(&mut state, &session_name, client_environment);
             }
-        }
         if request.detach_other_clients || request.kill_other_clients {
             self.detach_other_attach_clients_for_session(
                 &session_name,

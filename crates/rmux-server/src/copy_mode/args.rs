@@ -29,13 +29,12 @@ pub(super) fn parse_flagged_args(
             positional_mode = true;
             continue;
         }
-        if let Some(flag_cluster) = arg.strip_prefix('-') {
-            if !flag_cluster.is_empty() && flag_cluster.chars().all(|ch| allowed_flags.contains(ch))
+        if let Some(flag_cluster) = arg.strip_prefix('-')
+            && !flag_cluster.is_empty() && flag_cluster.chars().all(|ch| allowed_flags.contains(ch))
             {
                 flags.extend(flag_cluster.chars());
                 continue;
             }
-        }
         positionals.push(arg.clone());
     }
     Ok(ParsedFlaggedArgs { flags, positionals })

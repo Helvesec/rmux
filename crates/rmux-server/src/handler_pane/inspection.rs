@@ -192,8 +192,8 @@ impl RequestHandler {
                 error: session_not_found(&request.target),
             });
         };
-        if let Some(window_index) = request.target_window_index {
-            if session.window_at(window_index).is_none() {
+        if let Some(window_index) = request.target_window_index
+            && session.window_at(window_index).is_none() {
                 return Response::Error(ErrorResponse {
                     error: RmuxError::invalid_target(
                         format!("{}:{window_index}", request.target),
@@ -201,7 +201,6 @@ impl RequestHandler {
                     ),
                 });
             }
-        }
 
         Response::ListPanes(ListPanesResponse {
             output: command_output_from_lines(&collect_list_pane_lines(

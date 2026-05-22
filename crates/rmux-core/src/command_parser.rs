@@ -416,8 +416,8 @@ impl CommandParser {
         };
 
         for mut command in commands.commands {
-            if !no_alias {
-                if let Some(alias) = self.find_command_alias(&command.name) {
+            if !no_alias
+                && let Some(alias) = self.find_command_alias(&command.name) {
                     let mut alias_parser = self.clone();
                     alias_parser.environment.extend(
                         assignments
@@ -435,7 +435,6 @@ impl CommandParser {
                     output.append(replacement);
                     continue;
                 }
-            }
 
             for argument in &mut command.arguments {
                 if let CommandArgument::Commands(nested) = argument {

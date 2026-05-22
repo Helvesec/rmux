@@ -156,8 +156,10 @@ mod utf8_env_tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             match self.value.as_ref() {
-                Some(value) => std::env::set_var(self.name, value),
-                None => std::env::remove_var(self.name),
+                // TODO: Audit that the environment access only happens in single-threaded code.
+                Some(value) => unsafe { std::env::set_var(self.name, value) },
+                // TODO: Audit that the environment access only happens in single-threaded code.
+                None => unsafe { std::env::remove_var(self.name) },
             }
         }
     }
@@ -179,10 +181,14 @@ mod utf8_env_tests {
         let _lc_ctype = EnvVarGuard::capture("LC_CTYPE");
         let _lang = EnvVarGuard::capture("LANG");
 
-        std::env::remove_var("RMUX");
-        std::env::set_var("LC_ALL", "");
-        std::env::set_var("LC_CTYPE", "");
-        std::env::set_var("LANG", "en_US.UTF-8");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("RMUX") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("LC_ALL", "") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("LC_CTYPE", "") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("LANG", "en_US.UTF-8") };
 
         assert!(infer_client_utf8_from_env());
     }
@@ -195,10 +201,14 @@ mod utf8_env_tests {
         let _lc_ctype = EnvVarGuard::capture("LC_CTYPE");
         let _lang = EnvVarGuard::capture("LANG");
 
-        std::env::set_var("RMUX", "/tmp/rmux-1000/default,123,0");
-        std::env::set_var("LC_ALL", "C");
-        std::env::remove_var("LC_CTYPE");
-        std::env::remove_var("LANG");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("RMUX", "/tmp/rmux-1000/default,123,0") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("LC_ALL", "C") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("LC_CTYPE") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("LANG") };
 
         assert!(infer_client_utf8_from_env());
     }
@@ -211,10 +221,14 @@ mod utf8_env_tests {
         let _lc_ctype = EnvVarGuard::capture("LC_CTYPE");
         let _lang = EnvVarGuard::capture("LANG");
 
-        std::env::remove_var("RMUX");
-        std::env::set_var("LC_ALL", "C");
-        std::env::remove_var("LC_CTYPE");
-        std::env::remove_var("LANG");
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("RMUX") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("LC_ALL", "C") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("LC_CTYPE") };
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("LANG") };
 
         assert!(!infer_client_utf8_from_env());
     }

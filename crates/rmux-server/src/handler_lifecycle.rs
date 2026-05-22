@@ -383,13 +383,12 @@ pub(in crate::handler) fn after_hook_format_values(
 
         if flags.len() == 1 {
             let flag = flags.chars().next().expect("single-char flag");
-            if let Some(value) = scalar_arguments.get(index + 1).copied() {
-                if !value.starts_with('-') {
+            if let Some(value) = scalar_arguments.get(index + 1).copied()
+                && !value.starts_with('-') {
                     flag_values.entry(flag).or_default().push(value.to_owned());
                     index += 2;
                     continue;
                 }
-            }
         }
 
         for flag in flags.chars() {
@@ -433,8 +432,8 @@ fn lifecycle_hook_formats(
     }
     if let Some(window_target) = event.window_target() {
         let mut resolved_window = false;
-        if let Some(session) = state.sessions.session(window_target.session_name()) {
-            if let Some(window) = session.window_at(window_target.window_index()) {
+        if let Some(session) = state.sessions.session(window_target.session_name())
+            && let Some(window) = session.window_at(window_target.window_index()) {
                 formats.push(("hook_window".to_owned(), window.id().to_string()));
                 formats.push((
                     "hook_window_name".to_owned(),
@@ -442,31 +441,26 @@ fn lifecycle_hook_formats(
                 ));
                 resolved_window = true;
             }
-        }
-        if !resolved_window {
-            if let Some(window_id) = event.window_id() {
+        if !resolved_window
+            && let Some(window_id) = event.window_id() {
                 formats.push(("hook_window".to_owned(), format!("@{window_id}")));
                 if let Some(window_name) = event.window_name_snapshot() {
                     formats.push(("hook_window_name".to_owned(), window_name.to_owned()));
                 }
             }
-        }
     }
     if let Some(pane_target) = event.pane_target() {
         let mut resolved_pane = false;
-        if let Some(session) = state.sessions.session(pane_target.session_name()) {
-            if let Some(window) = session.window_at(pane_target.window_index()) {
-                if let Some(pane) = window.pane(pane_target.pane_index()) {
+        if let Some(session) = state.sessions.session(pane_target.session_name())
+            && let Some(window) = session.window_at(pane_target.window_index())
+                && let Some(pane) = window.pane(pane_target.pane_index()) {
                     formats.push(("hook_pane".to_owned(), format!("%{}", pane.id().as_u32())));
                     resolved_pane = true;
                 }
-            }
-        }
-        if !resolved_pane {
-            if let Some(pane_id) = event.pane_id() {
+        if !resolved_pane
+            && let Some(pane_id) = event.pane_id() {
                 formats.push(("hook_pane".to_owned(), format!("%{pane_id}")));
             }
-        }
     }
     formats
 }

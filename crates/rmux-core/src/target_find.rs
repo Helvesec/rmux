@@ -284,8 +284,8 @@ impl SessionStore {
             }
         }
 
-        if !value.starts_with(['+', '-']) {
-            if let Ok(window_index) = value.parse::<u32>() {
+        if !value.starts_with(['+', '-'])
+            && let Ok(window_index) = value.parse::<u32>() {
                 if session.window_at(window_index).is_some() {
                     return self.parts_for_window(session_name, window_index);
                 }
@@ -293,7 +293,6 @@ impl SessionStore {
                     return Ok(ResolvedParts::window(session_name.clone(), window_index));
                 }
             }
-        }
 
         if let Some(window_index) = unique_window_name_match(session, value, MatchMode::Exact)? {
             return self.parts_for_window(session_name, window_index);
@@ -323,19 +322,16 @@ impl SessionStore {
         context: &TargetFindContext,
     ) -> Result<ResolvedParts, RmuxError> {
         let window_id = crate::WindowId::new(parse_required_prefixed_id(value, '@')?);
-        if let Ok(current) = self.current_parts(context) {
-            if let Some(window) = self
+        if let Ok(current) = self.current_parts(context)
+            && let Some(window) = self
                 .session(&current.session_name)
                 .and_then(|session| session.window_at(current.window_index))
-            {
-                if window.id() == window_id {
+                && window.id() == window_id {
                     return Ok(ResolvedParts::window(
                         current.session_name,
                         current.window_index,
                     ));
                 }
-            }
-        }
 
         let mut matches = self
             .iter()
@@ -504,15 +500,14 @@ impl SessionStore {
             ));
         }
 
-        if let Ok(pane_index) = value.parse::<u32>() {
-            if window.pane(pane_index).is_some() {
+        if let Ok(pane_index) = value.parse::<u32>()
+            && window.pane(pane_index).is_some() {
                 return Ok(ResolvedParts::pane(
                     session_name.clone(),
                     window_index,
                     pane_index,
                 ));
             }
-        }
 
         if let Some(pane_index) = pane_description(window, value) {
             return Ok(ResolvedParts::pane(
@@ -535,17 +530,14 @@ impl SessionStore {
         context: &TargetFindContext,
     ) -> Result<ResolvedParts, RmuxError> {
         let pane_id = crate::PaneId::new(parse_required_prefixed_id(value, '%')?);
-        if let Ok(current) = self.current_parts(context) {
-            if let Some(pane) = self
+        if let Ok(current) = self.current_parts(context)
+            && let Some(pane) = self
                 .session(&current.session_name)
                 .and_then(|session| session.window_at(current.window_index))
                 .and_then(|window| window.pane(current.pane_index))
-            {
-                if pane.id() == pane_id {
+                && pane.id() == pane_id {
                     return Ok(current);
                 }
-            }
-        }
 
         let mut matches = self
             .iter()

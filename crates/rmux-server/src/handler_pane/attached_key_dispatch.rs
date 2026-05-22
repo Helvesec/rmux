@@ -273,8 +273,8 @@ impl RequestHandler {
             self.schedule_attached_repeat_timeout(attach_pid, repeat_deadline);
         }
 
-        if from_prefix_table {
-            if let Some(action) = step03_prefix_binding(lookup_key) {
+        if from_prefix_table
+            && let Some(action) = step03_prefix_binding(lookup_key) {
                 if let Err(error) = self.dispatch_step03_prefix_action(action, target).await {
                     if attached_live_input {
                         self.report_attached_command_error(&session_name, attach_pid, &error)
@@ -285,7 +285,6 @@ impl RequestHandler {
                 }
                 return Ok(true);
             }
-        }
 
         if let Some(command) = direct_copy_mode_command(binding.commands()) {
             Box::pin(self.execute_copy_mode_command(

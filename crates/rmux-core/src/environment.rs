@@ -143,15 +143,14 @@ impl EnvironmentStore {
     /// Resolves a single variable using session-local then global lookup.
     #[must_use]
     pub fn resolve(&self, session_name: Option<&SessionName>, name: &str) -> Option<&str> {
-        if let Some(session_name) = session_name {
-            if let Some(entry) = self
+        if let Some(session_name) = session_name
+            && let Some(entry) = self
                 .sessions
                 .get(session_name)
                 .and_then(|values| values.get(name))
             {
                 return entry.value();
             }
-        }
 
         self.global.get(name).and_then(EnvironmentEntry::value)
     }
@@ -181,13 +180,12 @@ impl EnvironmentStore {
             apply_entry_to_child_environment(values, name, entry);
         }
 
-        if let Some(session_name) = session_name {
-            if let Some(session_values) = self.sessions.get(session_name) {
+        if let Some(session_name) = session_name
+            && let Some(session_values) = self.sessions.get(session_name) {
                 for (name, entry) in session_values {
                     apply_entry_to_child_environment(values, name, entry);
                 }
             }
-        }
     }
 
     /// Merges client variables into a session environment using tmux `update-environment`.

@@ -139,13 +139,12 @@ impl HandlerState {
             0
         };
 
-        if remaining <= 1 {
-            if let Some(group) = self.window_link_groups.remove(&group_id) {
+        if remaining <= 1
+            && let Some(group) = self.window_link_groups.remove(&group_id) {
                 for group_slot in group.slots {
                     let _ = self.window_link_slots.remove(&group_slot);
                 }
             }
-        }
 
         remaining.max(1)
     }

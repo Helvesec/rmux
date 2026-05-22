@@ -372,11 +372,10 @@ impl OptionStore {
         query: &OptionQuery,
     ) -> Option<&'a OptionEntry> {
         for node in self.chain_for_context(context, query) {
-            if let Some(entry) = node.entry(query.canonical_name()) {
-                if query.index().is_none() || entry.value(query.index()).is_some() {
+            if let Some(entry) = node.entry(query.canonical_name())
+                && (query.index().is_none() || entry.value(query.index()).is_some()) {
                     return Some(entry);
                 }
-            }
         }
         None
     }
@@ -490,11 +489,10 @@ impl OptionStore {
             }
             ResolveContext::Session(session_name) => {
                 let mut chain = Vec::new();
-                if scope_allows_session(query) {
-                    if let Some(node) = self.sessions.get(*session_name) {
+                if scope_allows_session(query)
+                    && let Some(node) = self.sessions.get(*session_name) {
                         chain.push(node);
                     }
-                }
                 push_known_global_roots(&mut chain, self, query);
                 chain
             }
@@ -506,11 +504,10 @@ impl OptionStore {
                         chain.push(node);
                     }
                 }
-                if scope_allows_session(query) {
-                    if let Some(node) = self.sessions.get(*session_name) {
+                if scope_allows_session(query)
+                    && let Some(node) = self.sessions.get(*session_name) {
                         chain.push(node);
                     }
-                }
                 push_known_global_roots(&mut chain, self, query);
                 chain
             }
@@ -533,11 +530,10 @@ impl OptionStore {
                         chain.push(node);
                     }
                 }
-                if scope_allows_session(query) {
-                    if let Some(node) = self.sessions.get(*session_name) {
+                if scope_allows_session(query)
+                    && let Some(node) = self.sessions.get(*session_name) {
                         chain.push(node);
                     }
-                }
                 push_known_global_roots(&mut chain, self, query);
                 chain
             }
@@ -562,11 +558,10 @@ impl OptionStore {
         I: IntoIterator<Item = Option<&'a OptionNode>>,
     {
         for node in nodes.into_iter().flatten() {
-            if let Some(entry) = node.entry(query.canonical_name()) {
-                if let Some(value) = entry.value(query.index()) {
+            if let Some(entry) = node.entry(query.canonical_name())
+                && let Some(value) = entry.value(query.index()) {
                     return Some(value.to_owned());
                 }
-            }
         }
         None
     }

@@ -496,8 +496,8 @@ impl RequestHandler {
         request: Request,
         outcome: crate::pane_io::HandleOutcome,
     ) -> Result<QueueCommandAction, RmuxError> {
-        if let Some(_attach) = outcome.attach {
-            if matches!(
+        if let Some(_attach) = outcome.attach
+            && matches!(
                 request,
                 Request::AttachSession(_) | Request::AttachSessionExt(_)
             ) {
@@ -518,7 +518,6 @@ impl RequestHandler {
                 self.emit_client_attached(requester_pid, response.session_name.clone())
                     .await;
             }
-        }
 
         queue_action_from_response(outcome.response)
     }

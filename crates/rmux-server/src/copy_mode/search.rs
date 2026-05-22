@@ -122,15 +122,14 @@ impl CopyModeState {
         self.rebuild_search_results(plain_text);
         self.search_highlighted = true;
         self.search_current = self.find_search_match(direction);
-        if let Some(index) = self.search_current {
-            if let Some(result) = self.search_results.get(index) {
+        if let Some(index) = self.search_current
+            && let Some(result) = self.search_results.get(index) {
                 self.cursor = match self.mode_keys {
                     ModeKeys::Vi => result.start,
                     ModeKeys::Emacs => result.end,
                 };
                 self.ensure_cursor_visible();
             }
-        }
         Ok(())
     }
 
@@ -223,15 +222,14 @@ impl CopyModeState {
             }
         };
         self.search_current = next;
-        if let Some(index) = next {
-            if let Some(result) = self.search_results.get(index) {
+        if let Some(index) = next
+            && let Some(result) = self.search_results.get(index) {
                 self.cursor = match self.mode_keys {
                     ModeKeys::Vi => result.start,
                     ModeKeys::Emacs => result.end,
                 };
                 self.ensure_cursor_visible();
             }
-        }
         self.search_highlighted = true;
     }
 

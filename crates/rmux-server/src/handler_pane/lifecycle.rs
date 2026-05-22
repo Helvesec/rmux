@@ -391,8 +391,8 @@ impl RequestHandler {
         }
 
         let mut state = self.state.lock().await;
-        if retry_strip {
-            if let Err(error) =
+        if retry_strip
+            && let Err(error) =
                 state.strip_attached_submitted_line(&event.session_name, event.pane_id)
             {
                 warn!(
@@ -401,7 +401,6 @@ impl RequestHandler {
                     "failed to retry attached submitted line strip for dead pane: {error}"
                 );
             }
-        }
         if let Err(error) = append_remain_on_exit_message(&mut state, &event.session_name, target) {
             warn!(
                 session = %event.session_name,

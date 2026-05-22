@@ -79,11 +79,10 @@ impl TransportFailure {
         operation: &str,
         command_name: &'static str,
     ) -> RmuxError {
-        if command_name == "handshake" {
-            if let Some(error) = self.protocol_error.as_ref() {
+        if command_name == "handshake"
+            && let Some(error) = self.protocol_error.as_ref() {
                 return handshake_protocol_error(error);
             }
-        }
 
         self.to_error(operation)
     }

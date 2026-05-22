@@ -152,8 +152,8 @@ impl RequestHandler {
                 {
                     return Response::Error(ErrorResponse { error });
                 }
-            } else if let Some(command) = request.command.clone() {
-                if let Err(error) = state.hooks.set_with_options(
+            } else if let Some(command) = request.command.clone()
+                && let Err(error) = state.hooks.set_with_options(
                     request.scope.clone(),
                     request.hook,
                     command,
@@ -165,7 +165,6 @@ impl RequestHandler {
                 ) {
                     return Response::Error(ErrorResponse { error });
                 }
-            }
         }
 
         Response::SetHook(SetHookResponse {

@@ -68,8 +68,10 @@ fn ensure_server_running_reexecs_the_hidden_rmux_daemon() -> Result<(), Box<dyn 
 
     fs::create_dir_all(launcher_dir)?;
     write_hidden_launcher(&launcher_path, &pid_path)?;
-    std::env::set_var(BINARY_OVERRIDE_ENV, &launcher_path);
-    std::env::set_var(BINARY_OVERRIDE_TEST_OPT_IN_ENV, "1");
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var(BINARY_OVERRIDE_ENV, &launcher_path) };
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var(BINARY_OVERRIDE_TEST_OPT_IN_ENV, "1") };
 
     let mut connection = ensure_server_running(&socket_path)?;
     let response = connection.roundtrip(&Request::NewSession(NewSessionRequest {

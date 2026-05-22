@@ -89,13 +89,12 @@ impl RequestHandler {
         match event.location {
             MouseLocation::StatusLeft => Ok(Some(Target::Session(attached_session))),
             MouseLocation::Status | MouseLocation::StatusDefault | MouseLocation::StatusRight => {
-                if let Some(window_id) = event.window_id {
-                    if let Some(target) =
+                if let Some(window_id) = event.window_id
+                    && let Some(target) =
                         find_window_target_by_id(&state, &attached_session, window_id)
                     {
                         return Ok(Some(Target::Window(target)));
                     }
-                }
                 if let Some(session_name) = find_session_name_by_id(&state, event.session_id) {
                     return Ok(Some(Target::Session(session_name)));
                 }
