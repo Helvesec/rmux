@@ -877,6 +877,11 @@ async fn forward_attach_passthrough_replays_target_on_attach_control_switch() {
         "output on the previous window's channel must not reach the client after switch, got: {:?}",
         String::from_utf8_lossy(&collected)
     );
+    assert!(
+        contains(b"\x1b]0;rmux: alpha\x07"),
+        "switch must emit a rmux-tagged OSC 0 title so the host bar doesn't keep the previous window's title, got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
 
     closing.store(true, std::sync::atomic::Ordering::SeqCst);
     peer.shutdown().await.expect("close peer");

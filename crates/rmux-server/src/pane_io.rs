@@ -852,13 +852,20 @@ pub(crate) async fn forward_attach_passthrough(
 /// `[snapshot] ++ [raw]` when a log exists, falling back to the
 /// existing `render_frame` (a grid-derived repaint) when the log is
 /// empty or missing — e.g. on the very first attach before any
-/// inner-PTY bytes have arrived.
+/// inner-PTY bytes have arrived. Prefixed with an OSC title nudge
+/// so the host window/tab label carries the rmux session name
+/// until the inner program sets its own title.
 #[cfg(any(unix, windows))]
 async fn emit_initial_passthrough_state(
     stream: &LocalStream,
     current_target: &super::pane_io::types::OpenAttachTarget,
     live_input: &LiveAttachInputContext,
 ) -> io::Result<()> {
+    emit_attach_bytes(
+        stream,
+        &passthrough_title_sequence(&current_target.session_name),
+    )
+    .await?;
     if let Some(replay) = passthrough_replay_bytes_for_target(current_target, live_input).await {
         emit_attach_bytes(stream, &replay).await
     } else {
@@ -869,6 +876,20 @@ async fn emit_initial_passthrough_state(
         )
         .await
     }
+}
+
+/// Encodes an OSC 0 (set icon name + window title) sequence with a
+/// rmux-tagged session label. Emitted by the passthrough forwarder on
+/// attach and on window switch so the host terminal's title bar
+/// reflects the rmux context — the inner program is free to override
+/// with its own title on its next emit.
+#[cfg(any(unix, windows))]
+fn passthrough_title_sequence(session_name: &rmux_proto::SessionName) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(16 + session_name.as_str().len());
+    bytes.extend_from_slice(b"\x1b]0;rmux: ");
+    bytes.extend_from_slice(session_name.as_str().as_bytes());
+    bytes.extend_from_slice(b"\x07");
+    bytes
 }
 
 /// Resolves the bytes a passthrough client needs to see in order to
@@ -909,6 +930,15 @@ async fn switch_passthrough_target(
     live_input: &LiveAttachInputContext,
 ) -> io::Result<()> {
     *current_target = open_attach_target(next_target)?;
+    // Reset the host title to a rmux-tagged label so a window-switch
+    // away from a TUI that set its own title (e.g. `claude`) doesn't
+    // leave that title stuck on the new window. The new window's
+    // inner program will override on its next emit.
+    emit_attach_bytes(
+        stream,
+        &passthrough_title_sequence(&current_target.session_name),
+    )
+    .await?;
     // The replay log's snapshot already contains a reset prefix
     // (?1049l, soft reset, SGR0, clear, home) so we don't need an
     // explicit clear here when a log is present. When no log exists,

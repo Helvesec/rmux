@@ -4,7 +4,9 @@ use rmux_client::connect;
 use rmux_client::{detect_context, ClientContext};
 use rmux_proto::request::{AttachSessionExt2Request, SwitchClientExt3Request};
 use rmux_proto::request::{KillSessionRequest, ListSessionsRequest, NewSessionExtRequest};
-use rmux_proto::{ClientTerminalContext, ErrorResponse, Response};
+use rmux_proto::{
+    ClientTerminalContext, ErrorResponse, OptionName, Response, ScopeSelector, SetOptionMode,
+};
 
 use super::{attach_with_connection, current_terminal_size, run_switch_client_on_connection};
 use super::{
@@ -59,6 +61,18 @@ pub(super) fn run_new_session(
 
     if let Some(output) = output {
         write_command_output(&output)?;
+    }
+
+    // Apply the --passthrough flag as a session-scope option set
+    // immediately after creation. This must happen before any attach
+    // so the listener routes us to the passthrough forwarder.
+    if args.passthrough {
+        let _ = connection.set_option(
+            ScopeSelector::Session(target.clone()),
+            OptionName::Passthrough,
+            "on".to_owned(),
+            SetOptionMode::Replace,
+        );
     }
 
     if args.detached {

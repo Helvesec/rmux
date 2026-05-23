@@ -262,21 +262,42 @@ client`, `rename-session`, `rename-window`, `attach-session`,
   client, (d) output on the old channel doesn't leak through after
   the switch.
 
-### Phase 4 — Polish (pending, mostly cosmetic)
+### Phase 4 — Polish (landed)
 
-* CLI flag: `new-session --passthrough` / `-P` (today the option is
-  set after creation via `set-option`).
-* SIGWINCH the new window's inner program with its current size
-  on switch to coax lazy-redraw TUIs into repainting (today they
-  just continue from whatever state they were in; usually fine for
-  streaming TUIs like `claude`, less fine for a paused `vim`).
-* Replay-budget cleanup hooks on pane / window / session removal
-  (today the log is leaked when the pane goes away — bounded by
-  one budget per dead pane, will collect itself on next server
-  restart but worth reaping properly).
-* Optional OSC 0/2 title to surface the active window name on
-  switch (currently the inner program owns the title — which is
-  often the right call).
+* `new-session --passthrough` long-only CLI flag. Sets the
+  session-scope `passthrough` option immediately after creation
+  via the existing `set-option` RPC, before the attach handshake
+  routes to a forwarder. `-P` is taken by `print_session_info`
+  (tmux compat), hence long-only.
+* `OSC 0;rmux: <session>\BEL` title nudge emitted by the
+  passthrough forwarder on attach and on each window switch.
+  Inner programs are free to override on their next emit — this
+  just keeps the host title bar from carrying a stale
+  previous-window title while the new window's program hasn't
+  yet set one.
+* Replay-log cleanup on pane / session removal — `remove_pane_output`,
+  `remove_pane_outputs`, and `remove_session_pane_outputs` now also
+  drop entries from `HandlerState::replay_logs`. Sessions/panes
+  that come and go in long-running servers no longer leak one
+  budget's worth of bytes per dead pane.
+* Tests:
+  - `passthrough_set_option_is_observed_by_is_session_passthrough`
+    — set-option flips `is_session_passthrough`.
+  - The switch test now also asserts the OSC title sequence.
+
+### Deferred — not on the critical path
+
+* **SIGWINCH-on-switch nudge for lazy-redraw TUIs.** Streaming
+  TUIs (`claude`) don't need it; paused full-screen TUIs (`vim`,
+  `less` mid-page) would benefit. The cleanest implementation
+  sends `SIGWINCH` to the pane's foreground process group via
+  `killpg`, which requires plumbing `Pid` retrieval through
+  `PtyMaster`. Skipped pending a real reproduction in passthrough
+  mode that needs it.
+* **Per-pane-scope `passthrough-replay-bytes`.** The option is
+  server-scope today and locked in at log allocation time. If a
+  user changes it mid-session it doesn't retroactively resize
+  existing logs. Move to session/pane scope when there's demand.
 
 ## Out-of-scope follow-ups
 

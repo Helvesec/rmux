@@ -478,6 +478,7 @@ impl HandlerState {
         session_name: &SessionName,
     ) -> RemovedPaneOutputs {
         let _ = self.dead_panes.remove(session_name);
+        let _ = self.replay_logs.remove(session_name);
         let attached_submitted_rows = self
             .attached_submitted_rows
             .remove(session_name)
@@ -500,6 +501,9 @@ impl HandlerState {
     ) -> Option<(SharedPaneTranscript, PaneOutputSender)> {
         if let Some(dead_panes) = self.dead_panes.get_mut(session_name) {
             let _ = dead_panes.remove(&pane_id);
+        }
+        if let Some(panes) = self.replay_logs.get_mut(session_name) {
+            let _ = panes.remove(&pane_id);
         }
         self.clear_attached_submitted_line(session_name, pane_id);
         if let Some(generations) = self.pane_output_generations.get_mut(session_name) {
@@ -529,6 +533,9 @@ impl HandlerState {
         for pane_id in pane_ids {
             if let Some(dead_panes) = self.dead_panes.get_mut(session_name) {
                 let _ = dead_panes.remove(pane_id);
+            }
+            if let Some(panes) = self.replay_logs.get_mut(session_name) {
+                let _ = panes.remove(pane_id);
             }
             if let Some(absolute_y) = self.take_attached_submitted_line(session_name, *pane_id) {
                 removed.attached_submitted_rows.insert(*pane_id, absolute_y);

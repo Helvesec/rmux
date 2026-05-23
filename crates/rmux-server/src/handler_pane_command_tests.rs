@@ -2049,3 +2049,32 @@ async fn non_passthrough_session_still_permits_split_window() {
         "split-window in a non-passthrough session must succeed, got {response:?}",
     );
 }
+
+#[tokio::test]
+async fn passthrough_set_option_is_observed_by_is_session_passthrough() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    create_session(&handler, &alpha).await;
+    assert!(
+        !handler.is_session_passthrough(&alpha).await,
+        "fresh sessions must not be passthrough by default",
+    );
+
+    let set = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Session(alpha.clone()),
+            option: OptionName::Passthrough,
+            value: "on".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(
+        matches!(set, rmux_proto::Response::SetOption(_)),
+        "set-option passthrough=on must succeed, got {set:?}",
+    );
+
+    assert!(
+        handler.is_session_passthrough(&alpha).await,
+        "session must be passthrough after the option is set",
+    );
+}
