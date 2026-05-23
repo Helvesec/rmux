@@ -738,6 +738,101 @@ async fn reschedule_status_refresh_for_session(
     );
 }
 
+/// Passthrough-mode attach forwarder.
+///
+/// Companion to [`forward_attach`] for sessions where the
+/// `passthrough` option is `on`. The host terminal is never put into
+/// alt-screen, no status bar / overlay / chrome is emitted, and
+/// inner-PTY bytes flow verbatim from the pane output ring to the
+/// client socket. The only sequence the server prepends is the
+/// pane's current rendered frame, so the client sees the inner
+/// program's existing visible state right after attach without
+/// waiting for the next PTY emit.
+///
+/// Pane operations are gated upstream (see
+/// `handler_support::reject_pane_op_in_passthrough`); this loop
+/// assumes the session is single-pane and does not handle pane
+/// switching, overlays, copy-mode, or status redraws.
+#[cfg(any(unix, windows))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn forward_attach_passthrough(
+    stream: LocalStream,
+    target: AttachTarget,
+    initial_socket_bytes: Vec<u8>,
+    mut shutdown: watch::Receiver<()>,
+    _control_rx: mpsc::UnboundedReceiver<AttachControl>,
+    closing: Arc<AtomicBool>,
+    _persistent_overlay_epoch: Arc<AtomicU64>,
+    live_input: LiveAttachInputContext,
+) -> io::Result<()> {
+    let mut decoder = AttachFrameDecoder::new();
+    let mut pending_input = Vec::new();
+    let mut socket_read_buffer = [0_u8; READ_BUFFER_SIZE];
+    let mut current_target = open_attach_target(target)?;
+    let mut locked = false;
+    decoder.push_bytes(&initial_socket_bytes);
+
+    // No alt-screen enter. Just replay the current grid as the
+    // starting state so the client sees something coherent on
+    // attach. The render_frame already carries SGR / cursor /
+    // content for the visible viewport.
+    emit_render_frame(
+        &stream,
+        &current_target.outer_terminal,
+        &current_target.render_frame,
+    )
+    .await?;
+
+    loop {
+        if closing.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        // Drain anything already buffered in the socket without
+        // blocking — keeps keystrokes from queueing behind output.
+        loop {
+            match try_read_socket_bytes(&stream, &mut decoder, &mut socket_read_buffer)? {
+                TrySocketRead::Read => {}
+                TrySocketRead::Closed => {
+                    return Ok(());
+                }
+                TrySocketRead::WouldBlock => break,
+            }
+        }
+        process_socket_messages(
+            &mut decoder,
+            &stream,
+            &live_input,
+            &mut pending_input,
+            &mut locked,
+        )
+        .await?;
+
+        tokio::select! {
+            biased;
+            result = shutdown.changed() => {
+                let _ = result;
+                return Ok(());
+            }
+            output = recv_pane_output_optional(current_target.pane_output.as_mut()) => {
+                let Some(item) = output? else {
+                    current_target.pane_output = None;
+                    continue;
+                };
+                let (bytes, _passthroughs) = match item {
+                    OutputCursorItem::Event(event) => event.into_parts(),
+                    OutputCursorItem::Gap(_) => continue,
+                };
+                emit_attach_bytes(&stream, &bytes).await?;
+            }
+            socket = read_socket_bytes(&stream, &mut decoder, &mut socket_read_buffer) => {
+                if !socket? {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(any(unix, windows))]
 async fn process_socket_messages(
     decoder: &mut AttachFrameDecoder,

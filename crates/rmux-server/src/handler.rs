@@ -381,6 +381,17 @@ impl RequestHandler {
         }
     }
 
+    /// Returns true when the session resolves the `passthrough` option
+    /// to `on`. Used at the attach boundary to route to the
+    /// passthrough forwarder instead of the full renderer pipeline.
+    pub(crate) async fn is_session_passthrough(
+        &self,
+        session_name: &rmux_proto::SessionName,
+    ) -> bool {
+        let state = self.state.lock().await;
+        rmux_core::is_passthrough_session(&state.options, session_name)
+    }
+
     pub(crate) fn install_shutdown_handle(&self, shutdown_handle: ShutdownHandle) {
         *self
             .shutdown_handle
