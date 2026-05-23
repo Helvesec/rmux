@@ -175,7 +175,10 @@ pub(crate) struct Cli {
 }
 
 #[derive(Debug, Parser)]
-#[command(disable_help_subcommand = true, version)]
+#[command(
+    disable_help_subcommand = true,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("RMUX_GIT_HASH"), ")"),
+)]
 struct RawCli {
     #[arg(short = '2', action = ArgAction::SetTrue)]
     assume_256_colors: bool,
