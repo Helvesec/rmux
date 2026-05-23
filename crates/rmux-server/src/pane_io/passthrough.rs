@@ -66,7 +66,7 @@ mod tests {
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            _pane_master: pty.into_master(),
+            pane_master: pty.into_master(),
             pane_output: Some(pane_output.subscribe()),
             render_frame: Vec::new(),
             outer_terminal: OuterTerminal::resolve(
@@ -98,7 +98,7 @@ mod tests {
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            _pane_master: pty.into_master(),
+            pane_master: pty.into_master(),
             pane_output: Some(pane_output.subscribe()),
             render_frame: Vec::new(),
             outer_terminal: OuterTerminal::resolve(
@@ -133,7 +133,7 @@ mod tests {
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            _pane_master: pty.into_master(),
+            pane_master: pty.into_master(),
             pane_output: Some(pane_output.subscribe()),
             render_frame: Vec::new(),
             outer_terminal: OuterTerminal::resolve(

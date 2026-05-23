@@ -930,6 +930,20 @@ async fn switch_passthrough_target(
     live_input: &LiveAttachInputContext,
 ) -> io::Result<()> {
     *current_target = open_attach_target(next_target)?;
+    // Nudge the new window's foreground program into a repaint.
+    //
+    // Streaming TUIs (claude, tail -f) don't need this — they emit on
+    // their own clock. But lazy-redraw TUIs (vim mid-edit, less, htop
+    // between ticks) only repaint when *something* tells them to.
+    // Faking a winsize flap is jarring; sending SIGWINCH directly to
+    // the slave's foreground pgrp is the canonical nudge. No-op when
+    // the pane has no fg pgrp (newly forked, child already exited).
+    #[cfg(unix)]
+    {
+        let _ = rmux_os::process::unix::winch_foreground_pgrp(
+            current_target.pane_master.as_fd(),
+        );
+    }
     // Reset the host title to a rmux-tagged label so a window-switch
     // away from a TUI that set its own title (e.g. `claude`) doesn't
     // leave that title stuck on the new window. The new window's

@@ -889,3 +889,154 @@ async fn forward_attach_passthrough_replays_target_on_attach_control_switch() {
         .await
         .expect("attach task join did not time out");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn forward_attach_passthrough_winches_new_window_on_switch() {
+    use rmux_pty::ChildCommand;
+
+    let handler = Arc::new(RequestHandler::new());
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let session_name = SessionName::new("alpha").expect("valid session name");
+
+    // Window 1: idle PTY with no child. The forwarder starts here and
+    // we switch away before doing anything with it.
+    let pty_one = PtyPair::open().expect("open pty pair 1");
+
+    // Window 2: a real shell spawned under a fresh PTY via the same
+    // `ChildCommand::spawn` rmux uses in production. The shell traps
+    // WINCH and writes a sentinel to its stdout (= the slave) so we
+    // can observe delivery on the master.
+    let spawned = ChildCommand::new("/bin/sh")
+        .arg("-c")
+        .arg(
+            "trap 'printf RMUX_WINCH_OK' WINCH; \
+             i=0; while [ \"$i\" -lt 100 ]; do sleep 0.05; i=$((i+1)); done",
+        )
+        .spawn()
+        .expect("spawn /bin/sh under window 2 pty");
+    let (master_two, mut child_two) = spawned.into_parts();
+    // A second master handle so the reader thread doesn't fight the
+    // attach target for the fd.
+    let master_two_reader = master_two
+        .try_clone()
+        .expect("clone window 2 master for reader");
+
+    // Wait for the shell to claim the slave's fg pgrp.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while rmux_os::process::unix::foreground_pid(master_two.as_fd()).is_none() {
+        if tokio::time::Instant::now() >= deadline {
+            let _ = child_two.wait();
+            panic!("child shell did not claim window 2's fg pgrp within 2s");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Give the shell a beat to install its WINCH trap after exec.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let pane_output_one = pane_output_channel();
+    let pane_output_two = pane_output_channel();
+
+    let target_one = AttachTarget {
+        session_name: session_name.clone(),
+        pane_master: pty_one.into_master(),
+        pane_output: pane_output_one,
+        render_frame: Vec::new(),
+        outer_terminal: OuterTerminal::resolve(
+            &OptionStore::default(),
+            OuterTerminalContext::default(),
+        ),
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: None,
+    };
+    let target_two = AttachTarget {
+        session_name: session_name.clone(),
+        pane_master: master_two,
+        pane_output: pane_output_two,
+        render_frame: Vec::new(),
+        outer_terminal: OuterTerminal::resolve(
+            &OptionStore::default(),
+            OuterTerminalContext::default(),
+        ),
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: None,
+    };
+
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let live_input = LiveAttachInputContext {
+        handler,
+        attach_pid: std::process::id(),
+    };
+
+    let attach_task = tokio::spawn(forward_attach_passthrough(
+        stream,
+        target_one,
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        closing.clone(),
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+    ));
+
+    // The switch is the SIGWINCH delivery point.
+    control_tx
+        .send(AttachControl::switch(target_two))
+        .expect("switch send");
+
+    // Read from window 2's master on a blocking thread; the shell
+    // trap writes the sentinel via the slave and the master receives
+    // it. Use a timeout so a missed SIGWINCH surfaces as a clean fail.
+    let (sentinel_tx, sentinel_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut collected = Vec::new();
+        let mut buffer = [0_u8; 256];
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            match master_two_reader.io().read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    collected.extend_from_slice(&buffer[..n]);
+                    if collected
+                        .windows(b"RMUX_WINCH_OK".len())
+                        .any(|window| window == b"RMUX_WINCH_OK")
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = sentinel_tx.send(collected);
+    });
+
+    let collected = tokio::time::timeout(Duration::from_secs(4), sentinel_rx)
+        .await
+        .expect("reader thread did not finish in time")
+        .expect("reader thread did not send");
+    let saw_sentinel = collected
+        .windows(b"RMUX_WINCH_OK".len())
+        .any(|window| window == b"RMUX_WINCH_OK");
+
+    closing.store(true, std::sync::atomic::Ordering::SeqCst);
+    peer.shutdown().await.ok();
+    let _ = tokio::time::timeout(Duration::from_secs(2), attach_task).await;
+    let _ = child_two.kill(rmux_pty::Signal::KILL);
+    let _ = child_two.wait();
+
+    assert!(
+        saw_sentinel,
+        "passthrough switch must deliver SIGWINCH to the new window's fg pgrp; \
+         got master read: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+}

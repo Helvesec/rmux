@@ -98,6 +98,37 @@ pub mod unix {
         }
         u32::try_from(pgrp).ok()
     }
+
+    /// Sends `SIGWINCH` to the foreground process group of the terminal
+    /// referenced by `fd`. Returns `true` when the signal was delivered.
+    ///
+    /// **Why:** the kernel only emits `SIGWINCH` to the slave's foreground
+    /// pgrp when the master's winsize *changes* — re-applying the same
+    /// size is a no-op. When an outer rmux event (e.g. a window switch in
+    /// passthrough mode) leaves a lazy-redraw TUI like `vim` with stale
+    /// glyphs and the geometry hasn't changed, we still want it to
+    /// repaint. Delivering `SIGWINCH` directly to the fg pgrp gives the
+    /// same nudge without faking a size flap.
+    ///
+    /// Returns `false` when `fd` has no foreground pgrp (not a tty, or
+    /// nothing currently has it as ctty), or when the `killpg` call
+    /// itself fails (caller treats the failure as a benign no-op).
+    pub fn winch_foreground_pgrp(fd: BorrowedFd<'_>) -> bool {
+        let Some(pgrp) = foreground_pid(fd) else {
+            return false;
+        };
+        let Ok(pgrp) = libc::pid_t::try_from(pgrp) else {
+            return false;
+        };
+        let result = unsafe {
+            // SAFETY: `killpg` is async-signal-safe and takes only
+            // integer arguments. `pgrp` came from `tcgetpgrp` so it
+            // names a real process group; if it has since exited,
+            // `killpg` returns ESRCH which we surface as `false`.
+            libc::killpg(pgrp, libc::SIGWINCH)
+        };
+        result == 0
+    }
 }
 
 #[cfg(target_os = "linux")]

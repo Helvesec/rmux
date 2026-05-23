@@ -191,7 +191,11 @@ pub(crate) struct AttachSessionUpgrade {
 
 pub(super) struct OpenAttachTarget {
     pub(super) session_name: rmux_proto::SessionName,
-    pub(super) _pane_master: PtyMaster,
+    /// Master end of the pane's PTY. Kept alive for as long as the
+    /// target is open (closing it would orphan the slave) and used
+    /// by the passthrough forwarder to send SIGWINCH to the pane's
+    /// foreground pgrp on a window switch.
+    pub(super) pane_master: PtyMaster,
     pub(super) pane_output: Option<PaneOutputReceiver>,
     pub(super) render_frame: Vec<u8>,
     pub(super) outer_terminal: OuterTerminal,

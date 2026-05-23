@@ -280,20 +280,28 @@ client`, `rename-session`, `rename-window`, `attach-session`,
   drop entries from `HandlerState::replay_logs`. Sessions/panes
   that come and go in long-running servers no longer leak one
   budget's worth of bytes per dead pane.
+* **SIGWINCH-on-switch nudge for lazy-redraw TUIs.** On every
+  passthrough window switch, `switch_passthrough_target` calls
+  `rmux_os::process::unix::winch_foreground_pgrp` against the new
+  pane's master fd, which `tcgetpgrp`s the slave's foreground
+  process group and delivers `SIGWINCH` via `killpg`. Streaming
+  TUIs (`claude`, `tail -f`) ignore it; paused full-screen TUIs
+  (`vim` mid-edit, `less` mid-page, `htop` between ticks) repaint.
+  The kernel does *not* emit `SIGWINCH` on a same-size resize, so
+  the direct `killpg` path is the only honest nudge.
 * Tests:
   - `passthrough_set_option_is_observed_by_is_session_passthrough`
     — set-option flips `is_session_passthrough`.
   - The switch test now also asserts the OSC title sequence.
+  - `winch_foreground_pgrp_delivers_signal_to_pty_session_leader`
+    — spawns `/bin/sh` under a PTY, fires the helper, observes
+    the trap's sentinel written back through the master.
+  - `forward_attach_passthrough_winches_new_window_on_switch`
+    — end-to-end: switch into a window whose shell has trapped
+    `WINCH`, observe the trap fires.
 
 ### Deferred — not on the critical path
 
-* **SIGWINCH-on-switch nudge for lazy-redraw TUIs.** Streaming
-  TUIs (`claude`) don't need it; paused full-screen TUIs (`vim`,
-  `less` mid-page) would benefit. The cleanest implementation
-  sends `SIGWINCH` to the pane's foreground process group via
-  `killpg`, which requires plumbing `Pid` retrieval through
-  `PtyMaster`. Skipped pending a real reproduction in passthrough
-  mode that needs it.
 * **Per-pane-scope `passthrough-replay-bytes`.** The option is
   server-scope today and locked in at log allocation time. If a
   user changes it mid-session it doesn't retroactively resize

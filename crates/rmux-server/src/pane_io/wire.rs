@@ -32,7 +32,7 @@ pub(super) fn open_attach_target(target: AttachTarget) -> io::Result<OpenAttachT
     } = target;
     Ok(OpenAttachTarget {
         session_name,
-        _pane_master: pane_master,
+        pane_master,
         pane_output: Some(pane_output.subscribe()),
         render_frame,
         outer_terminal,
