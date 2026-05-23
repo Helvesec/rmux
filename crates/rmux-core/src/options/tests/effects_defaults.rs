@@ -247,9 +247,10 @@ fn frozen_registry_scope_counts_match_tmux_partitioning() {
         .filter(|entry| entry.scope_mask() == (registry::SCOPE_WINDOW | registry::SCOPE_PANE))
         .count();
 
-    // tmux frozen: 25 server, 54 session, 67 window (51 window-only + 16 window|pane)
-    assert_eq!(server_count, 25, "server options");
-    assert_eq!(session_count, 54, "session options");
+    // tmux frozen: 25 server, 54 session, 67 window (51 window-only + 16 window|pane).
+    // rmux extensions: +1 server (passthrough-replay-bytes), +1 session (passthrough).
+    assert_eq!(server_count, 26, "server options");
+    assert_eq!(session_count, 55, "session options");
     assert_eq!(
         window_only_count + window_pane_count,
         67,

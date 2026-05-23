@@ -297,6 +297,14 @@ pub enum OptionName {
     WrapSearch,
     /// The `xterm-keys` option.
     XtermKeys,
+    /// The `passthrough` session option — when on, the session runs in
+    /// passthrough mode (no chrome, no alt-screen on the host terminal,
+    /// inner PTY bytes forwarded verbatim, pane operations disallowed).
+    /// Set at session creation; treated as immutable thereafter.
+    Passthrough,
+    /// The `passthrough-replay-bytes` server option — per-window raw byte
+    /// log budget for passthrough sessions (bytes).
+    PassthroughReplayBytes,
 }
 
 /// The mutation mode for `set-option`.
