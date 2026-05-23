@@ -25,8 +25,15 @@ fn main() {
 
 fn git_describe() -> Option<String> {
     let hash = run_git(&["rev-parse", "--short=12", "HEAD"])?;
-    let dirty = run_git(&["status", "--porcelain"])
-        .is_some_and(|status| !status.trim().is_empty());
+    // `diff-index --quiet HEAD` exits 1 iff any tracked file differs
+    // from HEAD. Unlike `git status`, it ignores untracked files —
+    // which matters because an untracked sibling dir (e.g. an editor
+    // scratch folder) shouldn't make the binary report `-dirty`.
+    let dirty = !Command::new("git")
+        .args(["diff-index", "--quiet", "HEAD"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true);
     Some(if dirty {
         format!("{hash}-dirty")
     } else {
