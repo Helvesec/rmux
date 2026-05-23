@@ -17,8 +17,9 @@ use super::control::{apply_pending_attach_controls, PendingAttachAction};
 use super::wire::open_attach_target;
 use super::wire::recv_pane_output;
 use super::{
-    forward_attach, pane_output_channel, pane_output_channel_with_limits, process_socket_messages,
-    should_emit_overlay, AttachControl, AttachTarget, LiveAttachInputContext, OverlayFrame,
+    forward_attach, forward_attach_passthrough, pane_output_channel,
+    pane_output_channel_with_limits, process_socket_messages, should_emit_overlay, AttachControl,
+    AttachTarget, LiveAttachInputContext, OverlayFrame,
 };
 use crate::handler::RequestHandler;
 use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
@@ -650,4 +651,101 @@ async fn forward_attach_emits_display_panes_overlay_for_prefix_q_keystrokes() {
         result.is_ok(),
         "forward_attach should stay healthy: {result:?}"
     );
+}
+
+#[tokio::test]
+async fn forward_attach_passthrough_forwards_pane_output_verbatim_without_alt_screen() {
+    let handler = Arc::new(RequestHandler::new());
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let session_name = SessionName::new("alpha").expect("valid session name");
+
+    let pane_output = pane_output_channel();
+    let pty = PtyPair::open().expect("open pty pair");
+    let pane_master = pty.into_master();
+    let target = AttachTarget {
+        session_name: session_name.clone(),
+        pane_master,
+        pane_output: pane_output.clone(),
+        // Empty render_frame so the first bytes we see on the peer are
+        // strictly the pane-output bytes we push below.
+        render_frame: Vec::new(),
+        outer_terminal: OuterTerminal::resolve(
+            &OptionStore::default(),
+            OuterTerminalContext::default(),
+        ),
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+    };
+
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (_control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let live_input = LiveAttachInputContext {
+        handler,
+        attach_pid: std::process::id(),
+    };
+
+    let attach_task = tokio::spawn(forward_attach_passthrough(
+        stream,
+        target,
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        closing.clone(),
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+    ));
+
+    // Give the bypass loop time to enter its select before we publish
+    // — otherwise the subscribe() inside open_attach_target starts
+    // "from now" and would miss this byte.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = pane_output.send(b"hello passthrough\r\n".to_vec());
+
+    let mut collected = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while collected
+        .windows(b"hello passthrough".len())
+        .all(|window| window != b"hello passthrough")
+    {
+        let mut buf = [0_u8; 4096];
+        let read = tokio::time::timeout(deadline - tokio::time::Instant::now(), peer.read(&mut buf))
+            .await
+            .expect("peer read should not time out")
+            .expect("peer read");
+        if read == 0 {
+            break;
+        }
+        let mut decoder = AttachFrameDecoder::new();
+        decoder.push_bytes(&buf[..read]);
+        while let Some(AttachMessage::Data(bytes)) =
+            decoder.next_message().expect("decode attach frame")
+        {
+            collected.extend_from_slice(&bytes);
+        }
+    }
+
+    assert!(
+        collected
+            .windows(b"hello passthrough".len())
+            .any(|window| window == b"hello passthrough"),
+        "pane bytes must be forwarded verbatim, got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        !collected
+            .windows(b"\x1b[?1049h".len())
+            .any(|window| window == b"\x1b[?1049h"),
+        "passthrough must not put the host terminal into alt-screen, got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+
+    closing.store(true, std::sync::atomic::Ordering::SeqCst);
+    peer.shutdown().await.expect("close peer");
+    let _ = tokio::time::timeout(Duration::from_secs(2), attach_task)
+        .await
+        .expect("attach task join did not time out");
 }
