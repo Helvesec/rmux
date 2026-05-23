@@ -119,6 +119,11 @@ pub(crate) struct AttachTarget {
     pub(crate) kitty_graphics_passthrough: bool,
     pub(crate) persistent_overlay_state_id: Option<u64>,
     pub(crate) live_pane: Option<Box<LivePaneRender>>,
+    /// Stable id of the pane this target was built for. Used by the
+    /// passthrough attach forwarder to look up the pane's replay log
+    /// on attach and on window switch. `None` only in pre-existing
+    /// test fixtures.
+    pub(crate) active_pane_id: Option<PaneId>,
 }
 
 #[cfg(any(unix, windows))]
@@ -195,6 +200,7 @@ pub(super) struct OpenAttachTarget {
     pub(super) kitty_graphics_passthrough: bool,
     pub(super) persistent_overlay_state_id: Option<u64>,
     pub(super) live_pane: Option<Box<LivePaneRender>>,
+    pub(super) active_pane_id: Option<PaneId>,
 }
 
 #[derive(Clone)]

@@ -760,7 +760,7 @@ pub(crate) async fn forward_attach_passthrough(
     target: AttachTarget,
     initial_socket_bytes: Vec<u8>,
     mut shutdown: watch::Receiver<()>,
-    _control_rx: mpsc::UnboundedReceiver<AttachControl>,
+    mut control_rx: mpsc::UnboundedReceiver<AttachControl>,
     closing: Arc<AtomicBool>,
     _persistent_overlay_epoch: Arc<AtomicU64>,
     live_input: LiveAttachInputContext,
@@ -772,16 +772,7 @@ pub(crate) async fn forward_attach_passthrough(
     let mut locked = false;
     decoder.push_bytes(&initial_socket_bytes);
 
-    // No alt-screen enter. Just replay the current grid as the
-    // starting state so the client sees something coherent on
-    // attach. The render_frame already carries SGR / cursor /
-    // content for the visible viewport.
-    emit_render_frame(
-        &stream,
-        &current_target.outer_terminal,
-        &current_target.render_frame,
-    )
-    .await?;
+    emit_initial_passthrough_state(&stream, &current_target, &live_input).await?;
 
     loop {
         if closing.load(Ordering::SeqCst) {
@@ -813,6 +804,28 @@ pub(crate) async fn forward_attach_passthrough(
                 let _ = result;
                 return Ok(());
             }
+            control = control_rx.recv() => {
+                match control {
+                    None => return Ok(()),
+                    Some(AttachControl::Detach | AttachControl::Exited | AttachControl::DetachKill) => {
+                        return Ok(());
+                    }
+                    Some(AttachControl::Switch(next_target)) => {
+                        switch_passthrough_target(
+                            &stream,
+                            &mut current_target,
+                            *next_target,
+                            &live_input,
+                        )
+                        .await?;
+                    }
+                    Some(_) => {
+                        // Other control variants (Overlay, Write,
+                        // LockShellCommand, Suspend, AdvancePersistentOverlayState,
+                        // DetachExecShellCommand) are no-ops in passthrough.
+                    }
+                }
+            }
             output = recv_pane_output_optional(current_target.pane_output.as_mut()) => {
                 let Some(item) = output? else {
                     current_target.pane_output = None;
@@ -830,6 +843,87 @@ pub(crate) async fn forward_attach_passthrough(
                 }
             }
         }
+    }
+}
+
+/// Emits the active pane's recent state to the client on (re)attach.
+///
+/// In a passthrough session this is the replay log's
+/// `[snapshot] ++ [raw]` when a log exists, falling back to the
+/// existing `render_frame` (a grid-derived repaint) when the log is
+/// empty or missing — e.g. on the very first attach before any
+/// inner-PTY bytes have arrived.
+#[cfg(any(unix, windows))]
+async fn emit_initial_passthrough_state(
+    stream: &LocalStream,
+    current_target: &super::pane_io::types::OpenAttachTarget,
+    live_input: &LiveAttachInputContext,
+) -> io::Result<()> {
+    if let Some(replay) = passthrough_replay_bytes_for_target(current_target, live_input).await {
+        emit_attach_bytes(stream, &replay).await
+    } else {
+        emit_render_frame(
+            stream,
+            &current_target.outer_terminal,
+            &current_target.render_frame,
+        )
+        .await
+    }
+}
+
+/// Resolves the bytes a passthrough client needs to see in order to
+/// reproduce the pane's current state — replay log when available,
+/// otherwise `None` (caller falls back to `render_frame`).
+#[cfg(any(unix, windows))]
+async fn passthrough_replay_bytes_for_target(
+    current_target: &super::pane_io::types::OpenAttachTarget,
+    live_input: &LiveAttachInputContext,
+) -> Option<Vec<u8>> {
+    let pane_id = current_target.active_pane_id?;
+    let log = live_input
+        .handler
+        .passthrough_log_for_pane(&current_target.session_name, pane_id)
+        .await?;
+    let log = log.lock().ok()?;
+    let (snapshot, raw) = log.replay_parts();
+    if snapshot.is_empty() && raw.is_empty() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(snapshot.len() + raw.len());
+    bytes.extend_from_slice(snapshot);
+    bytes.extend_from_slice(raw);
+    Some(bytes)
+}
+
+/// Handles `AttachControl::Switch` inside the passthrough loop.
+///
+/// Swaps the attached pane output to the new window's pane, resets
+/// the host terminal state, then emits the new pane's replay log so
+/// the client sees the new window's recent history in its scrollback
+/// + the new window's current visible state.
+#[cfg(any(unix, windows))]
+async fn switch_passthrough_target(
+    stream: &LocalStream,
+    current_target: &mut super::pane_io::types::OpenAttachTarget,
+    next_target: AttachTarget,
+    live_input: &LiveAttachInputContext,
+) -> io::Result<()> {
+    *current_target = open_attach_target(next_target)?;
+    // The replay log's snapshot already contains a reset prefix
+    // (?1049l, soft reset, SGR0, clear, home) so we don't need an
+    // explicit clear here when a log is present. When no log exists,
+    // emit a minimal reset before painting render_frame so the old
+    // window's content doesn't bleed under.
+    if let Some(replay) = passthrough_replay_bytes_for_target(current_target, live_input).await {
+        emit_attach_bytes(stream, &replay).await
+    } else {
+        emit_attach_bytes(stream, b"\x1b[m\x1b[H\x1b[2J").await?;
+        emit_render_frame(
+            stream,
+            &current_target.outer_terminal,
+            &current_target.render_frame,
+        )
+        .await
     }
 }
 

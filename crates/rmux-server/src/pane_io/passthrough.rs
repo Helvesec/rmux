@@ -78,6 +78,7 @@ mod tests {
             kitty_graphics_passthrough: true,
             persistent_overlay_state_id: None,
             live_pane: None,
+            active_pane_id: None,
         };
 
         let frame = render_passthroughs(
@@ -109,6 +110,7 @@ mod tests {
             kitty_graphics_passthrough: true,
             persistent_overlay_state_id: None,
             live_pane: None,
+            active_pane_id: None,
         };
 
         let frame = render_passthroughs(
@@ -143,6 +145,7 @@ mod tests {
             kitty_graphics_passthrough: false,
             persistent_overlay_state_id: None,
             live_pane: None,
+            active_pane_id: None,
         };
 
         let frame = render_passthroughs(

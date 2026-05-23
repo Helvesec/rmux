@@ -28,6 +28,7 @@ pub(super) fn open_attach_target(target: AttachTarget) -> io::Result<OpenAttachT
         kitty_graphics_passthrough,
         persistent_overlay_state_id,
         live_pane,
+        active_pane_id,
     } = target;
     Ok(OpenAttachTarget {
         session_name,
@@ -40,6 +41,7 @@ pub(super) fn open_attach_target(target: AttachTarget) -> io::Result<OpenAttachT
         kitty_graphics_passthrough,
         persistent_overlay_state_id,
         live_pane,
+        active_pane_id,
     })
 }
 

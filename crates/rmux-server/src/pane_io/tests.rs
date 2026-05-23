@@ -224,6 +224,7 @@ async fn forward_attach_emits_stop_sequence_when_processing_errors() {
         kitty_graphics_passthrough: false,
         persistent_overlay_state_id: None,
         live_pane: None,
+        active_pane_id: None,
     };
     let invalid_initial_socket_bytes =
         encode_attach_message(&AttachMessage::Lock("unexpected".to_owned()))
@@ -313,6 +314,7 @@ fn test_attach_target_with_output(
         kitty_graphics_passthrough,
         persistent_overlay_state_id,
         live_pane: None,
+        active_pane_id: None,
     }
 }
 
@@ -575,6 +577,7 @@ async fn forward_attach_emits_display_panes_overlay_for_prefix_q_keystrokes() {
         kitty_graphics_passthrough: false,
         persistent_overlay_state_id: None,
         live_pane: None,
+        active_pane_id: None,
     };
 
     let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
@@ -678,6 +681,7 @@ async fn forward_attach_passthrough_forwards_pane_output_verbatim_without_alt_sc
         kitty_graphics_passthrough: false,
         persistent_overlay_state_id: None,
         live_pane: None,
+        active_pane_id: None,
     };
 
     let (_shutdown_tx, shutdown_rx) = watch::channel(());
@@ -740,6 +744,137 @@ async fn forward_attach_passthrough_forwards_pane_output_verbatim_without_alt_sc
             .windows(b"\x1b[?1049h".len())
             .any(|window| window == b"\x1b[?1049h"),
         "passthrough must not put the host terminal into alt-screen, got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+
+    closing.store(true, std::sync::atomic::Ordering::SeqCst);
+    peer.shutdown().await.expect("close peer");
+    let _ = tokio::time::timeout(Duration::from_secs(2), attach_task)
+        .await
+        .expect("attach task join did not time out");
+}
+
+#[tokio::test]
+async fn forward_attach_passthrough_replays_target_on_attach_control_switch() {
+    let handler = Arc::new(RequestHandler::new());
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let session_name = SessionName::new("alpha").expect("valid session name");
+
+    let pane_output_one = pane_output_channel();
+    let pane_output_two = pane_output_channel();
+    let pty_one = PtyPair::open().expect("open pty pair 1");
+    let pty_two = PtyPair::open().expect("open pty pair 2");
+
+    let target_one = AttachTarget {
+        session_name: session_name.clone(),
+        pane_master: pty_one.into_master(),
+        pane_output: pane_output_one.clone(),
+        render_frame: Vec::new(),
+        outer_terminal: OuterTerminal::resolve(
+            &OptionStore::default(),
+            OuterTerminalContext::default(),
+        ),
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: None,
+    };
+    let target_two = AttachTarget {
+        session_name: session_name.clone(),
+        pane_master: pty_two.into_master(),
+        pane_output: pane_output_two.clone(),
+        // A distinctive render_frame for window 2 so we can prove the
+        // switch handler used the new target's bytes (not stale ones).
+        render_frame: b"WINDOW-TWO-PAINT".to_vec(),
+        outer_terminal: OuterTerminal::resolve(
+            &OptionStore::default(),
+            OuterTerminalContext::default(),
+        ),
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: None,
+    };
+
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let live_input = LiveAttachInputContext {
+        handler,
+        attach_pid: std::process::id(),
+    };
+
+    let attach_task = tokio::spawn(forward_attach_passthrough(
+        stream,
+        target_one,
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        closing.clone(),
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+    ));
+
+    // Trigger a switch and let the loop process it.
+    control_tx
+        .send(AttachControl::switch(target_two))
+        .expect("switch send");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Once switched, output on window 2's channel must reach the
+    // client; output on window 1's channel must not.
+    let _ = pane_output_two.send(b"WINDOW-TWO-OUTPUT".to_vec());
+    let _ = pane_output_one.send(b"STALE-WINDOW-ONE".to_vec());
+
+    let mut collected = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while collected
+        .windows(b"WINDOW-TWO-OUTPUT".len())
+        .all(|window| window != b"WINDOW-TWO-OUTPUT")
+    {
+        let mut buf = [0_u8; 4096];
+        let read = tokio::time::timeout(deadline - tokio::time::Instant::now(), peer.read(&mut buf))
+            .await
+            .expect("peer read should not time out")
+            .expect("peer read");
+        if read == 0 {
+            break;
+        }
+        let mut decoder = AttachFrameDecoder::new();
+        decoder.push_bytes(&buf[..read]);
+        while let Some(AttachMessage::Data(bytes)) =
+            decoder.next_message().expect("decode attach frame")
+        {
+            collected.extend_from_slice(&bytes);
+        }
+    }
+
+    let contains = |needle: &[u8]| {
+        collected
+            .windows(needle.len())
+            .any(|window| window == needle)
+    };
+    assert!(
+        contains(b"WINDOW-TWO-PAINT"),
+        "switch must emit new target's render_frame, got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        contains(b"\x1b[2J"),
+        "switch must clear the host screen before painting the new target, got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        contains(b"WINDOW-TWO-OUTPUT"),
+        "post-switch pane output must reach the client, got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        !contains(b"STALE-WINDOW-ONE"),
+        "output on the previous window's channel must not reach the client after switch, got: {:?}",
         String::from_utf8_lossy(&collected)
     );
 

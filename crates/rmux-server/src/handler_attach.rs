@@ -602,6 +602,7 @@ fn attach_target_for_session_with_prompt(
         kitty_graphics_passthrough,
         persistent_overlay_state_id: None,
         live_pane,
+        active_pane_id: active_pane.as_ref().map(|pane| pane.id()),
     })
 }
 

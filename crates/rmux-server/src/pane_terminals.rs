@@ -89,6 +89,10 @@ pub(crate) struct HandlerState {
     terminals: PaneTerminalStore,
     transcripts: HashMap<SessionName, HashMap<PaneId, SharedPaneTranscript>>,
     pane_outputs: HashMap<SessionName, HashMap<PaneId, PaneOutputSender>>,
+    /// Per-pane replay logs, populated only for panes whose session has
+    /// `passthrough = on`. Used by the passthrough attach forwarder to
+    /// reproduce a window's recent state on (re)attach or window switch.
+    replay_logs: HashMap<SessionName, HashMap<PaneId, crate::passthrough_replay::SharedPassthroughReplayLog>>,
     pane_output_generations: HashMap<SessionName, HashMap<PaneId, u64>>,
     pane_lifecycle: HashMap<PaneId, PaneLifecycleState>,
     attached_submitted_rows: HashMap<SessionName, HashMap<PaneId, AttachedSubmittedLine>>,

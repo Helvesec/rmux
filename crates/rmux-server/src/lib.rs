@@ -81,6 +81,9 @@ mod pane_terminals;
 mod pane_transcript;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
+mod passthrough_replay;
+#[cfg(any(unix, windows))]
+#[cfg_attr(windows, allow(dead_code))]
 mod renderer;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]

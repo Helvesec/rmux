@@ -392,6 +392,18 @@ impl RequestHandler {
         rmux_core::is_passthrough_session(&state.options, session_name)
     }
 
+    /// Looks up the per-pane passthrough replay log without allocating.
+    /// Used by the passthrough attach forwarder on attach and window
+    /// switch to reproduce the active pane's recent history.
+    pub(crate) async fn passthrough_log_for_pane(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        pane_id: rmux_core::PaneId,
+    ) -> Option<crate::passthrough_replay::SharedPassthroughReplayLog> {
+        let state = self.state.lock().await;
+        state.passthrough_log_lookup(session_name, pane_id)
+    }
+
     pub(crate) fn install_shutdown_handle(&self, shutdown_handle: ShutdownHandle) {
         *self
             .shutdown_handle

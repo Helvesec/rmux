@@ -268,6 +268,41 @@ impl HandlerState {
         (receiver, sender)
     }
 
+    /// Returns the per-pane replay log for a passthrough session,
+    /// allocating one the first time it's requested. Returns `None`
+    /// when the session is not in passthrough mode — non-passthrough
+    /// panes pay no memory cost.
+    pub(crate) fn passthrough_log_for_pane(
+        &mut self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> Option<crate::passthrough_replay::SharedPassthroughReplayLog> {
+        if !rmux_core::is_passthrough_session(&self.options, session_name) {
+            return None;
+        }
+        let entry = self
+            .replay_logs
+            .entry(session_name.clone())
+            .or_default()
+            .entry(pane_id)
+            .or_insert_with(|| crate::passthrough_replay::new_shared_log(&self.options));
+        Some(entry.clone())
+    }
+
+    /// Looks up the existing replay log for a pane without allocating.
+    /// Used by the attach forwarder to grab the active pane's log on
+    /// attach or window switch.
+    pub(crate) fn passthrough_log_lookup(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> Option<crate::passthrough_replay::SharedPassthroughReplayLog> {
+        self.replay_logs
+            .get(session_name)
+            .and_then(|panes| panes.get(&pane_id))
+            .cloned()
+    }
+
     pub(crate) fn session_pane_outputs(
         &self,
         session_name: &SessionName,
@@ -357,6 +392,7 @@ impl HandlerState {
             );
         }
         self.clear_attached_submitted_line(session_name, pane_id);
+        let replay_log = self.passthrough_log_for_pane(session_name, pane_id);
         spawn_pane_output_reader(
             session_name.clone(),
             pane_id,
@@ -366,6 +402,7 @@ impl HandlerState {
             Some(generation),
             spawn.pane_alert_callback,
             spawn.pane_exit_callback,
+            replay_log,
         );
         Ok(())
     }
@@ -421,6 +458,7 @@ impl HandlerState {
             );
         }
         self.clear_attached_submitted_line(session_name, pane_id);
+        let replay_log = self.passthrough_log_for_pane(session_name, pane_id);
         spawn_pane_output_reader(
             session_name.clone(),
             pane_id,
@@ -430,6 +468,7 @@ impl HandlerState {
             Some(generation),
             spawn.pane_alert_callback,
             spawn.pane_exit_callback,
+            replay_log,
         );
         Ok(())
     }
