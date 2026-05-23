@@ -877,12 +877,18 @@ async fn passthrough_exit(
 /// Emits the active pane's recent state to the client on (re)attach.
 ///
 /// In a passthrough session this is the replay log's
-/// `[snapshot] ++ [raw]` when a log exists, falling back to the
-/// existing `render_frame` (a grid-derived repaint) when the log is
-/// empty or missing — e.g. on the very first attach before any
-/// inner-PTY bytes have arrived. Prefixed with an OSC title nudge
-/// so the host window/tab label carries the rmux session name
-/// until the inner program sets its own title.
+/// `[snapshot] ++ [raw]` when a log exists. When no log exists — e.g.
+/// the session was created in normal mode and then flipped to
+/// passthrough via `set-option`, so the pane never opened a replay
+/// log — we deliberately do **not** fall back to `render_frame`: that
+/// frame is built by the chrome-aware renderer and contains the
+/// status bar / borders. Painting it would flash chrome at the user
+/// despite passthrough mode promising none. A minimal SGR-reset +
+/// home + clear is enough; the inner program's next emit paints
+/// real content.
+///
+/// Prefixed with an OSC title nudge so the host tab label carries
+/// the rmux session name until the inner program sets its own.
 #[cfg(any(unix, windows))]
 async fn emit_initial_passthrough_state(
     stream: &LocalStream,
@@ -897,14 +903,16 @@ async fn emit_initial_passthrough_state(
     if let Some(replay) = passthrough_replay_bytes_for_target(current_target, live_input).await {
         emit_attach_bytes(stream, &replay).await
     } else {
-        emit_render_frame(
-            stream,
-            &current_target.outer_terminal,
-            &current_target.render_frame,
-        )
-        .await
+        emit_attach_bytes(stream, PASSTHROUGH_FALLBACK_RESET).await
     }
 }
+
+/// SGR reset → cursor home → erase screen. Used when a passthrough
+/// attach/switch has no replay log to paint and we explicitly do
+/// **not** want the chrome-laden `render_frame` (see
+/// [`emit_initial_passthrough_state`]).
+#[cfg(any(unix, windows))]
+const PASSTHROUGH_FALLBACK_RESET: &[u8] = b"\x1b[m\x1b[H\x1b[2J";
 
 /// Encodes an OSC 0 (set icon name + window title) sequence with a
 /// rmux-tagged session label. Emitted by the passthrough forwarder on
@@ -989,13 +997,10 @@ async fn switch_passthrough_target(
     if let Some(replay) = passthrough_replay_bytes_for_target(current_target, live_input).await {
         emit_attach_bytes(stream, &replay).await
     } else {
-        emit_attach_bytes(stream, b"\x1b[m\x1b[H\x1b[2J").await?;
-        emit_render_frame(
-            stream,
-            &current_target.outer_terminal,
-            &current_target.render_frame,
-        )
-        .await
+        // Same constraint as on first attach: do not paint
+        // `render_frame`, which would leak chrome from the
+        // non-passthrough renderer.
+        emit_attach_bytes(stream, PASSTHROUGH_FALLBACK_RESET).await
     }
 }
 

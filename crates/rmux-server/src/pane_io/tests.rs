@@ -858,13 +858,16 @@ async fn forward_attach_passthrough_replays_target_on_attach_control_switch() {
             .any(|window| window == needle)
     };
     assert!(
-        contains(b"WINDOW-TWO-PAINT"),
-        "switch must emit new target's render_frame, got: {:?}",
+        !contains(b"WINDOW-TWO-PAINT"),
+        "passthrough switch must NOT paint the chrome-laden render_frame; \
+         the renderer-built frame contains status bar / borders which contradict \
+         passthrough's no-chrome contract — got: {:?}",
         String::from_utf8_lossy(&collected)
     );
     assert!(
         contains(b"\x1b[2J"),
-        "switch must clear the host screen before painting the new target, got: {:?}",
+        "switch must clear the host screen so previous window's content \
+         doesn't bleed under, got: {:?}",
         String::from_utf8_lossy(&collected)
     );
     assert!(
