@@ -1958,3 +1958,94 @@ async fn pane_snapshot_revision_changes_after_clear_history() {
         "clearing scrollback must change the snapshot revision",
     );
 }
+
+#[tokio::test]
+async fn passthrough_session_rejects_split_window_with_typed_error() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    create_session(&handler, &alpha).await;
+
+    // Mark the session as passthrough via set-option (session scope).
+    let set = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Session(alpha.clone()),
+            option: OptionName::Passthrough,
+            value: "on".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(
+        matches!(set, rmux_proto::Response::SetOption(_)),
+        "set-option passthrough=on must succeed, got {set:?}"
+    );
+
+    let response = handler
+        .handle(Request::SplitWindow(SplitWindowRequest {
+            target: SplitWindowTarget::Session(alpha.clone()),
+            direction: SplitDirection::Vertical,
+            before: false,
+            environment: None,
+        }))
+        .await;
+    match response {
+        rmux_proto::Response::Error(error) => {
+            assert_eq!(
+                error.error.to_string(),
+                "split-window: not available in passthrough sessions"
+            );
+        }
+        other => panic!("expected error response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn passthrough_session_rejects_kill_pane_with_typed_error() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    create_session(&handler, &alpha).await;
+    let _set = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Session(alpha.clone()),
+            option: OptionName::Passthrough,
+            value: "on".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+
+    let target = PaneTarget::with_window(alpha.clone(), 0, 0);
+    let response = handler
+        .handle(Request::KillPane(KillPaneRequest {
+            target,
+            kill_all_except: false,
+        }))
+        .await;
+    match response {
+        rmux_proto::Response::Error(error) => {
+            assert_eq!(
+                error.error.to_string(),
+                "kill-pane: not available in passthrough sessions"
+            );
+        }
+        other => panic!("expected error response, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn non_passthrough_session_still_permits_split_window() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    create_session(&handler, &alpha).await;
+
+    let response = handler
+        .handle(Request::SplitWindow(SplitWindowRequest {
+            target: SplitWindowTarget::Session(alpha.clone()),
+            direction: SplitDirection::Vertical,
+            before: false,
+            environment: None,
+        }))
+        .await;
+    assert!(
+        matches!(response, rmux_proto::Response::SplitWindow(_)),
+        "split-window in a non-passthrough session must succeed, got {response:?}",
+    );
+}

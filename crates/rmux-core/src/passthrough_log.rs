@@ -17,13 +17,53 @@
 //! the snapshot horizon is gone — accepted trade-off, since the host
 //! terminal's own scrollback covers the live stream depth.
 
+use rmux_proto::{OptionName, RmuxError};
+
 use crate::grid::GridRenderOptions;
+use crate::identity::SessionName;
+use crate::options::OptionStore;
 use crate::screen::Screen;
 use crate::transcript::ScreenCaptureRange;
 
 /// Default per-window replay budget (1 MiB) — typically holds hours of a
 /// streaming TUI like `claude`.
 pub const DEFAULT_PASSTHROUGH_REPLAY_BUDGET: usize = 1024 * 1024;
+
+/// Returns true if `session_name` resolves the `passthrough` option to `on`.
+///
+/// A session in passthrough mode has different attach semantics (no
+/// alt-screen on the host terminal, no chrome, inner PTY bytes forwarded
+/// verbatim) and disallows pane operations entirely. The option is set at
+/// session creation and is treated as immutable thereafter.
+#[must_use]
+pub fn is_passthrough_session(options: &OptionStore, session_name: &SessionName) -> bool {
+    matches!(
+        options.resolve(Some(session_name), OptionName::Passthrough),
+        Some("on")
+    )
+}
+
+/// Returns `Err` if the addressed session is in passthrough mode, with an
+/// error message naming the rejected operation.
+///
+/// Use this at the top of pane-operation handlers (split-window,
+/// select-pane, swap-pane, kill-pane, break-pane, join-pane, pipe-pane,
+/// resize-pane, display-panes, select-layout, next-layout,
+/// previous-layout) so passthrough sessions get a stable rejection
+/// instead of silently corrupting their single-pane invariants.
+pub fn reject_pane_op_if_passthrough(
+    options: &OptionStore,
+    session_name: &SessionName,
+    op: &str,
+) -> Result<(), RmuxError> {
+    if is_passthrough_session(options, session_name) {
+        Err(RmuxError::Message(format!(
+            "{op}: not available in passthrough sessions"
+        )))
+    } else {
+        Ok(())
+    }
+}
 
 /// A bounded byte log that survives mid-stream truncation by replacing the
 /// dropped prefix with a snapshot of the screen state at truncation time.
@@ -258,6 +298,60 @@ mod tests {
         assert_eq!(log.raw_log_len(), 0);
         assert_eq!(log.snapshot_len(), 0);
         assert!(log.replay_bytes().is_empty());
+    }
+
+    #[test]
+    fn is_passthrough_session_is_false_when_option_unset() {
+        let store = OptionStore::new();
+        let session = SessionName::new("alpha").expect("valid name");
+        assert!(!is_passthrough_session(&store, &session));
+    }
+
+    #[test]
+    fn is_passthrough_session_is_true_when_session_option_set_to_on() {
+        use rmux_proto::SetOptionMode;
+        let mut store = OptionStore::new();
+        let session = SessionName::new("alpha").expect("valid name");
+        store
+            .set(
+                rmux_proto::ScopeSelector::Session(session.clone()),
+                OptionName::Passthrough,
+                "on".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("set ok");
+        assert!(is_passthrough_session(&store, &session));
+    }
+
+    #[test]
+    fn reject_pane_op_passes_for_non_passthrough_sessions() {
+        let store = OptionStore::new();
+        let session = SessionName::new("alpha").expect("valid name");
+        reject_pane_op_if_passthrough(&store, &session, "split-window")
+            .expect("non-passthrough should allow split-window");
+    }
+
+    #[test]
+    fn reject_pane_op_errors_with_op_name_for_passthrough_sessions() {
+        use rmux_proto::SetOptionMode;
+        let mut store = OptionStore::new();
+        let session = SessionName::new("alpha").expect("valid name");
+        store
+            .set(
+                rmux_proto::ScopeSelector::Session(session.clone()),
+                OptionName::Passthrough,
+                "on".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("set ok");
+        let error = reject_pane_op_if_passthrough(&store, &session, "split-window")
+            .expect_err("passthrough must reject");
+        assert_eq!(
+            error,
+            RmuxError::Message(
+                "split-window: not available in passthrough sessions".to_owned()
+            )
+        );
     }
 
     #[test]
