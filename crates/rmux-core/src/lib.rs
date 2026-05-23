@@ -26,6 +26,7 @@ mod layout;
 mod lifecycle;
 mod options;
 mod pane;
+mod passthrough_log;
 mod screen;
 mod session;
 pub mod style;
@@ -71,6 +72,9 @@ pub use options::{
     ShowOptionsMode,
 };
 pub use pane::{Pane, PaneGeometry};
+pub use passthrough_log::{
+    render_screen_snapshot, PassthroughReplayLog, DEFAULT_PASSTHROUGH_REPLAY_BUDGET,
+};
 pub use screen::{Screen, ScreenCellView, ScreenLineView};
 pub use session::{
     BreakPaneOptions, KillPaneOutcome, PaneJoinOptions, PaneSwapOptions, Session,
