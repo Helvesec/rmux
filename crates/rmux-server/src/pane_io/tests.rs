@@ -894,6 +894,111 @@ async fn forward_attach_passthrough_replays_target_on_attach_control_switch() {
 }
 
 #[tokio::test]
+async fn forward_attach_passthrough_never_paints_render_frame_or_alt_screen() {
+    // Simulates the flip-mid-life path: a session was created in
+    // normal mode and accumulated a chrome-laden render_frame; the
+    // user then set `passthrough on`; on attach the forwarder must
+    // *not* paint that frame, and must never emit alt-screen enter.
+    let handler = Arc::new(RequestHandler::new());
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let session_name = SessionName::new("alpha").expect("valid session name");
+
+    // Build a render_frame that contains *both* chrome (status-bar
+    // sentinel) and an alt-screen enter — so any leak is loud.
+    let mut chrome_frame = Vec::new();
+    chrome_frame.extend_from_slice(b"\x1b[?1049h"); // alt-screen enter
+    chrome_frame.extend_from_slice(b"CHROME_STATUS_BAR_LEAK");
+
+    let pty = PtyPair::open().expect("open pty pair");
+    let target = AttachTarget {
+        session_name: session_name.clone(),
+        pane_master: pty.into_master(),
+        pane_output: pane_output_channel(),
+        render_frame: chrome_frame.clone(),
+        outer_terminal: OuterTerminal::resolve(
+            &OptionStore::default(),
+            OuterTerminalContext::default(),
+        ),
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: None,
+    };
+
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let live_input = LiveAttachInputContext {
+        handler,
+        attach_pid: std::process::id(),
+    };
+
+    let attach_task = tokio::spawn(forward_attach_passthrough(
+        stream,
+        target,
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        closing.clone(),
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+    ));
+
+    // Give the forwarder time to emit its initial state, then detach.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    control_tx
+        .send(AttachControl::Detach)
+        .expect("send detach control");
+    let _ = tokio::time::timeout(Duration::from_secs(2), attach_task).await;
+
+    let mut collected = Vec::new();
+    let mut buf = [0_u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(50), peer.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(read)) => {
+                let mut decoder = AttachFrameDecoder::new();
+                decoder.push_bytes(&buf[..read]);
+                while let Some(AttachMessage::Data(bytes)) =
+                    decoder.next_message().expect("decode attach frame")
+                {
+                    collected.extend_from_slice(&bytes);
+                }
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+
+    let contains = |needle: &[u8]| {
+        collected
+            .windows(needle.len())
+            .any(|window| window == needle)
+    };
+    assert!(
+        !contains(b"CHROME_STATUS_BAR_LEAK"),
+        "passthrough forwarder must NOT paint the supplied render_frame; \
+         that frame comes from the chrome-aware renderer and contains the \
+         status bar. Got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        !contains(b"\x1b[?1049h"),
+        "passthrough forwarder must NEVER emit alt-screen enter from its \
+         own bytes; host scrollback would silently break. Got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        contains(b"\x1b]0;rmux: alpha\x07"),
+        "passthrough forwarder must still emit the rmux-tagged title \
+         sequence on attach, got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+}
+
+#[tokio::test]
 async fn forward_attach_passthrough_emits_stop_sequence_on_detach() {
     let handler = Arc::new(RequestHandler::new());
     let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
@@ -947,7 +1052,7 @@ async fn forward_attach_passthrough_emits_stop_sequence_on_detach() {
         .send(AttachControl::Detach)
         .expect("send detach control");
 
-    let _ = tokio::time::timeout(Duration::from_secs(2), attach_task)
+    tokio::time::timeout(Duration::from_secs(2), attach_task)
         .await
         .expect("attach task should exit within 2s after Detach")
         .expect("attach task join")

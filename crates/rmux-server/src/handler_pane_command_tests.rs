@@ -2078,3 +2078,60 @@ async fn passthrough_set_option_is_observed_by_is_session_passthrough() {
         "session must be passthrough after the option is set",
     );
 }
+
+#[tokio::test]
+async fn passthrough_option_can_be_flipped_back_off() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    create_session(&handler, &alpha).await;
+    let on = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Session(alpha.clone()),
+            option: OptionName::Passthrough,
+            value: "on".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(on, rmux_proto::Response::SetOption(_)), "{on:?}");
+    assert!(handler.is_session_passthrough(&alpha).await);
+    let off = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Session(alpha.clone()),
+            option: OptionName::Passthrough,
+            value: "off".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(off, rmux_proto::Response::SetOption(_)), "{off:?}");
+    assert!(
+        !handler.is_session_passthrough(&alpha).await,
+        "set-option passthrough=off must restore non-passthrough lookup",
+    );
+}
+
+#[tokio::test]
+async fn passthrough_option_is_session_scoped_not_global() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    create_session(&handler, &alpha).await;
+    create_session(&handler, &beta).await;
+    let set = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Session(alpha.clone()),
+            option: OptionName::Passthrough,
+            value: "on".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(set, rmux_proto::Response::SetOption(_)), "{set:?}");
+    assert!(
+        handler.is_session_passthrough(&alpha).await,
+        "alpha must be passthrough after its own set-option",
+    );
+    assert!(
+        !handler.is_session_passthrough(&beta).await,
+        "beta must stay non-passthrough — the option set targeted only alpha. \
+         If this assert ever fires, the option scope leaked across sessions.",
+    );
+}

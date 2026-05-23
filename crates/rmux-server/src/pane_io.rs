@@ -791,14 +791,30 @@ pub(crate) async fn forward_attach_passthrough(
                 TrySocketRead::WouldBlock => break,
             }
         }
-        process_socket_messages(
+        if let Err(error) = process_socket_messages(
             &mut decoder,
             &stream,
             &live_input,
             &mut pending_input,
             &mut locked,
         )
-        .await?;
+        .await
+        {
+            // Surface the failing socket-message phase before
+            // bubbling. Without this the listener sees a bare
+            // `io::Error` and the user sees nothing — that's the
+            // shape that triggered the original "session dies with
+            // no info" report.
+            tracing::warn!(
+                error = %error,
+                session = %current_target.session_name,
+                "passthrough attach forwarder: socket message processing failed; tearing down",
+            );
+            // Emit attach-stop best-effort so the client teardown
+            // is clean even on the error path.
+            let _ = emit_attach_stop(&stream, &current_target).await;
+            return Err(error);
+        }
 
         tokio::select! {
             biased;
@@ -895,15 +911,40 @@ async fn emit_initial_passthrough_state(
     current_target: &super::pane_io::types::OpenAttachTarget,
     live_input: &LiveAttachInputContext,
 ) -> io::Result<()> {
-    emit_attach_bytes(
-        stream,
-        &passthrough_title_sequence(&current_target.session_name),
-    )
-    .await?;
+    let title = passthrough_title_sequence(&current_target.session_name);
+    debug_assert!(
+        !contains_alt_screen_enter_dbg(&title),
+        "passthrough title sequence must not contain alt-screen-enter; \
+         host scrollback would break. title = {title:?}",
+    );
+    emit_attach_bytes(stream, &title).await?;
     if let Some(replay) = passthrough_replay_bytes_for_target(current_target, live_input).await {
+        // Replay bytes are the inner PTY's own emissions; vim et al
+        // legitimately toggle alt-screen here. No assert.
         emit_attach_bytes(stream, &replay).await
     } else {
+        debug_assert!(
+            !contains_alt_screen_enter_dbg(PASSTHROUGH_FALLBACK_RESET),
+            "PASSTHROUGH_FALLBACK_RESET must stay chrome-free",
+        );
         emit_attach_bytes(stream, PASSTHROUGH_FALLBACK_RESET).await
+    }
+}
+
+/// Shim so the assert site stays compilable in release builds (where
+/// `contains_alt_screen_enter` is `cfg(debug_assertions)`-gated).
+/// The compiler elides this and the wrapping `debug_assert!` in
+/// release, so there's no runtime cost.
+#[cfg(any(unix, windows))]
+#[inline]
+fn contains_alt_screen_enter_dbg(_bytes: &[u8]) -> bool {
+    #[cfg(debug_assertions)]
+    {
+        contains_alt_screen_enter(_bytes)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
     }
 }
 
@@ -913,6 +954,27 @@ async fn emit_initial_passthrough_state(
 /// [`emit_initial_passthrough_state`]).
 #[cfg(any(unix, windows))]
 const PASSTHROUGH_FALLBACK_RESET: &[u8] = b"\x1b[m\x1b[H\x1b[2J";
+
+/// Alt-screen *enter* sequence. Forwarded inner-PTY bytes may
+/// legitimately contain this (vim, less, htop all toggle alt-screen
+/// when run *inside* a passthrough session — that's the user's call).
+/// But rmux's own server-generated frames must never contain it, or
+/// passthrough mode would silently break the host-scrollback promise.
+/// Used by debug asserts at the boundary between server-generated and
+/// inner-forwarded bytes.
+#[cfg(all(any(unix, windows), debug_assertions))]
+const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
+
+/// Returns true if `bytes` contains the alt-screen-enter sequence.
+/// Used by debug asserts inside the passthrough forwarder to catch
+/// any future code that accidentally emits chrome from the server
+/// side instead of forwarding it from the inner PTY.
+#[cfg(all(any(unix, windows), debug_assertions))]
+fn contains_alt_screen_enter(bytes: &[u8]) -> bool {
+    bytes
+        .windows(ALT_SCREEN_ENTER.len())
+        .any(|window| window == ALT_SCREEN_ENTER)
+}
 
 /// Encodes an OSC 0 (set icon name + window title) sequence with a
 /// rmux-tagged session label. Emitted by the passthrough forwarder on
@@ -984,11 +1046,13 @@ async fn switch_passthrough_target(
     // away from a TUI that set its own title (e.g. `claude`) doesn't
     // leave that title stuck on the new window. The new window's
     // inner program will override on its next emit.
-    emit_attach_bytes(
-        stream,
-        &passthrough_title_sequence(&current_target.session_name),
-    )
-    .await?;
+    let title = passthrough_title_sequence(&current_target.session_name);
+    debug_assert!(
+        !contains_alt_screen_enter_dbg(&title),
+        "passthrough title sequence must not contain alt-screen-enter; \
+         host scrollback would break. title = {title:?}",
+    );
+    emit_attach_bytes(stream, &title).await?;
     // The replay log's snapshot already contains a reset prefix
     // (?1049l, soft reset, SGR0, clear, home) so we don't need an
     // explicit clear here when a log is present. When no log exists,
@@ -1000,6 +1064,10 @@ async fn switch_passthrough_target(
         // Same constraint as on first attach: do not paint
         // `render_frame`, which would leak chrome from the
         // non-passthrough renderer.
+        debug_assert!(
+            !contains_alt_screen_enter_dbg(PASSTHROUGH_FALLBACK_RESET),
+            "PASSTHROUGH_FALLBACK_RESET must stay chrome-free",
+        );
         emit_attach_bytes(stream, PASSTHROUGH_FALLBACK_RESET).await
     }
 }
