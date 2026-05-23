@@ -810,9 +810,11 @@ pub(crate) async fn forward_attach_passthrough(
                 session = %current_target.session_name,
                 "passthrough attach forwarder: socket message processing failed; tearing down",
             );
-            // Emit attach-stop best-effort so the client teardown
-            // is clean even on the error path.
-            let _ = emit_attach_stop(&stream, &current_target).await;
+            // Emit the detached banner so the client recognises the
+            // teardown — same rationale as `passthrough_exit`: we
+            // do NOT use `attach_stop_sequence` because it would
+            // clear the host screen.
+            let _ = emit_detached_message(&stream, &current_target).await;
             return Err(error);
         }
 
@@ -870,23 +872,46 @@ pub(crate) async fn forward_attach_passthrough(
     }
 }
 
-/// Common shutdown path for [`forward_attach_passthrough`]. Emits the
-/// outer-terminal attach-stop sequence (so the client recognises the
-/// teardown instead of erroring with "stream closed before attach-stop"),
-/// logs the trigger, and returns `Ok(())`.
+/// Common shutdown path for [`forward_attach_passthrough`]. Emits a
+/// user-readable banner that *also* serves as the client's stop
+/// sentinel — see `AttachStopDetector` in `rmux-client`. Logs the
+/// trigger and returns `Ok(())`.
 ///
-/// `emit_attach_stop` failures are intentionally swallowed: by the time
-/// we're tearing down the connection, the peer may have closed already
-/// and the write will fail with `BrokenPipe` / `ConnectionReset`. That's
-/// a benign race, not something to escalate.
+/// We deliberately do **not** use `emit_attach_stop` here: that
+/// emits the outer-terminal `attach_stop_sequence`, which includes
+/// `\x1b[H\x1b[2J\x1b[?1049l` — clear screen + leave alt-screen.
+/// In passthrough mode we were never in alt-screen, so leaving it
+/// is a no-op; but clearing the screen on detach *destroys* the
+/// inner program's output that the user wanted preserved in host
+/// scrollback. That made passthrough sessions look like they
+/// silently swallowed everything they wrote.
+///
+/// The `[detached (from session …)]` and `[exited]` banners are
+/// plain ASCII the user sees in their terminal, leaving their
+/// pre-attach scrollback fully visible above. The client's
+/// `AttachStopDetector` watches for either banner and treats them
+/// as a clean stop signal.
+///
+/// Best-effort: write failures are swallowed because by the time
+/// we're tearing down, the peer may have closed (BrokenPipe /
+/// ConnectionReset). That's a benign race.
 #[cfg(any(unix, windows))]
 async fn passthrough_exit(
     stream: &LocalStream,
     current_target: &types::OpenAttachTarget,
     reason: &'static str,
 ) -> io::Result<()> {
-    debug!(reason, session = %current_target.session_name, "passthrough attach forwarder exiting");
-    let _ = emit_attach_stop(stream, current_target).await;
+    debug!(
+        reason,
+        session = %current_target.session_name,
+        "passthrough attach forwarder exiting",
+    );
+    let write_result = if reason == "pane exited" {
+        emit_exited_message(stream).await
+    } else {
+        emit_detached_message(stream, current_target).await
+    };
+    let _ = write_result;
     Ok(())
 }
 
@@ -948,12 +973,27 @@ fn contains_alt_screen_enter_dbg(_bytes: &[u8]) -> bool {
     }
 }
 
-/// SGR reset → cursor home → erase screen. Used when a passthrough
-/// attach/switch has no replay log to paint and we explicitly do
-/// **not** want the chrome-laden `render_frame` (see
-/// [`emit_initial_passthrough_state`]).
+/// SGR reset only. Used when a passthrough attach/switch has no
+/// replay log to paint and we explicitly do **not** want the
+/// chrome-laden `render_frame` (see [`emit_initial_passthrough_state`]).
+///
+/// We deliberately do **not** include `\x1b[H` (cursor home) or
+/// `\x1b[2J` (erase screen): passthrough's whole point is to leave
+/// the host terminal's main screen buffer alone so the user's
+/// pre-attach scrollback is preserved. Clearing the visible region
+/// would contradict that promise and make `rmux new-session
+/// --passthrough` look like it "ate" the user's terminal — which is
+/// exactly what made the recent "session stops instantly with no
+/// output" report so opaque (whatever rmux wrote got erased by
+/// `\x1b[2J` before the user could read it).
+///
+/// The inner program's next emit (typically a shell prompt) is what
+/// the user sees first. If the inner program crashes before printing
+/// anything, the user is left looking at their pre-attach context —
+/// which is fine: the CLI prints a `[rmux: detached …]` line on the
+/// way out so the transition is obvious.
 #[cfg(any(unix, windows))]
-const PASSTHROUGH_FALLBACK_RESET: &[u8] = b"\x1b[m\x1b[H\x1b[2J";
+const PASSTHROUGH_FALLBACK_RESET: &[u8] = b"\x1b[m";
 
 /// Alt-screen *enter* sequence. Forwarded inner-PTY bytes may
 /// legitimately contain this (vim, less, htop all toggle alt-screen
@@ -1061,16 +1101,26 @@ async fn switch_passthrough_target(
     if let Some(replay) = passthrough_replay_bytes_for_target(current_target, live_input).await {
         emit_attach_bytes(stream, &replay).await
     } else {
-        // Same constraint as on first attach: do not paint
-        // `render_frame`, which would leak chrome from the
-        // non-passthrough renderer.
+        // On *switch* the screen still has the previous window's
+        // content; we must clear before painting the new window or
+        // the old content bleeds under. Different from the initial
+        // attach path, which deliberately preserves host scrollback.
+        // Still chrome-free — no `render_frame`.
         debug_assert!(
-            !contains_alt_screen_enter_dbg(PASSTHROUGH_FALLBACK_RESET),
-            "PASSTHROUGH_FALLBACK_RESET must stay chrome-free",
+            !contains_alt_screen_enter_dbg(PASSTHROUGH_SWITCH_RESET),
+            "PASSTHROUGH_SWITCH_RESET must stay chrome-free",
         );
-        emit_attach_bytes(stream, PASSTHROUGH_FALLBACK_RESET).await
+        emit_attach_bytes(stream, PASSTHROUGH_SWITCH_RESET).await
     }
 }
+
+/// SGR reset → cursor home → erase screen. Used on a passthrough
+/// *window switch* when the new window has no replay log. Unlike
+/// [`PASSTHROUGH_FALLBACK_RESET`] (initial attach), this clears the
+/// previous window's content so it doesn't bleed under the new
+/// window's first emit.
+#[cfg(any(unix, windows))]
+const PASSTHROUGH_SWITCH_RESET: &[u8] = b"\x1b[m\x1b[H\x1b[2J";
 
 #[cfg(any(unix, windows))]
 async fn process_socket_messages(

@@ -996,10 +996,19 @@ async fn forward_attach_passthrough_never_paints_render_frame_or_alt_screen() {
          sequence on attach, got: {:?}",
         String::from_utf8_lossy(&collected)
     );
+    assert!(
+        !contains(b"\x1b[2J"),
+        "passthrough INITIAL attach must NOT clear the host screen — \
+         that's a regression of the 'preserve host scrollback' promise. \
+         (Switching between windows IS allowed to clear, but the first \
+          attach must leave the user's pre-attach scrollback visible.) \
+         Got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
 }
 
 #[tokio::test]
-async fn forward_attach_passthrough_emits_stop_sequence_on_detach() {
+async fn forward_attach_passthrough_emits_detached_banner_on_detach() {
     let handler = Arc::new(RequestHandler::new());
     let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
     let session_name = SessionName::new("alpha").expect("valid session name");
@@ -1008,11 +1017,6 @@ async fn forward_attach_passthrough_emits_stop_sequence_on_detach() {
     let pty = PtyPair::open().expect("open pty pair");
     let outer_terminal =
         OuterTerminal::resolve(&OptionStore::default(), OuterTerminalContext::default());
-    let expected_stop = outer_terminal.attach_stop_sequence();
-    assert!(
-        !expected_stop.is_empty(),
-        "test invariant: outer terminal must produce a non-empty stop sequence for this assertion to be meaningful — adjust the fixture if defaults changed",
-    );
     let target = AttachTarget {
         session_name: session_name.clone(),
         pane_master: pty.into_master(),
@@ -1080,12 +1084,29 @@ async fn forward_attach_passthrough_emits_stop_sequence_on_detach() {
             Ok(Err(_)) | Err(_) => break,
         }
     }
+    let banner_prefix = b"[detached (from session alpha)]";
     assert!(
         collected
-            .windows(expected_stop.len())
-            .any(|window| window == expected_stop),
-        "passthrough forwarder must emit attach-stop sequence ({:?}) on Detach; got: {:?}",
-        String::from_utf8_lossy(&expected_stop),
+            .windows(banner_prefix.len())
+            .any(|window| window == banner_prefix),
+        "passthrough forwarder must emit the user-readable detached banner on Detach; \
+         got: {:?}",
+        String::from_utf8_lossy(&collected),
+    );
+    assert!(
+        !collected
+            .windows(b"\x1b[2J".len())
+            .any(|window| window == b"\x1b[2J"),
+        "passthrough detach must NOT emit screen-clear; that would destroy the inner \
+         program's output that the user wanted preserved in host scrollback. Got: {:?}",
+        String::from_utf8_lossy(&collected),
+    );
+    assert!(
+        !collected
+            .windows(b"\x1b[?1049l".len())
+            .any(|window| window == b"\x1b[?1049l"),
+        "passthrough detach must NOT emit alt-screen exit — we were never in alt-screen. \
+         Got: {:?}",
         String::from_utf8_lossy(&collected),
     );
 }

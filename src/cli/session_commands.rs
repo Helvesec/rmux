@@ -97,10 +97,23 @@ pub(super) fn run_new_session(
     }
 
     if args.detached {
+        if args.passthrough {
+            eprintln!("rmux: session '{target}' created in passthrough mode (detached)");
+        }
         return Ok(0);
     }
 
-    match detect_context() {
+    // For passthrough sessions, print a one-line status to stderr both
+    // before and after attach so the user has *something* to read
+    // regardless of how the inner program behaves. If the shell
+    // crashes before printing anything, this is the only visible
+    // evidence that rmux even ran. stderr is used because it's
+    // unbuffered and not subject to terminal-reset side effects.
+    let passthrough_attach = args.passthrough;
+    if passthrough_attach {
+        eprintln!("rmux: attaching to '{target}' (passthrough mode, no chrome)");
+    }
+    let result = match detect_context() {
         ClientContext::Nested => run_switch_client_on_connection(
             &mut connection,
             SwitchClientExt3Request {
@@ -131,7 +144,23 @@ pub(super) fn run_new_session(
                 client_size,
             },
         ),
+    };
+    if passthrough_attach {
+        match &result {
+            Ok(code) => {
+                eprintln!(
+                    "rmux: detached from passthrough session '{target}' (exit {code})",
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "rmux: passthrough attach to '{target}' failed: {}",
+                    error.message(),
+                );
+            }
+        }
     }
+    result
 }
 
 fn current_working_directory_string() -> Option<String> {
