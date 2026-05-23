@@ -103,15 +103,23 @@ pub(super) fn run_new_session(
         return Ok(0);
     }
 
-    // For passthrough sessions, print a one-line status to stderr both
-    // before and after attach so the user has *something* to read
-    // regardless of how the inner program behaves. If the shell
-    // crashes before printing anything, this is the only visible
-    // evidence that rmux even ran. stderr is used because it's
-    // unbuffered and not subject to terminal-reset side effects.
+    // For passthrough sessions, print a status line both before and
+    // after attach so the user has *something* to read regardless of
+    // how the inner program behaves.
+    //
+    // We write directly to /dev/tty (with stderr as fallback) because:
+    // - the inner program commonly runs `clear` on startup (zsh,
+    //   fish, ... — they all `\x1b[H\x1b[2J` to a fresh terminal),
+    //   which wipes anything we wrote to stderr before attach;
+    // - stderr may be redirected by the user (`2>/tmp/log`) — they'd
+    //   still want to see *that the session ended* in the terminal;
+    // - writing through /dev/tty pierces both of those and lands
+    //   visibly in the user's terminal.
     let passthrough_attach = args.passthrough;
     if passthrough_attach {
-        eprintln!("rmux: attaching to '{target}' (passthrough mode, no chrome)");
+        write_tty_line(&format!(
+            "rmux: attaching to '{target}' (passthrough mode, no chrome)",
+        ));
     }
     let result = match detect_context() {
         ClientContext::Nested => run_switch_client_on_connection(
@@ -147,20 +155,40 @@ pub(super) fn run_new_session(
     };
     if passthrough_attach {
         match &result {
-            Ok(code) => {
-                eprintln!(
-                    "rmux: detached from passthrough session '{target}' (exit {code})",
-                );
-            }
-            Err(error) => {
-                eprintln!(
-                    "rmux: passthrough attach to '{target}' failed: {}",
-                    error.message(),
-                );
-            }
+            Ok(code) => write_tty_line(&format!(
+                "rmux: detached from passthrough session '{target}' (exit {code})",
+            )),
+            Err(error) => write_tty_line(&format!(
+                "rmux: passthrough attach to '{target}' failed: {}",
+                error.message(),
+            )),
         }
     }
     result
+}
+
+/// Writes `line` followed by `\r\n` to the controlling terminal.
+/// Falls back to stderr if `/dev/tty` is unavailable (e.g. the
+/// process has no controlling terminal — CI, daemon contexts).
+///
+/// **Why /dev/tty specifically:** the inner program at attach time
+/// typically clears the screen on startup (`zsh`, `fish` and most
+/// shells run something equivalent to `\x1b[H\x1b[2J`), wiping
+/// anything we wrote to stderr beforehand. /dev/tty is a
+/// process-controlling-terminal handle that bypasses both stderr
+/// redirection and screen-clear side effects: the bytes land
+/// directly on the terminal device. We also append `\r\n` instead
+/// of just `\n` so the line renders cleanly even if the terminal
+/// is still in raw mode when this runs.
+fn write_tty_line(line: &str) {
+    use std::io::Write;
+    if let Ok(mut tty) = std::fs::OpenOptions::new().write(true).open("/dev/tty") {
+        let _ = tty.write_all(line.as_bytes());
+        let _ = tty.write_all(b"\r\n");
+        let _ = tty.flush();
+    } else {
+        eprintln!("{line}");
+    }
 }
 
 fn current_working_directory_string() -> Option<String> {
