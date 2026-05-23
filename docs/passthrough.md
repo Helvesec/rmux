@@ -225,37 +225,58 @@ client`, `rename-session`, `rename-window`, `attach-session`,
   peer socket, asserts the bytes arrive verbatim and that the byte
   stream contains no `ESC [ ? 1049 h`.
 
-### Phase 3 — Multi-window replay (pending — the next big chunk)
+### Phase 3 — Multi-window replay (landed)
 
-The piece that turns single-window passthrough into a usable
-session. Comprises:
+* `passthrough_replay` server module wraps the core
+  `PassthroughReplayLog` in `Arc<Mutex<_>>` and resolves the
+  server-scope `passthrough-replay-bytes` option into the
+  per-pane budget on allocation.
+* `HandlerState` carries `replay_logs: HashMap<SessionName,
+  HashMap<PaneId, _>>`. `passthrough_log_for_pane` lazily allocates
+  on first request; returns `None` for non-passthrough sessions
+  (no memory cost in the existing flow).
+* `spawn_pane_output_reader` / `read_pane_output[_blocking]` take
+  an `Option<SharedPassthroughReplayLog>` and call
+  `append_to_log(log, transcript, bytes)` on every chunk before
+  `publish_pane_bytes`. On `over_budget`, the snapshot is refreshed
+  from the live `Screen` via `clone_screen()`.
+* `AttachTarget` gains `active_pane_id: Option<PaneId>` so the
+  forwarder can look up the right log without a reverse mapping.
+* `forward_attach_passthrough` now consumes `control_rx`:
+  - `Detach` / `Exited` / `DetachKill` → return.
+  - `Switch(next_target)` → `open_attach_target(next_target)`,
+    then either emit the new pane's `replay_bytes()` (which carries
+    its own reset prefix) or, if no log exists yet, fall back to a
+    minimal reset (`ESC[m ESC[H ESC[2J`) plus the new target's
+    `render_frame`. Pane-output subscription is now on the new
+    pane's channel; the old one is dropped.
+  - Other variants (Overlay, Write, Lock, Suspend, etc.) are
+    no-ops in passthrough.
+* Initial attach uses the log when populated, falling back to
+  `render_frame` only before the pane has emitted any bytes.
+* Test:
+  `forward_attach_passthrough_replays_target_on_attach_control_switch`
+  drives a `Switch` and asserts (a) new target's `render_frame`
+  reaches the client, (b) a host-screen clear precedes it,
+  (c) post-switch output on the new pane's channel reaches the
+  client, (d) output on the old channel doesn't leak through after
+  the switch.
 
-* Per-window `PassthroughReplayLog` allocation, stored alongside
-  the existing pane terminal state (`pane_terminals`).
-* Tee in `pane_io::reader::publish_pane_bytes` — also append every
-  raw byte slice to the active window's log; on `over_budget`
-  re-snapshot from `PaneTranscript::screen()` and clear the raw
-  buffer.
-* In `forward_attach_passthrough`, detect the active window of the
-  attached session at start; subscribe to that window's pane
-  output only. On `select-window` (or `Ctrl-b 0..9`, `n`, `p`),
-  detach from the current pane output cursor, emit a host-terminal
-  state reset + the new window's `PassthroughReplayLog::replay_bytes()`,
-  then re-subscribe to the new window's pane output.
-* Optional: SIGWINCH the new window's inner program with its
-  current size to coax lazy-redraw TUIs.
-
-### Phase 4 — Hardening (pending)
+### Phase 4 — Polish (pending, mostly cosmetic)
 
 * CLI flag: `new-session --passthrough` / `-P` (today the option is
   set after creation via `set-option`).
-* Optional OSC 0/2 title to surface the active window name when
-  multi-window mode is live (skipped for single-window: the inner
-  program already owns the title).
-* End-to-end test: window switch replay reproduces the visible
-  state of the previous window's last screen.
-* `passthrough-replay-bytes` option actually wired into log
-  allocation budgets.
+* SIGWINCH the new window's inner program with its current size
+  on switch to coax lazy-redraw TUIs into repainting (today they
+  just continue from whatever state they were in; usually fine for
+  streaming TUIs like `claude`, less fine for a paused `vim`).
+* Replay-budget cleanup hooks on pane / window / session removal
+  (today the log is leaked when the pane goes away — bounded by
+  one budget per dead pane, will collect itself on next server
+  restart but worth reaping properly).
+* Optional OSC 0/2 title to surface the active window name on
+  switch (currently the inner program owns the title — which is
+  often the right call).
 
 ## Out-of-scope follow-ups
 
