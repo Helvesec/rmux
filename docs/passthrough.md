@@ -201,47 +201,61 @@ client`, `rename-session`, `rename-window`, `attach-session`,
    - `handler::pane_command_tests::passthrough_session_rejects_*` —
      end-to-end via the handler dispatch (3 tests).
 
-### Phase 2 — Attach integration (pending)
+### Phase 2 — Single-window attach bypass (landed)
 
-The hard part. Requires a second attach codepath that bypasses
-`pane_io::forward_attach`'s renderer/overlay/status machinery:
+* `pane_io::forward_attach_passthrough` — sibling of `forward_attach`.
+  - No `attach_start_sequence` (no `?1049h`).
+  - No status, no overlay, no copy-mode, no pane switching.
+  - On attach: emits the pane's existing `render_frame` so the host
+    sees the inner program's current visible state immediately.
+  - Loop: drain socket reads non-blocking, then
+    `tokio::select!` on shutdown / pane output / blocking socket
+    read. Pane output bytes go verbatim to the client; socket
+    input flows through the existing `process_socket_messages`
+    helper (handles `Data`, `Keystroke`, `Resize`, `Lock/Unlock`,
+    same as the regular forwarder).
+* `RequestHandler::is_session_passthrough` — async helper, locks
+  state, resolves the option.
+* Listener routes attaches to `forward_attach_passthrough` when the
+  session is passthrough; existing forwarder stays the default.
+* Integration test:
+  `forward_attach_passthrough_forwards_pane_output_verbatim_without_alt_screen`
+  — drives the bypass with an empty `render_frame`, pushes
+  `"hello passthrough\r\n"` through `pane_output`, reads from the
+  peer socket, asserts the bytes arrive verbatim and that the byte
+  stream contains no `ESC [ ? 1049 h`.
 
-* Detect `is_passthrough_session` at the listener attach hand-off
-  (`listener.rs`, around the existing `pane_io::forward_attach`
-  call) and route to a new `forward_attach_passthrough`.
-* In that path:
-  - Do **not** emit `attach_start_sequence` (no `?1049h`).
-  - Skip render-frame emission, status bar, overlays.
-  - Replay the active window's `PassthroughReplayLog` to the socket
-    as a single frame, then resume verbatim forwarding from the
-    pane output channel.
-  - Continue feeding inner PTY bytes into both the screen grid (for
-    state tracking + future snapshots) and the per-window
-    `PassthroughReplayLog`.
-* On detach: nothing to undo on the host terminal — we never put it
-  in alt-screen.
+### Phase 3 — Multi-window replay (pending — the next big chunk)
 
-### Phase 3 — Window switch (pending)
+The piece that turns single-window passthrough into a usable
+session. Comprises:
 
-* On `select-window` in a passthrough session, the handler emits the
-  outer-state reset sequence + the new window's
-  `PassthroughReplayLog::replay_bytes()` over the socket.
-* Set OSC 0/2 title to `rmux: <session>/<window-name>` on attach,
-  switch, and rename.
-* SIGWINCH the new window's inner program with its current size to
-  coax lazy-redraw TUIs.
+* Per-window `PassthroughReplayLog` allocation, stored alongside
+  the existing pane terminal state (`pane_terminals`).
+* Tee in `pane_io::reader::publish_pane_bytes` — also append every
+  raw byte slice to the active window's log; on `over_budget`
+  re-snapshot from `PaneTranscript::screen()` and clear the raw
+  buffer.
+* In `forward_attach_passthrough`, detect the active window of the
+  attached session at start; subscribe to that window's pane
+  output only. On `select-window` (or `Ctrl-b 0..9`, `n`, `p`),
+  detach from the current pane output cursor, emit a host-terminal
+  state reset + the new window's `PassthroughReplayLog::replay_bytes()`,
+  then re-subscribe to the new window's pane output.
+* Optional: SIGWINCH the new window's inner program with its
+  current size to coax lazy-redraw TUIs.
 
 ### Phase 4 — Hardening (pending)
 
-* Per-window log allocation tied to the session option budget;
-  re-snapshot on overflow.
-* CLI flag: `new-session --passthrough` / `-P`.
-* End-to-end test: attach a passthrough session, inner program
-  emits ANSI bytes, assert the socket bytes are exactly the inner
-  bytes (no 1049h, no status row, no border) plus the snapshot
-  prefix.
+* CLI flag: `new-session --passthrough` / `-P` (today the option is
+  set after creation via `set-option`).
+* Optional OSC 0/2 title to surface the active window name when
+  multi-window mode is live (skipped for single-window: the inner
+  program already owns the title).
 * End-to-end test: window switch replay reproduces the visible
   state of the previous window's last screen.
+* `passthrough-replay-bytes` option actually wired into log
+  allocation budgets.
 
 ## Out-of-scope follow-ups
 
