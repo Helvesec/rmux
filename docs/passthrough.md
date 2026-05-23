@@ -176,30 +176,72 @@ client`, `rename-session`, `rename-window`, `attach-session`,
 
 ## Implementation plan
 
-1. **rmux-core**: add `WindowReplayLog` (snapshot bytes + raw log,
-   bounded). Implement `append(bytes, screen)` and `replay() ->
-   Vec<u8>`. Snapshot rendering reuses `TerminalScreen::capture_*`
-   plumbing with a reset-prefix option.
-2. **rmux-proto**: add `passthrough: bool` to session creation request;
-   add `passthrough-replay-bytes` option to the table.
-3. **rmux-server**: add `Session::is_passthrough()`. Plumb into:
-   - `forward_attach`: when `is_passthrough()`, take the bypass
-     codepath (no alt-screen, no render frame, no status, raw forward
-     + replay).
-   - Pane handlers: reject pane ops with a single helper.
-   - Window switch handlers: emit reset + replay sequence.
-   - `pane_terminals` reader: tee inner bytes into the window log.
-4. **rmux-server**: title-bar OSC emitter — runs on attach, window
-   switch, window rename.
-5. **rmux-client**: nothing client-side specific. The client already
-   forwards bytes from the socket straight to the host terminal; the
-   server simply sends raw bytes instead of render frames.
-6. **Tests**:
-   - log overflow → snapshot truncation round-trips correctly;
-   - attach to passthrough session emits inner bytes verbatim without
-     1049h / status / border bytes;
-   - window switch emits reset + replay sequence;
-   - rejected pane ops produce the documented error.
+### Phase 1 — Foundation (landed)
+
+1. **rmux-core**: `PassthroughReplayLog` (snapshot bytes + raw log,
+   bounded). Snapshot rendering via `render_screen_snapshot(&Screen)`
+   reuses the existing grid capture path with a reset-prefix.
+   Helpers: `is_passthrough_session(opts, &name)`,
+   `reject_pane_op_if_passthrough(opts, &name, op)`.
+2. **rmux-proto**: `OptionName::Passthrough`,
+   `OptionName::PassthroughReplayBytes`.
+3. **rmux-core/options**: registry entries —
+   `passthrough` (session scope, flag, default `off`) and
+   `passthrough-replay-bytes` (server scope, number, default 1 MiB).
+4. **rmux-server**: `handler_support::reject_pane_op_in_passthrough`
+   wired into 12 pane-op handlers — `split-window`, `split-window -e`,
+   `swap-pane`, `join-pane`, `break-pane`, `kill-pane`, `pipe-pane`,
+   `select-pane` (selection only, not title), `select-pane -m`,
+   `select-pane-adjacent`, `select-layout`, `select-custom-layout`,
+   `select-old-layout`, `spread-layout`, `next-layout`,
+   `previous-layout`, `resize-pane`.
+5. **Tests** (landed):
+   - `passthrough_log::tests::*` — log + snapshot + gating helpers
+     (13 unit tests).
+   - `handler::pane_command_tests::passthrough_session_rejects_*` —
+     end-to-end via the handler dispatch (3 tests).
+
+### Phase 2 — Attach integration (pending)
+
+The hard part. Requires a second attach codepath that bypasses
+`pane_io::forward_attach`'s renderer/overlay/status machinery:
+
+* Detect `is_passthrough_session` at the listener attach hand-off
+  (`listener.rs`, around the existing `pane_io::forward_attach`
+  call) and route to a new `forward_attach_passthrough`.
+* In that path:
+  - Do **not** emit `attach_start_sequence` (no `?1049h`).
+  - Skip render-frame emission, status bar, overlays.
+  - Replay the active window's `PassthroughReplayLog` to the socket
+    as a single frame, then resume verbatim forwarding from the
+    pane output channel.
+  - Continue feeding inner PTY bytes into both the screen grid (for
+    state tracking + future snapshots) and the per-window
+    `PassthroughReplayLog`.
+* On detach: nothing to undo on the host terminal — we never put it
+  in alt-screen.
+
+### Phase 3 — Window switch (pending)
+
+* On `select-window` in a passthrough session, the handler emits the
+  outer-state reset sequence + the new window's
+  `PassthroughReplayLog::replay_bytes()` over the socket.
+* Set OSC 0/2 title to `rmux: <session>/<window-name>` on attach,
+  switch, and rename.
+* SIGWINCH the new window's inner program with its current size to
+  coax lazy-redraw TUIs.
+
+### Phase 4 — Hardening (pending)
+
+* Per-window log allocation tied to the session option budget;
+  re-snapshot on overflow.
+* CLI flag: `new-session --passthrough` / `-P`.
+* End-to-end test: attach a passthrough session, inner program
+  emits ANSI bytes, assert the socket bytes are exactly the inner
+  bytes (no 1049h, no status row, no border) plus the snapshot
+  prefix.
+* End-to-end test: window switch replay reproduces the visible
+  state of the previous window's last screen.
 
 ## Out-of-scope follow-ups
 
