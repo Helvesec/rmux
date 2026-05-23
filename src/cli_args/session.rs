@@ -1,4 +1,4 @@
-use clap::{ArgAction, ArgGroup, Args};
+use clap::{ArgAction, Args};
 use rmux_proto::SessionName;
 
 use super::{parse_session_name, parse_target_spec, TargetSpec};
@@ -78,48 +78,28 @@ pub(crate) struct KillSessionArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-#[command(group(
-    ArgGroup::new("access_action")
-        .required(false)
-        .multiple(false)
-        .args(["add", "deny", "list"])
-), group(
-    ArgGroup::new("access_mode")
-        .required(false)
-        .multiple(false)
-        .args(["read_only", "write"])
-))]
 pub(crate) struct ServerAccessArgs {
-    #[arg(short = 'a', action = ArgAction::SetTrue, group = "access_action")]
+    #[arg(short = 'a', action = ArgAction::SetTrue)]
     pub(crate) add: bool,
-    #[arg(short = 'd', action = ArgAction::SetTrue, group = "access_action")]
+    #[arg(short = 'd', action = ArgAction::SetTrue)]
     pub(crate) deny: bool,
-    #[arg(short = 'l', action = ArgAction::SetTrue, group = "access_action")]
+    #[arg(short = 'l', action = ArgAction::SetTrue)]
     pub(crate) list: bool,
-    #[arg(short = 'r', action = ArgAction::SetTrue, group = "access_mode")]
+    #[arg(short = 'r', action = ArgAction::SetTrue)]
     pub(crate) read_only: bool,
-    #[arg(short = 'w', action = ArgAction::SetTrue, group = "access_mode")]
+    #[arg(short = 'w', action = ArgAction::SetTrue)]
     pub(crate) write: bool,
-    #[arg(allow_hyphen_values = true)]
+    #[arg(short = 't', action = ArgAction::SetTrue, hide = true)]
+    pub(crate) unsupported_target: bool,
     pub(crate) user: Option<String>,
 }
 
 impl ServerAccessArgs {
     pub(super) fn validate(self) -> Result<Self, clap::Error> {
-        if self.list {
-            if self.user.is_some() {
-                return Err(clap::Error::raw(
-                    clap::error::ErrorKind::TooManyValues,
-                    "server-access -l does not accept a user argument",
-                ));
-            }
-            return Ok(self);
-        }
-
-        if self.user.is_none() {
+        if self.unsupported_target {
             return Err(clap::Error::raw(
-                clap::error::ErrorKind::MissingRequiredArgument,
-                "missing user argument",
+                clap::error::ErrorKind::UnknownArgument,
+                "command server-access: unknown flag -t",
             ));
         }
 

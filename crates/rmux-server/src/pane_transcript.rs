@@ -190,8 +190,12 @@ impl PaneTranscript {
         self.terminal.screen().history_size()
     }
 
-    pub(crate) fn history_bytes(&self) -> usize {
-        self.terminal.screen().history_bytes()
+    pub(crate) fn tmux_history_bytes(&self) -> usize {
+        self.terminal.screen().tmux_history_bytes()
+    }
+
+    pub(crate) fn tmux_history_all_bytes(&self) -> String {
+        self.terminal.screen().tmux_history_all_bytes()
     }
 
     pub(crate) fn resize(&mut self, size: TerminalSize) {

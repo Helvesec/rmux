@@ -4,7 +4,7 @@ use rmux_client::{connect, ClientError, Connection, StartServerError};
 
 use super::{
     expect_command_success, resolve_session_target_or_current, run_command, run_command_resolved,
-    write_command_output, ExitFailure, StartupOptions,
+    run_payload_command, write_command_output, ExitFailure, StartupOptions,
 };
 use crate::cli_args::{ClientTargetArgs, ServerAccessArgs, SessionTargetArgs};
 
@@ -45,7 +45,7 @@ pub(super) fn run_server_access(
     args: ServerAccessArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    run_command(socket_path, "server-access", move |connection| {
+    run_payload_command(socket_path, "server-access", move |connection| {
         connection.server_access(rmux_proto::ServerAccessRequest {
             add: args.add,
             deny: args.deny,

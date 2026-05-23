@@ -375,6 +375,10 @@ impl Session {
             ResizePaneAdjustment::AbsoluteHeight { rows } => {
                 let _ = window.resize_pane_height(pane_index, rows);
             }
+            ResizePaneAdjustment::AbsoluteSize { columns, rows } => {
+                let _ = window.resize_pane_width(pane_index, columns);
+                let _ = window.resize_pane_height(pane_index, rows);
+            }
             ResizePaneAdjustment::Up { cells } => {
                 let _ = window.resize_pane_by(pane_index, ResizePaneAdjustment::Up { cells });
             }

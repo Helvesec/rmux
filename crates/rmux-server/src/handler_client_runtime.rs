@@ -34,6 +34,12 @@ impl RequestHandler {
         (seconds > 0).then(|| Duration::from_secs(u64::from(seconds)))
     }
 
+    pub(crate) async fn attached_escape_time(&self) -> Duration {
+        let state = self.state.lock().await;
+        let millis = option_value_u32(&state.options, None, OptionName::EscapeTime);
+        Duration::from_millis(u64::from(millis))
+    }
+
     pub(in crate::handler) async fn requester_can_write(&self, requester_pid: u32) -> bool {
         {
             let active_attach = self.active_attach.lock().await;

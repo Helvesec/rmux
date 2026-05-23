@@ -19,6 +19,7 @@ pub(super) fn parse_resize_pane_args(
         "resize-pane",
         normalize_resize_pane_optional_delta(arguments),
     )
+    .and_then(ResizePaneArgs::validate)
 }
 
 fn validate_resize_pane_tmux_direction_delta_syntax(
@@ -112,6 +113,10 @@ pub(crate) struct SplitWindowArgs {
     pub(crate) start_directory: Option<PathBuf>,
     #[arg(short = 'l', allow_hyphen_values = true)]
     pub(crate) size: Option<String>,
+    #[arg(short = 'F', allow_hyphen_values = true)]
+    pub(crate) format: Option<String>,
+    #[arg(short = 'P', action = ArgAction::SetTrue)]
+    pub(crate) print_target: bool,
     #[arg(short = 't', value_parser = parse_target_spec)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
@@ -235,12 +240,6 @@ pub(crate) struct SelectLayoutArgs {
 }
 
 #[derive(Debug, Clone, Args)]
-#[command(group(
-    ArgGroup::new("adjustment")
-        .required(false)
-        .multiple(false)
-        .args(["down", "up", "left", "right", "columns", "rows", "zoom"])
-))]
 pub(crate) struct ResizePaneArgs {
     #[arg(short = 't', value_parser = parse_target_spec)]
     pub(crate) target: Option<TargetSpec>,
@@ -252,12 +251,37 @@ pub(crate) struct ResizePaneArgs {
     pub(crate) left: Option<u16>,
     #[arg(short = 'R', num_args = 0..=1, default_missing_value = "1")]
     pub(crate) right: Option<u16>,
-    #[arg(short = 'x', group = "adjustment")]
+    #[arg(short = 'x')]
     pub(crate) columns: Option<u16>,
-    #[arg(short = 'y', group = "adjustment")]
+    #[arg(short = 'y')]
     pub(crate) rows: Option<u16>,
-    #[arg(short = 'Z', action = ArgAction::SetTrue, group = "adjustment")]
+    #[arg(short = 'Z', action = ArgAction::SetTrue)]
     pub(crate) zoom: bool,
+}
+
+impl ResizePaneArgs {
+    fn validate(self) -> Result<Self, clap::Error> {
+        let relative_count = [
+            self.down.is_some(),
+            self.up.is_some(),
+            self.left.is_some(),
+            self.right.is_some(),
+        ]
+        .into_iter()
+        .filter(|present| *present)
+        .count();
+        let absolute_count = usize::from(self.columns.is_some()) + usize::from(self.rows.is_some());
+        let invalid = relative_count > 1
+            || (self.zoom && (relative_count > 0 || absolute_count > 0))
+            || (relative_count > 0 && absolute_count > 0);
+        if invalid {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "resize-pane accepts only one relative adjustment, zoom, or absolute size",
+            ));
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, Args)]

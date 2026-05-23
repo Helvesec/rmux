@@ -14,7 +14,10 @@ pub fn validate_hook_scope(hook: HookName, scope: &ScopeSelector) -> Result<(), 
             ScopeSelector::Global | ScopeSelector::Window(_)
         ) | (
             HookClass::Pane,
-            ScopeSelector::Global | ScopeSelector::Window(_) | ScopeSelector::Pane(_),
+            ScopeSelector::Global
+                | ScopeSelector::Session(_)
+                | ScopeSelector::Window(_)
+                | ScopeSelector::Pane(_),
         )
     );
 

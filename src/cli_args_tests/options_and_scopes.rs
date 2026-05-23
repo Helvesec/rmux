@@ -1,12 +1,21 @@
 use super::*;
 
 #[test]
-fn set_option_requires_scope_group() {
-    let error = parse_args(&["set-option", "status", "off"]).unwrap_err();
-    assert_eq!(
-        error.kind(),
-        clap::error::ErrorKind::MissingRequiredArgument
-    );
+fn set_option_accepts_default_scope_like_tmux() {
+    let cli = parse_args(&["set-option", "status", "off"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::SetOption(args) => {
+            assert!(!args.global);
+            assert!(!args.server);
+            assert!(!args.window);
+            assert!(!args.pane);
+            assert_eq!(args.target, None);
+            assert_eq!(args.option, "status");
+            assert_eq!(args.value.as_deref(), Some("off"));
+        }
+        _ => panic!("expected SetOption command"),
+    }
 }
 
 #[test]
@@ -18,7 +27,9 @@ fn set_option_accepts_global_and_target_for_server_scope_compatibility() {
             assert!(args.global);
             assert!(args.server);
             assert_eq!(
-                args.target,
+                args.target
+                    .as_ref()
+                    .and_then(|target| target.exact().cloned()),
                 Some(rmux_proto::Target::Session(
                     rmux_proto::SessionName::new("alpha").unwrap()
                 ))
@@ -34,12 +45,7 @@ fn set_option_accepts_trailing_colon_session_targets_like_tmux() {
 
     match cli.command.expect("parsed command") {
         super::super::Command::SetOption(args) => {
-            assert_eq!(
-                args.target,
-                Some(rmux_proto::Target::Session(
-                    rmux_proto::SessionName::new("alpha").unwrap()
-                ))
-            );
+            assert_eq!(target_text(&args.target), "alpha:");
         }
         _ => panic!("expected SetOption command"),
     }
@@ -94,7 +100,9 @@ fn set_option_accepts_window_scope_and_optional_value() {
         super::super::Command::SetOption(args) => {
             assert!(args.window);
             assert_eq!(
-                args.target,
+                args.target
+                    .as_ref()
+                    .and_then(|target| target.exact().cloned()),
                 Some(rmux_proto::Target::Pane(
                     rmux_proto::PaneTarget::with_window(
                         rmux_proto::SessionName::new("alpha").unwrap(),
@@ -139,7 +147,9 @@ fn show_window_options_parses_as_a_distinct_public_command() {
             assert!(args.value_only);
             assert_eq!(args.name.as_deref(), Some("pane-border-style"));
             assert_eq!(
-                args.target,
+                args.target
+                    .as_ref()
+                    .and_then(|target| target.exact().cloned()),
                 Some(rmux_proto::Target::Pane(
                     rmux_proto::PaneTarget::with_window(
                         rmux_proto::SessionName::new("alpha").unwrap(),

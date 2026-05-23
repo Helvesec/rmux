@@ -19,9 +19,19 @@ impl RequestHandler {
         command: ParsedModeTreeCommand,
         _context: &QueueExecutionContext,
     ) -> Result<QueueCommandAction, RmuxError> {
-        let attach_pid = self
+        let attach_pid = match self
             .mode_tree_attach_pid(requester_pid, command.kind.command_name())
-            .await?;
+            .await
+        {
+            Ok(attach_pid) => attach_pid,
+            Err(error) if is_missing_attached_client(&error, command.kind.command_name()) => {
+                return Ok(QueueCommandAction::Normal {
+                    output: None,
+                    error: None,
+                });
+            }
+            Err(error) => return Err(error),
+        };
 
         let session_name = self.attached_session_name(attach_pid).await?;
         let order_seq = default_order_seq(command.kind);
@@ -443,4 +453,12 @@ impl RequestHandler {
             .unwrap_or(true);
         Ok(rows.saturating_sub(u16::from(status_on)))
     }
+}
+
+fn is_missing_attached_client(error: &RmuxError, command_name: &str) -> bool {
+    matches!(
+        error,
+        RmuxError::Server(message)
+            if message == &format!("{command_name} requires an attached client")
+    )
 }

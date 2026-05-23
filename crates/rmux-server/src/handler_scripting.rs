@@ -4,16 +4,11 @@ use rmux_core::{
     LifecycleEvent, ENVIRON_HIDDEN,
 };
 use rmux_proto::request::Request;
-use rmux_proto::{
-    CommandOutput, ErrorResponse, HookName, NewWindowRequest, PaneTarget, Response, RmuxError,
-    ScopeSelector, Target,
-};
+use rmux_proto::{CommandOutput, Response, RmuxError, ScopeSelector};
 use std::collections::VecDeque;
 
 use super::RequestHandler;
 use crate::control::ControlCommandResult;
-use crate::hook_runtime::{capture_inline_hooks, PendingInlineHookFormat};
-use crate::pane_terminals::{NewWindowOptions, WindowSpawnOptions};
 
 #[path = "handler_scripting/buffer_parse.rs"]
 mod buffer_parse;
@@ -37,6 +32,8 @@ mod layout_parse;
 mod list_parse;
 #[path = "handler_scripting/mode_parse.rs"]
 mod mode_parse;
+#[path = "handler_scripting/new_window_runtime.rs"]
+mod new_window_runtime;
 #[path = "handler_scripting/pane_parse.rs"]
 mod pane_parse;
 #[path = "handler_scripting/prompt_parse.rs"]
@@ -78,7 +75,6 @@ pub(super) use self::format_context::format_context_for_target;
 pub(super) use self::prompt_parse::{ParsedPromptHistoryCommand, PromptHistoryAction};
 use self::queue::{queue_action_from_response, remove_group_contexts, QueueInvocation, QueueMode};
 pub(super) use self::queue::{QueueCommandAction, QueueExecutionContext};
-use self::queue_parse::ParsedNewWindowCommand;
 use self::request_parse::parse_queue_invocation;
 #[cfg(test)]
 pub(crate) use self::request_parse::parse_request_from_parts;
@@ -154,6 +150,55 @@ impl RequestHandler {
             QueueMode::Control,
         )
         .await
+    }
+
+    pub(in crate::handler) async fn start_attached_prompt_binding_commands(
+        &self,
+        requester_pid: u32,
+        commands: &ParsedCommands,
+        context: &QueueExecutionContext,
+    ) -> Result<bool, RmuxError> {
+        if commands.commands().len() != 1 {
+            return Ok(false);
+        }
+
+        self.apply_parse_time_assignments(commands).await;
+        let command = commands
+            .commands()
+            .first()
+            .expect("single command checked")
+            .clone();
+        let attached_session = self.current_session_candidate(requester_pid).await;
+        let invocation = {
+            let state = self.state.lock().await;
+            let find_context = queue_target_find_context(
+                &state.sessions,
+                requester_pid,
+                attached_session.as_ref(),
+                context.current_target.as_ref(),
+                context.mouse_target.as_ref(),
+            );
+            parse_queue_invocation(
+                command,
+                context.caller_cwd.as_deref(),
+                &state.sessions,
+                &find_context,
+            )
+        }?;
+
+        match invocation {
+            QueueInvocation::CommandPrompt(command) => {
+                self.start_attached_command_prompt_binding(requester_pid, command, context)
+                    .await?;
+                Ok(true)
+            }
+            QueueInvocation::ConfirmBefore(command) => {
+                self.start_attached_confirm_before_binding(requester_pid, command, context)
+                    .await?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     #[async_recursion::async_recursion]
@@ -355,98 +400,6 @@ impl RequestHandler {
         result
     }
 
-    async fn execute_queued_new_window(
-        &self,
-        requester_pid: u32,
-        command: ParsedNewWindowCommand,
-    ) -> Result<QueueCommandAction, RmuxError> {
-        let ParsedNewWindowCommand {
-            target,
-            target_window_index,
-            insert_at_target,
-            name,
-            detached,
-            start_directory,
-            environment,
-            command,
-        } = command;
-
-        let can_write = self.requester_can_write(requester_pid).await;
-        let request_for_hooks = crate::server_access::apply_access_policy(
-            Request::NewWindow(NewWindowRequest {
-                target: target.clone(),
-                name: name.clone(),
-                detached,
-                environment: environment.clone(),
-                command: command.clone(),
-                start_directory: start_directory.clone(),
-                target_window_index,
-                insert_at_target,
-            }),
-            can_write,
-        )?;
-
-        let socket_path = self.socket_path();
-        let process_command = rmux_proto::ProcessCommand::from_legacy_command(command.as_deref());
-        let (response, inline_hooks) = capture_inline_hooks(async {
-            let response = {
-                let mut state = self.state.lock().await;
-                match state.create_window_at_requested_index(
-                    &target,
-                    target_window_index,
-                    insert_at_target,
-                    NewWindowOptions {
-                        name,
-                        detached,
-                        spawn: WindowSpawnOptions {
-                            start_directory: start_directory.as_deref(),
-                            command: process_command.as_ref(),
-                            socket_path: &socket_path,
-                            environment_overrides: environment.as_deref(),
-                            pane_alert_callback: Some(self.pane_alert_callback()),
-                            pane_exit_callback: Some(self.pane_exit_callback()),
-                        },
-                    },
-                ) {
-                    Ok(response) => Response::NewWindow(response),
-                    Err(error) => Response::Error(ErrorResponse { error }),
-                }
-            };
-
-            if matches!(response, Response::NewWindow(_)) {
-                self.sync_session_silence_timers(&target).await;
-                if let Response::NewWindow(success) = &response {
-                    self.queue_inline_hook(
-                        HookName::AfterNewWindow,
-                        ScopeSelector::Session(target.clone()),
-                        Some(Target::Pane(PaneTarget::with_window(
-                            success.target.session_name().clone(),
-                            success.target.window_index(),
-                            0,
-                        ))),
-                        PendingInlineHookFormat::AfterCommand,
-                    );
-                    self.emit(LifecycleEvent::WindowLinked {
-                        session_name: target.clone(),
-                        target: Some(success.target.clone()),
-                    })
-                    .await;
-                }
-                self.refresh_attached_session(&target).await;
-            }
-
-            response
-        })
-        .await;
-
-        self.run_inline_hooks(requester_pid, inline_hooks, None)
-            .await;
-        self.run_request_hooks(requester_pid, &request_for_hooks, &response, None)
-            .await;
-
-        queue_action_from_response(response)
-    }
-
     async fn apply_parse_time_assignments(&self, commands: &ParsedCommands) {
         if commands.assignments().is_empty() {
             return;
@@ -517,6 +470,22 @@ impl RequestHandler {
                     .await?;
                 self.emit_client_attached(requester_pid, response.session_name.clone())
                     .await;
+            }
+        }
+
+        if matches!(request, Request::NewSession(_) | Request::NewSessionExt(_)) {
+            if let Response::NewSession(response) = &outcome.response {
+                if !response.detached
+                    && self
+                        .attach_control_to_existing_session(requester_pid, &response.session_name)
+                        .await
+                {
+                    self.emit(LifecycleEvent::ClientSessionChanged {
+                        session_name: response.session_name.clone(),
+                        client_name: Some(requester_pid.to_string()),
+                    })
+                    .await;
+                }
             }
         }
 

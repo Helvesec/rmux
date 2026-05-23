@@ -112,8 +112,28 @@ fn queue_target_spec_for_flag(
     } else if command_name == "new-window" && flag == 't' && new_window_target_is_session(value) {
         spec.find_type = TargetFindType::Session;
         spec.flags = TargetFindFlags::NONE;
+    } else if matches!(command_name, "set-hook" | "show-hooks") && flag == 't' {
+        spec.find_type = hook_target_find_type(value, arguments);
     }
     Some(spec)
+}
+
+fn hook_target_find_type(value: &str, arguments: &[String]) -> TargetFindType {
+    if arguments.iter().any(|arg| arg == "-p") {
+        TargetFindType::Pane
+    } else if arguments.iter().any(|arg| arg == "-w") {
+        TargetFindType::Window
+    } else if value.starts_with('%') || value.rsplit_once('.').is_some() {
+        TargetFindType::Pane
+    } else if value.starts_with('@')
+        || value
+            .rsplit_once(':')
+            .is_some_and(|(_, rest)| !rest.is_empty())
+    {
+        TargetFindType::Window
+    } else {
+        TargetFindType::Session
+    }
 }
 
 pub(super) fn new_window_target_is_session(value: &str) -> bool {

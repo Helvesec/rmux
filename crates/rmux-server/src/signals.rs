@@ -14,6 +14,8 @@ use tracing::debug;
 
 #[cfg(unix)]
 use crate::daemon::ShutdownHandle;
+#[cfg(unix)]
+use crate::diagnostic_log::record_shutdown_request;
 
 #[cfg(unix)]
 const SERVER_SIGNALS: [i32; 7] = [SIGHUP, SIGCHLD, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2];
@@ -56,6 +58,11 @@ impl SignalWatcher {
                     match signal {
                         SIGINT | SIGTERM => {
                             debug!(signal, "server received shutdown signal");
+                            record_shutdown_request(match signal {
+                                SIGINT => "signal-sigint",
+                                SIGTERM => "signal-sigterm",
+                                _ => "signal",
+                            });
                             shutdown.request_shutdown();
                             break;
                         }

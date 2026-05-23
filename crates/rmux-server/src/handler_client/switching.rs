@@ -98,6 +98,18 @@ impl RequestHandler {
             .await
         {
             Ok(client) => client,
+            Err(error)
+                if request.target_client.is_none()
+                    && matches!(
+                        &error,
+                        RmuxError::Server(message)
+                            if message == "switch-client requires an attached client"
+                    ) =>
+            {
+                return Response::Error(ErrorResponse {
+                    error: RmuxError::Message("no current client".to_owned()),
+                });
+            }
             Err(error) => return Response::Error(ErrorResponse { error }),
         };
         if switch_target_selector_count(&request) > 1 {

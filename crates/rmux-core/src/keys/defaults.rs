@@ -1,3 +1,77 @@
+use super::{key_code_lookup_bits, key_string_lookup_string, KeyCode};
+
+const DEFAULT_LIST_KEYS_TMUX_3_4: &str = include_str!("default_list_keys_tmux_3_4.txt");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DefaultListKeysDisplay<'a> {
+    pub(crate) index: usize,
+    pub(crate) key_string: &'a str,
+    pub(crate) command_string: &'a str,
+}
+
+pub(crate) fn list_keys_display(
+    table_name: &str,
+    key: KeyCode,
+) -> Option<DefaultListKeysDisplay<'static>> {
+    DEFAULT_LIST_KEYS_TMUX_3_4
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| parse_default_list_keys_line(index, line))
+        .find(|row| {
+            row.table_name == table_name
+                && default_display_key_matches(row.key_string, key_code_lookup_bits(key))
+        })
+        .map(|row| DefaultListKeysDisplay {
+            index: row.index,
+            key_string: row.key_string,
+            command_string: row.command_string,
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DefaultListKeysRow<'a> {
+    index: usize,
+    table_name: &'a str,
+    key_string: &'a str,
+    command_string: &'a str,
+}
+
+fn parse_default_list_keys_line(index: usize, line: &str) -> Option<DefaultListKeysRow<'_>> {
+    let after_table_flag = line.split_once(" -T ")?.1.trim_start();
+    let table_end = after_table_flag.find(char::is_whitespace)?;
+    let table_name = &after_table_flag[..table_end];
+    let after_table = after_table_flag[table_end..].trim_start();
+    let key_end = after_table.find(char::is_whitespace)?;
+    let key_string = &after_table[..key_end];
+    let command_string = after_table[key_end..].trim_start();
+    Some(DefaultListKeysRow {
+        index,
+        table_name,
+        key_string,
+        command_string,
+    })
+}
+
+fn default_display_key_matches(display_key: &str, key: KeyCode) -> bool {
+    let normalized = normalize_default_display_key(display_key);
+    key_string_lookup_string(normalized.as_ref())
+        .map(key_code_lookup_bits)
+        .is_some_and(|candidate| candidate == key)
+}
+
+fn normalize_default_display_key(display_key: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(stripped) = display_key.strip_prefix('\\') {
+        return std::borrow::Cow::Owned(stripped.to_owned());
+    }
+    if let Some(stripped) = display_key
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        return std::borrow::Cow::Owned(stripped.to_owned());
+    }
+    std::borrow::Cow::Borrowed(display_key)
+}
+
 pub(crate) const DEFAULT_BINDING_STRINGS: &[&str] = &[
     "bind -N 'Send the prefix key' C-b { send-prefix }",
     "bind -N 'Rotate through the panes' C-o { rotate-window }",
@@ -126,7 +200,6 @@ pub(crate) const DEFAULT_BINDING_STRINGS: &[&str] = &[
         " }"
     ),
     "bind -n MouseDown1Pane { select-pane -t=; send -M }",
-    "bind -n C-MouseDown1Pane { swap-pane -s@ }",
     "bind -n MouseDrag1Pane { if -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send -M } { copy-mode -M } }",
     "bind -n WheelUpPane { if -F '#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}' { send -M } { copy-mode -e } }",
     "bind -n MouseDown2Pane { select-pane -t=; if -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send -M } { paste -p } }",
@@ -134,7 +207,6 @@ pub(crate) const DEFAULT_BINDING_STRINGS: &[&str] = &[
     "bind -n TripleClick1Pane { select-pane -t=; if -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send -M } { copy-mode -H; send -X select-line; run -d0.3; send -X copy-pipe-and-cancel } }",
     "bind -n MouseDrag1Border { resize-pane -M }",
     "bind -n MouseDown1Status { select-window -t= }",
-    "bind -n C-MouseDown1Status { swap-window -t@ }",
     "bind -n WheelDownStatus { next-window }",
     "bind -n WheelUpStatus { previous-window }",
     concat!(
@@ -247,9 +319,6 @@ pub(crate) const DEFAULT_BINDING_STRINGS: &[&str] = &[
         " '#{?#{>:#{window_panes},1},,-}#{?window_zoomed_flag,Unzoom,Zoom}' 'z' {resize-pane -Z}",
         " }"
     ),
-    "bind -n MouseDown1ScrollbarUp { if -Ft= '#{pane_in_mode}' { send -X page-up } {copy-mode -u } }",
-    "bind -n MouseDown1ScrollbarDown { if -Ft= '#{pane_in_mode}' { send -X page-down } {copy-mode -d } }",
-    "bind -n MouseDrag1ScrollbarSlider { if -Ft= '#{pane_in_mode}' { send -X scroll-to-mouse } { copy-mode -S } }",
     "bind -Tcopy-mode C-Space { send -X begin-selection }",
     "bind -Tcopy-mode C-a { send -X start-of-line }",
     "bind -Tcopy-mode C-c { send -X cancel }",
@@ -258,8 +327,6 @@ pub(crate) const DEFAULT_BINDING_STRINGS: &[&str] = &[
     "bind -Tcopy-mode C-b { send -X cursor-left }",
     "bind -Tcopy-mode C-g { send -X clear-selection }",
     "bind -Tcopy-mode C-k { send -X copy-pipe-end-of-line-and-cancel }",
-    "bind -Tcopy-mode C-l { send -X cursor-centre-vertical }",
-    "bind -Tcopy-mode M-l { send -X cursor-centre-horizontal }",
     "bind -Tcopy-mode C-n { send -X cursor-down }",
     "bind -Tcopy-mode C-p { send -X cursor-up }",
     "bind -Tcopy-mode C-r { command-prompt -T search -ip'(search up)' -I'#{pane_search_string}' { send -X search-backward-incremental -- '%%' } }",

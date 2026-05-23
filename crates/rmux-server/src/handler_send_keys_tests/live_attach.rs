@@ -56,6 +56,31 @@ async fn send_keys_uses_runtime_extended_key_format_for_mode_two() {
 }
 
 #[tokio::test]
+async fn send_keys_sends_modified_cursor_keys_without_extended_mode() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let expected = b"\x1b[1;5A";
+    let capture =
+        RawPaneInputProbe::start(&handler, &alpha, "send-keys-c-up", expected.len()).await;
+    let response = handler
+        .handle(Request::SendKeys(SendKeysRequest {
+            target: PaneTarget::new(alpha.clone(), 0),
+            keys: vec!["C-Up".to_owned()],
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::SendKeys(SendKeysResponse { key_count: 1 })
+    );
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, expected).await;
+}
+
+#[tokio::test]
 async fn send_keys_m_forwards_the_current_mouse_event_to_the_pane() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -165,6 +190,241 @@ async fn live_attach_extended_keys_are_reencoded_for_the_target_pane() {
 
     capture.finish(&handler, &alpha).await;
     capture.assert_contents(&handler, expected).await;
+}
+
+#[tokio::test]
+async fn live_attach_standalone_escape_flushes_when_timeout_expires() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let expected = b"\x1b";
+    let capture =
+        RawPaneInputProbe::start(&handler, &alpha, "live-attach-escape-time", expected.len()).await;
+
+    let mut pending_input = Vec::new();
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, expected)
+        .await
+        .expect("standalone escape fragment");
+    assert_eq!(pending_input, expected);
+
+    let flushed = handler
+        .flush_attached_pending_escape_input(requester_pid, &mut pending_input)
+        .await
+        .expect("pending escape flush");
+
+    assert!(flushed);
+    assert!(pending_input.is_empty());
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, expected).await;
+}
+
+#[tokio::test]
+async fn live_attach_fragmented_arrow_consumes_pending_escape_before_timeout() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let expected = encode_key(
+        0,
+        ExtendedKeyFormat::Xterm,
+        key_string_lookup_string("Up").expect("Up parses"),
+    )
+    .expect("Up encodes");
+    let capture = RawPaneInputProbe::start(
+        &handler,
+        &alpha,
+        "live-attach-fragmented-up",
+        expected.len(),
+    )
+    .await;
+
+    let mut pending_input = Vec::new();
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"\x1b")
+        .await
+        .expect("arrow escape prefix");
+    assert_eq!(pending_input, b"\x1b");
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"[A")
+        .await
+        .expect("arrow suffix");
+
+    assert!(pending_input.is_empty());
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, &expected).await;
+}
+
+#[tokio::test]
+async fn live_attach_fragmented_arrow_survives_target_extended_key_mode() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[>4;2m")
+            .expect("extended key mode transcript update");
+    }
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let expected = b"\x1b[A";
+    let capture = RawPaneInputProbe::start(
+        &handler,
+        &alpha,
+        "live-attach-extended-mode-fragmented-up",
+        expected.len(),
+    )
+    .await;
+
+    let mut pending_input = Vec::new();
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"\x1b")
+        .await
+        .expect("arrow escape prefix");
+    assert_eq!(pending_input, b"\x1b");
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"[A")
+        .await
+        .expect("arrow suffix");
+
+    assert!(pending_input.is_empty());
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, expected).await;
+}
+
+#[tokio::test]
+async fn live_attach_ambiguous_escape_prefixes_wait_for_suffix() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[>4;2m")
+            .expect("extended key mode transcript update");
+    }
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    for (label, chunks, expected) in [
+        (
+            "ss3-up",
+            [b"\x1bO".as_slice(), b"A".as_slice()],
+            b"\x1b[A".as_slice(),
+        ),
+        (
+            "csi-home",
+            [b"\x1b[".as_slice(), b"H".as_slice()],
+            b"\x1b[1~".as_slice(),
+        ),
+        (
+            "csi-home-7",
+            [b"\x1b[7".as_slice(), b"~".as_slice()],
+            b"\x1b[1~".as_slice(),
+        ),
+        (
+            "csi-end-8",
+            [b"\x1b[8".as_slice(), b"~".as_slice()],
+            b"\x1b[4~".as_slice(),
+        ),
+        (
+            "ss3-f1",
+            [b"\x1bO".as_slice(), b"P".as_slice()],
+            b"\x1bOP".as_slice(),
+        ),
+        (
+            "csi-f9",
+            [b"\x1b[20".as_slice(), b"~".as_slice()],
+            b"\x1b[20~".as_slice(),
+        ),
+    ] {
+        let capture = RawPaneInputProbe::start(&handler, &alpha, label, expected.len()).await;
+        let mut pending_input = Vec::new();
+        for chunk in chunks {
+            handler
+                .handle_attached_live_input(requester_pid, &mut pending_input, chunk)
+                .await
+                .expect("fragmented escape sequence");
+        }
+        assert!(
+            pending_input.is_empty(),
+            "{label} should not leave pending input"
+        );
+        capture.finish(&handler, &alpha).await;
+        capture.assert_contents(&handler, expected).await;
+    }
+}
+
+#[tokio::test]
+async fn live_attach_fragmented_meta_key_consumes_pending_escape_before_timeout() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let expected = encode_key(
+        0,
+        ExtendedKeyFormat::Xterm,
+        key_string_lookup_string("M-1").expect("M-1 parses"),
+    )
+    .expect("M-1 encodes");
+    let capture = RawPaneInputProbe::start(
+        &handler,
+        &alpha,
+        "live-attach-fragmented-meta",
+        expected.len(),
+    )
+    .await;
+
+    let mut pending_input = Vec::new();
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"\x1b")
+        .await
+        .expect("meta escape prefix");
+    assert_eq!(pending_input, b"\x1b");
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"1")
+        .await
+        .expect("meta suffix");
+
+    assert!(pending_input.is_empty());
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, &expected).await;
 }
 
 #[tokio::test]

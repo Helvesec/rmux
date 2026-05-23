@@ -71,14 +71,21 @@ impl ExitedPaneOutput {
 impl RequestHandler {
     pub(in crate::handler) fn pane_exit_callback(&self) -> PaneExitCallback {
         let handler = self.downgrade();
-        let runtime = tokio::runtime::Handle::current();
+        let runtime = self.server_task_runtime();
         std::sync::Arc::new(move |event: PaneExitEvent| {
             let Some(handler) = handler.upgrade() else {
                 return;
             };
-            runtime.spawn(async move {
+            let task = async move {
                 handler.handle_pane_exit_event(event).await;
-            });
+            };
+            if let Some(runtime) = &runtime {
+                runtime.spawn(task);
+            } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(task);
+            } else {
+                tracing::warn!("dropping pane exit event because no Tokio runtime is available");
+            }
         })
     }
 

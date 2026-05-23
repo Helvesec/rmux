@@ -1,14 +1,15 @@
 //! Safe grid and scrollback storage for pane screen contents.
 
-use std::collections::VecDeque;
-
 use rmux_proto::TerminalSize;
+use std::collections::VecDeque;
 
 use crate::hyperlinks::Hyperlinks;
 use crate::input::{Colour, COLOUR_DEFAULT};
 
 #[path = "grid/cell.rs"]
 mod cell;
+#[path = "grid/history_bytes.rs"]
+mod history_bytes;
 #[path = "grid/render.rs"]
 mod render;
 

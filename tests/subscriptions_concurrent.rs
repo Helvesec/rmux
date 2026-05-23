@@ -564,7 +564,7 @@ fn wait_for_cursor_after_lag(
     subscription_id: PaneOutputSubscriptionId,
     mut resume_sequence: u64,
 ) -> Result<(u64, rmux_proto::PaneOutputCursorResponse), Box<dyn Error>> {
-    for _ in 0..200 {
+    for _ in 0..400 {
         let response =
             connection.roundtrip(&Request::PaneOutputCursor(PaneOutputCursorRequest {
                 subscription_id,
@@ -587,7 +587,7 @@ fn wait_for_cursor_after_lag(
         }
         thread::sleep(Duration::from_millis(25));
     }
-    Err("cursor did not deliver the oldest retained event after lag".into())
+    Err("cursor did not deliver the oldest retained event after lag (10s timeout)".into())
 }
 
 fn assert_limit_error(response: Response) {

@@ -297,7 +297,7 @@ async fn switch_client_requires_an_attached_client() {
             }))
             .await,
         Response::Error(rmux_proto::ErrorResponse {
-            error: RmuxError::Server("switch-client requires an attached client".to_owned()),
+            error: RmuxError::Message("no current client".to_owned()),
         })
     );
 }

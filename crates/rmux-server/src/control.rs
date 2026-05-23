@@ -1,3 +1,16 @@
+#[cfg_attr(windows, allow(unused_imports))]
+pub(crate) use crate::control_mode::ControlModeUpgrade;
+#[cfg(any(unix, windows))]
+use crate::daemon::ShutdownHandle;
+#[cfg(any(unix, windows))]
+use crate::handler::RequestHandler;
+#[cfg(any(unix, windows))]
+use rmux_ipc::LocalStream;
+use rmux_proto::SessionName;
+#[cfg(windows)]
+use rmux_proto::CONTROL_STDIN_EOF_MARKER;
+#[cfg(any(unix, windows))]
+use rmux_proto::{format_exit_line, format_guard_line, ControlGuardKind};
 #[cfg(any(unix, windows))]
 use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(any(unix, windows))]
@@ -7,40 +20,30 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(unix, windows))]
 use std::sync::Arc;
 #[cfg(any(unix, windows))]
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
-
-#[cfg(any(unix, windows))]
-use rmux_core::events::OutputCursorItem;
-#[cfg(any(unix, windows))]
-use rmux_ipc::LocalStream;
-use rmux_proto::SessionName;
-#[cfg(windows)]
-use rmux_proto::CONTROL_STDIN_EOF_MARKER;
-#[cfg(any(unix, windows))]
-use rmux_proto::{
-    format_exit_line, format_extended_output_line, format_guard_line, format_output_line,
-    format_pause_line, ControlGuardKind, CONTROL_BUFFER_HIGH,
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(any(unix, windows))]
 use tokio::io::{AsyncReadExt, WriteHalf};
 #[cfg(any(unix, windows))]
 use tokio::sync::{mpsc, watch};
 #[cfg(any(unix, windows))]
 use tokio::task::JoinHandle;
-#[cfg(any(unix, windows))]
-use tracing::warn;
-
-#[cfg_attr(windows, allow(unused_imports))]
-pub(crate) use crate::control_mode::ControlModeUpgrade;
-#[cfg(any(unix, windows))]
-use crate::daemon::ShutdownHandle;
-#[cfg(any(unix, windows))]
-use crate::handler::RequestHandler;
 
 #[path = "control/output_queue.rs"]
 mod output_queue;
 #[cfg(any(unix, windows))]
 use output_queue::{ensure_control_newline, flush_output_queue, ControlOutputQueue};
+
+#[path = "control/command_numbering.rs"]
+mod command_numbering;
+#[cfg(any(unix, windows))]
+use command_numbering::ControlCommandNumbering;
+
+#[path = "control/subscriptions.rs"]
+mod subscriptions;
+#[cfg(any(unix, windows))]
+use subscriptions::{
+    drain_ready_pane_events, handle_pane_event, refresh_subscriptions, PaneEvent, PaneSubscription,
+};
 
 #[cfg(any(unix, windows))]
 const MAX_DEFERRED_CONTROL_NOTIFICATIONS: usize = 1024;
@@ -106,7 +109,7 @@ pub(crate) async fn forward_control(
         .await
         .unwrap_or_default();
     let mut current_command: Option<ActiveControlCommand> = None;
-    let mut next_command_number = 1_u64;
+    let mut command_numbering = ControlCommandNumbering::new();
 
     refresh_subscriptions(
         &handler,
@@ -190,11 +193,15 @@ pub(crate) async fn forward_control(
             }
 
             let timestamp = unix_epoch_seconds();
-            let command_number = next_command_number;
-            next_command_number = next_command_number.saturating_add(1);
+            let command_frame = command_numbering.next_frame(&line);
             output_queue.enqueue_line(
-                format_guard_line(ControlGuardKind::Begin, timestamp, command_number, 1)
-                    .into_bytes(),
+                format_guard_line(
+                    ControlGuardKind::Begin,
+                    timestamp,
+                    command_frame.number,
+                    command_frame.guard_flag,
+                )
+                .into_bytes(),
                 false,
             );
             flush_output_queue(&mut output_queue, &mut write_half, flags, &mut paused_panes)
@@ -205,7 +212,8 @@ pub(crate) async fn forward_control(
                     let handler = Arc::clone(&handler);
                     current_command = Some(ActiveControlCommand {
                         timestamp,
-                        command_number,
+                        command_number: command_frame.number,
+                        guard_flag: command_frame.guard_flag,
                         task: tokio::spawn(async move {
                             handler
                                 .execute_control_commands(requester_pid, commands)
@@ -222,8 +230,13 @@ pub(crate) async fn forward_control(
                         flags,
                     )?;
                     output_queue.enqueue_line(
-                        format_guard_line(ControlGuardKind::Error, timestamp, command_number, 1)
-                            .into_bytes(),
+                        format_guard_line(
+                            ControlGuardKind::Error,
+                            timestamp,
+                            command_frame.number,
+                            command_frame.guard_flag,
+                        )
+                        .into_bytes(),
                         false,
                     );
                     flush_output_queue(
@@ -316,7 +329,7 @@ pub(crate) async fn forward_control(
                                 ControlGuardKind::Error,
                                 command.timestamp,
                                 command.command_number,
-                                1,
+                                command.guard_flag,
                             )
                             .into_bytes(),
                             false,
@@ -328,7 +341,7 @@ pub(crate) async fn forward_control(
                                 ControlGuardKind::End,
                                 command.timestamp,
                                 command.command_number,
-                                1,
+                                command.guard_flag,
                             )
                             .into_bytes(),
                             false,
@@ -352,6 +365,10 @@ async fn handle_server_event(
 ) -> io::Result<bool> {
     match event {
         ControlServerEvent::SessionChanged(next_session) => {
+            if command_active {
+                context.deferred.defer_session_change(next_session);
+                return Ok(false);
+            }
             *context.session_name = next_session;
             refresh_subscriptions(
                 context.handler,
@@ -427,6 +444,18 @@ async fn flush_deferred_server_events(context: &mut ServerEventContext<'_>) -> i
         }
     }
 
+    if let Some(next_session) = context.deferred.session_change.take() {
+        if handle_server_event(
+            ControlServerEvent::SessionChanged(next_session),
+            context,
+            false,
+        )
+        .await?
+        {
+            return Ok(true);
+        }
+    }
+
     if let Some(reason) = context.deferred.exit_reason.take() {
         return handle_server_event(ControlServerEvent::Exit(reason), context, false).await;
     }
@@ -453,6 +482,7 @@ struct ServerEventContext<'a> {
 #[cfg(any(unix, windows))]
 struct DeferredServerEvents {
     notifications: VecDeque<String>,
+    session_change: Option<Option<SessionName>>,
     exit_reason: Option<Option<String>>,
 }
 
@@ -469,6 +499,13 @@ impl DeferredServerEvents {
         }
         self.notifications.push_back(line);
     }
+
+    fn defer_session_change(&mut self, next_session: Option<SessionName>) {
+        if self.exit_reason.is_some() {
+            return;
+        }
+        self.session_change = Some(next_session);
+    }
 }
 
 #[derive(Debug)]
@@ -476,95 +513,8 @@ impl DeferredServerEvents {
 struct ActiveControlCommand {
     timestamp: i64,
     command_number: u64,
+    guard_flag: u8,
     task: JoinHandle<ControlCommandResult>,
-}
-
-#[derive(Debug)]
-#[cfg(any(unix, windows))]
-enum PaneEvent {
-    Data {
-        pane_id: u32,
-        bytes: Vec<u8>,
-        received_at: Instant,
-    },
-    Lagged {
-        pane_id: u32,
-        expected_sequence: u64,
-        resume_sequence: u64,
-        missed_events: u64,
-    },
-}
-
-#[derive(Debug)]
-#[cfg(any(unix, windows))]
-struct PaneSubscription {
-    stop_tx: tokio::sync::oneshot::Sender<()>,
-}
-
-#[cfg(any(unix, windows))]
-async fn refresh_subscriptions(
-    handler: &RequestHandler,
-    session_name: Option<&SessionName>,
-    subscriptions: &mut HashMap<u32, PaneSubscription>,
-    pane_event_tx: mpsc::UnboundedSender<PaneEvent>,
-) {
-    let Some(session_name) = session_name else {
-        subscriptions.clear();
-        return;
-    };
-    let panes = handler
-        .control_session_panes(session_name)
-        .await
-        .unwrap_or_default();
-    let desired = panes
-        .iter()
-        .map(|(pane_id, _)| *pane_id)
-        .collect::<HashSet<_>>();
-    let existing = subscriptions.keys().copied().collect::<Vec<_>>();
-    for pane_id in existing {
-        if desired.contains(&pane_id) {
-            continue;
-        }
-        if let Some(subscription) = subscriptions.remove(&pane_id) {
-            let _ = subscription.stop_tx.send(());
-        }
-    }
-
-    for (pane_id, sender) in panes {
-        if subscriptions.contains_key(&pane_id) {
-            continue;
-        }
-        let mut receiver = sender.subscribe();
-        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
-        let pane_event_tx = pane_event_tx.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = &mut stop_rx => return,
-                    item = receiver.recv() => {
-                        match item {
-                            OutputCursorItem::Event(event) => {
-                                let _ = pane_event_tx.send(PaneEvent::Data {
-                                    pane_id,
-                                    bytes: event.into_bytes(),
-                                    received_at: Instant::now(),
-                                });
-                            }
-                            OutputCursorItem::Gap(gap) => {
-                                let _ = pane_event_tx.send(PaneEvent::Lagged {
-                                    pane_id,
-                                    expected_sequence: gap.expected_sequence(),
-                                    resume_sequence: gap.resume_sequence(),
-                                    missed_events: gap.missed_events(),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        subscriptions.insert(pane_id, PaneSubscription { stop_tx });
-    }
 }
 
 #[cfg(any(unix, windows))]
@@ -583,72 +533,6 @@ fn extract_complete_control_lines(buffer: &mut Vec<u8>) -> Vec<String> {
     }
 
     lines
-}
-
-#[cfg(any(unix, windows))]
-fn handle_pane_event(
-    event: PaneEvent,
-    output_queue: &mut ControlOutputQueue,
-    paused_panes: &mut HashSet<u32>,
-    flags: ControlClientFlags,
-) -> io::Result<()> {
-    if flags.no_output {
-        return Ok(());
-    }
-
-    match event {
-        PaneEvent::Data {
-            pane_id,
-            bytes,
-            received_at,
-        } => {
-            if flags.uses_extended_output()
-                && output_queue.buffered_bytes >= CONTROL_BUFFER_HIGH
-                && paused_panes.insert(pane_id)
-            {
-                output_queue.enqueue_line(format_pause_line(pane_id).into_bytes(), false);
-            }
-            let age_ms = received_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-            let line = if flags.uses_extended_output() {
-                format_extended_output_line(pane_id, age_ms, &bytes)
-            } else {
-                format_output_line(pane_id, &bytes)
-            };
-            output_queue.enqueue_line(line.into_bytes(), true);
-        }
-        PaneEvent::Lagged {
-            pane_id,
-            expected_sequence,
-            resume_sequence,
-            missed_events,
-        } => {
-            warn!(
-                pane_id,
-                expected_sequence,
-                resume_sequence,
-                missed_events,
-                "control pane output cursor lagged"
-            );
-        }
-    }
-
-    Ok(())
-}
-
-#[cfg(any(unix, windows))]
-fn drain_ready_pane_events(
-    pane_event_rx: &mut mpsc::UnboundedReceiver<PaneEvent>,
-    output_queue: &mut ControlOutputQueue,
-    paused_panes: &mut HashSet<u32>,
-    flags: ControlClientFlags,
-) -> io::Result<()> {
-    loop {
-        match pane_event_rx.try_recv() {
-            Ok(event) => handle_pane_event(event, output_queue, paused_panes, flags)?,
-            Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
-            Err(mpsc::error::TryRecvError::Disconnected) => return Ok(()),
-        }
-    }
 }
 
 #[cfg(any(unix, windows))]

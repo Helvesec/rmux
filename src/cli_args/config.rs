@@ -1,7 +1,7 @@
 use clap::{ArgAction, ArgGroup, Args};
-use rmux_proto::{HookName, ScopeSelector, SessionName, Target};
+use rmux_proto::{HookName, ScopeSelector, SessionName};
 
-use super::{parse_session_name, parse_target};
+use super::{parse_session_name, parse_target_spec, TargetSpec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SetOptionCommandKind {
@@ -32,12 +32,14 @@ pub(crate) struct SetOptionArgs {
     pub(crate) append: bool,
     #[arg(short = 'o', action = ArgAction::SetTrue)]
     pub(crate) only_if_unset: bool,
+    #[arg(short = 'q', action = ArgAction::SetTrue)]
+    pub(crate) quiet: bool,
     #[arg(short = 'u', action = ArgAction::SetTrue)]
     pub(crate) unset: bool,
     #[arg(short = 'U', action = ArgAction::SetTrue)]
     pub(crate) unset_pane_overrides: bool,
-    #[arg(short = 't', value_parser = parse_target)]
-    pub(crate) target: Option<Target>,
+    #[arg(short = 't', value_parser = parse_target_spec)]
+    pub(crate) target: Option<TargetSpec>,
     pub(crate) option: String,
     #[arg(allow_hyphen_values = true)]
     pub(crate) value: Option<String>,
@@ -56,17 +58,6 @@ impl SetOptionArgs {
                     return Err(clap::Error::raw(
                         clap::error::ErrorKind::ArgumentConflict,
                         "set-option accepts at most one of -s, -w, or -p",
-                    ));
-                }
-                if !self.global
-                    && !self.server
-                    && !self.window
-                    && !self.pane
-                    && self.target.is_none()
-                {
-                    return Err(clap::Error::raw(
-                        clap::error::ErrorKind::MissingRequiredArgument,
-                        "set-option requires a target or one of -g, -s, -w, or -p",
                     ));
                 }
             }
@@ -152,8 +143,8 @@ pub(crate) struct ShowOptionsArgs {
     pub(crate) quiet: bool,
     #[arg(short = 'v', action = ArgAction::SetTrue)]
     pub(crate) value_only: bool,
-    #[arg(short = 't', value_parser = parse_target)]
-    pub(crate) target: Option<Target>,
+    #[arg(short = 't', value_parser = parse_target_spec)]
+    pub(crate) target: Option<TargetSpec>,
     #[arg(allow_hyphen_values = true)]
     pub(crate) name: Option<String>,
 }
@@ -223,8 +214,8 @@ pub(crate) struct SetHookArgs {
     pub(crate) pane: bool,
     #[arg(short = 'R', action = ArgAction::SetTrue)]
     pub(crate) run_immediately: bool,
-    #[arg(short = 't', value_parser = parse_target, group = "scope")]
-    pub(crate) target: Option<Target>,
+    #[arg(short = 't', value_parser = parse_target_spec, group = "scope")]
+    pub(crate) target: Option<TargetSpec>,
     #[arg(short = 'u', action = ArgAction::SetTrue)]
     pub(crate) unset: bool,
     #[arg(short = 'w', action = ArgAction::SetTrue)]
@@ -246,8 +237,8 @@ pub(crate) struct ShowHooksArgs {
     pub(crate) global: bool,
     #[arg(short = 'p', action = ArgAction::SetTrue)]
     pub(crate) pane: bool,
-    #[arg(short = 't', value_parser = parse_target, group = "scope")]
-    pub(crate) target: Option<Target>,
+    #[arg(short = 't', value_parser = parse_target_spec, group = "scope")]
+    pub(crate) target: Option<TargetSpec>,
     #[arg(short = 'w', action = ArgAction::SetTrue)]
     pub(crate) window: bool,
     #[arg(value_parser = parse_hook_name)]

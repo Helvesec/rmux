@@ -242,6 +242,45 @@ fn terminal_profile_prefers_rmux_term_program_for_default_window_name() {
 }
 
 #[test]
+fn terminal_profile_initial_pane_title_includes_user_host_and_cwd() {
+    let environment = EnvironmentStore::new();
+    let mut options = OptionStore::new();
+    let session_name = SessionName::new("alpha").expect("valid session name");
+    let home = std::env::current_dir().expect("current dir");
+    let home_text = home.to_string_lossy().into_owned();
+
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::DefaultShell,
+            "/bin/bash".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("default-shell succeeds");
+
+    let profile = TerminalProfile::for_session(
+        &environment,
+        &options,
+        &session_name,
+        7,
+        Path::new("/tmp/rmux.sock"),
+        true,
+        Some(&[
+            "USER=alice".to_owned(),
+            format!("HOME={home_text}"),
+            "PWD=/ignored".to_owned(),
+        ]),
+        None,
+        Some(&home),
+    )
+    .expect("profile");
+
+    let title = profile.initial_pane_title().expect("initial title");
+    assert!(title.starts_with("alice@"), "title was {title:?}");
+    assert!(title.ends_with(":~"), "title was {title:?}");
+}
+
+#[test]
 fn terminal_profile_falls_back_to_shell_name_without_term_program() {
     let environment = EnvironmentStore::new();
     let mut options = OptionStore::new();
@@ -411,11 +450,20 @@ fn resolve_shell_path_prefers_explicit_default_shell_option_before_shell_env_fal
 
 #[cfg(unix)]
 #[test]
-fn resolve_shell_path_uses_shell_env_when_default_shell_is_empty() {
-    let options = OptionStore::new();
+fn resolve_shell_path_uses_shell_env_when_default_shell_is_explicitly_empty() {
+    let mut options = OptionStore::new();
+    let session_name = SessionName::new("alpha").expect("valid session name");
     let environment = HashMap::from([("SHELL".to_owned(), "/bin/zsh".to_owned())]);
+    options
+        .set(
+            ScopeSelector::Session(session_name.clone()),
+            OptionName::DefaultShell,
+            String::new(),
+            SetOptionMode::Replace,
+        )
+        .expect("default-shell accepts an empty override");
 
-    let resolved = super::resolve_shell_path(&options, None, &environment);
+    let resolved = super::resolve_shell_path(&options, Some(&session_name), &environment);
 
     assert_eq!(
         resolved,

@@ -267,7 +267,10 @@ fn tmux_compat_harness_records_effective_tmux_argv_and_env_overrides() -> Result
     assert_eq!(run.rmux.effective_argv, vec![OsString::from("-V")]);
     assert_eq!(run.rmux.status_code, Some(0));
     assert!(!run.rmux.timed_out);
-    assert!(run.rmux.stdout_string().starts_with("rmux "));
+    assert_eq!(
+        run.rmux.stdout_string(),
+        format!("rmux {}\n", env!("CARGO_PKG_VERSION"))
+    );
     assert!(run.rmux.stderr_string().is_empty());
     harness.assert_socket_dirs_clean()?;
     Ok(())

@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 
 use rmux_core::{
     formats::{is_truthy, render_list_sessions_line, FormatContext},
@@ -7,24 +6,26 @@ use rmux_core::{
 };
 use rmux_proto::request::NewSessionExtRequest;
 use rmux_proto::{
-    CommandOutput, ErrorResponse, HasSessionResponse, HookName, KillSessionResponse,
-    ListSessionsResponse, NewSessionResponse, OptionName, Response, RmuxError, ScopeSelector,
+    CommandOutput, ErrorResponse, HasSessionResponse, KillSessionResponse, ListSessionsResponse,
+    NewSessionResponse, OptionName, Response, RmuxError,
 };
 
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
-use crate::hook_runtime::PendingInlineHookFormat;
 use crate::terminal::validate_process_command;
 
+#[path = "handler_session/control_mode.rs"]
+mod control_mode;
 #[path = "handler_session/list.rs"]
 mod list;
 
 use list::{sort_list_sessions, ListSessionSnapshot};
 
 use super::{
-    active_session_target, client_environment_snapshot, command_output_from_lines,
-    option_value_u32, parse_session_sort_order, prepare_lifecycle_event,
-    resolve_existing_session_target, resolve_session_lookup, update_environment_from_client,
-    RequestHandler, SessionLookup, SessionSortOrder, DEFAULT_SESSION_SIZE,
+    client_environment_snapshot, command_output_from_lines, option_value_u32,
+    parse_session_sort_order, prepare_lifecycle_event, resolve_existing_session_target,
+    resolve_session_lookup, scripting_support::format_context_for_target,
+    update_environment_from_client, PendingShutdownReason, RequestHandler, SessionLookup,
+    SessionSortOrder, DEFAULT_SESSION_SIZE,
 };
 
 impl RequestHandler {
@@ -244,21 +245,8 @@ impl RequestHandler {
             )
             .await;
         }
-        self.sync_session_silence_timers(&session_name).await;
-        let current_target = {
-            let state = self.state.lock().await;
-            active_session_target(&state.sessions, &session_name)
-        };
-        self.queue_inline_hook(
-            HookName::AfterNewSession,
-            ScopeSelector::Session(session_name.clone()),
-            current_target,
-            PendingInlineHookFormat::AfterCommand,
-        );
-        self.emit(LifecycleEvent::SessionCreated {
-            session_name: session_name.clone(),
-        })
-        .await;
+        self.finish_new_session_lifecycle(requester_pid, &session_name, detached)
+            .await;
 
         if !request.print_session_info {
             return response;
@@ -556,14 +544,11 @@ impl RequestHandler {
 
         let attached_count = self.attached_count(session_name).await;
         let state = self.state.lock().await;
-        let session = state
-            .sessions
-            .session(session_name)
-            .ok_or_else(|| RmuxError::SessionNotFound(session_name.to_string()))?;
-        let context = FormatContext::from_session(session).with_session_attached(attached_count);
-        let mut runtime = RuntimeFormatContext::new(context)
-            .with_state(&state)
-            .with_session(session);
+        let mut runtime = format_context_for_target(
+            &state,
+            &rmux_proto::Target::Session(session_name.clone()),
+            attached_count,
+        )?;
         if attached_count == 0 {
             runtime = runtime.with_unclipped_geometry();
         }
@@ -592,7 +577,7 @@ impl RequestHandler {
                 )
         };
         if should_shutdown {
-            self.shutdown_requested.store(true, Ordering::SeqCst);
+            self.queue_shutdown_request(PendingShutdownReason::ExitEmpty);
         }
         should_shutdown
     }

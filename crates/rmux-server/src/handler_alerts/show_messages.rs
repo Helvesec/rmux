@@ -49,6 +49,11 @@ impl RequestHandler {
         }
 
         let attached_session = self.current_session_candidate(requester_pid).await;
+        if attached_session.is_none() {
+            return Response::Error(ErrorResponse {
+                error: RmuxError::Message("no current client".to_owned()),
+            });
+        }
         let lines = {
             let state = self.state.lock().await;
             state

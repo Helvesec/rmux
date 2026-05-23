@@ -97,6 +97,7 @@ impl HandlerState {
             }
         };
         let runtime_window_name = profile.runtime_window_name(command);
+        let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let terminal = match open_pane_terminal(
             new_pane_geometry,
@@ -144,6 +145,7 @@ impl HandlerState {
             new_pane_id,
             PaneOutputSpawn {
                 geometry: new_pane_geometry,
+                initial_title,
                 output_reader,
                 #[cfg(windows)]
                 exit_watcher: Some(exit_watcher),

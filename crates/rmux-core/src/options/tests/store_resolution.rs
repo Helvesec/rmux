@@ -16,7 +16,7 @@ fn option_store_starts_without_explicit_overrides_but_resolves_defaults() {
     );
     assert_eq!(
         store.resolve_for_window(&session_name("alpha"), 0, OptionName::AutomaticRenameFormat),
-        Some("#{?pane_in_mode,[rmux],#{pane_current_command}}#{?pane_dead,[dead],}")
+        Some("#{?pane_in_mode,[tmux],#{pane_current_command}}#{?pane_dead,[dead],}")
     );
 }
 

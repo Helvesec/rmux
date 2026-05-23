@@ -6,6 +6,7 @@ use rmux_ipc::LocalStream;
 use rmux_proto::AttachMessage;
 use tokio::sync::mpsc;
 
+use super::exit_log::AttachExitReason;
 use super::persistent_overlay::{
     accept_persistent_overlay_state, advance_persistent_overlay_state, clear_then_base_frame,
     defer_persistent_clear, discard_stale_persistent_overlays, is_stale_persistent_switch,
@@ -90,7 +91,7 @@ pub(super) async fn switch_attach_target(
 }
 
 pub(super) enum PendingAttachAction {
-    Exit,
+    Exit(AttachExitReason),
     Continue { target_changed: bool },
     Write,
 }
@@ -123,23 +124,31 @@ pub(super) async fn apply_pending_attach_controls(
             Ok(AttachControl::Detach) => {
                 emit_attach_stop(stream, current_target).await?;
                 emit_detached_message(stream, current_target).await?;
-                return Ok(PendingAttachAction::Exit);
+                return Ok(PendingAttachAction::Exit(
+                    AttachExitReason::AttachControlDetach,
+                ));
             }
             Ok(AttachControl::Exited) => {
                 emit_attach_stop(stream, current_target).await?;
                 emit_exited_message(stream).await?;
-                return Ok(PendingAttachAction::Exit);
+                return Ok(PendingAttachAction::Exit(
+                    AttachExitReason::AttachControlExited,
+                ));
             }
             Ok(AttachControl::DetachKill) => {
                 emit_attach_stop(stream, current_target).await?;
                 emit_attach_message(stream, &AttachMessage::DetachKill).await?;
-                return Ok(PendingAttachAction::Exit);
+                return Ok(PendingAttachAction::Exit(
+                    AttachExitReason::AttachControlDetachKill,
+                ));
             }
             Ok(AttachControl::DetachExecShellCommand(command)) => {
                 emit_attach_stop(stream, current_target).await?;
                 emit_attach_message(stream, &AttachMessage::DetachExecShellCommand(command))
                     .await?;
-                return Ok(PendingAttachAction::Exit);
+                return Ok(PendingAttachAction::Exit(
+                    AttachExitReason::AttachControlDetachExec,
+                ));
             }
             Ok(AttachControl::Switch(next_target)) => {
                 if is_stale_persistent_switch(*persistent_overlay_state_id, next_target.as_ref()) {

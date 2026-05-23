@@ -250,6 +250,58 @@ fn buffer_capture_and_scripting_commands_round_trip_end_to_end() -> Result<(), B
 }
 
 #[test]
+fn issue_8_split_and_new_window_pane_output_round_trip() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("request-issue-8-pane-output")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-x", "120", "-y", "40"])?);
+    assert_success(&harness.run(&[
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "printf ISSUE8_FIRST",
+        "Enter",
+    ])?);
+    assert_success(&harness.run(&["split-window", "-h", "-t", "alpha:0.0"])?);
+    assert_success(&harness.run(&[
+        "send-keys",
+        "-t",
+        "alpha:0.1",
+        "printf ISSUE8_SECOND",
+        "Enter",
+    ])?);
+    assert_success(&harness.run(&["new-window", "-t", "alpha"])?);
+    assert_success(&harness.run(&[
+        "send-keys",
+        "-t",
+        "alpha:1.0",
+        "printf ISSUE8_WINDOW",
+        "Enter",
+    ])?);
+
+    assert!(stdout(&wait_for_capture_target(
+        &harness,
+        "alpha:0.0",
+        "ISSUE8_FIRST"
+    )?)
+    .contains("ISSUE8_FIRST"));
+    assert!(stdout(&wait_for_capture_target(
+        &harness,
+        "alpha:0.1",
+        "ISSUE8_SECOND"
+    )?)
+    .contains("ISSUE8_SECOND"));
+    assert!(stdout(&wait_for_capture_target(
+        &harness,
+        "alpha:1.0",
+        "ISSUE8_WINDOW"
+    )?)
+    .contains("ISSUE8_WINDOW"));
+
+    Ok(())
+}
+
+#[test]
 fn rename_listing_and_wait_for_commands_round_trip_end_to_end() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("request-rename-list-wait")?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -450,10 +502,18 @@ fn wait_for_capture(
     harness: &CliHarness,
     marker: &str,
 ) -> Result<std::process::Output, Box<dyn Error>> {
+    wait_for_capture_target(harness, "alpha:0.0", marker)
+}
+
+fn wait_for_capture_target(
+    harness: &CliHarness,
+    target: &str,
+    marker: &str,
+) -> Result<std::process::Output, Box<dyn Error>> {
     let mut last = None;
 
     for _ in 0..100 {
-        let output = harness.run(&["capture-pane", "-p", "-t", "alpha:0.0"])?;
+        let output = harness.run(&["capture-pane", "-p", "-t", target])?;
         if output.status.code() == Some(0) && stdout(&output).contains(marker) {
             return Ok(output);
         }
@@ -463,7 +523,7 @@ fn wait_for_capture(
 
     let last = last.expect("capture-pane must run at least once");
     Err(format!(
-        "capture-pane -p never surfaced marker {marker}; status={:?} stdout={:?} stderr={:?}",
+        "capture-pane -p -t {target} never surfaced marker {marker}; status={:?} stdout={:?} stderr={:?}",
         last.status.code(),
         stdout(&last),
         stderr(&last)

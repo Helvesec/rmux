@@ -248,18 +248,15 @@ impl RequestHandler {
                         if self.prompt_active(attach_pid).await {
                             break;
                         }
+                        continue;
                     }
                     ExtendedKeyDecode::Partial => {
                         pending_input.drain(..raw_start);
                         retain_partial_attached_control_input("live extended key", pending_input)?;
                         return Ok(forwarded_to_pane);
                     }
-                    ExtendedKeyDecode::Invalid => {
-                        raw_start = offset;
-                        offset += 1;
-                    }
+                    ExtendedKeyDecode::Invalid => {}
                 }
-                continue;
             }
             let prefix_table_active = self.attached_prefix_table_active(attach_pid).await;
             if slice

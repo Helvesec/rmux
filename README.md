@@ -14,7 +14,7 @@ English · [Français](README.fr.md) · [简体中文](README.zh-CN.md) · [日�
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Release validation](https://github.com/Helvesec/rmux/actions/workflows/ci.yml/badge.svg)](https://github.com/Helvesec/rmux/actions/workflows/ci.yml)
-[![rmux 0.2.5](https://img.shields.io/badge/rmux-0.2.5-informational.svg)](#install)
+[![rmux 0.3.0](https://img.shields.io/badge/rmux-0.3.0-informational.svg)](#install)
 [![Platform: Linux | macOS | Windows](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#platform-support)
 [![Unsafe policy](https://img.shields.io/badge/unsafe-restricted-success.svg)](#verification)
 
@@ -26,7 +26,7 @@ English · [Français](README.fr.md) · [简体中文](README.zh-CN.md) · [日�
 </div>
 
 > [!IMPORTANT]
-> Current release: **v0.2.0**, published on **18 May 2026**. All 90 tmux-compatible commands are implemented, but bugs are expected — this is a fresh public preview. Please [file issues](https://github.com/helvesec/rmux/issues) if you hit one.
+> Current release: **v0.3.0**, published on **23 May 2026**. All 90 tmux-compatible commands are implemented, but bugs are expected — this is a fresh public preview. Please [file issues](https://github.com/helvesec/rmux/issues) if you hit one.
 
 ## Why RMUX
 
@@ -45,7 +45,7 @@ Short, real examples of what RMUX can be used for.
     <td align="center" width="20%"><a href="https://rmux.io/#demo-orchestration"><img src="https://rmux.io/demos/demo-orchestration.png" width="150" alt="Multi Agents Orchestration demo preview"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/demo-orchestration"><strong>Multi Agents Orchestration</strong></a></sub><br><sub>≃ 514 lines</sub></td>
     <td align="center" width="20%"><a href="https://rmux.io/#demo-broadcast"><img src="https://rmux.io/demos/demo-broadcast.png" width="150" alt="Agent Broadcast Arena demo preview"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/broadcast-demo"><strong>Agent Broadcast Arena</strong></a></sub><br><sub>≃ 2,171 lines</sub></td>
     <td align="center" width="20%"><a href="https://rmux.io/#demo-zellij"><img src="https://rmux.io/demos/demo-zellij.png" width="150" alt="Mini-Zellij demo preview"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/mini-zellij"><strong>Mini-Zellij</strong></a></sub><br><sub>≃ 944 lines</sub></td>
-    <td align="center" width="20%"><a href="https://rmux.io/#demo-mirroring"><img src="https://rmux.io/demos/demo-mirroring.png" width="150" alt="Terminal browser mirroring demo preview"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/web-claude-demo"><strong>Terminal &lt;&gt; Browser Mirroring</strong></a></sub><br><sub>≃ 649 lines</sub></td>
+    <td align="center" width="20%"><a href="https://rmux.io/#demo-mirroring"><img src="https://rmux.io/demos/demo-mirroring.png" width="150" alt="Terminal browser mirroring demo preview"></a><br><sub><a href="https://rmux.io/#demo-mirroring"><strong>Terminal &lt;&gt; Browser Mirroring</strong></a></sub><br><sub>≃ 649 lines</sub></td>
     <td align="center" width="20%"><a href="https://rmux.io/#demo-playwright"><img src="https://rmux.io/demos/demo-playwright.png" width="150" alt="Playwright Testing demo preview"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/terminal-playwright-demo"><strong>Playwright Testing</strong></a></sub><br><sub>≃ 1,495 lines</sub></td>
   </tr>
 </table>
@@ -64,7 +64,7 @@ Prebuilt binary for Windows PowerShell:
 irm https://rmux.io/install.ps1 | iex
 ```
 
-Direct downloads and SHA256 checksums are available from the [v0.2.5 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.2.5).
+Direct downloads and SHA256 checksums are available from the [v0.3.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.3.0).
 
 From crates.io with Cargo:
 
@@ -110,11 +110,14 @@ rmux new-session --help
 rmux split-window --help
 ```
 
+Use `rmux -V` for the RMUX package version. For build and support details,
+use `rmux diagnose --human` or `rmux diagnose --json`.
+
 ## SDK Quickstart
 
 ```toml
 [dependencies]
-rmux-sdk = "0.2"
+rmux-sdk = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -239,6 +242,29 @@ conditionals, format jobs such as `#(cmd)`, recursive `source-file` entries,
 and unsupported options instead of executing them. Set
 `RMUX_DISABLE_TMUX_FALLBACK=1` to disable it entirely. Fallback files are read
 best-effort: non-regular files and files larger than 1 MiB are ignored.
+
+### Terminal compatibility notes
+
+RMUX works with shells that query terminal capabilities, including fish. It
+answers terminal device-attribute probes and handles Escape-key timing so fish
+prompts and key sequences behave normally inside RMUX panes.
+
+Kitty graphics passthrough is available for outer terminals that support the
+Kitty graphics protocol, including Kitty, Ghostty, and WezTerm. It is opt-in:
+
+```tmux
+set -g allow-passthrough on
+```
+
+If your terminal supports Kitty graphics but is not detected automatically, add
+a terminal feature override:
+
+```tmux
+set -as terminal-features 'xterm-kitty:kitty-graphics'
+```
+
+On Windows, RMUX enables modern ConPTY passthrough when the OS supports it. Set
+`RMUX_CONPTY_NO_PASSTHROUGH=1` to disable that backend mode for troubleshooting.
 
 ## Verification
 

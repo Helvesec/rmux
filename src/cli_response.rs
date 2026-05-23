@@ -1,4 +1,4 @@
-use rmux_proto::{CommandOutput, ErrorResponse, Response};
+use rmux_proto::{CommandOutput, ErrorResponse, Response, RmuxError};
 
 use crate::cli::ExitFailure;
 
@@ -103,7 +103,9 @@ pub(crate) fn expect_command_success(
         Response::UnlinkWindow(_) if command_name == "unlink-window" => Ok(()),
         Response::WaitFor(_) if command_name == "wait-for" => Ok(()),
         Response::ControlMode(_) if command_name == "control-mode" => Ok(()),
-        Response::Error(ErrorResponse { error }) => Err(ExitFailure::new(1, error.to_string())),
+        Response::Error(ErrorResponse { error }) => {
+            Err(ExitFailure::new(1, tmux_cli_error_message(&error)))
+        }
         other => Err(unexpected_response(command_name, &other)),
     }
 }
@@ -113,7 +115,9 @@ pub(crate) fn expect_command_output<'a>(
     command_name: &'static str,
 ) -> Result<&'a CommandOutput, ExitFailure> {
     match response {
-        Response::Error(ErrorResponse { error }) => Err(ExitFailure::new(1, error.to_string())),
+        Response::Error(ErrorResponse { error }) => {
+            Err(ExitFailure::new(1, tmux_cli_error_message(error)))
+        }
         other
             if matches!(
                 command_name,
@@ -142,6 +146,13 @@ pub(crate) fn expect_command_output<'a>(
                 .ok_or_else(|| unexpected_response(command_name, other))
         }
         other => Err(unexpected_response(command_name, other)),
+    }
+}
+
+fn tmux_cli_error_message(error: &RmuxError) -> String {
+    match error {
+        RmuxError::Server(message) => message.clone(),
+        _ => error.to_string(),
     }
 }
 

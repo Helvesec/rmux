@@ -17,6 +17,9 @@ use crate::pane_io::PaneOutputSender;
 #[cfg(test)]
 use crate::server_access::current_owner_uid;
 
+#[path = "handler_control/session_attach.rs"]
+mod session_attach;
+
 #[derive(Debug, Default)]
 pub(super) struct ActiveControlState {
     next_id: u64,

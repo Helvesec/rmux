@@ -23,6 +23,8 @@ mod control_notifications;
 mod copy_mode;
 mod daemon;
 #[cfg(any(unix, windows))]
+mod diagnostic_log;
+#[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod format_runtime;
 #[cfg(any(unix, windows))]
@@ -64,6 +66,8 @@ mod outer_terminal;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod pane_io;
+#[cfg(unix)]
+mod pane_reader_runtime;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod pane_screen_state;

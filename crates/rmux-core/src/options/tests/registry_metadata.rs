@@ -122,8 +122,9 @@ fn style_and_array_metadata_capture_tmux_specific_defaults() {
     assert!(status_format.is_array());
     match status_format.default_value() {
         registry::DefaultValue::Array(values) => {
-            assert_eq!(values.len(), 3);
-            assert!(values.iter().all(|value| value.contains("#[align=left")));
+            assert_eq!(values.len(), 2);
+            assert!(values.iter().any(|value| value.contains("#[align=left")));
+            assert!(values.iter().any(|value| value.contains("#[align=centre]")));
         }
         default => panic!("unexpected status-format default: {default:?}"),
     }
@@ -134,7 +135,7 @@ fn style_and_array_metadata_capture_tmux_specific_defaults() {
     assert_eq!(
         update_environment.default_value(),
         registry::DefaultValue::Scalar(concat!(
-            "DISPLAY KRB5CCNAME MSYSTEM SSH_ASKPASS SSH_AUTH_SOCK SSH_",
+            "DISPLAY KRB5CCNAME SSH_ASKPASS SSH_AUTH_SOCK SSH_",
             "AG",
             "ENT_PID SSH_CONNECTION WINDOWID XAUTHORITY"
         ))

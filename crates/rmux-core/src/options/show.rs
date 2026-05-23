@@ -5,7 +5,8 @@ use rmux_proto::{PaneTarget, RmuxError, WindowTarget};
 
 use super::registry::{registry, resolve_option_name, GlobalRoot};
 use super::render::{
-    default_array_show_values, render_entry_show_lines, render_show_line, show_option_name,
+    default_array_show_values, render_entry_show_lines, render_known_show_line, render_show_line,
+    show_option_name,
 };
 use super::scope::{ResolveContext, ShowScope};
 use super::storage::{OptionEntry, OptionNode};
@@ -231,10 +232,14 @@ impl OptionStore {
                     .map(OptionEntry::array_entries)
                     .unwrap_or_default(),
             };
+            if values.is_empty() && !value_only {
+                return vec![query.canonical_name().to_owned()];
+            }
             return values
                 .into_iter()
                 .map(|(index, value)| {
-                    render_show_line(
+                    render_known_show_line(
+                        query,
                         &show_option_name(query.canonical_name(), Some(index)),
                         &value,
                         value_only,
@@ -254,7 +259,8 @@ impl OptionStore {
         value
             .into_iter()
             .map(|value| {
-                render_show_line(
+                render_known_show_line(
+                    query,
                     &show_option_name(query.canonical_name(), query.index()),
                     &value,
                     value_only,

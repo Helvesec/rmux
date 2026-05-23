@@ -33,6 +33,11 @@ impl Window {
                 }
                 self.requested_main_height = Some(rows);
             }
+            ResizePaneAdjustment::AbsoluteSize { columns, rows } => {
+                self.resize_main_pane(ResizePaneAdjustment::AbsoluteWidth { columns });
+                self.resize_main_pane(ResizePaneAdjustment::AbsoluteHeight { rows });
+                return;
+            }
             ResizePaneAdjustment::Zoom => {
                 self.toggle_zoom(self.active_pane);
                 return;
@@ -166,6 +171,7 @@ impl Window {
             ResizePaneAdjustment::Right { cells } => (LayoutDirection::LeftRight, i32::from(cells)),
             ResizePaneAdjustment::AbsoluteWidth { .. }
             | ResizePaneAdjustment::AbsoluteHeight { .. }
+            | ResizePaneAdjustment::AbsoluteSize { .. }
             | ResizePaneAdjustment::Zoom
             | ResizePaneAdjustment::NoOp => return false,
         };

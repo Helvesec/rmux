@@ -181,8 +181,9 @@ async fn server_access_list_skips_uid_zero() {
     }
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
-async fn server_access_mutual_exclusion_validated() {
+async fn server_access_combined_flags_resolve_user_before_mutation() {
     let handler = RequestHandler::new();
 
     let response = handler
@@ -192,13 +193,16 @@ async fn server_access_mutual_exclusion_validated() {
             list: false,
             read_only: false,
             write: false,
-            user: Some("alice".to_owned()),
+            user: Some("rmux-no-such-user".to_owned()),
         }))
         .await;
-    assert!(
-        matches!(response, Response::Error(_)),
-        "-a and -d together must be rejected"
-    );
+    match response {
+        Response::Error(error) => assert_eq!(
+            error.error.to_string(),
+            "server error: unknown user: rmux-no-such-user"
+        ),
+        _ => panic!("expected unknown user error"),
+    }
 
     let response = handler
         .handle(Request::ServerAccess(rmux_proto::ServerAccessRequest {
@@ -207,11 +211,62 @@ async fn server_access_mutual_exclusion_validated() {
             list: false,
             read_only: true,
             write: true,
-            user: Some("alice".to_owned()),
+            user: Some("rmux-no-such-user".to_owned()),
         }))
         .await;
-    assert!(
-        matches!(response, Response::Error(_)),
-        "-r and -w together must be rejected"
-    );
+    match response {
+        Response::Error(error) => assert_eq!(
+            error.error.to_string(),
+            "server error: unknown user: rmux-no-such-user"
+        ),
+        _ => panic!("expected unknown user error"),
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn server_access_user_mutations_are_rejected_before_user_resolution_windows() {
+    let handler = RequestHandler::new();
+    let expected = "server error: server-access user mutations are unsupported on Windows; named-pipe access is scoped to the current Windows SID";
+
+    for request in [
+        rmux_proto::ServerAccessRequest {
+            add: true,
+            deny: true,
+            list: false,
+            read_only: false,
+            write: false,
+            user: Some("rmux-no-such-user".to_owned()),
+        },
+        rmux_proto::ServerAccessRequest {
+            add: false,
+            deny: false,
+            list: false,
+            read_only: true,
+            write: true,
+            user: Some("rmux-no-such-user".to_owned()),
+        },
+    ] {
+        match handler.handle(Request::ServerAccess(request)).await {
+            Response::Error(error) => assert_eq!(error.error.to_string(), expected),
+            _ => panic!("expected Windows server-access unsupported mutation error"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn server_access_list_ignores_user_and_mutation_flags() {
+    let handler = RequestHandler::with_owner_uid(1000);
+
+    let response = handler
+        .handle(Request::ServerAccess(rmux_proto::ServerAccessRequest {
+            add: true,
+            deny: true,
+            list: true,
+            read_only: false,
+            write: false,
+            user: Some("rmux-no-such-user".to_owned()),
+        }))
+        .await;
+    assert!(matches!(response, Response::ServerAccess(_)));
 }

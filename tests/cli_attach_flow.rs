@@ -1298,7 +1298,7 @@ fn prefix_w_then_prefix_q_timeout_restores_choose_tree_overlay() -> Result<(), B
         |content| {
             content.contains("sort: index")
                 && content.contains("(0) - alpha: 1 windows (attached)")
-                && content.contains("└─> + 0: [rmux]*Z")
+                && content.contains("└─> + 0: [tmux]*Z")
                 && content.contains("│ 0 │")
                 && content.contains("│ 3 │")
         },
@@ -1324,7 +1324,7 @@ fn prefix_w_then_prefix_q_timeout_restores_choose_tree_overlay() -> Result<(), B
         |content| {
             content.contains("sort: index")
                 && content.contains("(0) - alpha: 1 windows (attached)")
-                && content.contains("└─> + 0: [rmux]*Z")
+                && content.contains("└─> + 0: [tmux]*Z")
                 && content.contains("│ 0 │")
                 && content.contains("│ 3 │")
         },
@@ -1333,7 +1333,7 @@ fn prefix_w_then_prefix_q_timeout_restores_choose_tree_overlay() -> Result<(), B
     assert!(
         restored_tree_content.contains("sort: index")
             && restored_tree_content.contains("(0) - alpha: 1 windows (attached)")
-            && restored_tree_content.contains("└─> + 0: [rmux]*Z")
+            && restored_tree_content.contains("└─> + 0: [tmux]*Z")
             && restored_tree_content.contains("│ 0 │")
             && restored_tree_content.contains("│ 3 │"),
         "display-panes timeout inside choose-tree should restore the choose-tree overlay\n--- baseline ---\n{baseline_tree_content}\n--- restored ---\n{restored_tree_content}"
@@ -1378,7 +1378,7 @@ fn prefix_w_marks_the_host_pane_as_tmux_mode_for_status_formats() -> Result<(), 
         "alpha:0.0",
         "#{window_name}|#{pane_in_mode}|#{pane_mode}",
     ])?;
-    assert_eq!(common::stdout(&output), "[rmux]|1|tree-mode\n");
+    assert_eq!(common::stdout(&output), "[tmux]|1|tree-mode\n");
     let windows = harness.run(&[
         "list-windows",
         "-t",
@@ -1389,7 +1389,7 @@ fn prefix_w_marks_the_host_pane_as_tmux_mode_for_status_formats() -> Result<(), 
     assert!(
         common::stdout(&windows)
             .lines()
-            .any(|line| line == "0:[rmux]"),
+            .any(|line| line == "0:[tmux]"),
         "choose-tree should update the stored automatic window name, got: {:?}",
         common::stdout(&windows)
     );
@@ -1559,7 +1559,7 @@ fn choose_tree_q_restores_the_four_pane_layout_on_the_real_attached_client(
     assert!(
         !settled_panes.contains("sort: index")
             && !settled_panes.contains("┌ 0 (sort: index)")
-            && !settled_panes.contains("└─> + 0: [rmux]*Z"),
+            && !settled_panes.contains("└─> + 0: [tmux]*Z"),
         "choose-tree q should not leave stale mode-tree content after queued redraws settle\n--- settled ---\n{settled_panes}"
     );
 

@@ -143,6 +143,8 @@ pub(super) fn parse_resize_pane(
 ) -> Result<Request, RmuxError> {
     let mut target = None;
     let mut adjustment = None;
+    let mut absolute_width = None;
+    let mut absolute_height = None;
 
     while let Some(token) = args.peek() {
         match token {
@@ -164,9 +166,7 @@ pub(super) fn parse_resize_pane(
                         "resize-pane accepts only one adjustment flag".to_owned(),
                     ));
                 }
-                adjustment = Some(ResizePaneAdjustment::AbsoluteWidth {
-                    columns: parse_u16("resize-pane", "-x", &args.required("-x value")?)?,
-                });
+                absolute_width = Some(parse_u16("resize-pane", "-x", &args.required("-x value")?)?);
             }
             "-y" => {
                 let _ = args.optional();
@@ -175,13 +175,12 @@ pub(super) fn parse_resize_pane(
                         "resize-pane accepts only one adjustment flag".to_owned(),
                     ));
                 }
-                adjustment = Some(ResizePaneAdjustment::AbsoluteHeight {
-                    rows: parse_u16("resize-pane", "-y", &args.required("-y value")?)?,
-                });
+                absolute_height =
+                    Some(parse_u16("resize-pane", "-y", &args.required("-y value")?)?);
             }
             "-U" => {
                 let _ = args.optional();
-                if adjustment.is_some() {
+                if adjustment.is_some() || absolute_width.is_some() || absolute_height.is_some() {
                     return Err(RmuxError::Server(
                         "resize-pane accepts only one adjustment flag".to_owned(),
                     ));
@@ -192,7 +191,7 @@ pub(super) fn parse_resize_pane(
             }
             "-D" => {
                 let _ = args.optional();
-                if adjustment.is_some() {
+                if adjustment.is_some() || absolute_width.is_some() || absolute_height.is_some() {
                     return Err(RmuxError::Server(
                         "resize-pane accepts only one adjustment flag".to_owned(),
                     ));
@@ -203,7 +202,7 @@ pub(super) fn parse_resize_pane(
             }
             "-L" => {
                 let _ = args.optional();
-                if adjustment.is_some() {
+                if adjustment.is_some() || absolute_width.is_some() || absolute_height.is_some() {
                     return Err(RmuxError::Server(
                         "resize-pane accepts only one adjustment flag".to_owned(),
                     ));
@@ -214,7 +213,7 @@ pub(super) fn parse_resize_pane(
             }
             "-R" => {
                 let _ = args.optional();
-                if adjustment.is_some() {
+                if adjustment.is_some() || absolute_width.is_some() || absolute_height.is_some() {
                     return Err(RmuxError::Server(
                         "resize-pane accepts only one adjustment flag".to_owned(),
                     ));
@@ -225,7 +224,7 @@ pub(super) fn parse_resize_pane(
             }
             "-Z" => {
                 let _ = args.optional();
-                if adjustment.is_some() {
+                if adjustment.is_some() || absolute_width.is_some() || absolute_height.is_some() {
                     return Err(RmuxError::Server(
                         "resize-pane accepts only one adjustment flag".to_owned(),
                     ));
@@ -236,6 +235,12 @@ pub(super) fn parse_resize_pane(
         }
     }
     args.no_extra("resize-pane")?;
+    let adjustment = adjustment.or(match (absolute_width, absolute_height) {
+        (Some(columns), Some(rows)) => Some(ResizePaneAdjustment::AbsoluteSize { columns, rows }),
+        (Some(columns), None) => Some(ResizePaneAdjustment::AbsoluteWidth { columns }),
+        (None, Some(rows)) => Some(ResizePaneAdjustment::AbsoluteHeight { rows }),
+        (None, None) => None,
+    });
 
     Ok(Request::ResizePane(ResizePaneRequest {
         target: target.unwrap_or(implicit_pane_target(sessions, find_context, "resize-pane")?),

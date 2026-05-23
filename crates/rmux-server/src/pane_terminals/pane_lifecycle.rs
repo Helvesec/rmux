@@ -76,6 +76,7 @@ impl HandlerState {
         )?;
         let automatic_window_name = profile.automatic_window_name(command);
         let runtime_window_name = profile.runtime_window_name(command);
+        let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let terminal =
             open_pane_terminal(pane_geometry, profile, runtime_window_name.clone(), command)?;
@@ -93,6 +94,7 @@ impl HandlerState {
             pane.id,
             PaneOutputSpawn {
                 geometry: pane_geometry,
+                initial_title,
                 output_reader,
                 #[cfg(windows)]
                 exit_watcher: Some(exit_watcher),
@@ -209,6 +211,7 @@ impl HandlerState {
         )?;
         let automatic_window_name = profile.automatic_window_name(spawn.command);
         let runtime_window_name = profile.runtime_window_name(spawn.command);
+        let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let terminal = open_pane_terminal(
             pane_geometry,
@@ -232,6 +235,7 @@ impl HandlerState {
         )?;
         let output_spawn = PaneOutputSpawn {
             geometry: pane_geometry,
+            initial_title,
             output_reader,
             #[cfg(windows)]
             exit_watcher: Some(exit_watcher),
@@ -503,6 +507,7 @@ impl HandlerState {
         )?;
         let automatic_window_name = profile.automatic_window_name(process_command.as_ref());
         let runtime_window_name = profile.runtime_window_name(process_command.as_ref());
+        let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let terminal = open_pane_terminal(
             pane_geometry,
@@ -544,6 +549,7 @@ impl HandlerState {
             pane_id,
             PaneOutputSpawn {
                 geometry: pane_geometry,
+                initial_title,
                 output_reader,
                 #[cfg(windows)]
                 exit_watcher: Some(exit_watcher),

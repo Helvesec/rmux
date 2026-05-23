@@ -120,6 +120,7 @@ pub(super) fn parse_clear_history(mut args: CommandTokens) -> Result<Request, Rm
 pub(super) fn parse_display_message(mut args: CommandTokens) -> Result<Request, RmuxError> {
     let mut target = None;
     let mut print = false;
+    let mut all_formats = false;
     let mut message = None;
 
     while let Some(token) = args.peek() {
@@ -131,6 +132,11 @@ pub(super) fn parse_display_message(mut args: CommandTokens) -> Result<Request, 
             "-F" => {
                 let _ = args.optional();
                 message = Some(args.required("-F format")?);
+            }
+            "-a" => {
+                let _ = args.optional();
+                all_formats = true;
+                print = true;
             }
             "-p" => {
                 let _ = args.optional();
@@ -147,7 +153,10 @@ pub(super) fn parse_display_message(mut args: CommandTokens) -> Result<Request, 
         }
     }
 
-    if message.is_none() && !args.is_empty() {
+    if all_formats {
+        message = Some(display_all_formats_template());
+        args.no_extra("display-message")?;
+    } else if message.is_none() && !args.is_empty() {
         message = Some(args.remaining_joined());
     } else {
         args.no_extra("display-message")?;
@@ -159,6 +168,140 @@ pub(super) fn parse_display_message(mut args: CommandTokens) -> Result<Request, 
         message,
     }))
 }
+
+fn display_all_formats_template() -> String {
+    DISPLAY_ALL_FORMATS
+        .iter()
+        .map(|name| match *name {
+            "session_last_attached" => format!("{name}=#{{?{name},#{{{name}}},0}}"),
+            _ => format!("{name}=#{{{name}}}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+const DISPLAY_ALL_FORMATS: &[&str] = &[
+    "active_window_index",
+    "alternate_on",
+    "alternate_saved_x",
+    "alternate_saved_y",
+    "buffer_mode_format",
+    "client_mode_format",
+    "config_files",
+    "cursor_character",
+    "cursor_flag",
+    "cursor_x",
+    "cursor_y",
+    "history_all_bytes",
+    "history_bytes",
+    "history_limit",
+    "history_size",
+    "host",
+    "host_short",
+    "insert_flag",
+    "keypad_cursor_flag",
+    "keypad_flag",
+    "last_window_index",
+    "mouse_all_flag",
+    "mouse_any_flag",
+    "mouse_button_flag",
+    "mouse_sgr_flag",
+    "mouse_standard_flag",
+    "mouse_utf8_flag",
+    "next_session_id",
+    "origin_flag",
+    "pane_active",
+    "pane_at_bottom",
+    "pane_at_left",
+    "pane_at_right",
+    "pane_at_top",
+    "pane_bg",
+    "pane_bottom",
+    "pane_current_command",
+    "pane_current_path",
+    "pane_dead",
+    "pane_fg",
+    "pane_format",
+    "pane_height",
+    "pane_id",
+    "pane_in_mode",
+    "pane_index",
+    "pane_input_off",
+    "pane_last",
+    "pane_left",
+    "pane_marked",
+    "pane_marked_set",
+    "pane_path",
+    "pane_pid",
+    "pane_pipe",
+    "pane_right",
+    "pane_search_string",
+    "pane_start_command",
+    "pane_start_path",
+    "pane_synchronized",
+    "pane_tabs",
+    "pane_title",
+    "pane_top",
+    "pane_tty",
+    "pane_unseen_changes",
+    "pane_width",
+    "pid",
+    "scroll_region_lower",
+    "scroll_region_upper",
+    "server_sessions",
+    "session_activity",
+    "session_alerts",
+    "session_attached",
+    "session_created",
+    "session_format",
+    "session_grouped",
+    "session_id",
+    "session_last_attached",
+    "session_many_attached",
+    "session_marked",
+    "session_name",
+    "session_path",
+    "session_stack",
+    "session_windows",
+    "socket_path",
+    "start_time",
+    "tree_mode_format",
+    "uid",
+    "user",
+    "version",
+    "window_active",
+    "window_active_clients",
+    "window_active_sessions",
+    "window_active_sessions_list",
+    "window_activity",
+    "window_activity_flag",
+    "window_bell_flag",
+    "window_cell_height",
+    "window_cell_width",
+    "window_end_flag",
+    "window_flags",
+    "window_format",
+    "window_height",
+    "window_id",
+    "window_index",
+    "window_last_flag",
+    "window_layout",
+    "window_linked",
+    "window_linked_sessions",
+    "window_linked_sessions_list",
+    "window_marked_flag",
+    "window_name",
+    "window_panes",
+    "window_raw_flags",
+    "window_silence_flag",
+    "window_stack_index",
+    "window_start_flag",
+    "window_visible_layout",
+    "window_width",
+    "window_zoomed_flag",
+    "wrap_flag",
+    "command",
+];
 
 pub(super) fn parse_show_messages(mut args: CommandTokens) -> Result<Request, RmuxError> {
     let mut jobs = false;

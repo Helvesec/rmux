@@ -582,16 +582,6 @@ fn shipped_hooks_accept_registration_at_supported_scopes() {
 
 #[test]
 fn undispatched_hooks_are_rejected_for_registration() {
-    let error = validate_hook_registration(HookName::WindowResized, &ScopeSelector::Global)
-        .expect_err("unsupported hooks must be rejected");
-
-    assert_eq!(
-        error,
-        RmuxError::Message(
-            "window-resized is not supported: rmux does not dispatch this hook".to_owned()
-        )
-    );
-
     assert!(validate_hook_registration(HookName::ClientDarkTheme, &ScopeSelector::Global).is_err());
     assert!(
         validate_hook_registration(HookName::PaneTitleChanged, &ScopeSelector::Global).is_err()

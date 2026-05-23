@@ -255,6 +255,20 @@ fn target_resolution_error_message(
         {
             format!("can't find pane: {}", pane_target_lookup_token(raw_target))
         }
+        RmuxError::Server(message)
+            if target_type == ResolveTargetType::Pane && message == "no current target" =>
+        {
+            format!("can't find pane: {}", pane_target_lookup_token(raw_target))
+        }
+        RmuxError::InvalidTarget { reason, .. }
+            if target_type == ResolveTargetType::Window
+                && reason == "window index does not exist in session" =>
+        {
+            format!(
+                "can't find window: {}",
+                window_target_lookup_token(raw_target)
+            )
+        }
         _ => error.to_string(),
     }
 }
@@ -266,6 +280,15 @@ fn pane_target_lookup_token(raw_target: &str) -> &str {
     raw_target
         .rsplit_once('.')
         .map_or(raw_target, |(_, pane)| pane)
+}
+
+fn window_target_lookup_token(raw_target: &str) -> &str {
+    if raw_target.starts_with('@') {
+        return raw_target;
+    }
+    raw_target
+        .rsplit_once(':')
+        .map_or(raw_target, |(_, window)| window)
 }
 
 pub(super) fn display_panes_client_target_error(raw_target: &str) -> ExitFailure {

@@ -6,10 +6,11 @@ use std::sync::{Arc, Weak};
 
 use rmux_core::events::{PaneSnapshotCoalescerRegistry, SubscriptionLimits};
 use rmux_ipc::PeerIdentity;
-use rmux_proto::{KillServerResponse, Response, RmuxError, TerminalSize, WindowTarget};
+use rmux_proto::{KillServerResponse, OptionName, Response, RmuxError, TerminalSize, WindowTarget};
 use tokio::sync::{broadcast, Mutex};
 
 use crate::daemon::ShutdownHandle;
+use crate::diagnostic_log::{record_shutdown_queued, record_shutdown_request};
 #[path = "handler_alerts.rs"]
 mod alert_support;
 #[path = "handler_attach.rs"]
@@ -103,6 +104,29 @@ use wait_support::SdkWaitState;
 /// terminal discovery is wired in later steps.
 pub const DEFAULT_SESSION_SIZE: TerminalSize = TerminalSize { cols: 80, rows: 24 };
 const HOOK_EVENT_BUFFER: usize = 256;
+const SHUTDOWN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::handler) enum PendingShutdownReason {
+    ExitEmpty,
+    KillServer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitEmptyShutdownState {
+    StillApplies,
+    Stale,
+    Unknown,
+}
+
+impl PendingShutdownReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ExitEmpty => "exit-empty",
+            Self::KillServer => "kill-server",
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct RequestHandler {
@@ -117,6 +141,8 @@ pub(crate) struct RequestHandler {
     server_socket_path: Arc<StdMutex<PathBuf>>,
     server_access: Arc<StdMutex<ServerAccessStore>>,
     shutdown_requested: Arc<AtomicBool>,
+    shutdown_reason: Arc<StdMutex<Option<PendingShutdownReason>>>,
+    shutdown_retry_scheduled: Arc<AtomicBool>,
     shutdown_handle: Arc<StdMutex<Option<ShutdownHandle>>>,
     config_loading_depth: Arc<AtomicUsize>,
     next_connection_id: Arc<AtomicU64>,
@@ -127,6 +153,7 @@ pub(crate) struct RequestHandler {
     session_lease_janitor_started: Arc<AtomicBool>,
     pane_snapshot_coalescers: Arc<StdMutex<PaneSnapshotCoalescerRegistry>>,
     pane_snapshot_revisions: Arc<StdMutex<PaneSnapshotRevisionRegistry>>,
+    task_runtime: Option<tokio::runtime::Handle>,
     #[cfg(test)]
     cleanup_on_drop: bool,
     #[cfg(test)]
@@ -147,6 +174,8 @@ impl Clone for RequestHandler {
             server_socket_path: self.server_socket_path.clone(),
             server_access: self.server_access.clone(),
             shutdown_requested: self.shutdown_requested.clone(),
+            shutdown_reason: self.shutdown_reason.clone(),
+            shutdown_retry_scheduled: self.shutdown_retry_scheduled.clone(),
             shutdown_handle: self.shutdown_handle.clone(),
             config_loading_depth: self.config_loading_depth.clone(),
             next_connection_id: self.next_connection_id.clone(),
@@ -157,6 +186,7 @@ impl Clone for RequestHandler {
             session_lease_janitor_started: self.session_lease_janitor_started.clone(),
             pane_snapshot_coalescers: self.pane_snapshot_coalescers.clone(),
             pane_snapshot_revisions: self.pane_snapshot_revisions.clone(),
+            task_runtime: self.task_runtime.clone(),
             #[cfg(test)]
             cleanup_on_drop: false,
             #[cfg(test)]
@@ -178,6 +208,8 @@ pub(crate) struct WeakRequestHandler {
     server_socket_path: Weak<StdMutex<PathBuf>>,
     server_access: Weak<StdMutex<ServerAccessStore>>,
     shutdown_requested: Weak<AtomicBool>,
+    shutdown_reason: Weak<StdMutex<Option<PendingShutdownReason>>>,
+    shutdown_retry_scheduled: Weak<AtomicBool>,
     shutdown_handle: Weak<StdMutex<Option<ShutdownHandle>>>,
     config_loading_depth: Weak<AtomicUsize>,
     next_connection_id: Weak<AtomicU64>,
@@ -188,6 +220,7 @@ pub(crate) struct WeakRequestHandler {
     session_lease_janitor_started: Weak<AtomicBool>,
     pane_snapshot_coalescers: Weak<StdMutex<PaneSnapshotCoalescerRegistry>>,
     pane_snapshot_revisions: Weak<StdMutex<PaneSnapshotRevisionRegistry>>,
+    task_runtime: Option<tokio::runtime::Handle>,
     #[cfg(test)]
     paste_buffer_delete_pause: Weak<StdMutex<Option<Arc<PasteBufferDeletePause>>>>,
 }
@@ -206,6 +239,8 @@ impl WeakRequestHandler {
             server_socket_path: self.server_socket_path.upgrade()?,
             server_access: self.server_access.upgrade()?,
             shutdown_requested: self.shutdown_requested.upgrade()?,
+            shutdown_reason: self.shutdown_reason.upgrade()?,
+            shutdown_retry_scheduled: self.shutdown_retry_scheduled.upgrade()?,
             shutdown_handle: self.shutdown_handle.upgrade()?,
             config_loading_depth: self.config_loading_depth.upgrade()?,
             next_connection_id: self.next_connection_id.upgrade()?,
@@ -216,6 +251,7 @@ impl WeakRequestHandler {
             session_lease_janitor_started: self.session_lease_janitor_started.upgrade()?,
             pane_snapshot_coalescers: self.pane_snapshot_coalescers.upgrade()?,
             pane_snapshot_revisions: self.pane_snapshot_revisions.upgrade()?,
+            task_runtime: self.task_runtime.clone(),
             #[cfg(test)]
             cleanup_on_drop: false,
             #[cfg(test)]
@@ -285,6 +321,11 @@ impl RequestHandler {
     ) -> Self {
         let (hook_events, _receiver) = broadcast::channel(HOOK_EVENT_BUFFER);
         let mut state = HandlerState::default();
+        let task_runtime = tokio::runtime::Handle::try_current().ok();
+        #[cfg(unix)]
+        if let Some(runtime) = crate::pane_reader_runtime::PaneReaderRuntime::current() {
+            state.set_pane_reader_runtime(runtime);
+        }
         if let Some(environment) = environment {
             seed_global_environment(&mut state, environment);
         }
@@ -300,6 +341,8 @@ impl RequestHandler {
             server_socket_path: Arc::new(StdMutex::new(PathBuf::from("/tmp/rmux-test.sock"))),
             server_access: Arc::new(StdMutex::new(ServerAccessStore::new(owner_uid))),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
+            shutdown_reason: Arc::new(StdMutex::new(None)),
+            shutdown_retry_scheduled: Arc::new(AtomicBool::new(false)),
             shutdown_handle: Arc::new(StdMutex::new(None)),
             config_loading_depth: Arc::new(AtomicUsize::new(0)),
             next_connection_id: Arc::new(AtomicU64::new(1)),
@@ -316,6 +359,7 @@ impl RequestHandler {
             pane_snapshot_revisions: Arc::new(StdMutex::new(
                 PaneSnapshotRevisionRegistry::default(),
             )),
+            task_runtime,
             #[cfg(test)]
             cleanup_on_drop: true,
             #[cfg(test)]
@@ -336,6 +380,8 @@ impl RequestHandler {
             server_socket_path: Arc::downgrade(&self.server_socket_path),
             server_access: Arc::downgrade(&self.server_access),
             shutdown_requested: Arc::downgrade(&self.shutdown_requested),
+            shutdown_reason: Arc::downgrade(&self.shutdown_reason),
+            shutdown_retry_scheduled: Arc::downgrade(&self.shutdown_retry_scheduled),
             shutdown_handle: Arc::downgrade(&self.shutdown_handle),
             config_loading_depth: Arc::downgrade(&self.config_loading_depth),
             next_connection_id: Arc::downgrade(&self.next_connection_id),
@@ -346,6 +392,7 @@ impl RequestHandler {
             session_lease_janitor_started: Arc::downgrade(&self.session_lease_janitor_started),
             pane_snapshot_coalescers: Arc::downgrade(&self.pane_snapshot_coalescers),
             pane_snapshot_revisions: Arc::downgrade(&self.pane_snapshot_revisions),
+            task_runtime: self.task_runtime.clone(),
             #[cfg(test)]
             paste_buffer_delete_pause: Arc::downgrade(&self.paste_buffer_delete_pause),
         }
@@ -353,6 +400,10 @@ impl RequestHandler {
 
     pub(crate) fn allocate_connection_id(&self) -> u64 {
         self.next_connection_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn server_task_runtime(&self) -> Option<tokio::runtime::Handle> {
+        self.task_runtime.clone()
     }
 
     pub(crate) fn set_socket_path(&self, socket_path: impl AsRef<Path>) {
@@ -399,6 +450,28 @@ impl RequestHandler {
         if !self.shutdown_requested.load(Ordering::SeqCst) {
             return false;
         }
+        let reason = *self
+            .shutdown_reason
+            .lock()
+            .expect("shutdown reason mutex must not be poisoned");
+        if matches!(reason, Some(PendingShutdownReason::ExitEmpty)) {
+            match self.exit_empty_shutdown_state() {
+                ExitEmptyShutdownState::StillApplies => {}
+                ExitEmptyShutdownState::Stale => {
+                    self.shutdown_requested.store(false, Ordering::SeqCst);
+                    *self
+                        .shutdown_reason
+                        .lock()
+                        .expect("shutdown reason mutex must not be poisoned") = None;
+                    record_shutdown_request("stale-exit-empty-cancelled");
+                    return false;
+                }
+                ExitEmptyShutdownState::Unknown => {
+                    self.schedule_shutdown_retry();
+                    return false;
+                }
+            }
+        }
         if !self
             .subscriptions
             .lock()
@@ -418,15 +491,85 @@ impl RequestHandler {
         if !self.shutdown_requested.swap(false, Ordering::SeqCst) {
             return false;
         }
+        let reason = self
+            .shutdown_reason
+            .lock()
+            .expect("shutdown reason mutex must not be poisoned")
+            .take()
+            .map(PendingShutdownReason::as_str)
+            .unwrap_or("unknown");
         if let Some(handle) = self
             .shutdown_handle
             .lock()
             .expect("shutdown handle mutex must not be poisoned")
             .clone()
         {
+            record_shutdown_request(reason);
             handle.request_shutdown();
         }
         true
+    }
+
+    fn schedule_shutdown_retry(&self) {
+        if self
+            .shutdown_retry_scheduled
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        let Some(runtime) = self
+            .server_task_runtime()
+            .or_else(|| tokio::runtime::Handle::try_current().ok())
+        else {
+            self.shutdown_retry_scheduled.store(false, Ordering::SeqCst);
+            return;
+        };
+
+        let handler = self.clone();
+        runtime.spawn(async move {
+            tokio::time::sleep(SHUTDOWN_RETRY_DELAY).await;
+            handler
+                .shutdown_retry_scheduled
+                .store(false, Ordering::SeqCst);
+            let _ = handler.request_shutdown_if_pending();
+        });
+    }
+
+    pub(in crate::handler) fn queue_shutdown_request(&self, reason: PendingShutdownReason) {
+        let mut pending_reason = self
+            .shutdown_reason
+            .lock()
+            .expect("shutdown reason mutex must not be poisoned");
+        if matches!(
+            (*pending_reason, reason),
+            (
+                Some(PendingShutdownReason::KillServer),
+                PendingShutdownReason::ExitEmpty
+            )
+        ) {
+            return;
+        }
+        record_shutdown_queued(reason.as_str());
+        *pending_reason = Some(reason);
+        self.shutdown_requested.store(true, Ordering::SeqCst);
+    }
+
+    fn exit_empty_shutdown_state(&self) -> ExitEmptyShutdownState {
+        let Ok(state) = self.state.try_lock() else {
+            return ExitEmptyShutdownState::Unknown;
+        };
+        if state.sessions.is_empty()
+            && matches!(
+                state.options.resolve(None, OptionName::ExitEmpty),
+                Some("on")
+            )
+        {
+            ExitEmptyShutdownState::StillApplies
+        } else {
+            ExitEmptyShutdownState::Stale
+        }
     }
 
     #[cfg(test)]
@@ -483,7 +626,7 @@ impl RequestHandler {
             .lock()
             .expect("retained exited output mutex must not be poisoned")
             .clear();
-        self.shutdown_requested.store(true, Ordering::SeqCst);
+        self.queue_shutdown_request(PendingShutdownReason::KillServer);
         Response::KillServer(KillServerResponse)
     }
 }

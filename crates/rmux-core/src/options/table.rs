@@ -46,10 +46,10 @@ const STATUS_KEYS_CHOICES: &[&str] = &["emacs", "vi"];
 const STATUS_POSITION_CHOICES: &[&str] = &["top", "bottom"];
 const VISUAL_BELL_CHOICES: &[&str] = &["off", "on", "both"];
 const WINDOW_SIZE_CHOICES: &[&str] = &["largest", "smallest", "manual", "latest"];
-const STATUS_FORMAT1: &str = "#[align=left range=left #{E:status-left-style}]#[push-default]#{T;=/#{status-left-length}:status-left}#[pop-default]#[norange default]#[list=on align=#{status-justify}]#[list=left-marker]<#[list=right-marker]>#[list=on]#{W:#[range=window|#{window_index} #{E:window-status-style}#{?#{&&:#{window_last_flag},#{!=:#{E:window-status-last-style},default}}, #{E:window-status-last-style},}#{?#{&&:#{window_bell_flag},#{!=:#{E:window-status-bell-style},default}}, #{E:window-status-bell-style},#{?#{&&:#{||:#{window_activity_flag},#{window_silence_flag}},#{!=:#{E:window-status-activity-style},default}}, #{E:window-status-activity-style},}}]#[push-default]#{T:window-status-format}#[pop-default]#[norange default]#{?loop_last_flag,,#{E:window-status-separator}},#[range=window|#{window_index} list=focus #{?#{!=:#{E:window-status-current-style},default},#{E:window-status-current-style},#{E:window-status-style}}#{?#{&&:#{window_last_flag},#{!=:#{E:window-status-last-style},default}}, #{E:window-status-last-style},}#{?#{&&:#{window_bell_flag},#{!=:#{E:window-status-bell-style},default}}, #{E:window-status-bell-style},#{?#{&&:#{||:#{window_activity_flag},#{window_silence_flag}},#{!=:#{E:window-status-activity-style},default}}, #{E:window-status-activity-style},}}]#[push-default]#{T:window-status-current-format}#[pop-default]#[norange list=on default]#{?loop_last_flag,,#{E:window-status-separator}}}#[nolist align=right range=right #{E:status-right-style}]#[push-default]#{T;=/#{status-right-length}:status-right}#[pop-default]#[norange default]";
-const STATUS_FORMAT2: &str = "#[align=left]#{R: ,#{n:#{session_name}}}P: #[norange default]#[list=on align=#{status-justify}]#[list=left-marker]<#[list=right-marker]>#[list=on]#{P:#[range=pane|#{pane_id} #{E:pane-status-style}]#[push-default]#P[#{pane_width}x#{pane_height}]#[pop-default]#[norange list=on default]  ,#[range=pane|#{pane_id} list=focus #{?#{!=:#{E:pane-status-current-style},default},#{E:pane-status-current-style},#{E:pane-status-style}}]#[push-default]#P[#{pane_width}x#{pane_height}]*#[pop-default]#[norange list=on default] }";
-const STATUS_FORMAT3: &str = "#[align=left]#{R: ,#{n:#{session_name}}}S: #[norange default]#[list=on align=#{status-justify}]#[list=left-marker]<#[list=right-marker]>#[list=on]#{S:#[range=session|#{session_id} #{E:session-status-style}]#[push-default]#S#{session_alert}#[pop-default]#[norange list=on default]  ,#[range=session|#{session_id} list=focus #{?#{!=:#{E:session-status-current-style},default},#{E:session-status-current-style},#{E:session-status-style}}]#[push-default]#S*#{session_alert}#[pop-default]#[norange list=on default] }";
-const STATUS_FORMAT_DEFAULT: &[&str] = &[STATUS_FORMAT1, STATUS_FORMAT2, STATUS_FORMAT3];
+const STATUS_FORMAT1: &str = "#[align=left range=left #{E:status-left-style}]#[push-default]#{T;=/#{status-left-length}:status-left}#[pop-default]#[norange default]#[list=on align=#{status-justify}]#[list=left-marker]<#[list=right-marker]>#[list=on]#{W:#[range=window|#{window_index} #{E:window-status-style}#{?#{&&:#{window_last_flag},#{!=:#{E:window-status-last-style},default}}, #{E:window-status-last-style},}#{?#{&&:#{window_bell_flag},#{!=:#{E:window-status-bell-style},default}}, #{E:window-status-bell-style},#{?#{&&:#{||:#{window_activity_flag},#{window_silence_flag}},#{!=:#{E:window-status-activity-style},default}}, #{E:window-status-activity-style},}}]#[push-default]#{T:window-status-format}#[pop-default]#[norange default]#{?window_end_flag,,#{window-status-separator}},#[range=window|#{window_index} list=focus #{?#{!=:#{E:window-status-current-style},default},#{E:window-status-current-style},#{E:window-status-style}}#{?#{&&:#{window_last_flag},#{!=:#{E:window-status-last-style},default}}, #{E:window-status-last-style},}#{?#{&&:#{window_bell_flag},#{!=:#{E:window-status-bell-style},default}}, #{E:window-status-bell-style},#{?#{&&:#{||:#{window_activity_flag},#{window_silence_flag}},#{!=:#{E:window-status-activity-style},default}}, #{E:window-status-activity-style},}}]#[push-default]#{T:window-status-current-format}#[pop-default]#[norange list=on default]#{?window_end_flag,,#{window-status-separator}}}#[nolist align=right range=right #{E:status-right-style}]#[push-default]#{T;=/#{status-right-length}:status-right}#[pop-default]#[norange default]";
+const STATUS_FORMAT2: &str =
+    "#[align=centre]#{P:#{?pane_active,#[reverse],}#{pane_index}[#{pane_width}x#{pane_height}]#[default] }";
+const STATUS_FORMAT_DEFAULT: &[&str] = &[STATUS_FORMAT1, STATUS_FORMAT2];
 #[cfg(windows)]
 const STATUS_RIGHT_DEFAULT: &str =
     "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}\"#{=21:host_short}\" %H:%M %d-%b-%y";
@@ -57,7 +57,7 @@ const STATUS_RIGHT_DEFAULT: &str =
 const STATUS_RIGHT_DEFAULT: &str =
     "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}\"#{=21:pane_title}\" %H:%M %d-%b-%y";
 #[cfg(unix)]
-const DEFAULT_SHELL: &str = "";
+const DEFAULT_SHELL: &str = "/bin/bash";
 #[cfg(windows)]
 const DEFAULT_SHELL: &str = "";
 
@@ -105,7 +105,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::CodepointWidths,
         "codepoint-widths",
         &[],
-        SHOW_SERVER,
+        0,
         SCOPE_SERVER,
         GlobalRoot::Server,
         OptionValueType::String,
@@ -157,7 +157,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::DefaultClientCommand,
         "default-client-command",
         &[],
-        SHOW_SERVER,
+        0,
         SCOPE_SERVER,
         GlobalRoot::Server,
         OptionValueType::Command,
@@ -248,7 +248,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::ExtendedKeysFormat,
         "extended-keys-format",
         &[],
-        SHOW_SERVER,
+        0,
         SCOPE_SERVER,
         GlobalRoot::Server,
         OptionValueType::Choice(EXTENDED_KEYS_FORMAT_CHOICES),
@@ -274,7 +274,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::GetClipboard,
         "get-clipboard",
         &[],
-        SHOW_SERVER,
+        0,
         SCOPE_SERVER,
         GlobalRoot::Server,
         OptionValueType::Choice(GET_CLIPBOARD_CHOICES),
@@ -300,7 +300,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::InputBufferSize,
         "input-buffer-size",
         &[],
-        SHOW_SERVER,
+        0,
         SCOPE_SERVER,
         GlobalRoot::Server,
         OptionValueType::Number { minimum: 1048576 },
@@ -378,7 +378,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::PrefixTimeout,
         "prefix-timeout",
         &[],
-        SHOW_SERVER,
+        0,
         SCOPE_SERVER,
         GlobalRoot::Server,
         OptionValueType::Number { minimum: 0 },
@@ -456,7 +456,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::VariationSelectorAlwaysWide,
         "variation-selector-always-wide",
         &[],
-        SHOW_SERVER,
+        0,
         SCOPE_SERVER,
         GlobalRoot::Server,
         OptionValueType::Flag,
@@ -638,7 +638,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::FocusFollowsMouse,
         "focus-follows-mouse",
         &[],
-        SHOW_SESSION,
+        0,
         SCOPE_SESSION,
         GlobalRoot::Session,
         OptionValueType::Flag,
@@ -664,7 +664,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::InitialRepeatTime,
         "initial-repeat-time",
         &[],
-        SHOW_SESSION,
+        0,
         SCOPE_SESSION,
         GlobalRoot::Session,
         OptionValueType::Number { minimum: 0 },
@@ -729,7 +729,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::MessageFormat,
         "message-format",
         &[],
-        SHOW_SESSION,
+        0,
         SCOPE_SESSION,
         GlobalRoot::Session,
         OptionValueType::String,
@@ -1067,7 +1067,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::PaneStatusCurrentStyle,
         "pane-status-current-style",
         &[],
-        SHOW_WINDOW,
+        0,
         SCOPE_WINDOW,
         GlobalRoot::Window,
         OptionValueType::String,
@@ -1080,7 +1080,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::PaneStatusStyle,
         "pane-status-style",
         &[],
-        SHOW_WINDOW,
+        0,
         SCOPE_WINDOW,
         GlobalRoot::Window,
         OptionValueType::String,
@@ -1093,7 +1093,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::PromptCursorColour,
         "prompt-cursor-colour",
         &["prompt-cursor-color"],
-        SHOW_SESSION,
+        0,
         SCOPE_SESSION,
         GlobalRoot::Session,
         OptionValueType::Colour,
@@ -1106,7 +1106,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::PromptCursorStyle,
         "prompt-cursor-style",
         &[],
-        SHOW_SESSION,
+        0,
         SCOPE_SESSION,
         GlobalRoot::Session,
         OptionValueType::Choice(CURSOR_STYLE_CHOICES),
@@ -1119,7 +1119,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::PromptCommandCursorStyle,
         "prompt-command-cursor-style",
         &[],
-        SHOW_SESSION,
+        0,
         SCOPE_SESSION,
         GlobalRoot::Session,
         OptionValueType::Choice(CURSOR_STYLE_CHOICES),
@@ -1132,7 +1132,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::SessionStatusCurrentStyle,
         "session-status-current-style",
         &[],
-        SHOW_WINDOW,
+        0,
         SCOPE_WINDOW,
         GlobalRoot::Window,
         OptionValueType::String,
@@ -1145,7 +1145,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::SessionStatusStyle,
         "session-status-style",
         &[],
-        SHOW_WINDOW,
+        0,
         SCOPE_WINDOW,
         GlobalRoot::Window,
         OptionValueType::String,
@@ -1163,7 +1163,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         GlobalRoot::Session,
         OptionValueType::String,
         DefaultValue::Scalar(concat!(
-            "DISPLAY KRB5CCNAME MSYSTEM SSH_ASKPASS SSH_AUTH_SOCK SSH_",
+            "DISPLAY KRB5CCNAME SSH_ASKPASS SSH_AUTH_SOCK SSH_",
             "AG",
             "ENT_PID SSH_CONNECTION WINDOWID XAUTHORITY"
         )),
@@ -1266,7 +1266,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::AllowSetTitle,
         "allow-set-title",
         &[],
-        SHOW_WINDOW | SHOW_PANE,
+        0,
         SCOPE_WINDOW | SCOPE_PANE,
         GlobalRoot::Window,
         OptionValueType::Flag,
@@ -1309,7 +1309,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         SCOPE_WINDOW,
         GlobalRoot::Window,
         OptionValueType::String,
-        DefaultValue::Scalar("#{?pane_in_mode,[rmux],#{pane_current_command}}#{?pane_dead,[dead],}"),
+        DefaultValue::Scalar("#{?pane_in_mode,[tmux],#{pane_current_command}}#{?pane_dead,[dead],}"),
         "",
         false,
         EFFECT_RENDER,
@@ -1383,7 +1383,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::CopyModePositionFormat,
         "copy-mode-position-format",
         &[],
-        SHOW_WINDOW | SHOW_PANE,
+        0,
         SCOPE_WINDOW | SCOPE_PANE,
         GlobalRoot::Window,
         OptionValueType::String,
@@ -1396,7 +1396,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::CopyModePositionStyle,
         "copy-mode-position-style",
         &[],
-        SHOW_WINDOW,
+        0,
         SCOPE_WINDOW,
         GlobalRoot::Window,
         OptionValueType::String,
@@ -1409,7 +1409,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::CopyModeSelectionStyle,
         "copy-mode-selection-style",
         &[],
-        SHOW_WINDOW,
+        0,
         SCOPE_WINDOW,
         GlobalRoot::Window,
         OptionValueType::String,
@@ -1656,7 +1656,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::PaneScrollbars,
         "pane-scrollbars",
         &[],
-        SHOW_WINDOW,
+        0,
         SCOPE_WINDOW,
         GlobalRoot::Window,
         OptionValueType::Choice(PANE_SCROLLBARS_CHOICES),
@@ -1669,7 +1669,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::PaneScrollbarsStyle,
         "pane-scrollbars-style",
         &[],
-        SHOW_WINDOW | SHOW_PANE,
+        0,
         SCOPE_WINDOW | SCOPE_PANE,
         GlobalRoot::Window,
         OptionValueType::String,
@@ -1682,7 +1682,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::PaneScrollbarsPosition,
         "pane-scrollbars-position",
         &[],
-        SHOW_WINDOW,
+        0,
         SCOPE_WINDOW,
         GlobalRoot::Window,
         OptionValueType::Choice(PANE_SCROLLBARS_POSITION_CHOICES),
@@ -1786,7 +1786,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::TiledLayoutMaxColumns,
         "tiled-layout-max-columns",
         &[],
-        SHOW_WINDOW,
+        0,
         SCOPE_WINDOW,
         GlobalRoot::Window,
         OptionValueType::Number { minimum: 0 },

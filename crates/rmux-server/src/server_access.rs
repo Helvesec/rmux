@@ -269,22 +269,7 @@ fn read_only_request_allowed(request: &Request) -> bool {
 pub(crate) fn validate_server_access_request(
     request: &ServerAccessRequest,
 ) -> Result<(), RmuxError> {
-    if request.add && request.deny {
-        return Err(RmuxError::Server(
-            "-a and -d cannot be used together".to_owned(),
-        ));
-    }
-    if request.read_only && request.write {
-        return Err(RmuxError::Server(
-            "-r and -w cannot be used together".to_owned(),
-        ));
-    }
     if request.list {
-        if request.user.is_some() {
-            return Err(RmuxError::Server(
-                "server-access -l does not accept a user argument".to_owned(),
-            ));
-        }
         return Ok(());
     }
     #[cfg(windows)]

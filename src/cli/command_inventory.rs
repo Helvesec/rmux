@@ -10,7 +10,7 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ),
     (
         "bind-key",
-        "(bind) [-nr] [-T key-table] [-N note] key [command [argument ...]]",
+        "(bind) [-nr] [-T key-table] [-N note] key [command [arguments]]",
     ),
     (
         "break-pane",
@@ -18,7 +18,7 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ),
     (
         "capture-pane",
-        "(capturep) [-aCeJMNpPqT] [-b buffer-name] [-E end-line] [-S start-line] [-t target-pane]",
+        "(capturep) [-aCeJNpPqT] [-b buffer-name] [-E end-line] [-S start-line] [-t target-pane]",
     ),
     (
         "choose-buffer",
@@ -33,17 +33,17 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
         "[-GNrswZ] [-F format] [-f filter] [-K key-format] [-O sort-order] [-t target-pane] [template]",
     ),
     ("clear-history", "(clearhist) [-H] [-t target-pane]"),
-    ("clear-prompt-history", "(clearphist) [-T prompt-type]"),
+    ("clear-prompt-history", "(clearphist) [-T type]"),
     ("clock-mode", "[-t target-pane]"),
     (
         "command-prompt",
-        "[-1beFiklN] [-I inputs] [-p prompts] [-t target-client] [-T prompt-type] [template]",
+        "[-1bFkiN] [-I inputs] [-p prompts] [-t target-client] [-T type] [template]",
     ),
     (
         "confirm-before",
-        "(confirm) [-by] [-c confirm-key] [-p prompt] [-t target-client] command",
+        "(confirm) [-by] [-c confirm_key] [-p prompt] [-t target-client] command",
     ),
-    ("copy-mode", "[-deHMqSu] [-s src-pane] [-t target-pane]"),
+    ("copy-mode", "[-eHMuq] [-s src-pane] [-t target-pane]"),
     ("customize-mode", "[-NZ] [-F format] [-f filter] [-t target-pane]"),
     ("delete-buffer", "(deleteb) [-b buffer-name]"),
     (
@@ -52,15 +52,15 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ),
     (
         "display-menu",
-        "(menu) [-MO] [-b border-lines] [-c target-client] [-C starting-choice] [-H selected-style] [-s style] [-S border-style] [-t target-pane] [-T title] [-x position] [-y position] name [key] [command] ...",
+        "(menu) [-O] [-b border-lines] [-c target-client] [-C starting-choice] [-H selected-style] [-s style] [-S border-style] [-t target-pane][-T title] [-x position] [-y position] name key command ...",
     ),
     (
         "display-message",
-        "(display) [-aCIlNpv] [-c target-client] [-d delay] [-F format] [-t target-pane] [message]",
+        "(display) [-aIlNpv] [-c target-client] [-d delay] [-F format] [-t target-pane] [message]",
     ),
     (
         "display-popup",
-        "(popup) [-BCEkN] [-b border-lines] [-c target-client] [-d start-directory] [-e environment] [-h height] [-s style] [-S border-style] [-t target-pane] [-T title] [-w width] [-x position] [-y position] [shell-command [argument ...]]",
+        "(popup) [-BCE] [-b border-lines] [-c target-client] [-d start-directory] [-e environment] [-h height] [-s style] [-S border-style] [-t target-pane][-T title] [-w width] [-x position] [-y position] [shell-command]",
     ),
     (
         "display-panes",
@@ -89,24 +89,24 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
         "link-window",
         "(linkw) [-abdk] [-s src-window] [-t dst-window]",
     ),
-    ("list-buffers", "(lsb) [-F format] [-f filter] [-O order]"),
+    ("list-buffers", "(lsb) [-F format] [-f filter]"),
     (
         "list-clients",
-        "(lsc) [-F format] [-f filter] [-O order][-t target-session]",
+        "(lsc) [-F format] [-f filter] [-t target-session]",
     ),
     ("list-commands", "(lscm) [-F format] [command]"),
     (
         "list-keys",
-        "(lsk) [-1aNr] [-F format] [-O order] [-P prefix-string][-T key-table] [key]",
+        "(lsk) [-1aN] [-P prefix-string] [-T key-table] [key]",
     ),
     (
         "list-panes",
-        "(lsp) [-asr] [-F format] [-f filter] [-O order][-t target-window]",
+        "(lsp) [-as] [-F format] [-f filter] [-t target-window]",
     ),
-    ("list-sessions", "(ls) [-r] [-F format] [-f filter] [-O order]"),
+    ("list-sessions", "(ls) [-F format] [-f filter]"),
     (
         "list-windows",
-        "(lsw) [-ar] [-F format] [-f filter] [-O order][-t target-session]",
+        "(lsw) [-a] [-F format] [-f filter] [-t target-session]",
     ),
     (
         "load-buffer",
@@ -129,20 +129,20 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ),
     (
         "new-window",
-        "(neww) [-abdkPS] [-c start-directory] [-e environment] [-F format] [-n window-name] [-t target-window] [shell-command [argument ...]]",
+        "(neww) [-abdkPS] [-c start-directory] [-e environment] [-F format] [-n window-name] [-t target-window] [shell-command]",
     ),
     ("next-layout", "(nextl) [-t target-window]"),
     ("next-window", "(next) [-a] [-t target-session]"),
     (
         "paste-buffer",
-        "(pasteb) [-dprS] [-s separator] [-b buffer-name] [-t target-pane]",
+        "(pasteb) [-dpr] [-s separator] [-b buffer-name] [-t target-pane]",
     ),
     ("pipe-pane", "(pipep) [-IOo] [-t target-pane] [shell-command]"),
     ("previous-layout", "(prevl) [-t target-window]"),
     ("previous-window", "(prev) [-a] [-t target-session]"),
     (
         "refresh-client",
-        "(refresh) [-cDlLRSU] [-A pane:state] [-B name:what:format] [-C XxY] [-f flags] [-r pane:report] [-t target-client] [adjustment]",
+        "(refresh) [-cDlLRSU] [-A pane:state] [-B name:what:format] [-C XxY] [-f flags] [-t target-client] [adjustment]",
     ),
     ("rename-session", "(rename) [-t target-session] new-name"),
     ("rename-window", "(renamew) [-t target-window] new-name"),
@@ -156,16 +156,16 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ),
     (
         "respawn-pane",
-        "(respawnp) [-k] [-c start-directory] [-e environment] [-t target-pane] [shell-command [argument ...]]",
+        "(respawnp) [-k] [-c start-directory] [-e environment] [-t target-pane] [shell-command]",
     ),
     (
         "respawn-window",
-        "(respawnw) [-k] [-c start-directory] [-e environment] [-t target-window] [shell-command [argument ...]]",
+        "(respawnw) [-k] [-c start-directory] [-e environment] [-t target-window] [shell-command]",
     ),
     ("rotate-window", "(rotatew) [-DUZ] [-t target-window]"),
     (
         "run-shell",
-        "(run) [-bCE] [-c start-directory] [-d delay] [-t target-pane] [shell-command]",
+        "(run) [-bC] [-c start-directory] [-d delay] [-t target-pane] [shell-command]",
     ),
     ("save-buffer", "(saveb) [-a] [-b buffer-name] path"),
     ("select-layout", "(selectl) [-Enop] [-t target-pane] [layout-name]"),
@@ -176,17 +176,17 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ("select-window", "(selectw) [-lnpT] [-t target-window]"),
     (
         "send-keys",
-        "(send) [-FHKlMRX] [-c target-client] [-N repeat-count] [-t target-pane] [key ...]",
+        "(send) [-FHKlMRX] [-c target-client] [-N repeat-count] [-t target-pane] key ...",
     ),
     ("send-prefix", "[-2] [-t target-pane]"),
-    ("server-access", "[-adlrw] [-t target-pane] [user]"),
+    ("server-access", "[-adlrw] [user]"),
     (
         "set-buffer",
-        "(setb) [-aw] [-b buffer-name] [-n new-buffer-name] [-t target-client] [data]",
+        "(setb) [-aw] [-b buffer-name] [-n new-buffer-name] [-t target-client] data",
     ),
     (
         "set-environment",
-        "(setenv) [-Fhgru] [-t target-session] variable [value]",
+        "(setenv) [-Fhgru] [-t target-session] name [value]",
     ),
     ("set-hook", "[-agpRuw] [-t target-pane] hook [command]"),
     (
@@ -200,15 +200,15 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ("show-buffer", "(showb) [-b buffer-name]"),
     (
         "show-environment",
-        "(showenv) [-hgs] [-t target-session] [variable]",
+        "(showenv) [-hgs] [-t target-session] [name]",
     ),
-    ("show-hooks", "[-gpw] [-t target-pane] [hook]"),
+    ("show-hooks", "[-gpw] [-t target-pane]"),
     ("show-messages", "(showmsgs) [-JT] [-t target-client]"),
     (
         "show-options",
         "(show) [-AgHpqsvw] [-t target-pane] [option]",
     ),
-    ("show-prompt-history", "(showphist) [-T prompt-type]"),
+    ("show-prompt-history", "(showphist) [-T type]"),
     (
         "show-window-options",
         "(showw) [-gv] [-t target-window] [option]",
@@ -216,7 +216,7 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ("source-file", "(source) [-Fnqv] [-t target-pane] path ..."),
     (
         "split-window",
-        "(splitw) [-bdefhIPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-t target-pane] [shell-command [argument ...]]",
+        "(splitw) [-bdefhIPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-t target-pane][shell-command]",
     ),
     ("start-server", "(start) "),
     ("suspend-client", "(suspendc) [-t target-client]"),
@@ -224,7 +224,7 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ("swap-window", "(swapw) [-d] [-s src-window] [-t dst-window]"),
     (
         "switch-client",
-        "(switchc) [-ElnprZ] [-c target-client] [-t target-session] [-T key-table] [-O order]",
+        "(switchc) [-ElnprZ] [-c target-client] [-t target-session] [-T key-table]",
     ),
     ("unbind-key", "(unbind) [-anq] [-T key-table] key"),
     ("unlink-window", "(unlinkw) [-k] [-t target-window]"),

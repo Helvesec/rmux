@@ -13,6 +13,8 @@ use rmux_proto::{
 };
 
 use crate::pane_io::{PaneAlertCallback, PaneExitCallback, PaneOutputSender};
+#[cfg(unix)]
+use crate::pane_reader_runtime::PaneReaderRuntime;
 use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::pane_transcript::SharedPaneTranscript;
 
@@ -102,6 +104,8 @@ pub(crate) struct HandlerState {
     window_link_groups: HashMap<u64, WindowLinkGroup>,
     window_link_slots: HashMap<WindowLinkSlot, u64>,
     next_window_link_group_id: u64,
+    #[cfg(unix)]
+    pane_reader_runtime: Option<PaneReaderRuntime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,6 +147,26 @@ pub(crate) struct KilledWindowResult {
 }
 
 impl HandlerState {
+    #[cfg(unix)]
+    pub(crate) fn set_pane_reader_runtime(&mut self, runtime: PaneReaderRuntime) {
+        self.pane_reader_runtime = Some(runtime);
+    }
+
+    #[cfg(unix)]
+    pub(in crate::pane_terminals) fn pane_reader_runtime(
+        &self,
+    ) -> Result<PaneReaderRuntime, RmuxError> {
+        let runtime = self.pane_reader_runtime.clone();
+        #[cfg(test)]
+        let runtime = runtime.or_else(PaneReaderRuntime::current);
+
+        runtime.ok_or_else(|| {
+            RmuxError::Server(
+                "cannot spawn Unix pane output reader without the server Tokio runtime".to_owned(),
+            )
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn shutdown_terminals_for_test(&mut self) {
         let mut runtime_sessions = self

@@ -206,6 +206,23 @@ impl TerminalProfile {
             .or_else(|| shell_program_name(&self.shell))
     }
 
+    pub(crate) fn initial_pane_title(&self) -> Option<String> {
+        let user = self
+            .environment_value("USER")
+            .or_else(|| self.environment_value("LOGNAME"))
+            .or_else(|| self.environment_value("USERNAME"))?;
+        let host = crate::host_name::local_hostname()?;
+        let path = abbreviate_home(
+            &self.cwd.to_string_lossy(),
+            self.environment_value("HOME")
+                .or_else(|| self.environment_value("USERPROFILE")),
+        );
+        Some(format!(
+            "{user}@{}:{path}",
+            host.split('.').next().unwrap_or(&host)
+        ))
+    }
+
     pub(crate) fn automatic_window_name(&self, command: Option<&ProcessCommand>) -> Option<String> {
         if command.is_some() {
             self.runtime_window_name(command)
@@ -223,6 +240,23 @@ impl TerminalProfile {
             None => shell_program_name(&self.shell),
             Some(ProcessCommand::Argv(_)) | Some(_) => shell_program_name(&self.shell),
         }
+    }
+}
+
+fn abbreviate_home(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home.filter(|home| !home.is_empty()) else {
+        return path.to_owned();
+    };
+    if path == home {
+        "~".to_owned()
+    } else if let Some(suffix) = path.strip_prefix(home).and_then(|suffix| {
+        suffix
+            .strip_prefix('/')
+            .or_else(|| suffix.strip_prefix('\\'))
+    }) {
+        format!("~/{suffix}")
+    } else {
+        path.to_owned()
     }
 }
 

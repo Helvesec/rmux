@@ -42,7 +42,7 @@ async fn attached_mode_tree_acceptance_uses_mode_before_prefix_or_pty() {
             "#{window_name}|#{pane_in_mode}|#{pane_mode}"
         )
         .await,
-        "[rmux]|1|tree-mode\n"
+        "[tmux]|1|tree-mode\n"
     );
     {
         let state = handler.state.lock().await;
@@ -51,7 +51,7 @@ async fn attached_mode_tree_acceptance_uses_mode_before_prefix_or_pty() {
             .session(&alpha)
             .and_then(|session| session.window_at(0))
             .and_then(|window| window.name().map(str::to_owned));
-        assert_eq!(window_name.as_deref(), Some("[rmux]"));
+        assert_eq!(window_name.as_deref(), Some("[tmux]"));
     }
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x0e\r")
