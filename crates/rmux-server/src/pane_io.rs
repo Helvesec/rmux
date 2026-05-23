@@ -14,6 +14,8 @@ use std::{collections::VecDeque, io, sync::atomic::Ordering};
 use tokio::sync::mpsc;
 #[cfg(any(unix, windows))]
 use tokio::sync::watch;
+#[cfg(any(unix, windows))]
+use tracing::debug;
 
 const READ_BUFFER_SIZE: usize = 8192;
 mod control;
@@ -776,7 +778,7 @@ pub(crate) async fn forward_attach_passthrough(
 
     loop {
         if closing.load(Ordering::SeqCst) {
-            return Ok(());
+            return passthrough_exit(&stream, &current_target, "closing flag set").await;
         }
         // Drain anything already buffered in the socket without
         // blocking — keeps keystrokes from queueing behind output.
@@ -784,7 +786,7 @@ pub(crate) async fn forward_attach_passthrough(
             match try_read_socket_bytes(&stream, &mut decoder, &mut socket_read_buffer)? {
                 TrySocketRead::Read => {}
                 TrySocketRead::Closed => {
-                    return Ok(());
+                    return passthrough_exit(&stream, &current_target, "client socket closed (drain)").await;
                 }
                 TrySocketRead::WouldBlock => break,
             }
@@ -802,13 +804,19 @@ pub(crate) async fn forward_attach_passthrough(
             biased;
             result = shutdown.changed() => {
                 let _ = result;
-                return Ok(());
+                return passthrough_exit(&stream, &current_target, "server shutdown").await;
             }
             control = control_rx.recv() => {
                 match control {
-                    None => return Ok(()),
-                    Some(AttachControl::Detach | AttachControl::Exited | AttachControl::DetachKill) => {
-                        return Ok(());
+                    None => return passthrough_exit(&stream, &current_target, "control channel closed").await,
+                    Some(AttachControl::Detach) => {
+                        return passthrough_exit(&stream, &current_target, "detach").await;
+                    }
+                    Some(AttachControl::Exited) => {
+                        return passthrough_exit(&stream, &current_target, "pane exited").await;
+                    }
+                    Some(AttachControl::DetachKill) => {
+                        return passthrough_exit(&stream, &current_target, "detach-kill").await;
                     }
                     Some(AttachControl::Switch(next_target)) => {
                         switch_passthrough_target(
@@ -839,11 +847,31 @@ pub(crate) async fn forward_attach_passthrough(
             }
             socket = read_socket_bytes(&stream, &mut decoder, &mut socket_read_buffer) => {
                 if !socket? {
-                    return Ok(());
+                    return passthrough_exit(&stream, &current_target, "client socket closed").await;
                 }
             }
         }
     }
+}
+
+/// Common shutdown path for [`forward_attach_passthrough`]. Emits the
+/// outer-terminal attach-stop sequence (so the client recognises the
+/// teardown instead of erroring with "stream closed before attach-stop"),
+/// logs the trigger, and returns `Ok(())`.
+///
+/// `emit_attach_stop` failures are intentionally swallowed: by the time
+/// we're tearing down the connection, the peer may have closed already
+/// and the write will fail with `BrokenPipe` / `ConnectionReset`. That's
+/// a benign race, not something to escalate.
+#[cfg(any(unix, windows))]
+async fn passthrough_exit(
+    stream: &LocalStream,
+    current_target: &types::OpenAttachTarget,
+    reason: &'static str,
+) -> io::Result<()> {
+    debug!(reason, session = %current_target.session_name, "passthrough attach forwarder exiting");
+    let _ = emit_attach_stop(stream, current_target).await;
+    Ok(())
 }
 
 /// Emits the active pane's recent state to the client on (re)attach.

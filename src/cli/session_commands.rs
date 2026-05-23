@@ -66,13 +66,34 @@ pub(super) fn run_new_session(
     // Apply the --passthrough flag as a session-scope option set
     // immediately after creation. This must happen before any attach
     // so the listener routes us to the passthrough forwarder.
+    //
+    // Treat set-option failure as fatal: if it silently fell back to
+    // the normal forwarder the user would get a non-passthrough
+    // session and not understand why. Better to bail with a clear
+    // pointer to the session we just created so they can `kill` or
+    // `attach` it manually.
     if args.passthrough {
-        let _ = connection.set_option(
-            ScopeSelector::Session(target.clone()),
-            OptionName::Passthrough,
-            "on".to_owned(),
-            SetOptionMode::Replace,
-        );
+        let response = connection
+            .set_option(
+                ScopeSelector::Session(target.clone()),
+                OptionName::Passthrough,
+                "on".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .map_err(|error| {
+                ExitFailure::new(1,format!(
+                    "new-session: created session '{target}' but failed to enable \
+                     --passthrough: {error}. The session exists in normal mode; \
+                     run `rmux kill-session -t {target}` to clean up."
+                ))
+            })?;
+        if let Response::Error(ErrorResponse { error, .. }) = &response {
+            return Err(ExitFailure::new(1,format!(
+                "new-session: created session '{target}' but server rejected \
+                 --passthrough: {error}. Run `rmux kill-session -t {target}` \
+                 to clean up."
+            )));
+        }
     }
 
     if args.detached {

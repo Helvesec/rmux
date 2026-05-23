@@ -890,6 +890,98 @@ async fn forward_attach_passthrough_replays_target_on_attach_control_switch() {
         .expect("attach task join did not time out");
 }
 
+#[tokio::test]
+async fn forward_attach_passthrough_emits_stop_sequence_on_detach() {
+    let handler = Arc::new(RequestHandler::new());
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let session_name = SessionName::new("alpha").expect("valid session name");
+
+    let pane_output = pane_output_channel();
+    let pty = PtyPair::open().expect("open pty pair");
+    let outer_terminal =
+        OuterTerminal::resolve(&OptionStore::default(), OuterTerminalContext::default());
+    let expected_stop = outer_terminal.attach_stop_sequence();
+    assert!(
+        !expected_stop.is_empty(),
+        "test invariant: outer terminal must produce a non-empty stop sequence for this assertion to be meaningful — adjust the fixture if defaults changed",
+    );
+    let target = AttachTarget {
+        session_name: session_name.clone(),
+        pane_master: pty.into_master(),
+        pane_output: pane_output.clone(),
+        render_frame: Vec::new(),
+        outer_terminal,
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: None,
+    };
+
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let live_input = LiveAttachInputContext {
+        handler,
+        attach_pid: std::process::id(),
+    };
+
+    let attach_task = tokio::spawn(forward_attach_passthrough(
+        stream,
+        target,
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        closing.clone(),
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+    ));
+
+    // Let the forwarder enter its select loop before triggering Detach.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    control_tx
+        .send(AttachControl::Detach)
+        .expect("send detach control");
+
+    let _ = tokio::time::timeout(Duration::from_secs(2), attach_task)
+        .await
+        .expect("attach task should exit within 2s after Detach")
+        .expect("attach task join")
+        .expect("attach task should return Ok on clean detach");
+
+    // Drain whatever the forwarder wrote — must include the
+    // outer-terminal attach-stop sequence so the client side
+    // recognises the teardown instead of erroring with "stream
+    // closed before attach-stop sequence".
+    let mut collected = Vec::new();
+    let mut buf = [0_u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(50), peer.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(read)) => {
+                let mut decoder = AttachFrameDecoder::new();
+                decoder.push_bytes(&buf[..read]);
+                while let Some(AttachMessage::Data(bytes)) =
+                    decoder.next_message().expect("decode attach frame")
+                {
+                    collected.extend_from_slice(&bytes);
+                }
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    assert!(
+        collected
+            .windows(expected_stop.len())
+            .any(|window| window == expected_stop),
+        "passthrough forwarder must emit attach-stop sequence ({:?}) on Detach; got: {:?}",
+        String::from_utf8_lossy(&expected_stop),
+        String::from_utf8_lossy(&collected),
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn forward_attach_passthrough_winches_new_window_on_switch() {
