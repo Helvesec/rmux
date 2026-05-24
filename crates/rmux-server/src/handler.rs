@@ -418,6 +418,20 @@ impl RequestHandler {
             .and_then(|server_access| server_access.mode_for_identity(&peer.user))
     }
 
+    /// Clears any queued auto-shutdown. Call this when something that
+    /// makes the server non-empty happens (e.g. a new session is
+    /// created) so a stale flag from a just-destroyed session can't
+    /// tear down the freshly-created one.
+    ///
+    /// Without this, the race is: last session exits ->
+    /// `queue_shutdown_if_server_empty` sets the flag -> user
+    /// creates a new session -> next consumer of the flag (e.g.
+    /// retained-exited-outputs TTL expiry, ~5s later) fires the
+    /// shutdown anyway and detaches the new attach.
+    pub(crate) fn cancel_pending_shutdown(&self) {
+        self.shutdown_requested.store(false, Ordering::SeqCst);
+    }
+
     pub(crate) fn request_shutdown_if_pending(&self) -> bool {
         if !self.shutdown_requested.load(Ordering::SeqCst) {
             return false;

@@ -168,3 +168,72 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .windows(needle.len())
         .any(|window| window == needle)
 }
+
+/// Reported bug (interactive): create a passthrough session, exit
+/// it, then create another passthrough session — the second one
+/// spontaneously detaches after a few seconds with no user input.
+///
+/// Root cause: when the last session exits,
+/// `queue_shutdown_if_server_empty` sets `shutdown_requested = true`.
+/// `request_shutdown_if_pending` doesn't fire immediately because
+/// the retained-exited-outputs cache holds it back for ~5s. The
+/// user creates a new session inside that window. The flag stays
+/// set. When the retained-outputs TTL eventually expires, the
+/// shutdown fires anyway — even though the server now has an
+/// active session and attach — and the new attach gets detached.
+///
+/// Fix: cancel any queued shutdown when a new session is created.
+#[test]
+fn passthrough_second_session_after_exit_does_not_spontaneously_detach() -> TestResult {
+    let harness = CliHarness::new("passthrough-second-session-survives")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    // Session 1: create, attach via PTY, kill it, wait for client to
+    // notice. This mirrors the user's "rmux new-session --passthrough"
+    // -> "exit" sequence and primes the shutdown-pending flag.
+    let create_first = harness.run(&["new-session", "--passthrough", "-d", "-s", "first"])?;
+    assert!(create_first.status.success());
+    let mut attach_first = AttachedSession::spawn(&harness, "first", TerminalSize::new(120, 40))?;
+    attach_first.wait_for_raw_mode(IO_TIMEOUT)?;
+    let _ = read_until_contains(attach_first.master_mut(), SHELL_PROMPT_MARKER, IO_TIMEOUT)?;
+    // Kill the session to fully drop it (Detach alone wouldn't empty
+    // the server). This mirrors the inner `exit` typed by the user.
+    let _ = harness.run(&["kill-session", "-t", "first"]);
+    let _ = attach_first.wait_for_exit(IO_TIMEOUT)?;
+
+    // The shutdown-pending flag is now set. Give the daemon a beat
+    // — but stay under the retained-outputs TTL so the shutdown
+    // hasn't fired yet on its own.
+    std::thread::sleep(Duration::from_millis(800));
+
+    // Session 2: same flow. Under the unfixed code path, this attach
+    // gets detached within a few seconds when the stale flag fires.
+    let create_second = harness.run(&["new-session", "--passthrough", "-d", "-s", "second"])?;
+    assert!(
+        create_second.status.success(),
+        "creating second passthrough session failed: stderr={:?}",
+        String::from_utf8_lossy(&create_second.stderr)
+    );
+    let mut attach_second = AttachedSession::spawn(&harness, "second", TerminalSize::new(120, 40))?;
+    attach_second.wait_for_raw_mode(IO_TIMEOUT)?;
+    let _ = read_until_contains(attach_second.master_mut(), SHELL_PROMPT_MARKER, IO_TIMEOUT)?;
+
+    // Wait past the typical retained-outputs TTL (~5s) and verify
+    // the second attach is still alive — not detached out from
+    // under us by the stale shutdown flag.
+    std::thread::sleep(Duration::from_secs(6));
+    assert!(
+        attach_second.child_mut().try_wait()?.is_none(),
+        "second passthrough attach spontaneously exited — stale shutdown flag fired \
+         despite the new session existing. This is the bug."
+    );
+
+    // Clean up: detach by sending Ctrl-B d, then kill the session.
+    attach_second.send_bytes(b"\x02d")?;
+    let status = attach_second.wait_for_exit(IO_TIMEOUT)?;
+    assert_eq!(status.code(), Some(0));
+    let _ = harness.run(&["kill-session", "-t", "second"]);
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
