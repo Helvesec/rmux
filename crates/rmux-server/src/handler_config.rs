@@ -187,6 +187,8 @@ impl RequestHandler {
 
         let mode = if request.include_inherited {
             rmux_core::ShowOptionsMode::ResolvedWithInheritanceMarkers
+        } else if request.name.is_some() {
+            rmux_core::ShowOptionsMode::Resolved
         } else {
             rmux_core::ShowOptionsMode::Explicit
         };

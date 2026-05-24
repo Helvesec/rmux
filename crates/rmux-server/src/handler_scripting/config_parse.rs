@@ -49,6 +49,12 @@ pub(super) fn parse_set_option(
                 let _ = args.optional();
                 flags.pane = true;
             }
+            "-q" => {
+                let _ = args.optional();
+            }
+            "-w" if force_window => {
+                let _ = args.optional();
+            }
             "-a" => {
                 let _ = args.optional();
                 flags.append = true;
@@ -156,6 +162,7 @@ impl SetOptionFlags {
                 's' => self.server = true,
                 'w' => self.window = true,
                 'p' => self.pane = true,
+                'q' => {}
                 'a' => self.append = true,
                 'o' => self.only_if_unset = true,
                 'u' => self.unset = true,
@@ -176,8 +183,9 @@ fn is_set_option_flag_cluster(token: &str, force_window: bool) -> bool {
         && !token.starts_with("--")
         && token.len() > 2
         && token[1..].chars().all(|flag| {
-            matches!(flag, 'g' | 'a' | 'o' | 'u')
+            matches!(flag, 'g' | 'a' | 'o' | 'q' | 'u')
                 || (!force_window && matches!(flag, 's' | 'w' | 'p' | 'U'))
+                || (force_window && flag == 'w')
         })
 }
 

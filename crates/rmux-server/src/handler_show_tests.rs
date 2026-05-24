@@ -75,7 +75,7 @@ async fn show_options_returns_command_output_for_session_and_server_scopes() {
 }
 
 #[tokio::test]
-async fn show_options_without_a_omits_inherited_values() {
+async fn show_options_for_named_default_resolves_without_inheritance_marker() {
     let handler = RequestHandler::new();
     create_session(&handler, "alpha").await;
 
@@ -91,7 +91,7 @@ async fn show_options_without_a_omits_inherited_values() {
         .command_output()
         .expect("show-options should return command output");
 
-    assert_eq!(output.stdout(), b"");
+    assert_eq!(output.stdout(), b"status on\n");
 }
 
 #[tokio::test]
