@@ -169,6 +169,79 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         .any(|window| window == needle)
 }
 
+/// Behavioural contract: running `rmux switch-client -t B` from
+/// inside a passthrough attach on session A must repoint the
+/// forwarder to B's pane (the host terminal starts showing B), and
+/// must NOT kill session A — it stays around as a detached session
+/// the user can return to. This is what makes `rmux new-session
+/// --passthrough` inside another passthrough behave like a tmux
+/// switch (the nested CLI hits exactly this path via
+/// `detect_context() == Nested`).
+///
+/// Trigger we observe: the forwarder's `passthrough_title_sequence`
+/// for B (`\x1b]0;rmux: B\x07`) must appear in the attach byte
+/// stream after the switch — proof that `switch_passthrough_target`
+/// fired with the new target.
+#[test]
+fn switch_client_into_other_passthrough_session_actually_swaps_target() -> TestResult {
+    let harness = CliHarness::new("passthrough-switch-actually-swaps")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    let create_alpha = harness.run(&["new-session", "--passthrough", "-d", "-s", "alpha"])?;
+    assert!(create_alpha.status.success());
+    let create_beta = harness.run(&["new-session", "--passthrough", "-d", "-s", "beta"])?;
+    assert!(create_beta.status.success());
+
+    let mut attach = AttachedSession::spawn(&harness, "alpha", TerminalSize::new(120, 40))?;
+    attach.wait_for_raw_mode(IO_TIMEOUT)?;
+    let initial = read_until_contains(attach.master_mut(), "rmux: alpha", IO_TIMEOUT)?;
+    assert!(
+        initial.contains("rmux: alpha"),
+        "initial attach must emit alpha's tagged title; got {initial:?}",
+    );
+    drain_attach_output(attach.master_mut())?;
+
+    // Single attached client → switch-client without --target-client
+    // routes to that attach (resolve_managed_client fallback).
+    let switch = harness.run(&["switch-client", "-t", "beta"])?;
+    assert!(
+        switch.status.success(),
+        "switch-client -t beta failed: stderr={:?}",
+        String::from_utf8_lossy(&switch.stderr)
+    );
+
+    // Forwarder must repaint with beta's title — that's the proof
+    // that switch_passthrough_target ran with the new target.
+    let after = read_until_contains(attach.master_mut(), "rmux: beta", IO_TIMEOUT)?;
+    assert!(
+        after.contains("rmux: beta"),
+        "switch-client must cause the passthrough forwarder to emit beta's tagged \
+         title; got {after:?}",
+    );
+
+    // Outer session must survive — switching away is not a kill.
+    let ls = harness.run(&["list-sessions", "-F", "#{session_name}"])?;
+    let listed = String::from_utf8_lossy(&ls.stdout);
+    assert!(
+        listed.contains("alpha"),
+        "switching away from alpha must not destroy it; list-sessions: {listed:?}",
+    );
+    assert!(
+        listed.contains("beta"),
+        "beta must still exist after switch; list-sessions: {listed:?}",
+    );
+
+    attach.send_bytes(b"\x02d")?;
+    let status = attach.wait_for_exit(IO_TIMEOUT)?;
+    assert_eq!(status.code(), Some(0));
+    attach.assert_restored()?;
+
+    let _ = harness.run(&["kill-session", "-t", "alpha"]);
+    let _ = harness.run(&["kill-session", "-t", "beta"]);
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
 /// Reported bug (interactive): create a passthrough session, exit
 /// it, then create another passthrough session — the second one
 /// spontaneously detaches after a few seconds with no user input.
