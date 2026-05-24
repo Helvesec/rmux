@@ -231,6 +231,7 @@ impl From<NewSessionSpec> for rmux_proto::NewSessionExtRequest {
             print_format: value.print_format,
             command,
             process_command,
+            passthrough: false,
         }
     }
 }

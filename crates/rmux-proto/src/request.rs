@@ -675,6 +675,7 @@ mod tests {
                 print_format: None,
                 command: None,
                 process_command: None,
+                passthrough: false,
             })
             .command_name(),
             "new-session"

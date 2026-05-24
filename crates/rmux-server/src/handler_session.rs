@@ -51,6 +51,7 @@ impl RequestHandler {
                 print_format: None,
                 command: None,
                 process_command: None,
+                passthrough: false,
             },
         )
         .await
@@ -212,6 +213,26 @@ impl RequestHandler {
                     .session_mut(&session_name)
                     .expect("newly created session must accept cwd assignment");
                 session.set_cwd((!rendered.is_empty()).then(|| PathBuf::from(rendered)));
+            }
+
+            // Enable passthrough on the session *before* spawning the
+            // initial pane. The pane reader captures its replay-log
+            // handle at spawn time (`passthrough_log_for_pane` only
+            // allocates when the session is currently passthrough),
+            // so a post-create option flip would leave the already-
+            // spawned reader holding `None` — every byte through
+            // window 0 would bypass the log and any later window-
+            // switch round-trip would have nothing to replay.
+            if request.passthrough {
+                if let Err(error) = state.options.set(
+                    rmux_proto::ScopeSelector::Session(session_name.clone()),
+                    rmux_proto::OptionName::Passthrough,
+                    "on".to_owned(),
+                    rmux_proto::SetOptionMode::Replace,
+                ) {
+                    let _removed = state.sessions.remove_session(&session_name);
+                    return Response::Error(ErrorResponse { error });
+                }
             }
 
             let needs_terminal = created_group

@@ -203,6 +203,7 @@ async fn respawn_window_retains_surviving_pane_lifecycle_counters_and_redacts_en
             print_format: None,
             command: None,
             process_command: None,
+            passthrough: false,
         }))
         .await;
     assert!(matches!(created, Response::NewSession(_)));

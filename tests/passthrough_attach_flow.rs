@@ -567,19 +567,14 @@ fn passthrough_repeated_window_switches_keep_both_panes_alive() -> TestResult {
 /// from window 1. This is the contract that makes passthrough
 /// window-switching feel non-destructive.
 ///
-/// **KNOWN BUG (marked ignore)**: the pane output reader captures
-/// `Option<SharedPassthroughReplayLog>` at pane-spawn time. The
-/// CLI's `--passthrough` flow creates the session FIRST, then
-/// flips `set-option passthrough on` SECOND — so window 0's pane
-/// reader was already spawned with `replay_log = None` and never
-/// appends bytes to a log. Window 1 (created after passthrough was
-/// already on) does get a log. Result: switching window 1 → 0
-/// hits the empty-log fallback and the user loses their previous
-/// window's content. The fix needs either an atomic create-with-
-/// passthrough path or a shared mutable slot the reader re-reads.
-/// Left in place as a regression target for whichever lands first.
+/// History: this test originally failed because the pane reader
+/// captures its `Option<SharedPassthroughReplayLog>` at spawn time
+/// and the CLI's old flow did `new-session` then `set-option`
+/// (two requests) — so window 0's reader was already spawned with
+/// `replay_log = None`. Fixed by passing `passthrough: bool` in
+/// the `NewSessionExt` request so the option is set server-side
+/// *before* the initial pane's reader spawns.
 #[test]
-#[ignore = "passthrough replay log not populated for panes created before set-option(passthrough on) — see docstring"]
 fn passthrough_window_zero_replay_contains_pre_switch_output_on_round_trip() -> TestResult {
     let harness = CliHarness::new("passthrough-replay-roundtrip")?;
     let mut daemon = harness.start_hidden_daemon()?;

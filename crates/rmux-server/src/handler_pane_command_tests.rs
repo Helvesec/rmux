@@ -256,6 +256,7 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
             print_format: None,
             command: Some(vec![initial_command.clone()]),
             process_command: None,
+            passthrough: false,
         }))
         .await;
     assert!(matches!(created, rmux_proto::Response::NewSession(_)));
@@ -580,6 +581,7 @@ async fn pane_output_sequence_advances_when_transcript_changes() {
             print_format: None,
             command: Some(vec![pipe_discard_command()]),
             process_command: None,
+            passthrough: false,
         }))
         .await;
     assert!(matches!(created, rmux_proto::Response::NewSession(_)));
@@ -1704,6 +1706,7 @@ async fn pane_snapshot_returns_live_screen_built_via_terminal_parser() {
             print_format: None,
             command: Some(vec![pipe_discard_command()]),
             process_command: None,
+            passthrough: false,
         }))
         .await;
     assert!(matches!(created, rmux_proto::Response::NewSession(_)));
@@ -1833,6 +1836,7 @@ async fn pane_snapshot_folds_invalid_utf8_through_parser_not_raw_bytes() {
             print_format: None,
             command: Some(vec![pipe_discard_command()]),
             process_command: None,
+            passthrough: false,
         }))
         .await;
     assert!(matches!(created, rmux_proto::Response::NewSession(_)));
@@ -1918,6 +1922,7 @@ async fn pane_snapshot_revision_changes_after_clear_history() {
             print_format: None,
             command: Some(vec![pipe_discard_command()]),
             process_command: None,
+            passthrough: false,
         }))
         .await;
     assert!(matches!(created, rmux_proto::Response::NewSession(_)));

@@ -335,6 +335,7 @@ fn create_short_lived_shell_session(
         print_format: None,
         command: Some(vec!["sh".to_owned(), "-c".to_owned(), "sleep 1".to_owned()]),
         process_command: None,
+        passthrough: false,
     }))?;
     assert!(matches!(response, Response::NewSession(_)), "{response:?}");
     Ok(())
@@ -376,6 +377,7 @@ fn create_interactive_shell_session(
         print_format: None,
         command: Some(vec!["sh".to_owned(), "-i".to_owned()]),
         process_command: None,
+        passthrough: false,
     }))?;
     assert!(matches!(response, Response::NewSession(_)), "{response:?}");
     thread::sleep(Duration::from_millis(100));

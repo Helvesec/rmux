@@ -291,6 +291,7 @@ impl EnsureSession {
             kill_other_clients: false,
             flags: None,
             window_name: self.window_name.clone(),
+            passthrough: false,
             print_session_info: false,
             print_format: None,
             command: self.process.command.clone(),

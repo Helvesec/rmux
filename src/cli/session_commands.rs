@@ -4,9 +4,7 @@ use rmux_client::connect;
 use rmux_client::{detect_context, ClientContext};
 use rmux_proto::request::{AttachSessionExt2Request, SwitchClientExt3Request};
 use rmux_proto::request::{KillSessionRequest, ListSessionsRequest, NewSessionExtRequest};
-use rmux_proto::{
-    ClientTerminalContext, ErrorResponse, OptionName, Response, ScopeSelector, SetOptionMode,
-};
+use rmux_proto::{ClientTerminalContext, ErrorResponse, Response};
 
 use super::{attach_with_connection, current_terminal_size, run_switch_client_on_connection};
 use super::{
@@ -48,6 +46,13 @@ pub(super) fn run_new_session(
             print_format: args.print_format,
             command: (!args.command.is_empty()).then_some(args.command),
             process_command: None,
+            // Atomically set passthrough server-side. A separate
+            // post-create `set-option` would race with the initial
+            // pane reader spawn: the reader captures its replay log
+            // at spawn time, so a later flip would leave the
+            // already-spawned reader holding `None` and losing all
+            // bytes that flow through window 0.
+            passthrough: args.passthrough,
         })
         .map_err(ExitFailure::from_client)?;
     let output = response.command_output().cloned();
@@ -61,39 +66,6 @@ pub(super) fn run_new_session(
 
     if let Some(output) = output {
         write_command_output(&output)?;
-    }
-
-    // Apply the --passthrough flag as a session-scope option set
-    // immediately after creation. This must happen before any attach
-    // so the listener routes us to the passthrough forwarder.
-    //
-    // Treat set-option failure as fatal: if it silently fell back to
-    // the normal forwarder the user would get a non-passthrough
-    // session and not understand why. Better to bail with a clear
-    // pointer to the session we just created so they can `kill` or
-    // `attach` it manually.
-    if args.passthrough {
-        let response = connection
-            .set_option(
-                ScopeSelector::Session(target.clone()),
-                OptionName::Passthrough,
-                "on".to_owned(),
-                SetOptionMode::Replace,
-            )
-            .map_err(|error| {
-                ExitFailure::new(1,format!(
-                    "new-session: created session '{target}' but failed to enable \
-                     --passthrough: {error}. The session exists in normal mode; \
-                     run `rmux kill-session -t {target}` to clean up."
-                ))
-            })?;
-        if let Response::Error(ErrorResponse { error, .. }) = &response {
-            return Err(ExitFailure::new(1,format!(
-                "new-session: created session '{target}' but server rejected \
-                 --passthrough: {error}. Run `rmux kill-session -t {target}` \
-                 to clean up."
-            )));
-        }
     }
 
     if args.detached {

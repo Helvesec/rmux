@@ -87,6 +87,7 @@ pub(super) fn parse_new_session(mut args: CommandTokens) -> Result<Request, Rmux
         print_format,
         command: (!command.is_empty()).then_some(command),
         process_command: None,
+        passthrough: false,
     }))
 }
 

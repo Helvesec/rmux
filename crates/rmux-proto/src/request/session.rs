@@ -63,6 +63,16 @@ pub struct NewSessionExtRequest {
     /// Explicit process launch mode for the initial pane.
     #[serde(default)]
     pub process_command: Option<ProcessCommand>,
+    /// Whether the session should be created in passthrough mode.
+    ///
+    /// When `true`, the server sets the session-scope `passthrough`
+    /// option BEFORE spawning the initial pane. This is the only
+    /// way to guarantee the initial pane's reader is wired up with
+    /// a replay log: passthrough's per-pane log is allocated lazily
+    /// at reader spawn time, and a later `set-option` flip would
+    /// leave the already-spawned reader holding `None`.
+    #[serde(default)]
+    pub passthrough: bool,
 }
 
 impl<'de> Deserialize<'de> for NewSessionExtRequest {
@@ -88,6 +98,7 @@ impl<'de> Deserialize<'de> for NewSessionExtRequest {
                 "print_format",
                 "command",
                 "process_command",
+                "passthrough",
             ],
             NewSessionExtRequestVisitor,
         )
@@ -122,6 +133,7 @@ impl<'de> Visitor<'de> for NewSessionExtRequestVisitor {
         let print_format = required_next(&mut seq, 12, &self)?;
         let command = required_next(&mut seq, 13, &self)?;
         let process_command = compat_next_element(&mut seq)?;
+        let passthrough = compat_next_element(&mut seq)?;
 
         Ok(NewSessionExtRequest {
             session_name,
@@ -139,6 +151,7 @@ impl<'de> Visitor<'de> for NewSessionExtRequestVisitor {
             print_format,
             command,
             process_command,
+            passthrough,
         })
     }
 
@@ -161,6 +174,7 @@ impl<'de> Visitor<'de> for NewSessionExtRequestVisitor {
         let mut print_format = None;
         let mut command = None;
         let mut process_command = None;
+        let mut passthrough = None;
 
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
@@ -179,6 +193,7 @@ impl<'de> Visitor<'de> for NewSessionExtRequestVisitor {
                 "print_format" => print_format = Some(map.next_value()?),
                 "command" => command = Some(map.next_value()?),
                 "process_command" => process_command = Some(map.next_value()?),
+                "passthrough" => passthrough = Some(map.next_value()?),
                 _ => {
                     let _: de::IgnoredAny = map.next_value()?;
                 }
@@ -206,6 +221,7 @@ impl<'de> Visitor<'de> for NewSessionExtRequestVisitor {
             print_format: print_format.ok_or_else(|| de::Error::missing_field("print_format"))?,
             command: command.ok_or_else(|| de::Error::missing_field("command"))?,
             process_command: process_command.unwrap_or_default(),
+            passthrough: passthrough.unwrap_or_default(),
         })
     }
 }
