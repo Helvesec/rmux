@@ -1060,6 +1060,16 @@ async fn passthrough_replay_bytes_for_target(
 /// the host terminal state, then emits the new pane's replay log so
 /// the client sees the new window's recent history in its scrollback
 /// + the new window's current visible state.
+///
+/// Refresh-vs-switch detection: the daemon also sends
+/// `AttachControl::Switch` for things that aren't actual window
+/// switches — client resize, status refresh, focus change. Those
+/// arrive with `next_target.active_pane_id == current.active_pane_id`
+/// for the same session. Treating them as real switches would re-emit
+/// the title + clear-screen on every refresh, wiping whatever the
+/// inner program (typically a shell prompt + the last command's
+/// output) just rendered. We detect that case up front, update
+/// internal state, and skip all client-visible emission.
 #[cfg(any(unix, windows))]
 async fn switch_passthrough_target(
     stream: &LocalStream,
@@ -1067,7 +1077,20 @@ async fn switch_passthrough_target(
     next_target: AttachTarget,
     live_input: &LiveAttachInputContext,
 ) -> io::Result<()> {
+    // Snapshot identity *before* the move so we can decide whether
+    // this is a real switch. `active_pane_id == None` means we have
+    // no stable pane handle (test fixtures only) — fall through to
+    // the safer always-repaint path in that case.
+    let same_pane = current_target.active_pane_id.is_some()
+        && current_target.active_pane_id == next_target.active_pane_id
+        && current_target.session_name == next_target.session_name;
     *current_target = open_attach_target(next_target)?;
+    if same_pane {
+        // Refresh-only: same pane, same session. The inner program's
+        // output continues unchanged; emitting anything here would
+        // be a regression on the host-scrollback promise.
+        return Ok(());
+    }
     // Nudge the new window's foreground program into a repaint.
     //
     // Streaming TUIs (claude, tail -f) don't need this — they emit on
