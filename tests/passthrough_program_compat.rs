@@ -788,6 +788,298 @@ fn passthrough_prefix_w_opens_choose_tree_overlay_in_alt_screen() -> TestResult 
     Ok(())
 }
 
+/// Open the picker, hit Enter on whatever's highlighted by default
+/// (typically the current window). The picker must dismiss cleanly:
+/// alt-screen exits, no crash, the session keeps running.
+///
+/// We deliberately don't navigate first — choose-tree's row ordering
+/// (session/window/pane nesting + collapsed-by-default) is fragile
+/// to drive from a test. Picking the default item just exercises
+/// the Enter → dismiss → switch round-trip.
+#[test]
+fn passthrough_prefix_w_enter_dismisses_picker_and_session_survives() -> TestResult {
+    let harness = CliHarness::new("passthrough-prefix-w-enter-default-pick")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert!(harness
+        .run(&["new-session", "--passthrough", "-d", "-s", "alpha"])?
+        .status
+        .success());
+    assert!(harness
+        .run(&["new-window", "-t", "alpha", "-d", "sh", "-c", "exec /bin/sh"])?
+        .status
+        .success());
+
+    let mut attach = AttachedSession::spawn(&harness, "alpha", TerminalSize::new(120, 40))?;
+    attach.wait_for_raw_mode(IO_TIMEOUT)?;
+    let _ = read_until_contains(attach.master_mut(), SHELL_PROMPT_MARKER, IO_TIMEOUT)?;
+    drain_attach_output(attach.master_mut())?;
+
+    attach.send_bytes(b"\x02w")?;
+    std::thread::sleep(Duration::from_millis(500));
+    attach.send_bytes(b"\r")?;
+    std::thread::sleep(Duration::from_millis(500));
+
+    let bytes = drain_attach_output_bytes(attach.master_mut())?;
+    assert!(
+        contains_bytes(&bytes, b"\x1b[?1049l"),
+        "Enter on the picker must release alt-screen; got {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+
+    // Session must survive — attach client still alive.
+    assert!(
+        attach.child_mut().try_wait()?.is_none(),
+        "picker Enter must not tear down the attach"
+    );
+
+    attach.send_bytes(b"\x02d")?;
+    let _ = attach.wait_for_exit(IO_TIMEOUT)?;
+    let _ = harness.run(&["kill-session", "-t", "alpha"]);
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+/// Open + close the picker twice. We must see exactly two
+/// alt-screen-enter and two alt-screen-exit transitions — no leaks,
+/// no doubled emissions per cycle.
+#[test]
+fn passthrough_prefix_w_open_close_cycles_balance_alt_screen() -> TestResult {
+    let harness = CliHarness::new("passthrough-prefix-w-balance")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert!(harness
+        .run(&["new-session", "--passthrough", "-d", "-s", "alpha"])?
+        .status
+        .success());
+
+    let mut attach = AttachedSession::spawn(&harness, "alpha", TerminalSize::new(120, 40))?;
+    attach.wait_for_raw_mode(IO_TIMEOUT)?;
+    let _ = read_until_contains(attach.master_mut(), SHELL_PROMPT_MARKER, IO_TIMEOUT)?;
+    drain_attach_output(attach.master_mut())?;
+
+    // Drain after every event so we can attribute transitions to
+    // the cycle that produced them (and so a slow daemon doesn't
+    // backpressure into our timing).
+    let mut totals = Vec::new();
+    for cycle in 1..=2 {
+        attach.send_bytes(b"\x02w")?;
+        std::thread::sleep(Duration::from_millis(600));
+        let opened = drain_attach_output_bytes(attach.master_mut())?;
+        attach.send_bytes(b"q")?;
+        std::thread::sleep(Duration::from_millis(600));
+        let closed = drain_attach_output_bytes(attach.master_mut())?;
+        let open_enters = opened
+            .windows(b"\x1b[?1049h".len())
+            .filter(|w| *w == b"\x1b[?1049h")
+            .count();
+        let close_exits = closed
+            .windows(b"\x1b[?1049l".len())
+            .filter(|w| *w == b"\x1b[?1049l")
+            .count();
+        totals.push((cycle, open_enters, close_exits, opened.clone(), closed.clone()));
+    }
+    for (cycle, enters, exits, opened, closed) in &totals {
+        assert_eq!(
+            *enters, 1,
+            "cycle {cycle}: Ctrl-B w must emit exactly 1 alt-screen-enter; saw {enters}. \
+             opened-bytes={:?}",
+            String::from_utf8_lossy(opened)
+        );
+        assert_eq!(
+            *exits, 1,
+            "cycle {cycle}: q must emit exactly 1 alt-screen-exit; saw {exits}. \
+             closed-bytes={:?}",
+            String::from_utf8_lossy(closed)
+        );
+    }
+
+    attach.send_bytes(b"\x02d")?;
+    let _ = attach.wait_for_exit(IO_TIMEOUT)?;
+    let _ = harness.run(&["kill-session", "-t", "alpha"]);
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+/// Navigating inside the picker (↓ ↑) triggers re-renders. Each
+/// re-render emits a new overlay frame — but we must NOT emit a
+/// fresh `\x1b[?1049h` for each one (that would re-enter alt-screen
+/// every keystroke). Only the first frame opens the bracket.
+#[test]
+fn passthrough_prefix_w_navigation_does_not_repeat_alt_screen_enter() -> TestResult {
+    let harness = CliHarness::new("passthrough-prefix-w-no-repeat-enter")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert!(harness
+        .run(&["new-session", "--passthrough", "-d", "-s", "alpha"])?
+        .status
+        .success());
+    assert!(harness
+        .run(&["new-window", "-t", "alpha", "-d", "sh", "-c", "exec /bin/sh"])?
+        .status
+        .success());
+
+    let mut attach = AttachedSession::spawn(&harness, "alpha", TerminalSize::new(120, 40))?;
+    attach.wait_for_raw_mode(IO_TIMEOUT)?;
+    let _ = read_until_contains(attach.master_mut(), SHELL_PROMPT_MARKER, IO_TIMEOUT)?;
+    drain_attach_output(attach.master_mut())?;
+
+    attach.send_bytes(b"\x02w")?;
+    std::thread::sleep(Duration::from_millis(350));
+    // Expand and navigate several times.
+    for keys in [
+        b"\x1b[C".as_slice(), // expand
+        b"\x1b[B",            // down
+        b"\x1b[B",            // down
+        b"\x1b[A",            // up
+        b"\x1b[A",            // up
+    ] {
+        attach.send_bytes(keys)?;
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    attach.send_bytes(b"q")?;
+    std::thread::sleep(Duration::from_millis(300));
+
+    let bytes = drain_attach_output_bytes(attach.master_mut())?;
+    let enters = bytes
+        .windows(b"\x1b[?1049h".len())
+        .filter(|w| *w == b"\x1b[?1049h")
+        .count();
+    assert_eq!(
+        enters, 1,
+        "alt-screen enter must fire exactly ONCE per overlay session, not per \
+         re-render. saw {enters} enters in: {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+
+    attach.send_bytes(b"\x02d")?;
+    let _ = attach.wait_for_exit(IO_TIMEOUT)?;
+    let _ = harness.run(&["kill-session", "-t", "alpha"]);
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+/// `Ctrl-B t` (clock-mode) goes through the same overlay path on
+/// entry and DOES alt-screen-wrap correctly. Dismissal is the wart:
+/// clock-mode exits via `send_session_overlay(..., persistent=false)`
+/// + a refresh-style Switch to the same pane. From the passthrough
+/// forwarder's POV that's indistinguishable from a refresh tick, so
+/// we don't currently leave alt-screen. Tracked as a known gap; the
+/// fix probably needs a dedicated `AttachControl::ExitClockMode`
+/// signal or a different sentinel on the exit-frame.
+#[test]
+#[ignore = "clock-mode dismissal needs a distinguishable control signal — see docstring"]
+fn passthrough_prefix_t_clock_mode_uses_alt_screen() -> TestResult {
+    let harness = CliHarness::new("passthrough-prefix-t-clock-mode")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert!(harness
+        .run(&["new-session", "--passthrough", "-d", "-s", "alpha"])?
+        .status
+        .success());
+
+    let mut attach = AttachedSession::spawn(&harness, "alpha", TerminalSize::new(120, 40))?;
+    attach.wait_for_raw_mode(IO_TIMEOUT)?;
+    let _ = read_until_contains(attach.master_mut(), SHELL_PROMPT_MARKER, IO_TIMEOUT)?;
+    drain_attach_output(attach.master_mut())?;
+
+    // Ctrl-B t opens clock-mode.
+    attach.send_bytes(b"\x02t")?;
+    std::thread::sleep(Duration::from_millis(500));
+    let opened = drain_attach_output_bytes(attach.master_mut())?;
+    assert!(
+        contains_bytes(&opened, b"\x1b[?1049h"),
+        "Ctrl-B t (clock-mode) must wrap in alt-screen; got {:?}",
+        String::from_utf8_lossy(&opened)
+    );
+
+    // Clock-mode is dismissed by any key.
+    attach.send_bytes(b"q")?;
+    std::thread::sleep(Duration::from_millis(400));
+    let closed = drain_attach_output_bytes(attach.master_mut())?;
+    assert!(
+        contains_bytes(&closed, b"\x1b[?1049l"),
+        "dismissing clock-mode must exit alt-screen; got {:?}",
+        String::from_utf8_lossy(&closed)
+    );
+
+    attach.send_bytes(b"\x02d")?;
+    let _ = attach.wait_for_exit(IO_TIMEOUT)?;
+    let _ = harness.run(&["kill-session", "-t", "alpha"]);
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+/// While the overlay is up, inner-pane output (e.g. a background
+/// process printing) must NOT paint on top of the picker — those
+/// bytes get dropped by the forwarder. They still land in the
+/// passthrough replay log, so after dismissal a window-switch
+/// round-trip would recover them.
+///
+/// Verification: trigger background output in window 1, open the
+/// picker while it's spewing. The bytes that arrive while the
+/// picker is up must NOT contain the background marker (because
+/// the forwarder suppresses pane output during the overlay).
+#[test]
+fn passthrough_overlay_suppresses_inner_pane_output_while_visible() -> TestResult {
+    let harness = CliHarness::new("passthrough-overlay-suppresses-output")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert!(harness
+        .run(&["new-session", "--passthrough", "-d", "-s", "alpha"])?
+        .status
+        .success());
+
+    let mut attach = AttachedSession::spawn(&harness, "alpha", TerminalSize::new(120, 40))?;
+    attach.wait_for_raw_mode(IO_TIMEOUT)?;
+    let _ = read_until_contains(attach.master_mut(), SHELL_PROMPT_MARKER, IO_TIMEOUT)?;
+    drain_attach_output(attach.master_mut())?;
+
+    // Background spewer that *starts after a delay* (sleep 1 first)
+    // so we have time to open the picker before the first BG-SPEW
+    // ever lands in the attach stream. That isolates "leak through
+    // the overlay" from "raced ahead of the overlay".
+    attach
+        .send_bytes(b"(sleep 1; for i in 1 2 3 4 5 6; do printf 'BG-SPEW-%s\\n' \"$i\"; sleep 0.2; done) &\n")?;
+    std::thread::sleep(Duration::from_millis(200));
+    drain_attach_output(attach.master_mut())?;
+
+    // Open the picker before the spewer wakes up. Then wait long
+    // enough that the spewer fires several iterations while we're
+    // in alt-screen.
+    attach.send_bytes(b"\x02w")?;
+    std::thread::sleep(Duration::from_millis(2000));
+    let while_visible = drain_attach_output_bytes(attach.master_mut())?;
+
+    // While the picker is visible, the background marker must NOT
+    // appear (the forwarder dropped those bytes to avoid painting
+    // under the overlay).
+    let bg_count = (1..=6)
+        .filter(|i| {
+            let needle = format!("BG-SPEW-{i}").into_bytes();
+            contains_bytes(&while_visible, &needle)
+        })
+        .count();
+    assert_eq!(
+        bg_count, 0,
+        "inner-pane output must be suppressed while the overlay owns alt-screen; \
+         saw {bg_count} background markers in: {:?}",
+        String::from_utf8_lossy(&while_visible)
+    );
+
+    attach.send_bytes(b"q")?;
+    std::thread::sleep(Duration::from_millis(400));
+    // Wait for the background process to die so it doesn't keep
+    // spewing after detach.
+    std::thread::sleep(Duration::from_millis(1500));
+
+    attach.send_bytes(b"\x02d")?;
+    let _ = attach.wait_for_exit(IO_TIMEOUT)?;
+    let _ = harness.run(&["kill-session", "-t", "alpha"]);
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
 /// Reads from the attach until the shell's next prompt redraw, then
 /// returns the consumed bytes. Used by tests that send a command and
 /// want to capture the executed output without false-matching on the
