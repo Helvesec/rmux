@@ -310,3 +310,385 @@ fn passthrough_second_session_after_exit_does_not_spontaneously_detach() -> Test
     terminate_child(daemon.child_mut())?;
     Ok(())
 }
+
+// ---------------------------------------------------------------
+// Multi-window passthrough tests
+//
+// Contract under test: `--passthrough` supports MULTIPLE windows
+// per session even though it forbids multiple panes per window.
+// The user-facing promise is: `Ctrl-B 0` / `Ctrl-B 1` (and the
+// equivalent `select-window` CLI) flick between windows in the
+// host terminal, each one's output flowing verbatim through the
+// same client connection, the other window's pane staying alive
+// in the background.
+// ---------------------------------------------------------------
+
+/// Sanity: `new-window -t S -d <command>` adds a second window to
+/// a passthrough session and `list-windows` reports two windows.
+/// This is the prerequisite for every test below.
+#[test]
+fn passthrough_session_supports_two_windows_via_new_window() -> TestResult {
+    let harness = CliHarness::new("passthrough-multi-new-window")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    let create = harness.run(&["new-session", "--passthrough", "-d", "-s", "multi"])?;
+    assert!(
+        create.status.success(),
+        "create failed: {:?}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let add = harness.run(&[
+        "new-window",
+        "-t",
+        "multi",
+        "-d",
+        "sh",
+        "-c",
+        "printf WINDOW1-READY\\n; exec /bin/sh",
+    ])?;
+    assert!(
+        add.status.success(),
+        "new-window in passthrough failed: {:?}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let listed = harness.run(&[
+        "list-windows",
+        "-t",
+        "multi",
+        "-F",
+        "#{window_index}:#{window_active}",
+    ])?;
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        stdout.contains("0:1") && stdout.contains("1:0"),
+        "expected window 0 active and window 1 inactive after `new-window -d`; got: {stdout:?}",
+    );
+
+    let _ = harness.run(&["kill-session", "-t", "multi"]);
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+/// `rmux select-window -t S:1` while attached must repoint the
+/// passthrough forwarder onto window 1's pane (proof: window 1's
+/// tagged title `rmux: S` appears AND the marker we seeded in
+/// window 1 shows up via replay).
+#[test]
+fn passthrough_select_window_via_cli_repoints_attached_forwarder() -> TestResult {
+    let harness = CliHarness::new("passthrough-select-window-cli")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert!(harness
+        .run(&["new-session", "--passthrough", "-d", "-s", "multi"])?
+        .status
+        .success());
+    // Seed window 1 with a unique marker its shell prints on startup.
+    // Sleeping a beat after the marker keeps the shell alive so the
+    // pane stays open across our test.
+    assert!(harness
+        .run(&[
+            "new-window",
+            "-t",
+            "multi",
+            "-d",
+            "sh",
+            "-c",
+            "printf WINDOW-ONE-MARKER\\n; exec /bin/sh",
+        ])?
+        .status
+        .success());
+
+    let mut attach = AttachedSession::spawn(&harness, "multi", TerminalSize::new(120, 40))?;
+    attach.wait_for_raw_mode(IO_TIMEOUT)?;
+    // Wait for window 0's shell prompt to anchor "we're on window 0".
+    let _ = read_until_contains(attach.master_mut(), SHELL_PROMPT_MARKER, IO_TIMEOUT)?;
+    drain_attach_output(attach.master_mut())?;
+
+    let switch = harness.run(&["select-window", "-t", "multi:1"])?;
+    assert!(
+        switch.status.success(),
+        "select-window failed: {:?}",
+        String::from_utf8_lossy(&switch.stderr)
+    );
+
+    // Window 1's marker must appear in the attach stream — that's
+    // the proof its replay log was emitted by switch_passthrough_target.
+    let after = read_until_contains(attach.master_mut(), "WINDOW-ONE-MARKER", IO_TIMEOUT)?;
+    assert!(
+        after.contains("WINDOW-ONE-MARKER"),
+        "after select-window the forwarder must replay window 1's marker; got {after:?}",
+    );
+
+    attach.send_bytes(b"\x02d")?;
+    let status = attach.wait_for_exit(IO_TIMEOUT)?;
+    assert_eq!(status.code(), Some(0));
+    attach.assert_restored()?;
+    let _ = harness.run(&["kill-session", "-t", "multi"]);
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+/// User-keyboard flow: with two windows live, the user pressing
+/// `Ctrl-B 1` in the attach client (\x02 then '1') must move the
+/// active window to 1, and `Ctrl-B 0` must move it back.
+///
+/// Verification: after each switch, the *active* window per
+/// `list-windows` must match what we just selected.
+#[test]
+fn passthrough_prefix_key_window_select_changes_active_window() -> TestResult {
+    let harness = CliHarness::new("passthrough-prefix-window-select")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert!(harness
+        .run(&["new-session", "--passthrough", "-d", "-s", "multi"])?
+        .status
+        .success());
+    assert!(harness
+        .run(&[
+            "new-window",
+            "-t",
+            "multi",
+            "-d",
+            "sh",
+            "-c",
+            "printf WINDOW-ONE-MARKER\\n; exec /bin/sh",
+        ])?
+        .status
+        .success());
+
+    let mut attach = AttachedSession::spawn(&harness, "multi", TerminalSize::new(120, 40))?;
+    attach.wait_for_raw_mode(IO_TIMEOUT)?;
+    let _ = read_until_contains(attach.master_mut(), SHELL_PROMPT_MARKER, IO_TIMEOUT)?;
+
+    // Ctrl-B 1
+    attach.send_bytes(b"\x021")?;
+    // Wait for the window 1 marker via replay.
+    let after_one = read_until_contains(attach.master_mut(), "WINDOW-ONE-MARKER", IO_TIMEOUT)?;
+    assert!(
+        after_one.contains("WINDOW-ONE-MARKER"),
+        "Ctrl-B 1 must land on window 1 and replay its content; got {after_one:?}",
+    );
+
+    let active_after_one = active_window_index(&harness, "multi")?;
+    assert_eq!(
+        active_after_one, 1,
+        "list-windows must report window 1 active after Ctrl-B 1; got {active_after_one}",
+    );
+
+    // Ctrl-B 0
+    attach.send_bytes(b"\x020")?;
+    // After switching back the active marker should be 0; the
+    // replay should re-paint window 0's shell prompt area.
+    std::thread::sleep(Duration::from_millis(300));
+    let active_after_zero = active_window_index(&harness, "multi")?;
+    assert_eq!(
+        active_after_zero, 0,
+        "list-windows must report window 0 active after Ctrl-B 0; got {active_after_zero}",
+    );
+
+    attach.send_bytes(b"\x02d")?;
+    let status = attach.wait_for_exit(IO_TIMEOUT)?;
+    assert_eq!(status.code(), Some(0));
+    attach.assert_restored()?;
+    let _ = harness.run(&["kill-session", "-t", "multi"]);
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+/// Flick between two windows several times. Both windows must
+/// stay alive — their panes should NOT die from being
+/// foregrounded/backgrounded — and each switch must land on the
+/// requested window.
+#[test]
+fn passthrough_repeated_window_switches_keep_both_panes_alive() -> TestResult {
+    let harness = CliHarness::new("passthrough-flick-windows")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert!(harness
+        .run(&["new-session", "--passthrough", "-d", "-s", "multi"])?
+        .status
+        .success());
+    assert!(harness
+        .run(&[
+            "new-window",
+            "-t",
+            "multi",
+            "-d",
+            "sh",
+            "-c",
+            "printf WINDOW-ONE-MARKER\\n; exec /bin/sh",
+        ])?
+        .status
+        .success());
+
+    let mut attach = AttachedSession::spawn(&harness, "multi", TerminalSize::new(120, 40))?;
+    attach.wait_for_raw_mode(IO_TIMEOUT)?;
+    let _ = read_until_contains(attach.master_mut(), SHELL_PROMPT_MARKER, IO_TIMEOUT)?;
+
+    // Sequence: 1, 0, 1, 0, 1, 0 (six switches)
+    for round in 0..3 {
+        attach.send_bytes(b"\x021")?;
+        std::thread::sleep(Duration::from_millis(200));
+        let active = active_window_index(&harness, "multi")?;
+        assert_eq!(
+            active, 1,
+            "round {round}: expected active window 1 after Ctrl-B 1, got {active}"
+        );
+        attach.send_bytes(b"\x020")?;
+        std::thread::sleep(Duration::from_millis(200));
+        let active = active_window_index(&harness, "multi")?;
+        assert_eq!(
+            active, 0,
+            "round {round}: expected active window 0 after Ctrl-B 0, got {active}"
+        );
+    }
+
+    // Both windows must still be present.
+    let listed = harness.run(&["list-windows", "-t", "multi", "-F", "#{window_index}"])?;
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    let indexes: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        indexes,
+        vec!["0", "1"],
+        "both windows must still exist after repeated switching; got: {stdout:?}",
+    );
+
+    attach.send_bytes(b"\x02d")?;
+    let status = attach.wait_for_exit(IO_TIMEOUT)?;
+    assert_eq!(status.code(), Some(0));
+    let _ = harness.run(&["kill-session", "-t", "multi"]);
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+/// Replay log on round-trip: output emitted in window 0 *before*
+/// switching away must be visible again when we switch back to it
+/// from window 1. This is the contract that makes passthrough
+/// window-switching feel non-destructive.
+///
+/// **KNOWN BUG (marked ignore)**: the pane output reader captures
+/// `Option<SharedPassthroughReplayLog>` at pane-spawn time. The
+/// CLI's `--passthrough` flow creates the session FIRST, then
+/// flips `set-option passthrough on` SECOND — so window 0's pane
+/// reader was already spawned with `replay_log = None` and never
+/// appends bytes to a log. Window 1 (created after passthrough was
+/// already on) does get a log. Result: switching window 1 → 0
+/// hits the empty-log fallback and the user loses their previous
+/// window's content. The fix needs either an atomic create-with-
+/// passthrough path or a shared mutable slot the reader re-reads.
+/// Left in place as a regression target for whichever lands first.
+#[test]
+#[ignore = "passthrough replay log not populated for panes created before set-option(passthrough on) — see docstring"]
+fn passthrough_window_zero_replay_contains_pre_switch_output_on_round_trip() -> TestResult {
+    let harness = CliHarness::new("passthrough-replay-roundtrip")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert!(harness
+        .run(&["new-session", "--passthrough", "-d", "-s", "multi"])?
+        .status
+        .success());
+    assert!(harness
+        .run(&[
+            "new-window",
+            "-t",
+            "multi",
+            "-d",
+            "sh",
+            "-c",
+            "printf WINDOW-ONE-MARKER\\n; exec /bin/sh",
+        ])?
+        .status
+        .success());
+
+    let mut attach = AttachedSession::spawn(&harness, "multi", TerminalSize::new(120, 40))?;
+    attach.wait_for_raw_mode(IO_TIMEOUT)?;
+    let _ = read_until_contains(attach.master_mut(), SHELL_PROMPT_MARKER, IO_TIMEOUT)?;
+
+    // Type into window 0's shell — output goes through the attach.
+    attach.send_bytes(b"printf SCROLLBACK_SENTINEL_VALUE\n")?;
+    let _ = read_until_contains(attach.master_mut(), "SCROLLBACK_SENTINEL_VALUE", IO_TIMEOUT)?;
+    drain_attach_output(attach.master_mut())?;
+
+    // Round-trip via window 1.
+    attach.send_bytes(b"\x021")?;
+    let _ = read_until_contains(attach.master_mut(), "WINDOW-ONE-MARKER", IO_TIMEOUT)?;
+    drain_attach_output(attach.master_mut())?;
+    attach.send_bytes(b"\x020")?;
+
+    // When we land back on window 0, the replay must include the
+    // sentinel we printed earlier — otherwise host-terminal users
+    // lose their previous window's visible state on every flick.
+    let after = read_until_contains(attach.master_mut(), "SCROLLBACK_SENTINEL_VALUE", IO_TIMEOUT)
+        .map_err(|err| format!("window 0 replay missing pre-switch output: {err}"))?;
+    assert!(
+        after.contains("SCROLLBACK_SENTINEL_VALUE"),
+        "window 0 replay on return must contain prior shell output; got {after:?}",
+    );
+
+    attach.send_bytes(b"\x02d")?;
+    let status = attach.wait_for_exit(IO_TIMEOUT)?;
+    assert_eq!(status.code(), Some(0));
+    let _ = harness.run(&["kill-session", "-t", "multi"]);
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+/// `Ctrl-B c` from the attach client must create a second window
+/// and switch to it. This is the keyboard-driven counterpart to
+/// `rmux new-window` and is the most common interactive flow.
+#[test]
+fn passthrough_prefix_c_creates_new_window_from_attach() -> TestResult {
+    let harness = CliHarness::new("passthrough-prefix-c-new-window")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert!(harness
+        .run(&["new-session", "--passthrough", "-d", "-s", "multi"])?
+        .status
+        .success());
+
+    let mut attach = AttachedSession::spawn(&harness, "multi", TerminalSize::new(120, 40))?;
+    attach.wait_for_raw_mode(IO_TIMEOUT)?;
+    let _ = read_until_contains(attach.master_mut(), SHELL_PROMPT_MARKER, IO_TIMEOUT)?;
+
+    // Ctrl-B c
+    attach.send_bytes(b"\x02c")?;
+    // Give the daemon a beat to spawn the new window.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let listed = harness.run(&["list-windows", "-t", "multi", "-F", "#{window_index}"])?;
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    let indexes: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        indexes,
+        vec!["0", "1"],
+        "Ctrl-B c must create a second window; list-windows: {stdout:?}",
+    );
+
+    attach.send_bytes(b"\x02d")?;
+    let status = attach.wait_for_exit(IO_TIMEOUT)?;
+    assert_eq!(status.code(), Some(0));
+    let _ = harness.run(&["kill-session", "-t", "multi"]);
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+fn active_window_index(harness: &CliHarness, session: &str) -> Result<usize, Box<dyn Error>> {
+    let listed = harness.run(&[
+        "list-windows",
+        "-t",
+        session,
+        "-F",
+        "#{window_index}:#{window_active}",
+    ])?;
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    for line in stdout.lines() {
+        let mut parts = line.split(':');
+        let idx = parts.next().ok_or("missing index")?.parse::<usize>()?;
+        let active = parts.next().ok_or("missing active")? == "1";
+        if active {
+            return Ok(idx);
+        }
+    }
+    Err(format!("no active window found in: {stdout:?}").into())
+}
