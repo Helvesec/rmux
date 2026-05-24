@@ -711,6 +711,83 @@ fn passthrough_long_running_command_keeps_attach_alive() -> TestResult {
     Ok(())
 }
 
+/// Ctrl-B w (choose-tree window picker) in passthrough must:
+///   1. enter alt-screen (`\x1b[?1049h`) so the picker doesn't draw
+///      on top of the inner shell's content,
+///   2. render the choose-tree overlay (visible session/window list),
+///   3. on dismissal (Enter or Escape), exit alt-screen
+///      (`\x1b[?1049l`) so the host terminal is back where it was.
+///
+/// Before the alt-screen-bracketed-overlay fix this test fails:
+/// pressing Ctrl-B w silently does nothing — the daemon sends an
+/// `AttachControl::Overlay` to the forwarder which the passthrough
+/// loop drops on the floor.
+#[test]
+fn passthrough_prefix_w_opens_choose_tree_overlay_in_alt_screen() -> TestResult {
+    let harness = CliHarness::new("passthrough-prefix-w-choose-tree")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert!(harness
+        .run(&["new-session", "--passthrough", "-d", "-s", "alpha"])?
+        .status
+        .success());
+    // Two windows so the picker has something to list.
+    assert!(harness
+        .run(&[
+            "new-window",
+            "-t",
+            "alpha",
+            "-d",
+            "sh",
+            "-c",
+            "exec /bin/sh",
+        ])?
+        .status
+        .success());
+
+    let mut attach = AttachedSession::spawn(&harness, "alpha", TerminalSize::new(120, 40))?;
+    attach.wait_for_raw_mode(IO_TIMEOUT)?;
+    let _ = read_until_contains(attach.master_mut(), SHELL_PROMPT_MARKER, IO_TIMEOUT)?;
+    drain_attach_output(attach.master_mut())?;
+
+    attach.send_bytes(b"\x02w")?;
+
+    // Wait long enough for the daemon to render and send the overlay.
+    std::thread::sleep(Duration::from_millis(500));
+    let opened = drain_attach_output_bytes(attach.master_mut())?;
+
+    assert!(
+        contains_bytes(&opened, b"\x1b[?1049h"),
+        "Ctrl-B w in passthrough must enter alt-screen for the picker; got {:?}",
+        String::from_utf8_lossy(&opened)
+    );
+    // The choose-tree overlay should contain the session name 'alpha'
+    // as one of its rows.
+    assert!(
+        contains_bytes(&opened, b"alpha"),
+        "Ctrl-B w must render the choose-tree overlay listing 'alpha'; got {:?}",
+        String::from_utf8_lossy(&opened)
+    );
+
+    // Dismiss the overlay with 'q' (the input handler accepts both
+    // Escape and 'q' for cancel; 'q' avoids escape-sequence parsing
+    // ambiguity that can hold a bare \x1b waiting for more bytes).
+    attach.send_bytes(b"q")?;
+    std::thread::sleep(Duration::from_millis(400));
+    let closed = drain_attach_output_bytes(attach.master_mut())?;
+    assert!(
+        contains_bytes(&closed, b"\x1b[?1049l"),
+        "dismissing the choose-tree overlay must exit alt-screen; got {:?}",
+        String::from_utf8_lossy(&closed)
+    );
+
+    attach.send_bytes(b"\x02d")?;
+    let _ = attach.wait_for_exit(IO_TIMEOUT)?;
+    let _ = harness.run(&["kill-session", "-t", "alpha"]);
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
 /// Reads from the attach until the shell's next prompt redraw, then
 /// returns the consumed bytes. Used by tests that send a command and
 /// want to capture the executed output without false-matching on the

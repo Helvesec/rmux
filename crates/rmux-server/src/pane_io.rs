@@ -772,6 +772,14 @@ pub(crate) async fn forward_attach_passthrough(
     let mut socket_read_buffer = [0_u8; READ_BUFFER_SIZE];
     let mut current_target = open_attach_target(target)?;
     let mut locked = false;
+    // Tracks whether the host terminal is currently in alt-screen
+    // around a choose-tree / menu / clock-mode overlay. While true,
+    // we suppress inner-pane output emission (it would paint *under*
+    // the overlay in the alt-screen buffer; on return to the main
+    // screen the host shows whatever was there before, so dropping
+    // these is safe — the bytes still land in the passthrough replay
+    // log and a future window-switch / re-attach replays them).
+    let mut overlay_alt_screen_visible = false;
     decoder.push_bytes(&initial_socket_bytes);
 
     emit_initial_passthrough_state(&stream, &current_target, &live_input).await?;
@@ -845,9 +853,59 @@ pub(crate) async fn forward_attach_passthrough(
                         )
                         .await?;
                     }
+                    Some(AttachControl::Overlay(overlay)) => {
+                        // The daemon's `Ctrl-B w` / `choose-tree` /
+                        // menu / clock-mode paths all send overlay
+                        // frames here. In normal-chrome mode these
+                        // get layered over the status bar. In
+                        // passthrough we have no chrome — we
+                        // temporarily switch the host terminal into
+                        // alt-screen so the picker renders on a
+                        // clean buffer and the inner shell's content
+                        // is preserved underneath.
+                        //
+                        // The daemon can dismiss via either an empty
+                        // persistent frame OR (more commonly for
+                        // mode-tree) by sending
+                        // AdvancePersistentOverlayState then
+                        // refreshing the attach. We handle both.
+                        let is_dismissal = overlay.persistent && overlay.frame.is_empty();
+                        if is_dismissal {
+                            if overlay_alt_screen_visible {
+                                emit_attach_bytes(&stream, b"\x1b[?1049l").await?;
+                                overlay_alt_screen_visible = false;
+                            }
+                        } else if !overlay.frame.is_empty() {
+                            if !overlay_alt_screen_visible {
+                                emit_attach_bytes(&stream, b"\x1b[?1049h").await?;
+                                overlay_alt_screen_visible = true;
+                            }
+                            emit_attach_bytes(&stream, &overlay.frame).await?;
+                        }
+                    }
+                    Some(AttachControl::AdvancePersistentOverlayState(_)) => {
+                        // Mode-tree / menu dismissal path. The
+                        // daemon advances its overlay state and
+                        // (later) refreshes the attach. We don't
+                        // need any of the normal forwarder's
+                        // bookkeeping — just close our alt-screen
+                        // bracket if it's still open so the host
+                        // returns to its main buffer immediately.
+                        if overlay_alt_screen_visible {
+                            emit_attach_bytes(&stream, b"\x1b[?1049l").await?;
+                            overlay_alt_screen_visible = false;
+                        }
+                    }
+                    Some(AttachControl::Write(bytes)) => {
+                        // Bell / advisory bytes — forward unchanged.
+                        // Even when an overlay is visible these are
+                        // tiny single-byte sentinels (\x07 mostly)
+                        // and safe to emit on top.
+                        emit_attach_bytes(&stream, &bytes).await?;
+                    }
                     Some(_) => {
-                        // Other control variants (Overlay, Write,
-                        // LockShellCommand, Suspend, AdvancePersistentOverlayState,
+                        // Remaining control variants (LockShellCommand,
+                        // Suspend, AdvancePersistentOverlayState,
                         // DetachExecShellCommand) are no-ops in passthrough.
                     }
                 }
@@ -861,6 +919,14 @@ pub(crate) async fn forward_attach_passthrough(
                     OutputCursorItem::Event(event) => event.into_parts(),
                     OutputCursorItem::Gap(_) => continue,
                 };
+                if overlay_alt_screen_visible {
+                    // While the picker owns the host's alt-screen,
+                    // suppress inner-pane output so we don't paint
+                    // under the overlay. The bytes still land in the
+                    // pane's replay log via the pane reader so
+                    // history isn't lost.
+                    continue;
+                }
                 emit_attach_bytes(&stream, &bytes).await?;
             }
             socket = read_socket_bytes(&stream, &mut decoder, &mut socket_read_buffer) => {
