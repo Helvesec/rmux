@@ -816,15 +816,38 @@ fn passthrough_prefix_w_enter_dismisses_picker_and_session_survives() -> TestRes
     drain_attach_output(attach.master_mut())?;
 
     attach.send_bytes(b"\x02w")?;
-    std::thread::sleep(Duration::from_millis(500));
-    attach.send_bytes(b"\r")?;
-    std::thread::sleep(Duration::from_millis(500));
-
-    let bytes = drain_attach_output_bytes(attach.master_mut())?;
+    // The picker can re-render several times before reaching idle
+    // (initial frame, refresh after attached_count update, etc.).
+    // Wait until alt-screen-enter has actually landed.
+    let opened = read_until_contains(
+        attach.master_mut(),
+        "alpha: 2 windows",
+        IO_TIMEOUT,
+    )?;
     assert!(
-        contains_bytes(&bytes, b"\x1b[?1049l"),
-        "Enter on the picker must release alt-screen; got {:?}",
-        String::from_utf8_lossy(&bytes)
+        contains_bytes(opened.as_bytes(), b"\x1b[?1049h"),
+        "picker open must enter alt-screen; got {opened:?}"
+    );
+
+    attach.send_bytes(b"\r")?;
+    // Poll up to IO_TIMEOUT for the alt-screen-exit signal. Enter
+    // routes through accept_mode_tree_selection → dismiss_mode_tree
+    // → AdvancePersistentOverlayState, which can take multiple
+    // tokio tasks to deliver.
+    let mut accumulated: Vec<u8> = Vec::new();
+    let deadline = std::time::Instant::now() + IO_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        let chunk = drain_attach_output_bytes(attach.master_mut())?;
+        accumulated.extend_from_slice(&chunk);
+        if contains_bytes(&accumulated, b"\x1b[?1049l") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        contains_bytes(&accumulated, b"\x1b[?1049l"),
+        "Enter on the picker must release alt-screen within {IO_TIMEOUT:?}; got {:?}",
+        String::from_utf8_lossy(&accumulated)
     );
 
     // Session must survive — attach client still alive.
@@ -959,16 +982,17 @@ fn passthrough_prefix_w_navigation_does_not_repeat_alt_screen_enter() -> TestRes
     Ok(())
 }
 
-/// `Ctrl-B t` (clock-mode) goes through the same overlay path on
-/// entry and DOES alt-screen-wrap correctly. Dismissal is the wart:
-/// clock-mode exits via `send_session_overlay(..., persistent=false)`
-/// + a refresh-style Switch to the same pane. From the passthrough
-/// forwarder's POV that's indistinguishable from a refresh tick, so
-/// we don't currently leave alt-screen. Tracked as a known gap; the
-/// fix probably needs a dedicated `AttachControl::ExitClockMode`
-/// signal or a different sentinel on the exit-frame.
+/// `Ctrl-B t` (clock-mode) wraps in alt-screen on entry and
+/// releases it on dismissal.
+///
+/// The clock-mode lifecycle is: entry sends a non-persistent
+/// overlay frame, then per-second ticks send PERSISTENT frames to
+/// refresh the clock display, then dismissal sends another
+/// non-persistent frame (the "restore" content). Entry and exit
+/// look byte-identical to the forwarder *except* for whether we're
+/// already in alt-screen when they arrive — that's the signal the
+/// overlay handler keys off.
 #[test]
-#[ignore = "clock-mode dismissal needs a distinguishable control signal — see docstring"]
 fn passthrough_prefix_t_clock_mode_uses_alt_screen() -> TestResult {
     let harness = CliHarness::new("passthrough-prefix-t-clock-mode")?;
     let mut daemon = harness.start_hidden_daemon()?;

@@ -854,33 +854,68 @@ pub(crate) async fn forward_attach_passthrough(
                         .await?;
                     }
                     Some(AttachControl::Overlay(overlay)) => {
-                        // The daemon's `Ctrl-B w` / `choose-tree` /
-                        // menu / clock-mode paths all send overlay
-                        // frames here. In normal-chrome mode these
-                        // get layered over the status bar. In
-                        // passthrough we have no chrome — we
-                        // temporarily switch the host terminal into
-                        // alt-screen so the picker renders on a
-                        // clean buffer and the inner shell's content
-                        // is preserved underneath.
+                        // Overlay-emitting prefix bindings (Ctrl-B w
+                        // choose-tree, Ctrl-B t clock-mode, menu, …)
+                        // all flow through here. In normal-chrome
+                        // mode the daemon layers the frame over the
+                        // status bar; in passthrough we have no
+                        // chrome, so the picker would paint
+                        // *on top* of the inner shell. We bracket
+                        // it with host alt-screen instead.
                         //
-                        // The daemon can dismiss via either an empty
-                        // persistent frame OR (more commonly for
-                        // mode-tree) by sending
-                        // AdvancePersistentOverlayState then
-                        // refreshing the attach. We handle both.
-                        let is_dismissal = overlay.persistent && overlay.frame.is_empty();
-                        if is_dismissal {
-                            if overlay_alt_screen_visible {
+                        // The dispatch table — for posterity —
+                        // mapping the daemon's (persistent, frame)
+                        // shape to the action we take:
+                        //
+                        //   (true, empty)        => persistent dismissal sentinel
+                        //                           (e.g. menu close path)
+                        //   (true, non-empty)    => persistent picker frame
+                        //                           (choose-tree open + redraws;
+                        //                            clock-mode ticks also use this
+                        //                            for per-second updates)
+                        //   (false, non-empty) + alt-screen NOT visible
+                        //                        => non-persistent overlay entry
+                        //                           (clock-mode start)
+                        //   (false, non-empty) + alt-screen IS visible
+                        //                        => non-persistent overlay EXIT
+                        //                           (clock-mode dismiss sends a
+                        //                            restore frame here; we
+                        //                            release alt-screen and let
+                        //                            the inner pane's next emit
+                        //                            repaint the host buffer)
+                        //   (false, empty)       => ignored
+                        match (overlay.persistent, overlay.frame.is_empty()) {
+                            (true, true) => {
+                                if overlay_alt_screen_visible {
+                                    emit_attach_bytes(&stream, b"\x1b[?1049l").await?;
+                                    overlay_alt_screen_visible = false;
+                                }
+                            }
+                            (true, false) => {
+                                if !overlay_alt_screen_visible {
+                                    emit_attach_bytes(&stream, b"\x1b[?1049h").await?;
+                                    overlay_alt_screen_visible = true;
+                                }
+                                emit_attach_bytes(&stream, &overlay.frame).await?;
+                            }
+                            (false, false) if !overlay_alt_screen_visible => {
+                                emit_attach_bytes(&stream, b"\x1b[?1049h").await?;
+                                overlay_alt_screen_visible = true;
+                                emit_attach_bytes(&stream, &overlay.frame).await?;
+                            }
+                            (false, false) => {
+                                // Non-persistent arrival while alt-screen
+                                // is up is the clock-mode dismissal
+                                // signature. Drop the restore frame
+                                // (the inner pane will repaint) and
+                                // leave the alt-screen buffer.
                                 emit_attach_bytes(&stream, b"\x1b[?1049l").await?;
                                 overlay_alt_screen_visible = false;
                             }
-                        } else if !overlay.frame.is_empty() {
-                            if !overlay_alt_screen_visible {
-                                emit_attach_bytes(&stream, b"\x1b[?1049h").await?;
-                                overlay_alt_screen_visible = true;
+                            (false, true) => {
+                                // No-op; daemon shouldn't normally
+                                // send this combination.
                             }
-                            emit_attach_bytes(&stream, &overlay.frame).await?;
                         }
                     }
                     Some(AttachControl::AdvancePersistentOverlayState(_)) => {
