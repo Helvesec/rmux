@@ -229,6 +229,10 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ("unbind-key", "(unbind) [-anq] [-T key-table] key"),
     ("unlink-window", "(unlinkw) [-k] [-t target-window]"),
     ("wait-for", "(wait) [-L|-S|-U] channel"),
+    (
+        "web-share",
+        "[-lwX] [-K share-id] [--config] [--lookup share-id] [--ttl seconds] [--max-viewers count] [--public-url url] [-t target-pane]",
+    ),
 ];
 
 pub(super) fn run_list_commands(args: ListCommandsArgs) -> Result<i32, ExitFailure> {

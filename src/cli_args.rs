@@ -79,6 +79,9 @@ pub(crate) use window::{
     RenameWindowArgs, ResizeWindowArgs, RespawnWindowArgs, RotateWindowArgs, SwapWindowArgs,
     UnlinkWindowArgs, WindowTargetArgs,
 };
+#[path = "cli_args/web.rs"]
+mod web;
+pub(crate) use web::WebShareArgs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DocumentedCliAlias {
@@ -385,6 +388,7 @@ pub(crate) enum Command {
     SourceFile(SourceFileArgs),
     IfShell(IfShellArgs),
     WaitFor(WaitForArgs),
+    WebShare(WebShareArgs),
     DisplayMenu(DisplayMenuArgs),
     DisplayPopup(DisplayPopupArgs),
     ClearPromptHistory(PromptHistoryArgs),

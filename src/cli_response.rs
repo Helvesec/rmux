@@ -103,6 +103,7 @@ pub(crate) fn expect_command_success(
         Response::UnlinkWindow(_) if command_name == "unlink-window" => Ok(()),
         Response::WaitFor(_) if command_name == "wait-for" => Ok(()),
         Response::ControlMode(_) if command_name == "control-mode" => Ok(()),
+        Response::WebShare(_) if command_name == "web-share" => Ok(()),
         Response::Error(ErrorResponse { error }) => {
             Err(ExitFailure::new(1, tmux_cli_error_message(&error)))
         }
@@ -245,6 +246,7 @@ pub(crate) fn response_name(response: &Response) -> &'static str {
         Response::SourceFile(_) => "source-file",
         Response::UnlinkWindow(_) => "unlink-window",
         Response::ControlMode(_) => "control-mode",
+        Response::WebShare(_) => "web-share",
         Response::Error(_) => "error",
         _ => "unknown",
     }

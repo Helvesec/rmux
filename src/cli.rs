@@ -41,6 +41,8 @@ mod target_resolution;
 mod terminal_size;
 #[path = "cli/top_level.rs"]
 mod top_level;
+#[path = "cli/web_commands.rs"]
+mod web_commands;
 #[path = "cli/window_commands.rs"]
 mod window_commands;
 

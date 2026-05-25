@@ -34,6 +34,7 @@ use super::target_resolution::{
     resolve_pane_target_spec, resolve_select_layout_target_spec, resolve_session_target_or_current,
     resolve_window_target_or_current,
 };
+use super::web_commands::run_web_share;
 use super::window_commands::{
     run_kill_window, run_last_window, run_link_window, run_list_windows, run_move_window,
     run_new_window, run_next_window, run_previous_window, run_rename_window, run_resize_window,
@@ -472,6 +473,7 @@ fn dispatch(
                 connection.wait_for(args.channel, mode)
             })
         }
+        Command::WebShare(args) => run_web_share(args, socket_path, command_startup),
         Command::DisplayMenu(args) => {
             run_queued_server_command(socket_path, "display-menu", args.queue_command)
         }
@@ -533,6 +535,7 @@ pub(super) fn command_has_start_server_flag(command: &Command) -> bool {
         Command::NewSession(_)
             | Command::StartServer
             | Command::AttachSession(_)
+            | Command::WebShare(_)
             | Command::SourceFile(_)
     )
 }
