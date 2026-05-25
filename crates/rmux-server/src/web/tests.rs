@@ -70,7 +70,7 @@ fn create_returns_secret_urls_but_list_is_redacted() {
     assert_eq!(
         redacted,
         format!(
-            "https://share.rmux.io/share/#endpoint=wss://share.example/share&id={}&key=[REDACTED]",
+            "https://share.rmux.io/#endpoint=wss://share.example/share&id={}&key=[REDACTED]",
             created.share_id
         )
     );
@@ -92,7 +92,7 @@ fn default_local_share_uses_hosted_frontend_and_local_websocket_endpoint() {
 
     assert!(created
         .viewer_url
-        .starts_with("https://share.rmux.io/share/#endpoint=ws://127.0.0.1:9777/share&id="));
+        .starts_with("https://share.rmux.io/#endpoint=ws://127.0.0.1:9777/share&id="));
     assert!(!created.viewer_url.contains("&role=viewer"));
 
     let viewer_key = key_from_url(&created.viewer_url);

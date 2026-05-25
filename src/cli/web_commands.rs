@@ -70,7 +70,7 @@ mod tests {
     #[test]
     fn viewer_qr_uses_compact_unicode_blocks() {
         let output = viewer_qr_output(
-            "https://share.rmux.io/share/#endpoint=ws://127.0.0.1:9777/share&id=abcdefgh&key=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi",
+            "https://share.rmux.io/#endpoint=ws://127.0.0.1:9777/share&id=abcdefgh&key=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi",
         );
         let qr = std::str::from_utf8(output.stdout()).expect("QR output should be UTF-8");
 

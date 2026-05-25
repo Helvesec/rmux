@@ -8,7 +8,7 @@ pub(crate) fn parse_web_share_args(arguments: Vec<String>) -> Result<WebShareArg
 
 #[derive(Debug, Clone, Args)]
 #[command(
-    after_help = "Local web-share mode opens https://share.rmux.io/share/ against ws://127.0.0.1:<port>/share. Pass --tunnel-url for a bring-your-own public endpoint. Pass --frontend-url to use a self-hosted frontend. Chromium-based browsers may require allowing Local Network access for local mode. In-app webviews are not guaranteed."
+    after_help = "Local web-share mode opens https://share.rmux.io/ against ws://127.0.0.1:<port>/share. Pass --tunnel-url for a bring-your-own public endpoint. Pass --frontend-url to use a self-hosted frontend. Chromium-based browsers may require allowing Local Network access for local mode. In-app webviews are not guaranteed."
 )]
 #[command(group(
     ArgGroup::new("mode")

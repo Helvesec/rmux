@@ -18,7 +18,7 @@ use super::leases::{ConnectionLease, LeaseBook};
 use super::origin::{origin_allowed, validate_frontend_url, validate_public_base_url, FrontendUrl};
 
 const DEFAULT_FRONTEND_ORIGIN: &str = "https://share.rmux.io";
-const DEFAULT_FRONTEND_URL: &str = "https://share.rmux.io/share";
+const DEFAULT_FRONTEND_URL: &str = "https://share.rmux.io";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_MAX_VIEWERS: u16 = 5;
 const DEFAULT_PORT: u16 = 9777;
