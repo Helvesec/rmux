@@ -1,6 +1,7 @@
 use std::io::IsTerminal;
 use std::path::Path;
 
+use qrcode::render::unicode::Dense1x2;
 use rmux_proto::{
     CommandOutput, CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest,
     PaneTargetRef, Response, StopAllWebSharesRequest, StopWebShareRequest, WebShareConfigRequest,
@@ -55,16 +56,27 @@ fn write_created_share_output(created: &WebShareCreatedResponse) -> Result<(), E
 fn viewer_qr_output(viewer_url: &str) -> CommandOutput {
     match qrcode::QrCode::new(viewer_url.as_bytes()) {
         Ok(code) => {
-            let qr = code
-                .render::<char>()
-                .quiet_zone(false)
-                .module_dimensions(2, 1)
-                .dark_color('#')
-                .light_color(' ')
-                .build();
+            let qr = code.render::<Dense1x2>().module_dimensions(1, 1).build();
             CommandOutput::from_stdout(format!("{qr}\n"))
         }
         Err(_) => CommandOutput::from_stdout("QR omitted (viewer URL is too large)\n"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::viewer_qr_output;
+
+    #[test]
+    fn viewer_qr_uses_compact_unicode_blocks() {
+        let output = viewer_qr_output(
+            "https://share.rmux.io/share/#endpoint=ws://127.0.0.1:9777/share&id=abcdefgh&key=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi",
+        );
+        let qr = std::str::from_utf8(output.stdout()).expect("QR output should be UTF-8");
+
+        assert!(!qr.contains('#'));
+        assert!(qr.contains('\u{2580}') || qr.contains('\u{2584}') || qr.contains('\u{2588}'));
+        assert!(qr.lines().count() < 40);
     }
 }
 
