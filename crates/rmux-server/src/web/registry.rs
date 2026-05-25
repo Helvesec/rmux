@@ -4,14 +4,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
+use rmux_proto::RmuxError;
 use rmux_proto::{
     CommandOutput, CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest,
     StopAllWebSharesRequest, StopWebShareRequest, WebShareConfigRequest, WebShareConfigResponse,
     WebShareCreatedResponse, WebShareListResponse, WebShareListener, WebShareLookupResponse,
-    WebShareResponse, WebShareStoppedAllResponse, WebShareStoppedResponse, WebShareSummary,
-    WebShareUrlOptions, WebTerminalPalette,
+    WebShareResponse, WebShareScope, WebShareStoppedAllResponse, WebShareStoppedResponse,
+    WebShareSummary, WebShareUrlOptions, WebTerminalPalette,
 };
-use rmux_proto::{PaneTargetRef, RmuxError};
 use tokio::sync::watch;
 use tracing::info;
 
@@ -78,6 +78,16 @@ impl WebShareRegistry {
         &self,
         request: CreateWebShareRequest,
     ) -> Result<WebShareCreatedResponse, RmuxError> {
+        if request.controls && !request.writable {
+            return Err(RmuxError::Server(
+                "web-share controls require --writable".to_owned(),
+            ));
+        }
+        if request.controls && request.scope.is_pane() {
+            return Err(RmuxError::Server(
+                "web-share controls require a session target".to_owned(),
+            ));
+        }
         let max_readers = request.max_readers.unwrap_or(DEFAULT_MAX_READERS);
         if max_readers == 0 {
             return Err(RmuxError::Server(
@@ -99,6 +109,7 @@ impl WebShareRegistry {
         let expires_at = Some(SystemTime::now() + Duration::from_secs(ttl_seconds));
         let lease_book = LeaseBook::new(usize::from(max_readers));
         let (revoke_tx, _) = watch::channel(None);
+        let terminal_palette = request.terminal_palette.as_deref().cloned();
 
         let record = WebShareRecord {
             allow_loopback_development_origins: request.public_base_url.is_none(),
@@ -111,9 +122,10 @@ impl WebShareRegistry {
             operator_token: operator_token.clone(),
             pairing_code: pairing_code.clone(),
             revoke_tx,
+            controls: request.controls,
             share_id: share_id.clone(),
-            target: request.target.clone(),
-            terminal_palette: request.terminal_palette.clone(),
+            scope: request.scope.clone(),
+            terminal_palette,
             url_options: request.url_options,
             read_token: read_token.clone(),
             writable: request.writable,
@@ -121,7 +133,7 @@ impl WebShareRegistry {
 
         let read_url = record.read_url();
         let operator_url = record.operator_url();
-        let summary_target = record.target.clone();
+        let summary_scope = record.scope.clone();
         let expires_at_unix = expires_at.and_then(system_time_to_unix);
         self.inner
             .lock()
@@ -129,8 +141,9 @@ impl WebShareRegistry {
             .insert(record);
         info!(
             share_id = %share_id,
-            target = %summary_target,
+            scope = %summary_scope,
             writable = request.writable,
+            controls = request.controls,
             ttl_seconds,
             max_readers,
             public = request.public_base_url.is_some(),
@@ -142,13 +155,14 @@ impl WebShareRegistry {
         let output = created_output(&read_url, pairing_code.as_deref());
         Ok(WebShareCreatedResponse {
             share_id,
-            target: summary_target,
+            scope: summary_scope,
             read_url,
             operator_url,
             expires_at_unix,
             pairing_code,
             max_readers,
             writable: request.writable,
+            controls: request.controls,
             output,
         })
     }
@@ -405,8 +419,9 @@ struct WebShareRecord {
     operator_token: Option<String>,
     pairing_code: Option<String>,
     revoke_tx: watch::Sender<Option<WebShareRevokeReason>>,
+    controls: bool,
     share_id: String,
-    target: PaneTargetRef,
+    scope: WebShareScope,
     terminal_palette: Option<WebTerminalPalette>,
     url_options: WebShareUrlOptions,
     read_token: String,
@@ -415,52 +430,26 @@ struct WebShareRecord {
 
 impl WebShareRecord {
     fn read_url(&self) -> String {
-        share_url(
-            &self.frontend_origin,
-            &self.frontend_url,
-            &self.endpoint_origin,
-            &self.share_id,
-            Some(&self.read_token),
-            "read",
-            self.pairing_code.is_some(),
-            self.url_options,
-        )
+        share_url(self, Some(&self.read_token), "read")
     }
 
     fn redacted_read_url(&self) -> String {
-        share_url(
-            &self.frontend_origin,
-            &self.frontend_url,
-            &self.endpoint_origin,
-            &self.share_id,
-            None,
-            "read",
-            self.pairing_code.is_some(),
-            self.url_options,
-        )
+        share_url(self, None, "read")
     }
 
     fn operator_url(&self) -> Option<String> {
-        self.operator_token.as_deref().map(|token| {
-            share_url(
-                &self.frontend_origin,
-                &self.frontend_url,
-                &self.endpoint_origin,
-                &self.share_id,
-                Some(token),
-                "operator",
-                self.pairing_code.is_some(),
-                self.url_options,
-            )
-        })
+        self.operator_token
+            .as_deref()
+            .map(|token| share_url(self, Some(token), "operator"))
     }
 
     fn summary(&self) -> WebShareSummary {
         WebShareSummary {
             share_id: self.share_id.clone(),
-            target: self.target.clone(),
+            scope: self.scope.clone(),
             read_url: Some(self.redacted_read_url()),
             writable: self.writable,
+            controls: self.controls,
             active_readers: u16::try_from(self.lease_book.reader_count()).unwrap_or(u16::MAX),
             max_readers: self.max_readers,
             operator_connected: self.lease_book.operator_connected(),
@@ -529,7 +518,8 @@ impl WebShareRecord {
             _lease: Some(lease),
             role,
             revoke_rx: self.revoke_tx.subscribe(),
-            target: self.target.clone(),
+            scope: self.scope.clone(),
+            controls: self.controls,
             terminal_palette: self.terminal_palette.clone(),
         }
     }
@@ -572,7 +562,8 @@ pub(crate) struct WebShareAccess {
     _lease: Option<ConnectionLease>,
     revoke_rx: watch::Receiver<Option<WebShareRevokeReason>>,
     role: WebShareRole,
-    target: PaneTargetRef,
+    scope: WebShareScope,
+    controls: bool,
     terminal_palette: Option<WebTerminalPalette>,
 }
 
@@ -587,6 +578,10 @@ impl WebShareAccess {
 
     pub(crate) fn is_operator(&self) -> bool {
         matches!(self.role, WebShareRole::Operator)
+    }
+
+    pub(crate) fn controls(&self) -> bool {
+        self.controls && self.is_operator()
     }
 
     pub(crate) fn expires_at(&self) -> Option<SystemTime> {
@@ -610,8 +605,8 @@ impl WebShareAccess {
         }
     }
 
-    pub(crate) fn target(&self) -> &PaneTargetRef {
-        &self.target
+    pub(crate) fn scope(&self) -> &WebShareScope {
+        &self.scope
     }
 
     pub(crate) fn terminal_palette(&self) -> Option<&WebTerminalPalette> {
@@ -647,7 +642,7 @@ fn list_output(shares: &[WebShareSummary]) -> CommandOutput {
     for share in shares {
         output.push_str(&share.share_id);
         output.push(' ');
-        output.push_str(&share.target.to_string());
+        output.push_str(&share.scope.to_string());
         output.push(' ');
         output.push_str(share.read_url.as_deref().unwrap_or("-"));
         output.push('\n');
@@ -667,37 +662,31 @@ fn stopped_output(share_id: &str, stopped: bool) -> CommandOutput {
     CommandOutput::from_stdout(format!("{status} {share_id}\n"))
 }
 
-fn share_url(
-    frontend_origin: &str,
-    frontend_url: &str,
-    endpoint_origin: &str,
-    share_id: &str,
-    token: Option<&str>,
-    role: &str,
-    pin_required: bool,
-    options: WebShareUrlOptions,
-) -> String {
-    let endpoint = websocket_endpoint(endpoint_origin);
+fn share_url(record: &WebShareRecord, token: Option<&str>, role: &str) -> String {
+    let endpoint = websocket_endpoint(&record.endpoint_origin);
     let key = token.unwrap_or("[REDACTED]");
     debug_assert!(
-        frontend_url.starts_with(frontend_origin),
+        record.frontend_url.starts_with(&record.frontend_origin),
         "frontend URL must belong to its expected origin"
     );
-    let mut url = format!("{frontend_url}/#endpoint={endpoint}&id={share_id}&key={key}");
+    let mut url = format!(
+        "{}/#endpoint={endpoint}&id={}&key={key}",
+        record.frontend_url, record.share_id
+    );
     if role != "read" {
         url.push_str("&role=");
         url.push_str(role);
     }
-    if pin_required {
+    if record.pairing_code.is_some() {
         url.push_str("&pin=required");
     }
-    if options.no_navbar {
+    if record.url_options.no_navbar {
         url.push_str("&navbar=off");
     }
-    if options.no_disclaimer {
+    if record.url_options.no_disclaimer {
         url.push_str("&disclaimer=off");
     }
-    if let Some(theme) = options.terminal_theme {
+    if let Some(theme) = record.url_options.terminal_theme {
         url.push_str("&theme=");
         url.push_str(theme.as_url_value());
     }

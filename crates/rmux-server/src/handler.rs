@@ -73,7 +73,7 @@ mod web_support;
 #[path = "handler_web_disabled.rs"]
 mod web_support;
 #[cfg(all(any(unix, windows), feature = "web"))]
-pub(crate) use web_support::{WebPaneSnapshot, WebPaneStream};
+pub(crate) use web_support::{WebPaneSnapshot, WebPaneStream, WebSessionStream, WebShareStream};
 #[path = "handler_window.rs"]
 mod window_support;
 use crate::pane_terminals::HandlerState;

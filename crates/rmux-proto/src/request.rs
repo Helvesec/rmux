@@ -98,7 +98,7 @@ pub use buffer::{
 mod web;
 pub use web::{
     CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest, StopAllWebSharesRequest,
-    StopWebShareRequest, WebShareConfigRequest, WebShareRequest, WebShareUrlOptions,
+    StopWebShareRequest, WebShareConfigRequest, WebShareRequest, WebShareScope, WebShareUrlOptions,
     WebTerminalPalette, WebTerminalTheme,
 };
 

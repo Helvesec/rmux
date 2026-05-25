@@ -1,7 +1,7 @@
 use rmux_core::events::OutputCursorItem;
 use rmux_proto::{
     CreateWebShareRequest, ListWebSharesRequest, PaneId, PaneTargetRef, SessionName,
-    StopAllWebSharesRequest, WebShareUrlOptions, WebTerminalTheme,
+    StopAllWebSharesRequest, WebShareScope, WebShareUrlOptions, WebTerminalTheme,
 };
 
 use crate::pane_io::pane_output_channel_with_limits;
@@ -46,7 +46,7 @@ fn create_returns_secret_urls_but_list_is_redacted() {
     let registry = WebShareRegistry::default();
     let created = registry
         .create(CreateWebShareRequest {
-            target: target(),
+            scope: WebShareScope::Pane(target()),
             public_base_url: Some("https://share.example".to_owned()),
             frontend_url: None,
             ttl_seconds: Some(60),
@@ -55,6 +55,7 @@ fn create_returns_secret_urls_but_list_is_redacted() {
             require_pin: false,
             terminal_palette: None,
             writable: true,
+            controls: false,
         })
         .expect("share creates");
 
@@ -84,7 +85,7 @@ fn default_local_share_uses_hosted_frontend_and_local_websocket_endpoint() {
     let registry = WebShareRegistry::default();
     let created = registry
         .create(CreateWebShareRequest {
-            target: target(),
+            scope: WebShareScope::Pane(target()),
             public_base_url: None,
             frontend_url: None,
             ttl_seconds: Some(60),
@@ -93,6 +94,7 @@ fn default_local_share_uses_hosted_frontend_and_local_websocket_endpoint() {
             require_pin: false,
             terminal_palette: None,
             writable: false,
+            controls: false,
         })
         .expect("share creates");
 
@@ -127,7 +129,7 @@ fn frontend_override_changes_browser_origin_without_changing_local_endpoint() {
     );
     let created = registry
         .create(CreateWebShareRequest {
-            target: target(),
+            scope: WebShareScope::Pane(target()),
             public_base_url: None,
             frontend_url: None,
             ttl_seconds: Some(60),
@@ -136,6 +138,7 @@ fn frontend_override_changes_browser_origin_without_changing_local_endpoint() {
             require_pin: false,
             terminal_palette: None,
             writable: false,
+            controls: false,
         })
         .expect("share creates");
 
@@ -160,7 +163,7 @@ fn per_share_frontend_url_overrides_daemon_default() {
     let registry = WebShareRegistry::default();
     let created = registry
         .create(CreateWebShareRequest {
-            target: target(),
+            scope: WebShareScope::Pane(target()),
             public_base_url: Some("https://terminal.example".to_owned()),
             frontend_url: Some("https://share.fork.example/share".to_owned()),
             ttl_seconds: Some(60),
@@ -169,6 +172,7 @@ fn per_share_frontend_url_overrides_daemon_default() {
             require_pin: false,
             terminal_palette: None,
             writable: false,
+            controls: false,
         })
         .expect("share creates");
 
@@ -200,7 +204,7 @@ fn url_options_are_encoded_in_read_urls() {
     let registry = WebShareRegistry::default();
     let created = registry
         .create(CreateWebShareRequest {
-            target: target(),
+            scope: WebShareScope::Pane(target()),
             public_base_url: None,
             frontend_url: None,
             ttl_seconds: Some(60),
@@ -213,6 +217,7 @@ fn url_options_are_encoded_in_read_urls() {
             require_pin: false,
             terminal_palette: None,
             writable: true,
+            controls: false,
         })
         .expect("share creates");
 
@@ -232,7 +237,7 @@ fn pairing_code_is_required_out_of_band_when_pin_enabled() {
     let registry = WebShareRegistry::default();
     let created = registry
         .create(CreateWebShareRequest {
-            target: target(),
+            scope: WebShareScope::Pane(target()),
             public_base_url: None,
             frontend_url: None,
             ttl_seconds: Some(60),
@@ -241,6 +246,7 @@ fn pairing_code_is_required_out_of_band_when_pin_enabled() {
             require_pin: true,
             terminal_palette: None,
             writable: false,
+            controls: false,
         })
         .expect("share creates");
 
@@ -283,12 +289,78 @@ fn pairing_code_is_required_out_of_band_when_pin_enabled() {
 }
 
 #[test]
+fn controls_require_writable_session_share() {
+    let registry = WebShareRegistry::default();
+    let session = SessionName::new("alpha").expect("valid session");
+
+    let read_only_error = registry
+        .create(CreateWebShareRequest {
+            scope: WebShareScope::Session(session.clone()),
+            public_base_url: None,
+            frontend_url: None,
+            ttl_seconds: None,
+            max_readers: None,
+            url_options: Default::default(),
+            require_pin: false,
+            terminal_palette: None,
+            writable: false,
+            controls: true,
+        })
+        .expect_err("controls require writable");
+    assert!(read_only_error
+        .to_string()
+        .contains("controls require --writable"));
+
+    let pane_error = registry
+        .create(CreateWebShareRequest {
+            scope: WebShareScope::Pane(target()),
+            public_base_url: None,
+            frontend_url: None,
+            ttl_seconds: None,
+            max_readers: None,
+            url_options: Default::default(),
+            require_pin: false,
+            terminal_palette: None,
+            writable: true,
+            controls: true,
+        })
+        .expect_err("controls require a session scope");
+    assert!(pane_error
+        .to_string()
+        .contains("controls require a session target"));
+
+    let created = registry
+        .create(CreateWebShareRequest {
+            scope: WebShareScope::Session(session.clone()),
+            public_base_url: None,
+            frontend_url: None,
+            ttl_seconds: None,
+            max_readers: None,
+            url_options: Default::default(),
+            require_pin: false,
+            terminal_palette: None,
+            writable: true,
+            controls: true,
+        })
+        .expect("session controls share creates");
+    assert!(matches!(created.scope, WebShareScope::Session(ref actual) if actual == &session));
+    assert!(created.controls);
+
+    let listed = registry.list(ListWebSharesRequest);
+    assert!(matches!(
+        listed.shares[0].scope,
+        WebShareScope::Session(ref actual) if actual == &session
+    ));
+    assert!(listed.shares[0].controls);
+}
+
+#[test]
 fn stop_all_reports_removed_share_count() {
     let registry = WebShareRegistry::default();
     for _ in 0..2 {
         registry
             .create(CreateWebShareRequest {
-                target: target(),
+                scope: WebShareScope::Pane(target()),
                 public_base_url: None,
                 frontend_url: None,
                 ttl_seconds: None,
@@ -297,6 +369,7 @@ fn stop_all_reports_removed_share_count() {
                 require_pin: false,
                 terminal_palette: None,
                 writable: false,
+                controls: false,
             })
             .expect("share creates");
     }
@@ -309,7 +382,7 @@ fn connect_enforces_read_cap_and_single_operator() {
     let registry = WebShareRegistry::default();
     let created = registry
         .create(CreateWebShareRequest {
-            target: target(),
+            scope: WebShareScope::Pane(target()),
             public_base_url: None,
             frontend_url: None,
             ttl_seconds: None,
@@ -318,6 +391,7 @@ fn connect_enforces_read_cap_and_single_operator() {
             require_pin: false,
             terminal_palette: None,
             writable: true,
+            controls: false,
         })
         .expect("share creates");
     let read_key = key_from_url(&created.read_url);

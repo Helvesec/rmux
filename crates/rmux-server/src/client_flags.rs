@@ -6,6 +6,7 @@ impl ClientFlags {
     pub(crate) const IGNORESIZE: Self = Self(1 << 1);
     pub(crate) const ACTIVEPANE: Self = Self(1 << 2);
     pub(crate) const NO_DETACH_ON_DESTROY: Self = Self(1 << 3);
+    pub(crate) const WEB_CONTROLS: Self = Self(1 << 4);
 
     #[must_use]
     pub(crate) const fn contains(self, other: Self) -> bool {

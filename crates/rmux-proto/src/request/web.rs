@@ -1,19 +1,21 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
-use crate::PaneTargetRef;
+use crate::{PaneTargetRef, SessionName};
 
 /// Request payload for the `web-share` command family.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WebShareRequest {
-    /// Create a new browser-visible pane share.
+    /// Create a new browser-visible share.
     Create(CreateWebShareRequest),
-    /// List active pane shares.
+    /// List active web shares.
     List(ListWebSharesRequest),
-    /// Stop one active pane share.
+    /// Stop one active web share.
     Stop(StopWebShareRequest),
-    /// Stop every active pane share.
+    /// Stop every active web share.
     StopAll(StopAllWebSharesRequest),
-    /// Lookup one active pane share without exposing access keys.
+    /// Lookup one active web share without exposing access keys.
     Lookup(LookupWebShareRequest),
     /// Return the daemon web-share listener configuration.
     Config(WebShareConfigRequest),
@@ -22,8 +24,8 @@ pub enum WebShareRequest {
 /// Request payload for `web-share`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateWebShareRequest {
-    /// The exact pane slot or stable pane id to expose.
-    pub target: PaneTargetRef,
+    /// Browser-visible scope exposed by this share.
+    pub scope: WebShareScope,
     /// Optional public WS origin forwarded to the daemon.
     #[serde(default)]
     pub public_base_url: Option<String>,
@@ -44,10 +46,46 @@ pub struct CreateWebShareRequest {
     pub require_pin: bool,
     /// Terminal palette captured by the CLI for browser-side "User" theme.
     #[serde(default)]
-    pub terminal_palette: Option<WebTerminalPalette>,
+    pub terminal_palette: Option<Box<WebTerminalPalette>>,
     /// Whether an operator URL should be minted.
     #[serde(default)]
     pub writable: bool,
+    /// Whether writable session shares may execute whitelisted rmux controls.
+    #[serde(default)]
+    pub controls: bool,
+}
+
+/// Browser-visible scope exposed by a web share.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebShareScope {
+    /// Expose exactly one pane.
+    Pane(PaneTargetRef),
+    /// Expose an attached-client view of one session.
+    Session(SessionName),
+}
+
+impl WebShareScope {
+    /// Returns true when this share exposes one pane.
+    #[must_use]
+    pub const fn is_pane(&self) -> bool {
+        matches!(self, Self::Pane(_))
+    }
+
+    /// Returns true when this share exposes one session.
+    #[must_use]
+    pub const fn is_session(&self) -> bool {
+        matches!(self, Self::Session(_))
+    }
+}
+
+impl fmt::Display for WebShareScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pane(target) => target.fmt(formatter),
+            Self::Session(session_name) => session_name.fmt(formatter),
+        }
+    }
 }
 
 /// Browser presentation options for generated web-share URLs.

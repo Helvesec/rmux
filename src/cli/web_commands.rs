@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::io::IsTerminal;
 use std::path::Path;
 
@@ -6,16 +5,16 @@ use qrcode::render::unicode::Dense1x2;
 use rmux_proto::{
     CommandOutput, CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest,
     PaneTargetRef, Response, StopAllWebSharesRequest, StopWebShareRequest, WebShareConfigRequest,
-    WebShareCreatedResponse, WebShareRequest, WebShareResponse, WebShareUrlOptions,
+    WebShareCreatedResponse, WebShareRequest, WebShareResponse, WebShareScope, WebShareUrlOptions,
     WebTerminalTheme,
 };
 
 use super::{
     connect_with_startserver, finish_command_success, resolve_current_pane_target,
-    resolve_pane_target_spec, terminal_theme::capture_terminal_palette, write_command_output,
-    ExitFailure, StartupOptions,
+    resolve_pane_target_spec, resolve_session_target_spec,
+    terminal_theme::capture_terminal_palette, write_command_output, ExitFailure, StartupOptions,
 };
-use crate::cli_args::{parse_target_spec, TargetSpec, WebShareArgs, WebShareTerminalThemeArg};
+use crate::cli_args::{TargetSpec, WebShareArgs, WebShareTerminalThemeArg};
 
 pub(super) fn run_web_share(
     args: WebShareArgs,
@@ -66,40 +65,6 @@ fn read_qr_output(read_url: &str) -> CommandOutput {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{read_qr_output, web_share_pane_lookup_target};
-    use crate::cli_args::parse_target_spec;
-
-    #[test]
-    fn read_qr_uses_compact_unicode_blocks() {
-        let output = read_qr_output(
-            "https://share.rmux.io/#endpoint=ws://127.0.0.1:9777/share&id=abcdefgh&key=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi",
-        );
-        let qr = std::str::from_utf8(output.stdout()).expect("QR output should be UTF-8");
-
-        assert!(!qr.contains('#'));
-        assert!(qr.contains('\u{2580}') || qr.contains('\u{2584}') || qr.contains('\u{2588}'));
-        assert!(qr.lines().count() < 40);
-    }
-
-    #[test]
-    fn web_share_session_target_resolves_through_active_pane_lookup() {
-        let target = parse_target_spec("webdemo").expect("session target should parse");
-        let lookup = web_share_pane_lookup_target(&target).expect("lookup target");
-
-        assert_eq!(lookup.raw(), "webdemo:");
-    }
-
-    #[test]
-    fn web_share_pane_target_stays_exact() {
-        let target = parse_target_spec("webdemo:1.2").expect("pane target should parse");
-        let lookup = web_share_pane_lookup_target(&target).expect("lookup target");
-
-        assert_eq!(lookup.raw(), "webdemo:1.2");
-    }
-}
-
 fn build_web_share_request(
     args: WebShareArgs,
     connection: &mut rmux_client::Connection,
@@ -120,14 +85,20 @@ fn build_web_share_request(
         return Ok(WebShareRequest::Config(WebShareConfigRequest));
     }
 
-    let target = resolve_web_share_target(connection, args.target.as_ref())?;
+    if args.controls && !args.writable {
+        return Err(ExitFailure::new(
+            1,
+            "web-share --controls requires --writable",
+        ));
+    }
+    let scope = resolve_web_share_scope(connection, args.target.as_ref(), args.controls)?;
     let terminal_theme = args.terminal_theme.map(web_terminal_theme);
     let terminal_palette = match terminal_theme {
         Some(WebTerminalTheme::Light | WebTerminalTheme::Dark) => None,
         Some(WebTerminalTheme::User) | None => capture_terminal_palette(),
     };
     Ok(WebShareRequest::Create(CreateWebShareRequest {
-        target: PaneTargetRef::slot(target),
+        scope,
         public_base_url: args.public_base_url,
         frontend_url: args.frontend_url,
         ttl_seconds: args.ttl_seconds,
@@ -138,32 +109,51 @@ fn build_web_share_request(
             terminal_theme,
         },
         require_pin: args.require_pin,
-        terminal_palette,
+        terminal_palette: terminal_palette.map(Box::new),
         writable: args.writable,
+        controls: args.controls,
     }))
 }
 
-fn resolve_web_share_target(
+fn resolve_web_share_scope(
     connection: &mut rmux_client::Connection,
     target: Option<&TargetSpec>,
-) -> Result<rmux_proto::PaneTarget, ExitFailure> {
-    match target {
-        Some(target) => {
-            let lookup = web_share_pane_lookup_target(target)?;
-            resolve_pane_target_spec(connection, lookup.as_ref())
-        }
-        None => resolve_current_pane_target(connection, "web-share"),
+    controls: bool,
+) -> Result<WebShareScope, ExitFailure> {
+    let scope = match target {
+        Some(target) => resolve_web_share_target_spec(connection, target)?,
+        None => WebShareScope::Pane(PaneTargetRef::slot(resolve_current_pane_target(
+            connection,
+            "web-share",
+        )?)),
+    };
+    if controls && scope.is_pane() {
+        return Err(ExitFailure::new(
+            1,
+            "web-share --controls requires a session target",
+        ));
     }
+    Ok(scope)
 }
 
-fn web_share_pane_lookup_target(target: &TargetSpec) -> Result<Cow<'_, TargetSpec>, ExitFailure> {
-    let Some(rmux_proto::Target::Session(session_name)) = target.exact() else {
-        return Ok(Cow::Borrowed(target));
-    };
-
-    parse_target_spec(&format!("{session_name}:"))
-        .map(Cow::Owned)
-        .map_err(|error| ExitFailure::new(1, error))
+fn resolve_web_share_target_spec(
+    connection: &mut rmux_client::Connection,
+    target: &TargetSpec,
+) -> Result<WebShareScope, ExitFailure> {
+    match target.exact() {
+        Some(rmux_proto::Target::Session(_)) => {
+            let session_name = resolve_session_target_spec(connection, target, false)?;
+            Ok(WebShareScope::Session(session_name))
+        }
+        Some(rmux_proto::Target::Pane(_)) | None => {
+            let pane = resolve_pane_target_spec(connection, target)?;
+            Ok(WebShareScope::Pane(PaneTargetRef::slot(pane)))
+        }
+        Some(rmux_proto::Target::Window(_)) => Err(ExitFailure::new(
+            1,
+            "web-share -t accepts pane or session targets, not window targets",
+        )),
+    }
 }
 
 const fn web_terminal_theme(value: WebShareTerminalThemeArg) -> WebTerminalTheme {
@@ -171,5 +161,39 @@ const fn web_terminal_theme(value: WebShareTerminalThemeArg) -> WebTerminalTheme
         WebShareTerminalThemeArg::User => WebTerminalTheme::User,
         WebShareTerminalThemeArg::Light => WebTerminalTheme::Light,
         WebShareTerminalThemeArg::Dark => WebTerminalTheme::Dark,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_qr_output;
+    use crate::cli_args::parse_target_spec;
+
+    #[test]
+    fn read_qr_uses_compact_unicode_blocks() {
+        let output = read_qr_output(
+            "https://share.rmux.io/#endpoint=ws://127.0.0.1:9777/share&id=abcdefgh&key=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi",
+        );
+        let qr = std::str::from_utf8(output.stdout()).expect("QR output should be UTF-8");
+
+        assert!(!qr.contains('#'));
+        assert!(qr.contains('\u{2580}') || qr.contains('\u{2584}') || qr.contains('\u{2588}'));
+        assert!(qr.lines().count() < 40);
+    }
+
+    #[test]
+    fn web_share_session_target_stays_session_scoped() {
+        let target = parse_target_spec("webdemo").expect("session target should parse");
+
+        assert!(matches!(
+            target.exact(),
+            Some(rmux_proto::Target::Session(_))
+        ));
+    }
+
+    #[test]
+    fn web_share_pane_target_stays_exact() {
+        let target = parse_target_spec("webdemo:1.2").expect("pane target should parse");
+        assert!(matches!(target.exact(), Some(rmux_proto::Target::Pane(_))));
     }
 }

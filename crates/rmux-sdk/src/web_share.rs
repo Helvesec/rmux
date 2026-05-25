@@ -5,20 +5,20 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use rmux_proto::{
-    CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest, PaneTarget, PaneTargetRef,
-    Request, Response, StopAllWebSharesRequest, StopWebShareRequest, WebShareConfigRequest,
-    WebShareListener, WebShareRequest, WebShareResponse, WebShareUrlOptions, WebTerminalPalette,
-    WebTerminalTheme, CAPABILITY_WEB_SHARE,
+    CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest, PaneTargetRef, Request,
+    Response, StopAllWebSharesRequest, StopWebShareRequest, WebShareConfigRequest,
+    WebShareListener, WebShareRequest, WebShareResponse, WebShareScope, WebShareUrlOptions,
+    WebTerminalPalette, WebTerminalTheme, CAPABILITY_WEB_SHARE,
 };
 
 use crate::handles::{Pane, Rmux, Session};
 use crate::transport::TransportClient;
 use crate::{Result, RmuxError};
 
-/// Builder for creating one browser-visible pane share.
+/// Builder for creating one browser-visible pane or session share.
 pub struct WebShareBuilder<'a> {
     transport: &'a TransportClient,
-    target: PaneTargetRef,
+    scope: WebShareScope,
     frontend_url: Option<String>,
     public_base_url: Option<String>,
     ttl_seconds: Option<u64>,
@@ -28,13 +28,14 @@ pub struct WebShareBuilder<'a> {
     terminal_theme: Option<WebTerminalTheme>,
     terminal_palette: Option<WebTerminalPalette>,
     writable: bool,
+    controls: bool,
 }
 
 impl<'a> WebShareBuilder<'a> {
-    pub(crate) fn new(transport: &'a TransportClient, target: PaneTargetRef) -> Self {
+    pub(crate) fn new(transport: &'a TransportClient, scope: WebShareScope) -> Self {
         Self {
             transport,
-            target,
+            scope,
             frontend_url: None,
             public_base_url: None,
             ttl_seconds: None,
@@ -44,6 +45,7 @@ impl<'a> WebShareBuilder<'a> {
             terminal_theme: None,
             terminal_palette: None,
             writable: false,
+            controls: false,
         }
     }
 
@@ -154,10 +156,21 @@ impl<'a> WebShareBuilder<'a> {
         self
     }
 
+    /// Enables remote rmux controls for session shares.
+    ///
+    /// Controls require a session share and imply writable operator access.
+    #[must_use]
+    pub const fn controls(mut self) -> Self {
+        self.writable = true;
+        self.controls = true;
+        self
+    }
+
     /// Keeps the share read-only.
     #[must_use]
     pub const fn read_only(mut self) -> Self {
         self.writable = false;
+        self.controls = false;
         self
     }
 
@@ -167,7 +180,7 @@ impl<'a> WebShareBuilder<'a> {
             .transport
             .request(Request::WebShare(WebShareRequest::Create(
                 CreateWebShareRequest {
-                    target: self.target,
+                    scope: self.scope,
                     public_base_url: self.public_base_url,
                     frontend_url: self.frontend_url,
                     ttl_seconds: self.ttl_seconds,
@@ -177,8 +190,9 @@ impl<'a> WebShareBuilder<'a> {
                         ..self.url_options
                     },
                     require_pin: self.require_pin,
-                    terminal_palette: self.terminal_palette,
+                    terminal_palette: self.terminal_palette.map(Box::new),
                     writable: self.writable,
+                    controls: self.controls,
                 },
             )))
             .await?;
@@ -206,13 +220,14 @@ impl<'a> IntoFuture for WebShareBuilder<'a> {
 pub struct WebShareHandle {
     transport: TransportClient,
     id: String,
-    target: PaneTargetRef,
+    scope: WebShareScope,
     read_url: String,
     operator_url: Option<String>,
     expires_at_unix: Option<u64>,
     pairing_code: Option<String>,
     max_readers: u16,
     writable: bool,
+    controls: bool,
 }
 
 impl WebShareHandle {
@@ -220,13 +235,14 @@ impl WebShareHandle {
         Self {
             transport,
             id: created.share_id,
-            target: created.target,
+            scope: created.scope,
             read_url: created.read_url,
             operator_url: created.operator_url,
             expires_at_unix: created.expires_at_unix,
             pairing_code: created.pairing_code,
             max_readers: created.max_readers,
             writable: created.writable,
+            controls: created.controls,
         }
     }
 
@@ -236,16 +252,31 @@ impl WebShareHandle {
         &self.id
     }
 
-    /// Returns the pane target resolved by the daemon at create time.
+    /// Returns the pane or session scope resolved by the daemon at create time.
     #[must_use]
-    pub const fn target(&self) -> &PaneTargetRef {
-        &self.target
+    pub const fn scope(&self) -> &WebShareScope {
+        &self.scope
+    }
+
+    /// Returns the pane target when this is a single-pane share.
+    #[must_use]
+    pub fn pane_target(&self) -> Option<&PaneTargetRef> {
+        match &self.scope {
+            WebShareScope::Pane(target) => Some(target),
+            WebShareScope::Session(_) => None,
+        }
     }
 
     /// Returns whether this share minted an operator URL.
     #[must_use]
     pub const fn writable(&self) -> bool {
         self.writable
+    }
+
+    /// Returns whether this share grants remote rmux controls.
+    #[must_use]
+    pub const fn controls(&self) -> bool {
+        self.controls
     }
 
     /// Returns the read-only browser URL.
@@ -329,16 +360,31 @@ impl WebShareLookup {
         &self.summary.id
     }
 
-    /// Returns the pane target resolved by the daemon at create time.
+    /// Returns the pane or session scope resolved by the daemon at create time.
     #[must_use]
-    pub const fn target(&self) -> &PaneTargetRef {
-        &self.summary.target
+    pub const fn scope(&self) -> &WebShareScope {
+        &self.summary.scope
+    }
+
+    /// Returns the pane target when this is a single-pane share.
+    #[must_use]
+    pub fn pane_target(&self) -> Option<&PaneTargetRef> {
+        match &self.summary.scope {
+            WebShareScope::Pane(target) => Some(target),
+            WebShareScope::Session(_) => None,
+        }
     }
 
     /// Returns whether this share has an operator URL.
     #[must_use]
     pub const fn writable(&self) -> bool {
         self.summary.writable
+    }
+
+    /// Returns whether this share grants remote rmux controls.
+    #[must_use]
+    pub const fn controls(&self) -> bool {
+        self.summary.controls
     }
 
     /// Returns the redacted read-only URL, when available.
@@ -366,17 +412,19 @@ impl WebShareLookup {
     }
 }
 
-/// Redacted metadata for an active browser-visible pane share.
+/// Redacted metadata for an active browser-visible pane or session share.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebShareSummary {
     /// Opaque share id.
     pub id: String,
-    /// Shared pane target.
-    pub target: PaneTargetRef,
+    /// Shared pane or session scope.
+    pub scope: WebShareScope,
     /// Redacted read-only URL, if available.
     pub read_url_redacted: Option<String>,
     /// Whether this share has an operator URL.
     pub writable: bool,
+    /// Whether this share grants remote rmux controls.
+    pub controls: bool,
     /// Active read-only client count.
     pub active_readers: u16,
     /// Maximum read-only clients allowed.
@@ -391,9 +439,10 @@ impl From<rmux_proto::WebShareSummary> for WebShareSummary {
     fn from(value: rmux_proto::WebShareSummary) -> Self {
         Self {
             id: value.share_id,
-            target: value.target,
+            scope: value.scope,
             read_url_redacted: value.read_url,
             writable: value.writable,
+            controls: value.controls,
             active_readers: value.active_readers,
             max_readers: value.max_readers,
             operator_connected: value.operator_connected,
@@ -467,12 +516,12 @@ impl Rmux {
 }
 
 impl Session {
-    /// Starts a web-share builder for this session's first pane.
+    /// Starts a web-share builder for this session.
     #[must_use]
     pub fn share(&self) -> WebShareBuilder<'_> {
         WebShareBuilder::new(
             self.transport(),
-            PaneTargetRef::slot(PaneTarget::new(self.name().clone(), 0)),
+            WebShareScope::Session(self.name().clone()),
         )
     }
 }
@@ -481,7 +530,10 @@ impl Pane {
     /// Starts a web-share builder for this pane.
     #[must_use]
     pub fn share(&self) -> WebShareBuilder<'_> {
-        WebShareBuilder::new(self.transport(), self.proto_target_ref())
+        WebShareBuilder::new(
+            self.transport(),
+            WebShareScope::Pane(self.proto_target_ref()),
+        )
     }
 }
 

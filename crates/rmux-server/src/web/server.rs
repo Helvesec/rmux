@@ -11,12 +11,13 @@ use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 
 use super::protocol::{
-    close_for_auth_error, handle_client_text, handle_operator_binary_frame, read_auth_message,
+    close_for_auth_error, handle_pane_client_text, handle_pane_operator_binary_frame,
+    handle_session_client_text, handle_session_operator_binary_frame, read_auth_message,
     send_output, send_ready, send_revoked, send_snapshot, PRE_AUTH_TIMEOUT, UNIFORM_AUTH_DELAY,
 };
 use super::websocket::{WebSocket, WebSocketMessage};
 use super::WebShareRevokeReason;
-use crate::handler::RequestHandler;
+use crate::handler::{RequestHandler, WebPaneStream, WebSessionStream, WebShareStream};
 
 const HTTP_READ_LIMIT: usize = 8 * 1024;
 const OPERATOR_RATE_LIMIT: u16 = 200;
@@ -127,7 +128,7 @@ async fn serve_websocket(
         }
     };
     drop(pre_auth_permit);
-    let mut pane = match handler
+    let share = match handler
         .open_web_share(
             &auth.id,
             &auth.key,
@@ -151,7 +152,7 @@ async fn serve_websocket(
         }
     };
     if let Some(origin) = request.headers.get("origin") {
-        if !pane.origin_allowed(origin) {
+        if !share.origin_allowed(origin) {
             sleep(UNIFORM_AUTH_DELAY).await;
             let _ = socket.write_close_code(4004, "origin_not_allowed").await;
             return Ok(());
@@ -163,7 +164,21 @@ async fn serve_websocket(
         role = auth.role.as_str(),
         "web_share_auth_ok"
     );
-    send_ready(&mut socket, &pane, auth.role.as_str()).await?;
+    send_ready(&mut socket, &share, auth.role.as_str()).await?;
+    match share {
+        WebShareStream::Pane(pane) => serve_pane_loop(handler, socket, auth.id, pane).await,
+        WebShareStream::Session(session) => {
+            serve_session_loop(handler, socket, auth.id, session).await
+        }
+    }
+}
+
+async fn serve_pane_loop(
+    handler: Arc<RequestHandler>,
+    mut socket: WebSocket,
+    share_id: String,
+    mut pane: WebPaneStream,
+) -> io::Result<()> {
     send_snapshot(&mut socket, &pane.snapshot).await?;
     let mut rate_limiter = OperatorRateLimiter::new();
     let mut alive_tick = tokio::time::interval(Duration::from_millis(500));
@@ -196,7 +211,7 @@ async fn serve_websocket(
             message = socket.read_message() => {
                 match message? {
                     WebSocketMessage::Text(text) => {
-                        handle_client_text(&mut socket, &mut pane, &text).await?;
+                        handle_pane_client_text(&mut socket, &mut pane, &text).await?;
                     }
                     WebSocketMessage::Binary(bytes) => {
                         if !pane.is_operator() {
@@ -204,10 +219,10 @@ async fn serve_websocket(
                             return Ok(());
                         }
                         if !rate_limiter.try_acquire() {
-                            info!(share_id = %auth.id, "web_share_operator_rate_limit_hit");
+                            info!(share_id = %share_id, "web_share_operator_rate_limit_hit");
                             continue;
                         }
-                        handle_operator_binary_frame(&handler, &mut socket, &pane, &bytes).await?;
+                        handle_pane_operator_binary_frame(&handler, &mut socket, &pane, &bytes).await?;
                     }
                     WebSocketMessage::Close => {
                         let _ = socket.write_close().await;
@@ -234,6 +249,78 @@ async fn serve_websocket(
                 if !handler.web_target_alive(pane.target()).await {
                     send_revoked(&mut socket, WebShareRevokeReason::PaneGone).await?;
                     let _ = socket.write_close_code(1000, "pane_gone").await;
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+async fn serve_session_loop(
+    handler: Arc<RequestHandler>,
+    mut socket: WebSocket,
+    share_id: String,
+    mut session: WebSessionStream,
+) -> io::Result<()> {
+    let mut attach_reader = session.take_attach_reader();
+    let mut rate_limiter = OperatorRateLimiter::new();
+    let mut alive_tick = tokio::time::interval(Duration::from_millis(500));
+    let ttl_delay = session
+        .expires_at()
+        .map(duration_until)
+        .unwrap_or_else(|| Duration::from_secs(365 * 24 * 60 * 60));
+    let ttl_sleep = sleep(ttl_delay);
+    tokio::pin!(ttl_sleep);
+
+    loop {
+        tokio::select! {
+            output = attach_reader.read_attach_bytes() => {
+                match output? {
+                    Some(bytes) => send_output(&mut socket, &bytes).await?,
+                    None => return Ok(()),
+                }
+            }
+            message = socket.read_message() => {
+                match message? {
+                    WebSocketMessage::Text(text) => {
+                        handle_session_client_text(handler.as_ref(), &mut socket, &mut session, &text).await?;
+                    }
+                    WebSocketMessage::Binary(bytes) => {
+                        if !session.is_operator() {
+                            let _ = socket.write_close_code(4006, "read_no_binary").await;
+                            return Ok(());
+                        }
+                        if !rate_limiter.try_acquire() {
+                            info!(share_id = %share_id, "web_share_operator_rate_limit_hit");
+                            continue;
+                        }
+                        handle_session_operator_binary_frame(&handler, &mut socket, &mut session, &bytes).await?;
+                    }
+                    WebSocketMessage::Close => {
+                        let _ = socket.write_close().await;
+                        return Ok(());
+                    }
+                }
+            }
+            changed = session.revoke_rx.changed() => {
+                if changed.is_ok() {
+                    let reason = *session.revoke_rx.borrow();
+                    if let Some(reason) = reason {
+                        send_revoked(&mut socket, reason).await?;
+                        let _ = socket.write_close_code(1000, reason.as_str()).await;
+                        return Ok(());
+                    }
+                }
+            }
+            _ = ttl_sleep.as_mut() => {
+                send_revoked(&mut socket, WebShareRevokeReason::TtlExpired).await?;
+                let _ = socket.write_close_code(1000, "ttl_expired").await;
+                return Ok(());
+            }
+            _ = alive_tick.tick() => {
+                if !handler.web_session_alive(session.session_name()).await {
+                    send_revoked(&mut socket, WebShareRevokeReason::SessionGone).await?;
+                    let _ = socket.write_close_code(1000, "session_gone").await;
                     return Ok(());
                 }
             }

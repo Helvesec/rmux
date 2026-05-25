@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::CommandOutput;
-use crate::PaneTargetRef;
+use crate::WebShareScope;
 
 /// Response payload for the `web-share` command family.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,13 +35,13 @@ impl WebShareResponse {
     }
 }
 
-/// Success payload for creating a browser-visible pane share.
+/// Success payload for creating a browser-visible web share.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebShareCreatedResponse {
     /// Opaque share identifier.
     pub share_id: String,
-    /// Shared pane selector.
-    pub target: PaneTargetRef,
+    /// Shared browser scope.
+    pub scope: WebShareScope,
     /// Browser URL for read-only access.
     pub read_url: String,
     /// Browser URL for the single writable operator, when requested.
@@ -57,11 +57,13 @@ pub struct WebShareCreatedResponse {
     pub max_readers: u16,
     /// Whether an operator URL was minted.
     pub writable: bool,
+    /// Whether this operator share can execute whitelisted rmux controls.
+    pub controls: bool,
     /// CLI stdout rendering.
     pub output: CommandOutput,
 }
 
-/// Success payload for listing active browser-visible pane shares.
+/// Success payload for listing active browser-visible web shares.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebShareListResponse {
     /// Redacted active share rows.
@@ -70,7 +72,7 @@ pub struct WebShareListResponse {
     pub output: CommandOutput,
 }
 
-/// Success payload for stopping one active pane share.
+/// Success payload for stopping one active web share.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebShareStoppedResponse {
     /// Requested share identifier.
@@ -109,18 +111,20 @@ pub struct WebShareConfigResponse {
     pub output: CommandOutput,
 }
 
-/// Redacted metadata for an active browser-visible pane share.
+/// Redacted metadata for an active browser-visible web share.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebShareSummary {
     /// Opaque share identifier.
     pub share_id: String,
-    /// Shared pane selector.
-    pub target: PaneTargetRef,
+    /// Shared browser scope.
+    pub scope: WebShareScope,
     /// Redacted read-only URL, when available for display.
     #[serde(default)]
     pub read_url: Option<String>,
     /// Whether an operator URL exists for this share.
     pub writable: bool,
+    /// Whether this share can execute whitelisted rmux controls.
+    pub controls: bool,
     /// Active read-only clients.
     pub active_readers: u16,
     /// Effective cap for concurrent read-only clients.

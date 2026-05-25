@@ -8,7 +8,7 @@ pub(crate) fn parse_web_share_args(arguments: Vec<String>) -> Result<WebShareArg
 
 #[derive(Debug, Clone, Args)]
 #[command(
-    after_help = "Local web-share mode opens https://share.rmux.io/ against ws://127.0.0.1:<port>/share. -t accepts a pane target or a session name; session targets resolve to the active pane when the share is created. Pass --tunnel-url for a bring-your-own public endpoint. Pass --frontend-url to use a self-hosted frontend. Pass --theme user|light|dark to choose the initial browser terminal palette. Pass --pin to require an out-of-band pairing code. Chromium-based browsers may require allowing Local Network access for local mode. In-app webviews are not guaranteed."
+    after_help = "Local web-share mode opens https://share.rmux.io/ against ws://127.0.0.1:<port>/share. -t accepts a pane target or a session name; pane targets expose one pane, session targets expose the attached session view. Pass -w for operator input. Pass --controls with -w on a session target to allow whitelisted rmux commands. Pass --tunnel-url for a bring-your-own public endpoint. Pass --frontend-url to use a self-hosted frontend. Pass --theme user|light|dark to choose the initial browser terminal palette. Pass --pin to require an out-of-band pairing code. Chromium-based browsers may require allowing Local Network access for local mode. In-app webviews are not guaranteed."
 )]
 #[command(group(
     ArgGroup::new("mode")
@@ -31,6 +31,8 @@ pub(crate) struct WebShareArgs {
     pub(crate) target: Option<TargetSpec>,
     #[arg(short = 'w', long = "writable", action = ArgAction::SetTrue)]
     pub(crate) writable: bool,
+    #[arg(long = "controls", action = ArgAction::SetTrue)]
+    pub(crate) controls: bool,
     #[arg(long = "ttl", value_name = "seconds")]
     pub(crate) ttl_seconds: Option<u64>,
     #[arg(long = "max-readers", value_name = "count")]
