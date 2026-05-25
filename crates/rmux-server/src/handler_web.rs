@@ -1,6 +1,6 @@
 use rmux_proto::{
     CreateWebShareRequest, ErrorResponse, PaneInputRequest, PaneResizeRequest, PaneTargetRef,
-    ResizePaneAdjustment, Response, RmuxError, WebShareRequest,
+    ResizePaneAdjustment, Response, RmuxError, WebShareRequest, WebTerminalPalette,
 };
 
 use super::pane_support::resolve_pane_target_ref;
@@ -37,6 +37,10 @@ impl WebPaneStream {
 
     pub(crate) fn target(&self) -> &PaneTargetRef {
         &self.target
+    }
+
+    pub(crate) fn terminal_palette(&self) -> Option<&WebTerminalPalette> {
+        self._access.terminal_palette()
     }
 }
 
@@ -292,6 +296,7 @@ mod tests {
                     max_viewers: Some(1),
                     url_options: Default::default(),
                     require_pin: false,
+                    terminal_palette: None,
                     writable: false,
                 },
             )))

@@ -120,6 +120,7 @@ pub use pane_set::{
     PaneSet, PaneSetAny, PaneSetBatch, PaneSetExpectation, PaneSetFailure, PaneSetSuccess,
     PaneSetVisibleTextOutcome, PaneSetVisibleTextWait,
 };
+pub use rmux_proto::{WebTerminalPalette, WebTerminalTheme};
 pub use snapshot::{
     PaneAttributes, PaneCell, PaneColor, PaneCursor, PaneGlyph, PaneSnapshot,
     PaneSnapshotShapeError,

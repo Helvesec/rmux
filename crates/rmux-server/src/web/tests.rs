@@ -1,7 +1,7 @@
 use rmux_core::events::OutputCursorItem;
 use rmux_proto::{
     CreateWebShareRequest, ListWebSharesRequest, PaneId, PaneTargetRef, SessionName,
-    StopAllWebSharesRequest, WebShareUrlOptions,
+    StopAllWebSharesRequest, WebShareUrlOptions, WebTerminalTheme,
 };
 
 use crate::pane_io::pane_output_channel_with_limits;
@@ -53,6 +53,7 @@ fn create_returns_secret_urls_but_list_is_redacted() {
             max_viewers: Some(2),
             url_options: Default::default(),
             require_pin: false,
+            terminal_palette: None,
             writable: true,
         })
         .expect("share creates");
@@ -90,6 +91,7 @@ fn default_local_share_uses_hosted_frontend_and_local_websocket_endpoint() {
             max_viewers: Some(2),
             url_options: Default::default(),
             require_pin: false,
+            terminal_palette: None,
             writable: false,
         })
         .expect("share creates");
@@ -132,6 +134,7 @@ fn frontend_override_changes_browser_origin_without_changing_local_endpoint() {
             max_viewers: Some(2),
             url_options: Default::default(),
             require_pin: false,
+            terminal_palette: None,
             writable: false,
         })
         .expect("share creates");
@@ -164,6 +167,7 @@ fn per_share_frontend_url_overrides_daemon_default() {
             max_viewers: Some(2),
             url_options: Default::default(),
             require_pin: false,
+            terminal_palette: None,
             writable: false,
         })
         .expect("share creates");
@@ -204,18 +208,23 @@ fn url_options_are_encoded_in_viewer_urls() {
             url_options: WebShareUrlOptions {
                 no_navbar: true,
                 no_disclaimer: true,
+                terminal_theme: Some(WebTerminalTheme::Light),
             },
             require_pin: false,
+            terminal_palette: None,
             writable: true,
         })
         .expect("share creates");
 
     assert!(created.viewer_url.contains("&navbar=off"));
     assert!(created.viewer_url.contains("&disclaimer=off"));
+    assert!(created.viewer_url.contains("&theme=light"));
     assert!(created
         .operator_url
         .as_deref()
-        .is_some_and(|url| url.contains("&navbar=off") && url.contains("&disclaimer=off")));
+        .is_some_and(|url| url.contains("&navbar=off")
+            && url.contains("&disclaimer=off")
+            && url.contains("&theme=light")));
 }
 
 #[test]
@@ -230,6 +239,7 @@ fn pairing_code_is_required_out_of_band_when_pin_enabled() {
             max_viewers: Some(2),
             url_options: Default::default(),
             require_pin: true,
+            terminal_palette: None,
             writable: false,
         })
         .expect("share creates");
@@ -285,6 +295,7 @@ fn stop_all_reports_removed_share_count() {
                 max_viewers: None,
                 url_options: Default::default(),
                 require_pin: false,
+                terminal_palette: None,
                 writable: false,
             })
             .expect("share creates");
@@ -305,6 +316,7 @@ fn connect_enforces_viewer_cap_and_single_operator() {
             max_viewers: Some(1),
             url_options: Default::default(),
             require_pin: false,
+            terminal_palette: None,
             writable: true,
         })
         .expect("share creates");

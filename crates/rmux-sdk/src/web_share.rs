@@ -7,7 +7,8 @@ use std::time::Duration;
 use rmux_proto::{
     CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest, PaneTarget, PaneTargetRef,
     Request, Response, StopAllWebSharesRequest, StopWebShareRequest, WebShareConfigRequest,
-    WebShareListener, WebShareRequest, WebShareResponse, WebShareUrlOptions, CAPABILITY_WEB_SHARE,
+    WebShareListener, WebShareRequest, WebShareResponse, WebShareUrlOptions, WebTerminalPalette,
+    WebTerminalTheme, CAPABILITY_WEB_SHARE,
 };
 
 use crate::handles::{Pane, Rmux, Session};
@@ -24,6 +25,8 @@ pub struct WebShareBuilder<'a> {
     max_viewers: Option<u16>,
     url_options: WebShareUrlOptions,
     require_pin: bool,
+    terminal_theme: Option<WebTerminalTheme>,
+    terminal_palette: Option<WebTerminalPalette>,
     writable: bool,
 }
 
@@ -38,6 +41,8 @@ impl<'a> WebShareBuilder<'a> {
             max_viewers: None,
             url_options: WebShareUrlOptions::default(),
             require_pin: false,
+            terminal_theme: None,
+            terminal_palette: None,
             writable: false,
         }
     }
@@ -104,6 +109,44 @@ impl<'a> WebShareBuilder<'a> {
         self.pin()
     }
 
+    /// Sets the initial browser terminal theme for generated share URLs.
+    #[must_use]
+    pub const fn theme(mut self, theme: WebTerminalTheme) -> Self {
+        self.terminal_theme = Some(theme);
+        self
+    }
+
+    /// Alias for [`Self::theme`].
+    #[must_use]
+    pub const fn terminal_theme(self, theme: WebTerminalTheme) -> Self {
+        self.theme(theme)
+    }
+
+    /// Uses the owner's captured terminal palette when available.
+    #[must_use]
+    pub const fn user_theme(self) -> Self {
+        self.theme(WebTerminalTheme::User)
+    }
+
+    /// Uses the bundled light browser terminal palette.
+    #[must_use]
+    pub const fn light_theme(self) -> Self {
+        self.theme(WebTerminalTheme::Light)
+    }
+
+    /// Uses the bundled dark browser terminal palette.
+    #[must_use]
+    pub const fn dark_theme(self) -> Self {
+        self.theme(WebTerminalTheme::Dark)
+    }
+
+    /// Supplies a captured terminal palette for the browser "User" theme.
+    #[must_use]
+    pub fn terminal_palette(mut self, palette: WebTerminalPalette) -> Self {
+        self.terminal_palette = Some(palette);
+        self
+    }
+
     /// Enables the single-operator writable URL.
     #[must_use]
     pub const fn writable(mut self) -> Self {
@@ -129,8 +172,12 @@ impl<'a> WebShareBuilder<'a> {
                     frontend_url: self.frontend_url,
                     ttl_seconds: self.ttl_seconds,
                     max_viewers: self.max_viewers,
-                    url_options: self.url_options,
+                    url_options: WebShareUrlOptions {
+                        terminal_theme: self.terminal_theme,
+                        ..self.url_options
+                    },
                     require_pin: self.require_pin,
+                    terminal_palette: self.terminal_palette,
                     writable: self.writable,
                 },
             )))

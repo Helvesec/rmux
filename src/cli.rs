@@ -39,6 +39,8 @@ mod startup;
 mod target_resolution;
 #[path = "cli/terminal_size.rs"]
 mod terminal_size;
+#[path = "cli/terminal_theme.rs"]
+mod terminal_theme;
 #[path = "cli/top_level.rs"]
 mod top_level;
 #[path = "cli/web_commands.rs"]

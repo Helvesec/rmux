@@ -9,7 +9,7 @@ use rmux_proto::{
     StopAllWebSharesRequest, StopWebShareRequest, WebShareConfigRequest, WebShareConfigResponse,
     WebShareCreatedResponse, WebShareListResponse, WebShareListener, WebShareLookupResponse,
     WebShareResponse, WebShareStoppedAllResponse, WebShareStoppedResponse, WebShareSummary,
-    WebShareUrlOptions,
+    WebShareUrlOptions, WebTerminalPalette,
 };
 use rmux_proto::{PaneTargetRef, RmuxError};
 use tokio::sync::watch;
@@ -113,6 +113,7 @@ impl WebShareRegistry {
             revoke_tx,
             share_id: share_id.clone(),
             target: request.target.clone(),
+            terminal_palette: request.terminal_palette.clone(),
             url_options: request.url_options,
             viewer_token: viewer_token.clone(),
             writable: request.writable,
@@ -406,6 +407,7 @@ struct WebShareRecord {
     revoke_tx: watch::Sender<Option<WebShareRevokeReason>>,
     share_id: String,
     target: PaneTargetRef,
+    terminal_palette: Option<WebTerminalPalette>,
     url_options: WebShareUrlOptions,
     viewer_token: String,
     writable: bool,
@@ -530,6 +532,7 @@ impl WebShareRecord {
             role,
             revoke_rx: self.revoke_tx.subscribe(),
             target: self.target.clone(),
+            terminal_palette: self.terminal_palette.clone(),
         }
     }
 
@@ -572,6 +575,7 @@ pub(crate) struct WebShareAccess {
     revoke_rx: watch::Receiver<Option<WebShareRevokeReason>>,
     role: WebShareRole,
     target: PaneTargetRef,
+    terminal_palette: Option<WebTerminalPalette>,
 }
 
 impl WebShareAccess {
@@ -610,6 +614,10 @@ impl WebShareAccess {
 
     pub(crate) fn target(&self) -> &PaneTargetRef {
         &self.target
+    }
+
+    pub(crate) fn terminal_palette(&self) -> Option<&WebTerminalPalette> {
+        self.terminal_palette.as_ref()
     }
 
     pub(crate) fn revoke_receiver(&self) -> watch::Receiver<Option<WebShareRevokeReason>> {
@@ -690,6 +698,10 @@ fn share_url(
     }
     if options.no_disclaimer {
         url.push_str("&disclaimer=off");
+    }
+    if let Some(theme) = options.terminal_theme {
+        url.push_str("&theme=");
+        url.push_str(theme.as_url_value());
     }
     url
 }

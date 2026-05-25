@@ -1,4 +1,4 @@
-use clap::{ArgAction, ArgGroup, Args};
+use clap::{ArgAction, ArgGroup, Args, ValueEnum};
 
 use super::{parse_command_args, parse_target_spec, TargetSpec};
 
@@ -8,7 +8,7 @@ pub(crate) fn parse_web_share_args(arguments: Vec<String>) -> Result<WebShareArg
 
 #[derive(Debug, Clone, Args)]
 #[command(
-    after_help = "Local web-share mode opens https://share.rmux.io/ against ws://127.0.0.1:<port>/share. Pass --tunnel-url for a bring-your-own public endpoint. Pass --frontend-url to use a self-hosted frontend. Pass --pin to require an out-of-band pairing code. Chromium-based browsers may require allowing Local Network access for local mode. In-app webviews are not guaranteed."
+    after_help = "Local web-share mode opens https://share.rmux.io/ against ws://127.0.0.1:<port>/share. Pass --tunnel-url for a bring-your-own public endpoint. Pass --frontend-url to use a self-hosted frontend. Pass --theme user|light|dark to choose the initial browser terminal palette. Pass --pin to require an out-of-band pairing code. Chromium-based browsers may require allowing Local Network access for local mode. In-app webviews are not guaranteed."
 )]
 #[command(group(
     ArgGroup::new("mode")
@@ -43,8 +43,22 @@ pub(crate) struct WebShareArgs {
     pub(crate) no_navbar: bool,
     #[arg(long = "no-disclaimer", action = ArgAction::SetTrue)]
     pub(crate) no_disclaimer: bool,
+    #[arg(
+        long = "theme",
+        alias = "terminal-theme",
+        value_enum,
+        value_name = "user|light|dark"
+    )]
+    pub(crate) terminal_theme: Option<WebShareTerminalThemeArg>,
     #[arg(long = "pin", alias = "pairing-code", action = ArgAction::SetTrue)]
     pub(crate) require_pin: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum WebShareTerminalThemeArg {
+    User,
+    Light,
+    Dark,
 }
 
 fn normalize_web_share_args(arguments: Vec<String>) -> Vec<String> {

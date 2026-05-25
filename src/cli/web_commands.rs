@@ -6,13 +6,15 @@ use rmux_proto::{
     CommandOutput, CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest,
     PaneTargetRef, Response, StopAllWebSharesRequest, StopWebShareRequest, WebShareConfigRequest,
     WebShareCreatedResponse, WebShareRequest, WebShareResponse, WebShareUrlOptions,
+    WebTerminalTheme,
 };
 
 use super::{
     connect_with_startserver, finish_command_success, resolve_current_pane_target,
-    resolve_pane_target_spec, write_command_output, ExitFailure, StartupOptions,
+    resolve_pane_target_spec, terminal_theme::capture_terminal_palette, write_command_output,
+    ExitFailure, StartupOptions,
 };
-use crate::cli_args::WebShareArgs;
+use crate::cli_args::{WebShareArgs, WebShareTerminalThemeArg};
 
 pub(super) fn run_web_share(
     args: WebShareArgs,
@@ -104,6 +106,11 @@ fn build_web_share_request(
         Some(target) => resolve_pane_target_spec(connection, target)?,
         None => resolve_current_pane_target(connection, "web-share")?,
     };
+    let terminal_theme = args.terminal_theme.map(web_terminal_theme);
+    let terminal_palette = match terminal_theme {
+        Some(WebTerminalTheme::Light | WebTerminalTheme::Dark) => None,
+        Some(WebTerminalTheme::User) | None => capture_terminal_palette(),
+    };
     Ok(WebShareRequest::Create(CreateWebShareRequest {
         target: PaneTargetRef::slot(target),
         public_base_url: args.public_base_url,
@@ -113,8 +120,18 @@ fn build_web_share_request(
         url_options: WebShareUrlOptions {
             no_navbar: args.no_navbar,
             no_disclaimer: args.no_disclaimer,
+            terminal_theme,
         },
         require_pin: args.require_pin,
+        terminal_palette,
         writable: args.writable,
     }))
+}
+
+const fn web_terminal_theme(value: WebShareTerminalThemeArg) -> WebTerminalTheme {
+    match value {
+        WebShareTerminalThemeArg::User => WebTerminalTheme::User,
+        WebShareTerminalThemeArg::Light => WebTerminalTheme::Light,
+        WebShareTerminalThemeArg::Dark => WebTerminalTheme::Dark,
+    }
 }

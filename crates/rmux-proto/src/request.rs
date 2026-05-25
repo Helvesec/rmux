@@ -99,6 +99,7 @@ mod web;
 pub use web::{
     CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest, StopAllWebSharesRequest,
     StopWebShareRequest, WebShareConfigRequest, WebShareRequest, WebShareUrlOptions,
+    WebTerminalPalette, WebTerminalTheme,
 };
 
 /// All detached public command and internal RPC requests supported by the wire

@@ -96,18 +96,34 @@ fn web_share_accepts_frontend_and_tunnel_url_flags() {
 
 #[test]
 fn web_share_accepts_viewer_presentation_and_pin_flags() {
-    let cli = parse_args(&["web-share", "--no-navbar", "--no-disclaimer", "--pin"]).unwrap();
+    let cli = parse_args(&[
+        "web-share",
+        "--no-navbar",
+        "--no-disclaimer",
+        "--theme",
+        "user",
+        "--pin",
+    ])
+    .unwrap();
     let Some(super::super::Command::WebShare(args)) = cli.command else {
         panic!("expected web-share command");
     };
     assert!(args.no_navbar);
     assert!(args.no_disclaimer);
+    assert!(matches!(
+        args.terminal_theme,
+        Some(super::super::WebShareTerminalThemeArg::User)
+    ));
     assert!(args.require_pin);
 
-    let cli = parse_args(&["web-share", "--pairing-code"]).unwrap();
+    let cli = parse_args(&["web-share", "--terminal-theme", "dark", "--pairing-code"]).unwrap();
     let Some(super::super::Command::WebShare(args)) = cli.command else {
         panic!("expected web-share command");
     };
+    assert!(matches!(
+        args.terminal_theme,
+        Some(super::super::WebShareTerminalThemeArg::Dark)
+    ));
     assert!(args.require_pin);
 }
 

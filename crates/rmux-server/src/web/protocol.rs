@@ -4,6 +4,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::time::timeout;
 
+use rmux_proto::WebTerminalPalette;
+
 use super::websocket::{WebSocket, WebSocketMessage};
 use super::{WebShareConnectRole, WebShareRevokeReason};
 use crate::handler::{RequestHandler, WebPaneSnapshot, WebPaneStream};
@@ -168,6 +170,7 @@ pub(crate) async fn send_ready(
         },
         role,
         writable: pane.is_operator(),
+        terminal_palette: pane.terminal_palette(),
     };
     let text =
         serde_json::to_string(&payload).map_err(|error| io::Error::other(error.to_string()))?;
@@ -289,6 +292,8 @@ enum ServerMessage<'a> {
         pane_size: PaneSize,
         role: &'a str,
         writable: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        terminal_palette: Option<&'a WebTerminalPalette>,
     },
     Released,
     ShareRevoked {
