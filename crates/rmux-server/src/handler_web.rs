@@ -61,7 +61,7 @@ impl RequestHandler {
         pin: Option<&str>,
         role: WebShareConnectRole,
     ) -> Result<WebShareStream, RmuxError> {
-        let access = self.web_shares.connect(share_id, key, pin, role)?;
+        let access = self.web_shares.connect(share_id, key, pin, role).await?;
         match access.scope().clone() {
             WebShareScope::Pane(target) => {
                 let target = self.stable_web_target(&target).await?;

@@ -11,8 +11,10 @@ use rmux_proto::{
     WebShareResponse, WebShareStoppedAllResponse, WebShareStoppedResponse, WebShareSummary,
 };
 use tokio::sync::watch;
+use tokio::time::sleep;
 use tracing::info;
 
+use super::backoff::AuthBackoff;
 use super::leases::LeaseBook;
 use super::origin::{validate_frontend_url, validate_public_base_url, FrontendUrl};
 use super::record::{
@@ -27,6 +29,7 @@ const MAX_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Debug)]
 pub(crate) struct WebShareRegistry {
+    backoff: AuthBackoff,
     inner: Mutex<WebShareState>,
     next_id: AtomicU64,
     settings: WebShareSettings,
@@ -41,6 +44,7 @@ impl Default for WebShareRegistry {
 impl WebShareRegistry {
     pub(crate) fn new(settings: WebShareSettings) -> Self {
         Self {
+            backoff: AuthBackoff::new(),
             inner: Mutex::new(WebShareState::default()),
             next_id: AtomicU64::new(1),
             settings,
@@ -239,24 +243,49 @@ impl WebShareRegistry {
         })
     }
 
-    pub(crate) fn connect(
+    pub(crate) async fn connect(
         &self,
         share_id: &str,
         key: &str,
         pin: Option<&str>,
         role: WebShareConnectRole,
     ) -> Result<WebShareAccess, RmuxError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .expect("web-share registry mutex must not be poisoned");
-        inner.prune_expired();
-        let record = inner.records.get(share_id).ok_or_else(|| {
-            RmuxError::Server("web-share does not exist or has expired".to_owned())
-        })?;
-        let access = record.connect(key, pin, role)?;
-        info!(share_id, role = ?role, "web_share_access_granted");
-        Ok(access)
+        let delay = self.backoff.delay_before_next_attempt(share_id);
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
+
+        let result = {
+            let mut inner = self
+                .inner
+                .lock()
+                .expect("web-share registry mutex must not be poisoned");
+            inner.prune_expired();
+            let record = inner.records.get(share_id).ok_or_else(|| {
+                RmuxError::Server("web-share does not exist or has expired".to_owned())
+            })?;
+            record.connect(key, pin, role)
+        };
+
+        match result {
+            Ok(access) => {
+                self.backoff.record_success(share_id);
+                info!(share_id, role = ?role, "web_share_access_granted");
+                Ok(access)
+            }
+            Err(error) => {
+                if is_auth_failure_for_backoff(&error) {
+                    let failure = self.backoff.record_failure(share_id);
+                    info!(
+                        share_id,
+                        fails = failure.fails,
+                        next_delay_ms = failure.next_delay.as_millis(),
+                        "web_share_auth_backoff"
+                    );
+                }
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn listener(&self) -> WebShareListener {
@@ -325,6 +354,13 @@ impl WebShareRegistry {
             ))),
         }
     }
+}
+
+fn is_auth_failure_for_backoff(error: &RmuxError) -> bool {
+    let message = error.to_string();
+    message.contains("invalid web-share key")
+        || message.contains("invalid web-share pairing code")
+        || message.contains("does not exist or has expired")
 }
 
 #[derive(Debug)]

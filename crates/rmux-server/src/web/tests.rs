@@ -3,6 +3,7 @@ use rmux_proto::{
     CreateWebShareRequest, ListWebSharesRequest, PaneId, PaneTargetRef, SessionName,
     StopAllWebSharesRequest, WebShareScope, WebShareUrlOptions, WebTerminalTheme,
 };
+use std::time::{Duration, Instant};
 
 use crate::pane_io::pane_output_channel_with_limits;
 use crate::web::origin::validate_public_base_url;
@@ -80,8 +81,8 @@ fn create_returns_secret_urls_but_list_is_redacted() {
     );
 }
 
-#[test]
-fn default_local_share_uses_hosted_frontend_and_local_websocket_endpoint() {
+#[tokio::test]
+async fn default_local_share_uses_hosted_frontend_and_local_websocket_endpoint() {
     let registry = WebShareRegistry::default();
     let created = registry
         .create(CreateWebShareRequest {
@@ -111,6 +112,7 @@ fn default_local_share_uses_hosted_frontend_and_local_websocket_endpoint() {
             None,
             WebShareConnectRole::Read,
         )
+        .await
         .expect("read connects");
     assert!(access.origin_allowed("https://share.rmux.io"));
     assert!(access.origin_allowed("http://localhost:4321"));
@@ -118,8 +120,8 @@ fn default_local_share_uses_hosted_frontend_and_local_websocket_endpoint() {
     assert!(!access.origin_allowed("https://evil.example"));
 }
 
-#[test]
-fn frontend_override_changes_browser_origin_without_changing_local_endpoint() {
+#[tokio::test]
+async fn frontend_override_changes_browser_origin_without_changing_local_endpoint() {
     let registry = WebShareRegistry::new(
         crate::web::WebShareSettings::from_options(
             9778,
@@ -153,13 +155,14 @@ fn frontend_override_changes_browser_origin_without_changing_local_endpoint() {
             None,
             WebShareConnectRole::Read,
         )
+        .await
         .expect("read connects");
     assert!(access.origin_allowed("https://share.fork.example"));
     assert!(!access.origin_allowed("https://share.rmux.io"));
 }
 
-#[test]
-fn per_share_frontend_url_overrides_daemon_default() {
+#[tokio::test]
+async fn per_share_frontend_url_overrides_daemon_default() {
     let registry = WebShareRegistry::default();
     let created = registry
         .create(CreateWebShareRequest {
@@ -187,6 +190,7 @@ fn per_share_frontend_url_overrides_daemon_default() {
             None,
             WebShareConnectRole::Read,
         )
+        .await
         .expect("read connects");
     assert!(access.origin_allowed("https://share.fork.example"));
     assert!(!access.origin_allowed("https://share.rmux.io"));
@@ -299,8 +303,8 @@ fn url_options_are_encoded_in_read_urls() {
             && url.contains("&theme=light")));
 }
 
-#[test]
-fn pairing_code_is_required_out_of_band_when_pin_enabled() {
+#[tokio::test]
+async fn pairing_code_is_required_out_of_band_when_pin_enabled() {
     let registry = WebShareRegistry::default();
     let created = registry
         .create(CreateWebShareRequest {
@@ -336,6 +340,7 @@ fn pairing_code_is_required_out_of_band_when_pin_enabled() {
             None,
             WebShareConnectRole::Read
         )
+        .await
         .is_err());
     assert!(registry
         .connect(
@@ -344,6 +349,7 @@ fn pairing_code_is_required_out_of_band_when_pin_enabled() {
             Some("000000"),
             WebShareConnectRole::Read,
         )
+        .await
         .is_err());
     assert!(registry
         .connect(
@@ -352,6 +358,7 @@ fn pairing_code_is_required_out_of_band_when_pin_enabled() {
             Some(pairing_code),
             WebShareConnectRole::Read,
         )
+        .await
         .is_ok());
 }
 
@@ -444,8 +451,8 @@ fn stop_all_reports_removed_share_count() {
     assert!(registry.list(ListWebSharesRequest).shares.is_empty());
 }
 
-#[test]
-fn connect_enforces_read_cap_and_single_operator() {
+#[tokio::test]
+async fn connect_enforces_read_cap_and_single_operator() {
     let registry = WebShareRegistry::default();
     let created = registry
         .create(CreateWebShareRequest {
@@ -471,6 +478,7 @@ fn connect_enforces_read_cap_and_single_operator() {
             None,
             WebShareConnectRole::Read,
         )
+        .await
         .expect("read connects");
     assert!(!read.is_operator());
     assert!(registry
@@ -480,6 +488,7 @@ fn connect_enforces_read_cap_and_single_operator() {
             None,
             WebShareConnectRole::Read
         )
+        .await
         .is_err());
 
     let operator = registry
@@ -489,6 +498,7 @@ fn connect_enforces_read_cap_and_single_operator() {
             None,
             WebShareConnectRole::Operator,
         )
+        .await
         .expect("operator connects");
     assert!(operator.is_operator());
     assert!(registry
@@ -498,6 +508,7 @@ fn connect_enforces_read_cap_and_single_operator() {
             None,
             WebShareConnectRole::Operator,
         )
+        .await
         .is_err());
 
     drop(read);
@@ -508,7 +519,45 @@ fn connect_enforces_read_cap_and_single_operator() {
             None,
             WebShareConnectRole::Read
         )
+        .await
         .is_ok());
+}
+
+#[tokio::test]
+async fn auth_failures_backoff_per_share_id() {
+    let registry = WebShareRegistry::default();
+    let created = registry
+        .create(CreateWebShareRequest {
+            scope: WebShareScope::Pane(target()),
+            public_base_url: None,
+            frontend_url: None,
+            ttl_seconds: None,
+            max_readers: Some(2),
+            url_options: Default::default(),
+            require_pin: false,
+            terminal_palette: None,
+            writable: false,
+            controls: false,
+        })
+        .expect("share creates");
+
+    let start = Instant::now();
+    for _ in 0..4 {
+        assert!(registry
+            .connect(
+                &created.share_id,
+                "wrong-key",
+                None,
+                WebShareConnectRole::Read,
+            )
+            .await
+            .is_err());
+    }
+
+    assert!(
+        start.elapsed() >= Duration::from_millis(650),
+        "expected exponential backoff to delay repeated failures"
+    );
 }
 
 fn target() -> PaneTargetRef {
