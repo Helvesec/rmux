@@ -48,6 +48,7 @@ fn create_returns_secret_urls_but_list_is_redacted() {
         .create(CreateWebShareRequest {
             target: target(),
             public_base_url: Some("https://share.example".to_owned()),
+            frontend_url: None,
             ttl_seconds: Some(60),
             max_viewers: Some(2),
             writable: true,
@@ -82,6 +83,7 @@ fn default_local_share_uses_hosted_frontend_and_local_websocket_endpoint() {
         .create(CreateWebShareRequest {
             target: target(),
             public_base_url: None,
+            frontend_url: None,
             ttl_seconds: Some(60),
             max_viewers: Some(2),
             writable: false,
@@ -116,6 +118,7 @@ fn frontend_override_changes_browser_origin_without_changing_local_endpoint() {
         .create(CreateWebShareRequest {
             target: target(),
             public_base_url: None,
+            frontend_url: None,
             ttl_seconds: Some(60),
             max_viewers: Some(2),
             writable: false,
@@ -125,6 +128,31 @@ fn frontend_override_changes_browser_origin_without_changing_local_endpoint() {
     assert!(created
         .viewer_url
         .starts_with("https://share.fork.example/#endpoint=ws://127.0.0.1:9778/share&id="));
+    let viewer_key = key_from_url(&created.viewer_url);
+    let access = registry
+        .connect(&created.share_id, &viewer_key, WebShareConnectRole::Viewer)
+        .expect("viewer connects");
+    assert!(access.origin_allowed("https://share.fork.example"));
+    assert!(!access.origin_allowed("https://share.rmux.io"));
+}
+
+#[test]
+fn per_share_frontend_url_overrides_daemon_default() {
+    let registry = WebShareRegistry::default();
+    let created = registry
+        .create(CreateWebShareRequest {
+            target: target(),
+            public_base_url: Some("https://terminal.example".to_owned()),
+            frontend_url: Some("https://share.fork.example/share".to_owned()),
+            ttl_seconds: Some(60),
+            max_viewers: Some(2),
+            writable: false,
+        })
+        .expect("share creates");
+
+    assert!(created.viewer_url.starts_with(
+        "https://share.fork.example/share/#endpoint=wss://terminal.example/share&id="
+    ));
     let viewer_key = key_from_url(&created.viewer_url);
     let access = registry
         .connect(&created.share_id, &viewer_key, WebShareConnectRole::Viewer)
@@ -148,6 +176,7 @@ fn stop_all_reports_removed_share_count() {
             .create(CreateWebShareRequest {
                 target: target(),
                 public_base_url: None,
+                frontend_url: None,
                 ttl_seconds: None,
                 max_viewers: None,
                 writable: false,
@@ -165,6 +194,7 @@ fn connect_enforces_viewer_cap_and_single_operator() {
         .create(CreateWebShareRequest {
             target: target(),
             public_base_url: None,
+            frontend_url: None,
             ttl_seconds: None,
             max_viewers: Some(1),
             writable: true,

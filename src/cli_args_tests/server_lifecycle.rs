@@ -35,7 +35,7 @@ fn start_server_accepts_web_listener_flags() {
         "start-server",
         "--web-port",
         "9778",
-        "--web-frontend",
+        "--frontend-url",
         "https://share.example.com",
     ])
     .unwrap();
@@ -65,6 +65,50 @@ fn web_share_accepts_subcommand_style_lifecycle_forms() {
     assert_eq!(args.stop.as_deref(), Some("abc12345"));
 
     let cli = parse_args(&["web-share", "stop", "all"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert!(args.stop_all);
+}
+
+#[test]
+fn web_share_accepts_frontend_and_tunnel_url_flags() {
+    let cli = parse_args(&[
+        "web-share",
+        "--frontend-url",
+        "https://ui.example.com/share",
+        "--tunnel-url",
+        "https://terminal.example.com",
+    ])
+    .unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert_eq!(
+        args.frontend_url.as_deref(),
+        Some("https://ui.example.com/share")
+    );
+    assert_eq!(
+        args.public_base_url.as_deref(),
+        Some("https://terminal.example.com")
+    );
+}
+
+#[test]
+fn web_share_keeps_legacy_public_url_alias() {
+    let cli = parse_args(&["web-share", "--public-url", "https://terminal.example.com"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert_eq!(
+        args.public_base_url.as_deref(),
+        Some("https://terminal.example.com")
+    );
+}
+
+#[test]
+fn web_share_off_is_stop_all_alias() {
+    let cli = parse_args(&["web-share", "off"]).unwrap();
     let Some(super::super::Command::WebShare(args)) = cli.command else {
         panic!("expected web-share command");
     };

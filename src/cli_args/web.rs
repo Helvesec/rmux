@@ -8,7 +8,7 @@ pub(crate) fn parse_web_share_args(arguments: Vec<String>) -> Result<WebShareArg
 
 #[derive(Debug, Clone, Args)]
 #[command(
-    after_help = "Local web-share mode opens https://share.rmux.io/share/ against ws://127.0.0.1:<port>/share. It requires a browser that allows public-origin access to loopback WS connections. Chromium-based browsers may block this under Local Network Access; allow Local Network access for share.rmux.io, use Firefox/Safari, or run a localhost-hosted frontend with --web-frontend. In-app webviews are not guaranteed."
+    after_help = "Local web-share mode opens https://share.rmux.io/share/ against ws://127.0.0.1:<port>/share. Pass --tunnel-url for a bring-your-own public endpoint. Pass --frontend-url to use a self-hosted frontend. Chromium-based browsers may require allowing Local Network access for local mode. In-app webviews are not guaranteed."
 )]
 #[command(group(
     ArgGroup::new("mode")
@@ -35,7 +35,9 @@ pub(crate) struct WebShareArgs {
     pub(crate) ttl_seconds: Option<u64>,
     #[arg(long = "max-viewers", value_name = "count")]
     pub(crate) max_viewers: Option<u16>,
-    #[arg(long = "public-url", value_name = "url")]
+    #[arg(long = "frontend-url", alias = "web-frontend", value_name = "url")]
+    pub(crate) frontend_url: Option<String>,
+    #[arg(long = "tunnel-url", alias = "public-url", value_name = "url")]
     pub(crate) public_base_url: Option<String>,
 }
 
@@ -46,6 +48,7 @@ fn normalize_web_share_args(arguments: Vec<String>) -> Vec<String> {
     match command.as_str() {
         "list" => prefixed("-l", rest),
         "stop" => normalize_stop(rest),
+        "off" => prefixed("-X", rest),
         "config" => prefixed("--config", rest),
         "lookup" => prefixed("--lookup", rest),
         _ => arguments,

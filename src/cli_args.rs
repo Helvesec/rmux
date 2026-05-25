@@ -406,7 +406,7 @@ pub(crate) struct UnsupportedCommandArgs {
 pub(crate) struct StartServerArgs {
     #[arg(long = "web-port", value_name = "port")]
     pub(crate) web_port: Option<u16>,
-    #[arg(long = "web-frontend", value_name = "url")]
+    #[arg(long = "frontend-url", alias = "web-frontend", value_name = "url")]
     pub(crate) web_frontend: Option<String>,
 }
 

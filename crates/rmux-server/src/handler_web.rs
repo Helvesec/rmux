@@ -278,6 +278,7 @@ mod tests {
                 CreateWebShareRequest {
                     target: rmux_proto::PaneTarget::new(session_name.clone(), 0).into(),
                     public_base_url: Some("https://share.example".to_owned()),
+                    frontend_url: None,
                     ttl_seconds: None,
                     max_viewers: Some(1),
                     writable: false,

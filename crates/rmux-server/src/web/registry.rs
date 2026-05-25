@@ -15,9 +15,10 @@ use tokio::sync::watch;
 use tracing::info;
 
 use super::leases::{ConnectionLease, LeaseBook};
-use super::origin::{origin_allowed, validate_public_base_url};
+use super::origin::{origin_allowed, validate_frontend_url, validate_public_base_url, FrontendUrl};
 
 const DEFAULT_FRONTEND_ORIGIN: &str = "https://share.rmux.io";
+const DEFAULT_FRONTEND_URL: &str = "https://share.rmux.io/share";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_MAX_VIEWERS: u16 = 5;
 const DEFAULT_PORT: u16 = 9777;
@@ -83,6 +84,7 @@ impl WebShareRegistry {
             ));
         }
         let endpoint_origin = self.endpoint_origin(request.public_base_url.as_deref())?;
+        let frontend = self.frontend(request.frontend_url.as_deref())?;
         let share_id = self.next_share_id()?;
         let viewer_token = random_token()?;
         let operator_token = request.writable.then(random_token).transpose()?;
@@ -100,7 +102,8 @@ impl WebShareRegistry {
             allow_loopback_development_origins: request.public_base_url.is_none(),
             endpoint_origin,
             expires_at,
-            frontend_origin: self.settings.frontend_origin.clone(),
+            frontend_origin: frontend.origin,
+            frontend_url: frontend.url,
             lease_book,
             max_viewers,
             operator_token: operator_token.clone(),
@@ -259,6 +262,16 @@ impl WebShareRegistry {
             None => Ok(self.settings.local_endpoint_origin()),
         }
     }
+
+    fn frontend(&self, requested: Option<&str>) -> Result<FrontendUrl, RmuxError> {
+        match requested {
+            Some(value) => validate_frontend_url(value),
+            None => Ok(FrontendUrl {
+                origin: self.settings.frontend_origin.clone(),
+                url: self.settings.frontend_url.clone(),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -266,6 +279,7 @@ pub(crate) struct WebShareSettings {
     host: String,
     port: u16,
     frontend_origin: String,
+    frontend_url: String,
 }
 
 impl Default for WebShareSettings {
@@ -274,6 +288,7 @@ impl Default for WebShareSettings {
             host: DEFAULT_HOST.to_owned(),
             port: DEFAULT_PORT,
             frontend_origin: DEFAULT_FRONTEND_ORIGIN.to_owned(),
+            frontend_url: DEFAULT_FRONTEND_URL.to_owned(),
         }
     }
 }
@@ -283,14 +298,18 @@ impl WebShareSettings {
         port: u16,
         frontend_origin: Option<String>,
     ) -> Result<Self, RmuxError> {
-        let frontend_origin = match frontend_origin {
-            Some(value) => validate_public_base_url(&value)?,
-            None => DEFAULT_FRONTEND_ORIGIN.to_owned(),
+        let frontend = match frontend_origin {
+            Some(value) => validate_frontend_url(&value)?,
+            None => FrontendUrl {
+                origin: DEFAULT_FRONTEND_ORIGIN.to_owned(),
+                url: DEFAULT_FRONTEND_URL.to_owned(),
+            },
         };
         Ok(Self {
             host: DEFAULT_HOST.to_owned(),
             port,
-            frontend_origin,
+            frontend_origin: frontend.origin,
+            frontend_url: frontend.url,
         })
     }
 
@@ -372,6 +391,7 @@ struct WebShareRecord {
     endpoint_origin: String,
     expires_at: Option<SystemTime>,
     frontend_origin: String,
+    frontend_url: String,
     lease_book: Arc<LeaseBook>,
     max_viewers: u16,
     operator_token: Option<String>,
@@ -386,6 +406,7 @@ impl WebShareRecord {
     fn viewer_url(&self) -> String {
         share_url(
             &self.frontend_origin,
+            &self.frontend_url,
             &self.endpoint_origin,
             &self.share_id,
             Some(&self.viewer_token),
@@ -396,6 +417,7 @@ impl WebShareRecord {
     fn redacted_viewer_url(&self) -> String {
         share_url(
             &self.frontend_origin,
+            &self.frontend_url,
             &self.endpoint_origin,
             &self.share_id,
             None,
@@ -407,6 +429,7 @@ impl WebShareRecord {
         self.operator_token.as_deref().map(|token| {
             share_url(
                 &self.frontend_origin,
+                &self.frontend_url,
                 &self.endpoint_origin,
                 &self.share_id,
                 Some(token),
@@ -601,28 +624,24 @@ fn stopped_output(share_id: &str, stopped: bool) -> CommandOutput {
 
 fn share_url(
     frontend_origin: &str,
+    frontend_url: &str,
     endpoint_origin: &str,
     share_id: &str,
     token: Option<&str>,
     role: &str,
 ) -> String {
     let endpoint = websocket_endpoint(endpoint_origin);
-    let frontend = frontend_url(frontend_origin);
     let key = token.unwrap_or("[REDACTED]");
-    let mut url = format!("{frontend}/#endpoint={endpoint}&id={share_id}&key={key}");
+    debug_assert!(
+        frontend_url.starts_with(frontend_origin),
+        "frontend URL must belong to its expected origin"
+    );
+    let mut url = format!("{frontend_url}/#endpoint={endpoint}&id={share_id}&key={key}");
     if role != "viewer" {
         url.push_str("&role=");
         url.push_str(role);
     }
     url
-}
-
-fn frontend_url(frontend_origin: &str) -> String {
-    if frontend_origin == DEFAULT_FRONTEND_ORIGIN {
-        format!("{frontend_origin}/share")
-    } else {
-        frontend_origin.to_owned()
-    }
 }
 
 fn websocket_endpoint(base_url: &str) -> String {

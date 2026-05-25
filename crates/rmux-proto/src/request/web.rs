@@ -27,6 +27,9 @@ pub struct CreateWebShareRequest {
     /// Optional public WS origin forwarded to the daemon.
     #[serde(default)]
     pub public_base_url: Option<String>,
+    /// Optional browser frontend URL used for this share.
+    #[serde(default)]
+    pub frontend_url: Option<String>,
     /// Optional maximum share lifetime in seconds.
     #[serde(default)]
     pub ttl_seconds: Option<u64>,

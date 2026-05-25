@@ -207,7 +207,10 @@ against
 It requires a browser that allows public-origin access to loopback
 WS connections. Chromium-based browsers may block this under Local Network
 Access; allow Local Network access for
-.B share.rmux.io ,
-use Firefox/Safari, or run a localhost-hosted frontend with
-.B --web-frontend .
+.B share.rmux.io .
+Pass
+.B --tunnel-url
+to use a bring-your-own public endpoint, and
+.B --frontend-url
+to use a self-hosted frontend.
 In-app webviews are not guaranteed.

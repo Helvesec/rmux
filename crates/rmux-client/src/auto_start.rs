@@ -132,7 +132,7 @@ impl AutoStartConfig {
             command.arg("--web-port").arg(port.to_string());
         }
         if let Some(frontend) = &self.web_frontend {
-            command.arg("--web-frontend").arg(frontend);
+            command.arg("--frontend-url").arg(frontend);
         }
     }
 }

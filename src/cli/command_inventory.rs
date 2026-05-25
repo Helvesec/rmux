@@ -231,7 +231,7 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ("wait-for", "(wait) [-L|-S|-U] channel"),
     (
         "web-share",
-        "[-lwX] [-K share-id] [--config] [--lookup share-id] [--ttl seconds] [--max-viewers count] [--public-url url] [-t target-pane]",
+        "[-lwX] [-K share-id] [--config] [--lookup share-id] [--ttl seconds] [--max-viewers count] [--frontend-url url] [--tunnel-url url] [-t target-pane]",
     ),
 ];
 

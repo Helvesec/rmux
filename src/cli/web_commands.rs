@@ -95,6 +95,7 @@ fn build_web_share_request(
     Ok(WebShareRequest::Create(CreateWebShareRequest {
         target: PaneTargetRef::slot(target),
         public_base_url: args.public_base_url,
+        frontend_url: args.frontend_url,
         ttl_seconds: args.ttl_seconds,
         max_viewers: args.max_viewers,
         writable: args.writable,

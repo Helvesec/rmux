@@ -1,5 +1,11 @@
 use rmux_proto::RmuxError;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FrontendUrl {
+    pub(crate) origin: String,
+    pub(crate) url: String,
+}
+
 pub(crate) fn origin_matches(received: &str, expected: &str) -> bool {
     let Some(received) = normalize_origin(received) else {
         return false;
@@ -37,6 +43,55 @@ pub(crate) fn validate_public_base_url(value: &str) -> Result<String, RmuxError>
         ));
     }
     Ok(trimmed.to_owned())
+}
+
+pub(crate) fn validate_frontend_url(value: &str) -> Result<FrontendUrl, RmuxError> {
+    let trimmed = value.trim();
+    let Some((origin, path)) = split_url_origin_and_path(trimmed) else {
+        return Err(RmuxError::Server(
+            "web-share frontend URL must be an ASCII http(s) URL without query or fragment"
+                .to_owned(),
+        ));
+    };
+    let Some(normalized_origin) = normalize_origin(origin) else {
+        return Err(RmuxError::Server(
+            "web-share frontend URL must use a valid ASCII origin".to_owned(),
+        ));
+    };
+    let (scheme, rest) = normalized_origin
+        .split_once("://")
+        .expect("normalized origin must contain scheme separator");
+    let host = rest.split_once(':').map(|(host, _)| host).unwrap_or(rest);
+    if scheme == "http" && !is_loopback_host(host) {
+        return Err(RmuxError::Server(
+            "web-share frontend URL must use https:// outside localhost".to_owned(),
+        ));
+    }
+    let url = match path {
+        "" | "/" => origin.to_owned(),
+        path => format!("{}{}", origin, path.trim_end_matches('/')),
+    };
+    Ok(FrontendUrl {
+        origin: origin.to_owned(),
+        url,
+    })
+}
+
+fn split_url_origin_and_path(value: &str) -> Option<(&str, &str)> {
+    if !value.is_ascii() || value.contains('?') || value.contains('#') {
+        return None;
+    }
+    let (scheme, rest) = value.split_once("://")?;
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let path_start = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..path_start];
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let origin_end = scheme.len() + "://".len() + authority.len();
+    Some((&value[..origin_end], &value[origin_end..]))
 }
 
 fn is_loopback_development_origin(value: &str) -> bool {
@@ -145,7 +200,7 @@ fn secret_eq(left: &[u8], right: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{origin_allowed, origin_matches, validate_public_base_url};
+    use super::{origin_allowed, origin_matches, validate_frontend_url, validate_public_base_url};
 
     #[test]
     fn origin_matrix_matches_security_contract() {
@@ -220,6 +275,17 @@ mod tests {
         assert!(validate_public_base_url("http://127.0.0.1:9777").is_ok());
         assert!(validate_public_base_url("https://share.example.com").is_ok());
         assert!(validate_public_base_url("https://share.example.com/path").is_err());
+    }
+
+    #[test]
+    fn frontend_url_accepts_paths_and_derives_origin() {
+        let frontend = validate_frontend_url("https://share.example.com/share/")
+            .expect("frontend URL with path");
+        assert_eq!(frontend.origin, "https://share.example.com");
+        assert_eq!(frontend.url, "https://share.example.com/share");
+        assert!(validate_frontend_url("https://share.example.com/share?x=1").is_err());
+        assert!(validate_frontend_url("http://share.example.com/share").is_err());
+        assert!(validate_frontend_url("http://127.0.0.1:4321/share").is_ok());
     }
 
     #[test]

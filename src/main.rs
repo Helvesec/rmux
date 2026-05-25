@@ -196,13 +196,13 @@ where
                 .map_err(|_| "--web-port requires an integer port".to_owned())?;
             *web_port = Some(port);
         }
-        Some("--web-frontend") => {
+        Some("--frontend-url" | "--web-frontend") => {
             let frontend = args
                 .next()
-                .ok_or_else(|| "--web-frontend requires a URL".to_owned())?;
+                .ok_or_else(|| "--frontend-url requires a URL".to_owned())?;
             let frontend = frontend
                 .to_str()
-                .ok_or_else(|| "invalid UTF-8 in --web-frontend".to_owned())?;
+                .ok_or_else(|| "invalid UTF-8 in --frontend-url".to_owned())?;
             *web_frontend = Some(frontend.to_owned());
         }
         Some(other) => {

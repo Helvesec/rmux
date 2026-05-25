@@ -18,6 +18,7 @@ use crate::{Result, RmuxError};
 pub struct WebShareBuilder<'a> {
     transport: &'a TransportClient,
     target: PaneTargetRef,
+    frontend_url: Option<String>,
     public_base_url: Option<String>,
     ttl_seconds: Option<u64>,
     max_viewers: Option<u16>,
@@ -29,6 +30,7 @@ impl<'a> WebShareBuilder<'a> {
         Self {
             transport,
             target,
+            frontend_url: None,
             public_base_url: None,
             ttl_seconds: None,
             max_viewers: None,
@@ -47,6 +49,20 @@ impl<'a> WebShareBuilder<'a> {
     #[must_use]
     pub const fn max_viewers(mut self, max_viewers: u16) -> Self {
         self.max_viewers = Some(max_viewers);
+        self
+    }
+
+    /// Sets the browser frontend URL used for this share.
+    #[must_use]
+    pub fn frontend_url(mut self, url: impl Into<String>) -> Self {
+        self.frontend_url = Some(url.into());
+        self
+    }
+
+    /// Sets the public tunnel origin used by the frontend.
+    #[must_use]
+    pub fn tunnel_url(mut self, url: impl Into<String>) -> Self {
+        self.public_base_url = Some(url.into());
         self
     }
 
@@ -79,6 +95,7 @@ impl<'a> WebShareBuilder<'a> {
                 CreateWebShareRequest {
                     target: self.target,
                     public_base_url: self.public_base_url,
+                    frontend_url: self.frontend_url,
                     ttl_seconds: self.ttl_seconds,
                     max_viewers: self.max_viewers,
                     writable: self.writable,
