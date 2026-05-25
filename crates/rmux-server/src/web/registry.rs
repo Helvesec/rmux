@@ -12,6 +12,7 @@ use rmux_proto::{
 };
 use rmux_proto::{PaneTargetRef, RmuxError};
 use tokio::sync::watch;
+use tracing::info;
 
 use super::leases::{ConnectionLease, LeaseBook};
 use super::origin::validate_public_base_url;
@@ -116,6 +117,16 @@ impl WebShareRegistry {
             .lock()
             .expect("web-share registry mutex must not be poisoned")
             .insert(record);
+        info!(
+            share_id = %share_id,
+            target = %summary_target,
+            writable = request.writable,
+            ttl_seconds,
+            max_viewers,
+            public = request.public_base_url.is_some(),
+            listener_port = self.settings.port,
+            "web_share_created"
+        );
 
         let output = created_output(&viewer_url);
         Ok(WebShareCreatedResponse {
@@ -149,6 +160,9 @@ impl WebShareRegistry {
             .lock()
             .expect("web-share registry mutex must not be poisoned")
             .remove(&request.share_id, WebShareRevokeReason::StoppedByOwner);
+        if stopped {
+            info!(share_id = %request.share_id, reason = "cli_stop", "web_share_stopped");
+        }
         WebShareStoppedResponse {
             output: stopped_output(&request.share_id, stopped),
             share_id: request.share_id,
@@ -162,6 +176,9 @@ impl WebShareRegistry {
             .lock()
             .expect("web-share registry mutex must not be poisoned")
             .clear(WebShareRevokeReason::StoppedByOwner);
+        if stopped > 0 {
+            info!(stopped, reason = "cli_stop_all", "web_share_stop_all");
+        }
         WebShareStoppedAllResponse {
             output: CommandOutput::from_stdout(format!("stopped {stopped}\n")),
             stopped,
@@ -206,7 +223,9 @@ impl WebShareRegistry {
         let record = inner.records.get(share_id).ok_or_else(|| {
             RmuxError::Server("web-share does not exist or has expired".to_owned())
         })?;
-        record.connect(key, role)
+        let access = record.connect(key, role)?;
+        info!(share_id, role = ?role, "web_share_access_granted");
+        Ok(access)
     }
 
     pub(crate) fn listener(&self) -> WebShareListener {

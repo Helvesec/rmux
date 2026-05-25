@@ -6,8 +6,9 @@ use std::time::{Duration, Instant, SystemTime};
 use rmux_core::events::OutputCursorItem;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{sleep, timeout};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use super::origin::origin_matches;
 use super::protocol::{
@@ -20,6 +21,7 @@ use crate::handler::RequestHandler;
 
 const HTTP_READ_LIMIT: usize = 8 * 1024;
 const OPERATOR_RATE_LIMIT: u16 = 200;
+const PRE_AUTH_SLOTS: usize = 16;
 
 pub(crate) fn spawn(handler: Arc<RequestHandler>) {
     tokio::spawn(async move {
@@ -33,19 +35,37 @@ async fn serve(handler: Arc<RequestHandler>) -> io::Result<()> {
     let listener_config = handler.web_listener();
     let bind_addr = format!("{}:{}", listener_config.host, listener_config.port);
     let listener = TcpListener::bind(&bind_addr).await?;
+    let pre_auth = Arc::new(Semaphore::new(PRE_AUTH_SLOTS));
     debug!("web-share listener bound to {bind_addr}");
     loop {
         let (stream, _) = listener.accept().await?;
         let handler = Arc::clone(&handler);
+        let pre_auth = Arc::clone(&pre_auth);
         tokio::spawn(async move {
-            if let Err(error) = serve_connection(stream, handler).await {
+            if let Err(error) = serve_connection(stream, handler, pre_auth).await {
                 debug!("web-share connection ended: {error}");
             }
         });
     }
 }
 
-async fn serve_connection(mut stream: TcpStream, handler: Arc<RequestHandler>) -> io::Result<()> {
+async fn serve_connection(
+    mut stream: TcpStream,
+    handler: Arc<RequestHandler>,
+    pre_auth: Arc<Semaphore>,
+) -> io::Result<()> {
+    let pre_auth_permit = match pre_auth.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return write_response(
+                &mut stream,
+                503,
+                "text/plain; charset=utf-8",
+                b"too many pending web-share auth connections\n",
+            )
+            .await;
+        }
+    };
     let request = match timeout(PRE_AUTH_TIMEOUT, read_http_request(&mut stream)).await {
         Ok(Ok(request)) => request,
         Ok(Err(error)) if error.kind() == io::ErrorKind::InvalidData => {
@@ -82,8 +102,9 @@ async fn serve_connection(mut stream: TcpStream, handler: Arc<RequestHandler>) -
         .await;
     }
     if request.path == "/share" {
-        return serve_websocket(stream, request, handler).await;
+        return serve_websocket(stream, request, handler, pre_auth_permit).await;
     }
+    drop(pre_auth_permit);
     if request.path.starts_with("/ws/") {
         return write_response(
             &mut stream,
@@ -106,6 +127,7 @@ async fn serve_websocket(
     mut stream: TcpStream,
     request: HttpRequest,
     handler: Arc<RequestHandler>,
+    pre_auth_permit: OwnedSemaphorePermit,
 ) -> io::Result<()> {
     let Some(key) = request.headers.get("sec-websocket-key") else {
         return write_response(
@@ -125,6 +147,7 @@ async fn serve_websocket(
             return Ok(());
         }
     };
+    drop(pre_auth_permit);
     let mut pane = match handler
         .open_web_share(&auth.id, &auth.key, auth.role.connect_role())
         .await
@@ -133,6 +156,12 @@ async fn serve_websocket(
         Err(error) => {
             sleep(UNIFORM_AUTH_DELAY).await;
             let (code, reason) = close_for_auth_error(&error.to_string());
+            info!(
+                share_id = %auth.id,
+                close_code = code,
+                reason,
+                "web_share_auth_failed"
+            );
             let _ = socket.write_close_code(code, reason).await;
             return Ok(());
         }
@@ -145,6 +174,11 @@ async fn serve_websocket(
         }
     }
     sleep(UNIFORM_AUTH_DELAY).await;
+    info!(
+        share_id = %auth.id,
+        role = auth.role.as_str(),
+        "web_share_auth_ok"
+    );
     send_ready(&mut socket, &pane, auth.role.as_str()).await?;
     send_snapshot(&mut socket, &pane.snapshot).await?;
     let mut rate_limiter = OperatorRateLimiter::new();
@@ -186,7 +220,7 @@ async fn serve_websocket(
                             return Ok(());
                         }
                         if !rate_limiter.try_acquire() {
-                            debug!(share_id = auth.id, "operator_rate_limit_hit");
+                            info!(share_id = %auth.id, "web_share_operator_rate_limit_hit");
                             continue;
                         }
                         handle_operator_binary_frame(&handler, &mut socket, &pane, &bytes).await?;
@@ -345,6 +379,7 @@ async fn write_response(
         405 => "Method Not Allowed",
         410 => "Gone",
         431 => "Request Header Fields Too Large",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     let head = format!(
