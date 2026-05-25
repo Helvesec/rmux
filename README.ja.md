@@ -14,7 +14,7 @@
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Release validation](https://github.com/Helvesec/rmux/actions/workflows/ci.yml/badge.svg)](https://github.com/Helvesec/rmux/actions/workflows/ci.yml)
-[![rmux 0.3.0](https://img.shields.io/badge/rmux-0.3.0-informational.svg)](#install)
+[![rmux 0.3.1](https://img.shields.io/badge/rmux-0.3.1-informational.svg)](#install)
 [![Platform: Linux | macOS | Windows](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#platform-support)
 [![Unsafe policy](https://img.shields.io/badge/unsafe-restricted-success.svg)](#verification)
 
@@ -26,7 +26,7 @@
 </div>
 
 > [!IMPORTANT]
-> 現在のリリースは **v0.3.0**、公開日は **2026年5月23日**。tmux 互換の 90 コマンドはすべて実装済みですが、まだ新しい公開プレビューのため不具合が残る可能性があります。問題は [issues](https://github.com/helvesec/rmux/issues) へ報告できます。
+> 現在のリリースは **v0.3.1**、公開日は **2026年5月25日**。tmux 互換の 90 コマンドはすべて実装済みですが、まだ新しい公開プレビューのため不具合が残る可能性があります。問題は [issues](https://github.com/helvesec/rmux/issues) へ報告できます。
 
 ## RMUX を選ぶ理由
 
@@ -66,7 +66,7 @@ Windows PowerShell のビルド済みバイナリ：
 irm https://rmux.io/install.ps1 | iex
 ```
 
-直接ダウンロードと SHA256 チェックサムは [v0.3.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.3.0) で確認できます。
+直接ダウンロードと SHA256 チェックサムは [v0.3.1 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.3.1) で確認できます。
 
 Cargo で crates.io から：
 
