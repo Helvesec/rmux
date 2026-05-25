@@ -75,6 +75,7 @@ pub mod spec;
 pub mod trace;
 pub mod types;
 pub mod wait;
+pub mod web_share;
 
 #[allow(dead_code)]
 pub(crate) mod transport;
@@ -134,3 +135,6 @@ pub use types::{
     WindowRef,
 };
 pub use wait::{ArmedWait, VisibleTextExpectation, VisibleTextWait, WaitTimeoutError};
+pub use web_share::{
+    WebConfigInfo, WebShareBuilder, WebShareHandle, WebShareLookup, WebShareSummary,
+};
