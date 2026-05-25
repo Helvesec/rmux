@@ -375,13 +375,23 @@ impl OuterTerminal {
     }
 
     fn mouse_sequence(&self) -> Option<String> {
+        // Enable in the same order tmux uses in tty_mouse_mode():
+        //   ?1006h  SGR extended coordinates
+        //   ?1000h  normal button tracking   ← must come before ?1002h
+        //   ?1002h  button-event tracking
+        //
+        // Some terminals (e.g. Termius) require ?1000h to be set before
+        // ?1002h; reversing the order causes them to fall back to sending
+        // cursor keys (ESC [ A / ESC [ B) for scroll instead of SGR mouse
+        // events, so WheelUpPane / WheelDownPane bindings never fire.
         (self.supports_mouse && self.mouse_reporting_enabled)
-            .then_some("\x1b[?1006h\x1b[?1002h\x1b[?1000h".to_owned())
+            .then_some("\x1b[?1006h\x1b[?1000h\x1b[?1002h".to_owned())
     }
 
     fn disable_mouse_sequence(&self) -> Option<String> {
+        // Disable in reverse order.
         self.supports_mouse
-            .then_some("\x1b[?1000l\x1b[?1002l\x1b[?1006l".to_owned())
+            .then_some("\x1b[?1002l\x1b[?1000l\x1b[?1006l".to_owned())
     }
 
     fn extkeys_sequence(&self) -> Option<String> {
