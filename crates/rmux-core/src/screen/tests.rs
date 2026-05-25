@@ -1,5 +1,6 @@
-use super::{Screen, MAX_TERMINAL_PASSTHROUGH_EVENTS, MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES};
+use super::{Screen, MAX_TERMINAL_PASSTHROUGH_EVENTS};
 use crate::input::InputParser;
+use crate::terminal_passthrough::MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES;
 use crate::{GridRenderOptions, OptionStore, ScreenCaptureRange, Utf8Config};
 use rmux_proto::{OptionName, ScopeSelector, SetOptionMode, TerminalSize};
 
@@ -17,7 +18,7 @@ fn terminal_passthrough_drops_oversized_payloads() {
     let mut screen = new_screen(10, 2, 10);
     let payload = vec![b'A'; MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES + 1];
 
-    screen.push_terminal_passthrough(0, 0, &payload);
+    screen.push_terminal_passthrough(crate::TerminalPassthrough::kitty_graphics(0, 0, payload));
 
     assert!(screen.take_terminal_passthrough().is_empty());
     assert_eq!(screen.take_terminal_passthrough_dropped_count(), 1);
@@ -29,7 +30,11 @@ fn terminal_passthrough_keeps_newest_events_when_queue_is_full() {
     let mut screen = new_screen(10, 2, 10);
     for index in 0..=MAX_TERMINAL_PASSTHROUGH_EVENTS {
         let payload = format!("Gf=100;{index}");
-        screen.push_terminal_passthrough(index as u32, 0, payload.as_bytes());
+        screen.push_terminal_passthrough(crate::TerminalPassthrough::kitty_graphics(
+            index as u32,
+            0,
+            payload.into_bytes(),
+        ));
     }
 
     let passthroughs = screen.take_terminal_passthrough();

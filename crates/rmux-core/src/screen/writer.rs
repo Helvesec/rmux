@@ -1,6 +1,7 @@
 use crate::grid::{Grid, GridCell, GridCellFlags, GridLineFlags};
 use crate::input::mode;
 use crate::input::{CellState, InputEndType, ScreenWriter, COLOUR_DEFAULT};
+use crate::TerminalPassthrough;
 
 use super::{SavedGrid, Screen};
 
@@ -479,7 +480,19 @@ impl ScreenWriter for Screen {
     }
 
     fn apc_passthrough(&mut self, data: &[u8]) {
-        self.push_terminal_passthrough(self.cursor_x, self.cursor_y, data);
+        self.push_terminal_passthrough(TerminalPassthrough::kitty_graphics(
+            self.cursor_x,
+            self.cursor_y,
+            data.to_vec(),
+        ));
+    }
+
+    fn sixel_passthrough(&mut self, data: &[u8]) {
+        self.push_terminal_passthrough(TerminalPassthrough::sixel(
+            self.cursor_x,
+            self.cursor_y,
+            data.to_vec(),
+        ));
     }
 
     fn screen_size_x(&self) -> u32 {

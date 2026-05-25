@@ -163,6 +163,10 @@ impl OuterTerminal {
         self.supports_kitty_graphics
     }
 
+    pub(crate) const fn supports_sixel(&self) -> bool {
+        self.supports_sixel
+    }
+
     pub(crate) fn attach_start_sequence(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(alternate_screen_enter_sequence(self.context.term_name()));

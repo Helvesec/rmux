@@ -7,8 +7,9 @@ use super::{
         DEFAULT_CR, DEFAULT_CS, DEFAULT_DSBP, DEFAULT_DSEKS, DEFAULT_DSFCS, DEFAULT_DSMG,
         DEFAULT_ENBP, DEFAULT_ENEKS, DEFAULT_ENFCS, DEFAULT_ENMG, DEFAULT_FOOT_FEATURES,
         DEFAULT_FSL, DEFAULT_HLS, DEFAULT_ITERM2_FEATURES, DEFAULT_KITTY_FEATURES,
-        DEFAULT_MINTTY_FEATURES, DEFAULT_MS, DEFAULT_RXVT_UNICODE_FEATURES, DEFAULT_SE, DEFAULT_SS,
-        DEFAULT_SWD, DEFAULT_SYNC, DEFAULT_TMUX_FEATURES, DEFAULT_TSL, DEFAULT_XTERM_FEATURES,
+        DEFAULT_MINTTY_FEATURES, DEFAULT_MLTERM_FEATURES, DEFAULT_MS,
+        DEFAULT_RXVT_UNICODE_FEATURES, DEFAULT_SE, DEFAULT_SS, DEFAULT_SWD, DEFAULT_SYNC,
+        DEFAULT_TMUX_FEATURES, DEFAULT_TSL, DEFAULT_XTERM_FEATURES,
     },
     OuterTerminal, OuterTerminalContext,
 };
@@ -168,6 +169,9 @@ impl OuterTerminal {
         if term.starts_with("foot") {
             self.add_features(DEFAULT_FOOT_FEATURES);
         }
+        if term.starts_with("mlterm") || term_program.eq_ignore_ascii_case("mlterm") {
+            self.add_features(DEFAULT_MLTERM_FEATURES);
+        }
         if term.starts_with("xterm-kitty")
             || term.starts_with("xterm-ghostty")
             || term.starts_with("wezterm")
@@ -175,6 +179,9 @@ impl OuterTerminal {
             || term_program.eq_ignore_ascii_case("wezterm")
         {
             self.add_features(DEFAULT_KITTY_FEATURES);
+        }
+        if term.starts_with("wezterm") || term_program.eq_ignore_ascii_case("wezterm") {
+            self.apply_feature_name("sixel");
         }
         if term.starts_with("xterm") {
             self.add_features(DEFAULT_XTERM_FEATURES);

@@ -249,18 +249,21 @@ RMUX works with shells that query terminal capabilities, including fish. It
 answers terminal device-attribute probes and handles Escape-key timing so fish
 prompts and key sequences behave normally inside RMUX panes.
 
-Kitty graphics passthrough is available for outer terminals that support the
-Kitty graphics protocol, including Kitty, Ghostty, and WezTerm. It is opt-in:
+Graphics passthrough is available for outer terminals that support Kitty
+graphics or SIXEL. RMUX detects Kitty graphics for Kitty, Ghostty, and WezTerm,
+and detects SIXEL for terminals such as foot, mintty, mlterm, and WezTerm. It
+is opt-in:
 
 ```tmux
 set -g allow-passthrough on
 ```
 
-If your terminal supports Kitty graphics but is not detected automatically, add
-a terminal feature override:
+If your terminal supports either protocol but is not detected automatically,
+add a terminal feature override:
 
 ```tmux
 set -as terminal-features 'xterm-kitty:kitty-graphics'
+set -as terminal-features 'xterm*:sixel'
 ```
 
 On Windows, RMUX enables modern ConPTY passthrough when the OS supports it. Set

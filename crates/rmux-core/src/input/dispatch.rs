@@ -512,7 +512,16 @@ pub(crate) fn dispatch_dcs(parser: &mut InputParser, writer: &mut dyn ScreenWrit
     // tmux passthrough: DCS with `tmux;` prefix.
     if buf.starts_with(b"tmux;") {
         writer.dcs_passthrough(&buf[5..]);
+        return;
     }
 
-    // Sixel: final byte 'q' with no intermediates. Deferred to Milestone 30.
+    // Sixel: final byte 'q' with no intermediates. Preserve DCS parameters
+    // before the final byte so the outer terminal receives the original image
+    // command, minus the ESC P / ST framing.
+    if parser.interm_len == 0 && buf.first() == Some(&b'q') {
+        let mut payload = Vec::with_capacity(parser.param_len + buf.len());
+        payload.extend_from_slice(&parser.param_buf[..parser.param_len]);
+        payload.extend_from_slice(buf);
+        writer.sixel_passthrough(&payload);
+    }
 }

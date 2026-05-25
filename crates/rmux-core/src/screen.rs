@@ -3,7 +3,7 @@
 use crate::grid::{Grid, GridCell, GridCellFlags, GridLine};
 use crate::hyperlinks::Hyperlinks;
 use crate::input::{mode, CellState, SavedState, ScreenWriter, COLOUR_DEFAULT};
-use crate::terminal_passthrough::TerminalPassthrough;
+use crate::terminal_passthrough::{TerminalPassthrough, MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES};
 use crate::utf8::{combine_char as utf8_combine_char, CombineResult, Utf8Config};
 use rmux_proto::TerminalSize;
 
@@ -27,7 +27,6 @@ mod writer;
 pub use view::{ScreenCellView, ScreenLineView};
 
 pub(crate) const MAX_TERMINAL_PASSTHROUGH_EVENTS: usize = 256;
-pub(crate) const MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SavedGrid {
@@ -255,8 +254,8 @@ impl Screen {
         dropped
     }
 
-    fn push_terminal_passthrough(&mut self, cursor_x: u32, cursor_y: u32, payload: &[u8]) {
-        if payload.len() > MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES {
+    fn push_terminal_passthrough(&mut self, passthrough: TerminalPassthrough) {
+        if passthrough.payload().len() > MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES {
             self.dropped_terminal_passthrough_count =
                 self.dropped_terminal_passthrough_count.saturating_add(1);
             return;
@@ -274,12 +273,7 @@ impl Screen {
                 .saturating_add(overflow as u64);
         }
 
-        self.terminal_passthrough
-            .push(TerminalPassthrough::kitty_graphics(
-                cursor_x,
-                cursor_y,
-                payload.to_vec(),
-            ));
+        self.terminal_passthrough.push(passthrough);
     }
 
     /// Returns the stored OSC 8 URI for a hyperlink inner ID.

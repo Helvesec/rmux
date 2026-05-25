@@ -1,4 +1,4 @@
-use rmux_core::{PaneGeometry, TerminalPassthrough};
+use rmux_core::{PaneGeometry, TerminalPassthrough, TerminalPassthroughKind};
 
 use super::types::OpenAttachTarget;
 
@@ -6,21 +6,32 @@ pub(super) fn render_passthroughs(
     target: &OpenAttachTarget,
     passthroughs: &[TerminalPassthrough],
 ) -> Vec<u8> {
-    if !target.kitty_graphics_passthrough || passthroughs.is_empty() {
+    if passthroughs.is_empty() {
         return Vec::new();
     }
 
     let mut frame = Vec::new();
-    frame.extend_from_slice(b"\x1b[s");
     for passthrough in passthroughs {
-        // Kitty `c=` and `r=` describe image dimensions, not absolute terminal
-        // coordinates, so every live passthrough is anchored at the pane-local
-        // cursor captured when the application emitted it.
+        if !passthrough_enabled(target, passthrough.kind()) {
+            continue;
+        }
+        if frame.is_empty() {
+            frame.extend_from_slice(b"\x1b[s");
+        }
         append_cursor_position(&mut frame, target.active_pane_geometry, passthrough);
         frame.extend_from_slice(&passthrough.render_sequence());
     }
-    frame.extend_from_slice(b"\x1b[u");
+    if !frame.is_empty() {
+        frame.extend_from_slice(b"\x1b[u");
+    }
     frame
+}
+
+fn passthrough_enabled(target: &OpenAttachTarget, kind: TerminalPassthroughKind) -> bool {
+    match kind {
+        TerminalPassthroughKind::KittyGraphics => target.kitty_graphics_passthrough,
+        TerminalPassthroughKind::Sixel => target.sixel_passthrough,
+    }
 }
 
 fn append_cursor_position(
@@ -76,6 +87,7 @@ mod tests {
             cursor_style: 0,
             active_pane_geometry: PaneGeometry::new(5, 6, 80, 24),
             kitty_graphics_passthrough: true,
+            sixel_passthrough: false,
             persistent_overlay_state_id: None,
             live_pane: None,
         };
@@ -107,6 +119,7 @@ mod tests {
             cursor_style: 0,
             active_pane_geometry: PaneGeometry::new(5, 6, 80, 24),
             kitty_graphics_passthrough: true,
+            sixel_passthrough: false,
             persistent_overlay_state_id: None,
             live_pane: None,
         };
@@ -126,6 +139,34 @@ mod tests {
     }
 
     #[test]
+    fn render_passthroughs_wraps_sixel_dcs_at_pane_cursor() {
+        let pty = PtyPair::open().expect("open pty pair");
+        let pane_output = pane_output_channel();
+        let target = OpenAttachTarget {
+            session_name: SessionName::new("alpha").expect("valid session name"),
+            _pane_master: pty.into_master(),
+            pane_output: Some(pane_output.subscribe()),
+            render_frame: Vec::new(),
+            outer_terminal: OuterTerminal::resolve(
+                &OptionStore::default(),
+                OuterTerminalContext::from_pairs(&[("TERM", "foot")]),
+            ),
+            cursor_style: 0,
+            active_pane_geometry: PaneGeometry::new(5, 6, 80, 24),
+            kitty_graphics_passthrough: false,
+            sixel_passthrough: true,
+            persistent_overlay_state_id: None,
+            live_pane: None,
+        };
+
+        let frame = render_passthroughs(
+            &target,
+            &[TerminalPassthrough::sixel(1, 2, b"q#0!10~".to_vec())],
+        );
+        assert_eq!(frame, b"\x1b[s\x1b[9;7H\x1bPq#0!10~\x1b\\\x1b[u");
+    }
+
+    #[test]
     fn render_passthroughs_is_empty_when_target_disables_passthrough() {
         let pty = PtyPair::open().expect("open pty pair");
         let pane_output = pane_output_channel();
@@ -141,6 +182,7 @@ mod tests {
             cursor_style: 0,
             active_pane_geometry: PaneGeometry::new(5, 6, 80, 24),
             kitty_graphics_passthrough: false,
+            sixel_passthrough: false,
             persistent_overlay_state_id: None,
             live_pane: None,
         };
@@ -154,5 +196,36 @@ mod tests {
             )],
         );
         assert!(frame.is_empty());
+    }
+
+    #[test]
+    fn render_passthroughs_filters_by_protocol_support() {
+        let pty = PtyPair::open().expect("open pty pair");
+        let pane_output = pane_output_channel();
+        let target = OpenAttachTarget {
+            session_name: SessionName::new("alpha").expect("valid session name"),
+            _pane_master: pty.into_master(),
+            pane_output: Some(pane_output.subscribe()),
+            render_frame: Vec::new(),
+            outer_terminal: OuterTerminal::resolve(
+                &OptionStore::default(),
+                OuterTerminalContext::from_pairs(&[("TERM", "foot")]),
+            ),
+            cursor_style: 0,
+            active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+            kitty_graphics_passthrough: false,
+            sixel_passthrough: true,
+            persistent_overlay_state_id: None,
+            live_pane: None,
+        };
+
+        let frame = render_passthroughs(
+            &target,
+            &[
+                TerminalPassthrough::kitty_graphics(0, 0, b"Gf=100;AAAA".to_vec()),
+                TerminalPassthrough::sixel(0, 1, b"q#0!10~".to_vec()),
+            ],
+        );
+        assert_eq!(frame, b"\x1b[s\x1b[2;1H\x1bPq#0!10~\x1b\\\x1b[u");
     }
 }
