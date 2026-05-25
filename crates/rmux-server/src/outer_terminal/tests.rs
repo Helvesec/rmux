@@ -13,6 +13,9 @@ fn make_session() -> Session {
     Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 })
 }
 
+const MOUSE_ENABLE_SEQUENCE: &str = "\u{1b}[?1006h\u{1b}[?1000h\u{1b}[?1002h";
+const MOUSE_DISABLE_SEQUENCE: &str = "\u{1b}[?1002l\u{1b}[?1000l\u{1b}[?1006l";
+
 #[test]
 fn terminal_features_match_globs_and_case_insensitive_feature_names() {
     let mut options = OptionStore::new();
@@ -169,12 +172,14 @@ fn attach_sequences_follow_focus_and_extended_key_options() {
     assert!(start.contains("\u{1b}[?1006h"));
     assert!(start.contains("\u{1b}[?1002h"));
     assert!(start.contains("\u{1b}[?1000h"));
+    assert!(start.contains(MOUSE_ENABLE_SEQUENCE));
     assert!(start.contains("\u{1b}[?1004h"));
     assert!(start.contains("\u{1b}[>4;2m"));
     assert!(stop.contains("\u{1b}[?2004l"));
     assert!(stop.contains("\u{1b}[?1000l"));
     assert!(stop.contains("\u{1b}[?1002l"));
     assert!(stop.contains("\u{1b}[?1006l"));
+    assert!(stop.contains(MOUSE_DISABLE_SEQUENCE));
     assert!(stop.contains("\u{1b}[?1004l"));
     assert!(stop.contains("\u{1b}[>4m"));
     assert!(stop.ends_with("\u{1b}[?1049l\u{1b}[23;0;0t"));
@@ -207,9 +212,11 @@ fn client_mouse_feature_enables_mouse_attach_sequences_when_mouse_option_is_on()
     assert!(start.contains("\u{1b}[?1006h"));
     assert!(start.contains("\u{1b}[?1002h"));
     assert!(start.contains("\u{1b}[?1000h"));
+    assert!(start.contains(MOUSE_ENABLE_SEQUENCE));
     assert!(stop.contains("\u{1b}[?1000l"));
     assert!(stop.contains("\u{1b}[?1002l"));
     assert!(stop.contains("\u{1b}[?1006l"));
+    assert!(stop.contains(MOUSE_DISABLE_SEQUENCE));
 }
 
 #[test]
@@ -613,11 +620,13 @@ fn transition_sequence_toggles_mouse_reporting_with_session_scope() {
     assert!(seq.contains("\u{1b}[?1000l"));
     assert!(seq.contains("\u{1b}[?1002l"));
     assert!(seq.contains("\u{1b}[?1006l"));
+    assert!(seq.contains(MOUSE_DISABLE_SEQUENCE));
 
     let seq = String::from_utf8(enabled.transition_sequence_from(&disabled)).expect("utf8");
     assert!(seq.contains("\u{1b}[?1006h"));
     assert!(seq.contains("\u{1b}[?1002h"));
     assert!(seq.contains("\u{1b}[?1000h"));
+    assert!(seq.contains(MOUSE_ENABLE_SEQUENCE));
 }
 
 #[test]
