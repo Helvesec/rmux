@@ -1,8 +1,9 @@
 use std::path::Path;
 
 use rmux_proto::{
-    CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest, PaneTargetRef,
+    CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest, PaneTargetRef, Response,
     StopAllWebSharesRequest, StopWebShareRequest, WebShareConfigRequest, WebShareRequest,
+    WebShareResponse,
 };
 
 use super::{
@@ -21,7 +22,19 @@ pub(super) fn run_web_share(
     let response = connection
         .web_share(request)
         .map_err(ExitFailure::from_client)?;
+    warn_operator_url(&response);
     finish_command_success(response, "web-share")
+}
+
+fn warn_operator_url(response: &Response) {
+    let Response::WebShare(WebShareResponse::Created(created)) = response else {
+        return;
+    };
+    let Some(operator_url) = created.operator_url.as_deref() else {
+        return;
+    };
+    eprintln!("rmux: operator URL (writable, keep private):");
+    eprintln!("rmux:   {operator_url}");
 }
 
 fn build_web_share_request(

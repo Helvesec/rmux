@@ -113,7 +113,7 @@ impl WebShareRegistry {
             .expect("web-share registry mutex must not be poisoned")
             .insert(record);
 
-        let output = created_output(&viewer_url, operator_url.as_deref());
+        let output = created_output(&viewer_url);
         Ok(WebShareCreatedResponse {
             share_id,
             target: summary_target,
@@ -391,16 +391,11 @@ enum WebShareRole {
     Viewer,
 }
 
-fn created_output(viewer_url: &str, operator_url: Option<&str>) -> CommandOutput {
+fn created_output(viewer_url: &str) -> CommandOutput {
     let mut output = String::new();
     output.push_str("viewer ");
     output.push_str(viewer_url);
     output.push('\n');
-    if let Some(operator_url) = operator_url {
-        output.push_str("operator ");
-        output.push_str(operator_url);
-        output.push('\n');
-    }
     CommandOutput::from_stdout(output)
 }
 
@@ -503,6 +498,9 @@ mod tests {
             .operator_url
             .as_deref()
             .is_some_and(|url| url.contains("?key=")));
+        let stdout = String::from_utf8_lossy(created.output.stdout());
+        assert!(stdout.contains("viewer "));
+        assert!(!stdout.contains("operator "));
 
         let listed = registry.list(ListWebSharesRequest);
         assert_eq!(listed.shares.len(), 1);
