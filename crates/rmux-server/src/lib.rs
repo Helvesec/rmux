@@ -108,6 +108,8 @@ mod unix_socket;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod wait_for;
+#[cfg(all(any(unix, windows), feature = "web"))]
+mod web;
 pub use daemon::{
     default_socket_path, ConfigFileSelection, ConfigLoadOptions, DaemonConfig, ServerDaemon,
     ServerHandle,

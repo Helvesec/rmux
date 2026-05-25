@@ -15,7 +15,7 @@ fn command_names(input: &str) -> Vec<String> {
 
 #[test]
 fn frozen_command_inventory_has_expected_entries_and_aliases() {
-    assert_eq!(COMMAND_TABLE.len(), 90);
+    assert_eq!(COMMAND_TABLE.len(), 91);
     assert_eq!(lookup_command("new").unwrap().name, "new-session");
     assert_eq!(lookup_command("ls").unwrap().name, "list-sessions");
     assert_eq!(lookup_command("splitw").unwrap().name, "split-window");

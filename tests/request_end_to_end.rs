@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use common::{assert_success, stderr, stdout, CliHarness};
 
-const COMMAND_SURFACE: [&str; 90] = [
+const COMMAND_SURFACE: [&str; 91] = [
     "new-session",
     "start-server",
     "kill-server",
@@ -96,6 +96,7 @@ const COMMAND_SURFACE: [&str; 90] = [
     "run-shell",
     "if-shell",
     "wait-for",
+    "web-share",
     "rename-session",
     "list-sessions",
     "list-panes",

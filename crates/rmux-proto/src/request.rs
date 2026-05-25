@@ -94,6 +94,14 @@ pub use buffer::{
     LoadBufferRequest, PasteBufferRequest, SaveBufferRequest, SetBufferRequest, ShowBufferRequest,
 };
 
+#[path = "request/web.rs"]
+mod web;
+pub use web::{
+    CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest, StopAllWebSharesRequest,
+    StopWebShareRequest, WebShareConfigRequest, WebShareRequest, WebShareScope, WebShareUrlOptions,
+    WebTerminalPalette, WebTerminalTheme,
+};
+
 /// All detached public command and internal RPC requests supported by the wire
 /// protocol.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,6 +334,8 @@ pub enum Request {
     DaemonStatus(DaemonStatusRequest),
     /// Internal idle-only shutdown endpoint used by seamless upgrades.
     ShutdownIfIdle(ShutdownIfIdleRequest),
+    /// Browser-visible pane sharing command family.
+    WebShare(WebShareRequest),
 }
 
 impl Request {
@@ -446,6 +456,7 @@ impl Request {
             Self::Handshake(_) => "handshake",
             Self::DaemonStatus(_) => "daemon-status",
             Self::ShutdownIfIdle(_) => "shutdown-if-idle",
+            Self::WebShare(_) => "web-share",
         }
     }
 }

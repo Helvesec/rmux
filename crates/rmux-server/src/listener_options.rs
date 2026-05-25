@@ -10,6 +10,8 @@ pub(crate) struct ServeOptions {
     pub(crate) config_load: ConfigLoadOptions,
     pub(crate) subscription_limits: SubscriptionLimits,
     pub(crate) owner_uid: u32,
+    pub(crate) web_frontend: Option<String>,
+    pub(crate) web_port: u16,
     #[cfg(unix)]
     pub(crate) socket_identity: Option<SocketFileIdentity>,
 }
@@ -25,9 +27,17 @@ impl ServeOptions {
             config_load,
             subscription_limits,
             owner_uid,
+            web_frontend: None,
+            web_port: 9777,
             #[cfg(unix)]
             socket_identity: None,
         }
+    }
+
+    pub(crate) fn with_web_options(mut self, port: u16, frontend: Option<String>) -> Self {
+        self.web_port = port;
+        self.web_frontend = frontend;
+        self
     }
 
     #[cfg(unix)]

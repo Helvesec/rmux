@@ -46,6 +46,7 @@ crossterm = { version = "0.29.0", default-features = false, features = [
 tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 
 [features]
-default = []
+default = ["web"]
 crossterm = ["dep:crossterm"]
 regex = ["dep:regex"]
+web = []

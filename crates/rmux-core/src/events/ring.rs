@@ -212,6 +212,12 @@ impl OutputRing {
         OutputCursor::new(self.next_sequence)
     }
 
+    /// Returns a cursor that starts at an explicit output sequence.
+    #[must_use]
+    pub const fn cursor_from_sequence(sequence: u64) -> OutputCursor {
+        OutputCursor::new(sequence)
+    }
+
     /// Polls one item for `cursor`, reporting gaps before retained events.
     pub fn poll_cursor(&self, cursor: &mut OutputCursor) -> Option<OutputCursorItem> {
         let next = cursor.next_sequence();

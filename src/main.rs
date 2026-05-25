@@ -81,6 +81,8 @@ struct InternalDaemonArgs {
     config_selection: ServerConfigFileSelection,
     config_quiet: bool,
     config_cwd: Option<PathBuf>,
+    web_frontend: Option<String>,
+    web_port: Option<u16>,
 }
 
 #[cfg(test)]
@@ -99,6 +101,8 @@ where
     let mut config_selection = ServerConfigFileSelection::Disabled;
     let mut config_quiet = false;
     let mut config_cwd = None;
+    let mut web_frontend = None;
+    let mut web_port = None;
 
     if let Some(first) = args.next() {
         if os_string::os_str_bytes(first.as_os_str()).starts_with(b"--") {
@@ -108,6 +112,8 @@ where
                 &mut config_selection,
                 &mut config_quiet,
                 &mut config_cwd,
+                &mut web_frontend,
+                &mut web_port,
             )?;
         } else {
             socket_path = Some(PathBuf::from(first));
@@ -124,6 +130,8 @@ where
             &mut config_selection,
             &mut config_quiet,
             &mut config_cwd,
+            &mut web_frontend,
+            &mut web_port,
         )?;
     }
 
@@ -132,6 +140,8 @@ where
         config_selection,
         config_quiet,
         config_cwd,
+        web_frontend,
+        web_port,
     })
 }
 
@@ -141,6 +151,8 @@ fn parse_internal_flag<I>(
     config_selection: &mut ServerConfigFileSelection,
     config_quiet: &mut bool,
     config_cwd: &mut Option<PathBuf>,
+    web_frontend: &mut Option<String>,
+    web_port: &mut Option<u16>,
 ) -> Result<(), String>
 where
     I: Iterator<Item = OsString>,
@@ -173,6 +185,29 @@ where
                 .ok_or_else(|| "--config-cwd requires a path".to_owned())?;
             *config_cwd = Some(PathBuf::from(cwd));
         }
+        Some("--web-port") => {
+            let port = args
+                .next()
+                .ok_or_else(|| "--web-port requires a port".to_owned())?;
+            let port = port
+                .to_str()
+                .ok_or_else(|| "invalid UTF-8 in --web-port".to_owned())?
+                .parse::<u16>()
+                .map_err(|_| "--web-port requires an integer port".to_owned())?;
+            if port == 0 {
+                return Err("--web-port must be between 1 and 65535".to_owned());
+            }
+            *web_port = Some(port);
+        }
+        Some("--frontend-url" | "--web-frontend") => {
+            let frontend = args
+                .next()
+                .ok_or_else(|| "--frontend-url requires a URL".to_owned())?;
+            let frontend = frontend
+                .to_str()
+                .ok_or_else(|| "invalid UTF-8 in --frontend-url".to_owned())?;
+            *web_frontend = Some(frontend.to_owned());
+        }
         Some(other) => {
             return Err(format!("unexpected hidden daemon argument '{other}'"));
         }
@@ -196,6 +231,12 @@ fn run_hidden_daemon(args: InternalDaemonArgs) -> io::Result<()> {
             config.with_config_files(files, args.config_quiet, args.config_cwd)
         }
     };
+    if let Some(port) = args.web_port {
+        config = config.with_web_port(port);
+    }
+    if let Some(frontend) = args.web_frontend {
+        config = config.with_web_frontend(frontend);
+    }
     #[cfg(unix)]
     let runtime = Builder::new_current_thread().enable_all().build()?;
     #[cfg(windows)]

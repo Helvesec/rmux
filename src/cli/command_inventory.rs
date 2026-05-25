@@ -218,7 +218,7 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
         "split-window",
         "(splitw) [-bdefhIPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-t target-pane][shell-command]",
     ),
-    ("start-server", "(start) "),
+    ("start-server", "(start) [--web-port port] [--frontend-url url]"),
     ("suspend-client", "(suspendc) [-t target-client]"),
     ("swap-pane", "(swapp) [-dDUZ] [-s src-pane] [-t dst-pane]"),
     ("swap-window", "(swapw) [-d] [-s src-window] [-t dst-window]"),
@@ -229,6 +229,10 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ("unbind-key", "(unbind) [-anq] [-T key-table] key"),
     ("unlink-window", "(unlinkw) [-k] [-t target-window]"),
     ("wait-for", "(wait) [-L|-S|-U] channel"),
+    (
+        "web-share",
+        "[-lwX] [-K share-id] [--config] [--lookup share-id] [--ttl seconds] [--max-readers count] [--frontend-url url] [--tunnel-url url] [--no-navbar] [--no-disclaimer] [--theme user|light|dark] [--pin] [--controls] [-t pane|session]",
+    ),
 ];
 
 pub(super) fn run_list_commands(args: ListCommandsArgs) -> Result<i32, ExitFailure> {

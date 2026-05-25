@@ -254,20 +254,20 @@ fn publish_pane_bytes(
     if !pane_output.accepts_generation(generation) {
         return Vec::new();
     }
-    let append_result = {
-        let mut transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
-        transcript.append_bytes_with_effects(&bytes)
+    let Some((_sequence, append_result)) =
+        pane_output.publish_for_generation(generation, bytes, |bytes| {
+            let mut transcript = transcript
+                .lock()
+                .expect("pane transcript mutex must not be poisoned");
+            let mut append_result = transcript.append_bytes_with_effects(bytes);
+            let passthroughs = std::mem::take(&mut append_result.passthroughs);
+            (append_result, passthroughs)
+        })
+    else {
+        return Vec::new();
     };
     let replies = append_result.replies;
     let dropped_passthrough_count = append_result.dropped_passthrough_count;
-    if pane_output
-        .send_for_generation_with_passthroughs(generation, bytes, append_result.passthroughs)
-        .is_none()
-    {
-        return Vec::new();
-    }
     if dropped_passthrough_count > 0 {
         warn!(
             session = %session_name,

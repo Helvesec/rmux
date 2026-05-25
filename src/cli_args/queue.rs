@@ -114,10 +114,7 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
     let arguments = command_arguments_for_clap(command.arguments());
     match name.as_str() {
         "new-session" => parse_command_args("new-session", arguments).map(Command::NewSession),
-        "start-server" => {
-            parse_no_args("start-server", arguments)?;
-            Ok(Command::StartServer)
-        }
+        "start-server" => parse_command_args("start-server", arguments).map(Command::StartServer),
         "kill-server" => {
             parse_no_args("kill-server", arguments)?;
             Ok(Command::KillServer)
@@ -251,6 +248,7 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
         "source-file" => parse_command_args("source-file", arguments).map(Command::SourceFile),
         "if-shell" => parse_command_args("if-shell", arguments).map(Command::IfShell),
         "wait-for" => parse_command_args("wait-for", arguments).map(Command::WaitFor),
+        "web-share" => super::web::parse_web_share_args(arguments).map(Command::WebShare),
         "command-prompt" => parse_queue_command_args::<PromptArgs>("command-prompt", arguments)
             .map(|args| Command::Prompt(with_queue_command(args, queue_command))),
         "confirm-before" => {

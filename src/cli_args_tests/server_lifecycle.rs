@@ -19,7 +19,7 @@ fn start_server_parses_without_arguments() {
 
     assert!(matches!(
         cli.command,
-        Some(super::super::Command::StartServer)
+        Some(super::super::Command::StartServer(_))
     ));
 }
 
@@ -27,6 +27,125 @@ fn start_server_parses_without_arguments() {
 fn start_server_rejects_extra_arguments() {
     let error = parse_args(&["start-server", "extra"]).unwrap_err();
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+}
+
+#[test]
+fn start_server_accepts_web_listener_flags() {
+    let cli = parse_args(&[
+        "start-server",
+        "--web-port",
+        "9778",
+        "--frontend-url",
+        "https://share.example.com",
+    ])
+    .unwrap();
+
+    let Some(super::super::Command::StartServer(args)) = cli.command else {
+        panic!("expected start-server command");
+    };
+    assert_eq!(args.web_port, Some(9778));
+    assert_eq!(
+        args.web_frontend.as_deref(),
+        Some("https://share.example.com")
+    );
+}
+
+#[test]
+fn web_share_accepts_subcommand_style_lifecycle_forms() {
+    let cli = parse_args(&["web-share", "list"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert!(args.list);
+
+    let cli = parse_args(&["web-share", "stop", "abc12345"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert_eq!(args.stop.as_deref(), Some("abc12345"));
+
+    let cli = parse_args(&["web-share", "stop", "all"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert!(args.stop_all);
+}
+
+#[test]
+fn web_share_accepts_frontend_and_tunnel_url_flags() {
+    let cli = parse_args(&[
+        "web-share",
+        "--frontend-url",
+        "https://ui.example.com/share",
+        "--tunnel-url",
+        "https://terminal.example.com",
+    ])
+    .unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert_eq!(
+        args.frontend_url.as_deref(),
+        Some("https://ui.example.com/share")
+    );
+    assert_eq!(
+        args.public_base_url.as_deref(),
+        Some("https://terminal.example.com")
+    );
+}
+
+#[test]
+fn web_share_accepts_read_presentation_and_pin_flags() {
+    let cli = parse_args(&[
+        "web-share",
+        "--no-navbar",
+        "--no-disclaimer",
+        "--theme",
+        "user",
+        "--pin",
+    ])
+    .unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert!(args.no_navbar);
+    assert!(args.no_disclaimer);
+    assert!(matches!(
+        args.terminal_theme,
+        Some(super::super::WebShareTerminalThemeArg::User)
+    ));
+    assert!(args.require_pin);
+
+    let cli = parse_args(&["web-share", "--terminal-theme", "dark", "--pairing-code"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert!(matches!(
+        args.terminal_theme,
+        Some(super::super::WebShareTerminalThemeArg::Dark)
+    ));
+    assert!(args.require_pin);
+}
+
+#[test]
+fn web_share_keeps_legacy_public_url_alias() {
+    let cli = parse_args(&["web-share", "--public-url", "https://terminal.example.com"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert_eq!(
+        args.public_base_url.as_deref(),
+        Some("https://terminal.example.com")
+    );
+}
+
+#[test]
+fn web_share_off_is_stop_all_alias() {
+    let cli = parse_args(&["web-share", "off"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert!(args.stop_all);
 }
 
 #[test]

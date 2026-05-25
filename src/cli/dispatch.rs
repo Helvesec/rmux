@@ -34,6 +34,7 @@ use super::target_resolution::{
     resolve_pane_target_spec, resolve_select_layout_target_spec, resolve_session_target_or_current,
     resolve_window_target_or_current,
 };
+use super::web_commands::run_web_share;
 use super::window_commands::{
     run_kill_window, run_last_window, run_link_window, run_list_windows, run_move_window,
     run_new_window, run_next_window, run_previous_window, run_rename_window, run_resize_window,
@@ -98,7 +99,7 @@ fn dispatch(
         Command::NewSession(args) => {
             run_new_session(args, socket_path, command_startup, client_terminal)
         }
-        Command::StartServer => run_start_server(socket_path, command_startup),
+        Command::StartServer(_) => run_start_server(socket_path, command_startup),
         Command::KillServer => run_kill_server(socket_path),
         Command::HasSession(args) => run_has_session(args, socket_path),
         Command::KillSession(args) => run_kill_session(args, socket_path),
@@ -472,6 +473,7 @@ fn dispatch(
                 connection.wait_for(args.channel, mode)
             })
         }
+        Command::WebShare(args) => run_web_share(args, socket_path, command_startup),
         Command::DisplayMenu(args) => {
             run_queued_server_command(socket_path, "display-menu", args.queue_command)
         }
@@ -528,13 +530,18 @@ fn invalid_layout_failure(layout: &str) -> ExitFailure {
 }
 
 pub(super) fn command_has_start_server_flag(command: &Command) -> bool {
-    matches!(
-        command,
+    match command {
         Command::NewSession(_)
-            | Command::StartServer
-            | Command::AttachSession(_)
-            | Command::SourceFile(_)
-    )
+        | Command::StartServer(_)
+        | Command::AttachSession(_)
+        | Command::SourceFile(_) => true,
+        Command::WebShare(args) => web_share_creates_share(args),
+        _ => false,
+    }
+}
+
+fn web_share_creates_share(args: &crate::cli_args::WebShareArgs) -> bool {
+    !args.list && args.stop.is_none() && !args.stop_all && args.lookup.is_none() && !args.config
 }
 
 fn unsupported_argument_suffix(arguments: &[String]) -> String {

@@ -79,6 +79,9 @@ pub(crate) use window::{
     RenameWindowArgs, ResizeWindowArgs, RespawnWindowArgs, RotateWindowArgs, SwapWindowArgs,
     UnlinkWindowArgs, WindowTargetArgs,
 };
+#[path = "cli_args/web.rs"]
+mod web;
+pub(crate) use web::{WebShareArgs, WebShareTerminalThemeArg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DocumentedCliAlias {
@@ -300,7 +303,7 @@ where
 #[derive(Debug, Clone)]
 pub(crate) enum Command {
     NewSession(NewSessionArgs),
-    StartServer,
+    StartServer(StartServerArgs),
     KillServer,
     HasSession(SessionTargetArgs),
     KillSession(KillSessionArgs),
@@ -385,6 +388,7 @@ pub(crate) enum Command {
     SourceFile(SourceFileArgs),
     IfShell(IfShellArgs),
     WaitFor(WaitForArgs),
+    WebShare(WebShareArgs),
     DisplayMenu(DisplayMenuArgs),
     DisplayPopup(DisplayPopupArgs),
     ClearPromptHistory(PromptHistoryArgs),
@@ -396,6 +400,14 @@ pub(crate) enum Command {
 pub(crate) struct UnsupportedCommandArgs {
     pub(crate) name: String,
     pub(crate) arguments: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub(crate) struct StartServerArgs {
+    #[arg(long = "web-port", value_name = "port", value_parser = clap::value_parser!(u16).range(1..))]
+    pub(crate) web_port: Option<u16>,
+    #[arg(long = "frontend-url", alias = "web-frontend", value_name = "url")]
+    pub(crate) web_frontend: Option<String>,
 }
 
 trait QueuedCommand {

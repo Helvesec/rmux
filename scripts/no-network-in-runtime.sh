@@ -12,6 +12,8 @@ fi
 tmp_files="$(mktemp)"
 trap 'rm -f "$tmp_files"' EXIT HUP INT TERM
 
+# The web-share listener is the explicit TCP/WebSocket boundary; this guard
+# protects the rest of the runtime from accidental network/browser deps.
 {
   if [ -d src ]; then
     find src -type f -name '*.rs' 2>/dev/null
@@ -21,6 +23,7 @@ trap 'rm -f "$tmp_files"' EXIT HUP INT TERM
   fi
 } \
   | grep -v '/target/' \
+  | grep -v '^crates/rmux-server/src/web/' \
   | grep -Ev '(^|/)(tests?|[^/]*_tests)(/|\.rs$)' \
   >"$tmp_files" || true
 

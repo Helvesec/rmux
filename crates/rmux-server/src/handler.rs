@@ -66,11 +66,21 @@ mod subscription_support;
 mod target_support;
 #[path = "handler_waits.rs"]
 mod wait_support;
+#[cfg(all(any(unix, windows), feature = "web"))]
+#[path = "handler_web.rs"]
+mod web_support;
+#[cfg(not(all(any(unix, windows), feature = "web")))]
+#[path = "handler_web_disabled.rs"]
+mod web_support;
+#[cfg(all(any(unix, windows), feature = "web"))]
+pub(crate) use web_support::{WebPaneSnapshot, WebPaneStream, WebSessionStream, WebShareStream};
 #[path = "handler_window.rs"]
 mod window_support;
 use crate::pane_terminals::HandlerState;
 use crate::server_access::{current_owner_uid, AccessMode, ServerAccessStore};
 use crate::wait_for::WaitForStore;
+#[cfg(all(any(unix, windows), feature = "web"))]
+use crate::web::WebShareRegistry;
 use attach_support::{ActiveAttachState, ClientFlags};
 pub(in crate::handler) use client_environment_support::client_spawn_environment;
 pub(in crate::handler) use client_runtime_support::{
@@ -145,6 +155,8 @@ pub(crate) struct RequestHandler {
     session_lease_janitor_started: Arc<AtomicBool>,
     pane_snapshot_coalescers: Arc<StdMutex<PaneSnapshotCoalescerRegistry>>,
     pane_snapshot_revisions: Arc<StdMutex<PaneSnapshotRevisionRegistry>>,
+    #[cfg(all(any(unix, windows), feature = "web"))]
+    web_shares: Arc<WebShareRegistry>,
     task_runtime: Option<tokio::runtime::Handle>,
     #[cfg(test)]
     cleanup_on_drop: bool,
@@ -180,6 +192,8 @@ impl Clone for RequestHandler {
             session_lease_janitor_started: self.session_lease_janitor_started.clone(),
             pane_snapshot_coalescers: self.pane_snapshot_coalescers.clone(),
             pane_snapshot_revisions: self.pane_snapshot_revisions.clone(),
+            #[cfg(all(any(unix, windows), feature = "web"))]
+            web_shares: self.web_shares.clone(),
             task_runtime: self.task_runtime.clone(),
             #[cfg(test)]
             cleanup_on_drop: false,
@@ -216,6 +230,8 @@ pub(crate) struct WeakRequestHandler {
     session_lease_janitor_started: Weak<AtomicBool>,
     pane_snapshot_coalescers: Weak<StdMutex<PaneSnapshotCoalescerRegistry>>,
     pane_snapshot_revisions: Weak<StdMutex<PaneSnapshotRevisionRegistry>>,
+    #[cfg(all(any(unix, windows), feature = "web"))]
+    web_shares: Weak<WebShareRegistry>,
     task_runtime: Option<tokio::runtime::Handle>,
     #[cfg(test)]
     paste_buffer_delete_pause: Weak<StdMutex<Option<Arc<PasteBufferDeletePause>>>>,
@@ -249,6 +265,8 @@ impl WeakRequestHandler {
             session_lease_janitor_started: self.session_lease_janitor_started.upgrade()?,
             pane_snapshot_coalescers: self.pane_snapshot_coalescers.upgrade()?,
             pane_snapshot_revisions: self.pane_snapshot_revisions.upgrade()?,
+            #[cfg(all(any(unix, windows), feature = "web"))]
+            web_shares: self.web_shares.upgrade()?,
             task_runtime: self.task_runtime.clone(),
             #[cfg(test)]
             cleanup_on_drop: false,
@@ -301,6 +319,7 @@ impl RequestHandler {
         )
     }
 
+    #[cfg_attr(all(any(unix, windows), feature = "web"), allow(dead_code))]
     pub(crate) fn with_owner_uid_and_subscription_limits(
         owner_uid: u32,
         subscription_limits: SubscriptionLimits,
@@ -310,6 +329,21 @@ impl RequestHandler {
             Some(current_process_environment_snapshot()),
             subscription_limits,
         )
+    }
+
+    #[cfg(all(any(unix, windows), feature = "web"))]
+    pub(crate) fn with_owner_uid_subscription_limits_and_web_settings(
+        owner_uid: u32,
+        subscription_limits: SubscriptionLimits,
+        web_settings: crate::web::WebShareSettings,
+    ) -> Self {
+        let mut handler = Self::with_owner_uid_and_environment(
+            owner_uid,
+            Some(current_process_environment_snapshot()),
+            subscription_limits,
+        );
+        handler.web_shares = Arc::new(WebShareRegistry::new(web_settings));
+        handler
     }
 
     fn with_owner_uid_and_environment(
@@ -359,6 +393,8 @@ impl RequestHandler {
             pane_snapshot_revisions: Arc::new(StdMutex::new(
                 PaneSnapshotRevisionRegistry::default(),
             )),
+            #[cfg(all(any(unix, windows), feature = "web"))]
+            web_shares: Arc::new(WebShareRegistry::default()),
             task_runtime,
             #[cfg(test)]
             cleanup_on_drop: true,
@@ -394,6 +430,8 @@ impl RequestHandler {
             session_lease_janitor_started: Arc::downgrade(&self.session_lease_janitor_started),
             pane_snapshot_coalescers: Arc::downgrade(&self.pane_snapshot_coalescers),
             pane_snapshot_revisions: Arc::downgrade(&self.pane_snapshot_revisions),
+            #[cfg(all(any(unix, windows), feature = "web"))]
+            web_shares: Arc::downgrade(&self.web_shares),
             task_runtime: self.task_runtime.clone(),
             #[cfg(test)]
             paste_buffer_delete_pause: Arc::downgrade(&self.paste_buffer_delete_pause),

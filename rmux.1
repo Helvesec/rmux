@@ -89,7 +89,7 @@ table order.
 can render the compiled default key table without a running server when no
 runtime key-table mutations are available.
 .SH IMPLEMENTED COMMAND SURFACE
-The public CLI dispatches 90 commands:
+The public CLI dispatches 91 commands:
 .nf
 attach-session (attach)
 bind-key (bind)
@@ -181,6 +181,7 @@ switch-client (switchc)
 unbind-key (unbind)
 unlink-window (unlinkw)
 wait-for (wait)
+web-share
 .fi
 .SH BUILT-IN COMMAND ALIASES
 .TP
@@ -197,3 +198,44 @@ and
 .B unlink-window
 ship in the public CLI surface with tmux-style shared window links across
 sessions, including linked-window format variables and hook context.
+.PP
+.B web-share
+local mode opens
+.B https://share.rmux.io/
+against
+.B ws://127.0.0.1:<port>/share .
+The
+.B -t
+target may be a pane or a session name. Pane targets share one pane. Session
+targets mirror the active window layout and can switch windows through the web
+client.
+By default shares are read-only. Pass
+.B -w
+for operator input into the active pane. Pass
+.B --controls
+with
+.B -w
+on a session target to allow whitelisted rmux commands from the browser.
+It requires a browser that allows public-origin access to loopback
+WS connections. Chromium-based browsers may block this under Local Network
+Access; allow Local Network access for
+.B share.rmux.io .
+Pass
+.B --tunnel-url
+to use a bring-your-own public endpoint, and
+.B --frontend-url
+to use a self-hosted frontend.
+Pass
+.B --pin
+to require the out-of-band pairing code printed by
+.B web-share
+before a browser can authenticate. Pass
+.B --no-navbar
+or
+.B --no-disclaimer
+to generate a minimal viewer URL.
+Pass
+.B start-server --web-port PORT --frontend-url URL
+to configure the local web listener and the default frontend URL; port 0 is
+rejected.
+In-app webviews are not guaranteed.
