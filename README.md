@@ -256,6 +256,8 @@ is opt-in:
 
 ```tmux
 set -g allow-passthrough on
+# or, for tmux-compatible "all" passthrough:
+set -g allow-passthrough all
 ```
 
 If your terminal supports either protocol but is not detected automatically,
@@ -266,7 +268,9 @@ set -as terminal-features 'xterm-kitty:kitty-graphics'
 set -as terminal-features 'xterm*:sixel'
 ```
 
-On Windows, RMUX enables modern ConPTY passthrough when the OS supports it. Set
+SIXEL passthrough is covered by the automated Unix PTY attach regression suite.
+On Windows, RMUX enables modern ConPTY passthrough when the OS supports it, but
+SIXEL display still depends on the outer terminal. Set
 `RMUX_CONPTY_NO_PASSTHROUGH=1` to disable that backend mode for troubleshooting.
 
 ## Verification
