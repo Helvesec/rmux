@@ -1,5 +1,6 @@
 use super::{
-    parse_environment_assignments, spawn_hook_command, validate_process_command, TerminalProfile,
+    environment_from_os_pairs, parse_environment_assignments, spawn_hook_command,
+    validate_process_command, TerminalProfile,
 };
 use rmux_core::{EnvironmentStore, OptionStore};
 use rmux_proto::{OptionName, ProcessCommand, ScopeSelector, SessionName, SetOptionMode};
@@ -7,8 +8,11 @@ use rmux_proto::{OptionName, ProcessCommand, ScopeSelector, SessionName, SetOpti
 use rmux_pty::TerminalSize as PtyTerminalSize;
 use std::collections::HashMap;
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(windows)]
@@ -21,6 +25,25 @@ use std::time::Instant;
 use tokio::time::sleep;
 
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(unix)]
+#[test]
+fn base_environment_snapshot_skips_non_utf8_pairs() {
+    let environment = environment_from_os_pairs([
+        (
+            OsString::from_vec(b"INVALID_NAME_\xff".to_vec()),
+            OsString::from("value"),
+        ),
+        (
+            OsString::from("INVALID_VALUE"),
+            OsString::from_vec(b"value_\xff".to_vec()),
+        ),
+        (OsString::from("VALID"), OsString::from("value")),
+    ]);
+
+    assert_eq!(environment.get("VALID").map(String::as_str), Some("value"));
+    assert_eq!(environment.len(), 1);
+}
 
 #[test]
 fn spawn_hook_command_requires_a_runtime_before_launching_a_child() {

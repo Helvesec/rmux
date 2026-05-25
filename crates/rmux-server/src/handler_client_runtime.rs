@@ -12,6 +12,7 @@ use crate::outer_terminal::OuterTerminal;
 use crate::pane_io::AttachControl;
 use crate::pane_terminals::{session_not_found, HandlerState};
 use crate::server_access::current_owner_uid;
+use crate::terminal::base_process_environment;
 
 use super::{
     attach_support::{self, ClientFlags},
@@ -496,7 +497,7 @@ fn launched_as_hidden_daemon() -> bool {
 }
 
 pub(in crate::handler) fn current_process_environment_snapshot() -> HashMap<String, String> {
-    std::env::vars().collect()
+    base_process_environment()
 }
 
 pub(in crate::handler) fn seed_global_environment(

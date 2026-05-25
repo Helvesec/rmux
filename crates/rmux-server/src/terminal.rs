@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -320,8 +321,18 @@ fn abbreviate_home(path: &str, home: Option<&str>) -> String {
     }
 }
 
-fn base_process_environment() -> HashMap<String, String> {
-    std::env::vars().collect()
+pub(crate) fn base_process_environment() -> HashMap<String, String> {
+    environment_from_os_pairs(std::env::vars_os())
+}
+
+fn environment_from_os_pairs<I>(pairs: I) -> HashMap<String, String>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    pairs
+        .into_iter()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
 }
 
 fn shell_command_window_name(command: &str) -> Option<String> {
