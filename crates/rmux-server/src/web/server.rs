@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use rmux_core::events::OutputCursorItem;
@@ -14,6 +15,7 @@ use super::websocket::{WebSocket, WebSocketMessage};
 use crate::handler::{RequestHandler, WebPaneSnapshot};
 
 const HTTP_READ_LIMIT: usize = 8 * 1024;
+const OPERATOR_RATE_LIMIT: u16 = 200;
 
 pub(crate) fn spawn(handler: Arc<RequestHandler>) {
     tokio::spawn(async move {
@@ -120,6 +122,7 @@ async fn serve_websocket(
     }
     let mut socket = WebSocket::accept(stream, key).await?;
     send_snapshot(&mut socket, &pane.snapshot, pane.is_operator()).await?;
+    let mut rate_limiter = OperatorRateLimiter::new();
 
     loop {
         tokio::select! {
@@ -143,14 +146,28 @@ async fn serve_websocket(
             message = socket.read_message() => {
                 match message? {
                     WebSocketMessage::Text(text) => {
-                        handle_client_message(&handler, &pane, &text).await?;
+                        if !pane.is_operator() {
+                            let _ = socket.write_close().await;
+                            return Ok(());
+                        }
+                        if !rate_limiter.try_acquire() {
+                            debug!(share_id, "operator_rate_limit_hit");
+                            continue;
+                        }
+                        handle_client_message(&handler, &mut pane, &text).await?;
                     }
                     WebSocketMessage::Binary(bytes) => {
-                        if pane.is_operator() {
-                            let text = String::from_utf8_lossy(&bytes).into_owned();
-                            handler.web_send_text(pane.target(), text).await
-                                .map_err(|error| io::Error::other(error.to_string()))?;
+                        if !pane.is_operator() {
+                            let _ = socket.write_close().await;
+                            return Ok(());
                         }
+                        if !rate_limiter.try_acquire() {
+                            debug!(share_id, "operator_rate_limit_hit");
+                            continue;
+                        }
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        handler.web_send_text(pane.target(), text).await
+                            .map_err(|error| io::Error::other(error.to_string()))?;
                     }
                     WebSocketMessage::Close => {
                         let _ = socket.write_close().await;
@@ -164,7 +181,7 @@ async fn serve_websocket(
 
 async fn handle_client_message(
     handler: &RequestHandler,
-    pane: &crate::handler::WebPaneStream,
+    pane: &mut crate::handler::WebPaneStream,
     text: &str,
 ) -> io::Result<()> {
     let message = serde_json::from_str::<ClientMessage>(text)
@@ -178,6 +195,10 @@ async fn handle_client_message(
             .web_resize(pane.target(), cols, rows)
             .await
             .map_err(|error| io::Error::other(error.to_string())),
+        ClientMessage::Release if pane.is_operator() => {
+            pane.release_operator();
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -349,6 +370,7 @@ struct HttpRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ClientMessage {
     Input { text: String },
+    Release,
     Resize { cols: u16, rows: u16 },
 }
 
@@ -368,6 +390,32 @@ enum ServerMessage<'a> {
 }
 
 const INDEX_HTML: &str = include_str!("frontend/index.html");
+
+struct OperatorRateLimiter {
+    remaining: u16,
+    window_started: Instant,
+}
+
+impl OperatorRateLimiter {
+    fn new() -> Self {
+        Self {
+            remaining: OPERATOR_RATE_LIMIT,
+            window_started: Instant::now(),
+        }
+    }
+
+    fn try_acquire(&mut self) -> bool {
+        if self.window_started.elapsed() >= Duration::from_secs(1) {
+            self.remaining = OPERATOR_RATE_LIMIT;
+            self.window_started = Instant::now();
+        }
+        if self.remaining == 0 {
+            return false;
+        }
+        self.remaining -= 1;
+        true
+    }
+}
 
 #[cfg(test)]
 mod tests {

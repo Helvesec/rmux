@@ -25,6 +25,10 @@ impl WebPaneStream {
         self._access.is_operator()
     }
 
+    pub(crate) fn release_operator(&mut self) -> bool {
+        self._access.release_operator()
+    }
+
     pub(crate) fn target(&self) -> &PaneTargetRef {
         &self.target
     }

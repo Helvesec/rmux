@@ -6,6 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const CLIENT_FRAME_LIMIT: u64 = 4 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WebSocketMessage {
@@ -92,7 +93,7 @@ impl WebSocket {
             self.stream.read_exact(&mut bytes).await?;
             len = u64::from_be_bytes(bytes);
         }
-        if len > 1_048_576 {
+        if len > CLIENT_FRAME_LIMIT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "websocket frame exceeds rmux web limit",

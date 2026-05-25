@@ -350,7 +350,7 @@ impl WebShareRecord {
                 .ok_or_else(|| RmuxError::Server("web-share viewer limit reached".to_owned()))?;
             return Ok(WebShareAccess {
                 expected_origin: self.base_url.clone(),
-                _lease: lease,
+                _lease: Some(lease),
                 role: WebShareRole::Viewer,
                 target: self.target.clone(),
             });
@@ -369,7 +369,7 @@ impl WebShareRecord {
                 })?;
             return Ok(WebShareAccess {
                 expected_origin: self.base_url.clone(),
-                _lease: lease,
+                _lease: Some(lease),
                 role: WebShareRole::Operator,
                 target: self.target.clone(),
             });
@@ -381,7 +381,7 @@ impl WebShareRecord {
 #[derive(Debug)]
 pub(crate) struct WebShareAccess {
     expected_origin: String,
-    _lease: ConnectionLease,
+    _lease: Option<ConnectionLease>,
     role: WebShareRole,
     target: PaneTargetRef,
 }
@@ -393,6 +393,23 @@ impl WebShareAccess {
 
     pub(crate) fn is_operator(&self) -> bool {
         matches!(self.role, WebShareRole::Operator)
+    }
+
+    pub(crate) fn release_operator(&mut self) -> bool {
+        let Some(lease) = self._lease.take() else {
+            return false;
+        };
+        match lease.release_operator() {
+            Ok(viewer) => {
+                self._lease = Some(viewer);
+                self.role = WebShareRole::Viewer;
+                true
+            }
+            Err(viewer) => {
+                self._lease = Some(viewer);
+                false
+            }
+        }
     }
 
     pub(crate) fn target(&self) -> &PaneTargetRef {
