@@ -60,6 +60,14 @@ impl WebShareRecord {
         }
     }
 
+    pub(super) fn origin_allowed(&self, received: &str) -> bool {
+        origin_allowed(
+            received,
+            &self.frontend_origin,
+            self.allow_loopback_development_origins,
+        )
+    }
+
     pub(super) fn connect(
         &self,
         pin: Option<&str>,

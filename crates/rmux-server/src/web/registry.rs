@@ -313,6 +313,23 @@ impl WebShareRegistry {
         }
     }
 
+    pub(crate) fn known_token_origin_allowed(&self, token: &str, origin: &str) -> Option<bool> {
+        if !valid_token_shape(token) {
+            return None;
+        }
+        let token_hash = SecretHash::from_secret(token);
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("web-share registry mutex must not be poisoned");
+        inner.prune_expired();
+        let capability = inner.capability(&token_hash)?;
+        inner
+            .records
+            .get(&capability.share_id)
+            .map(|record| record.origin_allowed(origin))
+    }
+
     pub(crate) fn listener(&self) -> WebShareListener {
         self.settings.listener()
     }

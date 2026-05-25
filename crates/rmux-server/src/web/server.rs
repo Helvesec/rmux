@@ -170,6 +170,14 @@ async fn serve_websocket(
             return Ok(());
         }
     };
+    if handler
+        .known_web_share_origin_allowed(&auth.token, origin)
+        .is_some_and(|allowed| !allowed)
+    {
+        sleep(UNIFORM_AUTH_DELAY).await;
+        let _ = socket.write_close_code(4004, "origin_not_allowed").await;
+        return Ok(());
+    }
     drop(pre_auth_permit);
     let share = match handler
         .open_web_share(&auth.token, auth.pin.as_deref())

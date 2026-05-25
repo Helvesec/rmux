@@ -80,6 +80,10 @@ impl RequestHandler {
         }
     }
 
+    pub(crate) fn known_web_share_origin_allowed(&self, token: &str, origin: &str) -> Option<bool> {
+        self.web_shares.known_token_origin_allowed(token, origin)
+    }
+
     async fn open_web_session_share(
         &self,
         access: WebShareAccess,

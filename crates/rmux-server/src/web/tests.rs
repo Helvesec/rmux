@@ -112,6 +112,36 @@ async fn default_local_share_uses_hosted_frontend_and_local_websocket_endpoint()
 }
 
 #[tokio::test]
+async fn known_token_origin_precheck_does_not_consume_a_read_slot() {
+    let registry = WebShareRegistry::default();
+    let created = registry
+        .create(CreateWebShareRequest {
+            scope: WebShareScope::Pane(target()),
+            public_base_url: None,
+            frontend_url: None,
+            ttl_seconds: Some(60),
+            max_readers: Some(1),
+            url_options: Default::default(),
+            require_pin: false,
+            terminal_palette: None,
+            writable: false,
+            controls: false,
+        })
+        .expect("share creates");
+    let token = token_from_url(&created.read_url);
+
+    assert_eq!(
+        registry.known_token_origin_allowed(&token, "https://evil.example"),
+        Some(false)
+    );
+    assert!(registry
+        .connect(&token, None)
+        .await
+        .expect("read connects after rejected origin precheck")
+        .origin_allowed("https://share.rmux.io"));
+}
+
+#[tokio::test]
 async fn frontend_override_changes_browser_origin_without_changing_local_endpoint() {
     let registry = WebShareRegistry::new(
         crate::web::WebShareSettings::from_options(
