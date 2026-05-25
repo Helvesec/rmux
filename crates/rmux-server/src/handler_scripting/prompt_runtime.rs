@@ -185,14 +185,12 @@ impl RequestHandler {
         receiver: tokio::sync::oneshot::Receiver<PromptQueueResult>,
     ) {
         let handler = self.clone();
-        spawn_background_async("rmux-attached-prompt-finish", move || async move {
-            let result = receiver.await.unwrap_or_else(|_| PromptQueueResult::noop());
-            if let Some((commands, context)) = result.inserted {
-                let _ = handler
-                    .execute_parsed_commands(requester_pid, commands, context)
-                    .await;
-            }
-        });
+        let task = finish_attached_prompt_binding_task(handler, requester_pid, receiver);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(task);
+        } else {
+            spawn_background_async("rmux-attached-prompt-finish", move || task);
+        }
     }
 
     async fn build_confirm_before_plan(
@@ -264,6 +262,19 @@ impl RequestHandler {
             background: command.background,
             format_values,
         })
+    }
+}
+
+async fn finish_attached_prompt_binding_task(
+    handler: RequestHandler,
+    requester_pid: u32,
+    receiver: tokio::sync::oneshot::Receiver<PromptQueueResult>,
+) {
+    let result = receiver.await.unwrap_or_else(|_| PromptQueueResult::noop());
+    if let Some((commands, context)) = result.inserted {
+        let _ = handler
+            .execute_parsed_commands(requester_pid, commands, context)
+            .await;
     }
 }
 
