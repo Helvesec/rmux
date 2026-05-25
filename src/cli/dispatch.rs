@@ -530,14 +530,18 @@ fn invalid_layout_failure(layout: &str) -> ExitFailure {
 }
 
 pub(super) fn command_has_start_server_flag(command: &Command) -> bool {
-    matches!(
-        command,
+    match command {
         Command::NewSession(_)
-            | Command::StartServer(_)
-            | Command::AttachSession(_)
-            | Command::WebShare(_)
-            | Command::SourceFile(_)
-    )
+        | Command::StartServer(_)
+        | Command::AttachSession(_)
+        | Command::SourceFile(_) => true,
+        Command::WebShare(args) => web_share_creates_share(args),
+        _ => false,
+    }
+}
+
+fn web_share_creates_share(args: &crate::cli_args::WebShareArgs) -> bool {
+    !args.list && args.stop.is_none() && !args.stop_all && args.lookup.is_none() && !args.config
 }
 
 fn unsupported_argument_suffix(arguments: &[String]) -> String {

@@ -404,7 +404,7 @@ pub(crate) struct UnsupportedCommandArgs {
 
 #[derive(Debug, Clone, Default, Args)]
 pub(crate) struct StartServerArgs {
-    #[arg(long = "web-port", value_name = "port")]
+    #[arg(long = "web-port", value_name = "port", value_parser = clap::value_parser!(u16).range(1..))]
     pub(crate) web_port: Option<u16>,
     #[arg(long = "frontend-url", alias = "web-frontend", value_name = "url")]
     pub(crate) web_frontend: Option<String>,

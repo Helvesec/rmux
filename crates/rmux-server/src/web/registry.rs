@@ -1,28 +1,27 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
-use base64::Engine;
 use rmux_proto::RmuxError;
 use rmux_proto::{
     CommandOutput, CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest,
     StopAllWebSharesRequest, StopWebShareRequest, WebShareConfigRequest, WebShareConfigResponse,
     WebShareCreatedResponse, WebShareListResponse, WebShareListener, WebShareLookupResponse,
-    WebShareResponse, WebShareScope, WebShareStoppedAllResponse, WebShareStoppedResponse,
-    WebShareSummary, WebShareUrlOptions, WebTerminalPalette,
+    WebShareResponse, WebShareStoppedAllResponse, WebShareStoppedResponse, WebShareSummary,
 };
 use tokio::sync::watch;
 use tracing::info;
 
-use super::leases::{ConnectionLease, LeaseBook};
-use super::origin::{origin_allowed, validate_frontend_url, validate_public_base_url, FrontendUrl};
+use super::leases::LeaseBook;
+use super::origin::{validate_frontend_url, validate_public_base_url, FrontendUrl};
+use super::record::{
+    system_time_to_unix, WebShareAccess, WebShareConnectRole, WebShareRecord, WebShareRevokeReason,
+};
+use super::secrets::{random_pairing_code, random_share_id, random_token};
+use super::settings::WebShareSettings;
 
-const DEFAULT_FRONTEND_ORIGIN: &str = "https://share.rmux.io";
-const DEFAULT_FRONTEND_URL: &str = "https://share.rmux.io";
-const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_MAX_READERS: u16 = 5;
-const DEFAULT_PORT: u16 = 9777;
 const DEFAULT_TTL_SECONDS: u64 = 60 * 60;
 const MAX_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
 
@@ -69,7 +68,7 @@ impl WebShareRegistry {
                 Ok(WebShareResponse::Lookup(self.lookup(request)))
             }
             rmux_proto::WebShareRequest::Config(request) => {
-                Ok(WebShareResponse::Config(self.config(request)))
+                self.config(request).map(WebShareResponse::Config)
             }
         }
     }
@@ -78,6 +77,7 @@ impl WebShareRegistry {
         &self,
         request: CreateWebShareRequest,
     ) -> Result<WebShareCreatedResponse, RmuxError> {
+        self.require_listener_available()?;
         if request.controls && !request.writable {
             return Err(RmuxError::Server(
                 "web-share controls require --writable".to_owned(),
@@ -224,15 +224,19 @@ impl WebShareRegistry {
         }
     }
 
-    pub(crate) fn config(&self, _request: WebShareConfigRequest) -> WebShareConfigResponse {
+    pub(crate) fn config(
+        &self,
+        _request: WebShareConfigRequest,
+    ) -> Result<WebShareConfigResponse, RmuxError> {
+        self.require_listener_available()?;
         let listener = self.listener();
-        WebShareConfigResponse {
+        Ok(WebShareConfigResponse {
             output: CommandOutput::from_stdout(format!(
                 "{}:{} {}\n",
                 listener.host, listener.port, listener.frontend_origin
             )),
             listener,
-        }
+        })
     }
 
     pub(crate) fn connect(
@@ -257,6 +261,20 @@ impl WebShareRegistry {
 
     pub(crate) fn listener(&self) -> WebShareListener {
         self.settings.listener()
+    }
+
+    pub(crate) fn mark_listener_available(&self) {
+        self.inner
+            .lock()
+            .expect("web-share registry mutex must not be poisoned")
+            .listener = WebListenerState::Available;
+    }
+
+    pub(crate) fn mark_listener_unavailable(&self, reason: impl Into<String>) {
+        self.inner
+            .lock()
+            .expect("web-share registry mutex must not be poisoned")
+            .listener = WebListenerState::Unavailable(reason.into());
     }
 
     fn next_share_id(&self) -> Result<String, RmuxError> {
@@ -294,63 +312,40 @@ impl WebShareRegistry {
             }),
         }
     }
-}
 
-#[derive(Debug, Clone)]
-pub(crate) struct WebShareSettings {
-    host: String,
-    port: u16,
-    frontend_origin: String,
-    frontend_url: String,
-}
-
-impl Default for WebShareSettings {
-    fn default() -> Self {
-        Self {
-            host: DEFAULT_HOST.to_owned(),
-            port: DEFAULT_PORT,
-            frontend_origin: DEFAULT_FRONTEND_ORIGIN.to_owned(),
-            frontend_url: DEFAULT_FRONTEND_URL.to_owned(),
+    fn require_listener_available(&self) -> Result<(), RmuxError> {
+        let inner = self
+            .inner
+            .lock()
+            .expect("web-share registry mutex must not be poisoned");
+        match &inner.listener {
+            WebListenerState::Available => Ok(()),
+            WebListenerState::Unavailable(reason) => Err(RmuxError::Server(format!(
+                "web-share listener unavailable: {reason}"
+            ))),
         }
     }
 }
 
-impl WebShareSettings {
-    pub(crate) fn from_options(
-        port: u16,
-        frontend_origin: Option<String>,
-    ) -> Result<Self, RmuxError> {
-        let frontend = match frontend_origin {
-            Some(value) => validate_frontend_url(&value)?,
-            None => FrontendUrl {
-                origin: DEFAULT_FRONTEND_ORIGIN.to_owned(),
-                url: DEFAULT_FRONTEND_URL.to_owned(),
-            },
-        };
-        Ok(Self {
-            host: DEFAULT_HOST.to_owned(),
-            port,
-            frontend_origin: frontend.origin,
-            frontend_url: frontend.url,
-        })
-    }
-
-    fn listener(&self) -> WebShareListener {
-        WebShareListener {
-            host: self.host.clone(),
-            port: self.port,
-            frontend_origin: self.frontend_origin.clone(),
-        }
-    }
-
-    fn local_endpoint_origin(&self) -> String {
-        format!("http://{}:{}", self.host, self.port)
-    }
-}
-
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct WebShareState {
     records: HashMap<String, WebShareRecord>,
+    listener: WebListenerState,
+}
+
+impl Default for WebShareState {
+    fn default() -> Self {
+        Self {
+            records: HashMap::new(),
+            listener: WebListenerState::Available,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum WebListenerState {
+    Available,
+    Unavailable(String),
 }
 
 impl WebShareState {
@@ -407,223 +402,6 @@ impl WebShareState {
     }
 }
 
-#[derive(Debug)]
-struct WebShareRecord {
-    allow_loopback_development_origins: bool,
-    endpoint_origin: String,
-    expires_at: Option<SystemTime>,
-    frontend_origin: String,
-    frontend_url: String,
-    lease_book: Arc<LeaseBook>,
-    max_readers: u16,
-    operator_token: Option<String>,
-    pairing_code: Option<String>,
-    revoke_tx: watch::Sender<Option<WebShareRevokeReason>>,
-    controls: bool,
-    share_id: String,
-    scope: WebShareScope,
-    terminal_palette: Option<WebTerminalPalette>,
-    url_options: WebShareUrlOptions,
-    read_token: String,
-    writable: bool,
-}
-
-impl WebShareRecord {
-    fn read_url(&self) -> String {
-        share_url(self, Some(&self.read_token), "read")
-    }
-
-    fn redacted_read_url(&self) -> String {
-        share_url(self, None, "read")
-    }
-
-    fn operator_url(&self) -> Option<String> {
-        self.operator_token
-            .as_deref()
-            .map(|token| share_url(self, Some(token), "operator"))
-    }
-
-    fn summary(&self) -> WebShareSummary {
-        WebShareSummary {
-            share_id: self.share_id.clone(),
-            scope: self.scope.clone(),
-            read_url: Some(self.redacted_read_url()),
-            writable: self.writable,
-            controls: self.controls,
-            active_readers: u16::try_from(self.lease_book.reader_count()).unwrap_or(u16::MAX),
-            max_readers: self.max_readers,
-            operator_connected: self.lease_book.operator_connected(),
-            expires_at_unix: self.expires_at.and_then(system_time_to_unix),
-        }
-    }
-
-    fn connect(
-        &self,
-        key: &str,
-        pin: Option<&str>,
-        role: WebShareConnectRole,
-    ) -> Result<WebShareAccess, RmuxError> {
-        match role {
-            WebShareConnectRole::Read => {
-                if !secret_eq(key, &self.read_token) {
-                    return Err(RmuxError::Server("invalid web-share key".to_owned()));
-                }
-                self.check_pairing_code(pin)?;
-                let lease = self
-                    .lease_book
-                    .try_read()
-                    .map(ConnectionLease::Read)
-                    .ok_or_else(|| RmuxError::Server("web-share read limit reached".to_owned()))?;
-                Ok(self.access(lease, WebShareRole::Read))
-            }
-            WebShareConnectRole::Operator => {
-                let Some(operator_key) = self.operator_token.as_deref() else {
-                    return Err(RmuxError::Server(
-                        "web-share is not writable for operator role".to_owned(),
-                    ));
-                };
-                if !secret_eq(key, operator_key) {
-                    return Err(RmuxError::Server("invalid web-share key".to_owned()));
-                }
-                self.check_pairing_code(pin)?;
-                let lease = self
-                    .lease_book
-                    .try_operator()
-                    .map(ConnectionLease::Operator)
-                    .ok_or_else(|| {
-                        RmuxError::Server("web-share operator is already connected".to_owned())
-                    })?;
-                Ok(self.access(lease, WebShareRole::Operator))
-            }
-        }
-    }
-
-    fn check_pairing_code(&self, pin: Option<&str>) -> Result<(), RmuxError> {
-        let Some(expected) = self.pairing_code.as_deref() else {
-            return Ok(());
-        };
-        if pin.is_some_and(|provided| secret_eq(provided, expected)) {
-            return Ok(());
-        }
-        Err(RmuxError::Server(
-            "invalid web-share pairing code".to_owned(),
-        ))
-    }
-
-    fn access(&self, lease: ConnectionLease, role: WebShareRole) -> WebShareAccess {
-        WebShareAccess {
-            allow_loopback_development_origins: self.allow_loopback_development_origins,
-            expected_origin: self.frontend_origin.clone(),
-            expires_at: self.expires_at,
-            _lease: Some(lease),
-            role,
-            revoke_rx: self.revoke_tx.subscribe(),
-            scope: self.scope.clone(),
-            controls: self.controls,
-            terminal_palette: self.terminal_palette.clone(),
-        }
-    }
-
-    fn revoke(self, reason: WebShareRevokeReason) {
-        let _ = self.revoke_tx.send(Some(reason));
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WebShareConnectRole {
-    Operator,
-    Read,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WebShareRevokeReason {
-    PaneGone,
-    SessionGone,
-    StoppedByOwner,
-    TtlExpired,
-}
-
-impl WebShareRevokeReason {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::PaneGone => "pane_gone",
-            Self::SessionGone => "session_gone",
-            Self::StoppedByOwner => "stopped_by_owner",
-            Self::TtlExpired => "ttl_expired",
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct WebShareAccess {
-    allow_loopback_development_origins: bool,
-    expected_origin: String,
-    expires_at: Option<SystemTime>,
-    _lease: Option<ConnectionLease>,
-    revoke_rx: watch::Receiver<Option<WebShareRevokeReason>>,
-    role: WebShareRole,
-    scope: WebShareScope,
-    controls: bool,
-    terminal_palette: Option<WebTerminalPalette>,
-}
-
-impl WebShareAccess {
-    pub(crate) fn origin_allowed(&self, received: &str) -> bool {
-        origin_allowed(
-            received,
-            &self.expected_origin,
-            self.allow_loopback_development_origins,
-        )
-    }
-
-    pub(crate) fn is_operator(&self) -> bool {
-        matches!(self.role, WebShareRole::Operator)
-    }
-
-    pub(crate) fn controls(&self) -> bool {
-        self.controls && self.is_operator()
-    }
-
-    pub(crate) fn expires_at(&self) -> Option<SystemTime> {
-        self.expires_at
-    }
-
-    pub(crate) fn release_operator(&mut self) -> bool {
-        let Some(lease) = self._lease.take() else {
-            return false;
-        };
-        match lease.release_operator() {
-            Ok(read) => {
-                self._lease = Some(read);
-                self.role = WebShareRole::Read;
-                true
-            }
-            Err(read) => {
-                self._lease = Some(read);
-                false
-            }
-        }
-    }
-
-    pub(crate) fn scope(&self) -> &WebShareScope {
-        &self.scope
-    }
-
-    pub(crate) fn terminal_palette(&self) -> Option<&WebTerminalPalette> {
-        self.terminal_palette.as_ref()
-    }
-
-    pub(crate) fn revoke_receiver(&self) -> watch::Receiver<Option<WebShareRevokeReason>> {
-        self.revoke_rx.clone()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WebShareRole {
-    Operator,
-    Read,
-}
-
 fn created_output(read_url: &str, pairing_code: Option<&str>) -> CommandOutput {
     let mut output = String::new();
     output.push_str("read ");
@@ -660,97 +438,4 @@ fn lookup_output(share: Option<&WebShareSummary>) -> CommandOutput {
 fn stopped_output(share_id: &str, stopped: bool) -> CommandOutput {
     let status = if stopped { "stopped" } else { "missing" };
     CommandOutput::from_stdout(format!("{status} {share_id}\n"))
-}
-
-fn share_url(record: &WebShareRecord, token: Option<&str>, role: &str) -> String {
-    let endpoint = websocket_endpoint(&record.endpoint_origin);
-    let key = token.unwrap_or("[REDACTED]");
-    debug_assert!(
-        record.frontend_url.starts_with(&record.frontend_origin),
-        "frontend URL must belong to its expected origin"
-    );
-    let mut url = format!(
-        "{}/#endpoint={endpoint}&id={}&key={key}",
-        record.frontend_url, record.share_id
-    );
-    if role != "read" {
-        url.push_str("&role=");
-        url.push_str(role);
-    }
-    if record.pairing_code.is_some() {
-        url.push_str("&pin=required");
-    }
-    if record.url_options.no_navbar {
-        url.push_str("&navbar=off");
-    }
-    if record.url_options.no_disclaimer {
-        url.push_str("&disclaimer=off");
-    }
-    if let Some(theme) = record.url_options.terminal_theme {
-        url.push_str("&theme=");
-        url.push_str(theme.as_url_value());
-    }
-    url
-}
-
-fn websocket_endpoint(base_url: &str) -> String {
-    let (scheme, authority) = base_url
-        .split_once("://")
-        .expect("validated web-share base URL must include scheme");
-    let ws_scheme = if scheme == "https" { "wss" } else { "ws" };
-    format!("{ws_scheme}://{authority}/share")
-}
-
-fn random_share_id() -> Result<String, RmuxError> {
-    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
-    let mut bytes = [0u8; 5];
-    getrandom::fill(&mut bytes).map_err(random_error)?;
-    let value = u64::from_be_bytes([0, 0, 0, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4]]);
-    let mut out = String::with_capacity(8);
-    for shift in (0..40).step_by(5).rev() {
-        let index = ((value >> shift) & 0x1f) as usize;
-        out.push(ALPHABET[index] as char);
-    }
-    Ok(out)
-}
-
-fn random_pairing_code() -> Result<String, RmuxError> {
-    loop {
-        let mut bytes = [0u8; 3];
-        getrandom::fill(&mut bytes).map_err(random_error)?;
-        let value = (u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]);
-        if value < 16_000_000 {
-            return Ok(format!("{:06}", value % 1_000_000));
-        }
-    }
-}
-
-fn random_token() -> Result<String, RmuxError> {
-    let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).map_err(random_error)?;
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
-}
-
-fn random_error(error: getrandom::Error) -> RmuxError {
-    RmuxError::Server(format!("failed to create web-share secret: {error}"))
-}
-
-fn secret_eq(left: &str, right: &str) -> bool {
-    let left = left.as_bytes();
-    let right = right.as_bytes();
-    let max = left.len().max(right.len());
-    let mut diff = left.len() ^ right.len();
-    for index in 0..max {
-        let a = left.get(index).copied().unwrap_or(0);
-        let b = right.get(index).copied().unwrap_or(0);
-        diff |= usize::from(a ^ b);
-    }
-    diff == 0
-}
-
-fn system_time_to_unix(value: SystemTime) -> Option<u64> {
-    value
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|duration| duration.as_secs())
 }

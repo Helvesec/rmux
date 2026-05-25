@@ -200,6 +200,73 @@ fn public_base_url_rejects_query_and_fragment() {
 }
 
 #[test]
+fn local_web_share_requires_bound_listener_and_valid_port() {
+    assert!(crate::web::WebShareSettings::from_options(0, None).is_err());
+
+    let registry = WebShareRegistry::default();
+    registry.mark_listener_unavailable("address already in use");
+    let error = registry
+        .create(CreateWebShareRequest {
+            scope: WebShareScope::Pane(target()),
+            public_base_url: None,
+            frontend_url: None,
+            ttl_seconds: Some(60),
+            max_readers: Some(2),
+            url_options: Default::default(),
+            require_pin: false,
+            terminal_palette: None,
+            writable: false,
+            controls: false,
+        })
+        .expect_err("dead listener must reject local share URLs");
+    assert!(error.to_string().contains("listener unavailable"));
+    assert!(registry
+        .config(rmux_proto::WebShareConfigRequest)
+        .expect_err("dead listener must reject config")
+        .to_string()
+        .contains("listener unavailable"));
+
+    registry.mark_listener_available();
+    assert!(registry
+        .create(CreateWebShareRequest {
+            scope: WebShareScope::Pane(target()),
+            public_base_url: None,
+            frontend_url: None,
+            ttl_seconds: Some(60),
+            max_readers: Some(2),
+            url_options: Default::default(),
+            require_pin: false,
+            terminal_palette: None,
+            writable: false,
+            controls: false,
+        })
+        .is_ok());
+}
+
+#[test]
+fn public_url_scheme_is_case_insensitive_for_websocket_endpoint() {
+    let registry = WebShareRegistry::default();
+    let created = registry
+        .create(CreateWebShareRequest {
+            scope: WebShareScope::Pane(target()),
+            public_base_url: Some("HTTPS://terminal.example".to_owned()),
+            frontend_url: None,
+            ttl_seconds: Some(60),
+            max_readers: Some(2),
+            url_options: Default::default(),
+            require_pin: false,
+            terminal_palette: None,
+            writable: false,
+            controls: false,
+        })
+        .expect("uppercase HTTPS is valid");
+
+    assert!(created
+        .read_url
+        .starts_with("https://share.rmux.io/#endpoint=wss://terminal.example/share&id="));
+}
+
+#[test]
 fn url_options_are_encoded_in_read_urls() {
     let registry = WebShareRegistry::default();
     let created = registry

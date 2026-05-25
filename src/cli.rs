@@ -387,6 +387,24 @@ mod tests {
                 command: Vec::new(),
             }
         )));
+        let web_create = parse_cli(["rmux", "web-share", "-t", "alpha"])
+            .expect("web-share create parses")
+            .command
+            .expect("parsed command");
+        assert!(command_has_start_server_flag(&web_create));
+        for args in [
+            &["rmux", "web-share", "-l"][..],
+            &["rmux", "web-share", "-K", "abc12345"][..],
+            &["rmux", "web-share", "-X"][..],
+            &["rmux", "web-share", "--lookup", "abc12345"][..],
+            &["rmux", "web-share", "--config"][..],
+        ] {
+            let command = parse_cli(args.iter().copied())
+                .expect("web-share lifecycle command parses")
+                .command
+                .expect("parsed command");
+            assert!(!command_has_start_server_flag(&command));
+        }
     }
 
     #[test]
@@ -404,6 +422,11 @@ mod tests {
             }
             ServerStartupConfig::Default { .. } => panic!("expected explicit config files"),
         }
+    }
+
+    #[test]
+    fn start_server_rejects_zero_web_port() {
+        assert!(parse_cli(["rmux", "start-server", "--web-port", "0"]).is_err());
     }
 
     #[cfg(unix)]

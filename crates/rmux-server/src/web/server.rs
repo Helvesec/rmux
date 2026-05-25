@@ -23,18 +23,32 @@ const HTTP_READ_LIMIT: usize = 8 * 1024;
 const OPERATOR_RATE_LIMIT: u16 = 200;
 const PRE_AUTH_SLOTS: usize = 16;
 
-pub(crate) fn spawn(handler: Arc<RequestHandler>) {
-    tokio::spawn(async move {
-        if let Err(error) = serve(handler).await {
+pub(crate) async fn spawn(handler: Arc<RequestHandler>) {
+    let listener_config = handler.web_listener();
+    let bind_addr = format!("{}:{}", listener_config.host, listener_config.port);
+    let listener = match TcpListener::bind(&bind_addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            handler.mark_web_listener_unavailable(error.to_string());
             warn!("web-share listener unavailable: {error}");
+            return;
+        }
+    };
+    handler.mark_web_listener_available();
+    let task_handler = Arc::clone(&handler);
+    tokio::spawn(async move {
+        if let Err(error) = serve(handler, listener, bind_addr).await {
+            task_handler.mark_web_listener_unavailable(error.to_string());
+            warn!("web-share listener stopped: {error}");
         }
     });
 }
 
-async fn serve(handler: Arc<RequestHandler>) -> io::Result<()> {
-    let listener_config = handler.web_listener();
-    let bind_addr = format!("{}:{}", listener_config.host, listener_config.port);
-    let listener = TcpListener::bind(&bind_addr).await?;
+async fn serve(
+    handler: Arc<RequestHandler>,
+    listener: TcpListener,
+    bind_addr: String,
+) -> io::Result<()> {
     let pre_auth = Arc::new(Semaphore::new(PRE_AUTH_SLOTS));
     debug!("web-share listener bound to {bind_addr}");
     loop {
@@ -119,6 +133,11 @@ async fn serve_websocket(
         .await;
     };
     let mut socket = WebSocket::accept(stream, key).await?;
+    let Some(origin) = request.headers.get("origin") else {
+        sleep(UNIFORM_AUTH_DELAY).await;
+        let _ = socket.write_close_code(4004, "origin_required").await;
+        return Ok(());
+    };
     let auth = match read_auth_message(&mut socket).await {
         Ok(auth) => auth,
         Err((code, reason)) => {
@@ -151,12 +170,10 @@ async fn serve_websocket(
             return Ok(());
         }
     };
-    if let Some(origin) = request.headers.get("origin") {
-        if !share.origin_allowed(origin) {
-            sleep(UNIFORM_AUTH_DELAY).await;
-            let _ = socket.write_close_code(4004, "origin_not_allowed").await;
-            return Ok(());
-        }
+    if !share.origin_allowed(origin) {
+        sleep(UNIFORM_AUTH_DELAY).await;
+        let _ = socket.write_close_code(4004, "origin_not_allowed").await;
+        return Ok(());
     }
     sleep(UNIFORM_AUTH_DELAY).await;
     info!(

@@ -194,6 +194,9 @@ where
                 .ok_or_else(|| "invalid UTF-8 in --web-port".to_owned())?
                 .parse::<u16>()
                 .map_err(|_| "--web-port requires an integer port".to_owned())?;
+            if port == 0 {
+                return Err("--web-port must be between 1 and 65535".to_owned());
+            }
             *web_port = Some(port);
         }
         Some("--frontend-url" | "--web-frontend") => {

@@ -56,13 +56,6 @@ impl LeaseBook {
     pub(crate) fn reader_count(&self) -> usize {
         self.current_readers.load(Ordering::Acquire)
     }
-
-    fn read_uncapped(self: &Arc<Self>) -> ReadLease {
-        self.current_readers.fetch_add(1, Ordering::AcqRel);
-        ReadLease {
-            book: Arc::clone(self),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -83,10 +76,13 @@ pub(crate) struct OperatorLease {
 }
 
 impl OperatorLease {
-    pub(crate) fn release_to_read(mut self) -> ReadLease {
+    pub(crate) fn release_to_read(mut self) -> Result<ReadLease, Self> {
+        let Some(read) = self.book.try_read() else {
+            return Err(self);
+        };
         self.release_operator_slot();
         self.active = false;
-        self.book.read_uncapped()
+        Ok(read)
     }
 
     fn release_operator_slot(&self) {
@@ -109,13 +105,12 @@ pub(crate) enum ConnectionLease {
 }
 
 impl ConnectionLease {
-    pub(crate) fn is_operator(&self) -> bool {
-        matches!(self, Self::Operator(_))
-    }
-
     pub(crate) fn release_operator(self) -> Result<Self, Self> {
         match self {
-            Self::Operator(lease) => Ok(Self::Read(lease.release_to_read())),
+            Self::Operator(lease) => lease
+                .release_to_read()
+                .map(Self::Read)
+                .map_err(Self::Operator),
             Self::Read(lease) => Err(Self::Read(lease)),
         }
     }
@@ -139,19 +134,27 @@ mod tests {
     }
 
     #[test]
-    fn operator_release_converts_to_uncapped_read_without_leaking_slot() {
+    fn operator_release_requires_available_read_slot() {
         let book = LeaseBook::new(1);
         let _read = book.try_read().expect("read cap should allow one");
         let operator = book.try_operator().expect("operator slot should be free");
 
         assert!(book.operator_connected());
-        let released = operator.release_to_read();
-        assert!(!book.operator_connected());
-        assert_eq!(book.reader_count(), 2);
-        assert!(book.try_operator().is_some());
-
-        drop(released);
+        let operator = operator
+            .release_to_read()
+            .expect_err("full read cap keeps operator mode");
+        assert!(book.operator_connected());
         assert_eq!(book.reader_count(), 1);
+
+        drop(_read);
+        let released = operator
+            .release_to_read()
+            .expect("freed read slot allows release");
+        assert!(!book.operator_connected());
+        assert_eq!(book.reader_count(), 1);
+        assert!(book.try_operator().is_some());
+        drop(released);
+        assert_eq!(book.reader_count(), 0);
     }
 
     #[test]
@@ -162,6 +165,6 @@ mod tests {
         let returned = read
             .release_operator()
             .expect_err("read cannot release operator mode");
-        assert!(!returned.is_operator());
+        assert!(matches!(returned, ConnectionLease::Read(_)));
     }
 }

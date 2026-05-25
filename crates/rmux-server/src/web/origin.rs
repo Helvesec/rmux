@@ -1,4 +1,5 @@
 use rmux_proto::RmuxError;
+use subtle::ConstantTimeEq;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FrontendUrl {
@@ -188,14 +189,7 @@ fn is_loopback_host(host: &str) -> bool {
 }
 
 fn secret_eq(left: &[u8], right: &[u8]) -> bool {
-    let max = left.len().max(right.len());
-    let mut diff = left.len() ^ right.len();
-    for index in 0..max {
-        let a = left.get(index).copied().unwrap_or(0);
-        let b = right.get(index).copied().unwrap_or(0);
-        diff |= usize::from(a ^ b);
-    }
-    diff == 0
+    left.len() == right.len() && bool::from(left.ct_eq(right))
 }
 
 #[cfg(test)]

@@ -1,16 +1,13 @@
-use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
 use rmux_ipc::LocalStream;
 use rmux_os::identity::UserIdentity;
 use rmux_proto::{
-    encode_attach_message, AttachFrameDecoder, AttachMessage, AttachedKeystroke,
     CreateWebShareRequest, ErrorResponse, KillSessionRequest, PaneInputRequest, PaneResizeRequest,
     PaneTarget, PaneTargetRef, ResizePaneAdjustment, Response, RmuxError, SessionName,
-    TerminalSize, WebShareRequest, WebShareScope, WebTerminalPalette,
+    WebShareRequest, WebShareScope,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, watch};
 
 use super::attach_support::{attach_target_for_session, AttachRegistration, ClientFlags};
@@ -20,200 +17,31 @@ use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::{self, AttachControl, LiveAttachInputContext, PaneOutputReceiver};
 use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::server_access::current_owner_uid;
-use crate::web::{WebShareAccess, WebShareConnectRole, WebShareRevokeReason};
-use rmux_core::{input::mode, GridRenderOptions, ScreenCaptureRange};
+use crate::web::{WebShareAccess, WebShareConnectRole};
+use rmux_core::input::mode;
 
 const WEB_ATTACH_PID_BASE: u32 = 0x8000_0000;
-const ATTACH_READ_BUFFER_SIZE: usize = 8192;
 
-pub(crate) struct WebPaneStream {
-    _access: WebShareAccess,
-    pub(crate) output: PaneOutputReceiver,
-    pub(crate) snapshot: WebPaneSnapshot,
-    pub(crate) revoke_rx: tokio::sync::watch::Receiver<Option<WebShareRevokeReason>>,
-    target: PaneTargetRef,
-}
+#[path = "handler_web_snapshot.rs"]
+mod snapshot;
+#[path = "handler_web_stream.rs"]
+mod stream;
 
-pub(crate) enum WebShareStream {
-    Pane(WebPaneStream),
-    Session(WebSessionStream),
-}
-
-pub(crate) struct WebSessionStream {
-    _access: WebShareAccess,
-    pub(crate) revoke_rx: tokio::sync::watch::Receiver<Option<WebShareRevokeReason>>,
-    session_name: SessionName,
-    initial_size: TerminalSize,
-    writer: WriteHalf<LocalStream>,
-    reader: Option<Box<WebSessionAttachReader>>,
-}
-
-pub(crate) struct WebSessionAttachReader {
-    reader: ReadHalf<LocalStream>,
-    decoder: AttachFrameDecoder,
-    read_buffer: [u8; ATTACH_READ_BUFFER_SIZE],
-}
-
-impl WebPaneStream {
-    pub(crate) fn origin_allowed(&self, received: &str) -> bool {
-        self._access.origin_allowed(received)
-    }
-
-    pub(crate) fn is_operator(&self) -> bool {
-        self._access.is_operator()
-    }
-
-    pub(crate) fn expires_at(&self) -> Option<std::time::SystemTime> {
-        self._access.expires_at()
-    }
-
-    pub(crate) fn release_operator(&mut self) -> bool {
-        self._access.release_operator()
-    }
-
-    pub(crate) fn target(&self) -> &PaneTargetRef {
-        &self.target
-    }
-
-    pub(crate) fn terminal_palette(&self) -> Option<&WebTerminalPalette> {
-        self._access.terminal_palette()
-    }
-}
-
-impl WebShareStream {
-    pub(crate) fn origin_allowed(&self, received: &str) -> bool {
-        match self {
-            Self::Pane(stream) => stream.origin_allowed(received),
-            Self::Session(stream) => stream.origin_allowed(received),
-        }
-    }
-
-    pub(crate) fn is_operator(&self) -> bool {
-        match self {
-            Self::Pane(stream) => stream.is_operator(),
-            Self::Session(stream) => stream.is_operator(),
-        }
-    }
-
-    pub(crate) fn controls(&self) -> bool {
-        match self {
-            Self::Pane(_) => false,
-            Self::Session(stream) => stream.controls(),
-        }
-    }
-
-    pub(crate) fn terminal_palette(&self) -> Option<&WebTerminalPalette> {
-        match self {
-            Self::Pane(stream) => stream.terminal_palette(),
-            Self::Session(stream) => stream.terminal_palette(),
-        }
-    }
-}
-
-impl WebSessionStream {
-    pub(crate) fn origin_allowed(&self, received: &str) -> bool {
-        self._access.origin_allowed(received)
-    }
-
-    pub(crate) fn is_operator(&self) -> bool {
-        self._access.is_operator()
-    }
-
-    pub(crate) fn controls(&self) -> bool {
-        self._access.controls()
-    }
-
-    pub(crate) fn expires_at(&self) -> Option<std::time::SystemTime> {
-        self._access.expires_at()
-    }
-
-    pub(crate) fn release_operator(&mut self) -> bool {
-        self._access.release_operator()
-    }
-
-    pub(crate) fn session_name(&self) -> &SessionName {
-        &self.session_name
-    }
-
-    pub(crate) const fn initial_size(&self) -> TerminalSize {
-        self.initial_size
-    }
-
-    pub(crate) fn terminal_palette(&self) -> Option<&WebTerminalPalette> {
-        self._access.terminal_palette()
-    }
-
-    pub(crate) fn take_attach_reader(&mut self) -> WebSessionAttachReader {
-        *self
-            .reader
-            .take()
-            .expect("web session attach reader is taken exactly once")
-    }
-
-    pub(crate) async fn send_attach_keystroke(&mut self, bytes: Vec<u8>) -> io::Result<()> {
-        self.write_attach_message(AttachMessage::Keystroke(AttachedKeystroke::new(bytes)))
-            .await
-    }
-
-    pub(crate) async fn send_resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
-        self.write_attach_message(AttachMessage::Resize(TerminalSize { cols, rows }))
-            .await
-    }
-
-    async fn write_attach_message(&mut self, message: AttachMessage) -> io::Result<()> {
-        let frame =
-            encode_attach_message(&message).map_err(|error| io::Error::other(error.to_string()))?;
-        self.writer.write_all(&frame).await
-    }
-}
-
-impl WebSessionAttachReader {
-    pub(crate) async fn read_attach_bytes(&mut self) -> io::Result<Option<Vec<u8>>> {
-        loop {
-            if let Some(message) = self
-                .decoder
-                .next_message()
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?
-            {
-                match message {
-                    AttachMessage::Data(bytes) => return Ok(Some(bytes)),
-                    AttachMessage::KeyDispatched(_) => continue,
-                    AttachMessage::Lock(_)
-                    | AttachMessage::LockShellCommand(_)
-                    | AttachMessage::Unlock
-                    | AttachMessage::Suspend
-                    | AttachMessage::DetachKill
-                    | AttachMessage::DetachExec(_)
-                    | AttachMessage::DetachExecShellCommand(_)
-                    | AttachMessage::Resize(_)
-                    | AttachMessage::ResizeGeometry(_)
-                    | AttachMessage::Keystroke(_) => continue,
-                }
-            }
-
-            let read = self.reader.read(&mut self.read_buffer).await?;
-            if read == 0 {
-                return Ok(None);
-            }
-            self.decoder.push_bytes(&self.read_buffer[..read]);
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct WebPaneSnapshot {
-    pub(crate) cols: u16,
-    pub(crate) rows: u16,
-    pub(crate) output_sequence: u64,
-    pub(crate) ansi_lines: Vec<Vec<u8>>,
-    pub(crate) cursor_row: u16,
-    pub(crate) cursor_col: u16,
-    pub(crate) cursor_visible: bool,
-}
+use snapshot::snapshot_ansi_lines;
+pub(crate) use snapshot::WebPaneSnapshot;
+pub(crate) use stream::{WebPaneStream, WebSessionAttachReader, WebSessionStream, WebShareStream};
 
 impl RequestHandler {
     pub(crate) fn web_listener(&self) -> rmux_proto::WebShareListener {
         self.web_shares.listener()
+    }
+
+    pub(crate) fn mark_web_listener_available(&self) {
+        self.web_shares.mark_listener_available();
+    }
+
+    pub(crate) fn mark_web_listener_unavailable(&self, reason: impl Into<String>) {
+        self.web_shares.mark_listener_unavailable(reason);
     }
 
     pub(in crate::handler) async fn handle_web_share(&self, request: WebShareRequest) -> Response {
@@ -241,7 +69,7 @@ impl RequestHandler {
                 let (snapshot, output) = self.web_resnapshot(&target).await?;
                 let revoke_rx = access.revoke_receiver();
                 Ok(WebShareStream::Pane(WebPaneStream {
-                    _access: access,
+                    access,
                     output,
                     revoke_rx,
                     snapshot,
@@ -342,16 +170,12 @@ impl RequestHandler {
         let revoke_rx = access.revoke_receiver();
         let (reader, writer) = tokio::io::split(client_stream);
         Ok(WebSessionStream {
-            _access: access,
+            access,
             revoke_rx,
             session_name,
             initial_size,
             writer,
-            reader: Some(Box::new(WebSessionAttachReader {
-                reader,
-                decoder: AttachFrameDecoder::new(),
-                read_buffer: [0; ATTACH_READ_BUFFER_SIZE],
-            })),
+            reader: Some(Box::new(WebSessionAttachReader::new(reader))),
         })
     }
 
@@ -589,40 +413,6 @@ fn session_not_found_web(session_name: &SessionName) -> RmuxError {
     RmuxError::Server(format!("can't find session: {session_name}"))
 }
 
-impl WebPaneSnapshot {
-    pub(crate) fn ansi_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(b"\x1bc\x1b[?25l\x1b[H");
-        for (index, line) in self.ansi_lines.iter().enumerate() {
-            if index > 0 {
-                out.extend_from_slice(b"\r\n");
-            }
-            out.extend_from_slice(b"\x1b[0m");
-            out.extend_from_slice(line);
-        }
-        let cursor_row = self.cursor_row.min(self.rows.saturating_sub(1)) + 1;
-        let cursor_col = self.cursor_col.min(self.cols.saturating_sub(1)) + 1;
-        out.extend_from_slice(format!("\x1b[0m\x1b[{cursor_row};{cursor_col}H").as_bytes());
-        out.extend_from_slice(if self.cursor_visible {
-            b"\x1b[?25h"
-        } else {
-            b"\x1b[?25l"
-        });
-        out
-    }
-}
-
-fn snapshot_ansi_lines(screen: &rmux_core::Screen) -> Vec<Vec<u8>> {
-    screen.capture_transcript_lines_independent(
-        ScreenCaptureRange::default(),
-        GridRenderOptions {
-            with_sequences: true,
-            trim_spaces: false,
-            ..GridRenderOptions::default()
-        },
-    )
-}
-
 fn response_to_result(response: Response) -> Result<(), RmuxError> {
     match response {
         Response::Error(error) => Err(error.error),
@@ -633,7 +423,6 @@ fn response_to_result(response: Response) -> Result<(), RmuxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmux_core::{input::InputParser, Screen};
     use rmux_proto::{
         CreateWebShareRequest, NewSessionRequest, Request, Response, SessionName, TerminalSize,
         WebShareScope,
@@ -683,37 +472,5 @@ mod tests {
             }) if actual == &session_name
         ));
         assert!(created.read_url.contains("&key="));
-    }
-
-    #[test]
-    fn web_snapshot_bytes_preserve_ansi_style_and_cursor() {
-        let snapshot = WebPaneSnapshot {
-            cols: 80,
-            rows: 24,
-            output_sequence: 7,
-            ansi_lines: vec![b"\x1b[32mpingu@host\x1b[0m".to_vec()],
-            cursor_row: 3,
-            cursor_col: 7,
-            cursor_visible: true,
-        };
-
-        let bytes = snapshot.ansi_bytes();
-        let rendered = String::from_utf8(bytes).expect("snapshot bytes are utf8");
-
-        assert!(rendered.contains("\x1b[32mpingu@host"));
-        assert!(rendered.contains("\x1b[4;8H\x1b[?25h"));
-    }
-
-    #[test]
-    fn web_snapshot_capture_preserves_screen_sequences() {
-        let mut screen = Screen::new(TerminalSize { cols: 12, rows: 3 }, 100);
-        let mut parser = InputParser::new();
-        parser.parse(b"\x1b[32mpingu\x1b[0m@host", &mut screen);
-
-        let lines = snapshot_ansi_lines(&screen);
-        let joined = String::from_utf8(lines.concat()).expect("snapshot lines are utf8");
-
-        assert!(joined.contains("\x1b[32m"));
-        assert!(joined.contains("pingu"));
     }
 }

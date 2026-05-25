@@ -216,6 +216,13 @@ impl<'a> IntoFuture for WebShareBuilder<'a> {
 }
 
 /// A share handle returned by a create operation.
+///
+/// Dropping this handle does not stop the daemon-side share. The share remains
+/// active until its TTL expires, the shared pane or session goes away, or
+/// [`Self::stop`] is called explicitly.
+///
+/// Cloned handles point at the same daemon share. Stopping one clone invalidates
+/// the share for every other clone.
 #[derive(Clone)]
 pub struct WebShareHandle {
     transport: TransportClient,
