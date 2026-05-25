@@ -14,7 +14,7 @@ English · [Français](README.fr.md) · [简体中文](README.zh-CN.md) · [日�
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Release validation](https://github.com/Helvesec/rmux/actions/workflows/ci.yml/badge.svg)](https://github.com/Helvesec/rmux/actions/workflows/ci.yml)
-[![rmux 0.3.1](https://img.shields.io/badge/rmux-0.3.1-informational.svg)](#install)
+[![rmux 0.4.0](https://img.shields.io/badge/rmux-0.4.0-informational.svg)](#install)
 [![Platform: Linux | macOS | Windows](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#platform-support)
 [![Unsafe policy](https://img.shields.io/badge/unsafe-restricted-success.svg)](#verification)
 
@@ -26,7 +26,7 @@ English · [Français](README.fr.md) · [简体中文](README.zh-CN.md) · [日�
 </div>
 
 > [!IMPORTANT]
-> Current release: **v0.3.1**, published on **25 May 2026**. All 90 tmux-compatible commands are implemented, but bugs are expected — this is a fresh public preview. Please [file issues](https://github.com/helvesec/rmux/issues) if you hit one.
+> Current release: **v0.4.0**, published on **25 May 2026**. All 90 tmux-compatible commands are implemented, but bugs are expected — this is a fresh public preview. Please [file issues](https://github.com/helvesec/rmux/issues) if you hit one.
 
 ## Why RMUX
 
@@ -64,7 +64,7 @@ Prebuilt binary for Windows PowerShell:
 irm https://rmux.io/install.ps1 | iex
 ```
 
-Direct downloads and SHA256 checksums are available from the [v0.3.1 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.3.1).
+Direct downloads and SHA256 checksums are available from the [v0.4.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.4.0).
 
 From crates.io with Cargo:
 
@@ -117,7 +117,7 @@ use `rmux diagnose --human` or `rmux diagnose --json`.
 
 ```toml
 [dependencies]
-rmux-sdk = "0.3"
+rmux-sdk = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
