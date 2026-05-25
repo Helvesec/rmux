@@ -349,12 +349,8 @@ impl WebShareState {
         let expired = self
             .records
             .iter()
-            .filter_map(|(id, record)| {
-                record
-                    .expires_at
-                    .is_some_and(|expires| expires <= now)
-                    .then(|| id.clone())
-            })
+            .filter(|(_, record)| record.expires_at.is_some_and(|expires| expires <= now))
+            .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
         for id in expired {
             if let Some(record) = self.records.remove(&id) {
