@@ -65,6 +65,14 @@ pub use options::{
     ShowEnvironmentResponse, ShowHooksResponse, ShowOptionsResponse,
 };
 
+#[path = "response/web.rs"]
+mod web;
+pub use web::{
+    WebShareConfigResponse, WebShareCreatedResponse, WebShareListResponse, WebShareListener,
+    WebShareLookupResponse, WebShareResponse, WebShareStoppedAllResponse, WebShareStoppedResponse,
+    WebShareSummary,
+};
+
 /// All detached responses supported by the wire protocol.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Response {
@@ -254,6 +262,8 @@ pub enum Response {
     DaemonStatus(DaemonStatusResponse),
     /// Success payload for internal idle-only daemon shutdown.
     ShutdownIfIdle(ShutdownIfIdleResponse),
+    /// Success payload for browser-visible pane sharing.
+    WebShare(WebShareResponse),
 }
 
 impl Response {
@@ -356,6 +366,7 @@ impl Response {
             Self::Handshake(_) => "handshake",
             Self::DaemonStatus(_) => "daemon-status",
             Self::ShutdownIfIdle(_) => "shutdown-if-idle",
+            Self::WebShare(_) => "web-share",
         }
     }
 
@@ -393,6 +404,7 @@ impl Response {
             Self::ListClients(response) => Some(response.command_output()),
             Self::BreakPane(response) => response.command_output(),
             Self::Handshake(_) => None,
+            Self::WebShare(response) => response.command_output(),
             Self::SubscribePaneOutput(_)
             | Self::UnsubscribePaneOutput(_)
             | Self::PaneOutputCursor(_)

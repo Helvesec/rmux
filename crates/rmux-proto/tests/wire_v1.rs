@@ -33,7 +33,8 @@ use rmux_proto::{
     SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId, SendKeysRequest, SendKeysResponse, SessionName,
     SetHookRequest, SetOptionMode, SetOptionRequest, SubscribePaneOutputRefRequest,
     SubscribePaneOutputRequest, SubscribePaneOutputResponse, TerminalSize,
-    UnsubscribePaneOutputRequest, UnsubscribePaneOutputResponse, WindowTarget, RMUX_FRAME_MAGIC,
+    UnsubscribePaneOutputRequest, UnsubscribePaneOutputResponse, WebShareConfigRequest,
+    WebShareListener, WebShareRequest, WebShareResponse, WindowTarget, RMUX_FRAME_MAGIC,
     RMUX_WIRE_VERSION, V1_FRAME_LEDGER,
 };
 
@@ -559,6 +560,7 @@ fn cross_section_requests() -> Vec<Request> {
             target: pane_ref,
             title: Some("agent".to_owned()),
         }),
+        Request::WebShare(WebShareRequest::Config(WebShareConfigRequest)),
     ]
 }
 
@@ -629,6 +631,16 @@ fn cross_section_responses() -> Vec<Response> {
             wait_id: SdkWaitId::new(4),
             removed: true,
         }),
+        Response::WebShare(WebShareResponse::Config(
+            rmux_proto::WebShareConfigResponse {
+                listener: WebShareListener {
+                    host: "127.0.0.1".to_owned(),
+                    port: 9777,
+                    frontend_origin: "http://127.0.0.1:9777".to_owned(),
+                },
+                output: rmux_proto::CommandOutput::from_stdout("127.0.0.1:9777\n"),
+            },
+        )),
     ]
 }
 
@@ -750,8 +762,8 @@ fn ledger_active_size_matches_request_and_response_variant_count() {
         .iter()
         .filter(|entry| matches!(entry.status, FrameStatus::Active))
         .count();
-    // Active entries = 114 Request variants + 93 Response variants.
-    assert_eq!(active_count, 114 + 93, "active ledger size mismatch");
+    // Active entries = 115 Request variants + 94 Response variants.
+    assert_eq!(active_count, 115 + 94, "active ledger size mismatch");
 }
 
 #[test]
