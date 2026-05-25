@@ -172,28 +172,19 @@ async fn serve_websocket(
     };
     drop(pre_auth_permit);
     let share = match handler
-        .open_web_share(
-            &auth.id,
-            &auth.key,
-            auth.pin.as_deref(),
-            auth.role.connect_role(),
-        )
+        .open_web_share(&auth.token, auth.pin.as_deref())
         .await
     {
         Ok(pane) => pane,
         Err(error) => {
             sleep(UNIFORM_AUTH_DELAY).await;
             let (code, reason) = close_for_auth_error(&error.to_string());
-            info!(
-                share_id = %auth.id,
-                close_code = code,
-                reason,
-                "web_share_auth_failed"
-            );
+            info!(close_code = code, reason, "web_share_auth_failed");
             let _ = socket.write_close_code(code, reason).await;
             return Ok(());
         }
     };
+    let share_id = share.share_id().to_owned();
     if !share.origin_allowed(origin) {
         sleep(UNIFORM_AUTH_DELAY).await;
         let _ = socket.write_close_code(4004, "origin_not_allowed").await;
@@ -201,15 +192,15 @@ async fn serve_websocket(
     }
     sleep(UNIFORM_AUTH_DELAY).await;
     info!(
-        share_id = %auth.id,
-        role = auth.role.as_str(),
+        share_id = %share_id,
+        role = share.role(),
         "web_share_auth_ok"
     );
-    write_with_timeout(send_ready(&mut socket, &share, auth.role.as_str())).await?;
+    write_with_timeout(send_ready(&mut socket, &share)).await?;
     match share {
-        WebShareStream::Pane(pane) => serve_pane_loop(handler, socket, auth.id, *pane).await,
+        WebShareStream::Pane(pane) => serve_pane_loop(handler, socket, share_id, *pane).await,
         WebShareStream::Session(session) => {
-            serve_session_loop(handler, socket, auth.id, *session).await
+            serve_session_loop(handler, socket, share_id, *session).await
         }
     }
 }

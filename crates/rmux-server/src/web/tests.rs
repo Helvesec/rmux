@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use crate::pane_io::pane_output_channel_with_limits;
 use crate::web::origin::validate_public_base_url;
-use crate::web::{WebShareConnectRole, WebShareRegistry};
+use crate::web::secrets::random_token;
+use crate::web::WebShareRegistry;
 
 #[test]
 fn subscribe_from_future_sequence_skips_snapshot_covered_event() {
@@ -60,11 +61,11 @@ fn create_returns_secret_urls_but_list_is_redacted() {
         })
         .expect("share creates");
 
-    assert!(created.read_url.contains("&key="));
+    assert!(created.read_url.contains("#e=wss://share.example/share&t="));
     assert!(created
         .operator_url
         .as_deref()
-        .is_some_and(|url| url.contains("&key=")));
+        .is_some_and(|url| url.contains("#e=wss://share.example/share&t=")));
     let stdout = String::from_utf8_lossy(created.output.stdout());
     assert!(stdout.contains("read "));
     assert!(!stdout.contains("operator "));
@@ -74,10 +75,7 @@ fn create_returns_secret_urls_but_list_is_redacted() {
     let redacted = listed.shares[0].read_url.as_deref().expect("url");
     assert_eq!(
         redacted,
-        format!(
-            "https://share.rmux.io/#endpoint=wss://share.example/share&id={}&key=[REDACTED]",
-            created.share_id
-        )
+        format!("https://share.rmux.io/#e=wss://share.example/share&t=[REDACTED]")
     );
 }
 
@@ -99,19 +97,12 @@ async fn default_local_share_uses_hosted_frontend_and_local_websocket_endpoint()
         })
         .expect("share creates");
 
-    assert!(created
-        .read_url
-        .starts_with("https://share.rmux.io/#endpoint=ws://127.0.0.1:9777/share&id="));
-    assert!(!created.read_url.contains("&role=read"));
+    assert!(created.read_url.starts_with("https://share.rmux.io/#t="));
+    assert!(!created.read_url.contains("role="));
 
-    let read_key = key_from_url(&created.read_url);
+    let read_token = token_from_url(&created.read_url);
     let access = registry
-        .connect(
-            &created.share_id,
-            &read_key,
-            None,
-            WebShareConnectRole::Read,
-        )
+        .connect(&read_token, None)
         .await
         .expect("read connects");
     assert!(access.origin_allowed("https://share.rmux.io"));
@@ -146,15 +137,10 @@ async fn frontend_override_changes_browser_origin_without_changing_local_endpoin
 
     assert!(created
         .read_url
-        .starts_with("https://share.fork.example/#endpoint=ws://127.0.0.1:9778/share&id="));
-    let read_key = key_from_url(&created.read_url);
+        .starts_with("https://share.fork.example/#t="));
+    let read_token = token_from_url(&created.read_url);
     let access = registry
-        .connect(
-            &created.share_id,
-            &read_key,
-            None,
-            WebShareConnectRole::Read,
-        )
+        .connect(&read_token, None)
         .await
         .expect("read connects");
     assert!(access.origin_allowed("https://share.fork.example"));
@@ -179,17 +165,12 @@ async fn per_share_frontend_url_overrides_daemon_default() {
         })
         .expect("share creates");
 
-    assert!(created.read_url.starts_with(
-        "https://share.fork.example/share/#endpoint=wss://terminal.example/share&id="
-    ));
-    let read_key = key_from_url(&created.read_url);
+    assert!(created
+        .read_url
+        .starts_with("https://share.fork.example/share/#e=wss://terminal.example/share&t="));
+    let read_token = token_from_url(&created.read_url);
     let access = registry
-        .connect(
-            &created.share_id,
-            &read_key,
-            None,
-            WebShareConnectRole::Read,
-        )
+        .connect(&read_token, None)
         .await
         .expect("read connects");
     assert!(access.origin_allowed("https://share.fork.example"));
@@ -267,7 +248,7 @@ fn public_url_scheme_is_case_insensitive_for_websocket_endpoint() {
 
     assert!(created
         .read_url
-        .starts_with("https://share.rmux.io/#endpoint=wss://terminal.example/share&id="));
+        .starts_with("https://share.rmux.io/#e=wss://terminal.example/share&t="));
 }
 
 #[test]
@@ -332,32 +313,11 @@ async fn pairing_code_is_required_out_of_band_when_pin_enabled() {
     let stdout = String::from_utf8_lossy(created.output.stdout());
     assert!(stdout.contains(&format!("pin {pairing_code}\n")));
 
-    let read_key = key_from_url(&created.read_url);
+    let read_token = token_from_url(&created.read_url);
+    assert!(registry.connect(&read_token, None).await.is_err());
+    assert!(registry.connect(&read_token, Some("000000")).await.is_err());
     assert!(registry
-        .connect(
-            &created.share_id,
-            &read_key,
-            None,
-            WebShareConnectRole::Read
-        )
-        .await
-        .is_err());
-    assert!(registry
-        .connect(
-            &created.share_id,
-            &read_key,
-            Some("000000"),
-            WebShareConnectRole::Read,
-        )
-        .await
-        .is_err());
-    assert!(registry
-        .connect(
-            &created.share_id,
-            &read_key,
-            Some(pairing_code),
-            WebShareConnectRole::Read,
-        )
+        .connect(&read_token, Some(pairing_code))
         .await
         .is_ok());
 }
@@ -468,65 +428,106 @@ async fn connect_enforces_read_cap_and_single_operator() {
             controls: false,
         })
         .expect("share creates");
-    let read_key = key_from_url(&created.read_url);
-    let operator_key = key_from_url(created.operator_url.as_deref().expect("operator url"));
+    let read_token = token_from_url(&created.read_url);
+    let operator_token = token_from_url(created.operator_url.as_deref().expect("operator url"));
 
     let read = registry
-        .connect(
-            &created.share_id,
-            &read_key,
-            None,
-            WebShareConnectRole::Read,
-        )
+        .connect(&read_token, None)
         .await
         .expect("read connects");
     assert!(!read.is_operator());
-    assert!(registry
-        .connect(
-            &created.share_id,
-            &read_key,
-            None,
-            WebShareConnectRole::Read
-        )
-        .await
-        .is_err());
+    assert!(registry.connect(&read_token, None).await.is_err());
 
     let operator = registry
-        .connect(
-            &created.share_id,
-            &operator_key,
-            None,
-            WebShareConnectRole::Operator,
-        )
+        .connect(&operator_token, None)
         .await
         .expect("operator connects");
     assert!(operator.is_operator());
-    assert!(registry
-        .connect(
-            &created.share_id,
-            &operator_key,
-            None,
-            WebShareConnectRole::Operator,
-        )
-        .await
-        .is_err());
+    assert!(registry.connect(&operator_token, None).await.is_err());
 
     drop(read);
-    assert!(registry
-        .connect(
-            &created.share_id,
-            &read_key,
-            None,
-            WebShareConnectRole::Read
-        )
+    assert!(registry.connect(&read_token, None).await.is_ok());
+}
+
+#[tokio::test]
+async fn capability_tokens_grant_only_their_daemon_owned_roles() {
+    let registry = WebShareRegistry::default();
+    let created = registry
+        .create(CreateWebShareRequest {
+            scope: WebShareScope::Pane(target()),
+            public_base_url: None,
+            frontend_url: None,
+            ttl_seconds: None,
+            max_readers: Some(2),
+            url_options: Default::default(),
+            require_pin: false,
+            terminal_palette: None,
+            writable: true,
+            controls: false,
+        })
+        .expect("share creates");
+
+    assert!(!created.read_url.contains("id="));
+    assert!(!created.read_url.contains("key="));
+    assert!(!created.read_url.contains("role="));
+    let operator_url = created.operator_url.as_deref().expect("operator URL");
+    assert!(!operator_url.contains("id="));
+    assert!(!operator_url.contains("key="));
+    assert!(!operator_url.contains("role="));
+
+    let read_token = token_from_url(&created.read_url);
+    let read_access = registry
+        .connect(&read_token, None)
         .await
-        .is_ok());
+        .expect("read token connects");
+    assert!(!read_access.is_operator());
+    assert!(!read_access.controls());
+    drop(read_access);
+
+    let operator_token = token_from_url(operator_url);
+    let operator_access = registry
+        .connect(&operator_token, None)
+        .await
+        .expect("operator token connects");
+    assert!(operator_access.is_operator());
+    assert!(!operator_access.controls());
+}
+
+#[tokio::test]
+async fn stopped_or_expired_share_rejects_previous_tokens() {
+    let registry = WebShareRegistry::default();
+    let created = registry
+        .create(CreateWebShareRequest {
+            scope: WebShareScope::Pane(target()),
+            public_base_url: None,
+            frontend_url: None,
+            ttl_seconds: None,
+            max_readers: Some(2),
+            url_options: Default::default(),
+            require_pin: false,
+            terminal_palette: None,
+            writable: true,
+            controls: false,
+        })
+        .expect("share creates");
+    let read_token = token_from_url(&created.read_url);
+    let operator_token = token_from_url(created.operator_url.as_deref().expect("operator URL"));
+
+    assert!(
+        registry
+            .stop(rmux_proto::StopWebShareRequest {
+                share_id: created.share_id,
+            })
+            .stopped
+    );
+    assert!(registry.connect(&read_token, None).await.is_err());
+    assert!(registry.connect(&operator_token, None).await.is_err());
 }
 
 #[tokio::test]
 async fn auth_failures_backoff_per_share_id() {
     let registry = WebShareRegistry::default();
-    let created = registry
+    let _created = registry
         .create(CreateWebShareRequest {
             scope: WebShareScope::Pane(target()),
             public_base_url: None,
@@ -540,18 +541,11 @@ async fn auth_failures_backoff_per_share_id() {
             controls: false,
         })
         .expect("share creates");
+    let wrong_token = random_token().expect("test token");
 
     let start = Instant::now();
     for _ in 0..4 {
-        assert!(registry
-            .connect(
-                &created.share_id,
-                "wrong-key",
-                None,
-                WebShareConnectRole::Read,
-            )
-            .await
-            .is_err());
+        assert!(registry.connect(&wrong_token, None).await.is_err());
     }
 
     assert!(
@@ -567,8 +561,8 @@ fn target() -> PaneTargetRef {
     )
 }
 
-fn key_from_url(url: &str) -> String {
-    url.split_once("key=")
-        .map(|(_, key)| key.split('&').next().unwrap_or(key).to_owned())
-        .expect("key query")
+fn token_from_url(url: &str) -> String {
+    url.split_once("t=")
+        .map(|(_, token)| token.split('&').next().unwrap_or(token).to_owned())
+        .expect("token query")
 }

@@ -7,7 +7,7 @@ use tokio::time::timeout;
 use rmux_proto::WebTerminalPalette;
 
 use super::websocket::{WebSocket, WebSocketMessage};
-use super::{WebShareConnectRole, WebShareRevokeReason};
+use super::WebShareRevokeReason;
 use crate::handler::{
     RequestHandler, WebPaneSnapshot, WebPaneStream, WebSessionStream, WebShareStream,
 };
@@ -26,32 +26,8 @@ const WS_ATTACH_INPUT: u8 = 0x83;
 
 #[derive(Debug)]
 pub(crate) struct AuthMessage {
-    pub(crate) id: String,
-    pub(crate) key: String,
+    pub(crate) token: String,
     pub(crate) pin: Option<String>,
-    pub(crate) role: AuthRole,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum AuthRole {
-    Operator,
-    Read,
-}
-
-impl AuthRole {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Operator => "operator",
-            Self::Read => "read",
-        }
-    }
-
-    pub(crate) const fn connect_role(self) -> WebShareConnectRole {
-        match self {
-            Self::Operator => WebShareConnectRole::Operator,
-            Self::Read => WebShareConnectRole::Read,
-        }
-    }
 }
 
 pub(crate) async fn read_auth_message(
@@ -69,19 +45,12 @@ pub(crate) async fn read_auth_message(
     if wire.kind != "auth" {
         return Err((4006, "first_frame_must_auth"));
     }
-    let role = match wire.role.as_str() {
-        "read" => AuthRole::Read,
-        "operator" => AuthRole::Operator,
-        _ => return Err((4006, "invalid_role")),
-    };
-    if wire.id.is_empty() || wire.key.is_empty() {
+    if wire.token.is_empty() {
         return Err((4000, "invalid_auth"));
     }
     Ok(AuthMessage {
-        id: wire.id,
-        key: wire.key,
+        token: wire.token,
         pin: wire.pin,
-        role,
     })
 }
 
@@ -243,11 +212,7 @@ pub(crate) async fn send_snapshot(
     send_binary(socket, WS_SNAPSHOT_FULL, &snapshot.ansi_bytes()).await
 }
 
-pub(crate) async fn send_ready(
-    socket: &mut WebSocket,
-    share: &WebShareStream,
-    role: &str,
-) -> io::Result<()> {
+pub(crate) async fn send_ready(socket: &mut WebSocket, share: &WebShareStream) -> io::Result<()> {
     let pane_size = match share {
         WebShareStream::Pane(pane) => PaneSize {
             cols: pane.snapshot.cols,
@@ -265,7 +230,7 @@ pub(crate) async fn send_ready(
     let payload = ServerMessage::Ready {
         pane_size,
         scope,
-        role,
+        role: share.role(),
         writable: share.is_operator(),
         controls: share.controls(),
         terminal_palette: share.terminal_palette(),
@@ -449,7 +414,7 @@ async fn send_released(socket: &mut WebSocket) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::session_logout_allowed;
+    use super::{session_logout_allowed, AuthWireMessage};
 
     #[test]
     fn session_logout_requires_operator_controls() {
@@ -457,6 +422,13 @@ mod tests {
         assert!(!session_logout_allowed(false, true));
         assert!(!session_logout_allowed(true, false));
         assert!(session_logout_allowed(true, true));
+    }
+
+    #[test]
+    fn auth_wire_rejects_legacy_role_and_key_fields() {
+        let message = r#"{"type":"auth","id":"s","key":"k","role":"operator","token":"t"}"#;
+
+        assert!(serde_json::from_str::<AuthWireMessage>(message).is_err());
     }
 }
 
@@ -468,14 +440,13 @@ async fn send_binary(socket: &mut WebSocket, opcode: u8, body: &[u8]) -> io::Res
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AuthWireMessage {
     #[serde(rename = "type")]
     kind: String,
-    id: String,
-    key: String,
+    token: String,
     #[serde(default)]
     pin: Option<String>,
-    role: String,
 }
 
 #[derive(Debug, Deserialize)]

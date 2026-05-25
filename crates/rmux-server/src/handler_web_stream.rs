@@ -50,6 +50,10 @@ impl WebPaneStream {
         self.access.is_operator()
     }
 
+    pub(crate) fn share_id(&self) -> &str {
+        self.access.share_id()
+    }
+
     pub(crate) fn expires_at(&self) -> Option<std::time::SystemTime> {
         self.access.expires_at()
     }
@@ -82,6 +86,13 @@ impl WebShareStream {
         }
     }
 
+    pub(crate) fn share_id(&self) -> &str {
+        match self {
+            Self::Pane(stream) => stream.share_id(),
+            Self::Session(stream) => stream.share_id(),
+        }
+    }
+
     pub(crate) fn controls(&self) -> bool {
         match self {
             Self::Pane(_) => false,
@@ -95,6 +106,14 @@ impl WebShareStream {
             Self::Session(stream) => stream.terminal_palette(),
         }
     }
+
+    pub(crate) fn role(&self) -> &'static str {
+        if self.is_operator() {
+            "operator"
+        } else {
+            "read"
+        }
+    }
 }
 
 impl WebSessionStream {
@@ -104,6 +123,10 @@ impl WebSessionStream {
 
     pub(crate) fn is_operator(&self) -> bool {
         self.access.is_operator()
+    }
+
+    pub(crate) fn share_id(&self) -> &str {
+        self.access.share_id()
     }
 
     pub(crate) fn controls(&self) -> bool {

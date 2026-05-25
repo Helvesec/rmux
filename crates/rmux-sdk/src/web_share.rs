@@ -105,9 +105,9 @@ async fn require_web_share(transport: &TransportClient) -> Result<()> {
     crate::capabilities::require(transport, &[CAPABILITY_WEB_SHARE]).await
 }
 
-fn key_from_url(url: &str) -> Option<&str> {
-    url.split_once("key=")
-        .map(|(_, key)| key.split('&').next().unwrap_or(key))
+fn token_from_url(url: &str) -> Option<&str> {
+    url.split_once("t=")
+        .map(|(_, token)| token.split('&').next().unwrap_or(token))
 }
 
 fn unexpected_response(operation: &str, response: Response) -> RmuxError {

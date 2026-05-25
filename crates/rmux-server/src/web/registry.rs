@@ -20,7 +20,9 @@ use super::origin::{validate_frontend_url, validate_public_base_url, FrontendUrl
 use super::record::{
     system_time_to_unix, WebShareAccess, WebShareConnectRole, WebShareRecord, WebShareRevokeReason,
 };
-use super::secrets::{random_pairing_code, random_share_id, random_token};
+use super::secrets::{
+    random_pairing_code, random_share_id, random_token, valid_token_shape, SecretHash,
+};
 use super::settings::WebShareSettings;
 
 const DEFAULT_MAX_READERS: u16 = 5;
@@ -103,6 +105,8 @@ impl WebShareRegistry {
         let share_id = self.next_share_id()?;
         let read_token = random_token()?;
         let operator_token = request.writable.then(random_token).transpose()?;
+        let read_token_hash = SecretHash::from_secret(&read_token);
+        let operator_token_hash = operator_token.as_deref().map(SecretHash::from_secret);
         let pairing_code = request.require_pin.then(random_pairing_code).transpose()?;
         let ttl_seconds = request.ttl_seconds.unwrap_or(DEFAULT_TTL_SECONDS);
         if ttl_seconds == 0 || ttl_seconds > MAX_TTL_SECONDS {
@@ -123,7 +127,7 @@ impl WebShareRegistry {
             frontend_url: frontend.url,
             lease_book,
             max_readers,
-            operator_token: operator_token.clone(),
+            operator_token_hash,
             pairing_code: pairing_code.clone(),
             revoke_tx,
             controls: request.controls,
@@ -131,12 +135,12 @@ impl WebShareRegistry {
             scope: request.scope.clone(),
             terminal_palette,
             url_options: request.url_options,
-            read_token: read_token.clone(),
+            read_token_hash,
             writable: request.writable,
         };
 
-        let read_url = record.read_url();
-        let operator_url = record.operator_url();
+        let read_url = record.read_url(&read_token);
+        let operator_url = record.operator_url(operator_token.as_deref());
         let summary_scope = record.scope.clone();
         let expires_at_unix = expires_at.and_then(system_time_to_unix);
         self.inner
@@ -245,12 +249,26 @@ impl WebShareRegistry {
 
     pub(crate) async fn connect(
         &self,
-        share_id: &str,
-        key: &str,
+        token: &str,
         pin: Option<&str>,
-        role: WebShareConnectRole,
     ) -> Result<WebShareAccess, RmuxError> {
-        let delay = self.backoff.delay_before_next_attempt(share_id);
+        if !valid_token_shape(token) {
+            return Err(RmuxError::Server("invalid web-share token".to_owned()));
+        }
+        let token_hash = SecretHash::from_secret(token);
+        let lookup = {
+            let mut inner = self
+                .inner
+                .lock()
+                .expect("web-share registry mutex must not be poisoned");
+            inner.prune_expired();
+            inner.capability(&token_hash)
+        };
+        let backoff_key = lookup
+            .as_ref()
+            .map(|capability| capability.share_id.clone())
+            .unwrap_or_else(|| token_hash.backoff_key());
+        let delay = self.backoff.delay_before_next_attempt(&backoff_key);
         if !delay.is_zero() {
             sleep(delay).await;
         }
@@ -261,23 +279,30 @@ impl WebShareRegistry {
                 .lock()
                 .expect("web-share registry mutex must not be poisoned");
             inner.prune_expired();
-            let record = inner.records.get(share_id).ok_or_else(|| {
-                RmuxError::Server("web-share does not exist or has expired".to_owned())
-            })?;
-            record.connect(key, pin, role)
+            match inner.capability(&token_hash) {
+                Some(capability) => match inner.records.get(&capability.share_id) {
+                    Some(record) => record.connect(pin, capability.role),
+                    None => Err(RmuxError::Server(
+                        "web-share does not exist or has expired".to_owned(),
+                    )),
+                },
+                None => Err(RmuxError::Server(
+                    "web-share does not exist or has expired".to_owned(),
+                )),
+            }
         };
 
         match result {
             Ok(access) => {
-                self.backoff.record_success(share_id);
-                info!(share_id, role = ?role, "web_share_access_granted");
+                self.backoff.record_success(&backoff_key);
+                info!(share_id = %access.share_id(), role = ?access.connect_role(), "web_share_access_granted");
                 Ok(access)
             }
             Err(error) => {
                 if is_auth_failure_for_backoff(&error) {
-                    let failure = self.backoff.record_failure(share_id);
+                    let failure = self.backoff.record_failure(&backoff_key);
                     info!(
-                        share_id,
+                        share_id = %backoff_key,
                         fails = failure.fails,
                         next_delay_ms = failure.next_delay.as_millis(),
                         "web_share_auth_backoff"
@@ -366,6 +391,7 @@ fn is_auth_failure_for_backoff(error: &RmuxError) -> bool {
 #[derive(Debug)]
 struct WebShareState {
     records: HashMap<String, WebShareRecord>,
+    tokens: HashMap<SecretHash, WebCapability>,
     listener: WebListenerState,
 }
 
@@ -373,6 +399,7 @@ impl Default for WebShareState {
     fn default() -> Self {
         Self {
             records: HashMap::new(),
+            tokens: HashMap::new(),
             listener: WebListenerState::Available,
         }
     }
@@ -384,8 +411,30 @@ enum WebListenerState {
     Unavailable(String),
 }
 
+#[derive(Debug, Clone)]
+struct WebCapability {
+    share_id: String,
+    role: WebShareConnectRole,
+}
+
 impl WebShareState {
     fn insert(&mut self, record: WebShareRecord) {
+        self.tokens.insert(
+            record.read_token_hash,
+            WebCapability {
+                share_id: record.share_id.clone(),
+                role: WebShareConnectRole::Read,
+            },
+        );
+        if let Some(hash) = record.operator_token_hash {
+            self.tokens.insert(
+                hash,
+                WebCapability {
+                    share_id: record.share_id.clone(),
+                    role: WebShareConnectRole::Operator,
+                },
+            );
+        }
         self.records.insert(record.share_id.clone(), record);
     }
 
@@ -393,6 +442,7 @@ impl WebShareState {
         self.records
             .remove(share_id)
             .map(|record| {
+                self.remove_tokens(&record);
                 record.revoke(reason);
                 true
             })
@@ -404,8 +454,13 @@ impl WebShareState {
         for (_, record) in self.records.drain() {
             record.revoke(reason);
         }
+        self.tokens.clear();
         self.records.clear();
         stopped
+    }
+
+    fn capability(&self, token_hash: &SecretHash) -> Option<WebCapability> {
+        self.tokens.get(token_hash).cloned()
     }
 
     fn summaries(&self) -> Vec<WebShareSummary> {
@@ -432,8 +487,16 @@ impl WebShareState {
             .collect::<Vec<_>>();
         for id in expired {
             if let Some(record) = self.records.remove(&id) {
+                self.remove_tokens(&record);
                 record.revoke(WebShareRevokeReason::TtlExpired);
             }
+        }
+    }
+
+    fn remove_tokens(&mut self, record: &WebShareRecord) {
+        self.tokens.remove(&record.read_token_hash);
+        if let Some(hash) = record.operator_token_hash {
+            self.tokens.remove(&hash);
         }
     }
 }

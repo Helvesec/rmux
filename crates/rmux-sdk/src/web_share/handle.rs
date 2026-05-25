@@ -5,8 +5,8 @@ use crate::transport::TransportClient;
 use crate::Result;
 
 use super::{
-    key_from_url, list_web_shares, lookup_summary, stop_all_web_shares, stop_web_share, web_config,
-    WebConfigInfo, WebShareSummary,
+    list_web_shares, lookup_summary, stop_all_web_shares, stop_web_share, token_from_url,
+    web_config, WebConfigInfo, WebShareSummary,
 };
 
 /// A share handle returned by a create operation.
@@ -89,10 +89,19 @@ impl WebShareHandle {
         &self.read_url
     }
 
-    /// Returns the read-only key carried in the browser URL, when present.
+    /// Returns the read-only capability token carried in the browser URL, when present.
+    #[must_use]
+    pub fn read_token(&self) -> Option<&str> {
+        token_from_url(&self.read_url)
+    }
+
+    /// Returns the read-only capability token carried in the browser URL, when present.
+    ///
+    /// This is retained as a compatibility alias for earlier SDK examples that
+    /// called the URL capability a key.
     #[must_use]
     pub fn read_key(&self) -> Option<&str> {
-        key_from_url(&self.read_url)
+        self.read_token()
     }
 
     /// Returns the privileged operator URL, when this share is writable.
@@ -101,10 +110,19 @@ impl WebShareHandle {
         self.operator_url.as_deref()
     }
 
-    /// Returns the operator key carried in the operator URL, when present.
+    /// Returns the operator capability token carried in the operator URL, when present.
+    #[must_use]
+    pub fn operator_token(&self) -> Option<&str> {
+        self.operator_url.as_deref().and_then(token_from_url)
+    }
+
+    /// Returns the operator capability token carried in the operator URL, when present.
+    ///
+    /// This is retained as a compatibility alias for earlier SDK examples that
+    /// called the URL capability a key.
     #[must_use]
     pub fn operator_key(&self) -> Option<&str> {
-        self.operator_url.as_deref().and_then(key_from_url)
+        self.operator_token()
     }
 
     /// Returns the out-of-band pairing code required by this share, when requested.

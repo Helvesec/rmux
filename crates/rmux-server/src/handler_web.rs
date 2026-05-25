@@ -16,7 +16,7 @@ use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::{self, AttachControl, LiveAttachInputContext, PaneOutputReceiver};
 use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::server_access::current_owner_uid;
-use crate::web::{WebShareAccess, WebShareConnectRole};
+use crate::web::WebShareAccess;
 use rmux_core::input::mode;
 
 const WEB_ATTACH_PID_BASE: u32 = 0x8000_0000;
@@ -56,12 +56,10 @@ impl RequestHandler {
 
     pub(crate) async fn open_web_share(
         &self,
-        share_id: &str,
-        key: &str,
+        token: &str,
         pin: Option<&str>,
-        role: WebShareConnectRole,
     ) -> Result<WebShareStream, RmuxError> {
-        let access = self.web_shares.connect(share_id, key, pin, role).await?;
+        let access = self.web_shares.connect(token, pin).await?;
         match access.scope().clone() {
             WebShareScope::Pane(target) => {
                 let target = self.stable_web_target(&target).await?;
@@ -470,7 +468,7 @@ mod tests {
                 ..
             }) if actual == &session_name
         ));
-        assert!(created.read_url.contains("&key="));
+        assert!(created.read_url.contains("#e=wss://share.example/share&t="));
     }
 
     #[tokio::test]
@@ -508,14 +506,9 @@ mod tests {
             panic!("expected created web-share response");
         };
         let operator_url = created.operator_url.as_deref().expect("operator URL");
-        let operator_key = key_from_url(operator_url);
+        let operator_token = token_from_url(operator_url);
         let stream = handler
-            .open_web_share(
-                &created.share_id,
-                &operator_key,
-                None,
-                WebShareConnectRole::Operator,
-            )
+            .open_web_share(&operator_token, None)
             .await
             .expect("session web share opens");
         let WebShareStream::Session(mut session_stream) = stream else {
@@ -531,9 +524,9 @@ mod tests {
         assert!(!bytes.is_empty());
     }
 
-    fn key_from_url(url: &str) -> String {
-        url.split_once("key=")
-            .map(|(_, key)| key.split('&').next().unwrap_or(key).to_owned())
-            .expect("URL contains access key")
+    fn token_from_url(url: &str) -> String {
+        url.split_once("t=")
+            .map(|(_, token)| token.split('&').next().unwrap_or(token).to_owned())
+            .expect("URL contains access token")
     }
 }

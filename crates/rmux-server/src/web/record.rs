@@ -8,7 +8,7 @@ use tokio::sync::watch;
 
 use super::leases::{ConnectionLease, LeaseBook};
 use super::origin::origin_allowed;
-use super::secrets::secret_eq;
+use super::secrets::{secret_eq, SecretHash};
 
 #[derive(Debug)]
 pub(super) struct WebShareRecord {
@@ -19,7 +19,7 @@ pub(super) struct WebShareRecord {
     pub(super) frontend_url: String,
     pub(super) lease_book: Arc<LeaseBook>,
     pub(super) max_readers: u16,
-    pub(super) operator_token: Option<String>,
+    pub(super) operator_token_hash: Option<SecretHash>,
     pub(super) pairing_code: Option<String>,
     pub(super) revoke_tx: watch::Sender<Option<WebShareRevokeReason>>,
     pub(super) controls: bool,
@@ -27,23 +27,23 @@ pub(super) struct WebShareRecord {
     pub(super) scope: WebShareScope,
     pub(super) terminal_palette: Option<WebTerminalPalette>,
     pub(super) url_options: WebShareUrlOptions,
-    pub(super) read_token: String,
+    pub(super) read_token_hash: SecretHash,
     pub(super) writable: bool,
 }
 
 impl WebShareRecord {
-    pub(super) fn read_url(&self) -> String {
-        share_url(self, Some(&self.read_token), "read")
+    pub(super) fn read_url(&self, token: &str) -> String {
+        share_url(self, Some(token))
     }
 
     pub(super) fn redacted_read_url(&self) -> String {
-        share_url(self, None, "read")
+        share_url(self, None)
     }
 
-    pub(super) fn operator_url(&self) -> Option<String> {
-        self.operator_token
-            .as_deref()
-            .map(|token| share_url(self, Some(token), "operator"))
+    pub(super) fn operator_url(&self, token: Option<&str>) -> Option<String> {
+        self.operator_token_hash
+            .is_some()
+            .then(|| share_url(self, token))
     }
 
     pub(super) fn summary(&self) -> WebShareSummary {
@@ -62,15 +62,11 @@ impl WebShareRecord {
 
     pub(super) fn connect(
         &self,
-        key: &str,
         pin: Option<&str>,
         role: WebShareConnectRole,
     ) -> Result<WebShareAccess, RmuxError> {
         match role {
             WebShareConnectRole::Read => {
-                if !secret_eq(key, &self.read_token) {
-                    return Err(RmuxError::Server("invalid web-share key".to_owned()));
-                }
                 self.check_pairing_code(pin)?;
                 let lease = self
                     .lease_book
@@ -80,14 +76,11 @@ impl WebShareRecord {
                 Ok(self.access(lease, WebShareRole::Read))
             }
             WebShareConnectRole::Operator => {
-                let Some(operator_key) = self.operator_token.as_deref() else {
+                if self.operator_token_hash.is_none() {
                     return Err(RmuxError::Server(
                         "web-share is not writable for operator role".to_owned(),
                     ));
                 };
-                if !secret_eq(key, operator_key) {
-                    return Err(RmuxError::Server("invalid web-share key".to_owned()));
-                }
                 self.check_pairing_code(pin)?;
                 let lease = self
                     .lease_book
@@ -124,6 +117,7 @@ impl WebShareRecord {
             expires_at: self.expires_at,
             lease: Some(lease),
             role,
+            share_id: self.share_id.clone(),
             revoke_rx: self.revoke_tx.subscribe(),
             scope: self.scope.clone(),
             controls: self.controls,
@@ -165,6 +159,7 @@ pub(crate) struct WebShareAccess {
     lease: Option<ConnectionLease>,
     revoke_rx: watch::Receiver<Option<WebShareRevokeReason>>,
     role: WebShareRole,
+    share_id: String,
     scope: WebShareScope,
     controls: bool,
     terminal_palette: Option<WebTerminalPalette>,
@@ -183,8 +178,19 @@ impl WebShareAccess {
         matches!(self.role, WebShareRole::Operator)
     }
 
+    pub(crate) fn connect_role(&self) -> WebShareConnectRole {
+        match self.role {
+            WebShareRole::Operator => WebShareConnectRole::Operator,
+            WebShareRole::Read => WebShareConnectRole::Read,
+        }
+    }
+
     pub(crate) fn controls(&self) -> bool {
         self.controls && self.is_operator()
+    }
+
+    pub(crate) fn share_id(&self) -> &str {
+        &self.share_id
     }
 
     pub(crate) fn expires_at(&self) -> Option<SystemTime> {
@@ -246,21 +252,18 @@ pub(super) fn system_time_to_unix(value: SystemTime) -> Option<u64> {
         .map(|duration| duration.as_secs())
 }
 
-fn share_url(record: &WebShareRecord, token: Option<&str>, role: &str) -> String {
+fn share_url(record: &WebShareRecord, token: Option<&str>) -> String {
     let endpoint = websocket_endpoint(&record.endpoint_origin);
-    let key = token.unwrap_or("[REDACTED]");
+    let token = token.unwrap_or("[REDACTED]");
     debug_assert!(
         record.frontend_url.starts_with(&record.frontend_origin),
         "frontend URL must belong to its expected origin"
     );
-    let mut url = format!(
-        "{}/#endpoint={endpoint}&id={}&key={key}",
-        record.frontend_url, record.share_id
-    );
-    if role != "read" {
-        url.push_str("&role=");
-        url.push_str(role);
-    }
+    let mut url = if record.allow_loopback_development_origins {
+        format!("{}/#t={token}", record.frontend_url)
+    } else {
+        format!("{}/#e={endpoint}&t={token}", record.frontend_url)
+    };
     if record.pairing_code.is_some() {
         url.push_str("&pin=required");
     }
