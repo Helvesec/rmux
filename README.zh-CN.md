@@ -14,7 +14,7 @@
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Release validation](https://github.com/Helvesec/rmux/actions/workflows/ci.yml/badge.svg)](https://github.com/Helvesec/rmux/actions/workflows/ci.yml)
-[![rmux 0.3.1](https://img.shields.io/badge/rmux-0.3.1-informational.svg)](#install)
+[![rmux 0.4.0](https://img.shields.io/badge/rmux-0.4.0-informational.svg)](#install)
 [![Platform: Linux | macOS | Windows](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#platform-support)
 [![Unsafe policy](https://img.shields.io/badge/unsafe-restricted-success.svg)](#verification)
 
@@ -26,7 +26,7 @@
 </div>
 
 > [!IMPORTANT]
-> 当前版本：**v0.3.1**，发布于 **2026 年 5 月 25 日**。90 条兼容 tmux 的命令已全部实现，但这仍是新的公开预览版本，可能存在 bug。遇到问题时可在 [issues](https://github.com/helvesec/rmux/issues) 中反馈。
+> 当前版本：**v0.4.0**，发布于 **2026 年 5 月 25 日**。90 条兼容 tmux 的命令已全部实现，但这仍是新的公开预览版本，可能存在 bug。遇到问题时可在 [issues](https://github.com/helvesec/rmux/issues) 中反馈。
 
 ## 为什么选择 RMUX
 
@@ -66,7 +66,7 @@ Windows PowerShell 预构建二进制：
 irm https://rmux.io/install.ps1 | iex
 ```
 
-直接下载和 SHA256 校验和可在 [v0.3.1 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.3.1) 找到。
+直接下载和 SHA256 校验和可在 [v0.4.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.4.0) 找到。
 
 使用 Cargo 从 crates.io 安装：
 
@@ -114,7 +114,7 @@ rmux split-window --help
 
 ```toml
 [dependencies]
-rmux-sdk = "0.3"
+rmux-sdk = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 

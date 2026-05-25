@@ -14,7 +14,7 @@
 
 [![Licence : MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Validation de release](https://github.com/Helvesec/rmux/actions/workflows/ci.yml/badge.svg)](https://github.com/Helvesec/rmux/actions/workflows/ci.yml)
-[![rmux 0.3.1](https://img.shields.io/badge/rmux-0.3.1-informational.svg)](#install)
+[![rmux 0.4.0](https://img.shields.io/badge/rmux-0.4.0-informational.svg)](#install)
 [![Plateformes : Linux | macOS | Windows](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#platform-support)
 [![Politique unsafe](https://img.shields.io/badge/unsafe-restricted-success.svg)](#verification)
 
@@ -26,7 +26,7 @@
 </div>
 
 > [!IMPORTANT]
-> Version actuelle : **v0.3.1**, publiée le **25 mai 2026**. Les 90 commandes compatibles tmux sont implémentées, mais des bugs restent possibles : cette version est un aperçu public récent. [Signaler les problèmes](https://github.com/helvesec/rmux/issues) rencontrés.
+> Version actuelle : **v0.4.0**, publiée le **25 mai 2026**. Les 90 commandes compatibles tmux sont implémentées, mais des bugs restent possibles : cette version est un aperçu public récent. [Signaler les problèmes](https://github.com/helvesec/rmux/issues) rencontrés.
 
 ## Pourquoi RMUX
 
@@ -66,7 +66,7 @@ Binaire précompilé pour Windows PowerShell :
 irm https://rmux.io/install.ps1 | iex
 ```
 
-Les téléchargements directs et checksums SHA256 sont disponibles dans la [GitHub Release v0.3.1](https://github.com/helvesec/rmux/releases/tag/v0.3.1).
+Les téléchargements directs et checksums SHA256 sont disponibles dans la [GitHub Release v0.4.0](https://github.com/helvesec/rmux/releases/tag/v0.4.0).
 
 Depuis crates.io avec Cargo :
 
@@ -114,7 +114,7 @@ rmux split-window --help
 
 ```toml
 [dependencies]
-rmux-sdk = "0.3"
+rmux-sdk = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
