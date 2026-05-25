@@ -64,6 +64,12 @@ fn web_share_accepts_subcommand_style_lifecycle_forms() {
     };
     assert_eq!(args.stop.as_deref(), Some("abc12345"));
 
+    let cli = parse_args(&["web-share", "disconnect", "abc12345"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert_eq!(args.disconnect.as_deref(), Some("abc12345"));
+
     let cli = parse_args(&["web-share", "stop", "all"]).unwrap();
     let Some(super::super::Command::WebShare(args)) = cli.command else {
         panic!("expected web-share command");

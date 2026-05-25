@@ -541,7 +541,12 @@ pub(super) fn command_has_start_server_flag(command: &Command) -> bool {
 }
 
 fn web_share_creates_share(args: &crate::cli_args::WebShareArgs) -> bool {
-    !args.list && args.stop.is_none() && !args.stop_all && args.lookup.is_none() && !args.config
+    !args.list
+        && args.stop.is_none()
+        && args.disconnect.is_none()
+        && !args.stop_all
+        && args.lookup.is_none()
+        && !args.config
 }
 
 fn unsupported_argument_suffix(arguments: &[String]) -> String {

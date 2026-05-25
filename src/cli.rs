@@ -395,6 +395,7 @@ mod tests {
         for args in [
             &["rmux", "web-share", "-l"][..],
             &["rmux", "web-share", "-K", "abc12345"][..],
+            &["rmux", "web-share", "disconnect", "abc12345"][..],
             &["rmux", "web-share", "-X"][..],
             &["rmux", "web-share", "--lookup", "abc12345"][..],
             &["rmux", "web-share", "--config"][..],

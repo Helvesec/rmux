@@ -22,6 +22,7 @@ pub(super) fn run_web_share(
     startup: StartupOptions,
 ) -> Result<i32, ExitFailure> {
     let mut connection = connect_with_startserver(socket_path, startup)?;
+    let disconnect_output = args.disconnect.is_some();
     let request = build_web_share_request(args, &mut connection)?;
     let response = connection
         .web_share(request)
@@ -31,7 +32,21 @@ pub(super) fn run_web_share(
         write_created_share_output(created)?;
         return Ok(0);
     }
+    if disconnect_output {
+        if let Response::WebShare(WebShareResponse::Stopped(stopped)) = &response {
+            write_command_output(&disconnect_share_output(
+                stopped.share_id.as_str(),
+                stopped.stopped,
+            ))?;
+            return Ok(0);
+        }
+    }
     finish_command_success(response, "web-share")
+}
+
+fn disconnect_share_output(share_id: &str, stopped: bool) -> CommandOutput {
+    let status = if stopped { "disconnected" } else { "missing" };
+    CommandOutput::from_stdout(format!("{status} {share_id}\n"))
 }
 
 fn warn_operator_url(response: &Response) {
@@ -73,6 +88,9 @@ fn build_web_share_request(
         return Ok(WebShareRequest::List(ListWebSharesRequest));
     }
     if let Some(share_id) = args.stop {
+        return Ok(WebShareRequest::Stop(StopWebShareRequest { share_id }));
+    }
+    if let Some(share_id) = args.disconnect {
         return Ok(WebShareRequest::Stop(StopWebShareRequest { share_id }));
     }
     if args.stop_all {
@@ -166,7 +184,7 @@ const fn web_terminal_theme(value: WebShareTerminalThemeArg) -> WebTerminalTheme
 
 #[cfg(test)]
 mod tests {
-    use super::read_qr_output;
+    use super::{disconnect_share_output, read_qr_output};
     use crate::cli_args::parse_target_spec;
 
     #[test]
@@ -194,5 +212,11 @@ mod tests {
     fn web_share_pane_target_stays_exact() {
         let target = parse_target_spec("webdemo:1.2").expect("pane target should parse");
         assert!(matches!(target.exact(), Some(rmux_proto::Target::Pane(_))));
+    }
+
+    #[test]
+    fn disconnect_share_output_uses_disconnect_language() {
+        let output = disconnect_share_output("abc12345", true);
+        assert_eq!(output.stdout(), b"disconnected abc12345\n");
     }
 }

@@ -234,6 +234,10 @@ before a browser can authenticate. Pass
 or
 .B --no-disclaimer
 to generate a minimal viewer URL.
+Use
+.B web-share disconnect SHARE-ID
+to revoke one active browser share and close its viewers while leaving the rmux
+daemon and web-share listener running.
 Pass
 .B start-server --web-port PORT --frontend-url URL
 to configure the local web listener and the default frontend URL; port 0 is

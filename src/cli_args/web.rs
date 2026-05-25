@@ -8,19 +8,21 @@ pub(crate) fn parse_web_share_args(arguments: Vec<String>) -> Result<WebShareArg
 
 #[derive(Debug, Clone, Args)]
 #[command(
-    after_help = "Local web-share mode opens https://share.rmux.io/ against ws://127.0.0.1:<port>/share. -t accepts a pane target or a session name; pane targets expose one pane, session targets expose the attached session view. Pass -w for operator input. Pass --controls with -w on a session target to allow whitelisted rmux commands. Pass --tunnel-url for a bring-your-own public endpoint. Pass --frontend-url to use a self-hosted frontend. Pass --theme user|light|dark to choose the initial browser terminal palette. Pass --pin to require an out-of-band pairing code. Chromium-based browsers may require allowing Local Network access for local mode. In-app webviews are not guaranteed."
+    after_help = "Local web-share mode opens https://share.rmux.io/ against ws://127.0.0.1:<port>/share. -t accepts a pane target or a session name; pane targets expose one pane, session targets expose the attached session view. Pass -w for operator input. Pass --controls with -w on a session target to allow whitelisted rmux commands. Use `web-share disconnect <share-id>` to revoke one active share without stopping the rmux daemon. Pass --tunnel-url for a bring-your-own public endpoint. Pass --frontend-url to use a self-hosted frontend. Pass --theme user|light|dark to choose the initial browser terminal palette. Pass --pin to require an out-of-band pairing code. Chromium-based browsers may require allowing Local Network access for local mode. In-app webviews are not guaranteed."
 )]
 #[command(group(
     ArgGroup::new("mode")
         .required(false)
         .multiple(false)
-        .args(["list", "stop", "stop_all", "lookup", "config"])
+        .args(["list", "stop", "disconnect", "stop_all", "lookup", "config"])
 ))]
 pub(crate) struct WebShareArgs {
     #[arg(short = 'l', action = ArgAction::SetTrue, group = "mode")]
     pub(crate) list: bool,
     #[arg(short = 'K', value_name = "share-id", group = "mode")]
     pub(crate) stop: Option<String>,
+    #[arg(long = "disconnect", value_name = "share-id", group = "mode")]
+    pub(crate) disconnect: Option<String>,
     #[arg(short = 'X', action = ArgAction::SetTrue, group = "mode")]
     pub(crate) stop_all: bool,
     #[arg(long = "lookup", value_name = "share-id", group = "mode")]
@@ -70,10 +72,22 @@ fn normalize_web_share_args(arguments: Vec<String>) -> Vec<String> {
     match command.as_str() {
         "list" => prefixed("-l", rest),
         "stop" => normalize_stop(rest),
+        "disconnect" => normalize_disconnect(rest),
         "off" => prefixed("-X", rest),
         "config" => prefixed("--config", rest),
         "lookup" => prefixed("--lookup", rest),
         _ => arguments,
+    }
+}
+
+fn normalize_disconnect(rest: &[String]) -> Vec<String> {
+    match rest.split_first() {
+        Some((target, tail)) => {
+            let mut normalized = vec!["--disconnect".to_owned(), target.clone()];
+            normalized.extend_from_slice(tail);
+            normalized
+        }
+        None => vec!["--disconnect".to_owned()],
     }
 }
 
