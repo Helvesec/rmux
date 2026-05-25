@@ -22,7 +22,7 @@ lto = "fat"
 strip = "symbols"
 
 [workspace.package]
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 publish = false
 license = "MIT OR Apache-2.0"
@@ -30,7 +30,7 @@ repository = "https://github.com/helvesec/rmux"
 
 [package]
 name = "rmux"
-version = "0.3.1"
+version = "0.4.0"
 edition.workspace = true
 publish = true
 license.workspace = true
@@ -57,13 +57,13 @@ include = [
 clap = { version = "=4.5.39", features = ["derive"] }
 libc = "0.2"
 qrcode = { version = "0.14", default-features = false }
-rmux-client = { path = "crates/rmux-client", version = "0.3.1" }
-rmux-core = { path = "crates/rmux-core", version = "0.3.1" }
-rmux-os = { path = "crates/rmux-os", version = "0.3.1" }
-rmux-proto = { path = "crates/rmux-proto", version = "0.3.1" }
+rmux-client = { path = "crates/rmux-client", version = "0.4.0" }
+rmux-core = { path = "crates/rmux-core", version = "0.4.0" }
+rmux-os = { path = "crates/rmux-os", version = "0.4.0" }
+rmux-proto = { path = "crates/rmux-proto", version = "0.4.0" }
 # The root binary owns the hidden internal daemon mode, so it links the server
 # and Tokio runtime directly for that top-level re-exec path.
-rmux-server = { path = "crates/rmux-server", version = "0.3.1", default-features = false }
+rmux-server = { path = "crates/rmux-server", version = "0.4.0", default-features = false }
 tokio = { version = "1.48.0", features = ["net", "rt", "rt-multi-thread", "time"] }
 
 [features]
@@ -72,10 +72,10 @@ web = ["rmux-server/web"]
 
 [dev-dependencies]
 libc = "0.2"
-rmux-core = { path = "crates/rmux-core", version = "0.3.1" }
-rmux-pty = { path = "crates/rmux-pty", version = "0.3.1" }
-rmux-proto = { path = "crates/rmux-proto", version = "0.3.1" }
-rmux-sdk = { path = "crates/rmux-sdk", version = "0.3.1" }
+rmux-core = { path = "crates/rmux-core", version = "0.4.0" }
+rmux-pty = { path = "crates/rmux-pty", version = "0.4.0" }
+rmux-proto = { path = "crates/rmux-proto", version = "0.4.0" }
+rmux-sdk = { path = "crates/rmux-sdk", version = "0.4.0" }
 rustix = { version = "1.1.4", features = ["event", "termios"] }
 
 [build-dependencies]

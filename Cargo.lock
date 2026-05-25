@@ -691,7 +691,7 @@ dependencies = [
 
 [[package]]
 name = "ratatui-rmux"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "ratatui",
  "rmux-sdk",
@@ -738,7 +738,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rmux"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "clap",
  "embed-manifest",
@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-client"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "libc",
  "rmux-core",
@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "regex",
@@ -787,7 +787,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-ipc"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "libc",
  "rmux-os",
@@ -799,7 +799,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-os"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "libc",
  "rmux-types",
@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-proto"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "bincode",
  "rmux-types",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-pty"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "libc",
  "rmux-os",
@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-render-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "ratatui",
  "serde",
@@ -840,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-sdk"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "bincode",
  "crossterm",
@@ -858,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-server"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "async-recursion",
  "base64",
@@ -884,7 +884,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-types"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "serde",
 ]
@@ -1367,7 +1367,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xtask"
-version = "0.3.1"
+version = "0.4.0"
 
 [[package]]
 name = "zmij"
