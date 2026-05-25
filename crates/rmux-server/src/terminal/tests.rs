@@ -1,6 +1,7 @@
+#[cfg(unix)]
+use super::environment_from_os_pairs;
 use super::{
-    environment_from_os_pairs, parse_environment_assignments, spawn_hook_command,
-    validate_process_command, TerminalProfile,
+    parse_environment_assignments, spawn_hook_command, validate_process_command, TerminalProfile,
 };
 use rmux_core::{EnvironmentStore, OptionStore};
 use rmux_proto::{OptionName, ProcessCommand, ScopeSelector, SessionName, SetOptionMode};
@@ -8,6 +9,7 @@ use rmux_proto::{OptionName, ProcessCommand, ScopeSelector, SessionName, SetOpti
 use rmux_pty::TerminalSize as PtyTerminalSize;
 use std::collections::HashMap;
 use std::error::Error;
+#[cfg(unix)]
 use std::ffi::OsString;
 use std::fs;
 use std::io;

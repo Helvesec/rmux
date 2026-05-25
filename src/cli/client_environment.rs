@@ -24,7 +24,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{client_environment_assignments, environment_assignments_from_pairs};
+    use super::client_environment_assignments;
+    #[cfg(unix)]
+    use super::environment_assignments_from_pairs;
+    #[cfg(unix)]
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
