@@ -64,6 +64,26 @@ async fn attached_prefix_c_creates_window_across_separate_reads() {
 }
 
 #[tokio::test]
+async fn attached_prefix_confirm_accepts_following_key_in_same_read_after_split() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let alpha = session_name("alpha");
+    let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x02%")
+        .await
+        .expect("prefix split input");
+    wait_for_active_panes(&handler, &alpha, "0:0\n1:1\n").await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x02xy")
+        .await
+        .expect("prefix confirm input");
+    wait_for_active_panes(&handler, &alpha, "0:1\n").await;
+}
+
+#[tokio::test]
 async fn attached_kill_last_pane_exits_the_session() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
@@ -96,6 +116,21 @@ async fn attached_kill_last_pane_exits_the_session() {
     .await
     .expect("timed out waiting for attach exit notification");
     wait_for_session_removed(&handler, &alpha).await;
+}
+
+async fn wait_for_active_panes(handler: &RequestHandler, session: &SessionName, expected: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let panes = active_panes(handler, session).await;
+        if panes == expected {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for active panes {expected:?}, got {panes:?}"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
 }
 
 #[tokio::test]

@@ -399,6 +399,7 @@ impl RequestHandler {
             .await
             .map_err(io_other)?;
         let interactive_mode_active = self.prompt_active(attach_pid).await
+            || self.attached_prefix_table_active(attach_pid).await
             || self.mode_tree_active(attach_pid).await
             || self.overlay_active(attach_pid).await
             || self.display_panes_active(attach_pid).await
