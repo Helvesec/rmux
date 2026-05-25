@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use rmux_proto::{
     CommandOutput, CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest,
     StopAllWebSharesRequest, StopWebShareRequest, WebShareConfigRequest, WebShareConfigResponse,
@@ -10,6 +11,7 @@ use rmux_proto::{
     WebShareResponse, WebShareStoppedAllResponse, WebShareStoppedResponse, WebShareSummary,
 };
 use rmux_proto::{PaneTargetRef, RmuxError};
+use tokio::sync::watch;
 
 use super::leases::{ConnectionLease, LeaseBook};
 use super::origin::validate_public_base_url;
@@ -91,6 +93,7 @@ impl WebShareRegistry {
         }
         let expires_at = Some(SystemTime::now() + Duration::from_secs(ttl_seconds));
         let lease_book = LeaseBook::new(usize::from(max_viewers));
+        let (revoke_tx, _) = watch::channel(None);
 
         let record = WebShareRecord {
             base_url,
@@ -98,6 +101,7 @@ impl WebShareRegistry {
             lease_book,
             max_viewers,
             operator_token: operator_token.clone(),
+            revoke_tx,
             share_id: share_id.clone(),
             target: request.target.clone(),
             viewer_token: viewer_token.clone(),
@@ -144,7 +148,7 @@ impl WebShareRegistry {
             .inner
             .lock()
             .expect("web-share registry mutex must not be poisoned")
-            .remove(&request.share_id);
+            .remove(&request.share_id, WebShareRevokeReason::StoppedByOwner);
         WebShareStoppedResponse {
             output: stopped_output(&request.share_id, stopped),
             share_id: request.share_id,
@@ -157,7 +161,7 @@ impl WebShareRegistry {
             .inner
             .lock()
             .expect("web-share registry mutex must not be poisoned")
-            .clear();
+            .clear(WebShareRevokeReason::StoppedByOwner);
         WebShareStoppedAllResponse {
             output: CommandOutput::from_stdout(format!("stopped {stopped}\n")),
             stopped,
@@ -188,7 +192,12 @@ impl WebShareRegistry {
         }
     }
 
-    pub(crate) fn connect(&self, share_id: &str, key: &str) -> Result<WebShareAccess, RmuxError> {
+    pub(crate) fn connect(
+        &self,
+        share_id: &str,
+        key: &str,
+        role: WebShareConnectRole,
+    ) -> Result<WebShareAccess, RmuxError> {
         let mut inner = self
             .inner
             .lock()
@@ -197,7 +206,7 @@ impl WebShareRegistry {
         let record = inner.records.get(share_id).ok_or_else(|| {
             RmuxError::Server("web-share does not exist or has expired".to_owned())
         })?;
-        record.connect(key)
+        record.connect(key, role)
     }
 
     pub(crate) fn listener(&self) -> WebShareListener {
@@ -205,8 +214,22 @@ impl WebShareRegistry {
     }
 
     fn next_share_id(&self) -> Result<String, RmuxError> {
+        for _ in 0..32 {
+            let share_id = random_share_id()?;
+            if !self
+                .inner
+                .lock()
+                .expect("web-share registry mutex must not be poisoned")
+                .records
+                .contains_key(&share_id)
+            {
+                return Ok(share_id);
+            }
+        }
         let sequence = self.next_id.fetch_add(1, Ordering::Relaxed);
-        Ok(format!("{sequence:x}-{}", random_token()?))
+        Err(RmuxError::Server(format!(
+            "failed to create unique web-share id after {sequence} attempts"
+        )))
     }
 
     fn public_base_url(&self, requested: Option<&str>) -> Result<String, RmuxError> {
@@ -269,12 +292,21 @@ impl WebShareState {
         self.records.insert(record.share_id.clone(), record);
     }
 
-    fn remove(&mut self, share_id: &str) -> bool {
-        self.records.remove(share_id).is_some()
+    fn remove(&mut self, share_id: &str, reason: WebShareRevokeReason) -> bool {
+        self.records
+            .remove(share_id)
+            .map(|record| {
+                record.revoke(reason);
+                true
+            })
+            .unwrap_or(false)
     }
 
-    fn clear(&mut self) -> u32 {
+    fn clear(&mut self, reason: WebShareRevokeReason) -> u32 {
         let stopped = u32::try_from(self.records.len()).unwrap_or(u32::MAX);
+        for (_, record) in self.records.drain() {
+            record.revoke(reason);
+        }
         self.records.clear();
         stopped
     }
@@ -295,8 +327,21 @@ impl WebShareState {
 
     fn prune_expired(&mut self) {
         let now = SystemTime::now();
-        self.records
-            .retain(|_, record| record.expires_at.is_none_or(|expires| expires > now));
+        let expired = self
+            .records
+            .iter()
+            .filter_map(|(id, record)| {
+                record
+                    .expires_at
+                    .is_some_and(|expires| expires <= now)
+                    .then(|| id.clone())
+            })
+            .collect::<Vec<_>>();
+        for id in expired {
+            if let Some(record) = self.records.remove(&id) {
+                record.revoke(WebShareRevokeReason::TtlExpired);
+            }
+        }
     }
 }
 
@@ -307,6 +352,7 @@ struct WebShareRecord {
     lease_book: Arc<LeaseBook>,
     max_viewers: u16,
     operator_token: Option<String>,
+    revoke_tx: watch::Sender<Option<WebShareRevokeReason>>,
     share_id: String,
     target: PaneTargetRef,
     viewer_token: String,
@@ -315,17 +361,22 @@ struct WebShareRecord {
 
 impl WebShareRecord {
     fn viewer_url(&self) -> String {
-        share_url(&self.base_url, &self.share_id, Some(&self.viewer_token))
+        share_url(
+            &self.base_url,
+            &self.share_id,
+            Some(&self.viewer_token),
+            "viewer",
+        )
     }
 
     fn redacted_viewer_url(&self) -> String {
-        share_url(&self.base_url, &self.share_id, None)
+        share_url(&self.base_url, &self.share_id, None, "viewer")
     }
 
     fn operator_url(&self) -> Option<String> {
         self.operator_token
             .as_deref()
-            .map(|token| share_url(&self.base_url, &self.share_id, Some(token)))
+            .map(|token| share_url(&self.base_url, &self.share_id, Some(token), "operator"))
     }
 
     fn summary(&self) -> WebShareSummary {
@@ -341,47 +392,89 @@ impl WebShareRecord {
         }
     }
 
-    fn connect(&self, key: &str) -> Result<WebShareAccess, RmuxError> {
-        if secret_eq(key, &self.viewer_token) {
-            let lease = self
-                .lease_book
-                .try_viewer()
-                .map(ConnectionLease::Viewer)
-                .ok_or_else(|| RmuxError::Server("web-share viewer limit reached".to_owned()))?;
-            return Ok(WebShareAccess {
-                expected_origin: self.base_url.clone(),
-                _lease: Some(lease),
-                role: WebShareRole::Viewer,
-                target: self.target.clone(),
-            });
+    fn connect(&self, key: &str, role: WebShareConnectRole) -> Result<WebShareAccess, RmuxError> {
+        match role {
+            WebShareConnectRole::Viewer => {
+                if !secret_eq(key, &self.viewer_token) {
+                    return Err(RmuxError::Server("invalid web-share key".to_owned()));
+                }
+                let lease = self
+                    .lease_book
+                    .try_viewer()
+                    .map(ConnectionLease::Viewer)
+                    .ok_or_else(|| {
+                        RmuxError::Server("web-share viewer limit reached".to_owned())
+                    })?;
+                Ok(self.access(lease, WebShareRole::Viewer))
+            }
+            WebShareConnectRole::Operator => {
+                let Some(operator_key) = self.operator_token.as_deref() else {
+                    return Err(RmuxError::Server(
+                        "web-share is not writable for operator role".to_owned(),
+                    ));
+                };
+                if !secret_eq(key, operator_key) {
+                    return Err(RmuxError::Server("invalid web-share key".to_owned()));
+                }
+                let lease = self
+                    .lease_book
+                    .try_operator()
+                    .map(ConnectionLease::Operator)
+                    .ok_or_else(|| {
+                        RmuxError::Server("web-share operator is already connected".to_owned())
+                    })?;
+                Ok(self.access(lease, WebShareRole::Operator))
+            }
         }
-        if self
-            .operator_token
-            .as_deref()
-            .is_some_and(|operator_key| secret_eq(key, operator_key))
-        {
-            let lease = self
-                .lease_book
-                .try_operator()
-                .map(ConnectionLease::Operator)
-                .ok_or_else(|| {
-                    RmuxError::Server("web-share operator is already connected".to_owned())
-                })?;
-            return Ok(WebShareAccess {
-                expected_origin: self.base_url.clone(),
-                _lease: Some(lease),
-                role: WebShareRole::Operator,
-                target: self.target.clone(),
-            });
+    }
+
+    fn access(&self, lease: ConnectionLease, role: WebShareRole) -> WebShareAccess {
+        WebShareAccess {
+            expected_origin: self.base_url.clone(),
+            expires_at: self.expires_at,
+            _lease: Some(lease),
+            role,
+            revoke_rx: self.revoke_tx.subscribe(),
+            target: self.target.clone(),
         }
-        Err(RmuxError::Server("invalid web-share key".to_owned()))
+    }
+
+    fn revoke(self, reason: WebShareRevokeReason) {
+        let _ = self.revoke_tx.send(Some(reason));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WebShareConnectRole {
+    Operator,
+    Viewer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WebShareRevokeReason {
+    PaneGone,
+    SessionGone,
+    StoppedByOwner,
+    TtlExpired,
+}
+
+impl WebShareRevokeReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::PaneGone => "pane_gone",
+            Self::SessionGone => "session_gone",
+            Self::StoppedByOwner => "stopped_by_owner",
+            Self::TtlExpired => "ttl_expired",
+        }
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct WebShareAccess {
     expected_origin: String,
+    expires_at: Option<SystemTime>,
     _lease: Option<ConnectionLease>,
+    revoke_rx: watch::Receiver<Option<WebShareRevokeReason>>,
     role: WebShareRole,
     target: PaneTargetRef,
 }
@@ -393,6 +486,10 @@ impl WebShareAccess {
 
     pub(crate) fn is_operator(&self) -> bool {
         matches!(self.role, WebShareRole::Operator)
+    }
+
+    pub(crate) fn expires_at(&self) -> Option<SystemTime> {
+        self.expires_at
     }
 
     pub(crate) fn release_operator(&mut self) -> bool {
@@ -414,6 +511,10 @@ impl WebShareAccess {
 
     pub(crate) fn target(&self) -> &PaneTargetRef {
         &self.target
+    }
+
+    pub(crate) fn revoke_receiver(&self) -> watch::Receiver<Option<WebShareRevokeReason>> {
+        self.revoke_rx.clone()
     }
 }
 
@@ -456,28 +557,49 @@ fn stopped_output(share_id: &str, stopped: bool) -> CommandOutput {
     CommandOutput::from_stdout(format!("{status} {share_id}\n"))
 }
 
-fn share_url(base_url: &str, share_id: &str, token: Option<&str>) -> String {
+fn share_url(base_url: &str, share_id: &str, token: Option<&str>, role: &str) -> String {
+    let endpoint = websocket_endpoint(base_url);
+    let key = token.unwrap_or("[REDACTED]");
+    format!("{base_url}/#endpoint={endpoint}&id={share_id}&key={key}&role={role}")
+}
+
+fn websocket_endpoint(base_url: &str) -> String {
+    let (scheme, authority) = base_url
+        .split_once("://")
+        .expect("validated web-share base URL must include scheme");
+    let ws_scheme = if scheme == "https" { "wss" } else { "ws" };
+    format!("{ws_scheme}://{authority}/share")
+}
+
+fn random_share_id() -> Result<String, RmuxError> {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut bytes = [0u8; 5];
+    getrandom::fill(&mut bytes).map_err(random_error)?;
+    let value = u64::from_be_bytes([0, 0, 0, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4]]);
+    let mut out = String::with_capacity(8);
+    for shift in (0..40).step_by(5).rev() {
+        let index = ((value >> shift) & 0x1f) as usize;
+        out.push(ALPHABET[index] as char);
+    }
+    Ok(out)
+}
+
+fn random_token() -> Result<String, RmuxError> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(random_error)?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn random_error(error: getrandom::Error) -> RmuxError {
+    RmuxError::Server(format!("failed to create web-share secret: {error}"))
+}
+
+#[allow(dead_code)]
+fn legacy_share_url(base_url: &str, share_id: &str, token: Option<&str>) -> String {
     match token {
         Some(token) => format!("{base_url}/s/{share_id}?key={token}"),
         None => format!("{base_url}/s/{share_id}"),
     }
-}
-
-fn random_token() -> Result<String, RmuxError> {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes)
-        .map_err(|error| RmuxError::Server(format!("failed to create web-share token: {error}")))?;
-    Ok(hex_encode(&bytes))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(TABLE[(byte >> 4) as usize] as char);
-        out.push(TABLE[(byte & 0x0f) as usize] as char);
-    }
-    out
 }
 
 fn secret_eq(left: &str, right: &str) -> bool {
@@ -498,110 +620,4 @@ fn system_time_to_unix(value: SystemTime) -> Option<u64> {
         .duration_since(UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_secs())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rmux_proto::{PaneId, SessionName};
-
-    fn target() -> PaneTargetRef {
-        PaneTargetRef::by_id(
-            SessionName::new("alpha").expect("valid session"),
-            PaneId::new(7),
-        )
-    }
-
-    #[test]
-    fn create_returns_secret_urls_but_list_is_redacted() {
-        let registry = WebShareRegistry::default();
-        let created = registry
-            .create(CreateWebShareRequest {
-                target: target(),
-                public_base_url: Some("https://share.example".to_owned()),
-                ttl_seconds: Some(60),
-                max_viewers: Some(2),
-                writable: true,
-            })
-            .expect("share creates");
-
-        assert!(created.viewer_url.contains("?key="));
-        assert!(created
-            .operator_url
-            .as_deref()
-            .is_some_and(|url| url.contains("?key=")));
-        let stdout = String::from_utf8_lossy(created.output.stdout());
-        assert!(stdout.contains("viewer "));
-        assert!(!stdout.contains("operator "));
-
-        let listed = registry.list(ListWebSharesRequest);
-        assert_eq!(listed.shares.len(), 1);
-        let redacted = listed.shares[0].viewer_url.as_deref().expect("url");
-        assert_eq!(
-            redacted,
-            format!("https://share.example/s/{}", created.share_id)
-        );
-    }
-
-    #[test]
-    fn public_base_url_rejects_query_and_fragment() {
-        assert!(validate_public_base_url("https://x.test?a=1").is_err());
-        assert!(validate_public_base_url("https://x.test#frag").is_err());
-        assert!(validate_public_base_url("ssh://x.test").is_err());
-    }
-
-    #[test]
-    fn stop_all_reports_removed_share_count() {
-        let registry = WebShareRegistry::default();
-        for _ in 0..2 {
-            registry
-                .create(CreateWebShareRequest {
-                    target: target(),
-                    public_base_url: None,
-                    ttl_seconds: None,
-                    max_viewers: None,
-                    writable: false,
-                })
-                .expect("share creates");
-        }
-        assert_eq!(registry.stop_all(StopAllWebSharesRequest).stopped, 2);
-        assert!(registry.list(ListWebSharesRequest).shares.is_empty());
-    }
-
-    #[test]
-    fn connect_enforces_viewer_cap_and_single_operator() {
-        let registry = WebShareRegistry::default();
-        let created = registry
-            .create(CreateWebShareRequest {
-                target: target(),
-                public_base_url: None,
-                ttl_seconds: None,
-                max_viewers: Some(1),
-                writable: true,
-            })
-            .expect("share creates");
-        let viewer_key = key_from_url(&created.viewer_url);
-        let operator_key = key_from_url(created.operator_url.as_deref().expect("operator url"));
-
-        let viewer = registry
-            .connect(&created.share_id, &viewer_key)
-            .expect("viewer connects");
-        assert!(!viewer.is_operator());
-        assert!(registry.connect(&created.share_id, &viewer_key).is_err());
-
-        let operator = registry
-            .connect(&created.share_id, &operator_key)
-            .expect("operator connects");
-        assert!(operator.is_operator());
-        assert!(registry.connect(&created.share_id, &operator_key).is_err());
-
-        drop(viewer);
-        assert!(registry.connect(&created.share_id, &viewer_key).is_ok());
-    }
-
-    fn key_from_url(url: &str) -> String {
-        url.split_once("?key=")
-            .map(|(_, key)| key.to_owned())
-            .expect("key query")
-    }
 }

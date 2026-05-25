@@ -43,29 +43,43 @@
       line-height: 1.35;
       tab-size: 8;
     }
-    #terminal[data-writable="true"] { caret-color: var(--accent); }
+    button {
+      color: var(--text);
+      background: transparent;
+      border: 1px solid var(--border);
+      padding: 4px 8px;
+      font: inherit;
+    }
+    button[hidden] { display: none; }
+    #terminal[data-operator="true"] { caret-color: var(--accent); }
   </style>
 </head>
 <body>
   <header>
     <strong>rmux</strong>
-    <span id="status">connecting</span>
+    <span>
+      <button id="release" hidden>Release</button>
+      <span id="status">connecting</span>
+    </span>
   </header>
   <pre id="terminal" tabindex="0"></pre>
   <script>
     const statusEl = document.getElementById("status");
     const terminal = document.getElementById("terminal");
-    const params = new URLSearchParams(window.location.search);
+    const releaseButton = document.getElementById("release");
+    const params = new URLSearchParams(window.location.hash.slice(1));
     const key = params.get("key") || "";
-    const shareId = window.location.pathname.split("/").filter(Boolean).pop() || "";
-    const socketUrl = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/${encodeURIComponent(shareId)}?key=${encodeURIComponent(key)}`;
+    const shareId = params.get("id") || "";
+    let role = params.get("role") === "operator" ? "operator" : "viewer";
+    const endpoint = params.get("endpoint") || `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/share`;
     const decoder = new TextDecoder();
-    let writable = false;
     let socket;
 
     function connect() {
-      socket = new WebSocket(socketUrl);
+      socket = new WebSocket(endpoint);
+      socket.binaryType = "arraybuffer";
       socket.addEventListener("open", () => {
+        socket.send(JSON.stringify({ type: "auth", id: shareId, key, role }));
         statusEl.textContent = "connected";
         terminal.focus();
       });
@@ -76,34 +90,83 @@
         statusEl.textContent = "error";
       });
       socket.addEventListener("message", event => {
-        const message = JSON.parse(event.data);
-        if (message.type === "snapshot") {
-          writable = Boolean(message.writable);
-          terminal.dataset.writable = String(writable);
-          terminal.textContent = message.snapshot.lines.join("\n");
-          statusEl.textContent = writable ? "operator" : "viewer";
-        } else if (message.type === "output") {
-          const bytes = Uint8Array.from(atob(message.data), c => c.charCodeAt(0));
-          terminal.textContent += decoder.decode(bytes, { stream: true });
+        if (typeof event.data === "string") {
+          handleControl(JSON.parse(event.data));
+          return;
+        }
+        const frame = new Uint8Array(event.data);
+        const opcode = frame[0];
+        const payload = frame.subarray(1);
+        if (opcode === 0x10) terminal.textContent = "";
+        if (opcode === 0x01 || opcode === 0x10) {
+          terminal.textContent += stripAnsi(decoder.decode(payload, { stream: true }));
           window.scrollTo(0, document.body.scrollHeight);
-        } else if (message.type === "resync") {
-          statusEl.textContent = "resync";
+        } else if (opcode === 0x02 && payload.length === 4) {
+          statusEl.textContent = `${role} ${(payload[0] << 8) | payload[1]}x${(payload[2] << 8) | payload[3]}`;
         }
       });
     }
 
+    function handleControl(message) {
+      if (message.type === "ready") {
+        role = message.role;
+        terminal.dataset.operator = String(role === "operator");
+        releaseButton.hidden = role !== "operator";
+        statusEl.textContent = role;
+      } else if (message.type === "released") {
+        role = "viewer";
+        terminal.dataset.operator = "false";
+        releaseButton.hidden = true;
+        statusEl.textContent = "viewer";
+      } else if (message.type === "share_revoked") {
+        statusEl.textContent = message.reason || "closed";
+      }
+    }
+
+    function stripAnsi(value) {
+      return value
+        .replace(/\x1bc/g, "")
+        .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+        .replace(/\x1b[=>]/g, "");
+    }
+
+    function sendOperatorBytes(opcode, bytes) {
+      if (role !== "operator" || socket.readyState !== WebSocket.OPEN) return false;
+      if (bytes.length > 4096) {
+        statusEl.textContent = "input too large";
+        return true;
+      }
+      const frame = new Uint8Array(bytes.length + 1);
+      frame[0] = opcode;
+      frame.set(bytes, 1);
+      socket.send(frame);
+      return true;
+    }
+
     terminal.addEventListener("keydown", event => {
-      if (!writable || socket.readyState !== WebSocket.OPEN) return;
+      if (role !== "operator" || socket.readyState !== WebSocket.OPEN) return;
+      const encoder = new TextEncoder();
       if (event.key.length === 1) {
-        socket.send(JSON.stringify({ type: "input", text: event.key }));
+        sendOperatorBytes(0x80, encoder.encode(event.key));
         event.preventDefault();
       } else if (event.key === "Enter") {
-        socket.send(JSON.stringify({ type: "input", text: "\n" }));
+        sendOperatorBytes(0x80, encoder.encode("\r"));
         event.preventDefault();
       } else if (event.key === "Backspace") {
-        socket.send(JSON.stringify({ type: "input", text: "\u007f" }));
+        sendOperatorBytes(0x80, encoder.encode("\u007f"));
         event.preventDefault();
       }
+    });
+
+    window.addEventListener("resize", () => {
+      if (role !== "operator" || socket.readyState !== WebSocket.OPEN) return;
+      const cols = Math.max(1, Math.min(9999, Math.floor(terminal.clientWidth / 8)));
+      const rows = Math.max(1, Math.min(9999, Math.floor(terminal.clientHeight / 18)));
+      sendOperatorBytes(0x82, new Uint8Array([cols >> 8, cols & 255, rows >> 8, rows & 255]));
+    });
+
+    releaseButton.addEventListener("click", () => {
+      if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "release" }));
     });
 
     connect();

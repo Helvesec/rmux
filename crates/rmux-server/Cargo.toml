@@ -15,6 +15,7 @@ base64 = { version = "0.22", optional = true }
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
 getrandom = { version = "0.3", optional = true }
 glob = "0.3"
+httparse = { version = "1.9", optional = true }
 regex = "1.12.2"
 rmux-core = { path = "../rmux-core", version = "0.3.0" }
 rmux-ipc = { path = "../rmux-ipc", version = "0.3.0" }
@@ -29,7 +30,14 @@ tracing = "0.1"
 
 [features]
 default = ["web"]
-web = ["dep:base64", "dep:getrandom", "dep:serde", "dep:serde_json", "dep:sha1"]
+web = [
+    "dep:base64",
+    "dep:getrandom",
+    "dep:httparse",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:sha1",
+]
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["event", "fs", "net"] }

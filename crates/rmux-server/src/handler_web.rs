@@ -7,12 +7,13 @@ use super::pane_support::resolve_pane_target_ref;
 use super::RequestHandler;
 use crate::pane_io::PaneOutputReceiver;
 use crate::pane_terminal_lookup::pane_id_for_target;
-use crate::web::WebShareAccess;
+use crate::web::{WebShareAccess, WebShareConnectRole, WebShareRevokeReason};
 
 pub(crate) struct WebPaneStream {
     _access: WebShareAccess,
     pub(crate) output: PaneOutputReceiver,
     pub(crate) snapshot: WebPaneSnapshot,
+    pub(crate) revoke_rx: tokio::sync::watch::Receiver<Option<WebShareRevokeReason>>,
     target: PaneTargetRef,
 }
 
@@ -23,6 +24,10 @@ impl WebPaneStream {
 
     pub(crate) fn is_operator(&self) -> bool {
         self._access.is_operator()
+    }
+
+    pub(crate) fn expires_at(&self) -> Option<std::time::SystemTime> {
+        self._access.expires_at()
     }
 
     pub(crate) fn release_operator(&mut self) -> bool {
@@ -62,13 +67,16 @@ impl RequestHandler {
         &self,
         share_id: &str,
         key: &str,
+        role: WebShareConnectRole,
     ) -> Result<WebPaneStream, RmuxError> {
-        let access = self.web_shares.connect(share_id, key)?;
+        let access = self.web_shares.connect(share_id, key, role)?;
         let target = self.stable_web_target(access.target()).await?;
         let (snapshot, output) = self.web_resnapshot(&target).await?;
+        let revoke_rx = access.revoke_receiver();
         Ok(WebPaneStream {
             _access: access,
             output,
+            revoke_rx,
             snapshot,
             target,
         })
@@ -120,6 +128,21 @@ impl RequestHandler {
                 target: target.clone(),
                 keys: vec![text],
                 literal: true,
+            })
+            .await;
+        response_to_result(response)
+    }
+
+    pub(crate) async fn web_send_key(
+        &self,
+        target: &PaneTargetRef,
+        key: String,
+    ) -> Result<(), RmuxError> {
+        let response = self
+            .handle_pane_input_ref(PaneInputRequest {
+                target: target.clone(),
+                keys: vec![key],
+                literal: false,
             })
             .await;
         response_to_result(response)
@@ -179,6 +202,26 @@ impl RequestHandler {
             target.pane_index(),
         )?;
         Ok(PaneTargetRef::by_id(target.session_name().clone(), pane_id))
+    }
+
+    pub(crate) async fn web_target_alive(&self, target: &PaneTargetRef) -> bool {
+        let state = self.state.lock().await;
+        resolve_pane_target_ref(&state, target).is_ok()
+    }
+}
+
+impl WebPaneSnapshot {
+    pub(crate) fn ansi_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"\x1bc\x1b[?25l\x1b[H");
+        for (index, line) in self.lines.iter().enumerate() {
+            if index > 0 {
+                out.extend_from_slice(b"\r\n");
+            }
+            out.extend_from_slice(line.as_bytes());
+        }
+        out.extend_from_slice(b"\x1b[0m\x1b[H\x1b[?25h");
+        out
     }
 }
 
@@ -252,6 +295,6 @@ mod tests {
                 ..
             } if actual == &session_name
         ));
-        assert!(created.viewer_url.contains("?key="));
+        assert!(created.viewer_url.contains("&key="));
     }
 }

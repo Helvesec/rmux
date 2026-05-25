@@ -1,18 +1,22 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use base64::Engine;
 use rmux_core::events::OutputCursorItem;
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{sleep, timeout};
 use tracing::{debug, warn};
 
 use super::origin::origin_matches;
+use super::protocol::{
+    close_for_auth_error, handle_client_text, handle_operator_binary_frame, read_auth_message,
+    send_output, send_ready, send_revoked, send_snapshot, PRE_AUTH_TIMEOUT, UNIFORM_AUTH_DELAY,
+};
 use super::websocket::{WebSocket, WebSocketMessage};
-use crate::handler::{RequestHandler, WebPaneSnapshot};
+use super::WebShareRevokeReason;
+use crate::handler::RequestHandler;
 
 const HTTP_READ_LIMIT: usize = 8 * 1024;
 const OPERATOR_RATE_LIMIT: u16 = 200;
@@ -42,7 +46,20 @@ async fn serve(handler: Arc<RequestHandler>) -> io::Result<()> {
 }
 
 async fn serve_connection(mut stream: TcpStream, handler: Arc<RequestHandler>) -> io::Result<()> {
-    let request = read_http_request(&mut stream).await?;
+    let request = match timeout(PRE_AUTH_TIMEOUT, read_http_request(&mut stream)).await {
+        Ok(Ok(request)) => request,
+        Ok(Err(error)) if error.kind() == io::ErrorKind::InvalidData => {
+            return write_response(
+                &mut stream,
+                431,
+                "text/plain; charset=utf-8",
+                b"request headers too large or invalid\n",
+            )
+            .await;
+        }
+        Ok(Err(error)) => return Err(error),
+        Err(_) => return Ok(()),
+    };
     if request.method != "GET" {
         return write_response(
             &mut stream,
@@ -64,13 +81,17 @@ async fn serve_connection(mut stream: TcpStream, handler: Arc<RequestHandler>) -
         )
         .await;
     }
+    if request.path == "/share" {
+        return serve_websocket(stream, request, handler).await;
+    }
     if request.path.starts_with("/ws/") {
-        let share_id = request
-            .path
-            .strip_prefix("/ws/")
-            .expect("prefix checked")
-            .to_owned();
-        return serve_websocket(stream, request, handler, share_id).await;
+        return write_response(
+            &mut stream,
+            410,
+            "text/plain; charset=utf-8",
+            b"legacy web-share websocket path is gone; use /share\n",
+        )
+        .await;
     }
     write_response(
         &mut stream,
@@ -85,7 +106,6 @@ async fn serve_websocket(
     mut stream: TcpStream,
     request: HttpRequest,
     handler: Arc<RequestHandler>,
-    share_id: String,
 ) -> io::Result<()> {
     let Some(key) = request.headers.get("sec-websocket-key") else {
         return write_response(
@@ -96,33 +116,45 @@ async fn serve_websocket(
         )
         .await;
     };
-    let share_key = request.query.get("key").map(String::as_str).unwrap_or("");
-    let mut pane = match handler.open_web_share(&share_id, share_key).await {
+    let mut socket = WebSocket::accept(stream, key).await?;
+    let auth = match read_auth_message(&mut socket).await {
+        Ok(auth) => auth,
+        Err((code, reason)) => {
+            sleep(UNIFORM_AUTH_DELAY).await;
+            let _ = socket.write_close_code(code, reason).await;
+            return Ok(());
+        }
+    };
+    let mut pane = match handler
+        .open_web_share(&auth.id, &auth.key, auth.role.connect_role())
+        .await
+    {
         Ok(pane) => pane,
-        Err(_) => {
-            return write_response(
-                &mut stream,
-                403,
-                "text/plain; charset=utf-8",
-                b"invalid web-share credentials\n",
-            )
-            .await;
+        Err(error) => {
+            sleep(UNIFORM_AUTH_DELAY).await;
+            let (code, reason) = close_for_auth_error(&error.to_string());
+            let _ = socket.write_close_code(code, reason).await;
+            return Ok(());
         }
     };
     if let Some(origin) = request.headers.get("origin") {
         if !origin_matches(origin, pane.expected_origin()) {
-            return write_response(
-                &mut stream,
-                403,
-                "text/plain; charset=utf-8",
-                b"web-share origin is not allowed\n",
-            )
-            .await;
+            sleep(UNIFORM_AUTH_DELAY).await;
+            let _ = socket.write_close_code(4004, "origin_not_allowed").await;
+            return Ok(());
         }
     }
-    let mut socket = WebSocket::accept(stream, key).await?;
-    send_snapshot(&mut socket, &pane.snapshot, pane.is_operator()).await?;
+    sleep(UNIFORM_AUTH_DELAY).await;
+    send_ready(&mut socket, &pane, auth.role.as_str()).await?;
+    send_snapshot(&mut socket, &pane.snapshot).await?;
     let mut rate_limiter = OperatorRateLimiter::new();
+    let mut alive_tick = tokio::time::interval(Duration::from_millis(500));
+    let ttl_delay = pane
+        .expires_at()
+        .map(duration_until)
+        .unwrap_or_else(|| Duration::from_secs(365 * 24 * 60 * 60));
+    let ttl_sleep = sleep(ttl_delay);
+    tokio::pin!(ttl_sleep);
 
     loop {
         tokio::select! {
@@ -132,42 +164,32 @@ async fn serve_websocket(
                         send_output(&mut socket, event.bytes()).await?;
                     }
                     OutputCursorItem::Gap(gap) => {
-                        send_resync(&mut socket, gap.missed_events()).await?;
+                        debug!(missed = gap.missed_events(), "web-share viewer resync");
                         let (snapshot, output) = handler
                             .web_resnapshot(pane.target())
                             .await
                             .map_err(|error| io::Error::other(error.to_string()))?;
                         pane.snapshot = snapshot;
                         pane.output = output;
-                        send_snapshot(&mut socket, &pane.snapshot, pane.is_operator()).await?;
+                        send_snapshot(&mut socket, &pane.snapshot).await?;
                     }
                 }
             }
             message = socket.read_message() => {
                 match message? {
                     WebSocketMessage::Text(text) => {
-                        if !pane.is_operator() {
-                            let _ = socket.write_close().await;
-                            return Ok(());
-                        }
-                        if !rate_limiter.try_acquire() {
-                            debug!(share_id, "operator_rate_limit_hit");
-                            continue;
-                        }
-                        handle_client_message(&handler, &mut pane, &text).await?;
+                        handle_client_text(&mut socket, &mut pane, &text).await?;
                     }
                     WebSocketMessage::Binary(bytes) => {
                         if !pane.is_operator() {
-                            let _ = socket.write_close().await;
+                            let _ = socket.write_close_code(4006, "viewer_no_binary").await;
                             return Ok(());
                         }
                         if !rate_limiter.try_acquire() {
-                            debug!(share_id, "operator_rate_limit_hit");
+                            debug!(share_id = auth.id, "operator_rate_limit_hit");
                             continue;
                         }
-                        let text = String::from_utf8_lossy(&bytes).into_owned();
-                        handler.web_send_text(pane.target(), text).await
-                            .map_err(|error| io::Error::other(error.to_string()))?;
+                        handle_operator_binary_frame(&handler, &mut socket, &pane, &bytes).await?;
                     }
                     WebSocketMessage::Close => {
                         let _ = socket.write_close().await;
@@ -175,59 +197,36 @@ async fn serve_websocket(
                     }
                 }
             }
+            changed = pane.revoke_rx.changed() => {
+                if changed.is_ok() {
+                    let reason = *pane.revoke_rx.borrow();
+                    if let Some(reason) = reason {
+                        send_revoked(&mut socket, reason).await?;
+                        let _ = socket.write_close_code(1000, reason.as_str()).await;
+                        return Ok(());
+                    }
+                }
+            }
+            _ = ttl_sleep.as_mut() => {
+                send_revoked(&mut socket, WebShareRevokeReason::TtlExpired).await?;
+                let _ = socket.write_close_code(1000, "ttl_expired").await;
+                return Ok(());
+            }
+            _ = alive_tick.tick() => {
+                if !handler.web_target_alive(pane.target()).await {
+                    send_revoked(&mut socket, WebShareRevokeReason::PaneGone).await?;
+                    let _ = socket.write_close_code(1000, "pane_gone").await;
+                    return Ok(());
+                }
+            }
         }
     }
 }
 
-async fn handle_client_message(
-    handler: &RequestHandler,
-    pane: &mut crate::handler::WebPaneStream,
-    text: &str,
-) -> io::Result<()> {
-    let message = serde_json::from_str::<ClientMessage>(text)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    match message {
-        ClientMessage::Input { text } if pane.is_operator() => handler
-            .web_send_text(pane.target(), text)
-            .await
-            .map_err(|error| io::Error::other(error.to_string())),
-        ClientMessage::Resize { cols, rows } if pane.is_operator() => handler
-            .web_resize(pane.target(), cols, rows)
-            .await
-            .map_err(|error| io::Error::other(error.to_string())),
-        ClientMessage::Release if pane.is_operator() => {
-            pane.release_operator();
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-async fn send_snapshot(
-    socket: &mut WebSocket,
-    snapshot: &WebPaneSnapshot,
-    writable: bool,
-) -> io::Result<()> {
-    let payload = ServerMessage::Snapshot { snapshot, writable };
-    let text =
-        serde_json::to_string(&payload).map_err(|error| io::Error::other(error.to_string()))?;
-    socket.write_text(&text).await
-}
-
-async fn send_output(socket: &mut WebSocket, bytes: &[u8]) -> io::Result<()> {
-    let payload = ServerMessage::Output {
-        data: base64::engine::general_purpose::STANDARD.encode(bytes),
-    };
-    let text =
-        serde_json::to_string(&payload).map_err(|error| io::Error::other(error.to_string()))?;
-    socket.write_text(&text).await
-}
-
-async fn send_resync(socket: &mut WebSocket, missed_events: u64) -> io::Result<()> {
-    let payload = ServerMessage::Resync { missed_events };
-    let text =
-        serde_json::to_string(&payload).map_err(|error| io::Error::other(error.to_string()))?;
-    socket.write_text(&text).await
+fn duration_until(deadline: SystemTime) -> Duration {
+    deadline
+        .duration_since(SystemTime::now())
+        .unwrap_or(Duration::ZERO)
 }
 
 async fn read_http_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
@@ -242,40 +241,42 @@ async fn read_http_request(stream: &mut TcpStream) -> io::Result<HttpRequest> {
             ));
         }
         buffer.extend_from_slice(&chunk[..read]);
-        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
         if buffer.len() > HTTP_READ_LIMIT {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "HTTP request headers exceed rmux web limit",
             ));
         }
+        if buffer.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
     }
     parse_http_request(&buffer)
 }
 
 fn parse_http_request(buffer: &[u8]) -> io::Result<HttpRequest> {
-    let text = std::str::from_utf8(buffer)
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut request = httparse::Request::new(&mut headers);
+    let status = request
+        .parse(buffer)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    let head = text
-        .split_once("\r\n\r\n")
-        .map(|(head, _)| head)
-        .unwrap_or(text);
-    let mut lines = head.lines();
-    let request_line = lines.next().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "HTTP request line is missing")
-    })?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default().to_owned();
-    let target = parts.next().unwrap_or_default();
-    let (path, query) = split_target(target);
-    let mut headers = HashMap::new();
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_owned());
-        }
+    if !status.is_complete() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "incomplete HTTP request",
+        ));
     }
+    let method = request.method.unwrap_or_default().to_owned();
+    let target = request.path.unwrap_or_default();
+    let (path, query) = split_target(target);
+    let headers = request
+        .headers
+        .iter()
+        .map(|header| {
+            let value = String::from_utf8_lossy(header.value).trim().to_owned();
+            (header.name.to_ascii_lowercase(), value)
+        })
+        .collect();
     Ok(HttpRequest {
         method,
         path: path.to_owned(),
@@ -342,6 +343,8 @@ async fn write_response(
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        410 => "Gone",
+        431 => "Request Header Fields Too Large",
         _ => "Error",
     };
     let head = format!(
@@ -364,29 +367,6 @@ struct HttpRequest {
     path: String,
     query: HashMap<String, String>,
     headers: HashMap<String, String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ClientMessage {
-    Input { text: String },
-    Release,
-    Resize { cols: u16, rows: u16 },
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum ServerMessage<'a> {
-    Snapshot {
-        snapshot: &'a WebPaneSnapshot,
-        writable: bool,
-    },
-    Output {
-        data: String,
-    },
-    Resync {
-        missed_events: u64,
-    },
 }
 
 const INDEX_HTML: &str = include_str!("frontend/index.html");

@@ -469,7 +469,7 @@ async fn require_web_share(transport: &TransportClient) -> Result<()> {
 }
 
 fn key_from_url(url: &str) -> Option<&str> {
-    url.split_once("?key=")
+    url.split_once("key=")
         .map(|(_, key)| key.split('&').next().unwrap_or(key))
 }
 

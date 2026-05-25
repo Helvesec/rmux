@@ -61,8 +61,21 @@ impl WebSocket {
         self.write_frame(OPCODE_TEXT, text.as_bytes()).await
     }
 
+    pub(crate) async fn write_binary(&mut self, payload: &[u8]) -> io::Result<()> {
+        self.write_frame(OPCODE_BINARY, payload).await
+    }
+
     pub(crate) async fn write_close(&mut self) -> io::Result<()> {
         self.write_frame(OPCODE_CLOSE, &[]).await
+    }
+
+    pub(crate) async fn write_close_code(&mut self, code: u16, reason: &str) -> io::Result<()> {
+        let reason = reason.as_bytes();
+        let reason = &reason[..reason.len().min(123)];
+        let mut payload = Vec::with_capacity(2 + reason.len());
+        payload.extend_from_slice(&code.to_be_bytes());
+        payload.extend_from_slice(reason);
+        self.write_frame(OPCODE_CLOSE, &payload).await
     }
 
     async fn read_frame(&mut self) -> io::Result<WebSocketFrame> {
