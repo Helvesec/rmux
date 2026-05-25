@@ -607,13 +607,22 @@ fn share_url(
     role: &str,
 ) -> String {
     let endpoint = websocket_endpoint(endpoint_origin);
+    let frontend = frontend_url(frontend_origin);
     let key = token.unwrap_or("[REDACTED]");
-    let mut url = format!("{frontend_origin}/#endpoint={endpoint}&id={share_id}&key={key}");
+    let mut url = format!("{frontend}/#endpoint={endpoint}&id={share_id}&key={key}");
     if role != "viewer" {
         url.push_str("&role=");
         url.push_str(role);
     }
     url
+}
+
+fn frontend_url(frontend_origin: &str) -> String {
+    if frontend_origin == DEFAULT_FRONTEND_ORIGIN {
+        format!("{frontend_origin}/share")
+    } else {
+        frontend_origin.to_owned()
+    }
 }
 
 fn websocket_endpoint(base_url: &str) -> String {
