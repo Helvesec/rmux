@@ -1,7 +1,8 @@
 #!/usr/bin/env sh
 set -eu
 
-missing=0
+missing_file="$(mktemp)"
+trap 'rm -f "$missing_file"' EXIT
 
 find src crates -type f -name '*.rs' 2>/dev/null \
   | grep -v '/target/' \
@@ -29,9 +30,10 @@ find src crates -type f -name '*.rs' 2>/dev/null \
           }
           if (exit_code) exit 1
         }
-      ' "$file" || missing=$((missing + 1))
+      ' "$file" || printf '%s\n' "$file" >> "$missing_file"
     done
 
+missing="$(wc -l < "$missing_file" | tr -d ' ')"
 if [ "$missing" -ne 0 ]; then
   echo "$missing file(s) contain unsafe blocks without nearby SAFETY comments." >&2
   exit 1

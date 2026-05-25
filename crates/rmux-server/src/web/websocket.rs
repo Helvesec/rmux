@@ -123,19 +123,19 @@ impl WebSocket {
     }
 
     async fn write_frame(&mut self, opcode: u8, payload: &[u8]) -> io::Result<()> {
-        let mut head = Vec::with_capacity(10);
-        head.push(0x80 | opcode);
+        let mut frame = Vec::with_capacity(10 + payload.len());
+        frame.push(0x80 | opcode);
         if payload.len() < 126 {
-            head.push(payload.len() as u8);
+            frame.push(payload.len() as u8);
         } else if u16::try_from(payload.len()).is_ok() {
-            head.push(126);
-            head.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            frame.push(126);
+            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
         } else {
-            head.push(127);
-            head.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+            frame.push(127);
+            frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
         }
-        self.stream.write_all(&head).await?;
-        self.stream.write_all(payload).await
+        frame.extend_from_slice(payload);
+        self.stream.write_all(&frame).await
     }
 }
 
@@ -159,9 +159,16 @@ fn websocket_accept_key(key: &str) -> String {
     base64::engine::general_purpose::STANDARD.encode(digest)
 }
 
+pub(crate) fn valid_client_key(key: &str) -> bool {
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(key) else {
+        return false;
+    };
+    decoded.len() == 16
+}
+
 #[cfg(test)]
 mod tests {
-    use super::websocket_accept_key;
+    use super::{valid_client_key, websocket_accept_key};
 
     #[test]
     fn websocket_accept_key_matches_rfc_fixture() {
@@ -169,5 +176,12 @@ mod tests {
             websocket_accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
             "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
         );
+    }
+
+    #[test]
+    fn websocket_key_must_decode_to_sixteen_bytes() {
+        assert!(valid_client_key("dGhlIHNhbXBsZSBub25jZQ=="));
+        assert!(!valid_client_key("not-base64"));
+        assert!(!valid_client_key("Zm9v"));
     }
 }

@@ -83,7 +83,7 @@ fn split_url_origin_and_path(value: &str) -> Option<(&str, &str)> {
         return None;
     }
     let (scheme, rest) = value.split_once("://")?;
-    if scheme != "http" && scheme != "https" {
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
         return None;
     }
     let path_start = rest.find('/').unwrap_or(rest.len());
@@ -176,7 +176,7 @@ fn valid_dns_label(label: &str) -> bool {
     let Some(last) = bytes.last() else {
         return false;
     };
-    if !first.is_ascii_lowercase() || !last.is_ascii_alphanumeric() {
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) || !last.is_ascii_alphanumeric() {
         return false;
     }
     bytes
@@ -204,6 +204,7 @@ mod tests {
                 "https://share.example.com",
                 true,
             ),
+            ("https://1password.com", "https://1password.com", true),
             (
                 "https://SHARE.example.com",
                 "https://share.example.com",
@@ -280,6 +281,7 @@ mod tests {
         assert!(validate_frontend_url("https://share.example.com/share?x=1").is_err());
         assert!(validate_frontend_url("http://share.example.com/share").is_err());
         assert!(validate_frontend_url("http://127.0.0.1:4321/share").is_ok());
+        assert!(validate_frontend_url("HTTPS://37signals.com/share").is_ok());
     }
 
     #[test]

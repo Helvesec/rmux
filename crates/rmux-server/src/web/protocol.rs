@@ -107,10 +107,11 @@ pub(crate) async fn handle_pane_client_text(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     match message {
         ClientMessage::Release if pane.is_operator() => {
-            pane.release_operator();
-            let text = serde_json::to_string(&ServerMessage::Released { role: "read" })
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            socket.write_text(&text).await
+            if pane.release_operator() {
+                send_released(socket).await
+            } else {
+                socket.write_close_code(4003, "read_cap_reached").await
+            }
         }
         ClientMessage::Logout => {
             let _ = socket
@@ -135,10 +136,11 @@ pub(crate) async fn handle_session_client_text(
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     match message {
         ClientMessage::Release if session.is_operator() => {
-            session.release_operator();
-            let text = serde_json::to_string(&ServerMessage::Released { role: "read" })
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            socket.write_text(&text).await
+            if session.release_operator() {
+                send_released(socket).await
+            } else {
+                socket.write_close_code(4003, "read_cap_reached").await
+            }
         }
         ClientMessage::Logout
             if session_logout_allowed(session.is_operator(), session.controls()) =>
@@ -387,6 +389,12 @@ async fn resize_session(
     session: &mut WebSessionStream,
     body: &[u8],
 ) -> io::Result<()> {
+    if !session.controls() {
+        let _ = socket
+            .write_close_code(4006, "resize_requires_controls")
+            .await;
+        return Ok(());
+    }
     let Some((cols, rows)) = parse_resize(socket, body).await? else {
         return Ok(());
     };
@@ -431,6 +439,12 @@ async fn send_resize_notify(socket: &mut WebSocket, cols: u16, rows: u16) -> io:
 
 fn session_logout_allowed(is_operator: bool, controls: bool) -> bool {
     is_operator && controls
+}
+
+async fn send_released(socket: &mut WebSocket) -> io::Result<()> {
+    let text = serde_json::to_string(&ServerMessage::Released { role: "read" })
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    socket.write_text(&text).await
 }
 
 #[cfg(test)]

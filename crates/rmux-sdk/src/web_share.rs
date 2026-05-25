@@ -52,7 +52,7 @@ impl<'a> WebShareBuilder<'a> {
     /// Sets the maximum lifetime for the share.
     #[must_use]
     pub fn ttl(mut self, duration: Duration) -> Self {
-        self.ttl_seconds = Some(duration.as_secs());
+        self.ttl_seconds = Some(whole_seconds_ceil(duration));
         self
     }
 
@@ -637,9 +637,33 @@ fn key_from_url(url: &str) -> Option<&str> {
         .map(|(_, key)| key.split('&').next().unwrap_or(key))
 }
 
+fn whole_seconds_ceil(duration: Duration) -> u64 {
+    if duration.is_zero() {
+        0
+    } else {
+        duration
+            .as_secs()
+            .saturating_add(u64::from(duration.subsec_nanos() > 0))
+    }
+}
+
 fn unexpected_response(operation: &str, response: Response) -> RmuxError {
     RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
         "rmux daemon sent `{}` response for {operation}",
         response.command_name()
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::whole_seconds_ceil;
+    use std::time::Duration;
+
+    #[test]
+    fn ttl_ceil_rejects_only_explicit_zero_later() {
+        assert_eq!(whole_seconds_ceil(Duration::ZERO), 0);
+        assert_eq!(whole_seconds_ceil(Duration::from_millis(1)), 1);
+        assert_eq!(whole_seconds_ceil(Duration::from_secs(3)), 3);
+        assert_eq!(whole_seconds_ceil(Duration::new(3, 1)), 4);
+    }
 }

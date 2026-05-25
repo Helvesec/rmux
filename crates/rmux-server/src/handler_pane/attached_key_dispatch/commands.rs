@@ -133,10 +133,56 @@ fn web_controls_command_allowed(command: &ParsedCommand) -> bool {
             | "display-panes"
     );
     allowed
+        && !contains_cross_target_option(command)
         && command.arguments().iter().all(|argument| match argument {
             CommandArgument::String(_) => true,
             CommandArgument::Commands(commands) => web_controls_commands_allowed(commands),
         })
+}
+
+fn contains_cross_target_option(command: &ParsedCommand) -> bool {
+    let args = command
+        .arguments()
+        .iter()
+        .filter_map(CommandArgument::as_string)
+        .collect::<Vec<_>>();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index];
+        if arg == "--" {
+            break;
+        }
+        if is_target_option(arg) {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+fn is_target_option(arg: &str) -> bool {
+    if !arg.starts_with('-') || arg == "-" {
+        return false;
+    }
+    if matches!(
+        arg,
+        "--target" | "--target-pane" | "--session" | "--source" | "--src-pane" | "--dst-pane"
+    ) {
+        return true;
+    }
+    if arg.starts_with("--target=")
+        || arg.starts_with("--target-pane=")
+        || arg.starts_with("--session=")
+        || arg.starts_with("--source=")
+        || arg.starts_with("--src-pane=")
+        || arg.starts_with("--dst-pane=")
+    {
+        return true;
+    }
+    if arg.starts_with("--") {
+        return false;
+    }
+    arg[1..].chars().any(|flag| matches!(flag, 't' | 's'))
 }
 
 fn parsed_commands_block_for_prompt(commands: &ParsedCommands) -> bool {
@@ -217,6 +263,14 @@ mod tests {
         let parser = CommandParser::new();
         let split = parser.parse_one_group("split-window -h").unwrap();
         assert!(web_controls_commands_allowed(&split));
+
+        let split_other = parser.parse_one_group("split-window -t other -h").unwrap();
+        assert!(!web_controls_commands_allowed(&split_other));
+
+        let rename_other = parser
+            .parse_one_group("rename-window -t other:0 web")
+            .unwrap();
+        assert!(!web_controls_commands_allowed(&rename_other));
 
         let choose_tree = parser.parse_one_group("choose-tree").unwrap();
         assert!(!web_controls_commands_allowed(&choose_tree));

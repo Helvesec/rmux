@@ -111,6 +111,8 @@ mod imp {
             revents: 0,
         };
         let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+        // SAFETY: `pollfd` points to a valid single-entry array for the duration of the call,
+        // and `fd` is an open terminal descriptor owned by the caller.
         unsafe { libc::poll(&mut pollfd, 1, timeout_ms) > 0 && pollfd.revents & libc::POLLIN != 0 }
     }
 
@@ -121,7 +123,11 @@ mod imp {
 
     impl TermiosGuard {
         fn new(fd: libc::c_int) -> Option<Self> {
+            // SAFETY: `libc::termios` is a plain C struct whose all-zero value is only used as
+            // an output buffer before being read after a successful `tcgetattr` call.
             let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+            // SAFETY: `original` is a valid writable termios buffer and `fd` is expected to be
+            // an open terminal descriptor.
             if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
                 return None;
             }
@@ -129,6 +135,8 @@ mod imp {
             raw.c_lflag &= !(libc::ICANON | libc::ECHO);
             raw.c_cc[libc::VMIN] = 0;
             raw.c_cc[libc::VTIME] = 0;
+            // SAFETY: `raw` was derived from a termios value returned by `tcgetattr` for this
+            // descriptor, with only documented local-mode/control-byte fields adjusted.
             if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
                 return None;
             }
@@ -138,6 +146,8 @@ mod imp {
 
     impl Drop for TermiosGuard {
         fn drop(&mut self) {
+            // SAFETY: `original` was captured from this descriptor by `tcgetattr`; restoring it
+            // is best-effort and the return value is intentionally ignored during drop.
             let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
         }
     }
