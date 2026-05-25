@@ -98,7 +98,7 @@ pub use buffer::{
 mod web;
 pub use web::{
     CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest, StopAllWebSharesRequest,
-    StopWebShareRequest, WebShareConfigRequest, WebShareRequest,
+    StopWebShareRequest, WebShareConfigRequest, WebShareRequest, WebShareUrlOptions,
 };
 
 /// All detached public command and internal RPC requests supported by the wire

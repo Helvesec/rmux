@@ -23,6 +23,7 @@ const WS_RESIZE_REQUEST: u8 = 0x82;
 pub(crate) struct AuthMessage {
     pub(crate) id: String,
     pub(crate) key: String,
+    pub(crate) pin: Option<String>,
     pub(crate) role: AuthRole,
 }
 
@@ -74,6 +75,7 @@ pub(crate) async fn read_auth_message(
     Ok(AuthMessage {
         id: wire.id,
         key: wire.key,
+        pin: wire.pin,
         role,
     })
 }
@@ -269,6 +271,8 @@ struct AuthWireMessage {
     kind: String,
     id: String,
     key: String,
+    #[serde(default)]
+    pin: Option<String>,
     role: String,
 }
 

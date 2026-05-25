@@ -7,7 +7,7 @@ use std::time::Duration;
 use rmux_proto::{
     CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest, PaneTarget, PaneTargetRef,
     Request, Response, StopAllWebSharesRequest, StopWebShareRequest, WebShareConfigRequest,
-    WebShareListener, WebShareRequest, WebShareResponse, CAPABILITY_WEB_SHARE,
+    WebShareListener, WebShareRequest, WebShareResponse, WebShareUrlOptions, CAPABILITY_WEB_SHARE,
 };
 
 use crate::handles::{Pane, Rmux, Session};
@@ -22,6 +22,8 @@ pub struct WebShareBuilder<'a> {
     public_base_url: Option<String>,
     ttl_seconds: Option<u64>,
     max_viewers: Option<u16>,
+    url_options: WebShareUrlOptions,
+    require_pin: bool,
     writable: bool,
 }
 
@@ -34,6 +36,8 @@ impl<'a> WebShareBuilder<'a> {
             public_base_url: None,
             ttl_seconds: None,
             max_viewers: None,
+            url_options: WebShareUrlOptions::default(),
+            require_pin: false,
             writable: false,
         }
     }
@@ -73,6 +77,33 @@ impl<'a> WebShareBuilder<'a> {
         self
     }
 
+    /// Hides the browser navigation bar in generated share URLs.
+    #[must_use]
+    pub const fn no_navbar(mut self) -> Self {
+        self.url_options.no_navbar = true;
+        self
+    }
+
+    /// Suppresses the client-side privacy/disclaimer toast in generated share URLs.
+    #[must_use]
+    pub const fn no_disclaimer(mut self) -> Self {
+        self.url_options.no_disclaimer = true;
+        self
+    }
+
+    /// Requires an out-of-band pairing code in addition to the URL secret.
+    #[must_use]
+    pub const fn pin(mut self) -> Self {
+        self.require_pin = true;
+        self
+    }
+
+    /// Alias for [`Self::pin`].
+    #[must_use]
+    pub const fn pairing_code(self) -> Self {
+        self.pin()
+    }
+
     /// Enables the single-operator writable URL.
     #[must_use]
     pub const fn writable(mut self) -> Self {
@@ -98,6 +129,8 @@ impl<'a> WebShareBuilder<'a> {
                     frontend_url: self.frontend_url,
                     ttl_seconds: self.ttl_seconds,
                     max_viewers: self.max_viewers,
+                    url_options: self.url_options,
+                    require_pin: self.require_pin,
                     writable: self.writable,
                 },
             )))
@@ -130,6 +163,7 @@ pub struct WebShareHandle {
     viewer_url: String,
     operator_url: Option<String>,
     expires_at_unix: Option<u64>,
+    pairing_code: Option<String>,
     max_viewers: u16,
     writable: bool,
 }
@@ -143,6 +177,7 @@ impl WebShareHandle {
             viewer_url: created.viewer_url,
             operator_url: created.operator_url,
             expires_at_unix: created.expires_at_unix,
+            pairing_code: created.pairing_code,
             max_viewers: created.max_viewers,
             writable: created.writable,
         }
@@ -188,6 +223,12 @@ impl WebShareHandle {
     #[must_use]
     pub fn operator_key(&self) -> Option<&str> {
         self.operator_url.as_deref().and_then(key_from_url)
+    }
+
+    /// Returns the out-of-band pairing code required by this share, when requested.
+    #[must_use]
+    pub fn pairing_code(&self) -> Option<&str> {
+        self.pairing_code.as_deref()
     }
 
     /// Returns the effective viewer cap.

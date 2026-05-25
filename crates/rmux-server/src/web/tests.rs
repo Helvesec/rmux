@@ -1,7 +1,7 @@
 use rmux_core::events::OutputCursorItem;
 use rmux_proto::{
     CreateWebShareRequest, ListWebSharesRequest, PaneId, PaneTargetRef, SessionName,
-    StopAllWebSharesRequest,
+    StopAllWebSharesRequest, WebShareUrlOptions,
 };
 
 use crate::pane_io::pane_output_channel_with_limits;
@@ -51,6 +51,8 @@ fn create_returns_secret_urls_but_list_is_redacted() {
             frontend_url: None,
             ttl_seconds: Some(60),
             max_viewers: Some(2),
+            url_options: Default::default(),
+            require_pin: false,
             writable: true,
         })
         .expect("share creates");
@@ -86,6 +88,8 @@ fn default_local_share_uses_hosted_frontend_and_local_websocket_endpoint() {
             frontend_url: None,
             ttl_seconds: Some(60),
             max_viewers: Some(2),
+            url_options: Default::default(),
+            require_pin: false,
             writable: false,
         })
         .expect("share creates");
@@ -97,7 +101,12 @@ fn default_local_share_uses_hosted_frontend_and_local_websocket_endpoint() {
 
     let viewer_key = key_from_url(&created.viewer_url);
     let access = registry
-        .connect(&created.share_id, &viewer_key, WebShareConnectRole::Viewer)
+        .connect(
+            &created.share_id,
+            &viewer_key,
+            None,
+            WebShareConnectRole::Viewer,
+        )
         .expect("viewer connects");
     assert!(access.origin_allowed("https://share.rmux.io"));
     assert!(access.origin_allowed("http://localhost:4321"));
@@ -121,6 +130,8 @@ fn frontend_override_changes_browser_origin_without_changing_local_endpoint() {
             frontend_url: None,
             ttl_seconds: Some(60),
             max_viewers: Some(2),
+            url_options: Default::default(),
+            require_pin: false,
             writable: false,
         })
         .expect("share creates");
@@ -130,7 +141,12 @@ fn frontend_override_changes_browser_origin_without_changing_local_endpoint() {
         .starts_with("https://share.fork.example/#endpoint=ws://127.0.0.1:9778/share&id="));
     let viewer_key = key_from_url(&created.viewer_url);
     let access = registry
-        .connect(&created.share_id, &viewer_key, WebShareConnectRole::Viewer)
+        .connect(
+            &created.share_id,
+            &viewer_key,
+            None,
+            WebShareConnectRole::Viewer,
+        )
         .expect("viewer connects");
     assert!(access.origin_allowed("https://share.fork.example"));
     assert!(!access.origin_allowed("https://share.rmux.io"));
@@ -146,6 +162,8 @@ fn per_share_frontend_url_overrides_daemon_default() {
             frontend_url: Some("https://share.fork.example/share".to_owned()),
             ttl_seconds: Some(60),
             max_viewers: Some(2),
+            url_options: Default::default(),
+            require_pin: false,
             writable: false,
         })
         .expect("share creates");
@@ -155,7 +173,12 @@ fn per_share_frontend_url_overrides_daemon_default() {
     ));
     let viewer_key = key_from_url(&created.viewer_url);
     let access = registry
-        .connect(&created.share_id, &viewer_key, WebShareConnectRole::Viewer)
+        .connect(
+            &created.share_id,
+            &viewer_key,
+            None,
+            WebShareConnectRole::Viewer,
+        )
         .expect("viewer connects");
     assert!(access.origin_allowed("https://share.fork.example"));
     assert!(!access.origin_allowed("https://share.rmux.io"));
@@ -169,6 +192,87 @@ fn public_base_url_rejects_query_and_fragment() {
 }
 
 #[test]
+fn url_options_are_encoded_in_viewer_urls() {
+    let registry = WebShareRegistry::default();
+    let created = registry
+        .create(CreateWebShareRequest {
+            target: target(),
+            public_base_url: None,
+            frontend_url: None,
+            ttl_seconds: Some(60),
+            max_viewers: Some(2),
+            url_options: WebShareUrlOptions {
+                no_navbar: true,
+                no_disclaimer: true,
+            },
+            require_pin: false,
+            writable: true,
+        })
+        .expect("share creates");
+
+    assert!(created.viewer_url.contains("&navbar=off"));
+    assert!(created.viewer_url.contains("&disclaimer=off"));
+    assert!(created
+        .operator_url
+        .as_deref()
+        .is_some_and(|url| url.contains("&navbar=off") && url.contains("&disclaimer=off")));
+}
+
+#[test]
+fn pairing_code_is_required_out_of_band_when_pin_enabled() {
+    let registry = WebShareRegistry::default();
+    let created = registry
+        .create(CreateWebShareRequest {
+            target: target(),
+            public_base_url: None,
+            frontend_url: None,
+            ttl_seconds: Some(60),
+            max_viewers: Some(2),
+            url_options: Default::default(),
+            require_pin: true,
+            writable: false,
+        })
+        .expect("share creates");
+
+    let pairing_code = created
+        .pairing_code
+        .as_deref()
+        .expect("pin-enabled share returns pairing code");
+    assert_eq!(pairing_code.len(), 6);
+    assert!(pairing_code.bytes().all(|byte| byte.is_ascii_digit()));
+    assert!(created.viewer_url.contains("&pin=required"));
+    assert!(!created.viewer_url.contains(pairing_code));
+    let stdout = String::from_utf8_lossy(created.output.stdout());
+    assert!(stdout.contains(&format!("pin {pairing_code}\n")));
+
+    let viewer_key = key_from_url(&created.viewer_url);
+    assert!(registry
+        .connect(
+            &created.share_id,
+            &viewer_key,
+            None,
+            WebShareConnectRole::Viewer
+        )
+        .is_err());
+    assert!(registry
+        .connect(
+            &created.share_id,
+            &viewer_key,
+            Some("000000"),
+            WebShareConnectRole::Viewer,
+        )
+        .is_err());
+    assert!(registry
+        .connect(
+            &created.share_id,
+            &viewer_key,
+            Some(pairing_code),
+            WebShareConnectRole::Viewer,
+        )
+        .is_ok());
+}
+
+#[test]
 fn stop_all_reports_removed_share_count() {
     let registry = WebShareRegistry::default();
     for _ in 0..2 {
@@ -179,6 +283,8 @@ fn stop_all_reports_removed_share_count() {
                 frontend_url: None,
                 ttl_seconds: None,
                 max_viewers: None,
+                url_options: Default::default(),
+                require_pin: false,
                 writable: false,
             })
             .expect("share creates");
@@ -197,6 +303,8 @@ fn connect_enforces_viewer_cap_and_single_operator() {
             frontend_url: None,
             ttl_seconds: None,
             max_viewers: Some(1),
+            url_options: Default::default(),
+            require_pin: false,
             writable: true,
         })
         .expect("share creates");
@@ -204,17 +312,28 @@ fn connect_enforces_viewer_cap_and_single_operator() {
     let operator_key = key_from_url(created.operator_url.as_deref().expect("operator url"));
 
     let viewer = registry
-        .connect(&created.share_id, &viewer_key, WebShareConnectRole::Viewer)
+        .connect(
+            &created.share_id,
+            &viewer_key,
+            None,
+            WebShareConnectRole::Viewer,
+        )
         .expect("viewer connects");
     assert!(!viewer.is_operator());
     assert!(registry
-        .connect(&created.share_id, &viewer_key, WebShareConnectRole::Viewer)
+        .connect(
+            &created.share_id,
+            &viewer_key,
+            None,
+            WebShareConnectRole::Viewer
+        )
         .is_err());
 
     let operator = registry
         .connect(
             &created.share_id,
             &operator_key,
+            None,
             WebShareConnectRole::Operator,
         )
         .expect("operator connects");
@@ -223,13 +342,19 @@ fn connect_enforces_viewer_cap_and_single_operator() {
         .connect(
             &created.share_id,
             &operator_key,
+            None,
             WebShareConnectRole::Operator,
         )
         .is_err());
 
     drop(viewer);
     assert!(registry
-        .connect(&created.share_id, &viewer_key, WebShareConnectRole::Viewer)
+        .connect(
+            &created.share_id,
+            &viewer_key,
+            None,
+            WebShareConnectRole::Viewer
+        )
         .is_ok());
 }
 

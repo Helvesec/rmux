@@ -50,6 +50,9 @@ pub struct WebShareCreatedResponse {
     /// Expiration timestamp as UNIX seconds, when a TTL was requested.
     #[serde(default)]
     pub expires_at_unix: Option<u64>,
+    /// Out-of-band pairing code required by this share, when requested.
+    #[serde(default)]
+    pub pairing_code: Option<String>,
     /// Effective viewer cap.
     pub max_viewers: u16,
     /// Whether an operator URL was minted.

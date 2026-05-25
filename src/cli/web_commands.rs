@@ -5,7 +5,7 @@ use qrcode::render::unicode::Dense1x2;
 use rmux_proto::{
     CommandOutput, CreateWebShareRequest, ListWebSharesRequest, LookupWebShareRequest,
     PaneTargetRef, Response, StopAllWebSharesRequest, StopWebShareRequest, WebShareConfigRequest,
-    WebShareCreatedResponse, WebShareRequest, WebShareResponse,
+    WebShareCreatedResponse, WebShareRequest, WebShareResponse, WebShareUrlOptions,
 };
 
 use super::{
@@ -110,6 +110,11 @@ fn build_web_share_request(
         frontend_url: args.frontend_url,
         ttl_seconds: args.ttl_seconds,
         max_viewers: args.max_viewers,
+        url_options: WebShareUrlOptions {
+            no_navbar: args.no_navbar,
+            no_disclaimer: args.no_disclaimer,
+        },
+        require_pin: args.require_pin,
         writable: args.writable,
     }))
 }

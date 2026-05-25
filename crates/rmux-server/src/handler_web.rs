@@ -71,9 +71,10 @@ impl RequestHandler {
         &self,
         share_id: &str,
         key: &str,
+        pin: Option<&str>,
         role: WebShareConnectRole,
     ) -> Result<WebPaneStream, RmuxError> {
-        let access = self.web_shares.connect(share_id, key, role)?;
+        let access = self.web_shares.connect(share_id, key, pin, role)?;
         let target = self.stable_web_target(access.target()).await?;
         let (snapshot, output) = self.web_resnapshot(&target).await?;
         let revoke_rx = access.revoke_receiver();
@@ -289,6 +290,8 @@ mod tests {
                     frontend_url: None,
                     ttl_seconds: None,
                     max_viewers: Some(1),
+                    url_options: Default::default(),
+                    require_pin: false,
                     writable: false,
                 },
             )))

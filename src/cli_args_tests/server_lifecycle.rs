@@ -95,6 +95,23 @@ fn web_share_accepts_frontend_and_tunnel_url_flags() {
 }
 
 #[test]
+fn web_share_accepts_viewer_presentation_and_pin_flags() {
+    let cli = parse_args(&["web-share", "--no-navbar", "--no-disclaimer", "--pin"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert!(args.no_navbar);
+    assert!(args.no_disclaimer);
+    assert!(args.require_pin);
+
+    let cli = parse_args(&["web-share", "--pairing-code"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert!(args.require_pin);
+}
+
+#[test]
 fn web_share_keeps_legacy_public_url_alias() {
     let cli = parse_args(&["web-share", "--public-url", "https://terminal.example.com"]).unwrap();
     let Some(super::super::Command::WebShare(args)) = cli.command else {

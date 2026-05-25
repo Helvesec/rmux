@@ -36,9 +36,26 @@ pub struct CreateWebShareRequest {
     /// Optional viewer cap for this share.
     #[serde(default)]
     pub max_viewers: Option<u16>,
+    /// Presentation options encoded into generated viewer URLs.
+    #[serde(default)]
+    pub url_options: WebShareUrlOptions,
+    /// Whether clients must provide the out-of-band pairing code during auth.
+    #[serde(default)]
+    pub require_pin: bool,
     /// Whether an operator URL should be minted.
     #[serde(default)]
     pub writable: bool,
+}
+
+/// Browser presentation options for generated web-share URLs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebShareUrlOptions {
+    /// Hide the share navigation bar for this generated URL.
+    #[serde(default)]
+    pub no_navbar: bool,
+    /// Suppress the client-side privacy/disclaimer toast.
+    #[serde(default)]
+    pub no_disclaimer: bool,
 }
 
 /// Request payload for `web-share -l`.

@@ -9,6 +9,7 @@ use rmux_proto::{
     StopAllWebSharesRequest, StopWebShareRequest, WebShareConfigRequest, WebShareConfigResponse,
     WebShareCreatedResponse, WebShareListResponse, WebShareListener, WebShareLookupResponse,
     WebShareResponse, WebShareStoppedAllResponse, WebShareStoppedResponse, WebShareSummary,
+    WebShareUrlOptions,
 };
 use rmux_proto::{PaneTargetRef, RmuxError};
 use tokio::sync::watch;
@@ -88,6 +89,7 @@ impl WebShareRegistry {
         let share_id = self.next_share_id()?;
         let viewer_token = random_token()?;
         let operator_token = request.writable.then(random_token).transpose()?;
+        let pairing_code = request.require_pin.then(random_pairing_code).transpose()?;
         let ttl_seconds = request.ttl_seconds.unwrap_or(DEFAULT_TTL_SECONDS);
         if ttl_seconds == 0 || ttl_seconds > MAX_TTL_SECONDS {
             return Err(RmuxError::Server(
@@ -107,9 +109,11 @@ impl WebShareRegistry {
             lease_book,
             max_viewers,
             operator_token: operator_token.clone(),
+            pairing_code: pairing_code.clone(),
             revoke_tx,
             share_id: share_id.clone(),
             target: request.target.clone(),
+            url_options: request.url_options,
             viewer_token: viewer_token.clone(),
             writable: request.writable,
         };
@@ -129,17 +133,19 @@ impl WebShareRegistry {
             ttl_seconds,
             max_viewers,
             public = request.public_base_url.is_some(),
+            pin_required = request.require_pin,
             listener_port = self.settings.port,
             "web_share_created"
         );
 
-        let output = created_output(&viewer_url);
+        let output = created_output(&viewer_url, pairing_code.as_deref());
         Ok(WebShareCreatedResponse {
             share_id,
             target: summary_target,
             viewer_url,
             operator_url,
             expires_at_unix,
+            pairing_code,
             max_viewers,
             writable: request.writable,
             output,
@@ -218,6 +224,7 @@ impl WebShareRegistry {
         &self,
         share_id: &str,
         key: &str,
+        pin: Option<&str>,
         role: WebShareConnectRole,
     ) -> Result<WebShareAccess, RmuxError> {
         let mut inner = self
@@ -228,7 +235,7 @@ impl WebShareRegistry {
         let record = inner.records.get(share_id).ok_or_else(|| {
             RmuxError::Server("web-share does not exist or has expired".to_owned())
         })?;
-        let access = record.connect(key, role)?;
+        let access = record.connect(key, pin, role)?;
         info!(share_id, role = ?role, "web_share_access_granted");
         Ok(access)
     }
@@ -395,9 +402,11 @@ struct WebShareRecord {
     lease_book: Arc<LeaseBook>,
     max_viewers: u16,
     operator_token: Option<String>,
+    pairing_code: Option<String>,
     revoke_tx: watch::Sender<Option<WebShareRevokeReason>>,
     share_id: String,
     target: PaneTargetRef,
+    url_options: WebShareUrlOptions,
     viewer_token: String,
     writable: bool,
 }
@@ -411,6 +420,8 @@ impl WebShareRecord {
             &self.share_id,
             Some(&self.viewer_token),
             "viewer",
+            self.pairing_code.is_some(),
+            self.url_options,
         )
     }
 
@@ -422,6 +433,8 @@ impl WebShareRecord {
             &self.share_id,
             None,
             "viewer",
+            self.pairing_code.is_some(),
+            self.url_options,
         )
     }
 
@@ -434,6 +447,8 @@ impl WebShareRecord {
                 &self.share_id,
                 Some(token),
                 "operator",
+                self.pairing_code.is_some(),
+                self.url_options,
             )
         })
     }
@@ -451,12 +466,18 @@ impl WebShareRecord {
         }
     }
 
-    fn connect(&self, key: &str, role: WebShareConnectRole) -> Result<WebShareAccess, RmuxError> {
+    fn connect(
+        &self,
+        key: &str,
+        pin: Option<&str>,
+        role: WebShareConnectRole,
+    ) -> Result<WebShareAccess, RmuxError> {
         match role {
             WebShareConnectRole::Viewer => {
                 if !secret_eq(key, &self.viewer_token) {
                     return Err(RmuxError::Server("invalid web-share key".to_owned()));
                 }
+                self.check_pairing_code(pin)?;
                 let lease = self
                     .lease_book
                     .try_viewer()
@@ -475,6 +496,7 @@ impl WebShareRecord {
                 if !secret_eq(key, operator_key) {
                     return Err(RmuxError::Server("invalid web-share key".to_owned()));
                 }
+                self.check_pairing_code(pin)?;
                 let lease = self
                     .lease_book
                     .try_operator()
@@ -485,6 +507,18 @@ impl WebShareRecord {
                 Ok(self.access(lease, WebShareRole::Operator))
             }
         }
+    }
+
+    fn check_pairing_code(&self, pin: Option<&str>) -> Result<(), RmuxError> {
+        let Some(expected) = self.pairing_code.as_deref() else {
+            return Ok(());
+        };
+        if pin.is_some_and(|provided| secret_eq(provided, expected)) {
+            return Ok(());
+        }
+        Err(RmuxError::Server(
+            "invalid web-share pairing code".to_owned(),
+        ))
     }
 
     fn access(&self, lease: ConnectionLease, role: WebShareRole) -> WebShareAccess {
@@ -589,11 +623,16 @@ enum WebShareRole {
     Viewer,
 }
 
-fn created_output(viewer_url: &str) -> CommandOutput {
+fn created_output(viewer_url: &str, pairing_code: Option<&str>) -> CommandOutput {
     let mut output = String::new();
     output.push_str("viewer ");
     output.push_str(viewer_url);
     output.push('\n');
+    if let Some(pairing_code) = pairing_code {
+        output.push_str("pin ");
+        output.push_str(pairing_code);
+        output.push('\n');
+    }
     CommandOutput::from_stdout(output)
 }
 
@@ -629,6 +668,8 @@ fn share_url(
     share_id: &str,
     token: Option<&str>,
     role: &str,
+    pin_required: bool,
+    options: WebShareUrlOptions,
 ) -> String {
     let endpoint = websocket_endpoint(endpoint_origin);
     let key = token.unwrap_or("[REDACTED]");
@@ -640,6 +681,15 @@ fn share_url(
     if role != "viewer" {
         url.push_str("&role=");
         url.push_str(role);
+    }
+    if pin_required {
+        url.push_str("&pin=required");
+    }
+    if options.no_navbar {
+        url.push_str("&navbar=off");
+    }
+    if options.no_disclaimer {
+        url.push_str("&disclaimer=off");
     }
     url
 }
@@ -663,6 +713,17 @@ fn random_share_id() -> Result<String, RmuxError> {
         out.push(ALPHABET[index] as char);
     }
     Ok(out)
+}
+
+fn random_pairing_code() -> Result<String, RmuxError> {
+    loop {
+        let mut bytes = [0u8; 3];
+        getrandom::fill(&mut bytes).map_err(random_error)?;
+        let value = (u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]);
+        if value < 16_000_000 {
+            return Ok(format!("{:06}", value % 1_000_000));
+        }
+    }
 }
 
 fn random_token() -> Result<String, RmuxError> {

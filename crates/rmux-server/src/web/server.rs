@@ -128,7 +128,12 @@ async fn serve_websocket(
     };
     drop(pre_auth_permit);
     let mut pane = match handler
-        .open_web_share(&auth.id, &auth.key, auth.role.connect_role())
+        .open_web_share(
+            &auth.id,
+            &auth.key,
+            auth.pin.as_deref(),
+            auth.role.connect_role(),
+        )
         .await
     {
         Ok(pane) => pane,
