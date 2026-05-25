@@ -10,7 +10,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
 
-use super::origin::origin_matches;
 use super::protocol::{
     close_for_auth_error, handle_client_text, handle_operator_binary_frame, read_auth_message,
     send_output, send_ready, send_revoked, send_snapshot, PRE_AUTH_TIMEOUT, UNIFORM_AUTH_DELAY,
@@ -80,7 +79,8 @@ async fn serve_connection(
         Ok(Err(error)) => return Err(error),
         Err(_) => return Ok(()),
     };
-    if request.method != "GET" {
+    if request.method != "GET" && request.method != "HEAD" {
+        drop(pre_auth_permit);
         return write_response(
             &mut stream,
             405,
@@ -89,31 +89,10 @@ async fn serve_connection(
         )
         .await;
     }
-    if request.path == "/health" {
-        return write_response(&mut stream, 200, "text/plain; charset=utf-8", b"ok\n").await;
-    }
-    if request.path == "/" || request.path.starts_with("/s/") {
-        return write_response(
-            &mut stream,
-            200,
-            "text/html; charset=utf-8",
-            INDEX_HTML.as_bytes(),
-        )
-        .await;
-    }
-    if request.path == "/share" {
+    if request.method == "GET" && request.path == "/share" && request.is_websocket_upgrade() {
         return serve_websocket(stream, request, handler, pre_auth_permit).await;
     }
     drop(pre_auth_permit);
-    if request.path.starts_with("/ws/") {
-        return write_response(
-            &mut stream,
-            410,
-            "text/plain; charset=utf-8",
-            b"legacy web-share websocket path is gone; use /share\n",
-        )
-        .await;
-    }
     write_response(
         &mut stream,
         404,
@@ -167,7 +146,7 @@ async fn serve_websocket(
         }
     };
     if let Some(origin) = request.headers.get("origin") {
-        if !origin_matches(origin, pane.expected_origin()) {
+        if !pane.origin_allowed(origin) {
             sleep(UNIFORM_AUTH_DELAY).await;
             let _ = socket.write_close_code(4004, "origin_not_allowed").await;
             return Ok(());
@@ -302,7 +281,7 @@ fn parse_http_request(buffer: &[u8]) -> io::Result<HttpRequest> {
     }
     let method = request.method.unwrap_or_default().to_owned();
     let target = request.path.unwrap_or_default();
-    let (path, query) = split_target(target);
+    let path = path_from_target(target);
     let headers = request
         .headers
         .iter()
@@ -314,55 +293,12 @@ fn parse_http_request(buffer: &[u8]) -> io::Result<HttpRequest> {
     Ok(HttpRequest {
         method,
         path: path.to_owned(),
-        query,
         headers,
     })
 }
 
-fn split_target(target: &str) -> (&str, HashMap<String, String>) {
-    let Some((path, query)) = target.split_once('?') else {
-        return (target, HashMap::new());
-    };
-    (path, parse_query(query))
-}
-
-fn parse_query(query: &str) -> HashMap<String, String> {
-    query
-        .split('&')
-        .filter_map(|pair| {
-            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            Some((percent_decode(key)?, percent_decode(value)?))
-        })
-        .collect()
-}
-
-fn percent_decode(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => output.push(b' '),
-            b'%' if index + 2 < bytes.len() => {
-                let hi = hex_value(bytes[index + 1])?;
-                let lo = hex_value(bytes[index + 2])?;
-                output.push((hi << 4) | lo);
-                index += 2;
-            }
-            byte => output.push(byte),
-        }
-        index += 1;
-    }
-    String::from_utf8(output).ok()
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
+fn path_from_target(target: &str) -> &str {
+    target.split_once('?').map_or(target, |(path, _)| path)
 }
 
 async fn write_response(
@@ -377,7 +313,6 @@ async fn write_response(
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
-        410 => "Gone",
         431 => "Request Header Fields Too Large",
         503 => "Service Unavailable",
         _ => "Error",
@@ -400,11 +335,26 @@ async fn write_response(
 struct HttpRequest {
     method: String,
     path: String,
-    query: HashMap<String, String>,
     headers: HashMap<String, String>,
 }
 
-const INDEX_HTML: &str = include_str!("frontend/index.html");
+impl HttpRequest {
+    fn is_websocket_upgrade(&self) -> bool {
+        self.headers
+            .get("upgrade")
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+            && self
+                .headers
+                .get("connection")
+                .is_some_and(|value| has_header_token(value, "upgrade"))
+    }
+}
+
+fn has_header_token(value: &str, expected: &str) -> bool {
+    value
+        .split(',')
+        .any(|token| token.trim().eq_ignore_ascii_case(expected))
+}
 
 struct OperatorRateLimiter {
     remaining: u16,
@@ -434,20 +384,99 @@ impl OperatorRateLimiter {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_query, percent_decode, split_target};
+    use super::{path_from_target, serve_connection, HttpRequest};
+    use crate::handler::RequestHandler;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::Semaphore;
 
     #[test]
-    fn query_parser_decodes_key_values() {
-        let query = parse_query("key=a%2Fb+c&empty=");
-        assert_eq!(query.get("key").map(String::as_str), Some("a/b c"));
-        assert_eq!(query.get("empty").map(String::as_str), Some(""));
+    fn websocket_upgrade_requires_upgrade_token() {
+        let request = request_with_headers([
+            ("upgrade", "websocket"),
+            ("connection", "keep-alive, Upgrade"),
+        ]);
+        assert!(request.is_websocket_upgrade());
+
+        let request = request_with_headers([("upgrade", "websocket"), ("connection", "close")]);
+        assert!(!request.is_websocket_upgrade());
     }
 
     #[test]
-    fn target_split_preserves_path_without_query() {
-        let (path, query) = split_target("/ws/share");
-        assert_eq!(path, "/ws/share");
-        assert!(query.is_empty());
-        assert_eq!(percent_decode("a%20b").as_deref(), Some("a b"));
+    fn target_path_ignores_query_for_routing() {
+        assert_eq!(path_from_target("/share?ignored=true"), "/share");
+        assert_eq!(path_from_target("/assets/app.js"), "/assets/app.js");
+    }
+
+    #[tokio::test]
+    async fn non_websocket_http_paths_return_404() {
+        for target in ["/", "/assets/app.js", "/index.html"] {
+            let response =
+                response_for(format!("GET {target} HTTP/1.1\r\nHost: local\r\n\r\n")).await;
+            assert!(
+                response.starts_with("HTTP/1.1 404 Not Found"),
+                "{target}: {response}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_get_head_methods_return_405() {
+        let response = response_for("POST /share HTTP/1.1\r\nHost: local\r\n\r\n").await;
+        assert!(response.starts_with("HTTP/1.1 405 Method Not Allowed"));
+    }
+
+    #[tokio::test]
+    async fn share_websocket_upgrade_returns_101() {
+        let request = concat!(
+            "GET /share HTTP/1.1\r\n",
+            "Host: local\r\n",
+            "Connection: Upgrade\r\n",
+            "Upgrade: websocket\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "\r\n"
+        );
+        let response = response_for(request).await;
+        assert!(response.starts_with("HTTP/1.1 101 Switching Protocols"));
+    }
+
+    fn request_with_headers<const N: usize>(headers: [(&str, &str); N]) -> HttpRequest {
+        HttpRequest {
+            method: "GET".to_owned(),
+            path: "/share".to_owned(),
+            headers: headers
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value.to_owned()))
+                .collect::<HashMap<_, _>>(),
+        }
+    }
+
+    async fn response_for(request: impl AsRef<[u8]>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let client = TcpStream::connect(addr);
+        let server = listener.accept();
+        let (client, server) = tokio::join!(client, server);
+        let mut client = client.expect("client connects");
+        let (server, _) = server.expect("server accepts");
+        let task = tokio::spawn(serve_connection(
+            server,
+            Arc::new(RequestHandler::new()),
+            Arc::new(Semaphore::new(16)),
+        ));
+
+        client
+            .write_all(request.as_ref())
+            .await
+            .expect("write request");
+        let mut buffer = [0u8; 4096];
+        let read = client.read(&mut buffer).await.expect("read response");
+        drop(client);
+        let _ = task.await.expect("connection task joins");
+        String::from_utf8_lossy(&buffer[..read]).into_owned()
     }
 }

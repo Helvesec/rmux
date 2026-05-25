@@ -50,7 +50,7 @@ impl<'a> WebShareBuilder<'a> {
         self
     }
 
-    /// Sets the public origin used when generating browser URLs.
+    /// Sets the public WS origin used by the hosted frontend.
     #[must_use]
     pub fn public_url(mut self, url: impl Into<String>) -> Self {
         self.public_base_url = Some(url.into());
@@ -304,7 +304,7 @@ pub struct WebConfigInfo {
     pub host: String,
     /// Listener port.
     pub port: u16,
-    /// Origin used by the embedded frontend.
+    /// Origin used by the web-share frontend.
     pub frontend_origin: String,
 }
 

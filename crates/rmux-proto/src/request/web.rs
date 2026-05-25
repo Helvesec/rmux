@@ -24,7 +24,7 @@ pub enum WebShareRequest {
 pub struct CreateWebShareRequest {
     /// The exact pane slot or stable pane id to expose.
     pub target: PaneTargetRef,
-    /// Optional caller-facing base URL for generated links.
+    /// Optional public WS origin forwarded to the daemon.
     #[serde(default)]
     pub public_base_url: Option<String>,
     /// Optional maximum share lifetime in seconds.

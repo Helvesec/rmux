@@ -19,7 +19,7 @@ use rmux_proto::{
 };
 use tokio::time::sleep;
 
-const COMMAND_SURFACE_COUNT: usize = 78;
+const COMMAND_SURFACE_COUNT: usize = 79;
 const INTERNAL_REQUEST_COMMANDS: [&str; 37] = [
     "attach-session-ext",
     "attach-session-ext2",
@@ -138,6 +138,7 @@ const COMMAND_SURFACE: [&str; COMMAND_SURFACE_COUNT] = [
     "rename-session",
     "list-sessions",
     "list-panes",
+    "web-share",
 ];
 
 #[test]

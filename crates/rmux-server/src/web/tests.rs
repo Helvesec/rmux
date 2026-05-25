@@ -69,10 +69,68 @@ fn create_returns_secret_urls_but_list_is_redacted() {
     assert_eq!(
         redacted,
         format!(
-            "https://share.example/#endpoint=wss://share.example/share&id={}&key=[REDACTED]&role=viewer",
+            "https://share.rmux.io/#endpoint=wss://share.example/share&id={}&key=[REDACTED]",
             created.share_id
         )
     );
+}
+
+#[test]
+fn default_local_share_uses_hosted_frontend_and_local_websocket_endpoint() {
+    let registry = WebShareRegistry::default();
+    let created = registry
+        .create(CreateWebShareRequest {
+            target: target(),
+            public_base_url: None,
+            ttl_seconds: Some(60),
+            max_viewers: Some(2),
+            writable: false,
+        })
+        .expect("share creates");
+
+    assert!(created
+        .viewer_url
+        .starts_with("https://share.rmux.io/#endpoint=ws://127.0.0.1:9777/share&id="));
+    assert!(!created.viewer_url.contains("&role=viewer"));
+
+    let viewer_key = key_from_url(&created.viewer_url);
+    let access = registry
+        .connect(&created.share_id, &viewer_key, WebShareConnectRole::Viewer)
+        .expect("viewer connects");
+    assert!(access.origin_allowed("https://share.rmux.io"));
+    assert!(access.origin_allowed("http://localhost:4321"));
+    assert!(access.origin_allowed("http://127.0.0.1:5173"));
+    assert!(!access.origin_allowed("https://evil.example"));
+}
+
+#[test]
+fn frontend_override_changes_browser_origin_without_changing_local_endpoint() {
+    let registry = WebShareRegistry::new(
+        crate::web::WebShareSettings::from_options(
+            9778,
+            Some("https://share.fork.example".to_owned()),
+        )
+        .expect("settings"),
+    );
+    let created = registry
+        .create(CreateWebShareRequest {
+            target: target(),
+            public_base_url: None,
+            ttl_seconds: Some(60),
+            max_viewers: Some(2),
+            writable: false,
+        })
+        .expect("share creates");
+
+    assert!(created
+        .viewer_url
+        .starts_with("https://share.fork.example/#endpoint=ws://127.0.0.1:9778/share&id="));
+    let viewer_key = key_from_url(&created.viewer_url);
+    let access = registry
+        .connect(&created.share_id, &viewer_key, WebShareConnectRole::Viewer)
+        .expect("viewer connects");
+    assert!(access.origin_allowed("https://share.fork.example"));
+    assert!(!access.origin_allowed("https://share.rmux.io"));
 }
 
 #[test]

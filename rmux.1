@@ -198,3 +198,13 @@ and
 .B unlink-window
 ship in the public CLI surface with tmux-style shared window links across
 sessions, including linked-window format variables and hook context.
+.PP
+.B web-share
+local mode opens
+.B https://share.rmux.io
+against
+.B ws://127.0.0.1:<port>/share .
+It requires a browser that treats
+.B 127.0.0.1
+as a secure context. Tested on Chrome 130, Firefox 132, Safari 18, and
+Edge 130. In-app webviews are not guaranteed.

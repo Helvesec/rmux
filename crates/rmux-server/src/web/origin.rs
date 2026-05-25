@@ -10,6 +10,15 @@ pub(crate) fn origin_matches(received: &str, expected: &str) -> bool {
     secret_eq(received.as_bytes(), expected.as_bytes())
 }
 
+pub(crate) fn origin_allowed(
+    received: &str,
+    expected: &str,
+    allow_loopback_development: bool,
+) -> bool {
+    origin_matches(received, expected)
+        || allow_loopback_development && is_loopback_development_origin(received)
+}
+
 pub(crate) fn validate_public_base_url(value: &str) -> Result<String, RmuxError> {
     let trimmed = value.trim();
     let Some(origin) = normalize_origin(trimmed) else {
@@ -28,6 +37,17 @@ pub(crate) fn validate_public_base_url(value: &str) -> Result<String, RmuxError>
         ));
     }
     Ok(trimmed.to_owned())
+}
+
+fn is_loopback_development_origin(value: &str) -> bool {
+    let Some(origin) = normalize_origin(value) else {
+        return false;
+    };
+    let Some(rest) = origin.strip_prefix("http://") else {
+        return false;
+    };
+    let host = rest.split_once(':').map(|(host, _)| host).unwrap_or(rest);
+    is_loopback_host(host)
 }
 
 fn normalize_origin(value: &str) -> Option<String> {
@@ -125,7 +145,7 @@ fn secret_eq(left: &[u8], right: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{origin_matches, validate_public_base_url};
+    use super::{origin_allowed, origin_matches, validate_public_base_url};
 
     #[test]
     fn origin_matrix_matches_security_contract() {
@@ -200,5 +220,34 @@ mod tests {
         assert!(validate_public_base_url("http://127.0.0.1:9777").is_ok());
         assert!(validate_public_base_url("https://share.example.com").is_ok());
         assert!(validate_public_base_url("https://share.example.com/path").is_err());
+    }
+
+    #[test]
+    fn local_mode_allows_loopback_development_origins_in_addition_to_frontend() {
+        assert!(origin_allowed(
+            "https://share.rmux.io",
+            "https://share.rmux.io",
+            true
+        ));
+        assert!(origin_allowed(
+            "http://localhost:4321",
+            "https://share.rmux.io",
+            true
+        ));
+        assert!(origin_allowed(
+            "http://127.0.0.1:5173",
+            "https://share.rmux.io",
+            true
+        ));
+        assert!(!origin_allowed(
+            "http://localhost:4321",
+            "https://share.rmux.io",
+            false
+        ));
+        assert!(!origin_allowed(
+            "https://localhost:4321",
+            "https://share.rmux.io",
+            true
+        ));
     }
 }

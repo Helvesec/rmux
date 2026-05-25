@@ -636,9 +636,11 @@ fn cross_section_responses() -> Vec<Response> {
                 listener: WebShareListener {
                     host: "127.0.0.1".to_owned(),
                     port: 9777,
-                    frontend_origin: "http://127.0.0.1:9777".to_owned(),
+                    frontend_origin: "https://share.rmux.io".to_owned(),
                 },
-                output: rmux_proto::CommandOutput::from_stdout("127.0.0.1:9777\n"),
+                output: rmux_proto::CommandOutput::from_stdout(
+                    "127.0.0.1:9777 https://share.rmux.io\n",
+                ),
             },
         )),
     ]

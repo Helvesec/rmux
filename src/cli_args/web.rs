@@ -7,6 +7,9 @@ pub(crate) fn parse_web_share_args(arguments: Vec<String>) -> Result<WebShareArg
 }
 
 #[derive(Debug, Clone, Args)]
+#[command(
+    after_help = "Local web-share mode opens https://share.rmux.io against ws://127.0.0.1:<port>/share. It requires a browser that treats 127.0.0.1 as a secure context. Tested on: Chrome 130, Firefox 132, Safari 18, Edge 130. In-app webviews are not guaranteed."
+)]
 #[command(group(
     ArgGroup::new("mode")
         .required(false)

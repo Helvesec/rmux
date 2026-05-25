@@ -15,9 +15,9 @@ use tokio::sync::watch;
 use tracing::info;
 
 use super::leases::{ConnectionLease, LeaseBook};
-use super::origin::validate_public_base_url;
+use super::origin::{origin_allowed, validate_public_base_url};
 
-const DEFAULT_FRONTEND_ORIGIN: &str = "http://127.0.0.1:9777";
+const DEFAULT_FRONTEND_ORIGIN: &str = "https://share.rmux.io";
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_MAX_VIEWERS: u16 = 5;
 const DEFAULT_PORT: u16 = 9777;
@@ -82,7 +82,7 @@ impl WebShareRegistry {
                 "web-share requires at least one viewer slot".to_owned(),
             ));
         }
-        let base_url = self.public_base_url(request.public_base_url.as_deref())?;
+        let endpoint_origin = self.endpoint_origin(request.public_base_url.as_deref())?;
         let share_id = self.next_share_id()?;
         let viewer_token = random_token()?;
         let operator_token = request.writable.then(random_token).transpose()?;
@@ -97,8 +97,10 @@ impl WebShareRegistry {
         let (revoke_tx, _) = watch::channel(None);
 
         let record = WebShareRecord {
-            base_url,
+            allow_loopback_development_origins: request.public_base_url.is_none(),
+            endpoint_origin,
             expires_at,
+            frontend_origin: self.settings.frontend_origin.clone(),
             lease_book,
             max_viewers,
             operator_token: operator_token.clone(),
@@ -251,10 +253,10 @@ impl WebShareRegistry {
         )))
     }
 
-    fn public_base_url(&self, requested: Option<&str>) -> Result<String, RmuxError> {
+    fn endpoint_origin(&self, requested: Option<&str>) -> Result<String, RmuxError> {
         match requested {
             Some(value) => validate_public_base_url(value),
-            None => Ok(self.settings.frontend_origin.clone()),
+            None => Ok(self.settings.local_endpoint_origin()),
         }
     }
 }
@@ -283,7 +285,7 @@ impl WebShareSettings {
     ) -> Result<Self, RmuxError> {
         let frontend_origin = match frontend_origin {
             Some(value) => validate_public_base_url(&value)?,
-            None => format!("http://{DEFAULT_HOST}:{port}"),
+            None => DEFAULT_FRONTEND_ORIGIN.to_owned(),
         };
         Ok(Self {
             host: DEFAULT_HOST.to_owned(),
@@ -298,6 +300,10 @@ impl WebShareSettings {
             port: self.port,
             frontend_origin: self.frontend_origin.clone(),
         }
+    }
+
+    fn local_endpoint_origin(&self) -> String {
+        format!("http://{}:{}", self.host, self.port)
     }
 }
 
@@ -362,8 +368,10 @@ impl WebShareState {
 
 #[derive(Debug)]
 struct WebShareRecord {
-    base_url: String,
+    allow_loopback_development_origins: bool,
+    endpoint_origin: String,
     expires_at: Option<SystemTime>,
+    frontend_origin: String,
     lease_book: Arc<LeaseBook>,
     max_viewers: u16,
     operator_token: Option<String>,
@@ -377,7 +385,8 @@ struct WebShareRecord {
 impl WebShareRecord {
     fn viewer_url(&self) -> String {
         share_url(
-            &self.base_url,
+            &self.frontend_origin,
+            &self.endpoint_origin,
             &self.share_id,
             Some(&self.viewer_token),
             "viewer",
@@ -385,13 +394,25 @@ impl WebShareRecord {
     }
 
     fn redacted_viewer_url(&self) -> String {
-        share_url(&self.base_url, &self.share_id, None, "viewer")
+        share_url(
+            &self.frontend_origin,
+            &self.endpoint_origin,
+            &self.share_id,
+            None,
+            "viewer",
+        )
     }
 
     fn operator_url(&self) -> Option<String> {
-        self.operator_token
-            .as_deref()
-            .map(|token| share_url(&self.base_url, &self.share_id, Some(token), "operator"))
+        self.operator_token.as_deref().map(|token| {
+            share_url(
+                &self.frontend_origin,
+                &self.endpoint_origin,
+                &self.share_id,
+                Some(token),
+                "operator",
+            )
+        })
     }
 
     fn summary(&self) -> WebShareSummary {
@@ -445,7 +466,8 @@ impl WebShareRecord {
 
     fn access(&self, lease: ConnectionLease, role: WebShareRole) -> WebShareAccess {
         WebShareAccess {
-            expected_origin: self.base_url.clone(),
+            allow_loopback_development_origins: self.allow_loopback_development_origins,
+            expected_origin: self.frontend_origin.clone(),
             expires_at: self.expires_at,
             _lease: Some(lease),
             role,
@@ -486,6 +508,7 @@ impl WebShareRevokeReason {
 
 #[derive(Debug)]
 pub(crate) struct WebShareAccess {
+    allow_loopback_development_origins: bool,
     expected_origin: String,
     expires_at: Option<SystemTime>,
     _lease: Option<ConnectionLease>,
@@ -495,8 +518,12 @@ pub(crate) struct WebShareAccess {
 }
 
 impl WebShareAccess {
-    pub(crate) fn expected_origin(&self) -> &str {
-        &self.expected_origin
+    pub(crate) fn origin_allowed(&self, received: &str) -> bool {
+        origin_allowed(
+            received,
+            &self.expected_origin,
+            self.allow_loopback_development_origins,
+        )
     }
 
     pub(crate) fn is_operator(&self) -> bool {
@@ -572,10 +599,21 @@ fn stopped_output(share_id: &str, stopped: bool) -> CommandOutput {
     CommandOutput::from_stdout(format!("{status} {share_id}\n"))
 }
 
-fn share_url(base_url: &str, share_id: &str, token: Option<&str>, role: &str) -> String {
-    let endpoint = websocket_endpoint(base_url);
+fn share_url(
+    frontend_origin: &str,
+    endpoint_origin: &str,
+    share_id: &str,
+    token: Option<&str>,
+    role: &str,
+) -> String {
+    let endpoint = websocket_endpoint(endpoint_origin);
     let key = token.unwrap_or("[REDACTED]");
-    format!("{base_url}/#endpoint={endpoint}&id={share_id}&key={key}&role={role}")
+    let mut url = format!("{frontend_origin}/#endpoint={endpoint}&id={share_id}&key={key}");
+    if role != "viewer" {
+        url.push_str("&role=");
+        url.push_str(role);
+    }
+    url
 }
 
 fn websocket_endpoint(base_url: &str) -> String {
@@ -607,14 +645,6 @@ fn random_token() -> Result<String, RmuxError> {
 
 fn random_error(error: getrandom::Error) -> RmuxError {
     RmuxError::Server(format!("failed to create web-share secret: {error}"))
-}
-
-#[allow(dead_code)]
-fn legacy_share_url(base_url: &str, share_id: &str, token: Option<&str>) -> String {
-    match token {
-        Some(token) => format!("{base_url}/s/{share_id}?key={token}"),
-        None => format!("{base_url}/s/{share_id}"),
-    }
 }
 
 fn secret_eq(left: &str, right: &str) -> bool {

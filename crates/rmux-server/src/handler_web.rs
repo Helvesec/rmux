@@ -18,8 +18,8 @@ pub(crate) struct WebPaneStream {
 }
 
 impl WebPaneStream {
-    pub(crate) fn expected_origin(&self) -> &str {
-        self._access.expected_origin()
+    pub(crate) fn origin_allowed(&self, received: &str) -> bool {
+        self._access.origin_allowed(received)
     }
 
     pub(crate) fn is_operator(&self) -> bool {
