@@ -1,6 +1,10 @@
 use clap::{ArgAction, ArgGroup, Args};
 
-use super::{parse_target_spec, TargetSpec};
+use super::{parse_command_args, parse_target_spec, TargetSpec};
+
+pub(crate) fn parse_web_share_args(arguments: Vec<String>) -> Result<WebShareArgs, clap::Error> {
+    parse_command_args("web-share", normalize_web_share_args(arguments))
+}
 
 #[derive(Debug, Clone, Args)]
 #[command(group(
@@ -30,4 +34,36 @@ pub(crate) struct WebShareArgs {
     pub(crate) max_viewers: Option<u16>,
     #[arg(long = "public-url", value_name = "url")]
     pub(crate) public_base_url: Option<String>,
+}
+
+fn normalize_web_share_args(arguments: Vec<String>) -> Vec<String> {
+    let Some((command, rest)) = arguments.split_first() else {
+        return arguments;
+    };
+    match command.as_str() {
+        "list" => prefixed("-l", rest),
+        "stop" => normalize_stop(rest),
+        "config" => prefixed("--config", rest),
+        "lookup" => prefixed("--lookup", rest),
+        _ => arguments,
+    }
+}
+
+fn normalize_stop(rest: &[String]) -> Vec<String> {
+    match rest.split_first() {
+        Some((target, tail)) if target == "all" => prefixed("-X", tail),
+        Some((target, tail)) => {
+            let mut normalized = vec!["-K".to_owned(), target.clone()];
+            normalized.extend_from_slice(tail);
+            normalized
+        }
+        None => vec!["-K".to_owned()],
+    }
+}
+
+fn prefixed(flag: &str, rest: &[String]) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(rest.len() + 1);
+    normalized.push(flag.to_owned());
+    normalized.extend_from_slice(rest);
+    normalized
 }

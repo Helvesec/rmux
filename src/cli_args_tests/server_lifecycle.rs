@@ -51,6 +51,27 @@ fn start_server_accepts_web_listener_flags() {
 }
 
 #[test]
+fn web_share_accepts_subcommand_style_lifecycle_forms() {
+    let cli = parse_args(&["web-share", "list"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert!(args.list);
+
+    let cli = parse_args(&["web-share", "stop", "abc12345"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert_eq!(args.stop.as_deref(), Some("abc12345"));
+
+    let cli = parse_args(&["web-share", "stop", "all"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert!(args.stop_all);
+}
+
+#[test]
 fn kill_server_parses_without_arguments() {
     let cli = parse_args(&["kill-server"]).unwrap();
 
