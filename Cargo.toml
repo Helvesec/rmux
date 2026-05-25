@@ -56,6 +56,7 @@ include = [
 [dependencies]
 clap = { version = "=4.5.39", features = ["derive"] }
 libc = "0.2"
+qrcode = { version = "0.14", default-features = false }
 rmux-client = { path = "crates/rmux-client", version = "0.3.0" }
 rmux-core = { path = "crates/rmux-core", version = "0.3.0" }
 rmux-os = { path = "crates/rmux-os", version = "0.3.0" }
