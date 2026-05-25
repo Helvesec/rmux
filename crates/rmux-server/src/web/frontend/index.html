@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rmux share</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #111315;
+      --panel: #181b1f;
+      --text: #e8eaed;
+      --muted: #9aa4af;
+      --accent: #43c59e;
+      --border: #2c333a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    header {
+      height: 42px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 14px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+    }
+    #status { color: var(--muted); font-size: 12px; }
+    #terminal {
+      margin: 0;
+      padding: 14px;
+      min-height: calc(100vh - 42px);
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      outline: none;
+      font-size: 13px;
+      line-height: 1.35;
+      tab-size: 8;
+    }
+    #terminal[data-writable="true"] { caret-color: var(--accent); }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>rmux</strong>
+    <span id="status">connecting</span>
+  </header>
+  <pre id="terminal" tabindex="0"></pre>
+  <script>
+    const statusEl = document.getElementById("status");
+    const terminal = document.getElementById("terminal");
+    const params = new URLSearchParams(window.location.search);
+    const key = params.get("key") || "";
+    const shareId = window.location.pathname.split("/").filter(Boolean).pop() || "";
+    const socketUrl = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/${encodeURIComponent(shareId)}?key=${encodeURIComponent(key)}`;
+    const decoder = new TextDecoder();
+    let writable = false;
+    let socket;
+
+    function connect() {
+      socket = new WebSocket(socketUrl);
+      socket.addEventListener("open", () => {
+        statusEl.textContent = "connected";
+        terminal.focus();
+      });
+      socket.addEventListener("close", () => {
+        statusEl.textContent = "closed";
+      });
+      socket.addEventListener("error", () => {
+        statusEl.textContent = "error";
+      });
+      socket.addEventListener("message", event => {
+        const message = JSON.parse(event.data);
+        if (message.type === "snapshot") {
+          writable = Boolean(message.writable);
+          terminal.dataset.writable = String(writable);
+          terminal.textContent = message.snapshot.lines.join("\n");
+          statusEl.textContent = writable ? "operator" : "viewer";
+        } else if (message.type === "output") {
+          const bytes = Uint8Array.from(atob(message.data), c => c.charCodeAt(0));
+          terminal.textContent += decoder.decode(bytes, { stream: true });
+          window.scrollTo(0, document.body.scrollHeight);
+        } else if (message.type === "resync") {
+          statusEl.textContent = "resync";
+        }
+      });
+    }
+
+    terminal.addEventListener("keydown", event => {
+      if (!writable || socket.readyState !== WebSocket.OPEN) return;
+      if (event.key.length === 1) {
+        socket.send(JSON.stringify({ type: "input", text: event.key }));
+        event.preventDefault();
+      } else if (event.key === "Enter") {
+        socket.send(JSON.stringify({ type: "input", text: "\n" }));
+        event.preventDefault();
+      } else if (event.key === "Backspace") {
+        socket.send(JSON.stringify({ type: "input", text: "\u007f" }));
+        event.preventDefault();
+      }
+    });
+
+    connect();
+  </script>
+</body>
+</html>

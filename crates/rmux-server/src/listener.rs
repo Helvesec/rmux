@@ -39,6 +39,8 @@ pub(crate) async fn serve(
     handler.install_shutdown_handle(shutdown_handle.clone());
     handler.set_socket_path(&socket_path);
     handler.load_startup_config(options.config_load).await;
+    #[cfg(all(any(unix, windows), feature = "web"))]
+    crate::web::spawn(Arc::clone(&handler));
     let (connection_shutdown, connection_shutdown_rx) = watch::channel(());
     let mut connection_tasks = JoinSet::new();
     let hook_handler = Arc::clone(&handler);

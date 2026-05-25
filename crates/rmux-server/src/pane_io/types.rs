@@ -436,6 +436,17 @@ impl PaneOutputSender {
         }
     }
 
+    #[cfg_attr(not(all(any(unix, windows), feature = "web")), allow(dead_code))]
+    pub(crate) fn capture_with_next_sequence<T>(&self, capture: impl FnOnce() -> T) -> (u64, T) {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .expect("pane output state mutex must not be poisoned");
+        let captured = capture();
+        (state.next_sequence(), captured)
+    }
+
     pub(crate) fn clear_retained(&self) {
         self.inner
             .state

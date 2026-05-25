@@ -1,10 +1,48 @@
-use rmux_proto::{CreateWebShareRequest, ErrorResponse, PaneTargetRef, Response, WebShareRequest};
+use rmux_proto::{
+    CreateWebShareRequest, ErrorResponse, PaneInputRequest, PaneResizeRequest, PaneTargetRef,
+    ResizePaneAdjustment, Response, RmuxError, WebShareRequest,
+};
 
 use super::pane_support::resolve_pane_target_ref;
 use super::RequestHandler;
+use crate::pane_io::PaneOutputReceiver;
 use crate::pane_terminal_lookup::pane_id_for_target;
+use crate::web::WebShareAccess;
+
+pub(crate) struct WebPaneStream {
+    _access: WebShareAccess,
+    pub(crate) output: PaneOutputReceiver,
+    pub(crate) snapshot: WebPaneSnapshot,
+    target: PaneTargetRef,
+}
+
+impl WebPaneStream {
+    pub(crate) fn expected_origin(&self) -> &str {
+        self._access.expected_origin()
+    }
+
+    pub(crate) fn is_operator(&self) -> bool {
+        self._access.is_operator()
+    }
+
+    pub(crate) fn target(&self) -> &PaneTargetRef {
+        &self.target
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct WebPaneSnapshot {
+    pub(crate) cols: u16,
+    pub(crate) rows: u16,
+    pub(crate) output_sequence: u64,
+    pub(crate) lines: Vec<String>,
+}
 
 impl RequestHandler {
+    pub(crate) fn web_listener(&self) -> rmux_proto::WebShareListener {
+        self.web_shares.listener()
+    }
+
     pub(in crate::handler) async fn handle_web_share(&self, request: WebShareRequest) -> Response {
         let request = match self.resolve_web_share_targets(request).await {
             Ok(request) => request,
@@ -14,6 +52,91 @@ impl RequestHandler {
             Ok(response) => Response::WebShare(response),
             Err(error) => Response::Error(ErrorResponse { error }),
         }
+    }
+
+    pub(crate) async fn open_web_share(
+        &self,
+        share_id: &str,
+        key: &str,
+    ) -> Result<WebPaneStream, RmuxError> {
+        let access = self.web_shares.connect(share_id, key)?;
+        let target = self.stable_web_target(access.target()).await?;
+        let (snapshot, output) = self.web_resnapshot(&target).await?;
+        Ok(WebPaneStream {
+            _access: access,
+            output,
+            snapshot,
+            target,
+        })
+    }
+
+    pub(crate) async fn web_resnapshot(
+        &self,
+        target: &PaneTargetRef,
+    ) -> Result<(WebPaneSnapshot, PaneOutputReceiver), RmuxError> {
+        let (pane_output, transcript) = {
+            let state = self.state.lock().await;
+            let target = resolve_pane_target_ref(&state, target)?;
+            let pane_output = state.pane_output_for_target(
+                target.session_name(),
+                target.window_index(),
+                target.pane_index(),
+            )?;
+            let transcript = state.transcript_handle(&target)?;
+            (pane_output, transcript)
+        };
+        let (output_sequence, snapshot) = pane_output.capture_with_next_sequence(|| {
+            let transcript = transcript
+                .lock()
+                .expect("pane transcript mutex must not be poisoned");
+            let screen = transcript.clone_screen();
+            let size = screen.size();
+            WebPaneSnapshot {
+                cols: size.cols,
+                rows: size.rows,
+                output_sequence: 0,
+                lines: snapshot_lines(&screen),
+            }
+        });
+        let snapshot = WebPaneSnapshot {
+            output_sequence,
+            ..snapshot
+        };
+        let output = pane_output.subscribe_from_sequence(output_sequence);
+        Ok((snapshot, output))
+    }
+
+    pub(crate) async fn web_send_text(
+        &self,
+        target: &PaneTargetRef,
+        text: String,
+    ) -> Result<(), RmuxError> {
+        let response = self
+            .handle_pane_input_ref(PaneInputRequest {
+                target: target.clone(),
+                keys: vec![text],
+                literal: true,
+            })
+            .await;
+        response_to_result(response)
+    }
+
+    pub(crate) async fn web_resize(
+        &self,
+        target: &PaneTargetRef,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), RmuxError> {
+        let response = self
+            .handle_pane_resize_ref(PaneResizeRequest {
+                target: target.clone(),
+                adjustment: ResizePaneAdjustment::AbsoluteSize {
+                    columns: cols,
+                    rows,
+                },
+            })
+            .await;
+        response_to_result(response)
     }
 
     async fn resolve_web_share_targets(
@@ -40,6 +163,45 @@ impl RequestHandler {
         )?;
         request.target = PaneTargetRef::by_id(target.session_name().clone(), pane_id);
         Ok(WebShareRequest::Create(request))
+    }
+
+    async fn stable_web_target(&self, target: &PaneTargetRef) -> Result<PaneTargetRef, RmuxError> {
+        let state = self.state.lock().await;
+        let target = resolve_pane_target_ref(&state, target)?;
+        let pane_id = pane_id_for_target(
+            &state.sessions,
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+        )?;
+        Ok(PaneTargetRef::by_id(target.session_name().clone(), pane_id))
+    }
+}
+
+fn snapshot_lines(screen: &rmux_core::Screen) -> Vec<String> {
+    let size = screen.size();
+    let cols = usize::from(size.cols);
+    let rows = usize::from(size.rows);
+    let history_size = screen.history_size();
+    let mut lines = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let mut line = String::new();
+        if let Some(view) = screen.absolute_line_view(history_size + row) {
+            for cell in view.cells().iter().take(cols) {
+                if !cell.is_padding() {
+                    line.push_str(cell.text());
+                }
+            }
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+fn response_to_result(response: Response) -> Result<(), RmuxError> {
+    match response {
+        Response::Error(error) => Err(error.error),
+        _ => Ok(()),
     }
 }
 

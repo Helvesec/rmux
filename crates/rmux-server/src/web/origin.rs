@@ -1,0 +1,204 @@
+use rmux_proto::RmuxError;
+
+pub(crate) fn origin_matches(received: &str, expected: &str) -> bool {
+    let Some(received) = normalize_origin(received) else {
+        return false;
+    };
+    let Some(expected) = normalize_origin(expected) else {
+        return false;
+    };
+    secret_eq(received.as_bytes(), expected.as_bytes())
+}
+
+pub(crate) fn validate_public_base_url(value: &str) -> Result<String, RmuxError> {
+    let trimmed = value.trim();
+    let Some(origin) = normalize_origin(trimmed) else {
+        return Err(RmuxError::Server(
+            "web-share public URL must be an ASCII origin without path, query, or fragment"
+                .to_owned(),
+        ));
+    };
+    let (scheme, rest) = origin
+        .split_once("://")
+        .expect("normalized origin must contain scheme separator");
+    let host = rest.split_once(':').map(|(host, _)| host).unwrap_or(rest);
+    if scheme == "http" && !is_loopback_host(host) {
+        return Err(RmuxError::Server(
+            "web-share public URL must use https:// outside localhost".to_owned(),
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn normalize_origin(value: &str) -> Option<String> {
+    if !value.is_ascii() || value.contains('/') && !value.contains("://") {
+        return None;
+    }
+    let lowered = value.trim().to_ascii_lowercase();
+    let (scheme, authority) = lowered.split_once("://")?;
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    if authority.is_empty()
+        || authority.contains('/')
+        || authority.contains('?')
+        || authority.contains('#')
+        || authority.contains('@')
+    {
+        return None;
+    }
+    let (host, port) = parse_authority(authority, scheme)?;
+    if host.starts_with("xn--") || host.contains(".xn--") || !valid_host(&host) {
+        return None;
+    }
+    if scheme == "http" && !is_loopback_host(&host) {
+        return None;
+    }
+    Some(format!("{scheme}://{host}:{port}"))
+}
+
+fn parse_authority(authority: &str, scheme: &str) -> Option<(String, u16)> {
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, raw_port))
+            if !raw_port.is_empty() && raw_port.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            let port = raw_port.parse::<u16>().ok()?;
+            (host, port)
+        }
+        Some(_) => return None,
+        None => (authority, default_port(scheme)),
+    };
+    Some((host.to_owned(), port))
+}
+
+fn default_port(scheme: &str) -> u16 {
+    match scheme {
+        "http" => 80,
+        "https" => 443,
+        _ => unreachable!("scheme is validated before default_port"),
+    }
+}
+
+fn valid_host(host: &str) -> bool {
+    if is_loopback_host(host) {
+        return true;
+    }
+    if host.len() > 253 || host.starts_with('.') || host.ends_with('.') {
+        return false;
+    }
+    host.split('.').all(valid_dns_label)
+}
+
+fn valid_dns_label(label: &str) -> bool {
+    if label.is_empty() || label.len() > 63 {
+        return false;
+    }
+    let bytes = label.as_bytes();
+    let Some(first) = bytes.first() else {
+        return false;
+    };
+    let Some(last) = bytes.last() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() || !last.is_ascii_alphanumeric() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost")
+}
+
+fn secret_eq(left: &[u8], right: &[u8]) -> bool {
+    let max = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for index in 0..max {
+        let a = left.get(index).copied().unwrap_or(0);
+        let b = right.get(index).copied().unwrap_or(0);
+        diff |= usize::from(a ^ b);
+    }
+    diff == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{origin_matches, validate_public_base_url};
+
+    #[test]
+    fn origin_matrix_matches_security_contract() {
+        let cases = [
+            (
+                "https://share.example.com",
+                "https://share.example.com",
+                true,
+            ),
+            (
+                "https://SHARE.example.com",
+                "https://share.example.com",
+                true,
+            ),
+            (
+                "https://share.example.com:443",
+                "https://share.example.com",
+                true,
+            ),
+            (
+                "https://share.example.com/",
+                "https://share.example.com",
+                false,
+            ),
+            (
+                "https://share.example.com/foo",
+                "https://share.example.com",
+                false,
+            ),
+            (
+                "https://share.example.com?x=1",
+                "https://share.example.com",
+                false,
+            ),
+            (
+                "http://share.example.com",
+                "https://share.example.com",
+                false,
+            ),
+            (
+                "https://share.example.com.evil.com",
+                "https://share.example.com",
+                false,
+            ),
+            ("https://xn--n3h.com", "https://snow.example", false),
+            (
+                "https://user@share.example.com",
+                "https://share.example.com",
+                false,
+            ),
+            (
+                "https://share..example.com",
+                "https://share.example.com",
+                false,
+            ),
+            ("http://localhost:9777", "http://localhost:9777", true),
+            ("http://127.0.0.1:9777", "http://127.0.0.1:9777", true),
+            ("http://192.168.1.5", "http://192.168.1.5", false),
+        ];
+        for (received, expected, accepted) in cases {
+            assert_eq!(
+                origin_matches(received, expected),
+                accepted,
+                "{received} against {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_base_url_rejects_non_loopback_http() {
+        assert!(validate_public_base_url("http://share.example.com").is_err());
+        assert!(validate_public_base_url("http://127.0.0.1:9777").is_ok());
+        assert!(validate_public_base_url("https://share.example.com").is_ok());
+        assert!(validate_public_base_url("https://share.example.com/path").is_err());
+    }
+}
