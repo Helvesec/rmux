@@ -8,7 +8,7 @@ pub(crate) fn parse_web_share_args(arguments: Vec<String>) -> Result<WebShareArg
 
 #[derive(Debug, Clone, Args)]
 #[command(
-    after_help = "Local web-share mode opens https://share.rmux.io/share/ against ws://127.0.0.1:<port>/share. It requires a browser that allows public-origin access to loopback WebSockets. Chromium-based browsers may block this under Local Network Access; allow Local Network access for share.rmux.io, use Firefox/Safari, or run a localhost-hosted frontend with --web-frontend. In-app webviews are not guaranteed."
+    after_help = "Local web-share mode opens https://share.rmux.io/share/ against ws://127.0.0.1:<port>/share. It requires a browser that allows public-origin access to loopback WS connections. Chromium-based browsers may block this under Local Network Access; allow Local Network access for share.rmux.io, use Firefox/Safari, or run a localhost-hosted frontend with --web-frontend. In-app webviews are not guaranteed."
 )]
 #[command(group(
     ArgGroup::new("mode")
