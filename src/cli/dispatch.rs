@@ -99,7 +99,7 @@ fn dispatch(
         Command::NewSession(args) => {
             run_new_session(args, socket_path, command_startup, client_terminal)
         }
-        Command::StartServer => run_start_server(socket_path, command_startup),
+        Command::StartServer(_) => run_start_server(socket_path, command_startup),
         Command::KillServer => run_kill_server(socket_path),
         Command::HasSession(args) => run_has_session(args, socket_path),
         Command::KillSession(args) => run_kill_session(args, socket_path),
@@ -533,7 +533,7 @@ pub(super) fn command_has_start_server_flag(command: &Command) -> bool {
     matches!(
         command,
         Command::NewSession(_)
-            | Command::StartServer
+            | Command::StartServer(_)
             | Command::AttachSession(_)
             | Command::WebShare(_)
             | Command::SourceFile(_)

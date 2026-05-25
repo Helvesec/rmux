@@ -4,7 +4,7 @@ use rmux_client::AutoStartConfig;
 use rmux_server::{DaemonConfig, ServerDaemon};
 use tokio::runtime::Builder;
 
-use crate::cli_args::{Cli, ConfigFileSelection};
+use crate::cli_args::{Cli, Command, ConfigFileSelection, StartServerArgs};
 
 use super::ExitFailure;
 
@@ -34,6 +34,8 @@ impl StartupOptions {
 pub(super) struct StartupConfig {
     pub(super) server: ServerStartupConfig,
     pub(super) auto_start: AutoStartConfig,
+    pub(super) web_frontend: Option<String>,
+    pub(super) web_port: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,7 +53,8 @@ pub(super) enum ServerStartupConfig {
 
 pub(super) fn startup_config_from_cli(cli: &Cli) -> StartupConfig {
     let cwd = std::env::current_dir().ok();
-    match cli.config_file_selection() {
+    let web = start_server_web_args(cli.command.as_ref());
+    let mut config = match cli.config_file_selection() {
         ConfigFileSelection::Default => {
             let quiet = true;
             StartupConfig {
@@ -60,6 +63,8 @@ pub(super) fn startup_config_from_cli(cli: &Cli) -> StartupConfig {
                     cwd: cwd.clone(),
                 },
                 auto_start: AutoStartConfig::default_files(quiet, cwd),
+                web_frontend: web.web_frontend.clone(),
+                web_port: web.web_port,
             }
         }
         ConfigFileSelection::Custom(files) => {
@@ -72,9 +77,33 @@ pub(super) fn startup_config_from_cli(cli: &Cli) -> StartupConfig {
                     cwd: cwd.clone(),
                 },
                 auto_start: AutoStartConfig::custom_files(files, quiet, cwd),
+                web_frontend: web.web_frontend.clone(),
+                web_port: web.web_port,
             }
         }
+    };
+    config.auto_start = apply_web_auto_start_config(config.auto_start, &web);
+    config
+}
+
+fn start_server_web_args(command: Option<&Command>) -> StartServerArgs {
+    match command {
+        Some(Command::StartServer(args)) => args.clone(),
+        _ => StartServerArgs::default(),
     }
+}
+
+fn apply_web_auto_start_config(
+    mut config: AutoStartConfig,
+    args: &StartServerArgs,
+) -> AutoStartConfig {
+    if let Some(port) = args.web_port {
+        config = config.with_web_port(port);
+    }
+    if let Some(frontend) = &args.web_frontend {
+        config = config.with_web_frontend(frontend.clone());
+    }
+    config
 }
 
 fn apply_server_startup_config(
@@ -91,13 +120,27 @@ fn apply_server_startup_config(
     }
 }
 
+fn apply_web_daemon_config(config: DaemonConfig, startup: &StartupConfig) -> DaemonConfig {
+    let config = match startup.web_port {
+        Some(port) => config.with_web_port(port),
+        None => config,
+    };
+    match &startup.web_frontend {
+        Some(frontend) => config.with_web_frontend(frontend.clone()),
+        None => config,
+    }
+}
+
 pub(super) fn run_foreground_server(
     socket_path: &Path,
     startup_config: &StartupConfig,
 ) -> Result<i32, ExitFailure> {
-    let config = apply_server_startup_config(
-        DaemonConfig::new(socket_path.to_path_buf()),
-        &startup_config.server,
+    let config = apply_web_daemon_config(
+        apply_server_startup_config(
+            DaemonConfig::new(socket_path.to_path_buf()),
+            &startup_config.server,
+        ),
+        startup_config,
     );
     let runtime = Builder::new_current_thread()
         .enable_all()

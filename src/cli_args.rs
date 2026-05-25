@@ -303,7 +303,7 @@ where
 #[derive(Debug, Clone)]
 pub(crate) enum Command {
     NewSession(NewSessionArgs),
-    StartServer,
+    StartServer(StartServerArgs),
     KillServer,
     HasSession(SessionTargetArgs),
     KillSession(KillSessionArgs),
@@ -400,6 +400,14 @@ pub(crate) enum Command {
 pub(crate) struct UnsupportedCommandArgs {
     pub(crate) name: String,
     pub(crate) arguments: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Args)]
+pub(crate) struct StartServerArgs {
+    #[arg(long = "web-port", value_name = "port")]
+    pub(crate) web_port: Option<u16>,
+    #[arg(long = "web-frontend", value_name = "url")]
+    pub(crate) web_frontend: Option<String>,
 }
 
 trait QueuedCommand {

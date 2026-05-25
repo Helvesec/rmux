@@ -49,6 +49,8 @@ pub struct AutoStartConfig {
     selection: AutoStartConfigSelection,
     quiet: bool,
     cwd: Option<PathBuf>,
+    web_frontend: Option<String>,
+    web_port: Option<u16>,
 }
 
 impl AutoStartConfig {
@@ -59,6 +61,8 @@ impl AutoStartConfig {
             selection: AutoStartConfigSelection::Disabled,
             quiet: true,
             cwd: None,
+            web_frontend: None,
+            web_port: None,
         }
     }
 
@@ -69,6 +73,8 @@ impl AutoStartConfig {
             selection: AutoStartConfigSelection::Default,
             quiet,
             cwd,
+            web_frontend: None,
+            web_port: None,
         }
     }
 
@@ -79,7 +85,23 @@ impl AutoStartConfig {
             selection: AutoStartConfigSelection::Files(files),
             quiet,
             cwd,
+            web_frontend: None,
+            web_port: None,
         }
+    }
+
+    /// Overrides the web-share listener port for a newly auto-started daemon.
+    #[must_use]
+    pub const fn with_web_port(mut self, port: u16) -> Self {
+        self.web_port = Some(port);
+        self
+    }
+
+    /// Overrides the frontend origin used by newly auto-started web shares.
+    #[must_use]
+    pub fn with_web_frontend(mut self, frontend: String) -> Self {
+        self.web_frontend = Some(frontend);
+        self
     }
 
     #[cfg(not(windows))]
@@ -105,6 +127,12 @@ impl AutoStartConfig {
         }
         if let Some(cwd) = &self.cwd {
             command.arg("--config-cwd").arg(cwd);
+        }
+        if let Some(port) = self.web_port {
+            command.arg("--web-port").arg(port.to_string());
+        }
+        if let Some(frontend) = &self.web_frontend {
+            command.arg("--web-frontend").arg(frontend);
         }
     }
 }

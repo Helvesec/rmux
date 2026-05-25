@@ -269,7 +269,7 @@ mod tests {
     };
     use crate::cli_args::{
         parse as parse_cli, parse_target_spec, AttachSessionArgs, Command, ListSessionsArgs,
-        NewWindowArgs,
+        NewWindowArgs, StartServerArgs,
     };
     use std::ffi::OsString;
     use std::fs;
@@ -348,7 +348,9 @@ mod tests {
     #[test]
     fn start_server_inventory_matches_supported_frozen_commands() {
         assert!(command_has_start_server_flag(&default_client_command()));
-        assert!(command_has_start_server_flag(&Command::StartServer));
+        assert!(command_has_start_server_flag(&Command::StartServer(
+            StartServerArgs::default()
+        )));
         assert!(command_has_start_server_flag(&Command::AttachSession(
             AttachSessionArgs {
                 detach_other_clients: false,

@@ -235,6 +235,21 @@ impl Default for WebShareSettings {
 }
 
 impl WebShareSettings {
+    pub(crate) fn from_options(
+        port: u16,
+        frontend_origin: Option<String>,
+    ) -> Result<Self, RmuxError> {
+        let frontend_origin = match frontend_origin {
+            Some(value) => validate_public_base_url(&value)?,
+            None => format!("http://{DEFAULT_HOST}:{port}"),
+        };
+        Ok(Self {
+            host: DEFAULT_HOST.to_owned(),
+            port,
+            frontend_origin,
+        })
+    }
+
     fn listener(&self) -> WebShareListener {
         WebShareListener {
             host: self.host.clone(),

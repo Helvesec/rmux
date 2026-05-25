@@ -19,7 +19,7 @@ fn start_server_parses_without_arguments() {
 
     assert!(matches!(
         cli.command,
-        Some(super::super::Command::StartServer)
+        Some(super::super::Command::StartServer(_))
     ));
 }
 
@@ -27,6 +27,27 @@ fn start_server_parses_without_arguments() {
 fn start_server_rejects_extra_arguments() {
     let error = parse_args(&["start-server", "extra"]).unwrap_err();
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+}
+
+#[test]
+fn start_server_accepts_web_listener_flags() {
+    let cli = parse_args(&[
+        "start-server",
+        "--web-port",
+        "9778",
+        "--web-frontend",
+        "https://share.example.com",
+    ])
+    .unwrap();
+
+    let Some(super::super::Command::StartServer(args)) = cli.command else {
+        panic!("expected start-server command");
+    };
+    assert_eq!(args.web_port, Some(9778));
+    assert_eq!(
+        args.web_frontend.as_deref(),
+        Some("https://share.example.com")
+    );
 }
 
 #[test]

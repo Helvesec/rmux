@@ -37,6 +37,7 @@ use crate::unix_socket::{
 
 #[cfg(all(test, unix))]
 const FALLBACK_SOCKET_ROOT: &str = "/tmp";
+const DEFAULT_WEB_PORT: u16 = 9777;
 
 /// Computes the default RMUX daemon socket path.
 ///
@@ -72,6 +73,8 @@ pub struct DaemonConfig {
     socket_path: PathBuf,
     config_load: ConfigLoadOptions,
     subscription_limits: SubscriptionLimits,
+    web_frontend: Option<String>,
+    web_port: u16,
 }
 
 impl DaemonConfig {
@@ -82,6 +85,8 @@ impl DaemonConfig {
             socket_path,
             config_load: ConfigLoadOptions::disabled(),
             subscription_limits: SubscriptionLimits::default(),
+            web_frontend: None,
+            web_port: DEFAULT_WEB_PORT,
         }
     }
 
@@ -108,6 +113,18 @@ impl DaemonConfig {
         self.subscription_limits
     }
 
+    /// Returns the configured web-share listener port.
+    #[must_use]
+    pub const fn web_port(&self) -> u16 {
+        self.web_port
+    }
+
+    /// Returns the optional external web-share frontend origin.
+    #[must_use]
+    pub fn web_frontend(&self) -> Option<&str> {
+        self.web_frontend.as_deref()
+    }
+
     /// Enables RMUX default startup config loading.
     #[must_use]
     pub fn with_default_config_load(mut self, quiet: bool, cwd: Option<PathBuf>) -> Self {
@@ -123,6 +140,20 @@ impl DaemonConfig {
     #[must_use]
     pub fn with_subscription_limits(mut self, subscription_limits: SubscriptionLimits) -> Self {
         self.subscription_limits = subscription_limits;
+        self
+    }
+
+    /// Overrides the web-share listener port.
+    #[must_use]
+    pub const fn with_web_port(mut self, port: u16) -> Self {
+        self.web_port = port;
+        self
+    }
+
+    /// Overrides the frontend origin used in generated web-share URLs.
+    #[must_use]
+    pub fn with_web_frontend(mut self, frontend: String) -> Self {
+        self.web_frontend = Some(frontend);
         self
     }
 
@@ -244,6 +275,10 @@ impl ServerDaemon {
                 self.config.subscription_limits(),
                 owner_uid,
             )
+            .with_web_options(
+                self.config.web_port(),
+                self.config.web_frontend().map(str::to_owned),
+            )
             .with_socket_identity(bound_listener.identity)
             .with_server_signals(server_signal_rx);
 
@@ -274,6 +309,10 @@ impl ServerDaemon {
                 self.config.config_load().clone(),
                 self.config.subscription_limits(),
                 owner_uid,
+            )
+            .with_web_options(
+                self.config.web_port(),
+                self.config.web_frontend().map(str::to_owned),
             );
 
             let task = tokio::spawn(listener::serve(

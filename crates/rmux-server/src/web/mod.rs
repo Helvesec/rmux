@@ -7,7 +7,7 @@ mod registry;
 mod server;
 mod websocket;
 
-pub(crate) use registry::{WebShareAccess, WebShareRegistry};
+pub(crate) use registry::{WebShareAccess, WebShareRegistry, WebShareSettings};
 pub(crate) use server::spawn;
 
 #[cfg(test)]

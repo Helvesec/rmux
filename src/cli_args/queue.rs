@@ -114,10 +114,7 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
     let arguments = command_arguments_for_clap(command.arguments());
     match name.as_str() {
         "new-session" => parse_command_args("new-session", arguments).map(Command::NewSession),
-        "start-server" => {
-            parse_no_args("start-server", arguments)?;
-            Ok(Command::StartServer)
-        }
+        "start-server" => parse_command_args("start-server", arguments).map(Command::StartServer),
         "kill-server" => {
             parse_no_args("kill-server", arguments)?;
             Ok(Command::KillServer)

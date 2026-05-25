@@ -319,6 +319,7 @@ impl RequestHandler {
         )
     }
 
+    #[cfg_attr(all(any(unix, windows), feature = "web"), allow(dead_code))]
     pub(crate) fn with_owner_uid_and_subscription_limits(
         owner_uid: u32,
         subscription_limits: SubscriptionLimits,
@@ -328,6 +329,21 @@ impl RequestHandler {
             Some(current_process_environment_snapshot()),
             subscription_limits,
         )
+    }
+
+    #[cfg(all(any(unix, windows), feature = "web"))]
+    pub(crate) fn with_owner_uid_subscription_limits_and_web_settings(
+        owner_uid: u32,
+        subscription_limits: SubscriptionLimits,
+        web_settings: crate::web::WebShareSettings,
+    ) -> Self {
+        let mut handler = Self::with_owner_uid_and_environment(
+            owner_uid,
+            Some(current_process_environment_snapshot()),
+            subscription_limits,
+        );
+        handler.web_shares = Arc::new(WebShareRegistry::new(web_settings));
+        handler
     }
 
     fn with_owner_uid_and_environment(
