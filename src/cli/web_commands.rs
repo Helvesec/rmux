@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::IsTerminal;
 use std::path::Path;
 
@@ -14,7 +15,7 @@ use super::{
     resolve_pane_target_spec, terminal_theme::capture_terminal_palette, write_command_output,
     ExitFailure, StartupOptions,
 };
-use crate::cli_args::{WebShareArgs, WebShareTerminalThemeArg};
+use crate::cli_args::{parse_target_spec, TargetSpec, WebShareArgs, WebShareTerminalThemeArg};
 
 pub(super) fn run_web_share(
     args: WebShareArgs,
@@ -67,7 +68,8 @@ fn viewer_qr_output(viewer_url: &str) -> CommandOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::viewer_qr_output;
+    use super::{viewer_qr_output, web_share_pane_lookup_target};
+    use crate::cli_args::parse_target_spec;
 
     #[test]
     fn viewer_qr_uses_compact_unicode_blocks() {
@@ -79,6 +81,22 @@ mod tests {
         assert!(!qr.contains('#'));
         assert!(qr.contains('\u{2580}') || qr.contains('\u{2584}') || qr.contains('\u{2588}'));
         assert!(qr.lines().count() < 40);
+    }
+
+    #[test]
+    fn web_share_session_target_resolves_through_active_pane_lookup() {
+        let target = parse_target_spec("webdemo").expect("session target should parse");
+        let lookup = web_share_pane_lookup_target(&target).expect("lookup target");
+
+        assert_eq!(lookup.raw(), "webdemo:");
+    }
+
+    #[test]
+    fn web_share_pane_target_stays_exact() {
+        let target = parse_target_spec("webdemo:1.2").expect("pane target should parse");
+        let lookup = web_share_pane_lookup_target(&target).expect("lookup target");
+
+        assert_eq!(lookup.raw(), "webdemo:1.2");
     }
 }
 
@@ -102,10 +120,7 @@ fn build_web_share_request(
         return Ok(WebShareRequest::Config(WebShareConfigRequest));
     }
 
-    let target = match args.target.as_ref() {
-        Some(target) => resolve_pane_target_spec(connection, target)?,
-        None => resolve_current_pane_target(connection, "web-share")?,
-    };
+    let target = resolve_web_share_target(connection, args.target.as_ref())?;
     let terminal_theme = args.terminal_theme.map(web_terminal_theme);
     let terminal_palette = match terminal_theme {
         Some(WebTerminalTheme::Light | WebTerminalTheme::Dark) => None,
@@ -126,6 +141,29 @@ fn build_web_share_request(
         terminal_palette,
         writable: args.writable,
     }))
+}
+
+fn resolve_web_share_target(
+    connection: &mut rmux_client::Connection,
+    target: Option<&TargetSpec>,
+) -> Result<rmux_proto::PaneTarget, ExitFailure> {
+    match target {
+        Some(target) => {
+            let lookup = web_share_pane_lookup_target(target)?;
+            resolve_pane_target_spec(connection, lookup.as_ref())
+        }
+        None => resolve_current_pane_target(connection, "web-share"),
+    }
+}
+
+fn web_share_pane_lookup_target(target: &TargetSpec) -> Result<Cow<'_, TargetSpec>, ExitFailure> {
+    let Some(rmux_proto::Target::Session(session_name)) = target.exact() else {
+        return Ok(Cow::Borrowed(target));
+    };
+
+    parse_target_spec(&format!("{session_name}:"))
+        .map(Cow::Owned)
+        .map_err(|error| ExitFailure::new(1, error))
 }
 
 const fn web_terminal_theme(value: WebShareTerminalThemeArg) -> WebTerminalTheme {
