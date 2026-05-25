@@ -353,7 +353,7 @@ async fn serve_session_loop(
                 return Ok(());
             }
             _ = alive_tick.tick() => {
-                if !handler.web_session_alive(session.session_name()).await {
+                if !handler.web_session_alive(session.target()).await {
                     notify_revoked_and_close(&mut socket, WebShareRevokeReason::SessionGone).await?;
                     return Ok(());
                 }

@@ -9,8 +9,8 @@ mod server;
 mod settings;
 mod websocket;
 
-pub(crate) use record::{WebShareAccess, WebShareRevokeReason};
-pub(crate) use registry::WebShareRegistry;
+pub(crate) use record::{WebSessionTarget, WebShareAccess, WebShareRevokeReason, WebShareTarget};
+pub(crate) use registry::{ResolvedCreateWebShareRequest, WebShareRegistry};
 pub(crate) use server::spawn;
 pub(crate) use settings::WebShareSettings;
 

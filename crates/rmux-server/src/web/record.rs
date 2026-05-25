@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmux_proto::{
-    RmuxError, WebShareScope, WebShareSummary, WebShareUrlOptions, WebTerminalPalette,
+    PaneTargetRef, RmuxError, SessionId, SessionName, WebShareScope, WebShareSummary,
+    WebShareUrlOptions, WebTerminalPalette,
 };
 use tokio::sync::watch;
 
@@ -24,7 +25,7 @@ pub(super) struct WebShareRecord {
     pub(super) revoke_tx: watch::Sender<Option<WebShareRevokeReason>>,
     pub(super) controls: bool,
     pub(super) share_id: String,
-    pub(super) scope: WebShareScope,
+    pub(super) target: WebShareTarget,
     pub(super) terminal_palette: Option<WebTerminalPalette>,
     pub(super) url_options: WebShareUrlOptions,
     pub(super) read_token_hash: SecretHash,
@@ -49,7 +50,7 @@ impl WebShareRecord {
     pub(super) fn summary(&self) -> WebShareSummary {
         WebShareSummary {
             share_id: self.share_id.clone(),
-            scope: self.scope.clone(),
+            scope: self.target.scope(),
             read_url: Some(self.redacted_read_url()),
             writable: self.writable,
             controls: self.controls,
@@ -127,10 +128,49 @@ impl WebShareRecord {
             role,
             share_id: self.share_id.clone(),
             revoke_rx: self.revoke_tx.subscribe(),
-            scope: self.scope.clone(),
+            target: self.target.clone(),
             controls: self.controls,
             terminal_palette: self.terminal_palette.clone(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WebShareTarget {
+    Pane(PaneTargetRef),
+    Session(WebSessionTarget),
+}
+
+impl WebShareTarget {
+    pub(crate) fn pane(target: PaneTargetRef) -> Self {
+        Self::Pane(target)
+    }
+
+    pub(crate) fn session(name: SessionName, id: SessionId) -> Self {
+        Self::Session(WebSessionTarget { name, id })
+    }
+
+    pub(crate) fn scope(&self) -> WebShareScope {
+        match self {
+            Self::Pane(target) => WebShareScope::Pane(target.clone()),
+            Self::Session(target) => WebShareScope::Session(target.name.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WebSessionTarget {
+    name: SessionName,
+    id: SessionId,
+}
+
+impl WebSessionTarget {
+    pub(crate) fn name(&self) -> &SessionName {
+        &self.name
+    }
+
+    pub(crate) const fn id(&self) -> SessionId {
+        self.id
     }
 }
 
@@ -168,7 +208,7 @@ pub(crate) struct WebShareAccess {
     revoke_rx: watch::Receiver<Option<WebShareRevokeReason>>,
     role: WebShareRole,
     share_id: String,
-    scope: WebShareScope,
+    target: WebShareTarget,
     controls: bool,
     terminal_palette: Option<WebTerminalPalette>,
 }
@@ -222,8 +262,8 @@ impl WebShareAccess {
         }
     }
 
-    pub(crate) fn scope(&self) -> &WebShareScope {
-        &self.scope
+    pub(crate) fn target(&self) -> &WebShareTarget {
+        &self.target
     }
 
     pub(crate) fn terminal_palette(&self) -> Option<&WebTerminalPalette> {
@@ -267,11 +307,7 @@ fn share_url(record: &WebShareRecord, token: Option<&str>) -> String {
         record.frontend_url.starts_with(&record.frontend_origin),
         "frontend URL must belong to its expected origin"
     );
-    let mut url = if record.allow_loopback_development_origins {
-        format!("{}/#t={token}", record.frontend_url)
-    } else {
-        format!("{}/#e={endpoint}&t={token}", record.frontend_url)
-    };
+    let mut url = format!("{}/#endpoint={endpoint}&token={token}", record.frontend_url);
     if record.pairing_code.is_some() {
         url.push_str("&pin=required");
     }

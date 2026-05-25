@@ -19,6 +19,7 @@ use super::leases::LeaseBook;
 use super::origin::{validate_frontend_url, validate_public_base_url, FrontendUrl};
 use super::record::{
     system_time_to_unix, WebShareAccess, WebShareConnectRole, WebShareRecord, WebShareRevokeReason,
+    WebShareTarget,
 };
 use super::secrets::{
     random_pairing_code, random_share_id, random_token, valid_token_shape, SecretHash,
@@ -28,6 +29,31 @@ use super::settings::WebShareSettings;
 const DEFAULT_MAX_READERS: u16 = 5;
 const DEFAULT_TTL_SECONDS: u64 = 60 * 60;
 const MAX_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+#[derive(Debug)]
+pub(crate) struct ResolvedCreateWebShareRequest {
+    request: CreateWebShareRequest,
+    target: WebShareTarget,
+}
+
+impl ResolvedCreateWebShareRequest {
+    pub(crate) fn new(request: CreateWebShareRequest, target: WebShareTarget) -> Self {
+        Self { request, target }
+    }
+}
+
+#[cfg(test)]
+impl From<CreateWebShareRequest> for ResolvedCreateWebShareRequest {
+    fn from(request: CreateWebShareRequest) -> Self {
+        let target = match &request.scope {
+            rmux_proto::WebShareScope::Pane(target) => WebShareTarget::pane(target.clone()),
+            rmux_proto::WebShareScope::Session(name) => {
+                WebShareTarget::session(name.clone(), rmux_proto::SessionId::new(0))
+            }
+        };
+        Self { request, target }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct WebShareRegistry {
@@ -58,9 +84,9 @@ impl WebShareRegistry {
         request: rmux_proto::WebShareRequest,
     ) -> Result<WebShareResponse, RmuxError> {
         match request {
-            rmux_proto::WebShareRequest::Create(request) => {
-                self.create(request).map(WebShareResponse::Created)
-            }
+            rmux_proto::WebShareRequest::Create(_) => Err(RmuxError::Server(
+                "web-share create requires a resolved server target".to_owned(),
+            )),
             rmux_proto::WebShareRequest::List(request) => {
                 Ok(WebShareResponse::List(self.list(request)))
             }
@@ -81,8 +107,10 @@ impl WebShareRegistry {
 
     pub(crate) fn create(
         &self,
-        request: CreateWebShareRequest,
+        resolved: impl Into<ResolvedCreateWebShareRequest>,
     ) -> Result<WebShareCreatedResponse, RmuxError> {
+        let resolved = resolved.into();
+        let ResolvedCreateWebShareRequest { request, target } = resolved;
         self.require_listener_available()?;
         if request.controls && !request.writable {
             return Err(RmuxError::Server(
@@ -132,7 +160,7 @@ impl WebShareRegistry {
             revoke_tx,
             controls: request.controls,
             share_id: share_id.clone(),
-            scope: request.scope.clone(),
+            target: target.clone(),
             terminal_palette,
             url_options: request.url_options,
             read_token_hash,
@@ -141,7 +169,7 @@ impl WebShareRegistry {
 
         let read_url = record.read_url(&read_token);
         let operator_url = record.operator_url(operator_token.as_deref());
-        let summary_scope = record.scope.clone();
+        let summary_scope = record.target.scope();
         let expires_at_unix = expires_at.and_then(system_time_to_unix);
         self.inner
             .lock()

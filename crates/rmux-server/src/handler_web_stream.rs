@@ -2,12 +2,12 @@ use std::io;
 
 use rmux_proto::{
     encode_attach_message, AttachFrameDecoder, AttachMessage, AttachedKeystroke, PaneTargetRef,
-    SessionName, TerminalSize, WebTerminalPalette,
+    TerminalSize, WebTerminalPalette,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 
 use crate::pane_io::PaneOutputReceiver;
-use crate::web::{WebShareAccess, WebShareRevokeReason};
+use crate::web::{WebSessionTarget, WebShareAccess, WebShareRevokeReason};
 
 use super::WebPaneSnapshot;
 
@@ -29,7 +29,7 @@ pub(crate) enum WebShareStream {
 pub(crate) struct WebSessionStream {
     pub(crate) access: WebShareAccess,
     pub(crate) revoke_rx: tokio::sync::watch::Receiver<Option<WebShareRevokeReason>>,
-    pub(crate) session_name: SessionName,
+    pub(crate) target: WebSessionTarget,
     pub(crate) initial_size: TerminalSize,
     pub(crate) writer: WriteHalf<DuplexStream>,
     pub(crate) reader: Option<WebSessionAttachReader>,
@@ -141,8 +141,8 @@ impl WebSessionStream {
         self.access.release_operator()
     }
 
-    pub(crate) fn session_name(&self) -> &SessionName {
-        &self.session_name
+    pub(crate) fn target(&self) -> &WebSessionTarget {
+        &self.target
     }
 
     pub(crate) const fn initial_size(&self) -> TerminalSize {

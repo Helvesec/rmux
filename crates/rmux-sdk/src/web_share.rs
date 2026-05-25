@@ -106,7 +106,7 @@ async fn require_web_share(transport: &TransportClient) -> Result<()> {
 }
 
 fn token_from_url(url: &str) -> Option<&str> {
-    url.split_once("t=")
+    url.split_once("token=")
         .map(|(_, token)| token.split('&').next().unwrap_or(token))
 }
 
@@ -115,4 +115,22 @@ fn unexpected_response(operation: &str, response: Response) -> RmuxError {
         "rmux daemon sent `{}` response for {operation}",
         response.command_name()
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::token_from_url;
+
+    #[test]
+    fn token_from_url_reads_current_web_share_fragment_contract() {
+        let url =
+            "https://share.rmux.io/#endpoint=ws://127.0.0.1:9777/share&token=abc123&theme=dark";
+        assert_eq!(token_from_url(url), Some("abc123"));
+    }
+
+    #[test]
+    fn token_from_url_rejects_removed_legacy_short_key() {
+        let url = "https://share.rmux.io/#endpoint=ws://127.0.0.1:9777/share&t=abc123";
+        assert_eq!(token_from_url(url), None);
+    }
 }

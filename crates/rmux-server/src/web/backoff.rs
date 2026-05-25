@@ -6,6 +6,7 @@ const INITIAL_DELAY: Duration = Duration::from_millis(100);
 const MAX_DELAY: Duration = Duration::from_secs(10);
 const RESET_AFTER: Duration = Duration::from_secs(5 * 60);
 const GC_AFTER: Duration = Duration::from_secs(10 * 60);
+const MAX_BACKOFF_ENTRIES: usize = 4096;
 
 #[derive(Debug, Default)]
 pub(super) struct AuthBackoff {
@@ -33,7 +34,7 @@ impl AuthBackoff {
     pub(super) fn delay_before_next_attempt(&self, share_id: &str) -> Duration {
         let now = Instant::now();
         let mut entries = self.entries.lock().expect("backoff mutex poisoned");
-        entries.retain(|_, entry| now.duration_since(entry.last_attempt_at) <= GC_AFTER);
+        retain_recent_entries(&mut entries, now);
 
         let Some(entry) = entries.get(share_id) else {
             return Duration::ZERO;
@@ -55,6 +56,10 @@ impl AuthBackoff {
     pub(super) fn record_failure(&self, share_id: &str) -> AuthBackoffFailure {
         let now = Instant::now();
         let mut entries = self.entries.lock().expect("backoff mutex poisoned");
+        retain_recent_entries(&mut entries, now);
+        if !entries.contains_key(share_id) && entries.len() >= MAX_BACKOFF_ENTRIES {
+            evict_oldest_entry(&mut entries);
+        }
         let entry = entries
             .entry(share_id.to_owned())
             .or_insert_with(|| BackoffEntry {
@@ -75,9 +80,23 @@ impl AuthBackoff {
     }
 }
 
+fn retain_recent_entries(entries: &mut HashMap<String, BackoffEntry>, now: Instant) {
+    entries.retain(|_, entry| now.duration_since(entry.last_attempt_at) <= GC_AFTER);
+}
+
+fn evict_oldest_entry(entries: &mut HashMap<String, BackoffEntry>) {
+    if let Some(oldest_key) = entries
+        .iter()
+        .min_by_key(|(_, entry)| entry.last_attempt_at)
+        .map(|(share_id, _)| share_id.clone())
+    {
+        entries.remove(&oldest_key);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::AuthBackoff;
+    use super::{AuthBackoff, MAX_BACKOFF_ENTRIES};
     use std::time::Duration;
 
     #[test]
@@ -134,5 +153,18 @@ mod tests {
         backoff.record_failure("nonexistent");
         backoff.record_failure("nonexistent");
         assert!(backoff.delay_before_next_attempt("nonexistent") > Duration::from_millis(50));
+    }
+
+    #[test]
+    fn failure_table_evicts_old_entries_at_capacity() {
+        let backoff = AuthBackoff::new();
+        for index in 0..(MAX_BACKOFF_ENTRIES + 128) {
+            backoff.record_failure(&format!("share-{index}"));
+        }
+
+        let entries = backoff.entries.lock().expect("backoff mutex poisoned");
+        assert!(entries.len() <= MAX_BACKOFF_ENTRIES);
+        assert!(!entries.contains_key("share-0"));
+        assert!(entries.contains_key(&format!("share-{}", MAX_BACKOFF_ENTRIES + 127)));
     }
 }

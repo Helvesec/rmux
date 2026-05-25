@@ -29,6 +29,7 @@ mod wire;
 
 #[cfg(any(unix, windows))]
 use crate::renderer::PaneRenderDelta;
+#[cfg(all(any(unix, windows), feature = "web"))]
 pub(crate) use attach_transport::in_process_attach_pair;
 use attach_transport::{AttachTransport, TryAttachRead};
 #[cfg(any(unix, windows))]

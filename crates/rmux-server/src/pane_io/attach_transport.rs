@@ -2,14 +2,15 @@ use std::io;
 
 use rmux_ipc::{is_peer_disconnect, LocalStream};
 use rmux_proto::AttachFrameDecoder;
-use tokio::io::{
-    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf,
-};
+#[cfg(feature = "web")]
+use tokio::io::DuplexStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
 const ATTACH_READ_BUFFER_SIZE: usize = 8192;
 const ATTACH_CHANNEL_CAPACITY: usize = 32;
+#[cfg(feature = "web")]
 const IN_PROCESS_ATTACH_BUFFER_SIZE: usize = 64 * 1024;
 
 pub(crate) struct AttachTransport {
@@ -117,6 +118,7 @@ impl From<LocalStream> for AttachTransport {
     }
 }
 
+#[cfg(feature = "web")]
 pub(crate) fn in_process_attach_pair() -> (AttachTransport, DuplexStream) {
     let (client, server) = tokio::io::duplex(IN_PROCESS_ATTACH_BUFFER_SIZE);
     (AttachTransport::from_io(server), client)
@@ -140,7 +142,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "web"))]
 mod tests {
     use rmux_proto::{encode_attach_message, AttachFrameDecoder, AttachMessage};
 

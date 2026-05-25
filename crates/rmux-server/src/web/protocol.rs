@@ -15,6 +15,9 @@ use crate::handler::{
 pub(crate) const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const UNIFORM_AUTH_DELAY: Duration = Duration::from_millis(50);
 
+pub(crate) const WEB_SHARE_PROTOCOL_VERSION: u16 = 2;
+const SERVER_CAPABILITIES: &[&str] = &["token-auth", "operator-release-ack", "terminal-palette-v1"];
+const REQUIRED_CLIENT_CAPABILITY: &str = "token-auth";
 const OPERATOR_INPUT_FRAME_MAX: usize = 4 * 1024;
 const WS_OUTPUT_RAW: u8 = 0x01;
 const WS_RESIZE_NOTIFY: u8 = 0x02;
@@ -44,6 +47,16 @@ pub(crate) async fn read_auth_message(
         serde_json::from_str::<AuthWireMessage>(&text).map_err(|_| (4006, "invalid_auth_json"))?;
     if wire.kind != "auth" {
         return Err((4006, "first_frame_must_auth"));
+    }
+    if wire.protocol_version != WEB_SHARE_PROTOCOL_VERSION {
+        return Err((4006, "protocol_version_mismatch"));
+    }
+    if !wire
+        .capabilities
+        .iter()
+        .any(|capability| capability == REQUIRED_CLIENT_CAPABILITY)
+    {
+        return Err((4006, "missing_token_auth_capability"));
     }
     if wire.token.is_empty() {
         return Err((4000, "invalid_auth"));
@@ -115,7 +128,7 @@ pub(crate) async fn handle_session_client_text(
             if session_logout_allowed(session.is_operator(), session.controls()) =>
         {
             handler
-                .web_session_logout(session.session_name())
+                .web_session_logout(session.target())
                 .await
                 .map_err(|error| io::Error::other(error.to_string()))?;
             socket.write_close_code(1000, "session_closed").await
@@ -228,6 +241,8 @@ pub(crate) async fn send_ready(socket: &mut WebSocket, share: &WebShareStream) -
         WebShareStream::Session(_) => "session",
     };
     let payload = ServerMessage::Ready {
+        protocol_version: WEB_SHARE_PROTOCOL_VERSION,
+        capabilities: SERVER_CAPABILITIES,
         pane_size,
         scope,
         role: share.role(),
@@ -279,7 +294,7 @@ async fn send_session_text(
         return Ok(());
     };
     handler
-        .web_session_send_text(session.session_name(), text.to_owned())
+        .web_session_send_text(session.target(), text.to_owned())
         .await
         .map_err(|error| io::Error::other(error.to_string()))
 }
@@ -309,7 +324,7 @@ async fn send_session_key(
         return Ok(());
     };
     handler
-        .web_session_send_key(session.session_name(), key.to_owned())
+        .web_session_send_key(session.target(), key.to_owned())
         .await
         .map_err(|error| io::Error::other(error.to_string()))
 }
@@ -414,7 +429,7 @@ async fn send_released(socket: &mut WebSocket) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{session_logout_allowed, AuthWireMessage};
+    use super::{session_logout_allowed, AuthWireMessage, WEB_SHARE_PROTOCOL_VERSION};
 
     #[test]
     fn session_logout_requires_operator_controls() {
@@ -430,6 +445,22 @@ mod tests {
 
         assert!(serde_json::from_str::<AuthWireMessage>(message).is_err());
     }
+
+    #[test]
+    fn auth_wire_requires_versioned_token_capability_payload() {
+        let message = format!(
+            r#"{{"type":"auth","protocol_version":{},"capabilities":["token-auth"],"token":"t"}}"#,
+            WEB_SHARE_PROTOCOL_VERSION
+        );
+
+        let decoded = serde_json::from_str::<AuthWireMessage>(&message)
+            .expect("current auth payload decodes");
+
+        assert_eq!(decoded.kind, "auth");
+        assert_eq!(decoded.protocol_version, WEB_SHARE_PROTOCOL_VERSION);
+        assert_eq!(decoded.capabilities, ["token-auth"]);
+        assert_eq!(decoded.token, "t");
+    }
 }
 
 async fn send_binary(socket: &mut WebSocket, opcode: u8, body: &[u8]) -> io::Result<()> {
@@ -444,6 +475,8 @@ async fn send_binary(socket: &mut WebSocket, opcode: u8, body: &[u8]) -> io::Res
 struct AuthWireMessage {
     #[serde(rename = "type")]
     kind: String,
+    protocol_version: u16,
+    capabilities: Vec<String>,
     token: String,
     #[serde(default)]
     pin: Option<String>,
@@ -460,6 +493,8 @@ enum ClientMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ServerMessage<'a> {
     Ready {
+        protocol_version: u16,
+        capabilities: &'static [&'static str],
         pane_size: PaneSize,
         scope: &'a str,
         role: &'a str,

@@ -61,11 +61,13 @@ fn create_returns_secret_urls_but_list_is_redacted() {
         })
         .expect("share creates");
 
-    assert!(created.read_url.contains("#e=wss://share.example/share&t="));
+    assert!(created
+        .read_url
+        .contains("#endpoint=wss://share.example/share&token="));
     assert!(created
         .operator_url
         .as_deref()
-        .is_some_and(|url| url.contains("#e=wss://share.example/share&t=")));
+        .is_some_and(|url| url.contains("#endpoint=wss://share.example/share&token=")));
     let stdout = String::from_utf8_lossy(created.output.stdout());
     assert!(stdout.contains("read "));
     assert!(!stdout.contains("operator "));
@@ -75,7 +77,7 @@ fn create_returns_secret_urls_but_list_is_redacted() {
     let redacted = listed.shares[0].read_url.as_deref().expect("url");
     assert_eq!(
         redacted,
-        format!("https://share.rmux.io/#e=wss://share.example/share&t=[REDACTED]")
+        format!("https://share.rmux.io/#endpoint=wss://share.example/share&token=[REDACTED]")
     );
 }
 
@@ -97,7 +99,9 @@ async fn default_local_share_uses_hosted_frontend_and_local_websocket_endpoint()
         })
         .expect("share creates");
 
-    assert!(created.read_url.starts_with("https://share.rmux.io/#t="));
+    assert!(created
+        .read_url
+        .starts_with("https://share.rmux.io/#endpoint=ws://127.0.0.1:9777/share&token="));
     assert!(!created.read_url.contains("role="));
 
     let read_token = token_from_url(&created.read_url);
@@ -167,7 +171,7 @@ async fn frontend_override_changes_browser_origin_without_changing_local_endpoin
 
     assert!(created
         .read_url
-        .starts_with("https://share.fork.example/#t="));
+        .starts_with("https://share.fork.example/#endpoint=ws://127.0.0.1:9778/share&token="));
     let read_token = token_from_url(&created.read_url);
     let access = registry
         .connect(&read_token, None)
@@ -195,9 +199,9 @@ async fn per_share_frontend_url_overrides_daemon_default() {
         })
         .expect("share creates");
 
-    assert!(created
-        .read_url
-        .starts_with("https://share.fork.example/share/#e=wss://terminal.example/share&t="));
+    assert!(created.read_url.starts_with(
+        "https://share.fork.example/share/#endpoint=wss://terminal.example/share&token="
+    ));
     let read_token = token_from_url(&created.read_url);
     let access = registry
         .connect(&read_token, None)
@@ -278,7 +282,7 @@ fn public_url_scheme_is_case_insensitive_for_websocket_endpoint() {
 
     assert!(created
         .read_url
-        .starts_with("https://share.rmux.io/#e=wss://terminal.example/share&t="));
+        .starts_with("https://share.rmux.io/#endpoint=wss://terminal.example/share&token="));
 }
 
 #[test]
@@ -592,7 +596,7 @@ fn target() -> PaneTargetRef {
 }
 
 fn token_from_url(url: &str) -> String {
-    url.split_once("t=")
+    url.split_once("token=")
         .map(|(_, token)| token.split('&').next().unwrap_or(token).to_owned())
         .expect("token query")
 }

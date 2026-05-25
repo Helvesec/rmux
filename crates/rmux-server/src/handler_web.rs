@@ -16,7 +16,7 @@ use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::{self, AttachControl, LiveAttachInputContext, PaneOutputReceiver};
 use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::server_access::current_owner_uid;
-use crate::web::WebShareAccess;
+use crate::web::{ResolvedCreateWebShareRequest, WebSessionTarget, WebShareAccess, WebShareTarget};
 use rmux_core::input::mode;
 
 const WEB_ATTACH_PID_BASE: u32 = 0x8000_0000;
@@ -44,11 +44,19 @@ impl RequestHandler {
     }
 
     pub(in crate::handler) async fn handle_web_share(&self, request: WebShareRequest) -> Response {
-        let request = match self.resolve_web_share_targets(request).await {
-            Ok(request) => request,
-            Err(error) => return Response::Error(ErrorResponse { error }),
+        let response = match request {
+            WebShareRequest::Create(request) => {
+                let request = match self.resolve_create_web_share(request).await {
+                    Ok(request) => request,
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                };
+                self.web_shares
+                    .create(request)
+                    .map(rmux_proto::WebShareResponse::Created)
+            }
+            other => self.web_shares.handle(other),
         };
-        match self.web_shares.handle(request) {
+        match response {
             Ok(response) => Response::WebShare(response),
             Err(error) => Response::Error(ErrorResponse { error }),
         }
@@ -60,8 +68,8 @@ impl RequestHandler {
         pin: Option<&str>,
     ) -> Result<WebShareStream, RmuxError> {
         let access = self.web_shares.connect(token, pin).await?;
-        match access.scope().clone() {
-            WebShareScope::Pane(target) => {
+        match access.target().clone() {
+            WebShareTarget::Pane(target) => {
                 let target = self.stable_web_target(&target).await?;
                 let (snapshot, output) = self.web_resnapshot(&target).await?;
                 let revoke_rx = access.revoke_receiver();
@@ -73,8 +81,8 @@ impl RequestHandler {
                     target,
                 })))
             }
-            WebShareScope::Session(session_name) => {
-                let stream = self.open_web_session_share(access, session_name).await?;
+            WebShareTarget::Session(session_target) => {
+                let stream = self.open_web_session_share(access, session_target).await?;
                 Ok(WebShareStream::Session(Box::new(stream)))
             }
         }
@@ -87,7 +95,7 @@ impl RequestHandler {
     async fn open_web_session_share(
         &self,
         access: WebShareAccess,
-        session_name: SessionName,
+        session_target: WebSessionTarget,
     ) -> Result<WebSessionStream, RmuxError> {
         let (server_transport, client_stream) = pane_io::in_process_attach_pair();
         let attach_pid = self.allocate_web_attach_pid().await?;
@@ -108,18 +116,19 @@ impl RequestHandler {
             .active_attach
             .lock()
             .await
-            .attached_count(&session_name);
+            .attached_count(session_target.name());
         let (target, initial_size) = {
             let state = self.state.lock().await;
-            let size = state
+            let session = state
                 .sessions
-                .session(&session_name)
-                .map(|session| session.window().size())
-                .ok_or_else(|| session_not_found_web(&session_name))?;
+                .session(session_target.name())
+                .filter(|session| session.id() == session_target.id())
+                .ok_or_else(|| session_not_found_web(session_target.name()))?;
+            let size = session.window().size();
             (
                 attach_target_for_session(
                     &state,
-                    &session_name,
+                    session_target.name(),
                     attached_count,
                     &terminal_context,
                 )?,
@@ -129,7 +138,7 @@ impl RequestHandler {
         let attach_id = self
             .register_attach_with_access(
                 attach_pid,
-                session_name.clone(),
+                session_target.name().clone(),
                 AttachRegistration {
                     control_tx,
                     closing: closing.clone(),
@@ -172,7 +181,7 @@ impl RequestHandler {
         Ok(WebSessionStream {
             access,
             revoke_rx,
-            session_name,
+            target: session_target,
             initial_size,
             writer,
             reader: Some(WebSessionAttachReader::new(reader)),
@@ -251,10 +260,10 @@ impl RequestHandler {
 
     pub(crate) async fn web_session_send_text(
         &self,
-        session_name: &SessionName,
+        session_target: &WebSessionTarget,
         text: String,
     ) -> Result<(), RmuxError> {
-        let target = self.web_session_active_pane(session_name).await?;
+        let target = self.web_session_active_pane(session_target).await?;
         let response = self
             .handle_pane_input_ref(PaneInputRequest {
                 target: PaneTargetRef::slot(target),
@@ -267,10 +276,10 @@ impl RequestHandler {
 
     pub(crate) async fn web_session_send_key(
         &self,
-        session_name: &SessionName,
+        session_target: &WebSessionTarget,
         key: String,
     ) -> Result<(), RmuxError> {
-        let target = self.web_session_active_pane(session_name).await?;
+        let target = self.web_session_active_pane(session_target).await?;
         let response = self
             .handle_pane_input_ref(PaneInputRequest {
                 target: PaneTargetRef::slot(target),
@@ -283,11 +292,12 @@ impl RequestHandler {
 
     pub(crate) async fn web_session_logout(
         &self,
-        session_name: &SessionName,
+        session_target: &WebSessionTarget,
     ) -> Result<(), RmuxError> {
+        self.require_web_session(session_target).await?;
         let response = self
             .handle_kill_session(KillSessionRequest {
-                target: session_name.clone(),
+                target: session_target.name().clone(),
                 kill_all_except_target: false,
                 clear_alerts: false,
             })
@@ -313,22 +323,12 @@ impl RequestHandler {
         response_to_result(response)
     }
 
-    async fn resolve_web_share_targets(
-        &self,
-        request: WebShareRequest,
-    ) -> Result<WebShareRequest, rmux_proto::RmuxError> {
-        match request {
-            WebShareRequest::Create(request) => self.resolve_create_web_share(request).await,
-            other => Ok(other),
-        }
-    }
-
     async fn resolve_create_web_share(
         &self,
-        mut request: CreateWebShareRequest,
-    ) -> Result<WebShareRequest, rmux_proto::RmuxError> {
+        request: CreateWebShareRequest,
+    ) -> Result<ResolvedCreateWebShareRequest, rmux_proto::RmuxError> {
         let state = self.state.lock().await;
-        match &request.scope {
+        let target = match &request.scope {
             WebShareScope::Pane(raw_target) => {
                 let target = resolve_pane_target_ref(&state, raw_target)?;
                 let pane_id = pane_id_for_target(
@@ -337,18 +337,17 @@ impl RequestHandler {
                     target.window_index(),
                     target.pane_index(),
                 )?;
-                request.scope = WebShareScope::Pane(PaneTargetRef::by_id(
-                    target.session_name().clone(),
-                    pane_id,
-                ));
+                WebShareTarget::pane(PaneTargetRef::by_id(target.session_name().clone(), pane_id))
             }
             WebShareScope::Session(session_name) => {
-                if state.sessions.session(session_name).is_none() {
-                    return Err(session_not_found_web(session_name));
-                }
+                let session = state
+                    .sessions
+                    .session(session_name)
+                    .ok_or_else(|| session_not_found_web(session_name))?;
+                WebShareTarget::session(session.name().clone(), session.id())
             }
-        }
-        Ok(WebShareRequest::Create(request))
+        };
+        Ok(ResolvedCreateWebShareRequest::new(request, target))
     }
 
     async fn stable_web_target(&self, target: &PaneTargetRef) -> Result<PaneTargetRef, RmuxError> {
@@ -368,25 +367,38 @@ impl RequestHandler {
         resolve_pane_target_ref(&state, target).is_ok()
     }
 
-    pub(crate) async fn web_session_alive(&self, session_name: &SessionName) -> bool {
-        let state = self.state.lock().await;
-        state.sessions.session(session_name).is_some()
+    pub(crate) async fn web_session_alive(&self, session_target: &WebSessionTarget) -> bool {
+        self.require_web_session(session_target).await.is_ok()
     }
 
     async fn web_session_active_pane(
         &self,
-        session_name: &SessionName,
+        session_target: &WebSessionTarget,
     ) -> Result<PaneTarget, RmuxError> {
         let state = self.state.lock().await;
         let session = state
             .sessions
-            .session(session_name)
-            .ok_or_else(|| session_not_found_web(session_name))?;
+            .session(session_target.name())
+            .filter(|session| session.id() == session_target.id())
+            .ok_or_else(|| session_not_found_web(session_target.name()))?;
         Ok(PaneTarget::with_window(
-            session_name.clone(),
+            session_target.name().clone(),
             session.active_window_index(),
             session.active_pane_index(),
         ))
+    }
+
+    async fn require_web_session(
+        &self,
+        session_target: &WebSessionTarget,
+    ) -> Result<(), RmuxError> {
+        let state = self.state.lock().await;
+        state
+            .sessions
+            .session(session_target.name())
+            .filter(|session| session.id() == session_target.id())
+            .map(|_| ())
+            .ok_or_else(|| session_not_found_web(session_target.name()))
     }
 
     async fn allocate_web_attach_pid(&self) -> Result<u32, RmuxError> {
@@ -424,8 +436,8 @@ fn response_to_result(response: Response) -> Result<(), RmuxError> {
 mod tests {
     use super::*;
     use rmux_proto::{
-        CreateWebShareRequest, NewSessionRequest, Request, Response, SessionName, TerminalSize,
-        WebShareScope,
+        CreateWebShareRequest, KillSessionRequest, NewSessionRequest, Request, Response,
+        SessionName, TerminalSize, WebShareScope,
     };
     use tokio::time::{timeout, Duration};
 
@@ -472,7 +484,9 @@ mod tests {
                 ..
             }) if actual == &session_name
         ));
-        assert!(created.read_url.contains("#e=wss://share.example/share&t="));
+        assert!(created
+            .read_url
+            .contains("#endpoint=wss://share.example/share&token="));
     }
 
     #[tokio::test]
@@ -528,8 +542,70 @@ mod tests {
         assert!(!bytes.is_empty());
     }
 
+    #[tokio::test]
+    async fn web_session_share_rejects_recreated_session_with_same_name() {
+        let handler = RequestHandler::new();
+        let session_name = SessionName::new("websession").expect("valid session");
+        let created = handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session_name.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(created, Response::NewSession(_)));
+
+        let response = handler
+            .handle(Request::WebShare(WebShareRequest::Create(
+                CreateWebShareRequest {
+                    scope: WebShareScope::Session(session_name.clone()),
+                    public_base_url: Some("https://share.example".to_owned()),
+                    frontend_url: None,
+                    ttl_seconds: None,
+                    max_readers: Some(1),
+                    url_options: Default::default(),
+                    require_pin: false,
+                    terminal_palette: None,
+                    writable: true,
+                    controls: true,
+                },
+            )))
+            .await;
+        let Response::WebShare(rmux_proto::WebShareResponse::Created(created)) = response else {
+            panic!("expected created web-share response");
+        };
+        let operator_token = token_from_url(created.operator_url.as_deref().expect("operator URL"));
+
+        let killed = handler
+            .handle(Request::KillSession(KillSessionRequest {
+                target: session_name.clone(),
+                kill_all_except_target: false,
+                clear_alerts: false,
+            }))
+            .await;
+        assert!(matches!(killed, Response::KillSession(_)));
+
+        let recreated = handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session_name.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(recreated, Response::NewSession(_)));
+
+        let error = handler
+            .open_web_share(&operator_token, None)
+            .await
+            .err()
+            .expect("old share must not attach to a recreated session");
+        assert!(error.to_string().contains("can't find session"));
+    }
+
     fn token_from_url(url: &str) -> String {
-        url.split_once("t=")
+        url.split_once("token=")
             .map(|(_, token)| token.split('&').next().unwrap_or(token).to_owned())
             .expect("URL contains access token")
     }
