@@ -50,7 +50,7 @@ fn create_returns_secret_urls_but_list_is_redacted() {
             public_base_url: Some("https://share.example".to_owned()),
             frontend_url: None,
             ttl_seconds: Some(60),
-            max_viewers: Some(2),
+            max_readers: Some(2),
             url_options: Default::default(),
             require_pin: false,
             terminal_palette: None,
@@ -58,18 +58,18 @@ fn create_returns_secret_urls_but_list_is_redacted() {
         })
         .expect("share creates");
 
-    assert!(created.viewer_url.contains("&key="));
+    assert!(created.read_url.contains("&key="));
     assert!(created
         .operator_url
         .as_deref()
         .is_some_and(|url| url.contains("&key=")));
     let stdout = String::from_utf8_lossy(created.output.stdout());
-    assert!(stdout.contains("viewer "));
+    assert!(stdout.contains("read "));
     assert!(!stdout.contains("operator "));
 
     let listed = registry.list(ListWebSharesRequest);
     assert_eq!(listed.shares.len(), 1);
-    let redacted = listed.shares[0].viewer_url.as_deref().expect("url");
+    let redacted = listed.shares[0].read_url.as_deref().expect("url");
     assert_eq!(
         redacted,
         format!(
@@ -88,7 +88,7 @@ fn default_local_share_uses_hosted_frontend_and_local_websocket_endpoint() {
             public_base_url: None,
             frontend_url: None,
             ttl_seconds: Some(60),
-            max_viewers: Some(2),
+            max_readers: Some(2),
             url_options: Default::default(),
             require_pin: false,
             terminal_palette: None,
@@ -97,19 +97,19 @@ fn default_local_share_uses_hosted_frontend_and_local_websocket_endpoint() {
         .expect("share creates");
 
     assert!(created
-        .viewer_url
+        .read_url
         .starts_with("https://share.rmux.io/#endpoint=ws://127.0.0.1:9777/share&id="));
-    assert!(!created.viewer_url.contains("&role=viewer"));
+    assert!(!created.read_url.contains("&role=read"));
 
-    let viewer_key = key_from_url(&created.viewer_url);
+    let read_key = key_from_url(&created.read_url);
     let access = registry
         .connect(
             &created.share_id,
-            &viewer_key,
+            &read_key,
             None,
-            WebShareConnectRole::Viewer,
+            WebShareConnectRole::Read,
         )
-        .expect("viewer connects");
+        .expect("read connects");
     assert!(access.origin_allowed("https://share.rmux.io"));
     assert!(access.origin_allowed("http://localhost:4321"));
     assert!(access.origin_allowed("http://127.0.0.1:5173"));
@@ -131,7 +131,7 @@ fn frontend_override_changes_browser_origin_without_changing_local_endpoint() {
             public_base_url: None,
             frontend_url: None,
             ttl_seconds: Some(60),
-            max_viewers: Some(2),
+            max_readers: Some(2),
             url_options: Default::default(),
             require_pin: false,
             terminal_palette: None,
@@ -140,17 +140,17 @@ fn frontend_override_changes_browser_origin_without_changing_local_endpoint() {
         .expect("share creates");
 
     assert!(created
-        .viewer_url
+        .read_url
         .starts_with("https://share.fork.example/#endpoint=ws://127.0.0.1:9778/share&id="));
-    let viewer_key = key_from_url(&created.viewer_url);
+    let read_key = key_from_url(&created.read_url);
     let access = registry
         .connect(
             &created.share_id,
-            &viewer_key,
+            &read_key,
             None,
-            WebShareConnectRole::Viewer,
+            WebShareConnectRole::Read,
         )
-        .expect("viewer connects");
+        .expect("read connects");
     assert!(access.origin_allowed("https://share.fork.example"));
     assert!(!access.origin_allowed("https://share.rmux.io"));
 }
@@ -164,7 +164,7 @@ fn per_share_frontend_url_overrides_daemon_default() {
             public_base_url: Some("https://terminal.example".to_owned()),
             frontend_url: Some("https://share.fork.example/share".to_owned()),
             ttl_seconds: Some(60),
-            max_viewers: Some(2),
+            max_readers: Some(2),
             url_options: Default::default(),
             require_pin: false,
             terminal_palette: None,
@@ -172,18 +172,18 @@ fn per_share_frontend_url_overrides_daemon_default() {
         })
         .expect("share creates");
 
-    assert!(created.viewer_url.starts_with(
+    assert!(created.read_url.starts_with(
         "https://share.fork.example/share/#endpoint=wss://terminal.example/share&id="
     ));
-    let viewer_key = key_from_url(&created.viewer_url);
+    let read_key = key_from_url(&created.read_url);
     let access = registry
         .connect(
             &created.share_id,
-            &viewer_key,
+            &read_key,
             None,
-            WebShareConnectRole::Viewer,
+            WebShareConnectRole::Read,
         )
-        .expect("viewer connects");
+        .expect("read connects");
     assert!(access.origin_allowed("https://share.fork.example"));
     assert!(!access.origin_allowed("https://share.rmux.io"));
 }
@@ -196,7 +196,7 @@ fn public_base_url_rejects_query_and_fragment() {
 }
 
 #[test]
-fn url_options_are_encoded_in_viewer_urls() {
+fn url_options_are_encoded_in_read_urls() {
     let registry = WebShareRegistry::default();
     let created = registry
         .create(CreateWebShareRequest {
@@ -204,7 +204,7 @@ fn url_options_are_encoded_in_viewer_urls() {
             public_base_url: None,
             frontend_url: None,
             ttl_seconds: Some(60),
-            max_viewers: Some(2),
+            max_readers: Some(2),
             url_options: WebShareUrlOptions {
                 no_navbar: true,
                 no_disclaimer: true,
@@ -216,9 +216,9 @@ fn url_options_are_encoded_in_viewer_urls() {
         })
         .expect("share creates");
 
-    assert!(created.viewer_url.contains("&navbar=off"));
-    assert!(created.viewer_url.contains("&disclaimer=off"));
-    assert!(created.viewer_url.contains("&theme=light"));
+    assert!(created.read_url.contains("&navbar=off"));
+    assert!(created.read_url.contains("&disclaimer=off"));
+    assert!(created.read_url.contains("&theme=light"));
     assert!(created
         .operator_url
         .as_deref()
@@ -236,7 +236,7 @@ fn pairing_code_is_required_out_of_band_when_pin_enabled() {
             public_base_url: None,
             frontend_url: None,
             ttl_seconds: Some(60),
-            max_viewers: Some(2),
+            max_readers: Some(2),
             url_options: Default::default(),
             require_pin: true,
             terminal_palette: None,
@@ -250,34 +250,34 @@ fn pairing_code_is_required_out_of_band_when_pin_enabled() {
         .expect("pin-enabled share returns pairing code");
     assert_eq!(pairing_code.len(), 6);
     assert!(pairing_code.bytes().all(|byte| byte.is_ascii_digit()));
-    assert!(created.viewer_url.contains("&pin=required"));
-    assert!(!created.viewer_url.contains(pairing_code));
+    assert!(created.read_url.contains("&pin=required"));
+    assert!(!created.read_url.contains(pairing_code));
     let stdout = String::from_utf8_lossy(created.output.stdout());
     assert!(stdout.contains(&format!("pin {pairing_code}\n")));
 
-    let viewer_key = key_from_url(&created.viewer_url);
+    let read_key = key_from_url(&created.read_url);
     assert!(registry
         .connect(
             &created.share_id,
-            &viewer_key,
+            &read_key,
             None,
-            WebShareConnectRole::Viewer
+            WebShareConnectRole::Read
         )
         .is_err());
     assert!(registry
         .connect(
             &created.share_id,
-            &viewer_key,
+            &read_key,
             Some("000000"),
-            WebShareConnectRole::Viewer,
+            WebShareConnectRole::Read,
         )
         .is_err());
     assert!(registry
         .connect(
             &created.share_id,
-            &viewer_key,
+            &read_key,
             Some(pairing_code),
-            WebShareConnectRole::Viewer,
+            WebShareConnectRole::Read,
         )
         .is_ok());
 }
@@ -292,7 +292,7 @@ fn stop_all_reports_removed_share_count() {
                 public_base_url: None,
                 frontend_url: None,
                 ttl_seconds: None,
-                max_viewers: None,
+                max_readers: None,
                 url_options: Default::default(),
                 require_pin: false,
                 terminal_palette: None,
@@ -305,7 +305,7 @@ fn stop_all_reports_removed_share_count() {
 }
 
 #[test]
-fn connect_enforces_viewer_cap_and_single_operator() {
+fn connect_enforces_read_cap_and_single_operator() {
     let registry = WebShareRegistry::default();
     let created = registry
         .create(CreateWebShareRequest {
@@ -313,31 +313,31 @@ fn connect_enforces_viewer_cap_and_single_operator() {
             public_base_url: None,
             frontend_url: None,
             ttl_seconds: None,
-            max_viewers: Some(1),
+            max_readers: Some(1),
             url_options: Default::default(),
             require_pin: false,
             terminal_palette: None,
             writable: true,
         })
         .expect("share creates");
-    let viewer_key = key_from_url(&created.viewer_url);
+    let read_key = key_from_url(&created.read_url);
     let operator_key = key_from_url(created.operator_url.as_deref().expect("operator url"));
 
-    let viewer = registry
+    let read = registry
         .connect(
             &created.share_id,
-            &viewer_key,
+            &read_key,
             None,
-            WebShareConnectRole::Viewer,
+            WebShareConnectRole::Read,
         )
-        .expect("viewer connects");
-    assert!(!viewer.is_operator());
+        .expect("read connects");
+    assert!(!read.is_operator());
     assert!(registry
         .connect(
             &created.share_id,
-            &viewer_key,
+            &read_key,
             None,
-            WebShareConnectRole::Viewer
+            WebShareConnectRole::Read
         )
         .is_err());
 
@@ -359,13 +359,13 @@ fn connect_enforces_viewer_cap_and_single_operator() {
         )
         .is_err());
 
-    drop(viewer);
+    drop(read);
     assert!(registry
         .connect(
             &created.share_id,
-            &viewer_key,
+            &read_key,
             None,
-            WebShareConnectRole::Viewer
+            WebShareConnectRole::Read
         )
         .is_ok());
 }

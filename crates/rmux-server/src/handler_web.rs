@@ -293,7 +293,7 @@ mod tests {
                     public_base_url: Some("https://share.example".to_owned()),
                     frontend_url: None,
                     ttl_seconds: None,
-                    max_viewers: Some(1),
+                    max_readers: Some(1),
                     url_options: Default::default(),
                     require_pin: false,
                     terminal_palette: None,
@@ -312,7 +312,7 @@ mod tests {
                 ..
             } if actual == &session_name
         ));
-        assert!(created.viewer_url.contains("&key="));
+        assert!(created.read_url.contains("&key="));
     }
 
     #[test]

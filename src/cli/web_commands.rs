@@ -49,31 +49,31 @@ fn warn_operator_url(response: &Response) {
 fn write_created_share_output(created: &WebShareCreatedResponse) -> Result<(), ExitFailure> {
     write_command_output(&created.output)?;
     let qr_output = if std::io::stdout().is_terminal() {
-        viewer_qr_output(&created.viewer_url)
+        read_qr_output(&created.read_url)
     } else {
         CommandOutput::from_stdout("QR omitted (stdout not a terminal); see URL above\n")
     };
     write_command_output(&qr_output)
 }
 
-fn viewer_qr_output(viewer_url: &str) -> CommandOutput {
-    match qrcode::QrCode::new(viewer_url.as_bytes()) {
+fn read_qr_output(read_url: &str) -> CommandOutput {
+    match qrcode::QrCode::new(read_url.as_bytes()) {
         Ok(code) => {
             let qr = code.render::<Dense1x2>().module_dimensions(1, 1).build();
             CommandOutput::from_stdout(format!("{qr}\n"))
         }
-        Err(_) => CommandOutput::from_stdout("QR omitted (viewer URL is too large)\n"),
+        Err(_) => CommandOutput::from_stdout("QR omitted (read URL is too large)\n"),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{viewer_qr_output, web_share_pane_lookup_target};
+    use super::{read_qr_output, web_share_pane_lookup_target};
     use crate::cli_args::parse_target_spec;
 
     #[test]
-    fn viewer_qr_uses_compact_unicode_blocks() {
-        let output = viewer_qr_output(
+    fn read_qr_uses_compact_unicode_blocks() {
+        let output = read_qr_output(
             "https://share.rmux.io/#endpoint=ws://127.0.0.1:9777/share&id=abcdefgh&key=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi",
         );
         let qr = std::str::from_utf8(output.stdout()).expect("QR output should be UTF-8");
@@ -131,7 +131,7 @@ fn build_web_share_request(
         public_base_url: args.public_base_url,
         frontend_url: args.frontend_url,
         ttl_seconds: args.ttl_seconds,
-        max_viewers: args.max_viewers,
+        max_readers: args.max_readers,
         url_options: WebShareUrlOptions {
             no_navbar: args.no_navbar,
             no_disclaimer: args.no_disclaimer,

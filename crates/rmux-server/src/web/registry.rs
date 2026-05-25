@@ -21,7 +21,7 @@ use super::origin::{origin_allowed, validate_frontend_url, validate_public_base_
 const DEFAULT_FRONTEND_ORIGIN: &str = "https://share.rmux.io";
 const DEFAULT_FRONTEND_URL: &str = "https://share.rmux.io";
 const DEFAULT_HOST: &str = "127.0.0.1";
-const DEFAULT_MAX_VIEWERS: u16 = 5;
+const DEFAULT_MAX_READERS: u16 = 5;
 const DEFAULT_PORT: u16 = 9777;
 const DEFAULT_TTL_SECONDS: u64 = 60 * 60;
 const MAX_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -78,16 +78,16 @@ impl WebShareRegistry {
         &self,
         request: CreateWebShareRequest,
     ) -> Result<WebShareCreatedResponse, RmuxError> {
-        let max_viewers = request.max_viewers.unwrap_or(DEFAULT_MAX_VIEWERS);
-        if max_viewers == 0 {
+        let max_readers = request.max_readers.unwrap_or(DEFAULT_MAX_READERS);
+        if max_readers == 0 {
             return Err(RmuxError::Server(
-                "web-share requires at least one viewer slot".to_owned(),
+                "web-share requires at least one read slot".to_owned(),
             ));
         }
         let endpoint_origin = self.endpoint_origin(request.public_base_url.as_deref())?;
         let frontend = self.frontend(request.frontend_url.as_deref())?;
         let share_id = self.next_share_id()?;
-        let viewer_token = random_token()?;
+        let read_token = random_token()?;
         let operator_token = request.writable.then(random_token).transpose()?;
         let pairing_code = request.require_pin.then(random_pairing_code).transpose()?;
         let ttl_seconds = request.ttl_seconds.unwrap_or(DEFAULT_TTL_SECONDS);
@@ -97,7 +97,7 @@ impl WebShareRegistry {
             ));
         }
         let expires_at = Some(SystemTime::now() + Duration::from_secs(ttl_seconds));
-        let lease_book = LeaseBook::new(usize::from(max_viewers));
+        let lease_book = LeaseBook::new(usize::from(max_readers));
         let (revoke_tx, _) = watch::channel(None);
 
         let record = WebShareRecord {
@@ -107,7 +107,7 @@ impl WebShareRegistry {
             frontend_origin: frontend.origin,
             frontend_url: frontend.url,
             lease_book,
-            max_viewers,
+            max_readers,
             operator_token: operator_token.clone(),
             pairing_code: pairing_code.clone(),
             revoke_tx,
@@ -115,11 +115,11 @@ impl WebShareRegistry {
             target: request.target.clone(),
             terminal_palette: request.terminal_palette.clone(),
             url_options: request.url_options,
-            viewer_token: viewer_token.clone(),
+            read_token: read_token.clone(),
             writable: request.writable,
         };
 
-        let viewer_url = record.viewer_url();
+        let read_url = record.read_url();
         let operator_url = record.operator_url();
         let summary_target = record.target.clone();
         let expires_at_unix = expires_at.and_then(system_time_to_unix);
@@ -132,22 +132,22 @@ impl WebShareRegistry {
             target = %summary_target,
             writable = request.writable,
             ttl_seconds,
-            max_viewers,
+            max_readers,
             public = request.public_base_url.is_some(),
             pin_required = request.require_pin,
             listener_port = self.settings.port,
             "web_share_created"
         );
 
-        let output = created_output(&viewer_url, pairing_code.as_deref());
+        let output = created_output(&read_url, pairing_code.as_deref());
         Ok(WebShareCreatedResponse {
             share_id,
             target: summary_target,
-            viewer_url,
+            read_url,
             operator_url,
             expires_at_unix,
             pairing_code,
-            max_viewers,
+            max_readers,
             writable: request.writable,
             output,
         })
@@ -401,7 +401,7 @@ struct WebShareRecord {
     frontend_origin: String,
     frontend_url: String,
     lease_book: Arc<LeaseBook>,
-    max_viewers: u16,
+    max_readers: u16,
     operator_token: Option<String>,
     pairing_code: Option<String>,
     revoke_tx: watch::Sender<Option<WebShareRevokeReason>>,
@@ -409,32 +409,32 @@ struct WebShareRecord {
     target: PaneTargetRef,
     terminal_palette: Option<WebTerminalPalette>,
     url_options: WebShareUrlOptions,
-    viewer_token: String,
+    read_token: String,
     writable: bool,
 }
 
 impl WebShareRecord {
-    fn viewer_url(&self) -> String {
+    fn read_url(&self) -> String {
         share_url(
             &self.frontend_origin,
             &self.frontend_url,
             &self.endpoint_origin,
             &self.share_id,
-            Some(&self.viewer_token),
-            "viewer",
+            Some(&self.read_token),
+            "read",
             self.pairing_code.is_some(),
             self.url_options,
         )
     }
 
-    fn redacted_viewer_url(&self) -> String {
+    fn redacted_read_url(&self) -> String {
         share_url(
             &self.frontend_origin,
             &self.frontend_url,
             &self.endpoint_origin,
             &self.share_id,
             None,
-            "viewer",
+            "read",
             self.pairing_code.is_some(),
             self.url_options,
         )
@@ -459,10 +459,10 @@ impl WebShareRecord {
         WebShareSummary {
             share_id: self.share_id.clone(),
             target: self.target.clone(),
-            viewer_url: Some(self.redacted_viewer_url()),
+            read_url: Some(self.redacted_read_url()),
             writable: self.writable,
-            active_viewers: u16::try_from(self.lease_book.viewer_count()).unwrap_or(u16::MAX),
-            max_viewers: self.max_viewers,
+            active_readers: u16::try_from(self.lease_book.reader_count()).unwrap_or(u16::MAX),
+            max_readers: self.max_readers,
             operator_connected: self.lease_book.operator_connected(),
             expires_at_unix: self.expires_at.and_then(system_time_to_unix),
         }
@@ -475,19 +475,17 @@ impl WebShareRecord {
         role: WebShareConnectRole,
     ) -> Result<WebShareAccess, RmuxError> {
         match role {
-            WebShareConnectRole::Viewer => {
-                if !secret_eq(key, &self.viewer_token) {
+            WebShareConnectRole::Read => {
+                if !secret_eq(key, &self.read_token) {
                     return Err(RmuxError::Server("invalid web-share key".to_owned()));
                 }
                 self.check_pairing_code(pin)?;
                 let lease = self
                     .lease_book
-                    .try_viewer()
-                    .map(ConnectionLease::Viewer)
-                    .ok_or_else(|| {
-                        RmuxError::Server("web-share viewer limit reached".to_owned())
-                    })?;
-                Ok(self.access(lease, WebShareRole::Viewer))
+                    .try_read()
+                    .map(ConnectionLease::Read)
+                    .ok_or_else(|| RmuxError::Server("web-share read limit reached".to_owned()))?;
+                Ok(self.access(lease, WebShareRole::Read))
             }
             WebShareConnectRole::Operator => {
                 let Some(operator_key) = self.operator_token.as_deref() else {
@@ -544,7 +542,7 @@ impl WebShareRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WebShareConnectRole {
     Operator,
-    Viewer,
+    Read,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -600,13 +598,13 @@ impl WebShareAccess {
             return false;
         };
         match lease.release_operator() {
-            Ok(viewer) => {
-                self._lease = Some(viewer);
-                self.role = WebShareRole::Viewer;
+            Ok(read) => {
+                self._lease = Some(read);
+                self.role = WebShareRole::Read;
                 true
             }
-            Err(viewer) => {
-                self._lease = Some(viewer);
+            Err(read) => {
+                self._lease = Some(read);
                 false
             }
         }
@@ -628,13 +626,13 @@ impl WebShareAccess {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WebShareRole {
     Operator,
-    Viewer,
+    Read,
 }
 
-fn created_output(viewer_url: &str, pairing_code: Option<&str>) -> CommandOutput {
+fn created_output(read_url: &str, pairing_code: Option<&str>) -> CommandOutput {
     let mut output = String::new();
-    output.push_str("viewer ");
-    output.push_str(viewer_url);
+    output.push_str("read ");
+    output.push_str(read_url);
     output.push('\n');
     if let Some(pairing_code) = pairing_code {
         output.push_str("pin ");
@@ -651,7 +649,7 @@ fn list_output(shares: &[WebShareSummary]) -> CommandOutput {
         output.push(' ');
         output.push_str(&share.target.to_string());
         output.push(' ');
-        output.push_str(share.viewer_url.as_deref().unwrap_or("-"));
+        output.push_str(share.read_url.as_deref().unwrap_or("-"));
         output.push('\n');
     }
     CommandOutput::from_stdout(output)
@@ -686,7 +684,7 @@ fn share_url(
         "frontend URL must belong to its expected origin"
     );
     let mut url = format!("{frontend_url}/#endpoint={endpoint}&id={share_id}&key={key}");
-    if role != "viewer" {
+    if role != "read" {
         url.push_str("&role=");
         url.push_str(role);
     }

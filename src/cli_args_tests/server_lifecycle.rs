@@ -95,7 +95,7 @@ fn web_share_accepts_frontend_and_tunnel_url_flags() {
 }
 
 #[test]
-fn web_share_accepts_viewer_presentation_and_pin_flags() {
+fn web_share_accepts_read_presentation_and_pin_flags() {
     let cli = parse_args(&[
         "web-share",
         "--no-navbar",

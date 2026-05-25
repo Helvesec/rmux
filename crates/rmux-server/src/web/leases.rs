@@ -3,16 +3,16 @@ use std::sync::Arc;
 
 #[derive(Debug)]
 pub(crate) struct LeaseBook {
-    current_viewers: AtomicUsize,
-    max_viewers: usize,
+    current_readers: AtomicUsize,
+    max_readers: usize,
     operator_connected: AtomicBool,
 }
 
 impl LeaseBook {
-    pub(crate) fn new(max_viewers: usize) -> Arc<Self> {
+    pub(crate) fn new(max_readers: usize) -> Arc<Self> {
         Arc::new(Self {
-            current_viewers: AtomicUsize::new(0),
-            max_viewers,
+            current_readers: AtomicUsize::new(0),
+            max_readers,
             operator_connected: AtomicBool::new(false),
         })
     }
@@ -31,20 +31,20 @@ impl LeaseBook {
             })
     }
 
-    pub(crate) fn try_viewer(self: &Arc<Self>) -> Option<ViewerLease> {
-        let mut current = self.current_viewers.load(Ordering::Acquire);
+    pub(crate) fn try_read(self: &Arc<Self>) -> Option<ReadLease> {
+        let mut current = self.current_readers.load(Ordering::Acquire);
         loop {
-            if current >= self.max_viewers {
+            if current >= self.max_readers {
                 return None;
             }
-            match self.current_viewers.compare_exchange(
+            match self.current_readers.compare_exchange(
                 current,
                 current + 1,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    return Some(ViewerLease {
+                    return Some(ReadLease {
                         book: Arc::clone(self),
                     });
                 }
@@ -53,26 +53,26 @@ impl LeaseBook {
         }
     }
 
-    pub(crate) fn viewer_count(&self) -> usize {
-        self.current_viewers.load(Ordering::Acquire)
+    pub(crate) fn reader_count(&self) -> usize {
+        self.current_readers.load(Ordering::Acquire)
     }
 
-    fn viewer_uncapped(self: &Arc<Self>) -> ViewerLease {
-        self.current_viewers.fetch_add(1, Ordering::AcqRel);
-        ViewerLease {
+    fn read_uncapped(self: &Arc<Self>) -> ReadLease {
+        self.current_readers.fetch_add(1, Ordering::AcqRel);
+        ReadLease {
             book: Arc::clone(self),
         }
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct ViewerLease {
+pub(crate) struct ReadLease {
     book: Arc<LeaseBook>,
 }
 
-impl Drop for ViewerLease {
+impl Drop for ReadLease {
     fn drop(&mut self) {
-        self.book.current_viewers.fetch_sub(1, Ordering::AcqRel);
+        self.book.current_readers.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -83,10 +83,10 @@ pub(crate) struct OperatorLease {
 }
 
 impl OperatorLease {
-    pub(crate) fn release_to_viewer(mut self) -> ViewerLease {
+    pub(crate) fn release_to_read(mut self) -> ReadLease {
         self.release_operator_slot();
         self.active = false;
-        self.book.viewer_uncapped()
+        self.book.read_uncapped()
     }
 
     fn release_operator_slot(&self) {
@@ -105,7 +105,7 @@ impl Drop for OperatorLease {
 #[derive(Debug)]
 pub(crate) enum ConnectionLease {
     Operator(OperatorLease),
-    Viewer(ViewerLease),
+    Read(ReadLease),
 }
 
 impl ConnectionLease {
@@ -115,8 +115,8 @@ impl ConnectionLease {
 
     pub(crate) fn release_operator(self) -> Result<Self, Self> {
         match self {
-            Self::Operator(lease) => Ok(Self::Viewer(lease.release_to_viewer())),
-            Self::Viewer(lease) => Err(Self::Viewer(lease)),
+            Self::Operator(lease) => Ok(Self::Read(lease.release_to_read())),
+            Self::Read(lease) => Err(Self::Read(lease)),
         }
     }
 }
@@ -126,42 +126,42 @@ mod tests {
     use super::{ConnectionLease, LeaseBook};
 
     #[test]
-    fn viewer_lease_tracks_count_until_drop() {
+    fn read_lease_tracks_count_until_drop() {
         let book = LeaseBook::new(1);
-        let viewer = book.try_viewer().expect("viewer slot should be free");
+        let read = book.try_read().expect("read slot should be free");
 
-        assert_eq!(book.viewer_count(), 1);
-        assert!(book.try_viewer().is_none());
+        assert_eq!(book.reader_count(), 1);
+        assert!(book.try_read().is_none());
 
-        drop(viewer);
-        assert_eq!(book.viewer_count(), 0);
-        assert!(book.try_viewer().is_some());
+        drop(read);
+        assert_eq!(book.reader_count(), 0);
+        assert!(book.try_read().is_some());
     }
 
     #[test]
-    fn operator_release_converts_to_uncapped_viewer_without_leaking_slot() {
+    fn operator_release_converts_to_uncapped_read_without_leaking_slot() {
         let book = LeaseBook::new(1);
-        let _viewer = book.try_viewer().expect("viewer cap should allow one");
+        let _read = book.try_read().expect("read cap should allow one");
         let operator = book.try_operator().expect("operator slot should be free");
 
         assert!(book.operator_connected());
-        let released = operator.release_to_viewer();
+        let released = operator.release_to_read();
         assert!(!book.operator_connected());
-        assert_eq!(book.viewer_count(), 2);
+        assert_eq!(book.reader_count(), 2);
         assert!(book.try_operator().is_some());
 
         drop(released);
-        assert_eq!(book.viewer_count(), 1);
+        assert_eq!(book.reader_count(), 1);
     }
 
     #[test]
-    fn connection_lease_rejects_viewer_release() {
+    fn connection_lease_rejects_read_release() {
         let book = LeaseBook::new(1);
-        let viewer = ConnectionLease::Viewer(book.try_viewer().expect("viewer slot"));
+        let read = ConnectionLease::Read(book.try_read().expect("read slot"));
 
-        let returned = viewer
+        let returned = read
             .release_operator()
-            .expect_err("viewer cannot release operator mode");
+            .expect_err("read cannot release operator mode");
         assert!(!returned.is_operator());
     }
 }

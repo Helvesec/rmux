@@ -33,10 +33,10 @@ pub struct CreateWebShareRequest {
     /// Optional maximum share lifetime in seconds.
     #[serde(default)]
     pub ttl_seconds: Option<u64>,
-    /// Optional viewer cap for this share.
+    /// Optional cap for concurrent read-only clients.
     #[serde(default)]
-    pub max_viewers: Option<u16>,
-    /// Presentation options encoded into generated viewer URLs.
+    pub max_readers: Option<u16>,
+    /// Presentation options encoded into generated read-only URLs.
     #[serde(default)]
     pub url_options: WebShareUrlOptions,
     /// Whether clients must provide the out-of-band pairing code during auth.
@@ -59,7 +59,7 @@ pub struct WebShareUrlOptions {
     /// Suppress the client-side privacy/disclaimer toast.
     #[serde(default)]
     pub no_disclaimer: bool,
-    /// Optional initial terminal theme for generated viewer URLs.
+    /// Optional initial terminal theme for generated read-only URLs.
     #[serde(default)]
     pub terminal_theme: Option<WebTerminalTheme>,
 }

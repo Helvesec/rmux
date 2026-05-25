@@ -22,7 +22,7 @@ pub struct WebShareBuilder<'a> {
     frontend_url: Option<String>,
     public_base_url: Option<String>,
     ttl_seconds: Option<u64>,
-    max_viewers: Option<u16>,
+    max_readers: Option<u16>,
     url_options: WebShareUrlOptions,
     require_pin: bool,
     terminal_theme: Option<WebTerminalTheme>,
@@ -38,7 +38,7 @@ impl<'a> WebShareBuilder<'a> {
             frontend_url: None,
             public_base_url: None,
             ttl_seconds: None,
-            max_viewers: None,
+            max_readers: None,
             url_options: WebShareUrlOptions::default(),
             require_pin: false,
             terminal_theme: None,
@@ -54,10 +54,10 @@ impl<'a> WebShareBuilder<'a> {
         self
     }
 
-    /// Sets the maximum number of concurrent read-only viewers.
+    /// Sets the maximum number of concurrent read-only clients.
     #[must_use]
-    pub const fn max_viewers(mut self, max_viewers: u16) -> Self {
-        self.max_viewers = Some(max_viewers);
+    pub const fn max_readers(mut self, max_readers: u16) -> Self {
+        self.max_readers = Some(max_readers);
         self
     }
 
@@ -171,7 +171,7 @@ impl<'a> WebShareBuilder<'a> {
                     public_base_url: self.public_base_url,
                     frontend_url: self.frontend_url,
                     ttl_seconds: self.ttl_seconds,
-                    max_viewers: self.max_viewers,
+                    max_readers: self.max_readers,
                     url_options: WebShareUrlOptions {
                         terminal_theme: self.terminal_theme,
                         ..self.url_options
@@ -207,11 +207,11 @@ pub struct WebShareHandle {
     transport: TransportClient,
     id: String,
     target: PaneTargetRef,
-    viewer_url: String,
+    read_url: String,
     operator_url: Option<String>,
     expires_at_unix: Option<u64>,
     pairing_code: Option<String>,
-    max_viewers: u16,
+    max_readers: u16,
     writable: bool,
 }
 
@@ -221,11 +221,11 @@ impl WebShareHandle {
             transport,
             id: created.share_id,
             target: created.target,
-            viewer_url: created.viewer_url,
+            read_url: created.read_url,
             operator_url: created.operator_url,
             expires_at_unix: created.expires_at_unix,
             pairing_code: created.pairing_code,
-            max_viewers: created.max_viewers,
+            max_readers: created.max_readers,
             writable: created.writable,
         }
     }
@@ -248,16 +248,16 @@ impl WebShareHandle {
         self.writable
     }
 
-    /// Returns the read-only viewer URL.
+    /// Returns the read-only browser URL.
     #[must_use]
-    pub fn viewer_url(&self) -> &str {
-        &self.viewer_url
+    pub fn read_url(&self) -> &str {
+        &self.read_url
     }
 
-    /// Returns the viewer key carried in the viewer URL, when present.
+    /// Returns the read-only key carried in the browser URL, when present.
     #[must_use]
-    pub fn viewer_key(&self) -> Option<&str> {
-        key_from_url(&self.viewer_url)
+    pub fn read_key(&self) -> Option<&str> {
+        key_from_url(&self.read_url)
     }
 
     /// Returns the privileged operator URL, when this share is writable.
@@ -278,10 +278,10 @@ impl WebShareHandle {
         self.pairing_code.as_deref()
     }
 
-    /// Returns the effective viewer cap.
+    /// Returns the effective cap for concurrent read-only clients.
     #[must_use]
-    pub const fn max_viewers(&self) -> u16 {
-        self.max_viewers
+    pub const fn max_readers(&self) -> u16 {
+        self.max_readers
     }
 
     /// Returns the expiration timestamp in UNIX seconds.
@@ -295,9 +295,9 @@ impl WebShareHandle {
         lookup_summary(&self.transport, &self.id).await
     }
 
-    /// Returns the current number of read-only viewers.
-    pub async fn viewers_active(&self) -> Result<u16> {
-        Ok(self.summary().await?.active_viewers)
+    /// Returns the current number of read-only clients.
+    pub async fn readers_active(&self) -> Result<u16> {
+        Ok(self.summary().await?.active_readers)
     }
 
     /// Returns whether the single operator slot is occupied.
@@ -341,10 +341,10 @@ impl WebShareLookup {
         self.summary.writable
     }
 
-    /// Returns the redacted viewer URL, when available.
+    /// Returns the redacted read-only URL, when available.
     #[must_use]
-    pub fn viewer_url_redacted(&self) -> Option<&str> {
-        self.summary.viewer_url_redacted.as_deref()
+    pub fn read_url_redacted(&self) -> Option<&str> {
+        self.summary.read_url_redacted.as_deref()
     }
 
     /// Returns the cached summary from the lookup response.
@@ -373,14 +373,14 @@ pub struct WebShareSummary {
     pub id: String,
     /// Shared pane target.
     pub target: PaneTargetRef,
-    /// Redacted viewer URL, if available.
-    pub viewer_url_redacted: Option<String>,
+    /// Redacted read-only URL, if available.
+    pub read_url_redacted: Option<String>,
     /// Whether this share has an operator URL.
     pub writable: bool,
-    /// Active read-only viewer count.
-    pub active_viewers: u16,
-    /// Maximum read-only viewers allowed.
-    pub max_viewers: u16,
+    /// Active read-only client count.
+    pub active_readers: u16,
+    /// Maximum read-only clients allowed.
+    pub max_readers: u16,
     /// Whether the single operator slot is occupied.
     pub operator_connected: bool,
     /// Expiration timestamp in UNIX seconds.
@@ -392,10 +392,10 @@ impl From<rmux_proto::WebShareSummary> for WebShareSummary {
         Self {
             id: value.share_id,
             target: value.target,
-            viewer_url_redacted: value.viewer_url,
+            read_url_redacted: value.read_url,
             writable: value.writable,
-            active_viewers: value.active_viewers,
-            max_viewers: value.max_viewers,
+            active_readers: value.active_readers,
+            max_readers: value.max_readers,
             operator_connected: value.operator_connected,
             expires_at_unix: value.expires_at_unix,
         }

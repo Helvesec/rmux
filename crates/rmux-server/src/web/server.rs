@@ -182,7 +182,7 @@ async fn serve_websocket(
                         send_output(&mut socket, event.bytes()).await?;
                     }
                     OutputCursorItem::Gap(gap) => {
-                        debug!(missed = gap.missed_events(), "web-share viewer resync");
+                        debug!(missed = gap.missed_events(), "web-share read resync");
                         let (snapshot, output) = handler
                             .web_resnapshot(pane.target())
                             .await
@@ -200,7 +200,7 @@ async fn serve_websocket(
                     }
                     WebSocketMessage::Binary(bytes) => {
                         if !pane.is_operator() {
-                            let _ = socket.write_close_code(4006, "viewer_no_binary").await;
+                            let _ = socket.write_close_code(4006, "read_no_binary").await;
                             return Ok(());
                         }
                         if !rate_limiter.try_acquire() {

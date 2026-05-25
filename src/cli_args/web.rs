@@ -33,8 +33,8 @@ pub(crate) struct WebShareArgs {
     pub(crate) writable: bool,
     #[arg(long = "ttl", value_name = "seconds")]
     pub(crate) ttl_seconds: Option<u64>,
-    #[arg(long = "max-viewers", value_name = "count")]
-    pub(crate) max_viewers: Option<u16>,
+    #[arg(long = "max-readers", value_name = "count")]
+    pub(crate) max_readers: Option<u16>,
     #[arg(long = "frontend-url", alias = "web-frontend", value_name = "url")]
     pub(crate) frontend_url: Option<String>,
     #[arg(long = "tunnel-url", alias = "public-url", value_name = "url")]

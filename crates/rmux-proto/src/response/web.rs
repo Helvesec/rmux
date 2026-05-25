@@ -42,8 +42,8 @@ pub struct WebShareCreatedResponse {
     pub share_id: String,
     /// Shared pane selector.
     pub target: PaneTargetRef,
-    /// Browser URL for read-only viewers.
-    pub viewer_url: String,
+    /// Browser URL for read-only access.
+    pub read_url: String,
     /// Browser URL for the single writable operator, when requested.
     #[serde(default)]
     pub operator_url: Option<String>,
@@ -53,8 +53,8 @@ pub struct WebShareCreatedResponse {
     /// Out-of-band pairing code required by this share, when requested.
     #[serde(default)]
     pub pairing_code: Option<String>,
-    /// Effective viewer cap.
-    pub max_viewers: u16,
+    /// Effective cap for concurrent read-only clients.
+    pub max_readers: u16,
     /// Whether an operator URL was minted.
     pub writable: bool,
     /// CLI stdout rendering.
@@ -116,15 +116,15 @@ pub struct WebShareSummary {
     pub share_id: String,
     /// Shared pane selector.
     pub target: PaneTargetRef,
-    /// Redacted viewer URL, when available for display.
+    /// Redacted read-only URL, when available for display.
     #[serde(default)]
-    pub viewer_url: Option<String>,
+    pub read_url: Option<String>,
     /// Whether an operator URL exists for this share.
     pub writable: bool,
-    /// Active read-only viewers.
-    pub active_viewers: u16,
-    /// Effective viewer cap.
-    pub max_viewers: u16,
+    /// Active read-only clients.
+    pub active_readers: u16,
+    /// Effective cap for concurrent read-only clients.
+    pub max_readers: u16,
     /// Whether the single operator slot is currently connected.
     pub operator_connected: bool,
     /// Expiration timestamp as UNIX seconds, when a TTL was requested.

@@ -32,21 +32,21 @@ pub(crate) struct AuthMessage {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum AuthRole {
     Operator,
-    Viewer,
+    Read,
 }
 
 impl AuthRole {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Operator => "operator",
-            Self::Viewer => "viewer",
+            Self::Read => "read",
         }
     }
 
     pub(crate) const fn connect_role(self) -> WebShareConnectRole {
         match self {
             Self::Operator => WebShareConnectRole::Operator,
-            Self::Viewer => WebShareConnectRole::Viewer,
+            Self::Read => WebShareConnectRole::Read,
         }
     }
 }
@@ -67,7 +67,7 @@ pub(crate) async fn read_auth_message(
         return Err((4006, "first_frame_must_auth"));
     }
     let role = match wire.role.as_str() {
-        "viewer" => AuthRole::Viewer,
+        "read" => AuthRole::Read,
         "operator" => AuthRole::Operator,
         _ => return Err((4006, "invalid_role")),
     };
@@ -83,8 +83,8 @@ pub(crate) async fn read_auth_message(
 }
 
 pub(crate) fn close_for_auth_error(error: &str) -> (u16, &'static str) {
-    if error.contains("viewer limit") {
-        return (4003, "viewer_cap_reached");
+    if error.contains("read limit") {
+        return (4003, "read_cap_reached");
     }
     if error.contains("operator is already connected") {
         return (4007, "operator_already_connected");
@@ -105,12 +105,12 @@ pub(crate) async fn handle_client_text(
     match message {
         ClientMessage::Release if pane.is_operator() => {
             pane.release_operator();
-            let text = serde_json::to_string(&ServerMessage::Released)
+            let text = serde_json::to_string(&ServerMessage::Released { role: "read" })
                 .map_err(|error| io::Error::other(error.to_string()))?;
             socket.write_text(&text).await
         }
         ClientMessage::Release => {
-            let _ = socket.write_close_code(4006, "release_on_viewer").await;
+            let _ = socket.write_close_code(4006, "release_on_read").await;
             Ok(())
         }
     }
@@ -295,7 +295,9 @@ enum ServerMessage<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         terminal_palette: Option<&'a WebTerminalPalette>,
     },
-    Released,
+    Released {
+        role: &'a str,
+    },
     ShareRevoked {
         reason: &'a str,
     },
