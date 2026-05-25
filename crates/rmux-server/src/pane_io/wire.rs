@@ -4,7 +4,6 @@ use std::io;
 use std::time::Duration;
 
 use rmux_core::events::OutputCursorItem;
-use rmux_ipc::{is_peer_disconnect, LocalStream};
 use rmux_proto::{encode_attach_message, AttachFrameDecoder, AttachMessage};
 #[cfg(unix)]
 use rmux_pty::PtyIo;
@@ -16,6 +15,7 @@ use tracing::warn;
 
 use crate::outer_terminal::OuterTerminal;
 
+use super::attach_transport::{AttachTransport, TryAttachRead};
 use super::types::{AttachTarget, OpenAttachTarget, PaneOutputReceiver};
 
 #[cfg(unix)]
@@ -81,7 +81,7 @@ pub(super) fn open_pane_writer(pane_master: PtyMaster) -> io::Result<(AsyncFd<Pt
 }
 
 pub(super) async fn emit_render_frame(
-    stream: &LocalStream,
+    stream: &AttachTransport,
     outer_terminal: &OuterTerminal,
     render_frame: &[u8],
 ) -> io::Result<()> {
@@ -90,48 +90,21 @@ pub(super) async fn emit_render_frame(
 }
 
 pub(super) async fn read_socket_bytes(
-    stream: &LocalStream,
+    stream: &AttachTransport,
     decoder: &mut AttachFrameDecoder,
-    buffer: &mut [u8],
 ) -> io::Result<bool> {
-    loop {
-        stream.readable().await?;
-        match stream.try_read(buffer) {
-            Ok(0) => return Ok(false),
-            Ok(bytes_read) => {
-                decoder.push_bytes(&buffer[..bytes_read]);
-                return Ok(true);
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-pub(super) enum TrySocketRead {
-    Read,
-    Closed,
-    WouldBlock,
+    stream.read_into(decoder).await
 }
 
 pub(super) fn try_read_socket_bytes(
-    stream: &LocalStream,
+    stream: &AttachTransport,
     decoder: &mut AttachFrameDecoder,
-    buffer: &mut [u8],
-) -> io::Result<TrySocketRead> {
-    match stream.try_read(buffer) {
-        Ok(0) => Ok(TrySocketRead::Closed),
-        Ok(bytes_read) => {
-            decoder.push_bytes(&buffer[..bytes_read]);
-            Ok(TrySocketRead::Read)
-        }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(TrySocketRead::WouldBlock),
-        Err(error) => Err(error),
-    }
+) -> io::Result<TryAttachRead> {
+    stream.try_read_into(decoder)
 }
 
 pub(super) async fn emit_attach_message(
-    stream: &LocalStream,
+    stream: &AttachTransport,
     message: &AttachMessage,
 ) -> io::Result<()> {
     let frame = encode_attach_message(message).map_err(io::Error::other)?;
@@ -139,7 +112,7 @@ pub(super) async fn emit_attach_message(
 }
 
 pub(super) async fn emit_attach_frame(
-    stream: &LocalStream,
+    stream: &AttachTransport,
     message: &AttachMessage,
 ) -> io::Result<()> {
     let frame = encode_attach_message(message).map_err(io::Error::other)?;
@@ -173,13 +146,16 @@ pub(super) async fn recv_pane_output_optional(
     }
 }
 
-pub(super) async fn emit_attach_data_frame(stream: &LocalStream, bytes: &[u8]) -> io::Result<()> {
+pub(super) async fn emit_attach_data_frame(
+    stream: &AttachTransport,
+    bytes: &[u8],
+) -> io::Result<()> {
     let frame =
         encode_attach_message(&AttachMessage::Data(bytes.to_vec())).map_err(io::Error::other)?;
     write_all_to_stream(stream, &frame).await
 }
 
-pub(super) async fn emit_attach_bytes(stream: &LocalStream, bytes: &[u8]) -> io::Result<()> {
+pub(super) async fn emit_attach_bytes(stream: &AttachTransport, bytes: &[u8]) -> io::Result<()> {
     if bytes.is_empty() {
         return Ok(());
     }
@@ -188,7 +164,7 @@ pub(super) async fn emit_attach_bytes(stream: &LocalStream, bytes: &[u8]) -> io:
 }
 
 pub(super) async fn emit_attach_stop(
-    stream: &LocalStream,
+    stream: &AttachTransport,
     current_target: &OpenAttachTarget,
 ) -> io::Result<()> {
     emit_attach_bytes(
@@ -199,7 +175,7 @@ pub(super) async fn emit_attach_stop(
 }
 
 pub(super) async fn emit_detached_message(
-    stream: &LocalStream,
+    stream: &AttachTransport,
     current_target: &OpenAttachTarget,
 ) -> io::Result<()> {
     emit_attach_bytes(
@@ -213,7 +189,7 @@ pub(super) async fn emit_detached_message(
     .await
 }
 
-pub(super) async fn emit_exited_message(stream: &LocalStream) -> io::Result<()> {
+pub(super) async fn emit_exited_message(stream: &AttachTransport) -> io::Result<()> {
     emit_attach_bytes(stream, b"[exited]\r\n").await
 }
 
@@ -438,26 +414,8 @@ fn try_read_pane_now(reader: &PtyIo, buffer: &mut [u8]) -> io::Result<PaneRead> 
     }
 }
 
-async fn write_all_to_stream(stream: &LocalStream, mut bytes: &[u8]) -> io::Result<()> {
-    while !bytes.is_empty() {
-        stream.writable().await?;
-
-        match stream.try_write(bytes) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "write returned 0 while forwarding pane bytes",
-                ));
-            }
-            Ok(bytes_written) => bytes = &bytes[bytes_written..],
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) if is_peer_disconnect(&error) => return Ok(()),
-            Err(error) => return Err(error),
-        }
-    }
-
-    Ok(())
+async fn write_all_to_stream(stream: &AttachTransport, bytes: &[u8]) -> io::Result<()> {
+    stream.write_all(bytes).await
 }
 
 pub(super) fn invalid_attach_message(error: rmux_proto::RmuxError) -> io::Error {

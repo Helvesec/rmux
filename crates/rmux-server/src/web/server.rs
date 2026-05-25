@@ -183,9 +183,9 @@ async fn serve_websocket(
     );
     send_ready(&mut socket, &share, auth.role.as_str()).await?;
     match share {
-        WebShareStream::Pane(pane) => serve_pane_loop(handler, socket, auth.id, pane).await,
+        WebShareStream::Pane(pane) => serve_pane_loop(handler, socket, auth.id, *pane).await,
         WebShareStream::Session(session) => {
-            serve_session_loop(handler, socket, auth.id, session).await
+            serve_session_loop(handler, socket, auth.id, *session).await
         }
     }
 }

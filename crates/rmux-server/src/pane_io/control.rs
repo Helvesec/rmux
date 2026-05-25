@@ -2,10 +2,10 @@ use std::collections::VecDeque;
 use std::future::pending;
 use std::io;
 
-use rmux_ipc::LocalStream;
 use rmux_proto::AttachMessage;
 use tokio::sync::mpsc;
 
+use super::attach_transport::AttachTransport;
 use super::exit_log::AttachExitReason;
 use super::persistent_overlay::{
     accept_persistent_overlay_state, advance_persistent_overlay_state, clear_then_base_frame,
@@ -50,7 +50,7 @@ pub(super) async fn recv_attach_control(
 }
 
 pub(super) async fn switch_attach_target(
-    stream: &LocalStream,
+    stream: &AttachTransport,
     current_target: &mut OpenAttachTarget,
     next_target: AttachTarget,
     clear_from_persistent_overlay: bool,
@@ -101,7 +101,7 @@ pub(super) async fn apply_pending_attach_controls(
     deferred_controls: &mut VecDeque<AttachControl>,
     attach_controls: Option<&mut mpsc::UnboundedReceiver<AttachControl>>,
     current_target: &mut OpenAttachTarget,
-    stream: &LocalStream,
+    stream: &AttachTransport,
     render_generation: &mut u64,
     overlay_generation: &mut u64,
     persistent_overlay: &mut Option<Vec<u8>>,
@@ -290,7 +290,7 @@ pub(super) async fn apply_pending_attach_controls(
 }
 
 pub(super) async fn redraw_after_persistent_overlay_state_advance(
-    _stream: &LocalStream,
+    _stream: &AttachTransport,
     _current_target: &OpenAttachTarget,
     _persistent_overlay: &mut Option<Vec<u8>>,
     persistent_overlay_visible: &mut bool,

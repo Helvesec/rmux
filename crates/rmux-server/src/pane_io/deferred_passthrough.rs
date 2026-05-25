@@ -1,4 +1,6 @@
 #[cfg(any(unix, windows))]
+use super::attach_transport::AttachTransport;
+#[cfg(any(unix, windows))]
 use super::passthrough::render_passthroughs;
 #[cfg(any(unix, windows))]
 use super::types::OpenAttachTarget;
@@ -6,8 +8,6 @@ use super::types::OpenAttachTarget;
 use super::wire::emit_attach_bytes;
 #[cfg(any(unix, windows))]
 use rmux_core::TerminalPassthrough;
-#[cfg(any(unix, windows))]
-use rmux_ipc::LocalStream;
 #[cfg(any(unix, windows))]
 use std::io;
 #[cfg(any(unix, windows))]
@@ -67,7 +67,7 @@ pub(super) fn clear_deferred_passthroughs_if_target_changed(
 
 #[cfg(any(unix, windows))]
 pub(super) async fn flush_deferred_passthroughs(
-    stream: &LocalStream,
+    stream: &AttachTransport,
     current_target: &OpenAttachTarget,
     deferred_passthroughs: &mut Vec<TerminalPassthrough>,
     persistent_overlay_visible: bool,

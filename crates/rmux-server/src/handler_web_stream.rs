@@ -1,11 +1,10 @@
 use std::io;
 
-use rmux_ipc::LocalStream;
 use rmux_proto::{
     encode_attach_message, AttachFrameDecoder, AttachMessage, AttachedKeystroke, PaneTargetRef,
     SessionName, TerminalSize, WebTerminalPalette,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 
 use crate::pane_io::PaneOutputReceiver;
 use crate::web::{WebShareAccess, WebShareRevokeReason};
@@ -23,8 +22,8 @@ pub(crate) struct WebPaneStream {
 }
 
 pub(crate) enum WebShareStream {
-    Pane(WebPaneStream),
-    Session(WebSessionStream),
+    Pane(Box<WebPaneStream>),
+    Session(Box<WebSessionStream>),
 }
 
 pub(crate) struct WebSessionStream {
@@ -32,12 +31,12 @@ pub(crate) struct WebSessionStream {
     pub(crate) revoke_rx: tokio::sync::watch::Receiver<Option<WebShareRevokeReason>>,
     pub(crate) session_name: SessionName,
     pub(crate) initial_size: TerminalSize,
-    pub(crate) writer: WriteHalf<LocalStream>,
-    pub(crate) reader: Option<Box<WebSessionAttachReader>>,
+    pub(crate) writer: WriteHalf<DuplexStream>,
+    pub(crate) reader: Option<WebSessionAttachReader>,
 }
 
 pub(crate) struct WebSessionAttachReader {
-    reader: ReadHalf<LocalStream>,
+    reader: ReadHalf<DuplexStream>,
     decoder: AttachFrameDecoder,
     read_buffer: [u8; ATTACH_READ_BUFFER_SIZE],
 }
@@ -132,8 +131,7 @@ impl WebSessionStream {
     }
 
     pub(crate) fn take_attach_reader(&mut self) -> WebSessionAttachReader {
-        *self
-            .reader
+        self.reader
             .take()
             .expect("web session attach reader is taken exactly once")
     }
@@ -156,7 +154,7 @@ impl WebSessionStream {
 }
 
 impl WebSessionAttachReader {
-    pub(crate) fn new(reader: ReadHalf<LocalStream>) -> Self {
+    pub(crate) fn new(reader: ReadHalf<DuplexStream>) -> Self {
         Self {
             reader,
             decoder: AttachFrameDecoder::new(),

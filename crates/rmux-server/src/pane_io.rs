@@ -1,8 +1,6 @@
 #[cfg(any(unix, windows))]
 use rmux_core::events::OutputCursorItem;
 #[cfg(any(unix, windows))]
-use rmux_ipc::LocalStream;
-#[cfg(any(unix, windows))]
 use rmux_proto::{AttachFrameDecoder, AttachMessage};
 #[cfg(any(unix, windows))]
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -16,6 +14,7 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 
 const READ_BUFFER_SIZE: usize = 8192;
+mod attach_transport;
 mod control;
 mod deferred_passthrough;
 mod exit_log;
@@ -30,6 +29,8 @@ mod wire;
 
 #[cfg(any(unix, windows))]
 use crate::renderer::PaneRenderDelta;
+pub(crate) use attach_transport::in_process_attach_pair;
+use attach_transport::{AttachTransport, TryAttachRead};
 #[cfg(any(unix, windows))]
 use control::{
     apply_pending_attach_controls, recv_attach_control,
@@ -76,13 +77,12 @@ use wire::{
     emit_attach_bytes, emit_attach_frame, emit_attach_message, emit_attach_stop,
     emit_detached_message, emit_exited_message, emit_render_frame, invalid_attach_message,
     open_attach_target, read_socket_bytes, recv_pane_output_optional, try_read_socket_bytes,
-    TrySocketRead,
 };
 
 #[allow(clippy::too_many_arguments)]
 #[cfg(any(unix, windows))]
 pub(crate) async fn forward_attach(
-    stream: LocalStream,
+    stream: impl Into<AttachTransport>,
     target: AttachTarget,
     initial_socket_bytes: Vec<u8>,
     mut shutdown: watch::Receiver<()>,
@@ -91,13 +91,12 @@ pub(crate) async fn forward_attach(
     persistent_overlay_epoch: Arc<AtomicU64>,
     live_input: LiveAttachInputContext,
 ) -> io::Result<()> {
-    let stream = stream;
+    let stream = stream.into();
     let mut decoder = AttachFrameDecoder::new();
     let mut pending_input = Vec::new();
     let mut attach_controls = Some(control_rx);
     let mut deferred_controls = VecDeque::new();
     let mut pending_escape_flush = PendingEscapeFlush::default();
-    let mut socket_read_buffer = [0_u8; READ_BUFFER_SIZE];
     let mut current_target = open_attach_target(target)?;
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
@@ -211,9 +210,9 @@ pub(crate) async fn forward_attach(
             // keystrokes to the child process.
             if !pane_refresh.is_pending() {
                 loop {
-                    match try_read_socket_bytes(&stream, &mut decoder, &mut socket_read_buffer)? {
-                        TrySocketRead::Read => {}
-                        TrySocketRead::Closed => {
+                    match try_read_socket_bytes(&stream, &mut decoder)? {
+                        TryAttachRead::Read => {}
+                        TryAttachRead::Closed => {
                             log_attach_exit(
                                 &live_input,
                                 &current_target,
@@ -222,7 +221,7 @@ pub(crate) async fn forward_attach(
                             let _ = emit_attach_stop(&stream, &current_target).await;
                             return Ok(());
                         }
-                        TrySocketRead::WouldBlock => break,
+                        TryAttachRead::WouldBlock => break,
                     }
                 }
                 process_socket_messages(
@@ -453,7 +452,7 @@ pub(crate) async fn forward_attach(
                     )
                     .await;
                 }
-                result = read_socket_bytes(&stream, &mut decoder, &mut socket_read_buffer) => {
+                result = read_socket_bytes(&stream, &mut decoder) => {
                     if !result? {
                         log_attach_exit(
                             &live_input,
@@ -864,7 +863,7 @@ async fn sync_pending_escape_flush(
 #[cfg(any(unix, windows))]
 async fn process_socket_messages(
     decoder: &mut AttachFrameDecoder,
-    stream: &LocalStream,
+    stream: &AttachTransport,
     live_input: &LiveAttachInputContext,
     pending_input: &mut Vec<u8>,
     locked: &mut bool,

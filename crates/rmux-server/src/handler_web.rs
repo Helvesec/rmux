@@ -1,7 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
-use rmux_ipc::LocalStream;
 use rmux_os::identity::UserIdentity;
 use rmux_proto::{
     CreateWebShareRequest, ErrorResponse, KillSessionRequest, PaneInputRequest, PaneResizeRequest,
@@ -68,17 +67,17 @@ impl RequestHandler {
                 let target = self.stable_web_target(&target).await?;
                 let (snapshot, output) = self.web_resnapshot(&target).await?;
                 let revoke_rx = access.revoke_receiver();
-                Ok(WebShareStream::Pane(WebPaneStream {
+                Ok(WebShareStream::Pane(Box::new(WebPaneStream {
                     access,
                     output,
                     revoke_rx,
                     snapshot,
                     target,
-                }))
+                })))
             }
             WebShareScope::Session(session_name) => {
                 let stream = self.open_web_session_share(access, session_name).await?;
-                Ok(WebShareStream::Session(stream))
+                Ok(WebShareStream::Session(Box::new(stream)))
             }
         }
     }
@@ -88,8 +87,7 @@ impl RequestHandler {
         access: WebShareAccess,
         session_name: SessionName,
     ) -> Result<WebSessionStream, RmuxError> {
-        let (client_stream, server_stream) =
-            LocalStream::pair().map_err(|error| RmuxError::Server(error.to_string()))?;
+        let (server_transport, client_stream) = pane_io::in_process_attach_pair();
         let attach_pid = self.allocate_web_attach_pid().await?;
         let controls = access.controls();
         let mut flags = ClientFlags::default();
@@ -148,7 +146,7 @@ impl RequestHandler {
         tokio::spawn(async move {
             let _keep_shutdown_open = _shutdown_tx;
             let result = pane_io::forward_attach(
-                server_stream,
+                server_transport,
                 target,
                 Vec::new(),
                 shutdown_rx,
@@ -175,7 +173,7 @@ impl RequestHandler {
             session_name,
             initial_size,
             writer,
-            reader: Some(Box::new(WebSessionAttachReader::new(reader))),
+            reader: Some(WebSessionAttachReader::new(reader)),
         })
     }
 
@@ -427,6 +425,7 @@ mod tests {
         CreateWebShareRequest, NewSessionRequest, Request, Response, SessionName, TerminalSize,
         WebShareScope,
     };
+    use tokio::time::{timeout, Duration};
 
     #[tokio::test]
     async fn web_share_create_resolves_slot_target_to_stable_pane_id() {
@@ -472,5 +471,69 @@ mod tests {
             }) if actual == &session_name
         ));
         assert!(created.read_url.contains("&key="));
+    }
+
+    #[tokio::test]
+    async fn web_session_share_opens_portable_attach_transport() {
+        let handler = RequestHandler::new();
+        let session_name = SessionName::new("websession").expect("valid session");
+        let created = handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session_name.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(created, Response::NewSession(_)));
+
+        let response = handler
+            .handle(Request::WebShare(WebShareRequest::Create(
+                CreateWebShareRequest {
+                    scope: WebShareScope::Session(session_name),
+                    public_base_url: Some("https://share.example".to_owned()),
+                    frontend_url: None,
+                    ttl_seconds: None,
+                    max_readers: Some(1),
+                    url_options: Default::default(),
+                    require_pin: false,
+                    terminal_palette: None,
+                    writable: true,
+                    controls: true,
+                },
+            )))
+            .await;
+
+        let Response::WebShare(rmux_proto::WebShareResponse::Created(created)) = response else {
+            panic!("expected created web-share response");
+        };
+        let operator_url = created.operator_url.as_deref().expect("operator URL");
+        let operator_key = key_from_url(operator_url);
+        let stream = handler
+            .open_web_share(
+                &created.share_id,
+                &operator_key,
+                None,
+                WebShareConnectRole::Operator,
+            )
+            .await
+            .expect("session web share opens");
+        let WebShareStream::Session(mut session_stream) = stream else {
+            panic!("expected session web share stream");
+        };
+        let mut reader = session_stream.take_attach_reader();
+        let bytes = timeout(Duration::from_secs(2), reader.read_attach_bytes())
+            .await
+            .expect("attach stream should produce initial bytes")
+            .expect("attach read succeeds")
+            .expect("initial attach bytes are present");
+
+        assert!(!bytes.is_empty());
+    }
+
+    fn key_from_url(url: &str) -> String {
+        url.split_once("key=")
+            .map(|(_, key)| key.split('&').next().unwrap_or(key).to_owned())
+            .expect("URL contains access key")
     }
 }
