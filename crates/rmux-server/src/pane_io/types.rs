@@ -332,6 +332,7 @@ impl PaneOutputSender {
         self.push_for_generation(generation, bytes, Vec::new())
     }
 
+    #[cfg(test)]
     pub(crate) fn send_for_generation_with_passthroughs(
         &self,
         generation: Option<u64>,
@@ -339,6 +340,29 @@ impl PaneOutputSender {
         passthroughs: Vec<TerminalPassthrough>,
     ) -> Option<u64> {
         self.push_for_generation(generation, bytes, passthroughs)
+    }
+
+    pub(crate) fn publish_for_generation<R>(
+        &self,
+        generation: Option<u64>,
+        bytes: Vec<u8>,
+        build_side_effects: impl FnOnce(&[u8]) -> (R, Vec<TerminalPassthrough>),
+    ) -> Option<(u64, R)> {
+        let (sequence, result) = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .expect("pane output state mutex must not be poisoned");
+            if !generation_matches(self.current_generation(), generation) {
+                return None;
+            }
+            let (result, passthroughs) = build_side_effects(&bytes);
+            let sequence = state.push(bytes, passthroughs);
+            (sequence, result)
+        };
+        self.inner.notify.notify_waiters();
+        Some((sequence, result))
     }
 
     pub(crate) fn accepts_generation(&self, generation: Option<u64>) -> bool {
@@ -391,6 +415,23 @@ impl PaneOutputSender {
         PaneOutputReceiver {
             inner: Arc::clone(&self.inner),
             cursor,
+            passthrough_floor_sequence,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn subscribe_from_sequence(&self, sequence: u64) -> PaneOutputReceiver {
+        let passthrough_floor_sequence = {
+            let state = self
+                .inner
+                .state
+                .lock()
+                .expect("pane output state mutex must not be poisoned");
+            state.next_sequence()
+        };
+        PaneOutputReceiver {
+            inner: Arc::clone(&self.inner),
+            cursor: OutputRing::cursor_from_sequence(sequence),
             passthrough_floor_sequence,
         }
     }
