@@ -1,4 +1,6 @@
 use rmux_proto::request::Request;
+#[cfg(all(any(unix, windows), feature = "web"))]
+use rmux_proto::CAPABILITY_WEB_SHARE;
 use rmux_proto::{
     ControlModeResponse, ErrorResponse, HandshakeResponse, Response, RmuxError,
     SUPPORTED_CAPABILITIES,
@@ -96,10 +98,17 @@ impl RequestHandler {
         request: Request,
     ) -> HandleOutcome {
         if let Request::Handshake(request) = request {
-            let response = if let Err(error) = request.validate_against(SUPPORTED_CAPABILITIES) {
+            let supported_capabilities = supported_capabilities();
+            let response = if let Err(error) = request.validate_against(&supported_capabilities) {
                 Response::Error(ErrorResponse { error })
             } else {
-                Response::Handshake(HandshakeResponse::current())
+                Response::Handshake(HandshakeResponse {
+                    wire_version: rmux_proto::RMUX_WIRE_VERSION,
+                    capabilities: supported_capabilities
+                        .iter()
+                        .map(|value| value.to_string())
+                        .collect(),
+                })
             };
             return HandleOutcome::response(response);
         }
@@ -470,11 +479,27 @@ impl RequestHandler {
             Request::PaneSelect(request) => {
                 HandleOutcome::response(self.handle_pane_select_ref(request).await)
             }
+            Request::WebShare(request) => {
+                HandleOutcome::response(self.handle_web_share(request).await)
+            }
             _ => HandleOutcome::response(Response::Error(ErrorResponse {
                 error: RmuxError::Server(format!(
                     "{command_name} is only available through queued command dispatch"
                 )),
             })),
         }
+    }
+}
+
+fn supported_capabilities() -> Vec<&'static str> {
+    #[cfg(all(any(unix, windows), feature = "web"))]
+    {
+        let mut capabilities = SUPPORTED_CAPABILITIES.to_vec();
+        capabilities.push(CAPABILITY_WEB_SHARE);
+        capabilities
+    }
+    #[cfg(not(all(any(unix, windows), feature = "web")))]
+    {
+        SUPPORTED_CAPABILITIES.to_vec()
     }
 }
