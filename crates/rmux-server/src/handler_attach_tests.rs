@@ -1,4 +1,4 @@
-use super::RequestHandler;
+use crate::handler::RequestHandler;
 use crate::input_keys::MouseForwardEvent;
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
 use crate::outer_terminal::OuterTerminalContext;
@@ -107,6 +107,18 @@ fn take_switch_target(control: AttachControl) -> crate::pane_io::AttachTarget {
     }
 }
 
+/// Should this mount default to passthrough sessions?
+///
+/// The outer module that mounts this file via `#[path]` declares
+/// `pub(super) const FORCE_PASSTHROUGH: bool = ...;`.  Two mounts —
+/// one with `false`, one with `true` — let every test body run in
+/// both modes without duplicating source.  Additionally,
+/// `RMUX_TEST_FORCE_PASSTHROUGH=1` forces passthrough at runtime, so
+/// individual `cargo test` invocations can flip the world too.
+fn force_passthrough() -> bool {
+    super::FORCE_PASSTHROUGH || std::env::var_os("RMUX_TEST_FORCE_PASSTHROUGH").is_some()
+}
+
 async fn create_attached_session(
     handler: &RequestHandler,
     requester_pid: u32,
@@ -115,17 +127,45 @@ async fn create_attached_session(
     #[cfg(unix)]
     set_unix_test_shell(handler, session).await;
 
-    assert!(matches!(
-        handler
+    if force_passthrough() {
+        let response = handler
+            .handle(Request::NewSessionExt(NewSessionExtRequest {
+                session_name: Some(session.clone()),
+                working_directory: None,
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+                group_target: None,
+                attach_if_exists: false,
+                detach_other_clients: false,
+                kill_other_clients: false,
+                flags: None,
+                window_name: None,
+                print_session_info: false,
+                print_format: None,
+                command: None,
+                process_command: None,
+                passthrough: true,
+            }))
+            .await;
+        assert!(
+            matches!(response, Response::NewSession(_)),
+            "passthrough session should be created, got {response:?}"
+        );
+    } else {
+        let response = handler
             .handle(Request::NewSession(NewSessionRequest {
                 session_name: session.clone(),
                 detached: true,
                 size: Some(TerminalSize { cols: 80, rows: 24 }),
                 environment: None,
             }))
-            .await,
-        Response::NewSession(_)
-    ));
+            .await;
+        assert!(
+            matches!(response, Response::NewSession(_)),
+            "normal session should be created, got {response:?}"
+        );
+    }
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
         .register_attach(requester_pid, session.clone(), control_tx)
@@ -202,7 +242,7 @@ async fn create_session_with_command(
             print_format: None,
             command: Some(command),
             process_command: None,
-            passthrough: false,
+            passthrough: force_passthrough(),
         }))
         .await;
     assert!(
@@ -525,7 +565,7 @@ async fn wait_for_session_removed(handler: &RequestHandler, session_name: &Sessi
     }
 }
 
-use super::input_capture::RawPaneInputProbe;
+use crate::handler::input_capture::RawPaneInputProbe;
 
 async fn replace_transcript_contents(
     handler: &RequestHandler,
@@ -596,3 +636,6 @@ mod server_lifecycle;
 
 #[path = "handler_attach_tests/client_security.rs"]
 mod client_security;
+
+#[path = "handler_attach_tests/passthrough_input.rs"]
+mod passthrough_input;

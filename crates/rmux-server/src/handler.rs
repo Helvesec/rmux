@@ -534,8 +534,12 @@ mod input_capture;
 mod tests;
 
 #[cfg(test)]
-#[path = "handler_attach_tests.rs"]
+#[path = "handler_attach_tests_normal_mount.rs"]
 mod attach_tests;
+
+#[cfg(all(test, feature = "passthrough-global-tests"))]
+#[path = "handler_attach_tests_passthrough_mount.rs"]
+mod attach_tests_passthrough;
 
 #[cfg(test)]
 #[path = "handler_window_tests.rs"]

@@ -283,7 +283,7 @@ async fn suspend_client_marks_client_as_suspended() {
 
 #[tokio::test]
 async fn client_flags_apply_named_supports_negate_prefix() {
-    use super::super::attach_support::ClientFlags;
+    use crate::handler::attach_support::ClientFlags;
 
     let mut flags = ClientFlags::default();
     flags.apply_named("read-only").expect("apply read-only");
@@ -362,7 +362,7 @@ async fn refresh_client_flags_merge_incrementally() {
         assert!(
             active
                 .flags
-                .contains(super::super::attach_support::ClientFlags::ACTIVEPANE),
+                .contains(crate::handler::attach_support::ClientFlags::ACTIVEPANE),
             "active-pane flag must be set after refresh-client -f"
         );
     }
@@ -401,13 +401,13 @@ async fn refresh_client_flags_merge_incrementally() {
         assert!(
             active
                 .flags
-                .contains(super::super::attach_support::ClientFlags::ACTIVEPANE),
+                .contains(crate::handler::attach_support::ClientFlags::ACTIVEPANE),
             "active-pane flag must still be set after second refresh-client -f"
         );
         assert!(
             active
                 .flags
-                .contains(super::super::attach_support::ClientFlags::NO_DETACH_ON_DESTROY),
+                .contains(crate::handler::attach_support::ClientFlags::NO_DETACH_ON_DESTROY),
             "no-detach-on-destroy flag must be set after second refresh-client -f"
         );
     }
