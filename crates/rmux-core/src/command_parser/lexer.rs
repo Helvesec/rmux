@@ -44,7 +44,7 @@ pub(super) struct Lexer<'a> {
 impl<'a> Lexer<'a> {
     pub(super) fn new(input: &str, context: &'a CommandParser) -> Self {
         Self {
-            input: input.chars().collect(),
+            input: Self::normalize_newlines(input),
             offset: 0,
             ungot: Vec::new(),
             pending_backslashes: 0,
@@ -55,6 +55,26 @@ impl<'a> Lexer<'a> {
             line: 1,
             context,
         }
+    }
+
+    /// Collapse Windows (`\r\n`) and old-Mac (`\r`) line endings to `\n` so the
+    /// rest of the lexer only ever sees LF. Without this, a trailing `\r` from a
+    /// CRLF-saved config is swallowed into the preceding word by `read_word`, and
+    /// backslash line-continuation (which only checks for `\n`) fails on `\r\n`.
+    fn normalize_newlines(input: &str) -> Vec<char> {
+        let mut chars = Vec::with_capacity(input.len());
+        let mut iter = input.chars().peekable();
+        while let Some(ch) = iter.next() {
+            if ch == '\r' {
+                if iter.peek() == Some(&'\n') {
+                    iter.next();
+                }
+                chars.push('\n');
+            } else {
+                chars.push(ch);
+            }
+        }
+        chars
     }
 
     pub(super) fn next_token(&mut self) -> Result<SpannedToken, CommandParseError> {
