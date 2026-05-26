@@ -2,6 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn attached_remain_on_exit_strips_the_submitted_exit_line_from_dead_pane_capture() {
+    if skip_if_passthrough("remain-on-exit dead-pane capture uses pane render path bypassed in passthrough") { return; }
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");

@@ -1,5 +1,48 @@
 #[cfg(any(unix, windows))]
 use std::path::Path;
+#[cfg(unix)]
+use std::sync::OnceLock;
+
+/// Resolve a usable `bash` binary for tests at runtime.
+///
+/// Hardcoding `/bin/bash` breaks on systems where the canonical path is
+/// elsewhere (NixOS puts bash in the user profile, FreeBSD in
+/// `/usr/local/bin`, GitHub macOS runners in `/usr/local/bin/bash`, …).
+/// Resolution order:
+///   1. `RMUX_TEST_BASH` env var — explicit override for CI / dev.
+///   2. `/bin/bash` if it exists — the historical default.
+///   3. First `bash` found on `PATH` — what `/usr/bin/env bash` would
+///      pick up in a shebang.
+///   4. The literal string `"bash"` — last resort; relies on the spawn
+///      path doing its own PATH lookup.
+///
+/// The resolution is cached after the first call so every test in a
+/// run agrees on the same interpreter.
+#[cfg(unix)]
+pub(crate) fn test_bash_path() -> String {
+    static CACHED: OnceLock<String> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            if let Ok(value) = std::env::var("RMUX_TEST_BASH") {
+                if !value.is_empty() {
+                    return value;
+                }
+            }
+            if Path::new("/bin/bash").is_file() {
+                return "/bin/bash".to_owned();
+            }
+            if let Some(path_var) = std::env::var_os("PATH") {
+                for dir in std::env::split_paths(&path_var) {
+                    let candidate = dir.join("bash");
+                    if candidate.is_file() {
+                        return candidate.to_string_lossy().into_owned();
+                    }
+                }
+            }
+            "bash".to_owned()
+        })
+        .clone()
+}
 
 #[cfg(any(unix, windows))]
 pub(crate) fn command_quote(value: &str) -> String {

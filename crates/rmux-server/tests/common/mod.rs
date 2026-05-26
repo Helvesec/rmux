@@ -27,6 +27,39 @@ use tokio::sync::Mutex;
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
 pub(crate) static PTY_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
+/// Resolve a usable `bash` for integration tests at runtime.
+///
+/// Mirrors `rmux_server::test_shell::test_bash_path` (private to the lib).
+/// Integration tests live in a separate compilation unit and can't reach
+/// `pub(crate)` items, so the logic is duplicated rather than re-exposed.
+/// Resolution: `$RMUX_TEST_BASH` → `/bin/bash` if present → first
+/// `bash` on `$PATH` → bare `"bash"`.
+pub(crate) fn test_bash_path() -> String {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<String> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            if let Ok(value) = std::env::var("RMUX_TEST_BASH") {
+                if !value.is_empty() {
+                    return value;
+                }
+            }
+            if Path::new("/bin/bash").is_file() {
+                return "/bin/bash".to_owned();
+            }
+            if let Some(path_var) = std::env::var_os("PATH") {
+                for dir in std::env::split_paths(&path_var) {
+                    let candidate = dir.join("bash");
+                    if candidate.is_file() {
+                        return candidate.to_string_lossy().into_owned();
+                    }
+                }
+            }
+            "bash".to_owned()
+        })
+        .clone()
+}
+
 pub(crate) async fn start_server(harness: &TestHarness) -> Result<ServerHandle, Box<dyn Error>> {
     let socket_path = harness.socket_path().to_path_buf();
     ServerDaemon::new(DaemonConfig::new(socket_path))

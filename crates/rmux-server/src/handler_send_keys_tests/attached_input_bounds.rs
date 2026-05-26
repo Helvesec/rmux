@@ -13,7 +13,7 @@ async fn create_attached_live_session(
             .set(
                 ScopeSelector::Global,
                 OptionName::DefaultShell,
-                "/bin/bash".to_owned(),
+                crate::test_shell::test_bash_path(),
                 SetOptionMode::Replace,
             )
             .expect("test default-shell is valid");

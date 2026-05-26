@@ -64,6 +64,7 @@ async fn attached_prefix_q_repaints_status_line_after_status_message() {
 
 #[tokio::test]
 async fn attached_prefix_x_during_display_panes_opens_kill_pane_prompt() {
+    if skip_if_passthrough("display-panes overlay rendering differs under passthrough alt-screen wrap") { return; }
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
@@ -122,6 +123,7 @@ async fn attached_prefix_x_during_display_panes_opens_kill_pane_prompt() {
 
 #[tokio::test]
 async fn attached_prefix_q_emits_a_display_panes_overlay_when_prefix_and_q_arrive_separately() {
+    if skip_if_passthrough("display-panes overlay rendering differs under passthrough alt-screen wrap") { return; }
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
@@ -169,6 +171,7 @@ async fn attached_prefix_q_emits_a_display_panes_overlay_when_prefix_and_q_arriv
 
 #[tokio::test]
 async fn display_panes_bounds_unterminated_sgr_mouse_without_pane_leak() {
+    if skip_if_passthrough("display-panes overlay rendering differs under passthrough alt-screen wrap") { return; }
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
@@ -224,6 +227,7 @@ async fn display_panes_bounds_unterminated_sgr_mouse_without_pane_leak() {
 
 #[tokio::test]
 async fn attached_prefix_q_emits_a_display_panes_clear_after_the_timeout() {
+    if skip_if_passthrough("display-panes overlay rendering differs under passthrough alt-screen wrap") { return; }
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
@@ -296,6 +300,7 @@ async fn attached_prefix_q_emits_a_display_panes_clear_after_the_timeout() {
 
 #[tokio::test]
 async fn attached_prefix_q_inside_choose_tree_restores_the_tree_overlay_without_base_clear() {
+    if skip_if_passthrough("choose-tree + display-panes overlay differs under passthrough alt-screen wrap") { return; }
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");

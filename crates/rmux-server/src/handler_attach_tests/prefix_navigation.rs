@@ -2,6 +2,7 @@ use super::*;
 
 #[tokio::test]
 async fn attached_prefix_right_dispatches_select_pane_right() {
+    if skip_if_passthrough("window splits are rejected on passthrough sessions") { return; }
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
@@ -117,6 +118,7 @@ async fn attached_prefix_p_without_previous_window_reports_status_message() {
 
 #[tokio::test]
 async fn attached_prefix_o_cycles_to_the_next_pane() {
+    if skip_if_passthrough("window splits are rejected on passthrough sessions") { return; }
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
@@ -143,6 +145,7 @@ async fn attached_prefix_o_cycles_to_the_next_pane() {
 
 #[tokio::test]
 async fn attached_prefix_meta_digits_select_tmux_layout_presets() {
+    if skip_if_passthrough("window splits are rejected on passthrough sessions") { return; }
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
@@ -200,6 +203,7 @@ async fn attached_prefix_meta_digits_select_tmux_layout_presets() {
 
 #[tokio::test]
 async fn attached_prefix_meta_digit_dispatch_survives_escape_split_across_reads() {
+    if skip_if_passthrough("window splits are rejected on passthrough sessions") { return; }
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
@@ -249,6 +253,7 @@ async fn attached_prefix_meta_digit_dispatch_survives_escape_split_across_reads(
 
 #[tokio::test]
 async fn attached_prefix_space_cycles_next_layout_using_current_window_target() {
+    if skip_if_passthrough("window splits are rejected on passthrough sessions") { return; }
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
@@ -283,6 +288,7 @@ async fn attached_prefix_space_cycles_next_layout_using_current_window_target() 
 
 #[tokio::test]
 async fn attached_prefix_q_emits_a_display_panes_overlay() {
+    if skip_if_passthrough("display-panes overlay rendering differs under passthrough alt-screen wrap") { return; }
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");

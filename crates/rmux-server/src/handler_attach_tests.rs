@@ -119,6 +119,24 @@ fn force_passthrough() -> bool {
     super::FORCE_PASSTHROUGH || std::env::var_os("RMUX_TEST_FORCE_PASSTHROUGH").is_some()
 }
 
+/// Early-return guard for tests that exercise features passthrough
+/// sessions explicitly don't support (window splits, layout cycling,
+/// chrome overlays with parsable render bytes).  Prints a notice so
+/// the skip is visible in test output.
+///
+/// Use at the top of a test body:
+/// ```ignore
+/// if skip_if_passthrough("uses window splits") { return; }
+/// ```
+fn skip_if_passthrough(reason: &str) -> bool {
+    if force_passthrough() {
+        eprintln!("[passthrough mount] skipping: {reason}");
+        true
+    } else {
+        false
+    }
+}
+
 async fn create_attached_session(
     handler: &RequestHandler,
     requester_pid: u32,
@@ -181,7 +199,7 @@ async fn set_unix_test_shell(handler: &RequestHandler, _session: &SessionName) {
         .set(
             ScopeSelector::Global,
             OptionName::DefaultShell,
-            "/bin/bash".to_owned(),
+            crate::test_shell::test_bash_path(),
             SetOptionMode::Replace,
         )
         .expect("test default-shell is valid");

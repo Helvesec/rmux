@@ -242,6 +242,7 @@ async fn attach_session_active_pane_geometry_tracks_top_status_offset() {
 
 #[tokio::test]
 async fn attach_session_replays_all_visible_pane_screens() {
+    if skip_if_passthrough("visible-pane replay needs SplitWindow, which passthrough rejects") { return; }
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let top_ready = "RMUX_ATTACH_REPLAY_TOP_READY";
