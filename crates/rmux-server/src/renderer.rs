@@ -12,6 +12,7 @@ use rmux_proto::OptionName;
 
 use crate::copy_mode::CopyModeSummary;
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
+use crate::pane_terminals::HandlerState;
 #[path = "renderer/borders.rs"]
 mod borders;
 #[path = "renderer/clock_mode.rs"]
@@ -82,7 +83,15 @@ pub(crate) fn render_with_attached_count_and_prompt(
     attached_count: usize,
     prompt: Option<&RenderedPrompt>,
 ) -> Vec<u8> {
-    render_with_attached_count_prompt_and_pane_title(session, options, attached_count, prompt, None)
+    render_with_attached_count_prompt_and_pane_title(
+        session,
+        options,
+        attached_count,
+        prompt,
+        None,
+        None,
+        None,
+    )
 }
 
 pub(crate) fn render_with_attached_count_prompt_and_pane_title(
@@ -91,6 +100,8 @@ pub(crate) fn render_with_attached_count_prompt_and_pane_title(
     attached_count: usize,
     prompt: Option<&RenderedPrompt>,
     pane_title: Option<&str>,
+    state: Option<&HandlerState>,
+    key_table: Option<&str>,
 ) -> Vec<u8> {
     let geometry = StatusGeometry::for_session(session, options);
     let mut frame = Vec::new();
@@ -113,6 +124,8 @@ pub(crate) fn render_with_attached_count_prompt_and_pane_title(
             attached_count,
             prompt,
             pane_title,
+            state,
+            key_table,
         )
         .as_slice(),
     );
@@ -418,9 +431,20 @@ pub(crate) fn render_status_only_with_attached_count_and_prompt(
     options: &OptionStore,
     attached_count: usize,
     prompt: Option<&RenderedPrompt>,
+    state: Option<&HandlerState>,
+    key_table: Option<&str>,
 ) -> Vec<u8> {
     let geometry = StatusGeometry::for_session(session, options);
-    render_status_bar(session, options, geometry, attached_count, prompt, None)
+    render_status_bar(
+        session,
+        options,
+        geometry,
+        attached_count,
+        prompt,
+        None,
+        state,
+        key_table,
+    )
 }
 
 pub(crate) fn render_status_message(

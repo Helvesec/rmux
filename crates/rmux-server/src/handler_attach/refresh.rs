@@ -23,6 +23,7 @@ impl RequestHandler {
                         active.terminal_context.clone(),
                         active.mode_tree_state_id,
                         active.mode_tree.is_some(),
+                        active.key_table_name.clone(),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -56,12 +57,15 @@ impl RequestHandler {
         let targets = {
             let state = self.state.lock().await;
             let mut targets = Vec::with_capacity(prompts.len());
-            for (pid, prompt, terminal_context, mode_tree_state_id, mode_tree_active) in &prompts {
+            for (pid, prompt, terminal_context, mode_tree_state_id, mode_tree_active, key_table) in
+                &prompts
+            {
                 let Ok(mut target) = super::attach_target_for_session_with_prompt(
                     &state,
                     session_name,
                     attached_count,
                     prompt.as_ref(),
+                    key_table.as_deref(),
                     terminal_context,
                 ) else {
                     return;
@@ -124,10 +128,13 @@ impl RequestHandler {
                         active.terminal_context.clone(),
                         active.mode_tree_state_id,
                         active.mode_tree.is_some(),
+                        active.key_table_name.clone(),
                     )
                 })
         };
-        let Some((prompt, terminal_context, mode_tree_state_id, mode_tree_active)) = prompt else {
+        let Some((prompt, terminal_context, mode_tree_state_id, mode_tree_active, key_table)) =
+            prompt
+        else {
             return;
         };
         let target = {
@@ -137,6 +144,7 @@ impl RequestHandler {
                 session_name,
                 attached_count,
                 prompt.as_ref(),
+                key_table.as_deref(),
                 &terminal_context,
             )
             .ok()
@@ -189,10 +197,13 @@ impl RequestHandler {
                         active.terminal_context.clone(),
                         active.mode_tree_state_id,
                         active.mode_tree.is_some(),
+                        active.key_table_name.clone(),
                     )
                 })
         };
-        let Some((prompt, terminal_context, mode_tree_state_id, mode_tree_active)) = prompt else {
+        let Some((prompt, terminal_context, mode_tree_state_id, mode_tree_active, key_table)) =
+            prompt
+        else {
             return;
         };
         let target = {
@@ -202,6 +213,7 @@ impl RequestHandler {
                 session_name,
                 attached_count,
                 prompt.as_ref(),
+                key_table.as_deref(),
                 &terminal_context,
             )
             .ok()
