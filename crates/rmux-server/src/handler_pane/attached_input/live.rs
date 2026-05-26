@@ -465,9 +465,22 @@ impl RequestHandler {
             pending_input.clear();
             forwarded = true;
         }
+        // Filter `raw_part` for orphaned terminal responses
+        // (`\x1b[?…c`, `\x1b[…;…R`, etc.).  In passthrough mode the
+        // host terminal sends real replies because the daemon doesn't
+        // intercept queries — so if vim queries DA1 and exits before
+        // the round-trip completes, the reply lands here destined for
+        // the shell.  We drop it iff the counter says no query is
+        // outstanding.  See the long comment on
+        // `ActiveAttach::outstanding_terminal_queries`.
         if !raw_part.is_empty() {
-            self.write_attached_bytes(attach_pid, raw_part).await?;
-            forwarded = true;
+            let kept = self
+                .strip_orphan_terminal_responses(attach_pid, raw_part)
+                .await;
+            if !kept.is_empty() {
+                self.write_attached_bytes(attach_pid, &kept).await?;
+                forwarded = true;
+            }
         }
 
         let Some((start, _)) = split else {
@@ -523,6 +536,102 @@ impl RequestHandler {
         let session_name = target.session_name().clone();
         let state = self.state.lock().await;
         session_option_key(&state, &session_name, OptionName::Prefix)
+    }
+
+    /// Walk `bytes`, splitting out CSI terminal-response sequences
+    /// (`\x1b[?…c`, `\x1b[…;…R`, …) and **dropping** any that arrive
+    /// while the outstanding-query counter is 0.  Responses that pair
+    /// with a tracked query are kept and decrement the counter.
+    /// Returns the filtered buffer.
+    ///
+    /// Used by the passthrough fast path on the client→pane direction
+    /// to defuse the post-vim-exit DA1 leak.
+    async fn strip_orphan_terminal_responses(
+        &self,
+        attach_pid: u32,
+        bytes: &[u8],
+    ) -> Vec<u8> {
+        let mut output = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b
+                && bytes.get(i + 1).copied() == Some(b'[')
+            {
+                match decode_terminal_response(&bytes[i..]) {
+                    TerminalResponseDecode::Matched { size } => {
+                        if self.consume_outstanding_terminal_query(attach_pid).await {
+                            // Genuine reply — pass through.
+                            output.extend_from_slice(&bytes[i..i + size]);
+                        }
+                        // else: orphan — drop the bytes silently.
+                        i += size;
+                        continue;
+                    }
+                    TerminalResponseDecode::Partial
+                    | TerminalResponseDecode::NotResponse => {
+                        // Not a complete response or not a response at
+                        // all — keep flowing.  A partial here is
+                        // rare (responses fit in one ssh packet
+                        // typically), and getting the cleanup wrong
+                        // on a partial would tear an extended-key
+                        // sequence in half.  Best-effort: forward
+                        // verbatim.
+                    }
+                }
+            }
+            output.push(bytes[i]);
+            i += 1;
+        }
+        output
+    }
+
+    /// Add `count` to the outstanding-terminal-query counter for the
+    /// given attach.  Called by the passthrough forwarder when it
+    /// emits pane→client bytes that contain a DA1/DA2/DSR/etc. query.
+    /// See [`crate::terminal_query::count_terminal_queries`] for the
+    /// query shapes counted.
+    pub(crate) async fn bump_outstanding_terminal_queries(&self, attach_pid: u32, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let mut active_attach = self.active_attach.lock().await;
+        if let Some(attach) = active_attach.by_pid.get_mut(&attach_pid) {
+            attach.outstanding_terminal_queries =
+                attach.outstanding_terminal_queries.saturating_add(count);
+        }
+    }
+
+    /// Reset the outstanding-terminal-query counter to zero.
+    ///
+    /// Called when the passthrough forwarder observes alt-screen-exit
+    /// (`\x1b[?1049l`) — a strong signal that a curses program (vi,
+    /// less, htop, nvim) has finished and the pane is back to whatever
+    /// was running before (typically the user's shell).  Any in-flight
+    /// queries from the finished program are now orphans — their
+    /// replies are bouncing back across SSH and will land at the new
+    /// listener (the shell), not the original asker.  Wipe the counter
+    /// so `strip_orphan_terminal_responses` drops those replies.
+    pub(crate) async fn reset_outstanding_terminal_queries(&self, attach_pid: u32) {
+        let mut active_attach = self.active_attach.lock().await;
+        if let Some(attach) = active_attach.by_pid.get_mut(&attach_pid) {
+            attach.outstanding_terminal_queries = 0;
+        }
+    }
+
+    /// Try to consume one outstanding terminal query for the given
+    /// attach.  Returns `true` if the counter was non-zero and we
+    /// decremented (response is genuine — forward it).  Returns
+    /// `false` if no query was outstanding (response is an orphan —
+    /// drop it).
+    async fn consume_outstanding_terminal_query(&self, attach_pid: u32) -> bool {
+        let mut active_attach = self.active_attach.lock().await;
+        if let Some(attach) = active_attach.by_pid.get_mut(&attach_pid) {
+            if attach.outstanding_terminal_queries > 0 {
+                attach.outstanding_terminal_queries -= 1;
+                return true;
+            }
+        }
+        false
     }
 
     async fn attached_prefix_table_active(&self, attach_pid: u32) -> bool {

@@ -962,6 +962,34 @@ pub(crate) async fn forward_attach_passthrough(
                     // history isn't lost.
                     continue;
                 }
+                // Track terminal-capability queries in pane→client
+                // bytes before emission.  Each query bumps the
+                // outstanding-query counter; the matching reply on
+                // the client→pane direction decrements it (or gets
+                // dropped if no query is outstanding) in
+                // `strip_orphan_terminal_responses`.
+                let query_count = crate::terminal_query::count_terminal_queries(&bytes);
+                if query_count > 0 {
+                    live_input
+                        .handler
+                        .bump_outstanding_terminal_queries(live_input.attach_pid, query_count)
+                        .await;
+                }
+                // Curses apps (vi, less, htop, nvim) leave alt-screen
+                // on exit via `\x1b[?1049l`.  Any DA1/DSR queries the
+                // app sent are now orphaned — the reply is in flight
+                // round-tripping across SSH and will land at the
+                // shell that has taken over the pane.  Counter alone
+                // is insufficient here because the reply IS a real
+                // response to a real query; the problem is the
+                // listener changed.  Treat alt-screen-exit as "fresh
+                // page": drop everything outstanding.
+                if contains_alt_screen_exit(&bytes) {
+                    live_input
+                        .handler
+                        .reset_outstanding_terminal_queries(live_input.attach_pid)
+                        .await;
+                }
                 emit_attach_bytes(&stream, &bytes).await?;
             }
             socket = read_socket_bytes(&stream, &mut decoder, &mut socket_read_buffer) => {
@@ -1044,6 +1072,7 @@ async fn emit_initial_passthrough_state(
          host scrollback would break. title = {title:?}",
     );
     emit_attach_bytes(stream, &title).await?;
+    emit_attach_bytes(stream, PASSTHROUGH_CURSOR_SHOW).await?;
     if let Some(replay) = passthrough_replay_bytes_for_target(current_target, live_input).await {
         // Replay bytes are the inner PTY's own emissions; vim et al
         // legitimately toggle alt-screen here. No assert.
@@ -1096,6 +1125,17 @@ fn contains_alt_screen_enter_dbg(_bytes: &[u8]) -> bool {
 #[cfg(any(unix, windows))]
 const PASSTHROUGH_FALLBACK_RESET: &[u8] = b"\x1b[m";
 
+/// Cursor-show (DECTCEM, `?25h`). Emitted after the OSC title on every
+/// passthrough attach and window switch so a plain shell prompt is
+/// usable: shells don't emit `?25h` themselves (they assume the
+/// terminal default is visible), so any prior `?25l` — left over from a
+/// TUI that exited mid-state, a previous non-passthrough attach, or a
+/// stuck terminal state — would otherwise leave the user line-editing
+/// blind. TUIs that legitimately want the cursor hidden re-hide it on
+/// their next emit, after these bytes.
+#[cfg(any(unix, windows))]
+const PASSTHROUGH_CURSOR_SHOW: &[u8] = b"\x1b[?25h";
+
 /// Alt-screen *enter* sequence. Forwarded inner-PTY bytes may
 /// legitimately contain this (vim, less, htop all toggle alt-screen
 /// when run *inside* a passthrough session — that's the user's call).
@@ -1115,6 +1155,20 @@ fn contains_alt_screen_enter(bytes: &[u8]) -> bool {
     bytes
         .windows(ALT_SCREEN_ENTER.len())
         .any(|window| window == ALT_SCREEN_ENTER)
+}
+
+/// Alt-screen-exit (`\x1b[?1049l`).  Emitted by curses programs
+/// (vi, less, htop, nvim) on shutdown — a strong signal that
+/// "fullscreen program just exited" and any in-flight terminal
+/// queries it issued are now orphaned.
+#[cfg(any(unix, windows))]
+const ALT_SCREEN_EXIT: &[u8] = b"\x1b[?1049l";
+
+#[cfg(any(unix, windows))]
+fn contains_alt_screen_exit(bytes: &[u8]) -> bool {
+    bytes
+        .windows(ALT_SCREEN_EXIT.len())
+        .any(|window| window == ALT_SCREEN_EXIT)
 }
 
 /// Encodes an OSC 0 (set icon name + window title) sequence with a
@@ -1217,6 +1271,7 @@ async fn switch_passthrough_target(
          host scrollback would break. title = {title:?}",
     );
     emit_attach_bytes(stream, &title).await?;
+    emit_attach_bytes(stream, PASSTHROUGH_CURSOR_SHOW).await?;
     // The replay log's snapshot already contains a reset prefix
     // (?1049l, soft reset, SGR0, clear, home) so we don't need an
     // explicit clear here when a log is present. When no log exists,

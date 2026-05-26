@@ -654,8 +654,6 @@ async fn passthrough_prefix_kitty_csi_u_form_dispatches() {
 /// output stream, and drop responses on the host→pane input stream when
 /// no query is outstanding. Until that's wired, this test fails.
 #[tokio::test]
-#[ignore = "FAILING — drives the unsolicited-DA1-reply fix; un-ignore once \
-            TerminalResponseFilter is wired into the passthrough input path"]
 async fn passthrough_drops_unsolicited_da1_reply_from_host() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
@@ -677,6 +675,59 @@ async fn passthrough_drops_unsolicited_da1_reply_from_host() {
          to the pane in passthrough mode. The receiver is the shell \
          (vim has exited), which would echo the bytes as visible \
          garbage and poison ZLE keymap state."
+    );
+}
+
+/// Subtler case the simple "drop only when counter==0" filter doesn't
+/// catch: vim *did* query DA1 (so the counter is positive), then vim
+/// exited (alt-screen-exit `\x1b[?1049l` on pane→client), then the
+/// reply arrived destined for vim — but the shell is now the listener.
+/// The fix: treat alt-screen-exit as "any in-flight queries are now
+/// orphaned" and wipe the counter, so the late reply gets dropped.
+///
+/// Drives the user-reported regression after running `vi
+/// ~/.config/gh/hosts.yml` on macOS WezTerm-over-SSH: the literal text
+/// `?65;4;6;18;22c` showed up at the shell prompt.
+#[tokio::test]
+async fn passthrough_drops_da1_reply_after_curses_program_exits() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let alpha = session_name("alpha");
+    let _control_rx = create_passthrough_attached_session(&handler, requester_pid, &alpha).await;
+
+    // Bump the counter to simulate the forwarder observing vim's
+    // startup DA1 query on the pane→client direction.
+    handler
+        .bump_outstanding_terminal_queries(requester_pid, 1)
+        .await;
+
+    // Simulate the alt-screen-exit reaching the forwarder.  In
+    // production, `forward_attach_passthrough` would call
+    // `reset_outstanding_terminal_queries` when it spots
+    // `\x1b[?1049l` in pane→client bytes.
+    handler
+        .reset_outstanding_terminal_queries(requester_pid)
+        .await;
+
+    // Now the late DA1 reply arrives on client→pane.  Even though
+    // a query *was* outstanding moments ago, the curses-app exit
+    // signal means the original asker is gone.  The reply must be
+    // dropped, not delivered to whatever's reading the pane PTY now.
+    let mut pending_input = Vec::new();
+    let forwarded = handler
+        .handle_attached_live_input_inner(
+            requester_pid,
+            &mut pending_input,
+            b"\x1b[?65;4;6;18;22c",
+        )
+        .await
+        .expect("post-curses-exit DA1 reply input");
+    assert!(
+        !forwarded,
+        "a DA1 reply arriving after the pane's curses program has \
+         exited (alt-screen left, counter reset) must NOT be \
+         forwarded — the shell that has taken over the pane never \
+         asked for it."
     );
 }
 

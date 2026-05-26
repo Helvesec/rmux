@@ -162,6 +162,7 @@ impl RequestHandler {
                 mode_tree_frame: None,
                 overlay: None,
                 display_panes: None,
+                outstanding_terminal_queries: 0,
             },
         ) {
             replaced_key_table = previous.key_table_name.clone();

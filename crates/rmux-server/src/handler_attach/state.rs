@@ -53,6 +53,16 @@ pub(in crate::handler) struct ActiveAttach {
     pub(in crate::handler) last_key: Option<KeyCode>,
     pub(in crate::handler) mouse: ClientMouseState,
     pub(in crate::handler) prompt: Option<ClientPromptState>,
+    /// Count of terminal queries (DA1/DA2/DSR/etc.) currently in flight
+    /// from the active pane out to the client.  Incremented when the
+    /// forwarder spots a query in pane→client bytes; decremented (and
+    /// the reply is forwarded) when a matching response arrives on
+    /// client→pane.  When a response arrives with a 0 count it's an
+    /// orphan — typically vim asked DA1, exited before the reply
+    /// round-tripped back across SSH, and the reply now lands at the
+    /// shell as visible garbage like `^[[?65;4;6;18;22c`.  We drop
+    /// orphans rather than forward them.
+    pub(in crate::handler) outstanding_terminal_queries: u32,
     pub(in crate::handler) mode_tree_state_id: u64,
     pub(in crate::handler) mode_tree: Option<ModeTreeClientState>,
     pub(in crate::handler) mode_tree_frame: Option<Vec<u8>>,

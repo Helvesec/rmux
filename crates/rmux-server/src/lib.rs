@@ -102,6 +102,8 @@ mod terminal;
 mod test_env;
 #[cfg(test)]
 mod test_shell;
+#[cfg(any(unix, windows))]
+mod terminal_query;
 #[cfg(unix)]
 mod unix_socket;
 #[cfg(any(unix, windows))]
