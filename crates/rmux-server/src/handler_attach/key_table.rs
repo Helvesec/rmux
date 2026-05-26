@@ -11,7 +11,7 @@ impl RequestHandler {
         key_table_name: Option<String>,
         key_table_set_at: Option<Instant>,
     ) -> Result<(), rmux_proto::RmuxError> {
-        let previous_key_table = {
+        let (previous_key_table, session_name) = {
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach.by_pid.get_mut(&attach_pid).ok_or_else(|| {
                 rmux_proto::RmuxError::Server("attached client disappeared".to_owned())
@@ -24,16 +24,27 @@ impl RequestHandler {
             let previous = active.key_table_name.clone();
             active.key_table_name = key_table_name.clone();
             active.key_table_set_at = key_table_set_at.filter(|_| key_table_name.is_some());
-            previous
+            (previous, active.session_name.clone())
         };
 
-        let mut state = self.state.lock().await;
-        if let Some(table_name) = key_table_name {
-            let _ = state.key_bindings.get_table(&table_name, true);
+        {
+            let mut state = self.state.lock().await;
+            if let Some(table_name) = key_table_name {
+                let _ = state.key_bindings.get_table(&table_name, true);
+            }
+            if let Some(table_name) = previous_key_table {
+                state.key_bindings.unref_table(&table_name);
+            }
         }
-        if let Some(table_name) = previous_key_table {
-            state.key_bindings.unref_table(&table_name);
-        }
+
+        // The key table just changed (e.g. entering or leaving the "prefix"
+        // table), so repaint the status bar immediately. Otherwise
+        // #{client_prefix} -- and any prefix-pressed indicator built on it --
+        // only refreshes on the next key event, which is too late to show the
+        // prefix while it is actually being held.
+        let _ = self
+            .refresh_attached_client_status(attach_pid, &session_name)
+            .await;
         Ok(())
     }
 
@@ -71,7 +82,7 @@ impl RequestHandler {
         attach_pid: u32,
         key_table_set_at: Instant,
     ) {
-        let previous_key_table = {
+        let (previous_key_table, session_name) = {
             let mut active_attach = self.active_attach.lock().await;
             let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
                 return;
@@ -89,13 +100,18 @@ impl RequestHandler {
             active.repeat_deadline = None;
             active.repeat_active = false;
             active.last_key = None;
-            previous
+            (previous, active.session_name.clone())
         };
 
         if let Some(table_name) = previous_key_table {
             let mut state = self.state.lock().await;
             state.key_bindings.unref_table(&table_name);
         }
+
+        // Prefix timed out without a follow-up key; repaint so the indicator clears.
+        let _ = self
+            .refresh_attached_client_status(attach_pid, &session_name)
+            .await;
     }
 
     async fn clear_attached_repeat_state_if_current(
@@ -103,7 +119,7 @@ impl RequestHandler {
         attach_pid: u32,
         repeat_deadline: Instant,
     ) {
-        let previous_key_table = {
+        let (previous_key_table, session_name) = {
             let mut active_attach = self.active_attach.lock().await;
             let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
                 return;
@@ -118,12 +134,16 @@ impl RequestHandler {
             active.repeat_deadline = None;
             active.repeat_active = false;
             active.last_key = None;
-            previous
+            (previous, active.session_name.clone())
         };
 
         if let Some(table_name) = previous_key_table {
             let mut state = self.state.lock().await;
             state.key_bindings.unref_table(&table_name);
         }
+
+        let _ = self
+            .refresh_attached_client_status(attach_pid, &session_name)
+            .await;
     }
 }
