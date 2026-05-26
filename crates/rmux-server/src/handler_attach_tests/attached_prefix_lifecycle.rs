@@ -12,10 +12,17 @@ async fn attached_prefix_d_dispatches_detach_client() {
         .await
         .expect("prefix d dispatches");
 
-    assert!(
-        matches!(control_rx.try_recv(), Ok(AttachControl::Detach)),
-        "C-b d must detach the attached client"
-    );
+    // Entering and leaving the prefix key table now repaints the status bar
+    // (so #{client_prefix} can show a prefix indicator), so the Detach control
+    // may be preceded by status-refresh Write frames; scan past them.
+    let mut detached = false;
+    while let Ok(control) = control_rx.try_recv() {
+        if matches!(control, AttachControl::Detach) {
+            detached = true;
+            break;
+        }
+    }
+    assert!(detached, "C-b d must detach the attached client");
 }
 
 #[tokio::test]
@@ -34,8 +41,15 @@ async fn attached_prefix_d_dispatches_detach_client_across_separate_reads() {
         .await
         .expect("prefix d input");
 
+    let mut detached = false;
+    while let Ok(control) = control_rx.try_recv() {
+        if matches!(control, AttachControl::Detach) {
+            detached = true;
+            break;
+        }
+    }
     assert!(
-        matches!(control_rx.try_recv(), Ok(AttachControl::Detach)),
+        detached,
         "C-b d must still detach when prefix and command arrive in separate reads"
     );
 }

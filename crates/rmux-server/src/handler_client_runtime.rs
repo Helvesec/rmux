@@ -149,7 +149,7 @@ impl RequestHandler {
         session_name: &rmux_proto::SessionName,
     ) -> Result<(), RmuxError> {
         let attached_count = self.attached_count(session_name).await;
-        let (prompt, terminal_context) = {
+        let (prompt, terminal_context, key_table) = {
             let active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
@@ -161,6 +161,7 @@ impl RequestHandler {
                     .as_ref()
                     .map(prompt_support::ClientPromptState::rendered_prompt),
                 active.terminal_context.clone(),
+                active.key_table_name.clone(),
             )
         };
         let bytes = {
@@ -175,6 +176,8 @@ impl RequestHandler {
                 &state.options,
                 attached_count,
                 prompt.as_ref(),
+                Some(&state),
+                key_table.as_deref(),
             );
             outer_terminal.wrap_render_frame(&frame)
         };

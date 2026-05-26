@@ -484,6 +484,7 @@ pub(super) fn attach_target_for_session(
         session_name,
         attached_count,
         None,
+        None,
         terminal_context,
     )
 }
@@ -493,6 +494,7 @@ fn attach_target_for_session_with_prompt(
     session_name: &rmux_proto::SessionName,
     attached_count: usize,
     prompt: Option<&renderer::RenderedPrompt>,
+    key_table: Option<&str>,
     terminal_context: &OuterTerminalContext,
 ) -> Result<AttachTarget, rmux_proto::RmuxError> {
     let session = state
@@ -529,8 +531,10 @@ fn attach_target_for_session_with_prompt(
             prompt,
             pane_state
                 .as_ref()
-                .map(|state| state.title.as_str())
+                .map(|pane_state| pane_state.title.as_str())
                 .filter(|title| !title.is_empty()),
+            Some(state),
+            key_table,
         )
         .as_slice(),
     );

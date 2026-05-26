@@ -7,6 +7,7 @@ use rmux_core::{
 use rmux_proto::OptionName;
 
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
+use crate::pane_terminals::HandlerState;
 
 use super::{
     apply_runtime_style_overlay, apply_style_overlay, colour_inherits_base, cursor_position_bytes,
@@ -38,6 +39,8 @@ pub(super) fn render_status_bar(
     attached_count: usize,
     prompt: Option<&RenderedPrompt>,
     pane_title: Option<&str>,
+    state: Option<&HandlerState>,
+    key_table: Option<&str>,
 ) -> Vec<u8> {
     let Some(status_y) = geometry.status_y else {
         return Vec::new();
@@ -60,6 +63,8 @@ pub(super) fn render_status_bar(
         geometry.terminal_size.cols,
         attached_count,
         pane_title,
+        state,
+        key_table,
     );
     let mut frame = Vec::new();
     render_formatted_line(&mut frame, 0, status_y, &line);
@@ -85,7 +90,7 @@ pub(super) fn status_bar_runs(
         &base_style,
         options.resolve(Some(session_name), OptionName::StatusRightStyle),
     );
-    let context = active_format_context(session, attached_count);
+    let context = active_format_context(session, attached_count, None);
     let left_template = options
         .resolve(Some(session_name), OptionName::StatusLeft)
         .unwrap_or_default();
@@ -134,13 +139,26 @@ pub(super) fn status_bar_runs(
     runs
 }
 
-fn active_format_context(session: &Session, attached_count: usize) -> FormatContext {
+fn active_format_context(
+    session: &Session,
+    attached_count: usize,
+    key_table: Option<&str>,
+) -> FormatContext {
     let mut context = FormatContext::from_session(session)
         .with_session_attached(attached_count)
         .with_window(session.active_window_index(), session.window(), true, false);
     if let Some(pane) = session.window().active_pane() {
         context = context.with_window_pane(session.window(), pane);
     }
+    // The status bar is rendered per session, so client_prefix/client_key_table
+    // reflect the (representative) attached client's runtime key table. When the
+    // prefix has been pressed the client's key table is "prefix"; otherwise it
+    // falls back to the root table. Without this the #{?client_prefix,...} and
+    // #{client_key_table} format variables always expanded to empty.
+    let prefix_active = key_table == Some("prefix");
+    context = context
+        .with_named_value("client_key_table", key_table.unwrap_or("root"))
+        .with_named_value("client_prefix", if prefix_active { "1" } else { "0" });
     context
 }
 
@@ -150,7 +168,7 @@ pub(super) fn status_bar_line(
     columns: u16,
     attached_count: usize,
 ) -> FormattedLine {
-    status_bar_line_with_pane_title(session, options, columns, attached_count, None)
+    status_bar_line_with_pane_title(session, options, columns, attached_count, None, None, None)
 }
 
 fn status_bar_line_with_pane_title(
@@ -159,15 +177,23 @@ fn status_bar_line_with_pane_title(
     columns: u16,
     attached_count: usize,
     pane_title: Option<&str>,
+    state: Option<&HandlerState>,
+    key_table: Option<&str>,
 ) -> FormattedLine {
     let width = usize::from(columns);
     let utf8_config = Utf8Config::from_options(options);
     let session_name = session.name();
     let base_style = resolved_status_style(options, session_name);
-    let mut runtime = RuntimeFormatContext::new(active_format_context(session, attached_count))
-        .with_options(options)
-        .with_session(session)
-        .with_window(session.active_window_index(), session.window());
+    let mut runtime =
+        RuntimeFormatContext::new(active_format_context(session, attached_count, key_table))
+            .with_options(options)
+            .with_session(session)
+            .with_window(session.active_window_index(), session.window());
+    // Threading the handler state in lets runtime variables such as
+    // #{pane_in_mode} (the copy-mode indicator) resolve in the status bar.
+    if let Some(state) = state {
+        runtime = runtime.with_state(state);
+    }
     if let Some(pane) = session.window().active_pane() {
         runtime = runtime.with_pane(pane);
     }
