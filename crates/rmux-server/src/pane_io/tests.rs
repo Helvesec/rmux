@@ -7,7 +7,8 @@ use rmux_core::events::OutputCursorItem;
 use rmux_core::{OptionStore, PaneGeometry};
 use rmux_proto::{
     encode_attach_message, AttachFrameDecoder, AttachMessage, AttachedKeystroke, KeyDispatched,
-    NewSessionRequest, Request, Response, SessionName, TerminalSize,
+    NewSessionExtRequest, NewSessionRequest, NewWindowRequest, Request, Response, SessionName,
+    TerminalSize,
 };
 use rmux_pty::PtyPair;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1352,6 +1353,320 @@ async fn forward_attach_passthrough_winches_new_window_on_switch() {
         saw_sentinel,
         "passthrough switch must deliver SIGWINCH to the new window's fg pgrp; \
          got master read: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+}
+
+/// Spawns a passthrough session via the real handler pipeline and
+/// returns the populated handler. Pinned to a long-sleeping shell so
+/// the spawned PTY doesn't race the test by emitting prompt bytes
+/// (matches the helper in `handler_attach_tests/passthrough_input.rs`).
+async fn create_passthrough_session_with_quiet_shell(
+    handler: &RequestHandler,
+    session: &SessionName,
+) {
+    let response = handler
+        .handle(Request::NewSessionExt(NewSessionExtRequest {
+            session_name: Some(session.clone()),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "sleep 60".to_owned(),
+            ]),
+            process_command: None,
+            passthrough: true,
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::NewSession(_)),
+        "passthrough session must be created, got {response:?}"
+    );
+}
+
+#[tokio::test]
+async fn pane_screen_state_returns_mode_bits_alt_screen_and_cursor_style_from_transcript() {
+    // The new accessor that drives the switch-time mode diff. Feed
+    // the inner program's mode-setting bytes directly into the
+    // transcript and verify the handler-level lookup reports them.
+    // Pins the wiring from pane_screen_state → HandlerState lookup
+    // → transcripts hashmap → PaneTranscript::{mode,cursor_style,
+    // is_alternate}. A regression here would silently break the
+    // switch diff for every mode family at once.
+    use rmux_core::input::mode as mode_bits;
+
+    let handler = Arc::new(RequestHandler::new());
+    let alpha = SessionName::new("alpha").expect("valid session name");
+    create_passthrough_session_with_quiet_shell(&handler, &alpha).await;
+
+    let pane_id = handler
+        .pane_id_at_for_test(&alpha, 0)
+        .await
+        .expect("window 0 must have an active pane");
+
+    // Drive the pane into a "vim mid-session" state via raw bytes:
+    // enter alt-screen, enable SGR mouse + button-event tracking +
+    // bracketed paste, hide cursor, set a steady-bar cursor style.
+    handler
+        .feed_pane_transcript_for_test(
+            &alpha,
+            pane_id,
+            b"\x1b[?1049h\x1b[?1006h\x1b[?1002h\x1b[?2004h\x1b[?25l\x1b[6 q",
+        )
+        .await
+        .expect("feeding transcript should not fail");
+
+    let (modes, cursor_style, is_alternate) = handler
+        .pane_screen_state(&alpha, pane_id)
+        .await
+        .expect("pane_screen_state must return Some for a real pane");
+
+    assert!(is_alternate, "?1049h must flip the pane into alt-screen");
+    assert_eq!(
+        cursor_style, 6,
+        "DECSCUSR 6 (steady bar) must be tracked, got {cursor_style}"
+    );
+    assert!(
+        modes & mode_bits::MODE_MOUSE_SGR != 0,
+        "?1006h must set MODE_MOUSE_SGR; mode bits = {modes:#x}"
+    );
+    assert!(
+        modes & mode_bits::MODE_MOUSE_BUTTON != 0,
+        "?1002h must set MODE_MOUSE_BUTTON; mode bits = {modes:#x}"
+    );
+    assert!(
+        modes & mode_bits::MODE_BRACKETPASTE != 0,
+        "?2004h must set MODE_BRACKETPASTE; mode bits = {modes:#x}"
+    );
+    assert!(
+        modes & mode_bits::MODE_CURSOR == 0,
+        "?25l must clear MODE_CURSOR (cursor hidden); mode bits = {modes:#x}"
+    );
+}
+
+#[tokio::test]
+async fn forward_attach_passthrough_switch_emits_mode_resets_and_alt_screen_bridge() {
+    // End-to-end window-switch test: window 0 has a "vim" pane driven
+    // into alt-screen + mouse-SGR + bracketed paste + steady-bar
+    // cursor; window 1 has a fresh shell pane with no mode toggles.
+    // A switch from 0 → 1 must emit:
+    //   * `\x1b[?1049l` to bridge the host out of alt-screen
+    //     (otherwise scroll wheel in the shell window becomes arrow
+    //     keys per wezterm/iterm defaults, breaking line editing).
+    //   * `\x1b[?1006l` and `\x1b[?1002l` to disable mouse reporting
+    //     (otherwise scroll wheel events arrive at the shell as
+    //     mouse-event bytes and break input).
+    //   * `\x1b[0 q` to reset cursor style.
+    //   * `\x1b[?2004l` to disable bracketed paste only if the target
+    //     pane doesn't want it — its transcript has no `?2004h`, so
+    //     yes, it should be reset.
+    //
+    // The mode diff is idempotent (extra resets are no-ops at the
+    // host), so we test for the *presence* of each expected byte
+    // sequence — the exact ordering or interleaving with the
+    // snapshot-replay bytes is implementation detail.
+    let handler = Arc::new(RequestHandler::new());
+    let alpha = SessionName::new("alpha").expect("valid session name");
+    create_passthrough_session_with_quiet_shell(&handler, &alpha).await;
+
+    // Add window 1 with the same quiet shell so the spawned PTY
+    // doesn't churn bytes during the test.
+    let response = handler
+        .handle(Request::NewWindow(NewWindowRequest {
+            target: alpha.clone(),
+            name: None,
+            detached: true,
+            environment: None,
+            command: Some(vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "sleep 60".to_owned(),
+            ]),
+            start_directory: None,
+            target_window_index: None,
+            insert_at_target: false,
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::NewWindow(_)),
+        "new-window must succeed, got {response:?}"
+    );
+
+    let pane_zero = handler
+        .pane_id_at_for_test(&alpha, 0)
+        .await
+        .expect("window 0 pane");
+    let pane_one = handler
+        .pane_id_at_for_test(&alpha, 1)
+        .await
+        .expect("window 1 pane");
+    assert_ne!(pane_zero, pane_one, "pane IDs must differ across windows");
+
+    // Drive window 0's pane into "vim alt-screen with mouse on" state.
+    // Bracketed paste and steady-bar cursor mirror what a real
+    // editor session looks like.
+    handler
+        .feed_pane_transcript_for_test(
+            &alpha,
+            pane_zero,
+            b"\x1b[?1049h\x1b[?1006h\x1b[?1002h\x1b[?2004h\x1b[6 q",
+        )
+        .await
+        .expect("feed window 0 transcript");
+    // Window 1's pane stays untouched — fresh shell, no mode toggles.
+
+    // Build AttachTargets matched to the real pane IDs. PTY masters
+    // and pane_output channels are local stubs; the forwarder's
+    // switch path only uses them for SIGWINCH (ignored here) and
+    // output forwarding (no producer => no output).
+    let pty_zero = PtyPair::open().expect("pty 0");
+    let pty_one = PtyPair::open().expect("pty 1");
+    let outer_terminal = || {
+        OuterTerminal::resolve(&OptionStore::default(), OuterTerminalContext::default())
+    };
+    // Keep a handle to source-pane's output channel so we can drive
+    // the forwarder's host_in_alt_screen mirror to `true` via the
+    // same code path the inner program uses in production. Without
+    // this, the mirror stays at its initial `false` and the
+    // alt-screen bridge has no reason to emit `?1049l`.
+    let pane_output_zero = pane_output_channel();
+    let target_zero = AttachTarget {
+        session_name: alpha.clone(),
+        pane_master: pty_zero.into_master(),
+        pane_output: pane_output_zero.clone(),
+        render_frame: Vec::new(),
+        outer_terminal: outer_terminal(),
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: Some(pane_zero),
+    };
+    let target_one = AttachTarget {
+        session_name: alpha.clone(),
+        pane_master: pty_one.into_master(),
+        pane_output: pane_output_channel(),
+        render_frame: Vec::new(),
+        outer_terminal: outer_terminal(),
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: Some(pane_one),
+    };
+
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let live_input = LiveAttachInputContext {
+        handler: Arc::clone(&handler),
+        attach_pid: std::process::id(),
+    };
+
+    let attach_task = tokio::spawn(forward_attach_passthrough(
+        stream,
+        target_zero,
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        closing.clone(),
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+    ));
+
+    // Let the forwarder enter its select loop and emit the initial
+    // state for target_zero before we drive any state through the
+    // pane_output channel.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Simulate window-zero's "vim startup" — emit alt-screen-enter
+    // through the live pane_output channel so the forwarder's
+    // byte scanner picks it up and updates host_in_alt_screen to
+    // true. Bracketed paste / mouse modes don't need to flow here
+    // because the diff at switch time reads them from the target
+    // pane's Screen via the transcript we pre-populated above.
+    let _ = pane_output_zero.send(b"\x1b[?1049h".to_vec());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    control_tx
+        .send(AttachControl::switch(target_one))
+        .expect("send switch");
+    // Then detach so the forwarder exits and we can join.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    control_tx
+        .send(AttachControl::Detach)
+        .expect("send detach");
+
+    let _ = tokio::time::timeout(Duration::from_secs(2), attach_task).await;
+
+    let mut collected = Vec::new();
+    let mut buf = [0_u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(50), peer.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(read)) => {
+                let mut decoder = AttachFrameDecoder::new();
+                decoder.push_bytes(&buf[..read]);
+                while let Some(AttachMessage::Data(bytes)) =
+                    decoder.next_message().expect("decode attach frame")
+                {
+                    collected.extend_from_slice(&bytes);
+                }
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+
+    let contains = |needle: &[u8]| {
+        collected
+            .windows(needle.len())
+            .any(|window| window == needle)
+    };
+
+    assert!(
+        contains(b"\x1b[?1049l"),
+        "alt-screen bridge must emit `?1049l` so the host returns to main \
+         screen before the shell takes over (otherwise wezterm-class \
+         terminals map scroll-in-alt-screen to arrow keys). Got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        contains(b"\x1b[?1006l"),
+        "SGR mouse encoding must be reset; otherwise scroll wheel events \
+         arrive at the shell as `\\x1b[<…M` and break line editing. \
+         Got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        contains(b"\x1b[?1002l"),
+        "button-event mouse tracking must be reset; got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        contains(b"\x1b[?2004l"),
+        "bracketed paste must be reset when the target pane doesn't \
+         have it set (its transcript was never fed `?2004h`). Got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        contains(b"\x1b[0 q"),
+        "DECSCUSR must be reset to terminal default when target's \
+         cursor style differs from source's (source had 6, target has 0). \
+         Got: {:?}",
         String::from_utf8_lossy(&collected)
     );
 }

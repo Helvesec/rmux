@@ -417,6 +417,40 @@ impl RequestHandler {
         state.pane_screen_state_lookup(session_name, pane_id)
     }
 
+    /// Test helper: returns the active pane's ID for a given window
+    /// index, or `None` if the session/window/pane chain is missing.
+    /// Lets the passthrough switch-diff tests resolve pane IDs without
+    /// going through the chrome-laden attach_target_for_session path.
+    #[cfg(test)]
+    pub(crate) async fn pane_id_at_for_test(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        window_index: u32,
+    ) -> Option<rmux_core::PaneId> {
+        let state = self.state.lock().await;
+        state
+            .sessions
+            .session(session_name)?
+            .window_at(window_index)?
+            .active_pane()
+            .map(|pane| pane.id())
+    }
+
+    /// Test helper: feeds raw bytes into a pane's transcript so the
+    /// `Screen` records the inner-program's mode toggles without
+    /// actually spawning that program. Used by the switch-diff tests
+    /// to drive a pane into a known mode state.
+    #[cfg(test)]
+    pub(crate) async fn feed_pane_transcript_for_test(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        pane_id: rmux_core::PaneId,
+        bytes: &[u8],
+    ) -> Result<(), rmux_proto::RmuxError> {
+        let mut state = self.state.lock().await;
+        state.append_bytes_to_runtime_pane_transcript(session_name, pane_id, bytes)
+    }
+
     pub(crate) fn install_shutdown_handle(&self, shutdown_handle: ShutdownHandle) {
         *self
             .shutdown_handle
