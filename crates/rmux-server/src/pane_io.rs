@@ -780,13 +780,36 @@ pub(crate) async fn forward_attach_passthrough(
     // these is safe — the bytes still land in the passthrough replay
     // log and a future window-switch / re-attach replays them).
     let mut overlay_alt_screen_visible = false;
+    // Mirror of the host terminal's `?1049h/l` state. Updated by
+    // `update_host_alt_screen` from every byte sequence we emit that
+    // could toggle it (snapshot replays on attach/switch, raw inner-
+    // PTY bytes, overlay brackets). Read on detach to decide whether
+    // we need to emit `?1049l` so the [detached] banner lands on the
+    // host's main screen, and on switch to align mismatched buffers.
+    //
+    // Initial value is `false` because a fresh attach assumes the
+    // host arrives in main-screen — that's where every shell launches
+    // and where the user's pre-attach scrollback lives.
+    let mut host_in_alt_screen = false;
     decoder.push_bytes(&initial_socket_bytes);
 
-    emit_initial_passthrough_state(&stream, &current_target, &live_input).await?;
+    emit_initial_passthrough_state(
+        &stream,
+        &current_target,
+        &live_input,
+        &mut host_in_alt_screen,
+    )
+    .await?;
 
     loop {
         if closing.load(Ordering::SeqCst) {
-            return passthrough_exit(&stream, &current_target, "closing flag set").await;
+            return passthrough_exit(
+                &stream,
+                &current_target,
+                "closing flag set",
+                host_in_alt_screen,
+            )
+            .await;
         }
         // Drain anything already buffered in the socket without
         // blocking — keeps keystrokes from queueing behind output.
@@ -794,7 +817,13 @@ pub(crate) async fn forward_attach_passthrough(
             match try_read_socket_bytes(&stream, &mut decoder, &mut socket_read_buffer)? {
                 TrySocketRead::Read => {}
                 TrySocketRead::Closed => {
-                    return passthrough_exit(&stream, &current_target, "client socket closed (drain)").await;
+                    return passthrough_exit(
+                        &stream,
+                        &current_target,
+                        "client socket closed (drain)",
+                        host_in_alt_screen,
+                    )
+                    .await;
                 }
                 TrySocketRead::WouldBlock => break,
             }
@@ -821,7 +850,11 @@ pub(crate) async fn forward_attach_passthrough(
             // Emit the detached banner so the client recognises the
             // teardown — same rationale as `passthrough_exit`: we
             // do NOT use `attach_stop_sequence` because it would
-            // clear the host screen.
+            // clear the host screen. De-align alt-screen first so the
+            // banner lands on the host's main buffer.
+            if host_in_alt_screen {
+                let _ = emit_attach_bytes(&stream, ALT_SCREEN_EXIT).await;
+            }
             let _ = emit_detached_message(&stream, &current_target).await;
             return Err(error);
         }
@@ -830,19 +863,51 @@ pub(crate) async fn forward_attach_passthrough(
             biased;
             result = shutdown.changed() => {
                 let _ = result;
-                return passthrough_exit(&stream, &current_target, "server shutdown").await;
+                return passthrough_exit(
+                    &stream,
+                    &current_target,
+                    "server shutdown",
+                    host_in_alt_screen,
+                )
+                .await;
             }
             control = control_rx.recv() => {
                 match control {
-                    None => return passthrough_exit(&stream, &current_target, "control channel closed").await,
+                    None => {
+                        return passthrough_exit(
+                            &stream,
+                            &current_target,
+                            "control channel closed",
+                            host_in_alt_screen,
+                        )
+                        .await
+                    }
                     Some(AttachControl::Detach) => {
-                        return passthrough_exit(&stream, &current_target, "detach").await;
+                        return passthrough_exit(
+                            &stream,
+                            &current_target,
+                            "detach",
+                            host_in_alt_screen,
+                        )
+                        .await;
                     }
                     Some(AttachControl::Exited) => {
-                        return passthrough_exit(&stream, &current_target, "pane exited").await;
+                        return passthrough_exit(
+                            &stream,
+                            &current_target,
+                            "pane exited",
+                            host_in_alt_screen,
+                        )
+                        .await;
                     }
                     Some(AttachControl::DetachKill) => {
-                        return passthrough_exit(&stream, &current_target, "detach-kill").await;
+                        return passthrough_exit(
+                            &stream,
+                            &current_target,
+                            "detach-kill",
+                            host_in_alt_screen,
+                        )
+                        .await;
                     }
                     Some(AttachControl::Switch(next_target)) => {
                         switch_passthrough_target(
@@ -850,6 +915,7 @@ pub(crate) async fn forward_attach_passthrough(
                             &mut current_target,
                             *next_target,
                             &live_input,
+                            &mut host_in_alt_screen,
                         )
                         .await?;
                     }
@@ -887,20 +953,23 @@ pub(crate) async fn forward_attach_passthrough(
                         match (overlay.persistent, overlay.frame.is_empty()) {
                             (true, true) => {
                                 if overlay_alt_screen_visible {
-                                    emit_attach_bytes(&stream, b"\x1b[?1049l").await?;
+                                    emit_attach_bytes(&stream, ALT_SCREEN_EXIT).await?;
                                     overlay_alt_screen_visible = false;
+                                    host_in_alt_screen = false;
                                 }
                             }
                             (true, false) => {
                                 if !overlay_alt_screen_visible {
-                                    emit_attach_bytes(&stream, b"\x1b[?1049h").await?;
+                                    emit_attach_bytes(&stream, ALT_SCREEN_ENTER).await?;
                                     overlay_alt_screen_visible = true;
+                                    host_in_alt_screen = true;
                                 }
                                 emit_attach_bytes(&stream, &overlay.frame).await?;
                             }
                             (false, false) if !overlay_alt_screen_visible => {
-                                emit_attach_bytes(&stream, b"\x1b[?1049h").await?;
+                                emit_attach_bytes(&stream, ALT_SCREEN_ENTER).await?;
                                 overlay_alt_screen_visible = true;
+                                host_in_alt_screen = true;
                                 emit_attach_bytes(&stream, &overlay.frame).await?;
                             }
                             (false, false) => {
@@ -909,8 +978,9 @@ pub(crate) async fn forward_attach_passthrough(
                                 // signature. Drop the restore frame
                                 // (the inner pane will repaint) and
                                 // leave the alt-screen buffer.
-                                emit_attach_bytes(&stream, b"\x1b[?1049l").await?;
+                                emit_attach_bytes(&stream, ALT_SCREEN_EXIT).await?;
                                 overlay_alt_screen_visible = false;
+                                host_in_alt_screen = false;
                             }
                             (false, true) => {
                                 // No-op; daemon shouldn't normally
@@ -927,16 +997,20 @@ pub(crate) async fn forward_attach_passthrough(
                         // bracket if it's still open so the host
                         // returns to its main buffer immediately.
                         if overlay_alt_screen_visible {
-                            emit_attach_bytes(&stream, b"\x1b[?1049l").await?;
+                            emit_attach_bytes(&stream, ALT_SCREEN_EXIT).await?;
                             overlay_alt_screen_visible = false;
+                            host_in_alt_screen = false;
                         }
                     }
                     Some(AttachControl::Write(bytes)) => {
                         // Bell / advisory bytes — forward unchanged.
                         // Even when an overlay is visible these are
                         // tiny single-byte sentinels (\x07 mostly)
-                        // and safe to emit on top.
+                        // and safe to emit on top. Scan in case the
+                        // daemon ever sends a chunk that toggles
+                        // alt-screen via this channel.
                         emit_attach_bytes(&stream, &bytes).await?;
+                        update_host_alt_screen(&bytes, &mut host_in_alt_screen);
                     }
                     Some(_) => {
                         // Remaining control variants (LockShellCommand,
@@ -991,10 +1065,17 @@ pub(crate) async fn forward_attach_passthrough(
                         .await;
                 }
                 emit_attach_bytes(&stream, &bytes).await?;
+                update_host_alt_screen(&bytes, &mut host_in_alt_screen);
             }
             socket = read_socket_bytes(&stream, &mut decoder, &mut socket_read_buffer) => {
                 if !socket? {
-                    return passthrough_exit(&stream, &current_target, "client socket closed").await;
+                    return passthrough_exit(
+                        &stream,
+                        &current_target,
+                        "client socket closed",
+                        host_in_alt_screen,
+                    )
+                    .await;
                 }
             }
         }
@@ -1029,12 +1110,25 @@ async fn passthrough_exit(
     stream: &LocalStream,
     current_target: &types::OpenAttachTarget,
     reason: &'static str,
+    host_in_alt_screen: bool,
 ) -> io::Result<()> {
     debug!(
         reason,
         session = %current_target.session_name,
+        host_in_alt_screen,
         "passthrough attach forwarder exiting",
     );
+    // The detach banner must land on the host's MAIN screen — that's
+    // the buffer the user will be looking at after the attach goes
+    // away, and the buffer their pre-attach scrollback lives in. If
+    // we leave the host in alt-screen the banner gets painted into
+    // the alt buffer and instantly hidden by the terminal's
+    // `?1049l`-on-disconnect (or simply lost when the user switches
+    // tabs). The transition is best-effort: a peer that has already
+    // closed makes the write a benign no-op.
+    if host_in_alt_screen {
+        let _ = emit_attach_bytes(stream, ALT_SCREEN_EXIT).await;
+    }
     let write_result = if reason == "pane exited" {
         emit_exited_message(stream).await
     } else {
@@ -1064,10 +1158,11 @@ async fn emit_initial_passthrough_state(
     stream: &LocalStream,
     current_target: &super::pane_io::types::OpenAttachTarget,
     live_input: &LiveAttachInputContext,
+    host_in_alt_screen: &mut bool,
 ) -> io::Result<()> {
     let title = passthrough_title_sequence(&current_target.session_name);
     debug_assert!(
-        !contains_alt_screen_enter_dbg(&title),
+        !contains_alt_screen_enter(&title),
         "passthrough title sequence must not contain alt-screen-enter; \
          host scrollback would break. title = {title:?}",
     );
@@ -1075,33 +1170,24 @@ async fn emit_initial_passthrough_state(
     emit_attach_bytes(stream, PASSTHROUGH_CURSOR_SHOW).await?;
     if let Some(replay) = passthrough_replay_bytes_for_target(current_target, live_input).await {
         // Replay bytes are the inner PTY's own emissions; vim et al
-        // legitimately toggle alt-screen here. No assert.
-        emit_attach_bytes(stream, &replay).await
+        // legitimately toggle alt-screen here. No assert. Mirror the
+        // final alt-screen state from the bytes we just emitted so
+        // detach/switch can de-align correctly.
+        emit_attach_bytes(stream, &replay).await?;
+        update_host_alt_screen(&replay, host_in_alt_screen);
+        Ok(())
     } else {
         debug_assert!(
-            !contains_alt_screen_enter_dbg(PASSTHROUGH_FALLBACK_RESET),
+            !contains_alt_screen_enter(PASSTHROUGH_FALLBACK_RESET),
             "PASSTHROUGH_FALLBACK_RESET must stay chrome-free",
         );
         emit_attach_bytes(stream, PASSTHROUGH_FALLBACK_RESET).await
+        // Fallback path emits no alt toggles; host_in_alt_screen
+        // stays at whatever the caller initialised it to (false on
+        // a fresh attach).
     }
 }
 
-/// Shim so the assert site stays compilable in release builds (where
-/// `contains_alt_screen_enter` is `cfg(debug_assertions)`-gated).
-/// The compiler elides this and the wrapping `debug_assert!` in
-/// release, so there's no runtime cost.
-#[cfg(any(unix, windows))]
-#[inline]
-fn contains_alt_screen_enter_dbg(_bytes: &[u8]) -> bool {
-    #[cfg(debug_assertions)]
-    {
-        contains_alt_screen_enter(_bytes)
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        false
-    }
-}
 
 /// SGR reset only. Used when a passthrough attach/switch has no
 /// replay log to paint and we explicitly do **not** want the
@@ -1142,15 +1228,16 @@ const PASSTHROUGH_CURSOR_SHOW: &[u8] = b"\x1b[?25h";
 /// But rmux's own server-generated frames must never contain it, or
 /// passthrough mode would silently break the host-scrollback promise.
 /// Used by debug asserts at the boundary between server-generated and
-/// inner-forwarded bytes.
-#[cfg(all(any(unix, windows), debug_assertions))]
+/// inner-forwarded bytes, and by [`update_host_alt_screen`] to mirror
+/// the host's alt-screen state from the byte stream.
+#[cfg(any(unix, windows))]
 const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
 
 /// Returns true if `bytes` contains the alt-screen-enter sequence.
 /// Used by debug asserts inside the passthrough forwarder to catch
 /// any future code that accidentally emits chrome from the server
 /// side instead of forwarding it from the inner PTY.
-#[cfg(all(any(unix, windows), debug_assertions))]
+#[cfg(any(unix, windows))]
 fn contains_alt_screen_enter(bytes: &[u8]) -> bool {
     bytes
         .windows(ALT_SCREEN_ENTER.len())
@@ -1169,6 +1256,45 @@ fn contains_alt_screen_exit(bytes: &[u8]) -> bool {
     bytes
         .windows(ALT_SCREEN_EXIT.len())
         .any(|window| window == ALT_SCREEN_EXIT)
+}
+
+/// Mirrors the host terminal's alt-screen state by scanning `bytes`
+/// for `?1049h` / `?1049l` and applying each toggle in order.
+///
+/// `bytes` is what the forwarder just emitted to the client (snapshot
+/// replay, raw inner-PTY chunk, explicit transition, overlay frame).
+/// Each `?1049h` flips the host into alt; each `?1049l` flips it
+/// back. The final state after the scan is what the host is in.
+///
+/// Why scan rather than set explicitly at each emit site: the snapshot
+/// prefix and the inner program's own bytes both legitimately contain
+/// toggles, and they arrive interleaved in long raw buffers. A single
+/// scan keeps one source of truth (the bytes we actually emitted)
+/// without forcing every emit site to remember to update the flag.
+#[cfg(any(unix, windows))]
+fn update_host_alt_screen(bytes: &[u8], host_in_alt_screen: &mut bool) {
+    debug_assert_eq!(
+        ALT_SCREEN_ENTER.len(),
+        ALT_SCREEN_EXIT.len(),
+        "enter/exit must share length so a single window walk covers both",
+    );
+    let sequence_len = ALT_SCREEN_ENTER.len();
+    if bytes.len() < sequence_len {
+        return;
+    }
+    let mut i = 0;
+    while i + sequence_len <= bytes.len() {
+        let window = &bytes[i..i + sequence_len];
+        if window == ALT_SCREEN_ENTER {
+            *host_in_alt_screen = true;
+            i += sequence_len;
+        } else if window == ALT_SCREEN_EXIT {
+            *host_in_alt_screen = false;
+            i += sequence_len;
+        } else {
+            i += 1;
+        }
+    }
 }
 
 /// Encodes an OSC 0 (set icon name + window title) sequence with a
@@ -1231,6 +1357,7 @@ async fn switch_passthrough_target(
     current_target: &mut super::pane_io::types::OpenAttachTarget,
     next_target: AttachTarget,
     live_input: &LiveAttachInputContext,
+    host_in_alt_screen: &mut bool,
 ) -> io::Result<()> {
     // Snapshot identity *before* the move so we can decide whether
     // this is a real switch. `active_pane_id == None` means we have
@@ -1266,19 +1393,23 @@ async fn switch_passthrough_target(
     // inner program will override on its next emit.
     let title = passthrough_title_sequence(&current_target.session_name);
     debug_assert!(
-        !contains_alt_screen_enter_dbg(&title),
+        !contains_alt_screen_enter(&title),
         "passthrough title sequence must not contain alt-screen-enter; \
          host scrollback would break. title = {title:?}",
     );
     emit_attach_bytes(stream, &title).await?;
     emit_attach_bytes(stream, PASSTHROUGH_CURSOR_SHOW).await?;
-    // The replay log's snapshot already contains a reset prefix
-    // (?1049l, soft reset, SGR0, clear, home) so we don't need an
-    // explicit clear here when a log is present. When no log exists,
-    // emit a minimal reset before painting render_frame so the old
-    // window's content doesn't bleed under.
+    // The replay log's snapshot already contains a conditional alt-
+    // screen prefix (?1049h when the captured grid was alt, ?1049l
+    // otherwise) plus reset/clear/home, so the host is dragged into
+    // the right buffer automatically. When no log exists we have to
+    // do that work ourselves: a fresh pane is necessarily in main-
+    // screen (no inner program has written anything yet), so emit
+    // ?1049l if the host was left in alt by the previous window.
     if let Some(replay) = passthrough_replay_bytes_for_target(current_target, live_input).await {
-        emit_attach_bytes(stream, &replay).await
+        emit_attach_bytes(stream, &replay).await?;
+        update_host_alt_screen(&replay, host_in_alt_screen);
+        Ok(())
     } else {
         // On *switch* the screen still has the previous window's
         // content; we must clear before painting the new window or
@@ -1286,9 +1417,13 @@ async fn switch_passthrough_target(
         // attach path, which deliberately preserves host scrollback.
         // Still chrome-free — no `render_frame`.
         debug_assert!(
-            !contains_alt_screen_enter_dbg(PASSTHROUGH_SWITCH_RESET),
+            !contains_alt_screen_enter(PASSTHROUGH_SWITCH_RESET),
             "PASSTHROUGH_SWITCH_RESET must stay chrome-free",
         );
+        if *host_in_alt_screen {
+            emit_attach_bytes(stream, ALT_SCREEN_EXIT).await?;
+            *host_in_alt_screen = false;
+        }
         emit_attach_bytes(stream, PASSTHROUGH_SWITCH_RESET).await
     }
 }

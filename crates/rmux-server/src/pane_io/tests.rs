@@ -18,8 +18,8 @@ use super::wire::open_attach_target;
 use super::wire::recv_pane_output;
 use super::{
     forward_attach, forward_attach_passthrough, pane_output_channel,
-    pane_output_channel_with_limits, process_socket_messages, should_emit_overlay, AttachControl,
-    AttachTarget, LiveAttachInputContext, OverlayFrame,
+    pane_output_channel_with_limits, process_socket_messages, should_emit_overlay,
+    update_host_alt_screen, AttachControl, AttachTarget, LiveAttachInputContext, OverlayFrame,
 };
 use crate::handler::RequestHandler;
 use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
@@ -1351,6 +1351,143 @@ async fn forward_attach_passthrough_winches_new_window_on_switch() {
         saw_sentinel,
         "passthrough switch must deliver SIGWINCH to the new window's fg pgrp; \
          got master read: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+}
+
+#[test]
+fn update_host_alt_screen_tracks_last_toggle_in_chunk() {
+    // No toggle → unchanged.
+    let mut state = false;
+    update_host_alt_screen(b"plain text with no CSI", &mut state);
+    assert!(!state, "no toggle must leave state unchanged");
+
+    // Enter sets true.
+    update_host_alt_screen(b"prelude \x1b[?1049h tail", &mut state);
+    assert!(state, "?1049h must flip to alt");
+
+    // Exit sets false.
+    update_host_alt_screen(b"\x1b[?1049l", &mut state);
+    assert!(!state, "?1049l must flip back to main");
+
+    // Multi-toggle chunk: final wins.
+    update_host_alt_screen(b"\x1b[?1049h some\x1b[?1049l content\x1b[?1049h", &mut state);
+    assert!(state, "final ?1049h in chunk must determine end state");
+
+    // Short buffer (< 8 bytes) early-returns without panic.
+    update_host_alt_screen(b"abc", &mut state);
+    assert!(state, "short buffer leaves state untouched");
+}
+
+#[tokio::test]
+async fn forward_attach_passthrough_emits_alt_screen_exit_on_detach_if_host_in_alt() {
+    // Regression: when the inner program drove the host into alt-screen
+    // (vim, less, htop), detach must emit `\x1b[?1049l` *before* the
+    // detached banner. Without it the banner lands in the alt buffer
+    // and is hidden the moment the terminal returns to main on
+    // disconnect — the user sees a blank screen and wonders what
+    // happened. Sister of `forward_attach_passthrough_emits_detached_banner_on_detach`
+    // which pins the no-alt-screen case (no spurious `?1049l`).
+    let handler = Arc::new(RequestHandler::new());
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let session_name = SessionName::new("alpha").expect("valid session name");
+
+    let pane_output = pane_output_channel();
+    let pty = PtyPair::open().expect("open pty pair");
+    let outer_terminal =
+        OuterTerminal::resolve(&OptionStore::default(), OuterTerminalContext::default());
+    let target = AttachTarget {
+        session_name: session_name.clone(),
+        pane_master: pty.into_master(),
+        pane_output: pane_output.clone(),
+        render_frame: Vec::new(),
+        outer_terminal,
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: None,
+    };
+
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let live_input = LiveAttachInputContext {
+        handler,
+        attach_pid: std::process::id(),
+    };
+
+    let attach_task = tokio::spawn(forward_attach_passthrough(
+        stream,
+        target,
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        closing.clone(),
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+    ));
+
+    // Give the forwarder time to subscribe before we publish — same
+    // race as `forward_attach_passthrough_forwards_pane_output_verbatim`.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Simulate vim's first emit driving the host into alt-screen.
+    let _ = pane_output.send(b"\x1b[?1049h vim contents".to_vec());
+    // Let the forwarder drain that publish before detaching.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    control_tx
+        .send(AttachControl::Detach)
+        .expect("send detach control");
+
+    tokio::time::timeout(Duration::from_secs(2), attach_task)
+        .await
+        .expect("attach task should exit within 2s after Detach")
+        .expect("attach task join")
+        .expect("attach task should return Ok on clean detach");
+
+    let mut collected = Vec::new();
+    let mut buf = [0_u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(50), peer.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(read)) => {
+                let mut decoder = AttachFrameDecoder::new();
+                decoder.push_bytes(&buf[..read]);
+                while let Some(AttachMessage::Data(bytes)) =
+                    decoder.next_message().expect("decode attach frame")
+                {
+                    collected.extend_from_slice(&bytes);
+                }
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+
+    // Find positions: alt-enter must precede alt-exit, both must exist,
+    // alt-exit must precede the detached banner.
+    let find = |needle: &[u8]| {
+        collected
+            .windows(needle.len())
+            .position(|window| window == needle)
+    };
+    let alt_enter = find(b"\x1b[?1049h").expect("test publish drove host into alt-screen");
+    let alt_exit_after_enter = collected[alt_enter + 8..]
+        .windows(b"\x1b[?1049l".len())
+        .position(|window| window == b"\x1b[?1049l")
+        .map(|offset| offset + alt_enter + 8);
+    let alt_exit = alt_exit_after_enter
+        .expect("passthrough detach must emit `?1049l` after the host was driven into alt-screen");
+    let banner_at = collected
+        .windows(b"[detached".len())
+        .position(|window| window == b"[detached")
+        .expect("detached banner must be emitted");
+    assert!(
+        alt_exit < banner_at,
+        "alt-screen exit must come *before* the detached banner so the banner lands \
+         on the host's main buffer; got alt_exit={alt_exit}, banner={banner_at} in \
+         stream: {:?}",
         String::from_utf8_lossy(&collected)
     );
 }
