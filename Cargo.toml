@@ -12,7 +12,7 @@ members = [
     "crates/rmux-sdk",
     "crates/rmux-render-core",
     "crates/ratatui-rmux",
-    "xtask",
+    "xtask", 
 ]
 resolver = "2"
 

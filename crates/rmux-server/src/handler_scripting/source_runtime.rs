@@ -1,4 +1,6 @@
 use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::Ordering;
 
 use rmux_core::{
@@ -108,6 +110,48 @@ impl RequestHandler {
         self.config_loading_depth.fetch_sub(1, Ordering::Relaxed);
     }
 
+    async fn run_plugin_scripts(&self, plugin_paths: Vec<&str>) -> Result<(), RmuxError> {
+        let socket_path = self.server_socket_path.lock().unwrap().clone();
+        let session_name = {
+            let state = self.state.lock().await;
+            let name = state.sessions.iter().next().map(|(name, _)| name.clone());
+            name
+        };
+        let Some(session_name) = session_name else {
+            return Err(RmuxError::Server("no active session".to_owned()));
+        };
+        let rmux_binary = std::env::current_exe().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let shim_path = tmp.path().join("tmux");
+        std::fs::write(
+            &shim_path,
+            format!(
+                "#!/bin/sh\nexec {} -S \"$RMUX_SOCKET\" \"$@\"",
+                rmux_binary.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path_env = format!(
+            "{}:{}",
+            tmp.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        for path in plugin_paths {
+            let status = tokio::process::Command::new("bash")
+                .arg(path)
+                .env("PATH", &path_env)
+                .env("RMUX_SOCKET", socket_path.to_string_lossy().as_ref())
+                .env("RMUX_SESSION", session_name.as_str())
+                .status()
+                .await;
+            if let Err(e) = status {
+                return Err(RmuxError::Server(format!("failed to run plugin {path}: {e}")));
+            }
+        }
+        Ok(())
+    }
+
     pub(in crate::handler) async fn handle_source_file(
         &self,
         requester_pid: u32,
@@ -117,6 +161,20 @@ impl RequestHandler {
         if command.target.is_none() {
             command.target = self.implicit_source_file_target(requester_pid).await;
         }
+
+        let plugin_paths: Vec<&str> = command.paths
+            .iter()
+            .filter(|p| p.ends_with(".tmux"))
+            .map(String::as_str)
+            .collect();
+
+        if !plugin_paths.is_empty(){
+            return match self.run_plugin_scripts(plugin_paths).await {
+                Ok(()) => Response::SourceFile(SourceFileResponse::no_output()),
+                Err(error) => Response::Error(ErrorResponse { error }),
+            };
+        }
+
         let mut loaded = match self.load_source_file_command(&command, 1).await {
             Ok(loaded) => loaded,
             Err(error) => return Response::Error(ErrorResponse { error }),
@@ -174,6 +232,16 @@ impl RequestHandler {
         mut command: ParsedSourceFileCommand,
         context: &QueueExecutionContext,
     ) -> Result<QueueCommandAction, RmuxError> {
+        let plugin_paths: Vec<&str> = command
+            .paths
+            .iter()
+            .filter(|p| p.ends_with(".tmux"))
+            .map(String::as_str)
+            .collect();
+        if !plugin_paths.is_empty() {
+            self.run_plugin_scripts(plugin_paths).await?;
+            return Ok(QueueCommandAction::Normal { output: None, error: None });
+        }
         let depth = context.source_file_depth.saturating_add(1);
         command.current_file = context.current_file.clone();
         let mut loaded = self.load_source_file_command(&command, depth).await?;
