@@ -106,9 +106,23 @@ pub(crate) fn new_shared_log(options: &OptionStore) -> SharedPassthroughReplayLo
     ))))
 }
 
-/// Tees a slice of inner-PTY bytes into the pane's replay log and, if
-/// the log has exceeded budget, refreshes its snapshot from the
-/// pane's current grid state.
+/// Tees a slice of inner-PTY bytes into the pane's replay log and
+/// refreshes its snapshot when either (a) the raw log has exceeded
+/// budget, or (b) the chunk contains a full-repaint signal — alt-
+/// screen enter/exit. After a full repaint everything in raw_log
+/// prior to the marker is irrelevant to the displayed content (vim
+/// quitting drops an MB of UI churn that was only relevant to the
+/// alt buffer it's about to leave; ditto on entering alt-screen
+/// from a chatty main-buffer program). Refreshing eagerly keeps
+/// per-pane memory bounded under realistic TUI workloads, well
+/// below the budget ceiling.
+///
+/// Contract: the caller MUST have already applied `bytes` to
+/// `transcript` before this fn runs — the snapshot is built from
+/// the transcript's screen, and we want it to reflect the post-
+/// chunk state. The reader loop enforces this; see [`fix(passthrough):
+/// feed transcript before replay-log snapshot refresh`] in the
+/// history if this invariant looks tempting to invert.
 ///
 /// Cheap no-op when `log` is `None` — callers can pass through
 /// regardless of whether the owning session is passthrough.
@@ -124,11 +138,114 @@ pub(crate) fn append_to_log(
         .lock()
         .expect("passthrough replay log mutex must not be poisoned");
     log.append(bytes);
-    if log.over_budget() {
+    let full_repaint = contains_alt_screen_exit(bytes) || contains_alt_screen_enter(bytes);
+    if full_repaint || log.over_budget() {
         let screen = transcript
             .lock()
             .expect("pane transcript mutex must not be poisoned")
             .clone_screen();
         log.refresh_snapshot(&screen);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pane_transcript::PaneTranscript;
+    use rmux_proto::TerminalSize;
+
+    fn transcript_with(bytes: &[u8]) -> SharedPaneTranscript {
+        let transcript = PaneTranscript::shared(1024, TerminalSize { cols: 20, rows: 4 });
+        transcript
+            .lock()
+            .expect("test transcript not poisoned")
+            .append_bytes(bytes);
+        transcript
+    }
+
+    fn log_with_budget(budget: usize) -> SharedPassthroughReplayLog {
+        Arc::new(Mutex::new(PassthroughReplayLog::new(budget)))
+    }
+
+    #[test]
+    fn alt_screen_exit_in_chunk_collapses_raw_log_to_snapshot() {
+        // The dominant memory-growth case in real use: vim/htop runs
+        // for ages emitting MBs of UI churn into raw_log, then the
+        // user quits and the alt-buffer's contents are now irrelevant
+        // to anything that will be replayed. A proactive snapshot
+        // refresh at this moment caps memory below the budget rather
+        // than waiting until we drift past it.
+        let log = log_with_budget(1024 * 1024);
+        let transcript = transcript_with(b"baseline content");
+        // Burn a few KB of "vim activity" into the raw log without
+        // hitting the budget ceiling.
+        let chatter = vec![b'x'; 8 * 1024];
+        append_to_log(Some(&log), &transcript, &chatter);
+        assert_eq!(
+            log.lock().expect("not poisoned").raw_log_len(),
+            chatter.len(),
+            "raw_log should accumulate the bytes verbatim before the exit signal",
+        );
+        // Now vim quits — emit the alt-screen exit. Snapshot must
+        // collapse the raw log.
+        append_to_log(Some(&log), &transcript, b"goodbye\x1b[?1049l");
+        let final_log = log.lock().expect("not poisoned");
+        assert_eq!(
+            final_log.raw_log_len(),
+            0,
+            "alt-screen exit must trigger an eager snapshot refresh, draining raw_log",
+        );
+        assert!(
+            final_log.snapshot_len() > 0,
+            "snapshot must now hold the post-exit screen state",
+        );
+    }
+
+    #[test]
+    fn alt_screen_enter_in_chunk_collapses_raw_log_to_snapshot() {
+        // Sister of the exit case: entering alt-screen makes the
+        // pre-entry main-buffer history irrelevant to what the inner
+        // program will paint in the alt buffer. Eager refresh keeps
+        // memory bounded for a chatty main-buffer program (`tail -f`)
+        // that suddenly opens a TUI.
+        let log = log_with_budget(1024 * 1024);
+        let transcript = transcript_with(b"\x1b[?1049hentering alt");
+        append_to_log(Some(&log), &transcript, b"\x1b[?1049hvim opens");
+        let final_log = log.lock().expect("not poisoned");
+        assert_eq!(final_log.raw_log_len(), 0);
+        assert!(final_log.snapshot_len() > 0);
+    }
+
+    #[test]
+    fn plain_bytes_do_not_trigger_proactive_refresh() {
+        // Sanity: only the marker bytes refresh proactively. Ordinary
+        // shell output must accumulate in raw_log until budget is
+        // exceeded.
+        let log = log_with_budget(1024 * 1024);
+        let transcript = transcript_with(b"$ ls\r\n");
+        append_to_log(Some(&log), &transcript, b"file1 file2 file3\r\n");
+        let final_log = log.lock().expect("not poisoned");
+        assert!(
+            final_log.raw_log_len() > 0,
+            "plain output must stay in raw_log, not trigger a refresh",
+        );
+        assert_eq!(
+            final_log.snapshot_len(),
+            0,
+            "no proactive refresh expected for plain output",
+        );
+    }
+
+    #[test]
+    fn over_budget_still_refreshes_without_marker() {
+        // The legacy budget path must keep working. A 4-byte budget
+        // forces a refresh on every append larger than 4 bytes, with
+        // no alt-screen markers in the payload.
+        let log = log_with_budget(4);
+        let transcript = transcript_with(b"hi");
+        append_to_log(Some(&log), &transcript, b"longer-than-budget");
+        let final_log = log.lock().expect("not poisoned");
+        assert_eq!(final_log.raw_log_len(), 0);
+        assert!(final_log.snapshot_len() > 0);
     }
 }
