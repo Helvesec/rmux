@@ -29,6 +29,11 @@ mod types;
 mod wire;
 
 #[cfg(any(unix, windows))]
+use crate::passthrough_replay::{
+    contains_alt_screen_enter, contains_alt_screen_exit, update_host_alt_screen,
+    ALT_SCREEN_ENTER, ALT_SCREEN_EXIT,
+};
+#[cfg(any(unix, windows))]
 use crate::renderer::PaneRenderDelta;
 #[cfg(any(unix, windows))]
 use control::{
@@ -1221,81 +1226,6 @@ const PASSTHROUGH_FALLBACK_RESET: &[u8] = b"\x1b[m";
 /// their next emit, after these bytes.
 #[cfg(any(unix, windows))]
 const PASSTHROUGH_CURSOR_SHOW: &[u8] = b"\x1b[?25h";
-
-/// Alt-screen *enter* sequence. Forwarded inner-PTY bytes may
-/// legitimately contain this (vim, less, htop all toggle alt-screen
-/// when run *inside* a passthrough session — that's the user's call).
-/// But rmux's own server-generated frames must never contain it, or
-/// passthrough mode would silently break the host-scrollback promise.
-/// Used by debug asserts at the boundary between server-generated and
-/// inner-forwarded bytes, and by [`update_host_alt_screen`] to mirror
-/// the host's alt-screen state from the byte stream.
-#[cfg(any(unix, windows))]
-const ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
-
-/// Returns true if `bytes` contains the alt-screen-enter sequence.
-/// Used by debug asserts inside the passthrough forwarder to catch
-/// any future code that accidentally emits chrome from the server
-/// side instead of forwarding it from the inner PTY.
-#[cfg(any(unix, windows))]
-fn contains_alt_screen_enter(bytes: &[u8]) -> bool {
-    bytes
-        .windows(ALT_SCREEN_ENTER.len())
-        .any(|window| window == ALT_SCREEN_ENTER)
-}
-
-/// Alt-screen-exit (`\x1b[?1049l`).  Emitted by curses programs
-/// (vi, less, htop, nvim) on shutdown — a strong signal that
-/// "fullscreen program just exited" and any in-flight terminal
-/// queries it issued are now orphaned.
-#[cfg(any(unix, windows))]
-const ALT_SCREEN_EXIT: &[u8] = b"\x1b[?1049l";
-
-#[cfg(any(unix, windows))]
-fn contains_alt_screen_exit(bytes: &[u8]) -> bool {
-    bytes
-        .windows(ALT_SCREEN_EXIT.len())
-        .any(|window| window == ALT_SCREEN_EXIT)
-}
-
-/// Mirrors the host terminal's alt-screen state by scanning `bytes`
-/// for `?1049h` / `?1049l` and applying each toggle in order.
-///
-/// `bytes` is what the forwarder just emitted to the client (snapshot
-/// replay, raw inner-PTY chunk, explicit transition, overlay frame).
-/// Each `?1049h` flips the host into alt; each `?1049l` flips it
-/// back. The final state after the scan is what the host is in.
-///
-/// Why scan rather than set explicitly at each emit site: the snapshot
-/// prefix and the inner program's own bytes both legitimately contain
-/// toggles, and they arrive interleaved in long raw buffers. A single
-/// scan keeps one source of truth (the bytes we actually emitted)
-/// without forcing every emit site to remember to update the flag.
-#[cfg(any(unix, windows))]
-fn update_host_alt_screen(bytes: &[u8], host_in_alt_screen: &mut bool) {
-    debug_assert_eq!(
-        ALT_SCREEN_ENTER.len(),
-        ALT_SCREEN_EXIT.len(),
-        "enter/exit must share length so a single window walk covers both",
-    );
-    let sequence_len = ALT_SCREEN_ENTER.len();
-    if bytes.len() < sequence_len {
-        return;
-    }
-    let mut i = 0;
-    while i + sequence_len <= bytes.len() {
-        let window = &bytes[i..i + sequence_len];
-        if window == ALT_SCREEN_ENTER {
-            *host_in_alt_screen = true;
-            i += sequence_len;
-        } else if window == ALT_SCREEN_EXIT {
-            *host_in_alt_screen = false;
-            i += sequence_len;
-        } else {
-            i += 1;
-        }
-    }
-}
 
 /// Encodes an OSC 0 (set icon name + window title) sequence with a
 /// rmux-tagged session label. Emitted by the passthrough forwarder on

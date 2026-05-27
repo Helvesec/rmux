@@ -19,8 +19,9 @@ use super::wire::recv_pane_output;
 use super::{
     forward_attach, forward_attach_passthrough, pane_output_channel,
     pane_output_channel_with_limits, process_socket_messages, should_emit_overlay,
-    update_host_alt_screen, AttachControl, AttachTarget, LiveAttachInputContext, OverlayFrame,
+    AttachControl, AttachTarget, LiveAttachInputContext, OverlayFrame,
 };
+use crate::passthrough_replay::update_host_alt_screen;
 use crate::handler::RequestHandler;
 use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
 
