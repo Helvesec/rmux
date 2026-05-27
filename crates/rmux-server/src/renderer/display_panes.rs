@@ -147,12 +147,17 @@ fn display_pane_specs(session: &Session, options: &OptionStore) -> Vec<DisplayPa
     let active_colour = display_panes_colour(
         options.resolve(Some(session.name()), OptionName::DisplayPanesActiveColour),
     );
+    let base_index = options
+        .resolve(Some(session.name()), 
+            OptionName::PaneBaseIndex)
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0);
 
     display_panes(window)
         .into_iter()
         .filter_map(|pane| {
             let geometry = visible_pane_geometry(session, options, pane)?;
-            let label = pane.index().to_string();
+            let label = pane.index().saturating_add(base_index).to_string();
             let label_width = u16::try_from(label.len()).ok()?;
             if geometry.cols() < label_width || geometry.rows() == 0 {
                 return None;
@@ -413,7 +418,7 @@ pub(crate) struct DisplayPaneTarget {
 mod tests {
     use super::*;
     use rmux_core::{OptionStore, Session};
-    use rmux_proto::{ResizePaneAdjustment, SessionName, TerminalSize};
+    use rmux_proto::{ResizePaneAdjustment, SessionName, TerminalSize, ScopeSelector, SetOptionMode};
 
     fn session_name(value: &str) -> SessionName {
         SessionName::new(value).expect("valid session name")
@@ -483,5 +488,24 @@ mod tests {
         let options = OptionStore::new();
         assert!(render_display_panes_overlay(&session, &options).is_empty());
         assert_eq!(display_panes_label_count(&session, &options), 0);
+    }
+
+    #[test]
+    fn display_panes_overlay_respects_pane_base_index() {
+        let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 8, rows: 4 }); 
+        session.split_active_pane().expect("split succeeds");
+        let mut options = OptionStore::new();
+        options.set(
+                ScopeSelector::Global,
+                OptionName::PaneBaseIndex,
+                "1".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("set succeeds");
+
+        let frame = String::from_utf8(render_display_panes_overlay(&session, &options)).expect("overlay is utf-8");
+
+        assert!(frame.contains("\u{1b}[2;3H\u{1b}[0m\u{1b}[44m1"));
+        assert!(frame.contains("\u{1b}[2;7H\u{1b}[0m\u{1b}[41m2"));
     }
 }
