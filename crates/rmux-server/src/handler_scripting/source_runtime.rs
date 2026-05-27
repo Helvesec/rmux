@@ -110,6 +110,15 @@ impl RequestHandler {
         self.config_loading_depth.fetch_sub(1, Ordering::Relaxed);
     }
 
+    fn extract_plugin_paths(command: &ParsedSourceFileCommand) -> Vec<&str> {
+        command
+            .paths
+            .iter()
+            .filter(|p| p.ends_with(".tmux"))
+            .map(String::as_str)
+            .collect()
+    }
+
     async fn run_plugin_scripts(&self, plugin_paths: Vec<&str>) -> Result<(), RmuxError> {
         let socket_path = self.server_socket_path.lock().unwrap().clone();
         let session_name = {
@@ -162,13 +171,8 @@ impl RequestHandler {
             command.target = self.implicit_source_file_target(requester_pid).await;
         }
 
-        let plugin_paths: Vec<&str> = command.paths
-            .iter()
-            .filter(|p| p.ends_with(".tmux"))
-            .map(String::as_str)
-            .collect();
-
-        if !plugin_paths.is_empty(){
+        let plugin_paths = Self::extract_plugin_paths(&command);
+        if !plugin_paths.is_empty() {
             return match self.run_plugin_scripts(plugin_paths).await {
                 Ok(()) => Response::SourceFile(SourceFileResponse::no_output()),
                 Err(error) => Response::Error(ErrorResponse { error }),
@@ -232,12 +236,7 @@ impl RequestHandler {
         mut command: ParsedSourceFileCommand,
         context: &QueueExecutionContext,
     ) -> Result<QueueCommandAction, RmuxError> {
-        let plugin_paths: Vec<&str> = command
-            .paths
-            .iter()
-            .filter(|p| p.ends_with(".tmux"))
-            .map(String::as_str)
-            .collect();
+        let plugin_paths = Self::extract_plugin_paths(&command);
         if !plugin_paths.is_empty() {
             self.run_plugin_scripts(plugin_paths).await?;
             return Ok(QueueCommandAction::Normal { output: None, error: None });
