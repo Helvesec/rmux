@@ -169,8 +169,14 @@ impl PassthroughReplayLog {
 /// current display.
 ///
 /// Emits, in order:
-/// 1. Exit alt-screen if set (`ESC [ ? 1049 l`) — passthrough never wants
-///    the host in alt-screen.
+/// 1. Alt-screen sync: `ESC [ ? 1049 h` when the screen is in alt mode
+///    (a TUI like vim/less/htop), otherwise `ESC [ ? 1049 l`. The host
+///    must paint into the same buffer the captured grid belongs to —
+///    forcing the host to main while the grid was captured from alt
+///    paints alt-buffer content into main-buffer scrollback, corrupting
+///    the user's history. (Previous versions of this function always
+///    emitted `?1049l` and exhibited exactly that bug when a long-running
+///    TUI triggered a snapshot refresh on raw-log overflow.)
 /// 2. Soft reset (`ESC [ ! p`) to drop DEC private modes the previous
 ///    occupant may have left on.
 /// 3. SGR reset (`ESC [ 0 m`).
@@ -184,7 +190,11 @@ impl PassthroughReplayLog {
 #[must_use]
 pub fn render_screen_snapshot(screen: &Screen) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(b"\x1b[?1049l");
+    if screen.is_alternate() {
+        out.extend_from_slice(b"\x1b[?1049h");
+    } else {
+        out.extend_from_slice(b"\x1b[?1049l");
+    }
     out.extend_from_slice(b"\x1b[!p");
     out.extend_from_slice(b"\x1b[m");
     out.extend_from_slice(b"\x1b[2J\x1b[H");
@@ -275,9 +285,25 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_begins_with_safe_reset_sequence() {
+    fn snapshot_for_main_screen_begins_with_alt_exit_then_safe_reset() {
         let bytes = render_screen_snapshot(terminal_with(b"hi").screen());
         assert!(bytes.starts_with(b"\x1b[?1049l\x1b[!p\x1b[m\x1b[2J\x1b[H"));
+    }
+
+    #[test]
+    fn snapshot_for_alt_screen_begins_with_alt_enter_then_safe_reset() {
+        // Regression: a long-running TUI (vim, less, htop) in alt-screen
+        // mode would, on raw-log overflow, get a snapshot that
+        // unconditionally emitted `?1049l`. That dragged the host out of
+        // alt and painted the captured alt-buffer grid into main-buffer
+        // scrollback, corrupting the user's history. The snapshot must
+        // paint into the buffer the grid was captured from.
+        let bytes = render_screen_snapshot(terminal_with(b"\x1b[?1049hin alt").screen());
+        assert!(
+            bytes.starts_with(b"\x1b[?1049h\x1b[!p\x1b[m\x1b[2J\x1b[H"),
+            "alt-screen snapshot must begin with `?1049h`; got: {:?}",
+            String::from_utf8_lossy(&bytes[..16.min(bytes.len())])
+        );
     }
 
     #[test]
