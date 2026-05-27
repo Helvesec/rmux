@@ -1008,6 +1008,99 @@ async fn forward_attach_passthrough_never_paints_render_frame_or_alt_screen() {
 }
 
 #[tokio::test]
+async fn forward_attach_passthrough_emits_cursor_show_on_initial_attach() {
+    // Regression: in passthrough mode the host terminal's cursor
+    // visibility is whatever the previous inner program last left it
+    // as. A shell (zsh, bash) at the prompt assumes the cursor is
+    // visible and never emits `?25h` itself, so if anything earlier
+    // hid it (a prior TUI, a previous attach to a non-passthrough
+    // session, even a stuck terminal state), the user lands at a
+    // prompt with no visible cursor and no way to see where their
+    // line-editing is. The forwarder must guarantee a cursor-show on
+    // every attach so plain shells are usable; TUIs that legitimately
+    // want the cursor hidden can re-hide it via their own emit (their
+    // bytes flow through after ours).
+    let handler = Arc::new(RequestHandler::new());
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let session_name = SessionName::new("alpha").expect("valid session name");
+
+    let pty = PtyPair::open().expect("open pty pair");
+    let target = AttachTarget {
+        session_name: session_name.clone(),
+        pane_master: pty.into_master(),
+        pane_output: pane_output_channel(),
+        render_frame: Vec::new(),
+        outer_terminal: OuterTerminal::resolve(
+            &OptionStore::default(),
+            OuterTerminalContext::default(),
+        ),
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: None,
+    };
+
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let live_input = LiveAttachInputContext {
+        handler,
+        attach_pid: std::process::id(),
+    };
+
+    let attach_task = tokio::spawn(forward_attach_passthrough(
+        stream,
+        target,
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        closing.clone(),
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+    ));
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    control_tx
+        .send(AttachControl::Detach)
+        .expect("send detach control");
+    let _ = tokio::time::timeout(Duration::from_secs(2), attach_task).await;
+
+    let mut collected = Vec::new();
+    let mut buf = [0_u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(50), peer.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(read)) => {
+                let mut decoder = AttachFrameDecoder::new();
+                decoder.push_bytes(&buf[..read]);
+                while let Some(AttachMessage::Data(bytes)) =
+                    decoder.next_message().expect("decode attach frame")
+                {
+                    collected.extend_from_slice(&bytes);
+                }
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+
+    let contains = |needle: &[u8]| {
+        collected
+            .windows(needle.len())
+            .any(|window| window == needle)
+    };
+    assert!(
+        contains(b"\x1b[?25h"),
+        "passthrough initial attach must emit the cursor-show sequence \
+         `\\x1b[?25h` so a shell prompt is usable even if the host \
+         arrived at the attach with the cursor hidden. Got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+}
+
+#[tokio::test]
 async fn forward_attach_passthrough_emits_detached_banner_on_detach() {
     let handler = Arc::new(RequestHandler::new());
     let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
