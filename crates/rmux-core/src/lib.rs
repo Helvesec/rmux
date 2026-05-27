@@ -73,8 +73,8 @@ pub use options::{
 };
 pub use pane::{Pane, PaneGeometry};
 pub use passthrough_log::{
-    is_passthrough_session, reject_pane_op_if_passthrough, render_screen_snapshot,
-    PassthroughReplayLog, DEFAULT_PASSTHROUGH_REPLAY_BUDGET,
+    is_passthrough_session, reject_pane_op_if_passthrough, render_mode_diff_resets,
+    render_screen_snapshot, PassthroughReplayLog, DEFAULT_PASSTHROUGH_REPLAY_BUDGET,
 };
 pub use screen::{Screen, ScreenCellView, ScreenLineView};
 pub use session::{

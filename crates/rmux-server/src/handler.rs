@@ -404,6 +404,18 @@ impl RequestHandler {
         state.passthrough_log_lookup(session_name, pane_id)
     }
 
+    /// Snapshot of a pane's `(mode_bits, cursor_style)`. Used by the
+    /// passthrough attach forwarder to compute the source-vs-target
+    /// mode diff at window-switch time.
+    pub(crate) async fn pane_screen_state(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        pane_id: rmux_core::PaneId,
+    ) -> Option<(u32, u32)> {
+        let state = self.state.lock().await;
+        state.pane_screen_state_lookup(session_name, pane_id)
+    }
+
     pub(crate) fn install_shutdown_handle(&self, shutdown_handle: ShutdownHandle) {
         *self
             .shutdown_handle

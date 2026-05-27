@@ -1296,6 +1296,24 @@ async fn switch_passthrough_target(
     let same_pane = current_target.active_pane_id.is_some()
         && current_target.active_pane_id == next_target.active_pane_id
         && current_target.session_name == next_target.session_name;
+    // Capture the SOURCE pane's mode state BEFORE the swap so we can
+    // diff against the target after replay. In passthrough every byte
+    // the inner program emits flowed to the host verbatim, so the
+    // source pane's Screen-tracked mode bits are an accurate mirror
+    // of what the host currently has on the wire — modes the target
+    // pane doesn't want need explicit reset, or they bleed into the
+    // new window (the dominant symptom: mouse mode stuck on after
+    // switching from a TUI window to a shell window, scroll events
+    // arrive at the shell as input bytes and break line editing).
+    let source_state = match current_target.active_pane_id {
+        Some(pane_id) => {
+            live_input
+                .handler
+                .pane_screen_state(&current_target.session_name, pane_id)
+                .await
+        }
+        None => None,
+    };
     *current_target = open_attach_target(next_target)?;
     if same_pane {
         // Refresh-only: same pane, same session. The inner program's
@@ -1339,6 +1357,7 @@ async fn switch_passthrough_target(
     if let Some(replay) = passthrough_replay_bytes_for_target(current_target, live_input).await {
         emit_attach_bytes(stream, &replay).await?;
         update_host_alt_screen(&replay, host_in_alt_screen);
+        emit_passthrough_mode_diff(stream, current_target, live_input, source_state).await?;
         Ok(())
     } else {
         // On *switch* the screen still has the previous window's
@@ -1354,8 +1373,50 @@ async fn switch_passthrough_target(
             emit_attach_bytes(stream, ALT_SCREEN_EXIT).await?;
             *host_in_alt_screen = false;
         }
-        emit_attach_bytes(stream, PASSTHROUGH_SWITCH_RESET).await
+        emit_attach_bytes(stream, PASSTHROUGH_SWITCH_RESET).await?;
+        emit_passthrough_mode_diff(stream, current_target, live_input, source_state).await
     }
+}
+
+/// Emits DEC-private-mode RESETs to bridge the host from the previous
+/// (source) pane's mode state to the active (target) pane's. Reads
+/// the target's modes from its `Screen` via the handler; computes the
+/// diff against the captured source state; emits idempotent
+/// `\x1b[?Xl` toggles for the bits the target doesn't want.
+///
+/// No-op when either side's state is unavailable (test fixtures with
+/// no real pane handle), the panes' states are equal, or all of the
+/// source bits are also target bits.
+#[cfg(any(unix, windows))]
+async fn emit_passthrough_mode_diff(
+    stream: &LocalStream,
+    current_target: &super::pane_io::types::OpenAttachTarget,
+    live_input: &LiveAttachInputContext,
+    source_state: Option<(u32, u32)>,
+) -> io::Result<()> {
+    let Some((source_modes, source_cursor_style)) = source_state else {
+        return Ok(());
+    };
+    let Some(pane_id) = current_target.active_pane_id else {
+        return Ok(());
+    };
+    let Some((target_modes, target_cursor_style)) = live_input
+        .handler
+        .pane_screen_state(&current_target.session_name, pane_id)
+        .await
+    else {
+        return Ok(());
+    };
+    let diff = rmux_core::render_mode_diff_resets(
+        source_modes,
+        target_modes,
+        source_cursor_style,
+        target_cursor_style,
+    );
+    if diff.is_empty() {
+        return Ok(());
+    }
+    emit_attach_bytes(stream, &diff).await
 }
 
 /// SGR reset → cursor home → erase screen. Used on a passthrough

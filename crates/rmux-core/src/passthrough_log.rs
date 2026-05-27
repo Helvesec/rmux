@@ -365,6 +365,93 @@ fn render_dec_modes(mode_bits: u32, cursor_style: u32, out: &mut Vec<u8>) {
     }
 }
 
+/// Emits the DEC-private-mode RESET sequences needed to transition the
+/// host terminal from `source_modes` / `source_cursor_style` (what the
+/// pane the user just *left* had set) to `target_modes` /
+/// `target_cursor_style` (what the pane they're switching *to* wants).
+///
+/// In passthrough, every byte the inner program emits flows verbatim
+/// to the host, so a pane's `Screen::mode()` accurately mirrors what
+/// the host had on the wire while that pane was active. Diffing the
+/// source's mode bits against the target's tells us exactly what to
+/// reset so the host doesn't carry the source's TUI state into a
+/// shell that doesn't want it.
+///
+/// SETs for bits the target wants but the source didn't have are
+/// emitted by [`render_dec_modes`] inside the snapshot replay — we
+/// only emit RESETs here. A `\x1b[?Xl` for a bit the host doesn't
+/// have set is an idempotent no-op on every conformant terminal, so
+/// callers can apply this output unconditionally after the snapshot.
+///
+/// The set of modes considered for reset is the "TUI-only" subset —
+/// mouse families, focus events, application keypad/cursor keys,
+/// bracketed paste, modifyOtherKeys, theme updates, synchronized
+/// output. We deliberately do NOT include MODE_CURSOR / MODE_WRAP
+/// (post-DECSTR defaults are visible/on; the snapshot's render_dec_modes
+/// handles "currently off" cases via explicit emit), MODE_INSERT or
+/// MODE_ORIGIN (both DECSTR-resettable, handled by the snapshot
+/// prefix).
+#[must_use]
+pub fn render_mode_diff_resets(
+    source_modes: u32,
+    target_modes: u32,
+    source_cursor_style: u32,
+    target_cursor_style: u32,
+) -> Vec<u8> {
+    let bits_to_reset = source_modes & !target_modes;
+    let has = |bit: u32| bits_to_reset & bit != 0;
+    let mut out = Vec::new();
+
+    if has(mode::MODE_MOUSE_ALL) {
+        out.extend_from_slice(b"\x1b[?1003l");
+    }
+    if has(mode::MODE_MOUSE_BUTTON) {
+        out.extend_from_slice(b"\x1b[?1002l");
+    }
+    if has(mode::MODE_MOUSE_STANDARD) {
+        out.extend_from_slice(b"\x1b[?1000l");
+    }
+    if has(mode::MODE_MOUSE_SGR) {
+        out.extend_from_slice(b"\x1b[?1006l");
+    }
+    if has(mode::MODE_MOUSE_UTF8) {
+        out.extend_from_slice(b"\x1b[?1005l");
+    }
+    if has(mode::MODE_FOCUSON) {
+        out.extend_from_slice(b"\x1b[?1004l");
+    }
+    if has(mode::MODE_BRACKETPASTE) {
+        out.extend_from_slice(b"\x1b[?2004l");
+    }
+    if has(mode::MODE_KCURSOR) {
+        out.extend_from_slice(b"\x1b[?1l");
+    }
+    if has(mode::MODE_KKEYPAD) {
+        // DECPNM — keypad numeric mode (the reset of `\x1b=`).
+        out.extend_from_slice(b"\x1b>");
+    }
+    if has(mode::MODE_THEME_UPDATES) {
+        out.extend_from_slice(b"\x1b[?2031l");
+    }
+    if has(mode::MODE_SYNC) {
+        out.extend_from_slice(b"\x1b[?2026l");
+    }
+    // modifyOtherKeys: source had any level set, target wants none.
+    // `\x1b[>4m` (no params) returns to xterm default behaviour.
+    if has(mode::MODE_KEYS_EXTENDED) || has(mode::MODE_KEYS_EXTENDED_2) {
+        out.extend_from_slice(b"\x1b[>4m");
+    }
+
+    // Cursor style: if source had a specific style and target wants a
+    // different style (including the "terminal default" 0), emit the
+    // target style explicitly. DECSCUSR 0 = "reset to terminal default".
+    if source_cursor_style != target_cursor_style {
+        out.extend_from_slice(format!("\x1b[{target_cursor_style} q").as_bytes());
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,5 +794,85 @@ mod tests {
         assert!(!log.over_budget());
         log.append(b"x");
         assert!(log.over_budget());
+    }
+
+    #[test]
+    fn mode_diff_resets_emits_resets_for_mouse_when_source_had_and_target_doesnt() {
+        // The reported bug: TUI in source window had SGR mouse + button-event
+        // tracking; user switched to a shell window; mouse stayed on at the
+        // host; scroll wheel events arrived at the shell as input bytes.
+        // The diff at switch time must explicitly disable both.
+        let source = mode::MODE_MOUSE_SGR | mode::MODE_MOUSE_BUTTON;
+        let target = 0;
+        let bytes = render_mode_diff_resets(source, target, 0, 0);
+        assert!(
+            contains(&bytes, b"\x1b[?1006l"),
+            "SGR mouse encoding must be reset; got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(
+            contains(&bytes, b"\x1b[?1002l"),
+            "button-event tracking must be reset; got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    #[test]
+    fn mode_diff_resets_is_empty_when_source_and_target_match() {
+        // Switching between two shells with no mode toggles set: the
+        // diff is empty, no bytes emitted (idempotent fast path).
+        let bytes = render_mode_diff_resets(0, 0, 0, 0);
+        assert!(bytes.is_empty(), "no diff expected: {:?}", String::from_utf8_lossy(&bytes));
+
+        // Or two vim windows that both set the same modes.
+        let same = mode::MODE_MOUSE_SGR | mode::MODE_MOUSE_BUTTON | mode::MODE_BRACKETPASTE;
+        let bytes = render_mode_diff_resets(same, same, 0, 0);
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn mode_diff_resets_skips_bits_target_also_wants() {
+        // Both source and target want bracketed paste (shells do); only
+        // mouse modes (source-only) should appear in the diff.
+        let source = mode::MODE_MOUSE_SGR | mode::MODE_BRACKETPASTE;
+        let target = mode::MODE_BRACKETPASTE;
+        let bytes = render_mode_diff_resets(source, target, 0, 0);
+        assert!(contains(&bytes, b"\x1b[?1006l"));
+        assert!(
+            !contains(&bytes, b"\x1b[?2004l"),
+            "bracketed paste must NOT be reset when target also wants it: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    #[test]
+    fn mode_diff_resets_emits_modify_other_keys_off_for_either_level() {
+        // Source had modifyOtherKeys level-2; target wants neither.
+        // The reset sequence `\x1b[>4m` (no params) returns to xterm
+        // default and covers both levels.
+        let source = mode::MODE_KEYS_EXTENDED_2;
+        let bytes = render_mode_diff_resets(source, 0, 0, 0);
+        assert!(contains(&bytes, b"\x1b[>4m"));
+
+        // Source had level-1; same reset works.
+        let source = mode::MODE_KEYS_EXTENDED;
+        let bytes = render_mode_diff_resets(source, 0, 0, 0);
+        assert!(contains(&bytes, b"\x1b[>4m"));
+    }
+
+    #[test]
+    fn mode_diff_resets_emits_target_cursor_style_when_different() {
+        // Source had blinking bar (5); target wants terminal default (0).
+        // Emit `\x1b[0 q` to reset cursor style.
+        let bytes = render_mode_diff_resets(0, 0, 5, 0);
+        assert!(contains(&bytes, b"\x1b[0 q"));
+
+        // Same style → no emit.
+        let bytes = render_mode_diff_resets(0, 0, 4, 4);
+        assert!(!contains(&bytes, b" q"));
+
+        // Different non-zero → emit target's.
+        let bytes = render_mode_diff_resets(0, 0, 5, 2);
+        assert!(contains(&bytes, b"\x1b[2 q"));
     }
 }
