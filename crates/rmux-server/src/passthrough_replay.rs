@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use rmux_core::{
     OptionStore, PassthroughReplayLog, DEFAULT_PASSTHROUGH_REPLAY_BUDGET,
 };
-use rmux_proto::OptionName;
+use rmux_proto::{OptionName, SessionName};
 
 use crate::pane_transcript::SharedPaneTranscript;
 
@@ -89,20 +89,36 @@ pub(crate) fn update_host_alt_screen(bytes: &[u8], host_in_alt_screen: &mut bool
 /// Shared, lockable replay log. One per pane in a passthrough session.
 pub(crate) type SharedPassthroughReplayLog = Arc<Mutex<PassthroughReplayLog>>;
 
-/// Resolves the configured server-scope replay budget. Falls back to
-/// the core default if the option is unset or non-numeric.
-pub(crate) fn resolve_replay_budget(options: &OptionStore) -> usize {
+/// Resolves the effective `passthrough-replay-bytes` budget for a
+/// session. tmux-style scope resolution: a session-scope value (set
+/// via `set -t <session> passthrough-replay-bytes N`) overrides the
+/// server-scope default. Falls back to the core default if neither
+/// is set or the value parses as non-numeric.
+///
+/// Per-session override matters when one session runs a chatty TUI
+/// (claude streaming MBs, htop) and wants a deeper replay buffer
+/// without bloating every other session's per-pane allocation.
+pub(crate) fn resolve_replay_budget(
+    options: &OptionStore,
+    session_name: Option<&SessionName>,
+) -> usize {
     options
-        .resolve(None, OptionName::PassthroughReplayBytes)
+        .resolve(session_name, OptionName::PassthroughReplayBytes)
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(DEFAULT_PASSTHROUGH_REPLAY_BUDGET)
 }
 
-/// Allocates a fresh per-pane replay log sized to the configured budget.
+/// Allocates a fresh per-pane replay log sized to the budget that
+/// resolves for `session_name` (session-scope override falls back to
+/// server-scope; see [`resolve_replay_budget`]).
 #[must_use]
-pub(crate) fn new_shared_log(options: &OptionStore) -> SharedPassthroughReplayLog {
+pub(crate) fn new_shared_log(
+    options: &OptionStore,
+    session_name: &SessionName,
+) -> SharedPassthroughReplayLog {
     Arc::new(Mutex::new(PassthroughReplayLog::new(resolve_replay_budget(
         options,
+        Some(session_name),
     ))))
 }
 
@@ -247,5 +263,36 @@ mod tests {
         let final_log = log.lock().expect("not poisoned");
         assert_eq!(final_log.raw_log_len(), 0);
         assert!(final_log.snapshot_len() > 0);
+    }
+
+    #[test]
+    fn session_scope_budget_overrides_server_scope() {
+        use rmux_proto::{ScopeSelector, SetOptionMode};
+        // Two sessions share a server-scope default of 1 MiB. Heavy
+        // overrides hers to 4 MiB via `set -t heavy`. Light keeps the
+        // default. Replay budgets must resolve independently.
+        let mut store = OptionStore::new();
+        let heavy = SessionName::new("heavy").expect("valid name");
+        let light = SessionName::new("light").expect("valid name");
+        store
+            .set(
+                ScopeSelector::Global,
+                OptionName::PassthroughReplayBytes,
+                "1048576".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("set server default");
+        store
+            .set(
+                ScopeSelector::Session(heavy.clone()),
+                OptionName::PassthroughReplayBytes,
+                "4194304".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("set session override");
+
+        assert_eq!(resolve_replay_budget(&store, Some(&heavy)), 4 * 1024 * 1024);
+        assert_eq!(resolve_replay_budget(&store, Some(&light)), 1024 * 1024);
+        assert_eq!(resolve_replay_budget(&store, None), 1024 * 1024);
     }
 }

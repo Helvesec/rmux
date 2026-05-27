@@ -238,6 +238,10 @@ fn frozen_registry_scope_counts_match_tmux_partitioning() {
         .iter()
         .filter(|entry| entry.scope_mask() == registry::SCOPE_SESSION)
         .count();
+    let server_session_count = metadata
+        .iter()
+        .filter(|entry| entry.scope_mask() == (registry::SCOPE_SERVER | registry::SCOPE_SESSION))
+        .count();
     let window_only_count = metadata
         .iter()
         .filter(|entry| entry.scope_mask() == registry::SCOPE_WINDOW)
@@ -248,9 +252,17 @@ fn frozen_registry_scope_counts_match_tmux_partitioning() {
         .count();
 
     // tmux frozen: 25 server, 54 session, 67 window (51 window-only + 16 window|pane).
-    // rmux extensions: +1 server (passthrough-replay-bytes), +1 session (passthrough).
-    assert_eq!(server_count, 26, "server options");
-    assert_eq!(session_count, 55, "session options");
+    // rmux extensions:
+    //   +1 session (passthrough — session mode bit, session-scope only)
+    //   +1 server|session (passthrough-replay-bytes — server default with
+    //     per-session override, since one session may run heavy TUIs
+    //     wanting a deeper replay buffer without bloating others)
+    assert_eq!(server_count, 25, "server-only options");
+    assert_eq!(session_count, 55, "session-only options");
+    assert_eq!(
+        server_session_count, 1,
+        "server|session dual-scope options (rmux passthrough-replay-bytes)"
+    );
     assert_eq!(
         window_only_count + window_pane_count,
         67,

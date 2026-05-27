@@ -285,7 +285,7 @@ impl HandlerState {
             .entry(session_name.clone())
             .or_default()
             .entry(pane_id)
-            .or_insert_with(|| crate::passthrough_replay::new_shared_log(&self.options));
+            .or_insert_with(|| crate::passthrough_replay::new_shared_log(&self.options, session_name));
         Some(entry.clone())
     }
 
