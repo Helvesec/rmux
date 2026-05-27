@@ -89,6 +89,7 @@ impl HandlerState {
             environment_overrides,
             Some(new_pane_id),
             start_directory.or(requested_cwd.as_deref()),
+            Some(window_index),
         ) {
             Ok(profile) => profile,
             Err(error) => {
