@@ -21,6 +21,7 @@ use rmux_proto::{OptionName, RmuxError};
 
 use crate::grid::GridRenderOptions;
 use crate::identity::SessionName;
+use crate::input::mode;
 use crate::options::OptionStore;
 use crate::screen::Screen;
 use crate::transcript::ScreenCaptureRange;
@@ -197,6 +198,13 @@ pub fn render_screen_snapshot(screen: &Screen) -> Vec<u8> {
     }
     out.extend_from_slice(b"\x1b[!p");
     out.extend_from_slice(b"\x1b[m");
+    // Re-assert DEC private modes that the inner program had set. The
+    // soft reset above wiped them; without re-asserting, an attach
+    // landing on a mid-session TUI loses mouse reporting / bracketed
+    // paste / cursor visibility / modifyOtherKeys, breaking interactive
+    // input until the inner program happens to re-emit them on its own
+    // (usually never, until SIGWINCH).
+    render_dec_modes(screen.mode(), screen.cursor_style(), &mut out);
     out.extend_from_slice(b"\x1b[2J\x1b[H");
 
     let range = ScreenCaptureRange::default();
@@ -221,6 +229,99 @@ pub fn render_screen_snapshot(screen: &Screen) -> Vec<u8> {
         .as_bytes(),
     );
     out
+}
+
+/// Emits the byte sequence required to re-assert the DEC private modes
+/// implied by `mode_bits` (and the cursor style implied by
+/// `cursor_style`) into `out`.
+///
+/// The bits map 1:1 to the constants in [`crate::input::mode`]. We
+/// emit only what differs from the post-DECSTR defaults, so a fresh
+/// shell — which leaves everything at defaults except cursor-visible
+/// and autowrap (both on) — produces zero bytes here. A vim/htop /
+/// less / fzf session with mouse + bracketed paste + cursor hidden
+/// emits the half-dozen toggles needed to make it functional again.
+///
+/// Order is deliberate: ON-by-default modes first (so an explicit
+/// reset can't be re-overridden by a later toggle), then OFF-by-
+/// default mode setters, then mouse + modifyOtherKeys families where
+/// the higher-numbered variant should win when the inner program had
+/// (incorrectly) set multiple.
+fn render_dec_modes(mode_bits: u32, cursor_style: u32, out: &mut Vec<u8>) {
+    let on = |bit: u32| mode_bits & bit != 0;
+
+    // On-by-default modes: emit reset only when currently off.
+    if !on(mode::MODE_CURSOR) {
+        out.extend_from_slice(b"\x1b[?25l");
+    }
+    if !on(mode::MODE_WRAP) {
+        out.extend_from_slice(b"\x1b[?7l");
+    }
+
+    // Off-by-default mode setters.
+    if on(mode::MODE_INSERT) {
+        out.extend_from_slice(b"\x1b[4h");
+    }
+    if on(mode::MODE_KCURSOR) {
+        // DECCKM — application cursor keys (arrows emit `\x1bOA` etc.).
+        out.extend_from_slice(b"\x1b[?1h");
+    }
+    if on(mode::MODE_KKEYPAD) {
+        // DECPAM — application keypad. Note the `\x1b=` form (no CSI).
+        out.extend_from_slice(b"\x1b=");
+    }
+    if on(mode::MODE_ORIGIN) {
+        out.extend_from_slice(b"\x1b[?6h");
+    }
+    if on(mode::MODE_CRLF) {
+        out.extend_from_slice(b"\x1b[?20h");
+    }
+    if on(mode::MODE_FOCUSON) {
+        out.extend_from_slice(b"\x1b[?1004h");
+    }
+    if on(mode::MODE_BRACKETPASTE) {
+        out.extend_from_slice(b"\x1b[?2004h");
+    }
+    if on(mode::MODE_THEME_UPDATES) {
+        out.extend_from_slice(b"\x1b[?2031h");
+    }
+    if on(mode::MODE_SYNC) {
+        out.extend_from_slice(b"\x1b[?2026h");
+    }
+
+    // Mouse tracking family. The three "what to track" modes
+    // (?1000/1002/1003) are mutually exclusive at the terminal — pick
+    // the most-permissive one set. The two "encoding" modes
+    // (?1005 UTF-8 / ?1006 SGR) are also mutually exclusive in
+    // practice; prefer SGR (modern default) when both are set.
+    if on(mode::MODE_MOUSE_ALL) {
+        out.extend_from_slice(b"\x1b[?1003h");
+    } else if on(mode::MODE_MOUSE_BUTTON) {
+        out.extend_from_slice(b"\x1b[?1002h");
+    } else if on(mode::MODE_MOUSE_STANDARD) {
+        out.extend_from_slice(b"\x1b[?1000h");
+    }
+    if on(mode::MODE_MOUSE_SGR) {
+        out.extend_from_slice(b"\x1b[?1006h");
+    } else if on(mode::MODE_MOUSE_UTF8) {
+        out.extend_from_slice(b"\x1b[?1005h");
+    }
+
+    // modifyOtherKeys (xterm CSI > 4 ; n m). EXTENDED_2 (level 2,
+    // sends all keys as CSI u / extended sequences) supersedes
+    // EXTENDED (level 1).
+    if on(mode::MODE_KEYS_EXTENDED_2) {
+        out.extend_from_slice(b"\x1b[>4;2m");
+    } else if on(mode::MODE_KEYS_EXTENDED) {
+        out.extend_from_slice(b"\x1b[>4;1m");
+    }
+
+    // Cursor style (DECSCUSR). 0 = "terminal default" — skip; a
+    // non-zero value names a specific shape the inner program asked
+    // for (blinking block, steady underline, bar, etc.).
+    if cursor_style != 0 {
+        out.extend_from_slice(format!("\x1b[{cursor_style} q").as_bytes());
+    }
 }
 
 #[cfg(test)]
@@ -304,6 +405,120 @@ mod tests {
             "alt-screen snapshot must begin with `?1049h`; got: {:?}",
             String::from_utf8_lossy(&bytes[..16.min(bytes.len())])
         );
+    }
+
+    fn snapshot_after(setup: &[u8]) -> Vec<u8> {
+        render_screen_snapshot(terminal_with(setup).screen())
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    #[test]
+    fn snapshot_re_asserts_mouse_sgr_reporting_when_inner_program_had_set_it() {
+        // The mouse-broken-vim-after-reattach failure mode: vim sets
+        // ?1006h (SGR mouse encoding) + ?1002h (button events) at
+        // startup. The snapshot's soft reset wipes these; without
+        // re-asserting them, an attach mid-session leaves vim unable
+        // to receive mouse events until something else re-emits the
+        // toggles. Pin per-protocol so a future regression fingers the
+        // right family.
+        let bytes = snapshot_after(b"\x1b[?1006h\x1b[?1002h vim ready");
+        assert!(contains(&bytes, b"\x1b[?1006h"), "must re-emit SGR mouse encoding");
+        assert!(contains(&bytes, b"\x1b[?1002h"), "must re-emit button-event tracking");
+    }
+
+    #[test]
+    fn snapshot_picks_most_permissive_mouse_tracking_mode() {
+        // When more than one tracking-level bit is on (rare but
+        // possible if the inner program toggled them in sequence and
+        // the parser kept all bits set), ?1003 (any-event) wins.
+        // The encoding-level bits (?1006 SGR vs ?1005 UTF-8) are
+        // independent of tracking-level and may coexist; SGR wins.
+        let bytes = snapshot_after(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h");
+        assert!(
+            contains(&bytes, b"\x1b[?1003h"),
+            "?1003 must be picked when all three tracking modes are set"
+        );
+        assert!(
+            !contains(&bytes, b"\x1b[?1002h") && !contains(&bytes, b"\x1b[?1000h"),
+            "lower-precedence tracking modes must NOT be emitted: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert!(contains(&bytes, b"\x1b[?1006h"));
+    }
+
+    #[test]
+    fn snapshot_re_asserts_bracketed_paste() {
+        // Shells (bash, zsh) and most TUIs enable bracketed paste on
+        // startup so multi-line pastes don't auto-execute. Losing it
+        // across a snapshot turns a pasted block into a runaway
+        // command. Easy to miss; hence a dedicated pin.
+        let bytes = snapshot_after(b"\x1b[?2004h prompt ");
+        assert!(contains(&bytes, b"\x1b[?2004h"));
+    }
+
+    #[test]
+    fn snapshot_re_asserts_modify_other_keys_level_two() {
+        // modifyOtherKeys=2 is the modern wezterm/kitty default for
+        // shells that opt in. Level 2 supersedes level 1; only the
+        // level-2 toggle should appear in the snapshot.
+        let bytes = snapshot_after(b"\x1b[>4;2m");
+        assert!(contains(&bytes, b"\x1b[>4;2m"));
+        assert!(
+            !contains(&bytes, b"\x1b[>4;1m"),
+            "level-2 supersedes level-1; only one toggle should be emitted"
+        );
+    }
+
+    #[test]
+    fn snapshot_re_asserts_cursor_hidden_when_inner_program_hid_it() {
+        // Cursor visible is the post-DECSTR default, so the snapshot
+        // emits NO ?25 toggle for a shell. When the inner program
+        // hid the cursor (a TUI mid-animation), the snapshot must
+        // emit `?25l` so the cursor stays hidden through replay.
+        let visible = snapshot_after(b"shell prompt$ ");
+        assert!(
+            !contains(&visible, b"\x1b[?25l"),
+            "cursor-visible is the default; snapshot must NOT emit ?25l"
+        );
+        let hidden = snapshot_after(b"\x1b[?25l hidden");
+        assert!(contains(&hidden, b"\x1b[?25l"));
+    }
+
+    #[test]
+    fn snapshot_for_plain_shell_emits_no_extra_mode_bytes() {
+        // Sanity floor: a shell running with nothing fancy set should
+        // produce a snapshot whose prefix matches the historical fixed
+        // prefix exactly, plus the grid and cursor positioning. This
+        // pin guards against accidentally emitting toggles for modes
+        // that ARE on by default.
+        let bytes = snapshot_after(b"$ ");
+        let expected_prefix = b"\x1b[?1049l\x1b[!p\x1b[m\x1b[2J\x1b[H";
+        assert!(
+            bytes.starts_with(expected_prefix),
+            "plain shell must produce no extra mode bytes between SGR reset \
+             and clear; got prefix: {:?}",
+            String::from_utf8_lossy(&bytes[..expected_prefix.len().min(bytes.len())])
+        );
+    }
+
+    #[test]
+    fn snapshot_re_asserts_application_cursor_keys() {
+        // DECCKM (vim, less, fzf all set this so arrows emit `\x1bOA`).
+        // Losing it across snapshot would silently re-encode arrow
+        // keys as `\x1b[A` which the inner program doesn't recognise.
+        let bytes = snapshot_after(b"\x1b[?1h app-cursor");
+        assert!(contains(&bytes, b"\x1b[?1h"));
+    }
+
+    #[test]
+    fn snapshot_re_asserts_focus_event_reporting() {
+        let bytes = snapshot_after(b"\x1b[?1004h");
+        assert!(contains(&bytes, b"\x1b[?1004h"));
     }
 
     #[test]
