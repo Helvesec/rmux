@@ -240,6 +240,37 @@ and unsupported options instead of executing them. Set
 `RMUX_DISABLE_TMUX_FALLBACK=1` to disable it entirely. Fallback files are read
 best-effort: non-regular files and files larger than 1 MiB are ignored.
 
+### Shell tips
+
+#### Per-pane shell history (zsh)
+
+RMUX exports `$RMUX_SESSION`, `$RMUX_WINDOW` and `$RMUX_PANE` into every pane.
+You can use them to give each pane its own up-arrow history while keeping
+`Ctrl-R` searching across all shells — drop this into `~/.zshrc` *after* the
+line where you `setopt share_history`:
+
+```zsh
+# rmux: dual-write history. ↑/↓ walks THIS pane's own history first
+# (most relevant when you return to a pane), while Ctrl-R still
+# searches the global $HISTFILE across all shells.
+if [[ -n $RMUX_PANE ]]; then
+  mkdir -p ~/.cache/rmux/history
+  _rmux_pane_hist=~/.cache/rmux/history/${RMUX_SESSION}-${RMUX_WINDOW}-${RMUX_PANE}
+  # Load this pane's prior history first.
+  [[ -f $_rmux_pane_hist ]] && fc -R "$_rmux_pane_hist"
+  # Mirror every new command into the pane file; return 0 = also save to $HISTFILE.
+  zshaddhistory() {
+    print -r -- "${1%%$'\n'}" >> "$_rmux_pane_hist"
+    return 0
+  }
+fi
+```
+
+Trade-offs: the file follows the *slot* (`SESSION-WINDOW-PANE`), not the
+shell, so renumbering windows shifts history. The per-pane files grow
+forever — rotate `~/.cache/rmux/history/` periodically if you care. Outside
+RMUX the snippet is a no-op.
+
 ## Verification
 
 The workspace is designed to be checked from source with locked dependencies:
