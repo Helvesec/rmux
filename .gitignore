@@ -10,3 +10,6 @@ SDK demo/playwright-report/
 
 # Local release orchestrator. Kept in the repo working directory, not tracked.
 /rmux-release.sh
+
+# Per-user sidecar from the midnight-expert plugin (verify-stop-hook bookkeeping).
+.midnight-expert/
