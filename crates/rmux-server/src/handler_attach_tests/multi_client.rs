@@ -42,7 +42,9 @@ async fn different_requester_pids_reject_ambiguous_cross_process_attach_control(
         switched,
         Response::Error(rmux_proto::ErrorResponse {
             error: rmux_proto::RmuxError::Server(
-                "switch-client requires an unambiguous attached client".to_owned(),
+                "switch-client: 2 clients attached (101, 303); pick one with \
+                 `-t <client>` or address a whole session with `-s <session>`"
+                    .to_owned(),
             ),
         })
     );
@@ -58,7 +60,9 @@ async fn different_requester_pids_reject_ambiguous_cross_process_attach_control(
         detached,
         Response::Error(rmux_proto::ErrorResponse {
             error: rmux_proto::RmuxError::Server(
-                "detach-client requires an unambiguous attached client".to_owned(),
+                "detach-client: 2 clients attached (101, 303); pick one with \
+                 `-t <client>` or address a whole session with `-s <session>`"
+                    .to_owned(),
             ),
         })
     );

@@ -12,7 +12,7 @@ use super::super::mode_tree_support::ModeTreeClientState;
 use super::super::overlay_support::ClientOverlayState;
 use super::super::prompt_support::ClientPromptState;
 use crate::client_flags::ClientFlags;
-use crate::handler_support::{ambiguous_attached_client, attached_client_required};
+use crate::handler_support::{ambiguous_attached_client_listing, attached_client_required};
 use crate::mouse::ClientMouseState;
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::AttachControl;
@@ -225,7 +225,11 @@ impl ActiveAttachState {
                 .keys()
                 .next()
                 .expect("single-entry attach map must have one key")),
-            _ => Err(ambiguous_attached_client(command_name)),
+            _ => {
+                let mut pids: Vec<u32> = self.by_pid.keys().copied().collect();
+                pids.sort_unstable();
+                Err(ambiguous_attached_client_listing(command_name, &pids, &[]))
+            }
         }
     }
 }
