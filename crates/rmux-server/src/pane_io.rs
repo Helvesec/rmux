@@ -1305,12 +1305,15 @@ async fn switch_passthrough_target(
     // new window (the dominant symptom: mouse mode stuck on after
     // switching from a TUI window to a shell window, scroll events
     // arrive at the shell as input bytes and break line editing).
+    // We extract only `(modes, cursor_style)` for the diff; the
+    // alt-screen bit is tracked separately by `host_in_alt_screen`.
     let source_state = match current_target.active_pane_id {
         Some(pane_id) => {
             live_input
                 .handler
                 .pane_screen_state(&current_target.session_name, pane_id)
                 .await
+                .map(|(modes, style, _alt)| (modes, style))
         }
         None => None,
     };
@@ -1357,7 +1360,14 @@ async fn switch_passthrough_target(
     if let Some(replay) = passthrough_replay_bytes_for_target(current_target, live_input).await {
         emit_attach_bytes(stream, &replay).await?;
         update_host_alt_screen(&replay, host_in_alt_screen);
-        emit_passthrough_mode_diff(stream, current_target, live_input, source_state).await?;
+        emit_passthrough_mode_diff(
+            stream,
+            current_target,
+            live_input,
+            source_state,
+            host_in_alt_screen,
+        )
+        .await?;
         Ok(())
     } else {
         // On *switch* the screen still has the previous window's
@@ -1374,37 +1384,72 @@ async fn switch_passthrough_target(
             *host_in_alt_screen = false;
         }
         emit_attach_bytes(stream, PASSTHROUGH_SWITCH_RESET).await?;
-        emit_passthrough_mode_diff(stream, current_target, live_input, source_state).await
+        emit_passthrough_mode_diff(
+            stream,
+            current_target,
+            live_input,
+            source_state,
+            host_in_alt_screen,
+        )
+        .await
     }
 }
 
-/// Emits DEC-private-mode RESETs to bridge the host from the previous
-/// (source) pane's mode state to the active (target) pane's. Reads
-/// the target's modes from its `Screen` via the handler; computes the
-/// diff against the captured source state; emits idempotent
-/// `\x1b[?Xl` toggles for the bits the target doesn't want.
+/// Bridges the host terminal from the source pane's state to the
+/// target pane's after a window switch:
+///
+/// 1. **Alt-screen bridge.** If the target's `Screen::is_alternate()`
+///    disagrees with the forwarder's `host_in_alt_screen` mirror —
+///    typically because the target pane's replay log contained no
+///    snapshot prefix (its raw_log fit under budget) and the inner
+///    program (e.g. a shell) doesn't emit `?1049l` on its own — emit
+///    the bridging `?1049h` / `?1049l` explicitly. Without this the
+///    host stays in alt-screen after switching from vim to a shell,
+///    and wezterm-class terminals interpret subsequent scroll-wheel
+///    events as arrow keys (because their default scroll-in-alt-
+///    screen behaviour is "send arrows so less/man can scroll").
+///
+/// 2. **DEC private mode diff.** Reset bits that the source had but
+///    the target doesn't want (mouse families, focus, bracketed
+///    paste, modifyOtherKeys, etc.). The snapshot replay's
+///    `render_dec_modes` already emits SETs for what target wants;
+///    we only handle the RESETs here.
 ///
 /// No-op when either side's state is unavailable (test fixtures with
-/// no real pane handle), the panes' states are equal, or all of the
-/// source bits are also target bits.
+/// no real pane handle), the panes' states are equal, or no bits
+/// differ.
 #[cfg(any(unix, windows))]
 async fn emit_passthrough_mode_diff(
     stream: &LocalStream,
     current_target: &super::pane_io::types::OpenAttachTarget,
     live_input: &LiveAttachInputContext,
     source_state: Option<(u32, u32)>,
+    host_in_alt_screen: &mut bool,
 ) -> io::Result<()> {
-    let Some((source_modes, source_cursor_style)) = source_state else {
-        return Ok(());
-    };
     let Some(pane_id) = current_target.active_pane_id else {
         return Ok(());
     };
-    let Some((target_modes, target_cursor_style)) = live_input
+    let Some((target_modes, target_cursor_style, target_is_alternate)) = live_input
         .handler
         .pane_screen_state(&current_target.session_name, pane_id)
         .await
     else {
+        return Ok(());
+    };
+
+    // Alt-screen bridge before the mode diff: any subsequent mode
+    // toggles we emit should land on the buffer the target expects.
+    if target_is_alternate != *host_in_alt_screen {
+        let toggle = if target_is_alternate {
+            ALT_SCREEN_ENTER
+        } else {
+            ALT_SCREEN_EXIT
+        };
+        emit_attach_bytes(stream, toggle).await?;
+        *host_in_alt_screen = target_is_alternate;
+    }
+
+    let Some((source_modes, source_cursor_style)) = source_state else {
         return Ok(());
     };
     let diff = rmux_core::render_mode_diff_resets(

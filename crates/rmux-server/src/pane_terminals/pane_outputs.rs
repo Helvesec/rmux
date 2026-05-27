@@ -303,21 +303,27 @@ impl HandlerState {
             .cloned()
     }
 
-    /// Snapshot of a pane's `(mode_bits, cursor_style)`. Used by the
-    /// passthrough attach forwarder at window-switch time to compute
-    /// the diff between the source pane's state and the target's, so
-    /// it can emit reset toggles for modes the target doesn't want —
-    /// e.g. a TUI in source set `?1006h` for mouse but the shell in
-    /// target doesn't want it; without the diff, mouse stays on at
-    /// the host and scroll events arrive at the shell as input bytes.
+    /// Snapshot of a pane's `(mode_bits, cursor_style, is_alternate)`.
+    /// Used by the passthrough attach forwarder at window-switch time to
+    /// compute the diff between the source pane's state and the
+    /// target's, so it can emit reset toggles for modes the target
+    /// doesn't want — e.g. a TUI in source set `?1006h` for mouse but
+    /// the shell in target doesn't want it; without the diff, mouse
+    /// stays on at the host and scroll events arrive at the shell as
+    /// input bytes. `is_alternate` covers the same hazard for the
+    /// alt-screen buffer bit, which lives outside the mode bitmap.
     pub(crate) fn pane_screen_state_lookup(
         &self,
         session_name: &SessionName,
         pane_id: PaneId,
-    ) -> Option<(u32, u32)> {
+    ) -> Option<(u32, u32, bool)> {
         let transcript = self.transcripts.get(session_name)?.get(&pane_id)?;
         let transcript = transcript.lock().ok()?;
-        Some((transcript.mode(), transcript.cursor_style()))
+        Some((
+            transcript.mode(),
+            transcript.cursor_style(),
+            transcript.is_alternate(),
+        ))
     }
 
     pub(crate) fn session_pane_outputs(
