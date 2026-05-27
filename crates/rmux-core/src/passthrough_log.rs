@@ -203,7 +203,8 @@ pub fn render_screen_snapshot(screen: &Screen) -> Vec<u8> {
     // landing on a mid-session TUI loses mouse reporting / bracketed
     // paste / cursor visibility / modifyOtherKeys, breaking interactive
     // input until the inner program happens to re-emit them on its own
-    // (usually never, until SIGWINCH).
+    // (usually never, until SIGWINCH). MODE_ORIGIN is intentionally
+    // not re-emitted here — see the post-paint tail below.
     render_dec_modes(screen.mode(), screen.cursor_style(), &mut out);
     out.extend_from_slice(b"\x1b[2J\x1b[H");
 
@@ -220,6 +221,36 @@ pub fn render_screen_snapshot(screen: &Screen) -> Vec<u8> {
 
     let (cursor_x, cursor_y) = screen.cursor_position();
     out.extend_from_slice(b"\x1b[m");
+
+    // Scroll region (DECSTBM). Default is (0, rows-1) = full screen,
+    // which is what the soft reset gave us — emit only when narrower.
+    // `less` / `man` / TUIs with pinned chrome lines depend on this:
+    // without it their status line scrolls with content after a
+    // snapshot refresh. DECSTBM has a side effect of homing the
+    // cursor; that's fine because the final cursor positioning below
+    // overrides it.
+    let (region_top, region_bottom) = screen.scroll_region();
+    let default_bottom = u32::from(screen.size().rows.max(1)).saturating_sub(1);
+    if region_top != 0 || region_bottom != default_bottom {
+        out.extend_from_slice(
+            format!(
+                "\x1b[{};{}r",
+                region_top.saturating_add(1),
+                region_bottom.saturating_add(1),
+            )
+            .as_bytes(),
+        );
+    }
+
+    // KNOWN GAP: DECSC/DECRC saved-cursor state is held by the input
+    // parser (not Screen), so it doesn't survive a snapshot refresh.
+    // Programs that did `\x1b7` and rely on a later `\x1b8` after the
+    // refresh land at the wrong cursor. The `?1049h` alt-screen save
+    // path *is* in Screen (saved_cursor_x/y), but emitting it from
+    // here would race with our own `?1049h` emit ordering and risk
+    // the host stashing the wrong reference cursor. Defer until a
+    // user actually reports a corner case that demands it.
+
     out.extend_from_slice(
         format!(
             "\x1b[{};{}H",
@@ -228,6 +259,13 @@ pub fn render_screen_snapshot(screen: &Screen) -> Vec<u8> {
         )
         .as_bytes(),
     );
+
+    // Set origin mode LAST so the cursor positioning above stayed
+    // absolute. The inner program's next emission will see origin
+    // mode active.
+    if screen.mode() & mode::MODE_ORIGIN != 0 {
+        out.extend_from_slice(b"\x1b[?6h");
+    }
     out
 }
 
@@ -270,9 +308,12 @@ fn render_dec_modes(mode_bits: u32, cursor_style: u32, out: &mut Vec<u8>) {
         // DECPAM — application keypad. Note the `\x1b=` form (no CSI).
         out.extend_from_slice(b"\x1b=");
     }
-    if on(mode::MODE_ORIGIN) {
-        out.extend_from_slice(b"\x1b[?6h");
-    }
+    // NOTE: MODE_ORIGIN (?6) is deliberately handled by the snapshot
+    // *outside* this function — emitting it here would make the
+    // subsequent cursor-positioning CSI H commands region-relative
+    // instead of absolute, breaking our paint of absolute grid
+    // coords + saved-cursor restore. See render_screen_snapshot's
+    // post-positioning tail.
     if on(mode::MODE_CRLF) {
         out.extend_from_slice(b"\x1b[?20h");
     }
@@ -519,6 +560,71 @@ mod tests {
     fn snapshot_re_asserts_focus_event_reporting() {
         let bytes = snapshot_after(b"\x1b[?1004h");
         assert!(contains(&bytes, b"\x1b[?1004h"));
+    }
+
+    #[test]
+    fn snapshot_restores_scroll_region_when_inner_program_narrowed_it() {
+        // less / man set a scroll region that pins their status line
+        // at the bottom. After the soft reset wipes DECSTBM, scrolling
+        // includes the status row and everything jitters. The snapshot
+        // must re-issue the DECSTBM that was in effect.
+        //
+        // CSI 2;3r means "scroll region rows 2..=3" in 1-based coords,
+        // i.e. rupper=1 rlower=2 internally. Use that exact ask so the
+        // test pins both endpoints.
+        let bytes = snapshot_after(b"\x1b[2;3r");
+        assert!(
+            contains(&bytes, b"\x1b[2;3r"),
+            "snapshot must re-emit DECSTBM with the captured region; got: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    #[test]
+    fn snapshot_omits_scroll_region_when_inner_program_left_it_at_full_screen() {
+        // Default region is full screen; emitting DECSTBM unnecessarily
+        // is harmless but noisy. Keep the no-op case clean.
+        let bytes = snapshot_after(b"plain content");
+        // Search for the `r` final byte of DECSTBM in any CSI form.
+        // The wider snapshot doesn't emit `r` for any other reason.
+        let has_decstbm = bytes.windows(2).any(|window| window[1] == b'r' && window[0].is_ascii_digit());
+        assert!(
+            !has_decstbm,
+            "snapshot must NOT emit DECSTBM when region is full-screen default; got: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    #[test]
+    fn snapshot_emits_origin_mode_after_cursor_positioning_not_before() {
+        // Origin mode (?6) changes how CSI H is interpreted: with
+        // origin on, positioning is region-relative; with it off,
+        // positioning is absolute. The snapshot paints absolute coords
+        // for the grid and the saved cursor, so origin mode must be
+        // set AFTER all positioning is done. Pin the order so a future
+        // refactor that moves origin into render_dec_modes breaks this
+        // test instead of silently breaking cursor placement in
+        // origin-mode TUIs.
+        let bytes = snapshot_after(b"\x1b[?6h");
+        let origin_at = bytes
+            .windows(b"\x1b[?6h".len())
+            .position(|window| window == b"\x1b[?6h")
+            .expect("snapshot must re-emit origin mode when set");
+        // The last absolute cursor positioning is the final `[<y>;<x>H`.
+        // Look for the `H` byte preceding origin_at; if it's there,
+        // positioning came first.
+        assert!(
+            bytes[..origin_at]
+                .iter()
+                .rev()
+                .take(16)
+                .any(|byte| *byte == b'H'),
+            "origin mode must be emitted AFTER the final CSI H positioning; \
+             got bytes around origin@{origin_at}: {:?}",
+            String::from_utf8_lossy(
+                &bytes[origin_at.saturating_sub(20)..(origin_at + 5).min(bytes.len())]
+            )
+        );
     }
 
     #[test]

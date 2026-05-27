@@ -160,6 +160,17 @@ impl Screen {
         (self.cursor_x, self.cursor_y)
     }
 
+    /// Returns the inclusive scroll-region (top, bottom) row indices,
+    /// 0-based. The default is `(0, rows - 1)` — full viewport. Set by
+    /// DECSTBM (`\x1b[<top>;<bot>r`). `less`, `man`, and any TUI with
+    /// a pinned status line / chrome rely on this; without
+    /// restoration their scrolling region collapses to the full screen
+    /// on replay and chrome lines start scrolling with content.
+    #[must_use]
+    pub const fn scroll_region(&self) -> (u32, u32) {
+        (self.rupper, self.rlower)
+    }
+
     /// Returns the absolute cursor row including history.
     #[must_use]
     pub fn cursor_absolute_y(&self) -> usize {
