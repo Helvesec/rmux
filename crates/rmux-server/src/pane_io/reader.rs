@@ -162,15 +162,20 @@ async fn read_pane_output(
         }
 
         let bytes = buffer[..bytes_read].to_vec();
+        // Order is load-bearing: feed the transcript FIRST so that the
+        // replay log's snapshot refresh (triggered by over-budget here,
+        // or by alt-screen-exit detection later) sees a screen state
+        // that already reflects these bytes — not the previous chunk.
+        let append_result = apply_bytes_to_transcript(&transcript, &bytes);
         append_to_log(replay_log.as_ref(), &transcript, &bytes);
         let replies = publish_pane_bytes(
             &session_name,
             pane_id,
-            &transcript,
             &pane_output,
             generation,
             pane_alert_callback.as_ref(),
             bytes,
+            append_result,
         );
         write_parser_replies_to_pane(&reply_writer, replies).await?;
     }
@@ -204,38 +209,54 @@ fn read_pane_output_blocking(
         }
 
         let bytes = buffer[..bytes_read].to_vec();
+        // See unix sibling for the load-bearing transcript-first order.
+        let append_result = apply_bytes_to_transcript(&transcript, &bytes);
         append_to_log(replay_log.as_ref(), &transcript, &bytes);
         let replies = publish_pane_bytes(
             &session_name,
             pane_id,
-            &transcript,
             &pane_output,
             generation,
             pane_alert_callback.as_ref(),
             bytes,
+            append_result,
         );
         write_parser_replies_to_pane_blocking(&pane_reader, replies)?;
     }
 }
 
+/// Feeds a chunk of inner-PTY bytes through the pane's `PaneTranscript`
+/// and returns the side effects (parser replies, terminal passthroughs,
+/// bell count). Pulled out of [`publish_pane_bytes`] so the reader loop
+/// can do this BEFORE [`append_to_log`] runs — that way a snapshot
+/// refresh inside the replay log sees a transcript that already
+/// reflects the bytes that just arrived.
+fn apply_bytes_to_transcript(
+    transcript: &SharedPaneTranscript,
+    bytes: &[u8],
+) -> crate::pane_transcript::PaneAppendResult {
+    let mut transcript = transcript
+        .lock()
+        .expect("pane transcript mutex must not be poisoned");
+    transcript.append_bytes_with_effects(bytes)
+}
+
+/// Publishes `bytes` (already applied to the transcript via
+/// [`apply_bytes_to_transcript`]) to the pane's output channel and
+/// fires alert / dropped-passthrough side effects. Returns the parser
+/// replies the caller must write back to the inner PTY.
 fn publish_pane_bytes(
     session_name: &rmux_proto::SessionName,
     pane_id: PaneId,
-    transcript: &SharedPaneTranscript,
     pane_output: &PaneOutputSender,
     generation: Option<u64>,
     pane_alert_callback: Option<&PaneAlertCallback>,
     bytes: Vec<u8>,
+    append_result: crate::pane_transcript::PaneAppendResult,
 ) -> Vec<u8> {
     if !pane_output.accepts_generation(generation) {
         return Vec::new();
     }
-    let append_result = {
-        let mut transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
-        transcript.append_bytes_with_effects(&bytes)
-    };
     let replies = append_result.replies;
     let dropped_passthrough_count = append_result.dropped_passthrough_count;
     if pane_output
