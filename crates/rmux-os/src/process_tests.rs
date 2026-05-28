@@ -153,14 +153,11 @@ fn parses_nul_separated_environment() {
 #[cfg(unix)]
 #[test]
 fn winch_foreground_pgrp_returns_false_for_non_tty_fd() {
-    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+    use std::os::fd::AsFd;
     // A pipe has no controlling pgrp, so `tcgetpgrp` returns -1 and
-    // the helper should bail without attempting `killpg`.
-    let mut fds = [0; 2];
-    let result = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    assert_eq!(result, 0, "create pipe");
-    let read_end = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    let _write_end = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    // the helper should bail without attempting `killpg`. rustix's
+    // `pipe()` returns owned fds directly, no `from_raw_fd` unsafe.
+    let (read_end, _write_end) = rustix::pipe::pipe().expect("create pipe");
     assert!(!unix::winch_foreground_pgrp(read_end.as_fd()));
 }
 
@@ -168,28 +165,30 @@ fn winch_foreground_pgrp_returns_false_for_non_tty_fd() {
 #[test]
 fn winch_foreground_pgrp_delivers_signal_to_pty_session_leader() {
     use std::io::Read;
-    use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+    use std::os::fd::AsFd;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    // Allocate a PTY pair. We hold the master; the spawned shell will
-    // adopt the slave as its controlling terminal so the kernel knows
-    // who to deliver SIGWINCH to.
-    let mut master_raw: libc::c_int = -1;
-    let mut slave_raw: libc::c_int = -1;
-    let opened = unsafe {
-        libc::openpty(
-            &mut master_raw,
-            &mut slave_raw,
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    assert_eq!(opened, 0, "openpty");
-    let master = unsafe { OwnedFd::from_raw_fd(master_raw) };
-    let slave = unsafe { OwnedFd::from_raw_fd(slave_raw) };
+    // Allocate a PTY pair via rustix. We hold the master; the spawned
+    // shell will adopt the slave as its controlling terminal so the
+    // kernel knows who to deliver SIGWINCH to.
+    //
+    // rustix doesn't expose a one-shot `openpty`, so we drive the
+    // four POSIX primitives directly: open the multiplexer, grant
+    // the slave permissions, unlock it, then open its pts path.
+    // All four wrappers are safe; no `from_raw_fd` dance.
+    let master = rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
+        .expect("openpt");
+    rustix::pty::grantpt(&master).expect("grantpt");
+    rustix::pty::unlockpt(&master).expect("unlockpt");
+    let slave_name = rustix::pty::ptsname(&master, Vec::new()).expect("ptsname");
+    let slave = rustix::fs::open(
+        slave_name.as_c_str(),
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY,
+        rustix::fs::Mode::empty(),
+    )
+    .expect("open slave pts");
     let slave_stdin = slave.try_clone().expect("clone slave for stdin");
     let slave_stdout = slave.try_clone().expect("clone slave for stdout");
     let slave_stderr = slave;
@@ -204,17 +203,23 @@ fn winch_foreground_pgrp_delivers_signal_to_pty_session_leader() {
     cmd.stdin(Stdio::from(slave_stdin))
         .stdout(Stdio::from(slave_stdout))
         .stderr(Stdio::from(slave_stderr));
+    // `Command::pre_exec` itself is `unsafe` (async-signal-safety
+    // contract on what may run between fork and exec) — that outer
+    // unsafe is structural, not avoidable. But the *body* can be
+    // pure rustix calls instead of raw libc, which keeps the
+    // unsafe surface as small as possible.
     unsafe {
-        // setsid + TIOCSCTTY in the child so the slave becomes its
-        // controlling terminal and the kernel knows who to deliver
-        // SIGWINCH to when we killpg the slave's fg pgrp.
         cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
+            use std::os::fd::BorrowedFd;
+            rustix::process::setsid().map_err(std::io::Error::from)?;
+            // fd 0 is the slave PTY, wired up by `Command::stdin`
+            // above. Borrowing it for the TIOCSCTTY ioctl is safe
+            // — we don't own it, just need a BorrowedFd handle.
+            // SAFETY: the kernel has just dup2'd the slave to fd 0
+            // as part of `posix_spawn`'s fd setup; it's a real,
+            // open descriptor for the lifetime of pre_exec.
+            let stdin_fd = BorrowedFd::borrow_raw(0);
+            rustix::process::ioctl_tiocsctty(stdin_fd).map_err(std::io::Error::from)?;
             Ok(())
         });
     }

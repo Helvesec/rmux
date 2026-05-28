@@ -117,17 +117,20 @@ pub mod unix {
         let Some(pgrp) = foreground_pid(fd) else {
             return false;
         };
-        let Ok(pgrp) = libc::pid_t::try_from(pgrp) else {
+        // rustix's `Pid::from_raw` accepts non-zero, non-negative pid_t.
+        // `foreground_pid` already filtered `tcgetpgrp <= 0`, so this
+        // conversion only fails on a u32 that doesn't fit in pid_t —
+        // treat that as "no fg pgrp, benign no-op".
+        let Ok(pgrp_pid_t) = i32::try_from(pgrp) else {
             return false;
         };
-        let result = unsafe {
-            // SAFETY: `killpg` is async-signal-safe and takes only
-            // integer arguments. `pgrp` came from `tcgetpgrp` so it
-            // names a real process group; if it has since exited,
-            // `killpg` returns ESRCH which we surface as `false`.
-            libc::killpg(pgrp, libc::SIGWINCH)
+        let Some(pid) = rustix::process::Pid::from_raw(pgrp_pid_t) else {
+            return false;
         };
-        result == 0
+        // ESRCH (process group exited) surfaces as `Err`; we map any
+        // failure to `false` since the caller treats it as a benign
+        // no-op.
+        rustix::process::kill_process_group(pid, rustix::process::Signal::WINCH).is_ok()
     }
 }
 

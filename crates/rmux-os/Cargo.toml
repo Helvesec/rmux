@@ -14,7 +14,7 @@ rmux-types = { path = "../rmux-types", version = "0.3.1" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.185"
-rustix = { version = "1.1.4", features = ["process", "termios"] }
+rustix = { version = "1.1.4", features = ["fs", "pipe", "process", "pty", "termios"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
