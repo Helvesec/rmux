@@ -200,6 +200,48 @@ fn tmux_compat_explicit_missing_config_file_is_silent_for_detached_new_session_w
 }
 
 #[test]
+fn tmux_compat_show_options_a_inheritance_marker_matches_reference_when_frozen_tmux_is_available(
+) -> Result<(), Box<dyn Error>> {
+    let harness = TmuxCompatHarness::new("tmux-compat-show-options-a-marker")?;
+    let Some(tmux_binary) = frozen_tmux_or_skip(&harness)? else {
+        return Ok(());
+    };
+    let config = tmux_compat_config();
+    let expected_overrides = default_overrides(harness.tmpdir());
+
+    let create = harness.run_pair_with(
+        &tmux_binary,
+        &["new-session", "-d", "-s", "alpha"],
+        config.clone(),
+    )?;
+    assert_quiet_success(&create);
+    assert_run_metadata(
+        &create,
+        &harness,
+        &tmux_binary,
+        &["new-session", "-d", "-s", "alpha"],
+        &expected_overrides,
+    );
+
+    let show_status = harness.run_pair_with(
+        &tmux_binary,
+        &["show-options", "-A", "-t", "alpha", "status"],
+        config,
+    )?;
+
+    assert_exact_tmux_compat(&show_status);
+    assert_run_metadata(
+        &show_status,
+        &harness,
+        &tmux_binary,
+        &["show-options", "-A", "-t", "alpha", "status"],
+        &expected_overrides,
+    );
+    assert_eq!(show_status.rmux.stdout_string(), "status* on\n");
+    Ok(())
+}
+
+#[test]
 fn tmux_compat_environment_style_and_terminal_feature_lines_when_frozen_tmux_is_available(
 ) -> Result<(), Box<dyn Error>> {
     let harness = TmuxCompatHarness::new("tmux-compat-env-style-terminal-features")?;

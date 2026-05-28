@@ -116,6 +116,7 @@ pub struct KeyBindingDisplay {
     binding: KeyBinding,
     key_string: String,
     command_string: String,
+    default_index: Option<usize>,
 }
 
 impl KeyBindingDisplay {
@@ -368,12 +369,7 @@ impl KeyBindingStore {
                         .active
                         .values()
                         .cloned()
-                        .map(|binding| KeyBindingDisplay {
-                            table_name: table.name.clone(),
-                            key_string: key_string_lookup_key(binding.key, false),
-                            command_string: binding.commands.to_tmux_string(),
-                            binding,
-                        })
+                        .map(|binding| display_binding(table, binding))
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>()
@@ -385,12 +381,7 @@ impl KeyBindingStore {
                         .active
                         .values()
                         .cloned()
-                        .map(|binding| KeyBindingDisplay {
-                            table_name: table.name.clone(),
-                            key_string: key_string_lookup_key(binding.key, false),
-                            command_string: binding.commands.to_tmux_string(),
-                            binding,
-                        })
+                        .map(|binding| display_binding(table, binding))
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>()
@@ -398,7 +389,10 @@ impl KeyBindingStore {
 
         bindings.sort_by(|left, right| {
             let ordering = match sort_order {
-                KeyBindingSortOrder::Key => left.binding.key.cmp(&right.binding.key),
+                KeyBindingSortOrder::Key => match (left.default_index, right.default_index) {
+                    (Some(left), Some(right)) => left.cmp(&right),
+                    _ => left.binding.key.cmp(&right.binding.key),
+                },
                 KeyBindingSortOrder::Modifier => (left.binding.key & KEYC_MASK_MODIFIERS)
                     .cmp(&(right.binding.key & KEYC_MASK_MODIFIERS)),
                 KeyBindingSortOrder::Name => left
@@ -481,6 +475,29 @@ impl KeyBindingStore {
         if should_remove {
             self.tables.remove(table_name);
         }
+    }
+}
+
+fn display_binding(table: &KeyBindingTable, binding: KeyBinding) -> KeyBindingDisplay {
+    let default_display = table
+        .defaults
+        .get(&binding.key)
+        .filter(|default| *default == &binding)
+        .and_then(|_| defaults::list_keys_display(&table.name, binding.key));
+    let key_string = default_display.map_or_else(
+        || key_string_lookup_key(binding.key, false),
+        |display| display.key_string.to_owned(),
+    );
+    let command_string = default_display.map_or_else(
+        || binding.commands.to_tmux_string(),
+        |display| display.command_string.to_owned(),
+    );
+    KeyBindingDisplay {
+        table_name: table.name.clone(),
+        binding,
+        key_string,
+        command_string,
+        default_index: default_display.map(|display| display.index),
     }
 }
 

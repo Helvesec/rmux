@@ -173,6 +173,9 @@ pub trait ScreenWriter {
     /// Handle DCS passthrough string.
     fn dcs_passthrough(&mut self, data: &[u8]) {}
 
+    /// Handle an opaque SIXEL DCS passthrough string.
+    fn sixel_passthrough(&mut self, data: &[u8]) {}
+
     // ─── APC handlers ──────────────────────────────────────────
     /// Handle an opaque APC passthrough string.
     fn apc_passthrough(&mut self, data: &[u8]) {}

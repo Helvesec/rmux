@@ -233,6 +233,7 @@ impl RequestHandler {
             match state.respawn_pane(
                 request,
                 &socket_path,
+                None,
                 Some(self.pane_alert_callback()),
                 Some(self.pane_exit_callback()),
                 |state, replaced| {

@@ -5,7 +5,7 @@ use rmux_proto::{
     ErrorResponse, HookName, PaneTarget, ProcessCommand, Response, ScopeSelector, Target,
 };
 
-use super::RequestHandler;
+use super::{client_environment_snapshot, client_spawn_environment, RequestHandler};
 use crate::hook_runtime::PendingInlineHookFormat;
 use crate::pane_terminals::{
     HandlerState, NewWindowOptions, RespawnWindowOptions, WindowSpawnOptions,
@@ -23,6 +23,7 @@ struct UnlinkedWindowSnapshot {
 impl RequestHandler {
     pub(super) async fn handle_new_window(
         &self,
+        requester_pid: u32,
         request: rmux_proto::NewWindowRequest,
     ) -> Response {
         let session_name = request.target;
@@ -31,6 +32,8 @@ impl RequestHandler {
         let command = request.command;
         let process_command = ProcessCommand::from_legacy_command(command.as_deref());
         let socket_path = self.socket_path();
+        let client_environment = client_environment_snapshot(requester_pid);
+        let spawn_environment = client_spawn_environment(client_environment.as_ref());
         let response = {
             let mut state = self.state.lock().await;
             let options = NewWindowOptions {
@@ -40,6 +43,7 @@ impl RequestHandler {
                     start_directory: start_directory.as_deref(),
                     command: process_command.as_ref(),
                     socket_path: &socket_path,
+                    spawn_environment: spawn_environment.as_ref(),
                     environment_overrides: environment_overrides.as_deref(),
                     pane_alert_callback: Some(self.pane_alert_callback()),
                     pane_exit_callback: Some(self.pane_exit_callback()),
@@ -507,11 +511,14 @@ impl RequestHandler {
 
     pub(super) async fn handle_respawn_window(
         &self,
+        requester_pid: u32,
         request: rmux_proto::RespawnWindowRequest,
     ) -> Response {
         let session_name = request.target.session_name().clone();
         let socket_path = self.socket_path();
         let process_command = ProcessCommand::from_legacy_command(request.command.as_deref());
+        let client_environment = client_environment_snapshot(requester_pid);
+        let spawn_environment = client_spawn_environment(client_environment.as_ref());
         let response = {
             let mut state = self.state.lock().await;
             match state.respawn_window(
@@ -522,6 +529,7 @@ impl RequestHandler {
                         start_directory: request.start_directory.as_deref(),
                         command: process_command.as_ref(),
                         socket_path: &socket_path,
+                        spawn_environment: spawn_environment.as_ref(),
                         environment_overrides: request.environment.as_deref(),
                         pane_alert_callback: Some(self.pane_alert_callback()),
                         pane_exit_callback: Some(self.pane_exit_callback()),

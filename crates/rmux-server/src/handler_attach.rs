@@ -587,10 +587,13 @@ fn attach_target_for_session_with_prompt(
                 .unwrap_or_else(|| rmux_core::PaneGeometry::new(0, 0, 0, 0))
         },
     );
-    let kitty_graphics_passthrough = active_pane.as_ref().is_some_and(|pane| {
+    let terminal_passthrough_allowed = active_pane.as_ref().is_some_and(|pane| {
         !state.pane_in_mode(session_name, pane.id())
-            && kitty_graphics_passthrough_enabled(session, &state.options, pane, &outer_terminal)
+            && pane_passthrough_enabled(session, &state.options, pane)
     });
+    let kitty_graphics_passthrough =
+        terminal_passthrough_allowed && outer_terminal.supports_kitty_graphics();
+    let sixel_passthrough = terminal_passthrough_allowed && outer_terminal.supports_sixel();
 
     Ok(AttachTarget {
         session_name: session_name.clone(),
@@ -601,28 +604,27 @@ fn attach_target_for_session_with_prompt(
         cursor_style,
         active_pane_geometry,
         kitty_graphics_passthrough,
+        sixel_passthrough,
         persistent_overlay_state_id: None,
         live_pane,
         active_pane_id: active_pane.as_ref().map(|pane| pane.id()),
     })
 }
 
-fn kitty_graphics_passthrough_enabled(
+fn pane_passthrough_enabled(
     session: &rmux_core::Session,
     options: &rmux_core::OptionStore,
     pane: &rmux_core::Pane,
-    outer_terminal: &OuterTerminal,
 ) -> bool {
-    outer_terminal.supports_kitty_graphics()
-        && matches!(
-            options.resolve_for_pane(
-                session.name(),
-                session.active_window_index(),
-                pane.index(),
-                OptionName::AllowPassthrough,
-            ),
-            Some("on")
-        )
+    matches!(
+        options.resolve_for_pane(
+            session.name(),
+            session.active_window_index(),
+            pane.index(),
+            OptionName::AllowPassthrough,
+        ),
+        Some("on" | "all")
+    )
 }
 
 fn live_pane_render_for_target(

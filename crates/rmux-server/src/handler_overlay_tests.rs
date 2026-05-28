@@ -54,6 +54,7 @@ async fn create_quiet_attached_session(
             command: Some(quiet_overlay_command()),
             process_command: None,
             passthrough: false,
+            client_environment: None,
         }))
         .await;
     assert!(

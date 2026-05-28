@@ -20,11 +20,12 @@ use rmux_proto::{
 use tokio::time::sleep;
 
 const COMMAND_SURFACE_COUNT: usize = 78;
-const INTERNAL_REQUEST_COMMANDS: [&str; 35] = [
+const INTERNAL_REQUEST_COMMANDS: [&str; 37] = [
     "attach-session-ext",
     "attach-session-ext2",
     "cancel-sdk-wait",
     "control-mode",
+    "daemon-status",
     "detach-client-ext",
     "handshake",
     "new-session-ext",
@@ -46,6 +47,7 @@ const INTERNAL_REQUEST_COMMANDS: [&str; 35] = [
     "select-old-layout",
     "send-keys-ext",
     "spread-layout",
+    "shutdown-if-idle",
     "sdk-wait-output",
     "sdk-wait-for-output-ref",
     "sdk-wait-for-output",

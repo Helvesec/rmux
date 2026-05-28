@@ -21,6 +21,9 @@ use super::{session_not_found, HandlerState};
 #[path = "pane_outputs/submitted.rs"]
 mod submitted;
 
+#[path = "pane_outputs/exit_refresh.rs"]
+mod exit_refresh;
+
 pub(super) use self::submitted::AttachedSubmittedLine;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +63,7 @@ pub(super) struct RemovedPaneOutputs {
 
 pub(in crate::pane_terminals) struct PaneOutputSpawn {
     pub(in crate::pane_terminals) geometry: PaneGeometry,
+    pub(in crate::pane_terminals) initial_title: Option<String>,
     pub(in crate::pane_terminals) output_reader: PtyMaster,
     #[cfg(windows)]
     pub(in crate::pane_terminals) exit_watcher: Option<PtyChild>,
@@ -363,7 +367,7 @@ impl HandlerState {
             .lock()
             .expect("pane transcript mutex must not be poisoned")
             .set_utf8_config(Utf8Config::from_options(&self.options));
-        seed_initial_pane_title(&transcript);
+        seed_initial_pane_title(&transcript, spawn.initial_title.as_deref());
         let pane_output = pane_output_channel();
 
         if self
@@ -390,6 +394,8 @@ impl HandlerState {
             )));
         }
 
+        #[cfg(unix)]
+        let reader_runtime = self.pane_reader_runtime()?;
         self.transcripts
             .entry(session_name.clone())
             .or_default()
@@ -425,6 +431,8 @@ impl HandlerState {
             Some(generation),
             spawn.pane_alert_callback,
             spawn.pane_exit_callback,
+            #[cfg(unix)]
+            reader_runtime,
             replay_log,
         );
         Ok(())
@@ -451,7 +459,9 @@ impl HandlerState {
             .lock()
             .expect("pane transcript mutex must not be poisoned")
             .mark_clear_on_dead_exit();
-        seed_initial_pane_title(&transcript);
+        seed_initial_pane_title(&transcript, spawn.initial_title.as_deref());
+        #[cfg(unix)]
+        let reader_runtime = self.pane_reader_runtime()?;
         self.transcripts
             .entry(session_name.clone())
             .or_default()
@@ -491,6 +501,8 @@ impl HandlerState {
             Some(generation),
             spawn.pane_alert_callback,
             spawn.pane_exit_callback,
+            #[cfg(unix)]
+            reader_runtime,
             replay_log,
         );
         Ok(())
@@ -739,14 +751,22 @@ impl HandlerState {
     }
 }
 
-fn seed_initial_pane_title(transcript: &SharedPaneTranscript) {
-    let Some(hostname) = crate::host_name::local_hostname() else {
-        return;
+fn seed_initial_pane_title(transcript: &SharedPaneTranscript, initial_title: Option<&str>) {
+    let fallback;
+    let title = match initial_title.filter(|title| !title.is_empty()) {
+        Some(title) => title,
+        None => {
+            let Some(hostname) = crate::host_name::local_hostname() else {
+                return;
+            };
+            fallback = hostname;
+            &fallback
+        }
     };
     let mut transcript = transcript
         .lock()
         .expect("pane transcript mutex must not be poisoned");
     if transcript.title().is_empty() {
-        transcript.append_bytes(format!("\x1b]0;{hostname}\x07").as_bytes());
+        transcript.append_bytes(format!("\x1b]0;{title}\x07").as_bytes());
     }
 }

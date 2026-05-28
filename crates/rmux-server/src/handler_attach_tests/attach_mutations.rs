@@ -260,6 +260,96 @@ async fn allow_passthrough_mutations_refresh_attached_targets() {
         target.kitty_graphics_passthrough,
         "allow-passthrough changes must recompute the attach target gate"
     );
+    assert!(
+        !target.sixel_passthrough,
+        "kitty-only terminals must not enable sixel passthrough"
+    );
+}
+
+#[tokio::test]
+async fn allow_passthrough_enables_sixel_for_sixel_terminals() {
+    let handler = RequestHandler::new();
+    let requester_pid = 43;
+    let alpha = session_name("alpha");
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach_with_terminal_context(
+            requester_pid,
+            alpha,
+            control_tx,
+            OuterTerminalContext::from_pairs(&[("TERM", "foot")]),
+        )
+        .await;
+
+    let set = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::AllowPassthrough,
+            value: "on".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(set, Response::SetOption(_)));
+
+    let target = take_switch_target(control_rx.try_recv().expect("passthrough refresh"));
+    assert!(
+        target.sixel_passthrough,
+        "allow-passthrough should enable sixel passthrough on sixel terminals"
+    );
+}
+
+#[tokio::test]
+async fn allow_passthrough_all_uses_active_pane_gate_for_now() {
+    let handler = RequestHandler::new();
+    let requester_pid = 43;
+    let alpha = session_name("alpha");
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach_with_terminal_context(
+            requester_pid,
+            alpha,
+            control_tx,
+            OuterTerminalContext::from_pairs(&[("TERM", "xterm-kitty")]),
+        )
+        .await;
+
+    let set = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::AllowPassthrough,
+            value: "all".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(set, Response::SetOption(_)));
+
+    let target = take_switch_target(control_rx.try_recv().expect("passthrough refresh"));
+    assert!(
+        target.kitty_graphics_passthrough,
+        "all is accepted and currently shares the active-pane passthrough path"
+    );
 }
 
 #[tokio::test]

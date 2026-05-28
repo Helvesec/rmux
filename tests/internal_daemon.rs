@@ -4,7 +4,8 @@ mod common;
 
 use std::error::Error;
 use std::fs;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use rmux_client::{connect, ensure_server_running, INTERNAL_DAEMON_FLAG};
 use rmux_proto::{
@@ -12,9 +13,12 @@ use rmux_proto::{
 };
 
 use common::{
-    env_lock, terminate_child, unique_socket_path, wait_for_socket, write_hidden_launcher,
-    AutoStartCleanup, EnvVarGuard, BINARY_OVERRIDE_ENV, BINARY_OVERRIDE_TEST_OPT_IN_ENV,
+    env_lock, stderr, terminate_child, unique_socket_path, wait_for_socket, write_hidden_launcher,
+    AutoStartCleanup, CliHarness, EnvVarGuard, BINARY_OVERRIDE_ENV,
+    BINARY_OVERRIDE_TEST_OPT_IN_ENV,
 };
+
+const CLIENT_VERSION_OVERRIDE_ENV: &str = "RMUX_INTERNAL_CLIENT_VERSION";
 
 #[test]
 fn hidden_daemon_mode_binds_requested_socket_and_serves_requests() -> Result<(), Box<dyn Error>> {
@@ -225,4 +229,53 @@ fn ensure_server_running_reexecs_the_hidden_rmux_daemon() -> Result<(), Box<dyn 
     );
 
     Ok(())
+}
+
+#[test]
+fn seamless_upgrade_restarts_idle_stale_daemon_on_real_socket() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("seamless-upgrade")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+    let mut old_daemon = harness.start_hidden_daemon()?;
+    let old_pid = old_daemon.pid();
+
+    let output = harness.run_with(&["new-session", "-d", "-s", "upgraded"], |command| {
+        command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        command.env(CLIENT_VERSION_OVERRIDE_ENV, "999.0.0-test");
+    })?;
+    assert!(
+        output.status.success(),
+        "new-session after seamless upgrade failed: {}",
+        stderr(&output)
+    );
+
+    wait_for_child_exit(old_daemon.child_mut(), Duration::from_secs(5))?;
+    let new_pid = fs::read_to_string(harness.pid_path())?
+        .trim()
+        .parse::<u32>()?;
+    assert_ne!(
+        old_pid, new_pid,
+        "seamless upgrade must replace the stale idle daemon process"
+    );
+
+    let has_session = harness.run(&["has-session", "-t", "upgraded"])?;
+    assert!(
+        has_session.status.success(),
+        "new daemon did not serve the post-upgrade session: {}",
+        stderr(&has_session)
+    );
+
+    Ok(())
+}
+
+fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("stale daemon process {} did not exit", child.id()).into());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }

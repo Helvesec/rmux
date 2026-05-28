@@ -212,6 +212,12 @@ impl ScreenWriter for RecordingWriter {
             String::from_utf8_lossy(data)
         ));
     }
+    fn sixel_passthrough(&mut self, data: &[u8]) {
+        self.calls.push(format!(
+            "sixel_passthrough({:?})",
+            String::from_utf8_lossy(data)
+        ));
+    }
     fn apc_passthrough(&mut self, data: &[u8]) {
         self.calls.push(format!(
             "apc_passthrough({:?})",

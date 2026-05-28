@@ -5,15 +5,24 @@
 //! platform flags or Unix session setup locally.
 
 use std::io;
-use std::process::Command;
+use std::process::{Child, Command};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 #[cfg(windows)]
-use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
+use windows_sys::Win32::Foundation::{
+    GetHandleInformation, SetHandleInformation, ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE,
+    ERROR_INVALID_PARAMETER, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Console::{
+    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
@@ -29,6 +38,16 @@ use windows_sys::Win32::System::Threading::{
 /// fresh session is created in the child just before `exec`.
 pub fn configure_hidden_daemon_command(command: &mut Command, allow_job_breakaway: bool) {
     configure_hidden_daemon_command_impl(command, allow_job_breakaway);
+}
+
+/// Spawns a previously configured hidden-daemon command.
+///
+/// On Windows, captured stdout/stderr handles owned by the short-lived launcher
+/// can otherwise leak into the detached daemon and keep parent-side
+/// `wait_with_output` calls open until the daemon exits. This helper is the
+/// single place that applies the handle inheritance guard before spawning.
+pub fn spawn_hidden_daemon_command(command: &mut Command) -> io::Result<Child> {
+    spawn_hidden_daemon_command_impl(command)
 }
 
 /// Returns whether a hidden-daemon spawn error should be retried without the
@@ -60,6 +79,17 @@ fn configure_hidden_daemon_command_impl(command: &mut Command, allow_job_breakaw
 fn configure_hidden_daemon_command_impl(_command: &mut Command, _allow_job_breakaway: bool) {}
 
 #[cfg(windows)]
+fn spawn_hidden_daemon_command_impl(command: &mut Command) -> io::Result<Child> {
+    let _guard = StandardHandleInheritanceGuard::new()?;
+    command.spawn()
+}
+
+#[cfg(not(windows))]
+fn spawn_hidden_daemon_command_impl(command: &mut Command) -> io::Result<Child> {
+    command.spawn()
+}
+
+#[cfg(windows)]
 fn should_retry_hidden_daemon_without_breakaway_impl(error: &io::Error) -> bool {
     matches!(
         error.raw_os_error(),
@@ -83,6 +113,72 @@ pub const fn hidden_daemon_creation_flags(allow_job_breakaway: bool) -> u32 {
         base | CREATE_BREAKAWAY_FROM_JOB
     } else {
         base
+    }
+}
+
+#[cfg(windows)]
+struct StandardHandleInheritanceGuard {
+    _lock: MutexGuard<'static, ()>,
+    handles: Vec<(HANDLE, u32)>,
+}
+
+#[cfg(windows)]
+impl StandardHandleInheritanceGuard {
+    fn new() -> io::Result<Self> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+        let lock = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("hidden daemon std-handle inheritance mutex must not be poisoned");
+        let mut guard = Self {
+            _lock: lock,
+            handles: Vec::new(),
+        };
+
+        for std_handle in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: `std_handle` is one of the three documented standard
+            // handle constants, and the returned pseudo-handle is validated
+            // before use.
+            let handle = unsafe { GetStdHandle(std_handle) };
+            if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+                continue;
+            }
+            let mut flags = 0_u32;
+            // SAFETY: `handle` was returned by `GetStdHandle` and filtered for
+            // null/INVALID_HANDLE_VALUE above; `flags` is a valid out pointer.
+            let ok = unsafe { GetHandleInformation(handle, &mut flags) };
+            if ok == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_INVALID_HANDLE as i32) {
+                    continue;
+                }
+                return Err(error);
+            }
+            if flags & HANDLE_FLAG_INHERIT != 0 {
+                // SAFETY: `handle` is a valid standard handle at this point;
+                // only the inherit bit is modified and restored by the guard.
+                let ok = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+                if ok == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                guard.handles.push((handle, flags));
+            }
+        }
+
+        Ok(guard)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StandardHandleInheritanceGuard {
+    fn drop(&mut self) {
+        for (handle, flags) in self.handles.drain(..) {
+            let inherit_flag = flags & HANDLE_FLAG_INHERIT;
+            // SAFETY: handles in this list were successfully updated by
+            // `new`; restoring the inherit bit is best-effort during drop.
+            let _ = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, inherit_flag) };
+        }
     }
 }
 

@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "ratatui-rmux"
-version = "0.2.5"
+version = "0.3.1"
 dependencies = [
  "ratatui",
  "rmux-sdk",
@@ -654,7 +654,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rmux"
-version = "0.2.5"
+version = "0.3.1"
 dependencies = [
  "clap",
  "embed-manifest",
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-client"
-version = "0.2.5"
+version = "0.3.1"
 dependencies = [
  "libc",
  "rmux-core",
@@ -686,12 +686,13 @@ dependencies = [
  "rustix",
  "signal-hook",
  "tokio",
+ "tracing",
  "windows-sys",
 ]
 
 [[package]]
 name = "rmux-core"
-version = "0.2.5"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "regex",
@@ -701,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-ipc"
-version = "0.2.5"
+version = "0.3.1"
 dependencies = [
  "libc",
  "rmux-os",
@@ -713,7 +714,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-os"
-version = "0.2.5"
+version = "0.3.1"
 dependencies = [
  "libc",
  "rmux-types",
@@ -723,7 +724,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-proto"
-version = "0.2.5"
+version = "0.3.1"
 dependencies = [
  "bincode",
  "rmux-types",
@@ -733,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-pty"
-version = "0.2.5"
+version = "0.3.1"
 dependencies = [
  "libc",
  "rmux-os",
@@ -746,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-render-core"
-version = "0.2.5"
+version = "0.3.1"
 dependencies = [
  "ratatui",
  "serde",
@@ -754,7 +755,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-sdk"
-version = "0.2.5"
+version = "0.3.1"
 dependencies = [
  "bincode",
  "crossterm",
@@ -772,7 +773,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-server"
-version = "0.2.5"
+version = "0.3.1"
 dependencies = [
  "async-recursion",
  "chrono",
@@ -791,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-types"
-version = "0.2.5"
+version = "0.3.1"
 dependencies = [
  "serde",
 ]
@@ -1230,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.5"
+version = "0.3.1"
 
 [[package]]
 name = "zmij"

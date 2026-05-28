@@ -45,10 +45,11 @@ impl ExitFailure {
             clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => 0,
             _ => 1,
         };
+        let message = tmux_compat_clap_message(&error);
 
         Self {
             exit_code,
-            message: error.to_string().trim_end().to_owned(),
+            message,
             use_stderr: error.use_stderr(),
         }
     }
@@ -88,6 +89,14 @@ impl ExitFailure {
     pub(super) fn from_auto_start(error: AutoStartError) -> Self {
         Self::new(1, error.to_string())
     }
+}
+
+fn tmux_compat_clap_message(error: &clap::Error) -> String {
+    let message = error.to_string().trim_end().to_owned();
+    if let Some(stripped) = message.strip_prefix("error: command ") {
+        return format!("command {stripped}");
+    }
+    message
 }
 
 fn server_is_absent(error: &ClientError) -> bool {

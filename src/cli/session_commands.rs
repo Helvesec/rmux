@@ -13,6 +13,7 @@ use super::{
     run_command_resolved, run_payload_command, unexpected_response, write_command_output,
     ExitFailure, StartupOptions,
 };
+use crate::cli::client_environment::client_environment_assignments;
 use crate::cli_args::{
     KillSessionArgs, ListSessionsArgs, NewSessionArgs, RenameSessionArgs, SessionTargetArgs,
 };
@@ -53,6 +54,7 @@ pub(super) fn run_new_session(
             // already-spawned reader holding `None` and losing all
             // bytes that flow through window 0.
             passthrough: args.passthrough,
+            client_environment: Some(client_environment_assignments()),
         })
         .map_err(ExitFailure::from_client)?;
     let output = response.command_output().cloned();

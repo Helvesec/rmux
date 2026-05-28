@@ -36,6 +36,14 @@ pub(super) async fn execute_attached_binding_commands(
         .with_mouse_target(mouse_target);
 
     if parsed_commands_block_for_prompt(&commands) {
+        if attached_live_input
+            && handler
+                .start_attached_prompt_binding_commands(requester_pid, &commands, &context)
+                .await?
+        {
+            return Ok(());
+        }
+
         let handler = handler.clone();
         spawn_background_async("rmux-attached-prompt", move || async move {
             let _ = handler

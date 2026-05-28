@@ -131,11 +131,13 @@ impl Connection {
         scope: OptionScopeSelector,
         name: Option<String>,
         value_only: bool,
+        include_inherited: bool,
     ) -> Result<Response, ClientError> {
         self.roundtrip(&Request::ShowOptions(ShowOptionsRequest {
             scope,
             name,
             value_only,
+            include_inherited,
         }))
     }
 

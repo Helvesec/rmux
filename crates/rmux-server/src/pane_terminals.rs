@@ -13,6 +13,8 @@ use rmux_proto::{
 };
 
 use crate::pane_io::{PaneAlertCallback, PaneExitCallback, PaneOutputSender};
+#[cfg(unix)]
+use crate::pane_reader_runtime::PaneReaderRuntime;
 use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::pane_transcript::SharedPaneTranscript;
 
@@ -32,6 +34,8 @@ mod pane_terminal_store;
 mod pane_transcripts;
 #[path = "pane_terminals/pane_transfer.rs"]
 mod pane_transfer;
+#[path = "pane_terminals/pipes.rs"]
+mod pipes;
 #[path = "pane_terminals/rollback.rs"]
 mod rollback;
 #[path = "pane_terminals/session_mutation.rs"]
@@ -49,7 +53,7 @@ use lifecycle_state::PaneLifecycleSpawn;
 pub(crate) use lifecycle_state::PaneLifecycleState;
 pub(crate) use pane_outputs::PaneExitMetadata;
 use pane_outputs::{AttachedSubmittedLine, PaneOutputSpawn, RemovedPaneOutputs};
-use pane_pipe::{ActivePanePipe, PanePipeStore};
+use pane_pipe::PanePipeStore;
 use pane_terminal_store::PaneTerminalStore;
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use pane_transcripts::PaneCaptureRequest;
@@ -60,7 +64,17 @@ pub(crate) struct WindowSpawnOptions<'a> {
     pub(crate) start_directory: Option<&'a Path>,
     pub(crate) command: Option<&'a ProcessCommand>,
     pub(crate) socket_path: &'a Path,
+    pub(crate) spawn_environment: Option<&'a HashMap<String, String>>,
     pub(crate) environment_overrides: Option<&'a [String]>,
+    pub(crate) pane_alert_callback: Option<PaneAlertCallback>,
+    pub(crate) pane_exit_callback: Option<PaneExitCallback>,
+}
+
+pub(crate) struct InitialPaneSpawnOptions<'a> {
+    pub(crate) socket_path: &'a Path,
+    pub(crate) spawn_environment: Option<&'a HashMap<String, String>>,
+    pub(crate) environment_overrides: Option<&'a [String]>,
+    pub(crate) command: Option<&'a ProcessCommand>,
     pub(crate) pane_alert_callback: Option<PaneAlertCallback>,
     pub(crate) pane_exit_callback: Option<PaneExitCallback>,
 }
@@ -106,6 +120,8 @@ pub(crate) struct HandlerState {
     window_link_groups: HashMap<u64, WindowLinkGroup>,
     window_link_slots: HashMap<WindowLinkSlot, u64>,
     next_window_link_group_id: u64,
+    #[cfg(unix)]
+    pane_reader_runtime: Option<PaneReaderRuntime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +163,26 @@ pub(crate) struct KilledWindowResult {
 }
 
 impl HandlerState {
+    #[cfg(unix)]
+    pub(crate) fn set_pane_reader_runtime(&mut self, runtime: PaneReaderRuntime) {
+        self.pane_reader_runtime = Some(runtime);
+    }
+
+    #[cfg(unix)]
+    pub(in crate::pane_terminals) fn pane_reader_runtime(
+        &self,
+    ) -> Result<PaneReaderRuntime, RmuxError> {
+        let runtime = self.pane_reader_runtime.clone();
+        #[cfg(test)]
+        let runtime = runtime.or_else(PaneReaderRuntime::current);
+
+        runtime.ok_or_else(|| {
+            RmuxError::Server(
+                "cannot spawn Unix pane output reader without the server Tokio runtime".to_owned(),
+            )
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn shutdown_terminals_for_test(&mut self) {
         let mut runtime_sessions = self
@@ -283,70 +319,6 @@ impl HandlerState {
         }
     }
 
-    pub(crate) fn pipe_pane(
-        &mut self,
-        target: PaneTarget,
-        command: Option<String>,
-        read_from_pipe: bool,
-        write_to_pipe: bool,
-        once: bool,
-    ) -> Result<rmux_proto::PipePaneResponse, RmuxError> {
-        let session_name = target.session_name().clone();
-        let window_index = target.window_index();
-        let pane_index = target.pane_index();
-        let pane_id = pane_id_for_target(&self.sessions, &session_name, window_index, pane_index)?;
-        let runtime_session_name =
-            self.runtime_session_name_for_window(&session_name, window_index);
-
-        if once && self.pipes.contains(&runtime_session_name, pane_id) {
-            return Ok(rmux_proto::PipePaneResponse { target });
-        }
-
-        if let Some(pipe) = self.remove_pane_pipe(&runtime_session_name, pane_id) {
-            pipe.stop();
-        }
-
-        let Some(command) = command.filter(|command| !command.is_empty()) else {
-            return Ok(rmux_proto::PipePaneResponse { target });
-        };
-
-        let pane_master =
-            self.clone_pane_master_if_alive(&session_name, window_index, pane_index)?;
-        let pane_output = self.pane_output_for_target(&session_name, window_index, pane_index)?;
-        let profile = self
-            .terminals
-            .pane_profile(&runtime_session_name, pane_id, window_index, pane_index)?
-            .clone();
-        let pipe = ActivePanePipe::spawn(
-            &profile,
-            pane_output,
-            pane_master,
-            &command,
-            read_from_pipe,
-            write_to_pipe,
-        )?;
-        if let Some(previous) = self.pipes.insert(&runtime_session_name, pane_id, pipe) {
-            previous.stop();
-        }
-
-        Ok(rmux_proto::PipePaneResponse { target })
-    }
-
-    fn remove_session_pipes(
-        &mut self,
-        session_name: &SessionName,
-    ) -> HashMap<PaneId, ActivePanePipe> {
-        self.pipes.remove_session(session_name)
-    }
-
-    fn remove_pane_pipe(
-        &mut self,
-        session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Option<ActivePanePipe> {
-        self.pipes.remove(session_name, pane_id)
-    }
-
     fn clear_marked_pane_if_id(&mut self, pane_id: PaneId) {
         if self.marked_pane == Some(pane_id) {
             self.marked_pane = None;
@@ -425,7 +397,7 @@ pub(crate) fn session_not_found(session_name: &SessionName) -> RmuxError {
 mod tests {
     use std::collections::HashMap;
 
-    use super::HandlerState;
+    use super::{HandlerState, InitialPaneSpawnOptions};
     use rmux_proto::{
         HookLifecycle, HookName, OptionName, PaneTarget, RmuxError, ScopeSelector, SessionName,
         SetOptionMode, TerminalSize, WindowTarget,
@@ -448,11 +420,14 @@ mod tests {
         state
             .insert_initial_session_terminal(
                 &alpha,
-                std::path::Path::new("/tmp/rmux-test.sock"),
-                None,
-                None,
-                None,
-                None,
+                InitialPaneSpawnOptions {
+                    socket_path: std::path::Path::new("/tmp/rmux-test.sock"),
+                    spawn_environment: None,
+                    environment_overrides: None,
+                    command: None,
+                    pane_alert_callback: None,
+                    pane_exit_callback: None,
+                },
             )
             .expect("initial terminals exist");
         state

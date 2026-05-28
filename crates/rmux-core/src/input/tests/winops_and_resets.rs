@@ -140,11 +140,26 @@ fn oversized_kitty_apc_records_a_passthrough_drop() {
     let mut writer = RecordingWriter::new(80, 24);
 
     parser.parse(b"\x1b_G", &mut writer);
-    let chunk = vec![b'A'; INPUT_BUF_MAX + 1];
+    let chunk = vec![b'A'; crate::terminal_passthrough::MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES + 1];
     parser.parse(&chunk, &mut writer);
     parser.parse(b"\x1b\\", &mut writer);
 
     assert!(!writer.has_call("apc_passthrough"));
+    assert_eq!(parser.take_terminal_passthrough_dropped_count(), 1);
+    assert_eq!(parser.take_terminal_passthrough_dropped_count(), 0);
+}
+
+#[test]
+fn oversized_sixel_dcs_records_a_passthrough_drop() {
+    let mut parser = InputParser::new();
+    let mut writer = RecordingWriter::new(80, 24);
+
+    parser.parse(b"\x1bPq", &mut writer);
+    let chunk = vec![b'A'; crate::terminal_passthrough::MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES + 1];
+    parser.parse(&chunk, &mut writer);
+    parser.parse(b"\x1b\\", &mut writer);
+
+    assert!(!writer.has_call("sixel_passthrough"));
     assert_eq!(parser.take_terminal_passthrough_dropped_count(), 1);
     assert_eq!(parser.take_terminal_passthrough_dropped_count(), 0);
 }

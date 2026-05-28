@@ -561,6 +561,7 @@ async fn hook_commands_do_not_emit_nested_control_notifications() {
             scope: rmux_proto::OptionScopeSelector::SessionGlobal,
             name: None,
             value_only: false,
+            include_inherited: true,
         }))
         .await;
     assert!(matches!(response, Response::ShowOptions(_)));

@@ -385,6 +385,51 @@ fn extended_key_decode_supports_modified_cursor_sequences() {
 }
 
 #[test]
+fn extended_key_encode_uses_xterm_modified_cursor_sequences() {
+    for (name, expected) in [
+        ("C-Up", b"\x1b[1;5A".as_slice()),
+        ("C-Down", b"\x1b[1;5B".as_slice()),
+        ("C-Right", b"\x1b[1;5C".as_slice()),
+        ("C-Left", b"\x1b[1;5D".as_slice()),
+        ("S-Up", b"\x1b[1;2A".as_slice()),
+        ("M-Up", b"\x1b[1;3A".as_slice()),
+        ("C-Home", b"\x1b[1;5H".as_slice()),
+        ("C-End", b"\x1b[1;5F".as_slice()),
+    ] {
+        assert_eq!(
+            encode_key(
+                mode::MODE_KEYS_EXTENDED_2,
+                ExtendedKeyFormat::Xterm,
+                parse_key(name),
+            )
+            .as_deref(),
+            Some(expected),
+            "{name} should use xterm modified cursor encoding"
+        );
+    }
+}
+
+#[test]
+fn standard_key_encode_uses_xterm_modified_cursor_sequences() {
+    for (name, expected) in [
+        ("C-Up", b"\x1b[1;5A".as_slice()),
+        ("C-Down", b"\x1b[1;5B".as_slice()),
+        ("C-Right", b"\x1b[1;5C".as_slice()),
+        ("C-Left", b"\x1b[1;5D".as_slice()),
+        ("S-Up", b"\x1b[1;2A".as_slice()),
+        ("M-Up", b"\x1b[1;3A".as_slice()),
+        ("C-Home", b"\x1b[1;5H".as_slice()),
+        ("C-End", b"\x1b[1;5F".as_slice()),
+    ] {
+        assert_eq!(
+            encode_key(0, ExtendedKeyFormat::Xterm, parse_key(name)).as_deref(),
+            Some(expected),
+            "{name} should use xterm modified cursor encoding"
+        );
+    }
+}
+
+#[test]
 fn mouse_decode_rejects_non_esc_start() {
     assert_eq!(decode_mouse(b"X", None), MouseDecode::Invalid);
 }
@@ -559,6 +604,32 @@ fn vt10x_arrow_keys_match_tmux_standard_and_cursor_modes() {
         encode_key(mode::MODE_KCURSOR, ExtendedKeyFormat::Xterm, up).expect("cursor mode up"),
         b"\x1bOA"
     );
+}
+
+#[test]
+fn extended_modes_do_not_drop_plain_navigation_keys() {
+    for mode in [mode::MODE_KEYS_EXTENDED, mode::MODE_KEYS_EXTENDED_2] {
+        for format in [ExtendedKeyFormat::Xterm, ExtendedKeyFormat::CsiU] {
+            for (name, expected) in [
+                ("Up", b"\x1b[A".as_slice()),
+                ("Down", b"\x1b[B".as_slice()),
+                ("Left", b"\x1b[D".as_slice()),
+                ("Right", b"\x1b[C".as_slice()),
+                ("Home", b"\x1b[1~".as_slice()),
+                ("End", b"\x1b[4~".as_slice()),
+                ("DC", b"\x1b[3~".as_slice()),
+                ("PageUp", b"\x1b[5~".as_slice()),
+                ("PageDown", b"\x1b[6~".as_slice()),
+                ("F1", b"\x1bOP".as_slice()),
+            ] {
+                assert_eq!(
+                    encode_key(mode, format, parse_key(name)).as_deref(),
+                    Some(expected),
+                    "{name} should fall back to its VT sequence in extended mode"
+                );
+            }
+        }
+    }
 }
 
 #[test]

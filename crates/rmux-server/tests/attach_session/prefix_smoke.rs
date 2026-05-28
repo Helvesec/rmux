@@ -176,6 +176,7 @@ async fn new_passthrough_session(
             command: None,
             process_command: None,
             passthrough: true,
+            client_environment: None,
         }),
     )
     .await?;

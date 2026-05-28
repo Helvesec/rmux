@@ -5,7 +5,8 @@ use rmux_proto::{PaneTarget, RmuxError, WindowTarget};
 
 use super::registry::{registry, resolve_option_name, GlobalRoot};
 use super::render::{
-    default_array_show_values, render_entry_show_lines, render_show_line, show_option_name,
+    default_array_show_values, render_entry_show_lines, render_known_show_line, render_show_line,
+    show_option_name,
 };
 use super::scope::{ResolveContext, ShowScope};
 use super::storage::{OptionEntry, OptionNode};
@@ -62,7 +63,7 @@ impl OptionStore {
         let mut lines = Vec::new();
 
         match mode {
-            ShowOptionsMode::Resolved => {
+            ShowOptionsMode::Resolved | ShowOptionsMode::ResolvedWithInheritanceMarkers => {
                 for metadata in registry()
                     .iter()
                     .filter(|metadata| metadata.visible_in(show_scope.mask()))
@@ -72,7 +73,7 @@ impl OptionStore {
                         &show_scope,
                         &query,
                         value_only,
-                        ShowOptionsMode::Resolved,
+                        mode,
                     ));
                 }
 
@@ -204,11 +205,17 @@ impl OptionStore {
     ) -> Vec<String> {
         if query.is_user() {
             return match mode {
-                ShowOptionsMode::Resolved => self
+                ShowOptionsMode::Resolved | ShowOptionsMode::ResolvedWithInheritanceMarkers => self
                     .resolved_user_values_for_show_scope(scope)
                     .into_iter()
                     .find(|(entry_name, _)| entry_name == query.canonical_name())
-                    .map(|(_, value)| render_show_line(query.canonical_name(), &value, value_only))
+                    .map(|(_, value)| {
+                        render_show_line(
+                            &self.show_name_for_mode(scope, query, mode),
+                            &value,
+                            value_only,
+                        )
+                    })
                     .into_iter()
                     .collect(),
                 ShowOptionsMode::Explicit => self
@@ -222,7 +229,7 @@ impl OptionStore {
 
         if query.is_array() && query.index().is_none() {
             let values = match mode {
-                ShowOptionsMode::Resolved => {
+                ShowOptionsMode::Resolved | ShowOptionsMode::ResolvedWithInheritanceMarkers => {
                     self.resolved_array_values_for_show_scope(scope, query)
                 }
                 ShowOptionsMode::Explicit => self
@@ -231,20 +238,24 @@ impl OptionStore {
                     .map(OptionEntry::array_entries)
                     .unwrap_or_default(),
             };
+            if values.is_empty() && !value_only {
+                return vec![query.canonical_name().to_owned()];
+            }
             return values
                 .into_iter()
                 .map(|(index, value)| {
-                    render_show_line(
-                        &show_option_name(query.canonical_name(), Some(index)),
-                        &value,
-                        value_only,
-                    )
+                    let name = show_option_name(query.canonical_name(), Some(index));
+                    let name =
+                        self.show_index_name_for_mode(scope, query, Some(index), mode, &name);
+                    render_known_show_line(query, &name, &value, value_only)
                 })
                 .collect();
         }
 
         let value = match mode {
-            ShowOptionsMode::Resolved => self.resolved_value_for_show_scope(scope, query),
+            ShowOptionsMode::Resolved | ShowOptionsMode::ResolvedWithInheritanceMarkers => {
+                self.resolved_value_for_show_scope(scope, query)
+            }
             ShowOptionsMode::Explicit => self
                 .node_for_show_scope(scope)
                 .and_then(|node| node.value(query.canonical_name(), query.index()))
@@ -254,13 +265,42 @@ impl OptionStore {
         value
             .into_iter()
             .map(|value| {
-                render_show_line(
-                    &show_option_name(query.canonical_name(), query.index()),
-                    &value,
-                    value_only,
-                )
+                let name = show_option_name(query.canonical_name(), query.index());
+                let name = self.show_index_name_for_mode(scope, query, query.index(), mode, &name);
+                render_known_show_line(query, &name, &value, value_only)
             })
             .collect()
+    }
+
+    fn show_name_for_mode(
+        &self,
+        scope: &ShowScope,
+        query: &OptionQuery,
+        mode: ShowOptionsMode,
+    ) -> String {
+        let name = query.canonical_name();
+        self.show_index_name_for_mode(scope, query, query.index(), mode, name)
+    }
+
+    fn show_index_name_for_mode(
+        &self,
+        scope: &ShowScope,
+        query: &OptionQuery,
+        index: Option<u32>,
+        mode: ShowOptionsMode,
+        name: &str,
+    ) -> String {
+        if mode != ShowOptionsMode::ResolvedWithInheritanceMarkers {
+            return name.to_owned();
+        }
+        if self
+            .node_for_show_scope(scope)
+            .is_some_and(|node| node.contains(query.canonical_name(), index))
+        {
+            name.to_owned()
+        } else {
+            format!("{name}*")
+        }
     }
 
     fn resolved_array_values_for_show_scope(

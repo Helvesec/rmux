@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+/// Maximum payload size retained for one terminal graphics passthrough event.
+pub(crate) const MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+
 /// Opaque terminal command that must be forwarded to a capable outer terminal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalPassthrough {
@@ -14,6 +17,8 @@ pub struct TerminalPassthrough {
 pub enum TerminalPassthroughKind {
     /// Kitty terminal graphics protocol, encoded as an APC payload.
     KittyGraphics,
+    /// SIXEL graphics protocol, encoded as a DCS payload.
+    Sixel,
 }
 
 impl TerminalPassthrough {
@@ -22,6 +27,17 @@ impl TerminalPassthrough {
     pub fn kitty_graphics(cursor_x: u32, cursor_y: u32, payload: impl Into<Vec<u8>>) -> Self {
         Self {
             kind: TerminalPassthroughKind::KittyGraphics,
+            cursor_x,
+            cursor_y,
+            payload: Arc::from(payload.into()),
+        }
+    }
+
+    /// Creates a SIXEL passthrough event at a pane-local cursor position.
+    #[must_use]
+    pub fn sixel(cursor_x: u32, cursor_y: u32, payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            kind: TerminalPassthroughKind::Sixel,
             cursor_x,
             cursor_y,
             payload: Arc::from(payload.into()),
@@ -63,6 +79,32 @@ impl TerminalPassthrough {
                 sequence.extend_from_slice(b"\x1b\\");
                 sequence
             }
+            TerminalPassthroughKind::Sixel => {
+                let mut sequence = Vec::with_capacity(self.payload.len() + 4);
+                sequence.extend_from_slice(b"\x1bP");
+                sequence.extend_from_slice(&self.payload);
+                sequence.extend_from_slice(b"\x1b\\");
+                sequence
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TerminalPassthrough;
+
+    #[test]
+    fn renders_kitty_apc_sequence() {
+        let passthrough = TerminalPassthrough::kitty_graphics(0, 0, b"Gf=100;AAAA".to_vec());
+
+        assert_eq!(passthrough.render_sequence(), b"\x1b_Gf=100;AAAA\x1b\\");
+    }
+
+    #[test]
+    fn renders_sixel_dcs_sequence() {
+        let passthrough = TerminalPassthrough::sixel(0, 0, b"q#0!10~".to_vec());
+
+        assert_eq!(passthrough.render_sequence(), b"\x1bPq#0!10~\x1b\\");
     }
 }

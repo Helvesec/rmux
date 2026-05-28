@@ -6,6 +6,14 @@ use crate::SessionName;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KillServerRequest;
 
+/// Request payload for internal daemon status inspection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonStatusRequest;
+
+/// Request payload for internal idle-only daemon shutdown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShutdownIfIdleRequest;
+
 /// Request payload for `lock-server`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockServerRequest;

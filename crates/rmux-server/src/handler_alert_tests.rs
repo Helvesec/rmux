@@ -327,6 +327,7 @@ async fn pane_alert_event_updates_grouped_session_window_names() {
             command: None,
             process_command: None,
             passthrough: false,
+            client_environment: None,
         }))
         .await;
     assert!(matches!(response, Response::NewSession(_)));

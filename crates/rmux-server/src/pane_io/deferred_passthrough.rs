@@ -16,10 +16,11 @@ use tracing::warn;
 #[cfg(any(unix, windows))]
 const DEFERRED_PASSTHROUGH_LIMIT: usize = 16;
 
-// Kitty graphics are forwarded live to attached clients; they are not part of
-// the text grid and are not replayed on later attaches. This queue only delays
-// passthroughs while rmux-owned overlays are visible, and stays bounded so a
-// busy image-producing app cannot grow server memory through the overlay path.
+// Terminal graphics are forwarded live to attached clients; they are not part
+// of the text grid and are not replayed on later attaches. This queue only
+// delays passthroughs while rmux-owned overlays are visible, and stays bounded
+// so a busy image-producing app cannot grow server memory through the overlay
+// path.
 #[cfg(any(unix, windows))]
 pub(super) fn defer_passthroughs(
     deferred_passthroughs: &mut Vec<TerminalPassthrough>,

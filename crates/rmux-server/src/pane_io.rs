@@ -20,8 +20,10 @@ use tracing::debug;
 const READ_BUFFER_SIZE: usize = 8192;
 mod control;
 mod deferred_passthrough;
+mod exit_log;
 mod live_render;
 mod passthrough;
+mod pending_escape;
 mod persistent_overlay;
 mod reader;
 mod refresh_scheduler;
@@ -46,7 +48,11 @@ use deferred_passthrough::{
     clear_deferred_passthroughs_if_target_changed, defer_passthroughs, flush_deferred_passthroughs,
     take_passthrough_frame,
 };
+#[cfg(any(unix, windows))]
+use exit_log::{record_attach_exit, AttachExitReason};
 pub(crate) use live_render::LivePaneRender;
+#[cfg(any(unix, windows))]
+use pending_escape::PendingEscapeFlush;
 #[cfg(any(unix, windows))]
 use persistent_overlay::{
     accept_persistent_overlay_state, advance_persistent_overlay_state, clear_then_base_frame,
@@ -97,6 +103,7 @@ pub(crate) async fn forward_attach(
     let mut pending_input = Vec::new();
     let mut attach_controls = Some(control_rx);
     let mut deferred_controls = VecDeque::new();
+    let mut pending_escape_flush = PendingEscapeFlush::default();
     let mut socket_read_buffer = [0_u8; READ_BUFFER_SIZE];
     let mut current_target = open_attach_target(target)?;
     let mut render_generation = 0_u64;
@@ -156,6 +163,11 @@ pub(crate) async fn forward_attach(
             )
             .await?;
             if closing.load(Ordering::SeqCst) {
+                log_attach_exit(
+                    &live_input,
+                    &current_target,
+                    AttachExitReason::AttachClosingFlag,
+                );
                 let _ = emit_attach_stop(&stream, &current_target).await;
                 return Ok(());
             }
@@ -173,7 +185,8 @@ pub(crate) async fn forward_attach(
             )
             .await?
             {
-                PendingAttachAction::Exit => {
+                PendingAttachAction::Exit(reason) => {
+                    log_attach_exit(&live_input, &current_target, reason);
                     return Ok(());
                 }
                 PendingAttachAction::Continue { target_changed } => {
@@ -208,6 +221,11 @@ pub(crate) async fn forward_attach(
                     match try_read_socket_bytes(&stream, &mut decoder, &mut socket_read_buffer)? {
                         TrySocketRead::Read => {}
                         TrySocketRead::Closed => {
+                            log_attach_exit(
+                                &live_input,
+                                &current_target,
+                                AttachExitReason::AttachStreamClosed,
+                            );
                             let _ = emit_attach_stop(&stream, &current_target).await;
                             return Ok(());
                         }
@@ -222,6 +240,12 @@ pub(crate) async fn forward_attach(
                     &mut locked,
                 )
                 .await?;
+                sync_pending_escape_flush(
+                    &mut pending_escape_flush,
+                    &live_input,
+                    &pending_input,
+                )
+                .await;
             }
             prime_persistent_overlay_barriers(
                 &mut persistent_overlay_state_id,
@@ -242,7 +266,8 @@ pub(crate) async fn forward_attach(
             )
             .await?
             {
-                PendingAttachAction::Exit => {
+                PendingAttachAction::Exit(reason) => {
+                    log_attach_exit(&live_input, &current_target, reason);
                     return Ok(());
                 }
                 PendingAttachAction::Continue { target_changed } => {
@@ -270,6 +295,11 @@ pub(crate) async fn forward_attach(
                 PendingAttachAction::Write => {}
             }
             if live_input.handler.request_shutdown_if_pending() {
+                log_attach_exit(
+                    &live_input,
+                    &current_target,
+                    AttachExitReason::PendingServerShutdown,
+                );
                 let _ = emit_attach_stop(&stream, &current_target).await;
                 return Ok(());
             }
@@ -278,12 +308,22 @@ pub(crate) async fn forward_attach(
                 biased;
                 result = shutdown.changed() => {
                     let _ = result;
+                    log_attach_exit(
+                        &live_input,
+                        &current_target,
+                        AttachExitReason::ServerShutdown,
+                    );
                     let _ = emit_attach_stop(&stream, &current_target).await;
                     return Ok(());
                 }
                 _ = wait_for_refresh_deadline(pane_refresh.deadline()) => {
                     pane_refresh.clear();
                     if closing.load(Ordering::SeqCst) {
+                        log_attach_exit(
+                            &live_input,
+                            &current_target,
+                            AttachExitReason::AttachClosingFlag,
+                        );
                         let _ = emit_attach_stop(&stream, &current_target).await;
                         return Ok(());
                     }
@@ -301,7 +341,8 @@ pub(crate) async fn forward_attach(
                     )
                     .await?
                     {
-                        PendingAttachAction::Exit => {
+                        PendingAttachAction::Exit(reason) => {
+                            log_attach_exit(&live_input, &current_target, reason);
                             return Ok(());
                         }
                         PendingAttachAction::Continue { target_changed } => {
@@ -331,6 +372,11 @@ pub(crate) async fn forward_attach(
                                 continue;
                             }
                             if closing.load(Ordering::SeqCst) {
+                                log_attach_exit(
+                                    &live_input,
+                                    &current_target,
+                                    AttachExitReason::AttachClosingFlag,
+                                );
                                 let _ = emit_attach_stop(&stream, &current_target).await;
                                 return Ok(());
                             }
@@ -344,6 +390,11 @@ pub(crate) async fn forward_attach(
                 }
                 _ = wait_for_refresh_deadline(status_refresh.deadline()) => {
                     if closing.load(Ordering::SeqCst) {
+                        log_attach_exit(
+                            &live_input,
+                            &current_target,
+                            AttachExitReason::AttachClosingFlag,
+                        );
                         let _ = emit_attach_stop(&stream, &current_target).await;
                         return Ok(());
                     }
@@ -361,7 +412,8 @@ pub(crate) async fn forward_attach(
                     )
                     .await?
                     {
-                        PendingAttachAction::Exit => {
+                        PendingAttachAction::Exit(reason) => {
+                            log_attach_exit(&live_input, &current_target, reason);
                             return Ok(());
                         }
                         PendingAttachAction::Continue { target_changed } => {
@@ -410,28 +462,67 @@ pub(crate) async fn forward_attach(
                 }
                 result = read_socket_bytes(&stream, &mut decoder, &mut socket_read_buffer) => {
                     if !result? {
+                        log_attach_exit(
+                            &live_input,
+                            &current_target,
+                            AttachExitReason::AttachStreamClosed,
+                        );
                         let _ = emit_attach_stop(&stream, &current_target).await;
                         return Ok(());
                     }
                 }
+                _ = wait_for_refresh_deadline(pending_escape_flush.deadline()) => {
+                    pending_escape_flush.clear();
+                    if locked {
+                        pending_input.clear();
+                        continue;
+                    }
+                    live_input
+                        .handler
+                        .flush_attached_pending_escape_input(
+                            live_input.attach_pid,
+                            &mut pending_input,
+                        )
+                        .await?;
+                }
                 control = recv_attach_control(&mut deferred_controls, attach_controls.as_mut()) => {
                     match control {
                         Some(AttachControl::Detach) => {
+                            log_attach_exit(
+                                &live_input,
+                                &current_target,
+                                AttachExitReason::AttachControlDetach,
+                            );
                             let _ = emit_attach_stop(&stream, &current_target).await;
                             let _ = emit_detached_message(&stream, &current_target).await;
                             return Ok(());
                         }
                         Some(AttachControl::Exited) => {
+                            log_attach_exit(
+                                &live_input,
+                                &current_target,
+                                AttachExitReason::AttachControlExited,
+                            );
                             let _ = emit_attach_stop(&stream, &current_target).await;
                             let _ = emit_exited_message(&stream).await;
                             return Ok(());
                         }
                         Some(AttachControl::DetachKill) => {
+                            log_attach_exit(
+                                &live_input,
+                                &current_target,
+                                AttachExitReason::AttachControlDetachKill,
+                            );
                             emit_attach_stop(&stream, &current_target).await?;
                             emit_attach_message(&stream, &AttachMessage::DetachKill).await?;
                             return Ok(());
                         }
                         Some(AttachControl::DetachExecShellCommand(command)) => {
+                            log_attach_exit(
+                                &live_input,
+                                &current_target,
+                                AttachExitReason::AttachControlDetachExec,
+                            );
                             emit_attach_stop(&stream, &current_target).await?;
                             emit_attach_message(
                                 &stream,
@@ -449,6 +540,7 @@ pub(crate) async fn forward_attach(
                             }
                             render_generation = render_generation.saturating_add(1);
                             pending_input.clear();
+                            pending_escape_flush.clear();
                             deferred_passthroughs.clear();
                             let pending_overlay = take_pending_persistent_overlay_for_state(
                                 attach_controls.as_mut(),
@@ -610,6 +702,11 @@ pub(crate) async fn forward_attach(
                         continue;
                     }
                     if closing.load(Ordering::SeqCst) {
+                        log_attach_exit(
+                            &live_input,
+                            &current_target,
+                            AttachExitReason::AttachClosingFlag,
+                        );
                         let _ = emit_attach_stop(&stream, &current_target).await;
                         return Ok(());
                     }
@@ -627,7 +724,8 @@ pub(crate) async fn forward_attach(
                     )
                     .await?
                     {
-                        PendingAttachAction::Exit => {
+                        PendingAttachAction::Exit(reason) => {
+                            log_attach_exit(&live_input, &current_target, reason);
                             return Ok(());
                         }
                         PendingAttachAction::Continue { target_changed } => {
@@ -649,6 +747,11 @@ pub(crate) async fn forward_attach(
                                 continue;
                             }
                             if closing.load(Ordering::SeqCst) {
+                                log_attach_exit(
+                                    &live_input,
+                                    &current_target,
+                                    AttachExitReason::AttachClosingFlag,
+                                );
                                 let _ = emit_attach_stop(&stream, &current_target).await;
                                 return Ok(());
                             }
@@ -703,10 +806,20 @@ pub(crate) async fn forward_attach(
     .await;
 
     if result.is_err() {
+        log_attach_exit(&live_input, &current_target, AttachExitReason::AttachError);
         let _ = emit_attach_stop(&stream, &current_target).await;
     }
 
     result
+}
+
+#[cfg(any(unix, windows))]
+fn log_attach_exit(
+    live_input: &LiveAttachInputContext,
+    current_target: &types::OpenAttachTarget,
+    reason: AttachExitReason,
+) {
+    record_attach_exit(live_input.attach_pid, &current_target.session_name, reason);
 }
 
 #[cfg(any(unix, windows))]
@@ -1471,6 +1584,16 @@ async fn emit_passthrough_mode_diff(
 /// window's first emit.
 #[cfg(any(unix, windows))]
 const PASSTHROUGH_SWITCH_RESET: &[u8] = b"\x1b[m\x1b[H\x1b[2J";
+
+#[cfg(any(unix, windows))]
+async fn sync_pending_escape_flush(
+    pending_escape_flush: &mut PendingEscapeFlush,
+    live_input: &LiveAttachInputContext,
+    pending_input: &[u8],
+) {
+    let escape_time = live_input.handler.attached_escape_time().await;
+    pending_escape_flush.sync(pending_input, escape_time);
+}
 
 #[cfg(any(unix, windows))]
 async fn process_socket_messages(

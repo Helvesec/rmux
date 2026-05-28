@@ -7,11 +7,12 @@ use crate::pane_transcript::SharedPaneTranscript;
 
 use super::HandlerState;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PaneHistoryStats {
     pub(crate) limit: usize,
     pub(crate) size: usize,
     pub(crate) bytes: usize,
+    pub(crate) all_bytes: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,7 +199,8 @@ impl HandlerState {
         Some(PaneHistoryStats {
             limit: transcript.history_limit(),
             size: transcript.history_size(),
-            bytes: transcript.history_bytes(),
+            bytes: transcript.tmux_history_bytes(),
+            all_bytes: transcript.tmux_history_all_bytes(),
         })
     }
 

@@ -8,6 +8,9 @@ use crate::{
     SessionName, Target, WindowTarget,
 };
 
+#[path = "request/compat.rs"]
+mod compat;
+
 #[path = "request/show.rs"]
 mod show;
 pub use show::ShowHooksRequest;
@@ -57,8 +60,8 @@ pub use session::{
 #[path = "request/server.rs"]
 mod server;
 pub use server::{
-    KillServerRequest, LockClientRequest, LockServerRequest, LockSessionRequest,
-    ServerAccessRequest,
+    DaemonStatusRequest, KillServerRequest, LockClientRequest, LockServerRequest,
+    LockSessionRequest, ServerAccessRequest, ShutdownIfIdleRequest,
 };
 
 #[path = "request/client.rs"]
@@ -319,6 +322,10 @@ pub enum Request {
     SubscribePaneOutputRef(SubscribePaneOutputRefRequest),
     /// Internal daemon-backed SDK byte wait endpoint with stable pane-id targeting.
     SdkWaitForOutputRef(SdkWaitForOutputRefRequest),
+    /// Internal daemon version and activity status endpoint.
+    DaemonStatus(DaemonStatusRequest),
+    /// Internal idle-only shutdown endpoint used by seamless upgrades.
+    ShutdownIfIdle(ShutdownIfIdleRequest),
 }
 
 impl Request {
@@ -437,6 +444,8 @@ impl Request {
             Self::AttachSessionExt2(_) => "attach-session",
             Self::SwitchClientExt3(_) => "switch-client",
             Self::Handshake(_) => "handshake",
+            Self::DaemonStatus(_) => "daemon-status",
+            Self::ShutdownIfIdle(_) => "shutdown-if-idle",
         }
     }
 }
@@ -676,6 +685,7 @@ mod tests {
                 command: None,
                 process_command: None,
                 passthrough: false,
+                client_environment: None,
             })
             .command_name(),
             "new-session"

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
@@ -6,7 +6,7 @@ use std::sync::{Arc, Weak};
 
 use rmux_core::events::{PaneSnapshotCoalescerRegistry, SubscriptionLimits};
 use rmux_ipc::PeerIdentity;
-use rmux_proto::{KillServerResponse, Response, RmuxError, TerminalSize, WindowTarget};
+use rmux_proto::{RmuxError, TerminalSize, WindowTarget};
 use tokio::sync::{broadcast, Mutex};
 
 use crate::daemon::ShutdownHandle;
@@ -16,6 +16,8 @@ mod alert_support;
 pub(crate) mod attach_support;
 #[path = "handler_buffer.rs"]
 mod buffer_support;
+#[path = "handler_client_environment.rs"]
+mod client_environment_support;
 #[path = "handler_client_runtime.rs"]
 mod client_runtime_support;
 #[path = "handler_client.rs"]
@@ -28,6 +30,8 @@ mod config_support;
 mod control_support;
 #[path = "handler_copy_mode.rs"]
 mod copy_mode_support;
+#[path = "handler_daemon.rs"]
+mod daemon_support;
 #[path = "handler_dispatch.rs"]
 mod dispatch_support;
 #[path = "handler_exited_outputs.rs"]
@@ -54,6 +58,8 @@ mod server_access_support;
 mod session_lease_support;
 #[path = "handler_session.rs"]
 mod session_support;
+#[path = "handler_shutdown.rs"]
+mod shutdown_support;
 #[path = "handler_subscriptions.rs"]
 mod subscription_support;
 #[path = "handler_targets.rs"]
@@ -66,6 +72,7 @@ use crate::pane_terminals::HandlerState;
 use crate::server_access::{current_owner_uid, AccessMode, ServerAccessStore};
 use crate::wait_for::WaitForStore;
 use attach_support::{ActiveAttachState, ClientFlags};
+pub(in crate::handler) use client_environment_support::client_spawn_environment;
 pub(in crate::handler) use client_runtime_support::{
     attached_client_matches_target, client_environment_snapshot, clipboard_query_sequence,
     command_output_from_lines, effective_client_terminal_context, format_client_uid,
@@ -104,6 +111,13 @@ use wait_support::SdkWaitState;
 pub const DEFAULT_SESSION_SIZE: TerminalSize = TerminalSize { cols: 80, rows: 24 };
 const HOOK_EVENT_BUFFER: usize = 256;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::handler) enum PendingShutdownReason {
+    ExitEmpty,
+    KillServer,
+    SeamlessUpgradeIdle,
+}
+
 #[derive(Debug)]
 pub(crate) struct RequestHandler {
     state: Arc<Mutex<HandlerState>>,
@@ -117,6 +131,10 @@ pub(crate) struct RequestHandler {
     server_socket_path: Arc<StdMutex<PathBuf>>,
     server_access: Arc<StdMutex<ServerAccessStore>>,
     shutdown_requested: Arc<AtomicBool>,
+    shutdown_reason: Arc<StdMutex<Option<PendingShutdownReason>>>,
+    shutdown_retry_scheduled: Arc<AtomicBool>,
+    active_detached_connections: Arc<StdMutex<HashSet<u64>>>,
+    active_detached_requests: Arc<AtomicUsize>,
     shutdown_handle: Arc<StdMutex<Option<ShutdownHandle>>>,
     config_loading_depth: Arc<AtomicUsize>,
     next_connection_id: Arc<AtomicU64>,
@@ -127,6 +145,7 @@ pub(crate) struct RequestHandler {
     session_lease_janitor_started: Arc<AtomicBool>,
     pane_snapshot_coalescers: Arc<StdMutex<PaneSnapshotCoalescerRegistry>>,
     pane_snapshot_revisions: Arc<StdMutex<PaneSnapshotRevisionRegistry>>,
+    task_runtime: Option<tokio::runtime::Handle>,
     #[cfg(test)]
     cleanup_on_drop: bool,
     #[cfg(test)]
@@ -147,6 +166,10 @@ impl Clone for RequestHandler {
             server_socket_path: self.server_socket_path.clone(),
             server_access: self.server_access.clone(),
             shutdown_requested: self.shutdown_requested.clone(),
+            shutdown_reason: self.shutdown_reason.clone(),
+            shutdown_retry_scheduled: self.shutdown_retry_scheduled.clone(),
+            active_detached_connections: self.active_detached_connections.clone(),
+            active_detached_requests: self.active_detached_requests.clone(),
             shutdown_handle: self.shutdown_handle.clone(),
             config_loading_depth: self.config_loading_depth.clone(),
             next_connection_id: self.next_connection_id.clone(),
@@ -157,6 +180,7 @@ impl Clone for RequestHandler {
             session_lease_janitor_started: self.session_lease_janitor_started.clone(),
             pane_snapshot_coalescers: self.pane_snapshot_coalescers.clone(),
             pane_snapshot_revisions: self.pane_snapshot_revisions.clone(),
+            task_runtime: self.task_runtime.clone(),
             #[cfg(test)]
             cleanup_on_drop: false,
             #[cfg(test)]
@@ -178,6 +202,10 @@ pub(crate) struct WeakRequestHandler {
     server_socket_path: Weak<StdMutex<PathBuf>>,
     server_access: Weak<StdMutex<ServerAccessStore>>,
     shutdown_requested: Weak<AtomicBool>,
+    shutdown_reason: Weak<StdMutex<Option<PendingShutdownReason>>>,
+    shutdown_retry_scheduled: Weak<AtomicBool>,
+    active_detached_connections: Weak<StdMutex<HashSet<u64>>>,
+    active_detached_requests: Weak<AtomicUsize>,
     shutdown_handle: Weak<StdMutex<Option<ShutdownHandle>>>,
     config_loading_depth: Weak<AtomicUsize>,
     next_connection_id: Weak<AtomicU64>,
@@ -188,6 +216,7 @@ pub(crate) struct WeakRequestHandler {
     session_lease_janitor_started: Weak<AtomicBool>,
     pane_snapshot_coalescers: Weak<StdMutex<PaneSnapshotCoalescerRegistry>>,
     pane_snapshot_revisions: Weak<StdMutex<PaneSnapshotRevisionRegistry>>,
+    task_runtime: Option<tokio::runtime::Handle>,
     #[cfg(test)]
     paste_buffer_delete_pause: Weak<StdMutex<Option<Arc<PasteBufferDeletePause>>>>,
 }
@@ -206,6 +235,10 @@ impl WeakRequestHandler {
             server_socket_path: self.server_socket_path.upgrade()?,
             server_access: self.server_access.upgrade()?,
             shutdown_requested: self.shutdown_requested.upgrade()?,
+            shutdown_reason: self.shutdown_reason.upgrade()?,
+            shutdown_retry_scheduled: self.shutdown_retry_scheduled.upgrade()?,
+            active_detached_connections: self.active_detached_connections.upgrade()?,
+            active_detached_requests: self.active_detached_requests.upgrade()?,
             shutdown_handle: self.shutdown_handle.upgrade()?,
             config_loading_depth: self.config_loading_depth.upgrade()?,
             next_connection_id: self.next_connection_id.upgrade()?,
@@ -216,6 +249,7 @@ impl WeakRequestHandler {
             session_lease_janitor_started: self.session_lease_janitor_started.upgrade()?,
             pane_snapshot_coalescers: self.pane_snapshot_coalescers.upgrade()?,
             pane_snapshot_revisions: self.pane_snapshot_revisions.upgrade()?,
+            task_runtime: self.task_runtime.clone(),
             #[cfg(test)]
             cleanup_on_drop: false,
             #[cfg(test)]
@@ -285,6 +319,11 @@ impl RequestHandler {
     ) -> Self {
         let (hook_events, _receiver) = broadcast::channel(HOOK_EVENT_BUFFER);
         let mut state = HandlerState::default();
+        let task_runtime = tokio::runtime::Handle::try_current().ok();
+        #[cfg(unix)]
+        if let Some(runtime) = crate::pane_reader_runtime::PaneReaderRuntime::current() {
+            state.set_pane_reader_runtime(runtime);
+        }
         if let Some(environment) = environment {
             seed_global_environment(&mut state, environment);
         }
@@ -300,6 +339,10 @@ impl RequestHandler {
             server_socket_path: Arc::new(StdMutex::new(PathBuf::from("/tmp/rmux-test.sock"))),
             server_access: Arc::new(StdMutex::new(ServerAccessStore::new(owner_uid))),
             shutdown_requested: Arc::new(AtomicBool::new(false)),
+            shutdown_reason: Arc::new(StdMutex::new(None)),
+            shutdown_retry_scheduled: Arc::new(AtomicBool::new(false)),
+            active_detached_connections: Arc::new(StdMutex::new(HashSet::new())),
+            active_detached_requests: Arc::new(AtomicUsize::new(0)),
             shutdown_handle: Arc::new(StdMutex::new(None)),
             config_loading_depth: Arc::new(AtomicUsize::new(0)),
             next_connection_id: Arc::new(AtomicU64::new(1)),
@@ -316,6 +359,7 @@ impl RequestHandler {
             pane_snapshot_revisions: Arc::new(StdMutex::new(
                 PaneSnapshotRevisionRegistry::default(),
             )),
+            task_runtime,
             #[cfg(test)]
             cleanup_on_drop: true,
             #[cfg(test)]
@@ -336,6 +380,10 @@ impl RequestHandler {
             server_socket_path: Arc::downgrade(&self.server_socket_path),
             server_access: Arc::downgrade(&self.server_access),
             shutdown_requested: Arc::downgrade(&self.shutdown_requested),
+            shutdown_reason: Arc::downgrade(&self.shutdown_reason),
+            shutdown_retry_scheduled: Arc::downgrade(&self.shutdown_retry_scheduled),
+            active_detached_connections: Arc::downgrade(&self.active_detached_connections),
+            active_detached_requests: Arc::downgrade(&self.active_detached_requests),
             shutdown_handle: Arc::downgrade(&self.shutdown_handle),
             config_loading_depth: Arc::downgrade(&self.config_loading_depth),
             next_connection_id: Arc::downgrade(&self.next_connection_id),
@@ -346,6 +394,7 @@ impl RequestHandler {
             session_lease_janitor_started: Arc::downgrade(&self.session_lease_janitor_started),
             pane_snapshot_coalescers: Arc::downgrade(&self.pane_snapshot_coalescers),
             pane_snapshot_revisions: Arc::downgrade(&self.pane_snapshot_revisions),
+            task_runtime: self.task_runtime.clone(),
             #[cfg(test)]
             paste_buffer_delete_pause: Arc::downgrade(&self.paste_buffer_delete_pause),
         }
@@ -353,6 +402,10 @@ impl RequestHandler {
 
     pub(crate) fn allocate_connection_id(&self) -> u64 {
         self.next_connection_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(crate) fn server_task_runtime(&self) -> Option<tokio::runtime::Handle> {
+        self.task_runtime.clone()
     }
 
     pub(crate) fn set_socket_path(&self, socket_path: impl AsRef<Path>) {
@@ -465,53 +518,36 @@ impl RequestHandler {
             .and_then(|server_access| server_access.mode_for_identity(&peer.user))
     }
 
-    /// Clears any queued auto-shutdown. Call this when something that
-    /// makes the server non-empty happens (e.g. a new session is
-    /// created) so a stale flag from a just-destroyed session can't
-    /// tear down the freshly-created one.
+    /// Clears a queued **exit-empty** auto-shutdown. Call this when
+    /// something that makes the server non-empty happens (e.g. a new
+    /// session is created) so a stale flag from a just-destroyed
+    /// session can't tear down the freshly-created one.
     ///
     /// Without this, the race is: last session exits ->
     /// `queue_shutdown_if_server_empty` sets the flag -> user
     /// creates a new session -> next consumer of the flag (e.g.
     /// retained-exited-outputs TTL expiry, ~5s later) fires the
     /// shutdown anyway and detaches the new attach.
+    ///
+    /// Deliberately scoped to `ExitEmpty`: an explicit `kill-server`
+    /// (reason `KillServer`) or a `SeamlessUpgradeIdle` shutdown must
+    /// *not* be cancellable by "session was just created" — those
+    /// represent user / orchestrator intent that outranks the
+    /// new-session signal. Without this scope, an explicit
+    /// `kill-server` followed by `kill-session` + `new-session`
+    /// would silently swallow the kill request.
     pub(crate) fn cancel_pending_shutdown(&self) {
+        let mut reason = self
+            .shutdown_reason
+            .lock()
+            .expect("shutdown reason mutex must not be poisoned");
+        if !matches!(*reason, Some(PendingShutdownReason::ExitEmpty)) {
+            return;
+        }
+        *reason = None;
         self.shutdown_requested.store(false, Ordering::SeqCst);
     }
 
-    pub(crate) fn request_shutdown_if_pending(&self) -> bool {
-        if !self.shutdown_requested.load(Ordering::SeqCst) {
-            return false;
-        }
-        if !self
-            .subscriptions
-            .lock()
-            .expect("subscription registry mutex must not be poisoned")
-            .is_empty()
-        {
-            return false;
-        }
-        if !self
-            .retained_exited_outputs
-            .lock()
-            .expect("retained exited output mutex must not be poisoned")
-            .is_empty(std::time::Instant::now())
-        {
-            return false;
-        }
-        if !self.shutdown_requested.swap(false, Ordering::SeqCst) {
-            return false;
-        }
-        if let Some(handle) = self
-            .shutdown_handle
-            .lock()
-            .expect("shutdown handle mutex must not be poisoned")
-            .clone()
-        {
-            handle.request_shutdown();
-        }
-        true
-    }
 
     #[cfg(test)]
     fn install_paste_buffer_delete_pause(&self) -> Arc<PasteBufferDeletePause> {
@@ -561,17 +597,6 @@ impl RequestHandler {
     }
 }
 
-impl RequestHandler {
-    async fn handle_kill_server(&self) -> Response {
-        self.retained_exited_outputs
-            .lock()
-            .expect("retained exited output mutex must not be poisoned")
-            .clear();
-        self.shutdown_requested.store(true, Ordering::SeqCst);
-        Response::KillServer(KillServerResponse)
-    }
-}
-
 #[cfg(test)]
 #[path = "handler_send_keys_tests/input_capture.rs"]
 mod input_capture;
@@ -599,6 +624,10 @@ mod set_mutation_tests;
 #[cfg(test)]
 #[path = "handler_environment_hook_tests.rs"]
 mod environment_hook_tests;
+
+#[cfg(test)]
+#[path = "handler_hook_dispatch_tests.rs"]
+mod hook_dispatch_tests;
 
 #[cfg(test)]
 #[path = "handler_zoom_tests.rs"]
@@ -637,6 +666,10 @@ mod clock_mode_tests;
 mod control_notification_tests;
 
 #[cfg(test)]
+#[path = "handler_control_lifecycle_tests.rs"]
+mod control_lifecycle_tests;
+
+#[cfg(test)]
 #[path = "handler_scripting_tests.rs"]
 mod scripting_tests;
 
@@ -647,3 +680,11 @@ mod prompt_tests;
 #[cfg(test)]
 #[path = "handler_pane_command_tests.rs"]
 mod pane_command_tests;
+
+#[cfg(test)]
+#[path = "handler_pane_pipe_tests.rs"]
+mod pane_pipe_tests;
+
+#[cfg(test)]
+#[path = "handler_pane_exit_format_tests.rs"]
+mod pane_exit_format_tests;

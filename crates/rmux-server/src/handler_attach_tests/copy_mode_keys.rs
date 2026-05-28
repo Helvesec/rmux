@@ -367,7 +367,7 @@ async fn attached_copy_mode_updates_automatic_window_name_on_entry_and_exit() {
             "#{window_name}|#{pane_in_mode}|#{pane_mode}"
         )
         .await,
-        "[rmux]|1|copy-mode\n"
+        "[tmux]|1|copy-mode\n"
     );
 
     handler
@@ -385,7 +385,7 @@ async fn attached_copy_mode_updates_automatic_window_name_on_entry_and_exit() {
         "copy-mode exit should restore normal pane mode, got {restored_status:?}"
     );
     assert!(
-        !restored_status.starts_with("[rmux]|"),
+        !restored_status.starts_with("[tmux]|"),
         "copy-mode exit should restore a process-derived automatic window name, got {restored_status:?}"
     );
 }

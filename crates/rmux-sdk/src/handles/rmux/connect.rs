@@ -169,7 +169,7 @@ fn spawn_hidden_daemon_with_breakaway(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     rmux_os::daemon::configure_hidden_daemon_command(&mut command, allow_job_breakaway);
-    let child = command.spawn()?;
+    let child = rmux_os::daemon::spawn_hidden_daemon_command(&mut command)?;
     drop(child);
     Ok(())
 }

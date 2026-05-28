@@ -10,11 +10,13 @@ fn parse_args(args: &[&str]) -> Result<super::Cli, clap::Error> {
 fn show_options_accepts_global_server_window_pane_and_value_only_scopes() {
     for args in [
         &["show-options"][..],
+        &["show-options", "-A", "-t", "alpha", "status"][..],
         &["show-options", "-g"][..],
         &["show-options", "-g", "-t", "alpha", "status"][..],
         &["show-options", "-g", "@status-line"][..],
         &["show-options", "-s"][..],
         &["show-options", "-gs", "-t", "alpha", "message-limit"][..],
+        &["show-options", "-gA", "status"][..],
         &["show-options", "-s", "-v", "terminal-features"][..],
         &["show-options", "-gw", "-t", "alpha:2", "pane-border-style"][..],
         &["show-options", "-w", "-t", "alpha:2"][..],

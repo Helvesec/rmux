@@ -31,6 +31,31 @@ impl AttachedSession {
         session_name: &str,
         size: TerminalSize,
     ) -> Result<Self, Box<dyn Error>> {
+        Self::spawn_configured(harness, session_name, size, |_| {})
+    }
+
+    pub(crate) fn spawn_with_env(
+        harness: &CliHarness,
+        session_name: &str,
+        size: TerminalSize,
+        environment: &[(&str, &str)],
+    ) -> Result<Self, Box<dyn Error>> {
+        Self::spawn_configured(harness, session_name, size, |attach| {
+            for (name, value) in environment {
+                attach.env(name, value);
+            }
+        })
+    }
+
+    fn spawn_configured<F>(
+        harness: &CliHarness,
+        session_name: &str,
+        size: TerminalSize,
+        configure: F,
+    ) -> Result<Self, Box<dyn Error>>
+    where
+        F: FnOnce(&mut Command),
+    {
         let pty = PtyPair::open_with_size(size)?;
         let master = File::from(pty.master().try_clone()?.into_owned_fd());
         let terminal = File::from(pty.slave().try_clone()?.into_owned_fd());
@@ -42,6 +67,7 @@ impl AttachedSession {
             .stdin(Stdio::from(pty.slave().try_clone()?.into_owned_fd()))
             .stdout(Stdio::from(pty.slave().try_clone()?.into_owned_fd()))
             .stderr(Stdio::from(pty.slave().try_clone()?.into_owned_fd()));
+        configure(&mut attach);
         drop(pty);
 
         let child = attach.spawn()?;

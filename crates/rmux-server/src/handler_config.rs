@@ -3,9 +3,9 @@ use rmux_core::{
     ENVIRON_HIDDEN,
 };
 use rmux_proto::{
-    CommandOutput, ErrorResponse, Response, RmuxError, ScopeSelector, SetEnvironmentMode,
-    SetEnvironmentResponse, SetHookMutationRequest, SetHookResponse, ShowEnvironmentResponse,
-    ShowHooksResponse, ShowOptionsResponse, WindowTarget,
+    CommandOutput, ErrorResponse, OptionScopeSelector, Response, RmuxError, ScopeSelector,
+    SetEnvironmentMode, SetEnvironmentResponse, SetHookMutationRequest, SetHookResponse,
+    ShowEnvironmentResponse, ShowHooksResponse, ShowOptionsResponse, WindowTarget,
 };
 
 use super::RequestHandler;
@@ -185,10 +185,23 @@ impl RequestHandler {
             return Response::Error(ErrorResponse { error });
         }
 
-        match state.options.show_options_lines_filtered(
+        let mode = if request.include_inherited {
+            rmux_core::ShowOptionsMode::ResolvedWithInheritanceMarkers
+        } else if matches!(
+            request.scope,
+            OptionScopeSelector::ServerGlobal
+                | OptionScopeSelector::SessionGlobal
+                | OptionScopeSelector::WindowGlobal
+        ) {
+            rmux_core::ShowOptionsMode::Resolved
+        } else {
+            rmux_core::ShowOptionsMode::Explicit
+        };
+        match state.options.show_options_lines_with_mode_filtered(
             &request.scope,
             request.name.as_deref(),
             request.value_only,
+            mode,
         ) {
             Ok(lines) => Response::ShowOptions(ShowOptionsResponse {
                 scope: request.scope,

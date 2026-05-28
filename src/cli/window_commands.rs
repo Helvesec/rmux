@@ -1,8 +1,12 @@
 use std::path::Path;
 
 use rmux_client::{connect, Connection};
-use rmux_proto::{ErrorResponse, MoveWindowTarget, ResolveTargetType, Response};
+use rmux_proto::{
+    ErrorResponse, KillSessionRequest, KillWindowResponse, MoveWindowTarget, ResolveTargetType,
+    Response,
+};
 
+use super::format_print::print_target_format;
 use super::{
     list_session_names, resolve_current_pane_target, resolve_current_session_target,
     resolve_existing_window_target_or_current, resolve_session_listing_target,
@@ -16,6 +20,8 @@ use crate::cli_args::{
     NewWindowArgs, RenameWindowArgs, ResizeWindowArgs, RespawnWindowArgs, RotateWindowArgs,
     SessionTargetArgs, SwapWindowArgs, TargetSpec, UnlinkWindowArgs, WindowTargetArgs,
 };
+
+const DEFAULT_NEW_WINDOW_PRINT_FORMAT: &str = "#{session_name}:#{window_index}.#{pane_index}";
 
 pub(super) fn run_link_window(
     args: LinkWindowArgs,
@@ -65,8 +71,11 @@ pub(super) fn run_swap_window(
 ) -> Result<i32, ExitFailure> {
     run_command_resolved(socket_path, "swap-window", move |connection| {
         let source = resolve_window_target_spec(connection, &args.source, false)?;
-        let target =
-            resolve_window_target_or_current(connection, args.target.as_ref(), "swap-window")?;
+        let target = resolve_existing_window_target_or_current(
+            connection,
+            args.target.as_ref(),
+            "swap-window",
+        )?;
         connection
             .swap_window(source, target, args.detached)
             .map_err(ExitFailure::from_client)
@@ -228,31 +237,59 @@ fn resolve_current_session(
 }
 
 pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
-    run_command_resolved(socket_path, "new-window", move |connection| {
-        let insert_at_target = args.after || args.before;
-        let (target, target_window_index) = if insert_at_target {
-            resolve_new_window_placement_target(
-                connection,
-                args.target.as_ref(),
-                args.after,
-                "new-window",
-            )?
-        } else {
-            resolve_new_window_target_spec(connection, args.target.as_ref())?
-        };
-        connection
-            .new_window_at_with_environment(
-                target,
-                target_window_index,
-                args.name,
-                args.detached,
-                (!args.environment.is_empty()).then_some(args.environment),
-                args.start_directory,
-                (!args.command.is_empty()).then_some(args.command),
-                insert_at_target,
-            )
-            .map_err(ExitFailure::from_client)
-    })
+    let print_target = args.print_target;
+    let print_format = args
+        .format
+        .clone()
+        .unwrap_or_else(|| DEFAULT_NEW_WINDOW_PRINT_FORMAT.to_owned());
+    let mut connection = connect(socket_path)
+        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let insert_at_target = args.after || args.before;
+    let (target, target_window_index) = if insert_at_target {
+        resolve_new_window_placement_target(
+            &mut connection,
+            args.target.as_ref(),
+            args.after,
+            "new-window",
+        )?
+    } else {
+        resolve_new_window_target_spec(&mut connection, args.target.as_ref())?
+    };
+    let response = connection
+        .new_window_at_with_environment(
+            target,
+            target_window_index,
+            args.name,
+            args.detached,
+            (!args.environment.is_empty()).then_some(args.environment),
+            args.start_directory,
+            (!args.command.is_empty()).then_some(args.command),
+            insert_at_target,
+        )
+        .map_err(ExitFailure::from_client)?;
+    let target = match response {
+        Response::NewWindow(response) => response.target,
+        Response::Error(ErrorResponse { error }) => {
+            return Err(ExitFailure::new(1, error.to_string()))
+        }
+        other => return Err(unexpected_response("new-window", &other)),
+    };
+
+    if print_target {
+        let pane = rmux_proto::PaneTarget::with_window(
+            target.session_name().clone(),
+            target.window_index(),
+            0,
+        );
+        print_target_format(
+            &mut connection,
+            "new-window",
+            rmux_proto::Target::Pane(pane),
+            &print_format,
+        )?;
+    }
+
+    Ok(0)
 }
 
 fn resolve_new_window_placement_target(
@@ -343,9 +380,31 @@ pub(super) fn run_kill_window(
     run_command_resolved(socket_path, "kill-window", move |connection| {
         let target =
             resolve_window_target_or_current(connection, args.target.as_ref(), "kill-window")?;
-        connection
-            .kill_window(target, args.kill_others)
-            .map_err(ExitFailure::from_client)
+        let response = connection
+            .kill_window(target.clone(), args.kill_others)
+            .map_err(ExitFailure::from_client)?;
+        match response {
+            Response::Error(ErrorResponse { error })
+                if error
+                    .to_string()
+                    .starts_with("server error: cannot kill the only window") =>
+            {
+                let session_name = target.session_name().clone();
+                let kill_session = connection
+                    .kill_session(KillSessionRequest {
+                        target: session_name,
+                        kill_all_except_target: false,
+                        clear_alerts: false,
+                    })
+                    .map_err(ExitFailure::from_client)?;
+                if matches!(kill_session, Response::KillSession(_)) {
+                    Ok(Response::KillWindow(KillWindowResponse { target }))
+                } else {
+                    Ok(kill_session)
+                }
+            }
+            response => Ok(response),
+        }
     })
 }
 

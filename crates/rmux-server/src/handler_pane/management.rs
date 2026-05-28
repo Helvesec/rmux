@@ -4,7 +4,8 @@ use rmux_proto::{
 };
 
 use super::super::{
-    prepare_lifecycle_event, scripting_support::format_context_for_target, RequestHandler,
+    client_environment_snapshot, client_spawn_environment, prepare_lifecycle_event,
+    scripting_support::format_context_for_target, RequestHandler,
 };
 use crate::format_runtime::render_runtime_template;
 use crate::hook_runtime::PendingInlineHookFormat;
@@ -313,39 +314,51 @@ impl RequestHandler {
 
     pub(in crate::handler) async fn handle_split_window(
         &self,
+        requester_pid: u32,
         request: rmux_proto::SplitWindowRequest,
     ) -> Response {
-        self.handle_split_window_parts(SplitWindowParts {
-            target: request.target,
-            direction: request.direction,
-            before: request.before,
-            environment_overrides: request.environment,
-            command: None,
-            process_command: None,
-            start_directory: None,
-            keep_alive_on_exit: None,
-        })
+        self.handle_split_window_parts(
+            requester_pid,
+            SplitWindowParts {
+                target: request.target,
+                direction: request.direction,
+                before: request.before,
+                environment_overrides: request.environment,
+                command: None,
+                process_command: None,
+                start_directory: None,
+                keep_alive_on_exit: None,
+            },
+        )
         .await
     }
 
     pub(in crate::handler) async fn handle_split_window_ext(
         &self,
+        requester_pid: u32,
         request: rmux_proto::SplitWindowExtRequest,
     ) -> Response {
-        self.handle_split_window_parts(SplitWindowParts {
-            target: request.target,
-            direction: request.direction,
-            before: request.before,
-            environment_overrides: request.environment,
-            command: request.command,
-            process_command: request.process_command,
-            start_directory: request.start_directory,
-            keep_alive_on_exit: request.keep_alive_on_exit,
-        })
+        self.handle_split_window_parts(
+            requester_pid,
+            SplitWindowParts {
+                target: request.target,
+                direction: request.direction,
+                before: request.before,
+                environment_overrides: request.environment,
+                command: request.command,
+                process_command: request.process_command,
+                start_directory: request.start_directory,
+                keep_alive_on_exit: request.keep_alive_on_exit,
+            },
+        )
         .await
     }
 
-    async fn handle_split_window_parts(&self, parts: SplitWindowParts) -> Response {
+    async fn handle_split_window_parts(
+        &self,
+        requester_pid: u32,
+        parts: SplitWindowParts,
+    ) -> Response {
         let SplitWindowParts {
             target,
             direction,
@@ -376,6 +389,8 @@ impl RequestHandler {
         if let Err(error) = validate_process_command(process_command.as_ref()) {
             return Response::Error(ErrorResponse { error });
         }
+        let client_environment = client_environment_snapshot(requester_pid);
+        let spawn_environment = client_spawn_environment(client_environment.as_ref());
         let response = {
             let mut state = self.state.lock().await;
             match state.split_window(
@@ -383,6 +398,7 @@ impl RequestHandler {
                 direction,
                 before,
                 &socket_path,
+                spawn_environment.as_ref(),
                 environment_overrides.as_deref(),
                 process_command.as_ref(),
                 start_directory.as_deref(),
@@ -624,15 +640,19 @@ impl RequestHandler {
 
     pub(in crate::handler) async fn handle_respawn_pane(
         &self,
+        requester_pid: u32,
         request: rmux_proto::RespawnPaneRequest,
     ) -> Response {
         let session_name = request.target.session_name().clone();
         let socket_path = self.socket_path();
+        let client_environment = client_environment_snapshot(requester_pid);
+        let spawn_environment = client_spawn_environment(client_environment.as_ref());
         let response = {
             let mut state = self.state.lock().await;
             match state.respawn_pane(
                 request,
                 &socket_path,
+                spawn_environment.as_ref(),
                 Some(self.pane_alert_callback()),
                 Some(self.pane_exit_callback()),
                 |state, replaced| {

@@ -291,6 +291,7 @@ fn grouped_new_session_without_explicit_name_round_trips_through_the_real_socket
         command: None,
         process_command: None,
         passthrough: false,
+        client_environment: None,
     }))?;
 
     assert_eq!(

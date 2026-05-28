@@ -361,6 +361,37 @@ fn supports_capability_reads_handshake_capabilities() {
 }
 
 #[test]
+fn supports_capability_caches_handshake_capabilities() {
+    let response = Response::Handshake(HandshakeResponse {
+        wire_version: rmux_proto::RMUX_WIRE_VERSION,
+        capabilities: vec![
+            "daemon.status".to_owned(),
+            "daemon.shutdown_if_idle".to_owned(),
+        ],
+    });
+    let (client_stream, server_stream) = UnixStream::pair().expect("create stream pair");
+
+    let server = thread::spawn(move || {
+        let stream = expect_request(server_stream, Request::Handshake(HandshakeRequest::current()));
+        write_response(stream, response);
+    });
+
+    let mut connection = super::Connection::new(client_stream).expect("connection with timeout");
+    assert!(
+        connection
+            .supports_capability("daemon.status")
+            .expect("first capability query succeeds")
+    );
+    assert!(
+        connection
+            .supports_capability("daemon.shutdown_if_idle")
+            .expect("second capability query uses cache")
+    );
+
+    server.join().expect("server thread joins");
+}
+
+#[test]
 fn supports_capability_treats_error_response_as_unsupported() {
     let response = Response::Error(ErrorResponse {
         error: RmuxError::UnknownCommand("handshake".to_owned()),

@@ -21,6 +21,10 @@ pub(crate) struct NewWindowArgs {
     pub(crate) start_directory: Option<PathBuf>,
     #[arg(short = 'e')]
     pub(crate) environment: Vec<String>,
+    #[arg(short = 'F', allow_hyphen_values = true)]
+    pub(crate) format: Option<String>,
+    #[arg(short = 'P', action = ArgAction::SetTrue)]
+    pub(crate) print_target: bool,
     #[arg(short = 't', value_parser = parse_target_spec)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(short = 'n')]

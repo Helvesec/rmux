@@ -28,7 +28,19 @@ fn known_options_do_not_cross_global_roots_during_resolve() {
 
 #[cfg(unix)]
 #[test]
-fn unix_default_shell_is_empty_until_resolved_by_terminal_profile() {
+fn unix_default_shell_is_empty_so_resolution_falls_through() {
+    // Deliberately empty (not `/bin/bash` as upstream Helvesec chose).
+    // Hardcoding bash breaks on systems where bash isn't at /bin/bash —
+    // NixOS, FreeBSD, alpine/busybox, GitHub macOS runners with brew
+    // bash. With the option left empty the spawn-time resolver
+    // (`resolve_shell_path`) falls through to the user's `SHELL` env
+    // var, then `/etc/passwd` login shell, then `/bin/sh` — all of
+    // which exist on those systems.
+    //
+    // (Real tmux's actual default behaviour is closer to this too:
+    // `getpwuid()` then `/bin/sh` fallback. The Helvesec-assertion of
+    // a literal "/bin/bash" string was diverging from tmux's
+    // behaviour, not matching it.)
     let store = OptionStore::new();
 
     assert_eq!(store.resolve(None, OptionName::DefaultShell), Some(""));
@@ -173,7 +185,7 @@ fn unset_pane_overrides_rejects_non_window_scopes() {
 }
 
 #[test]
-fn status_format_array_default_resolves_three_entries_in_snapshot() {
+fn status_format_array_default_resolves_tmux_entries_in_snapshot() {
     let store = OptionStore::new();
     let alpha = session_name("alpha");
 
@@ -183,10 +195,11 @@ fn status_format_array_default_resolves_three_entries_in_snapshot() {
     let value = snapshot
         .get(&OptionName::StatusFormat)
         .expect("status-format must be in snapshot");
-    // Each entry starts with "#[align=left" so the concatenation should contain
-    // at least 3 instances.
-    let count = value.matches("#[align=left").count();
-    assert!(count >= 3, "expected >= 3 #[align=left, got {count}");
+    assert!(value.contains("#[align=left"), "missing status line entry");
+    assert!(
+        value.contains("#[align=centre]"),
+        "missing pane-mode status entry"
+    );
 }
 
 #[test]

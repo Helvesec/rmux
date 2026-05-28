@@ -164,6 +164,7 @@ async fn create_attached_session(
                 command: None,
                 process_command: None,
                 passthrough: true,
+                client_environment: None,
             }))
             .await;
         assert!(
@@ -261,6 +262,7 @@ async fn create_session_with_command(
             command: Some(command),
             process_command: None,
             passthrough: force_passthrough(),
+            client_environment: None,
         }))
         .await;
     assert!(

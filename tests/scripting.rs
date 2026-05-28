@@ -303,7 +303,7 @@ fn hook_surface_smoke_matches_supported_cli_behavior() -> Result<(), Box<dyn Err
     assert_success(&harness.run(&[
         "set-hook",
         "-t",
-        "alpha",
+        "al",
         "client-attached",
         "display-message hi",
     ])?);
@@ -316,7 +316,7 @@ fn hook_surface_smoke_matches_supported_cli_behavior() -> Result<(), Box<dyn Err
         "window-resized is not supported: rmux does not dispatch this hook\n"
     );
 
-    let output = harness.run(&["show-hooks", "-t", "alpha", "client-attached"])?;
+    let output = harness.run(&["show-hooks", "-t", "al", "client-attached"])?;
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(stdout(&output), "client-attached[0] display-message hi\n");
     assert!(stderr(&output).is_empty());

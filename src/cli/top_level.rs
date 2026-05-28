@@ -42,6 +42,27 @@ pub(super) fn top_level_parse_failure(args: &[OsString]) -> Option<ExitFailure> 
     None
 }
 
+pub(super) fn top_level_version_requested(args: &[OsString]) -> bool {
+    let mut index = 0;
+
+    while let Some(argument) = args.get(index) {
+        let bytes = os_str_bytes(argument);
+        if bytes == b"--" || !bytes.starts_with(b"-") || bytes == b"-" {
+            return false;
+        }
+        if !bytes.starts_with(b"--") && bytes.iter().skip(1).any(|flag| *flag == b'V') {
+            return true;
+        }
+        if short_option_consumes_next_argument(&bytes) {
+            index += 1;
+        }
+
+        index += 1;
+    }
+
+    false
+}
+
 fn invalid_short_option_in_cluster(bytes: &[u8]) -> Option<u8> {
     for flag in bytes.iter().copied().skip(1) {
         if flag == b'V' {

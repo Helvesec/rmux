@@ -1,5 +1,6 @@
 use super::{
-    parse_environment_assignments, spawn_hook_command, validate_process_command, TerminalProfile,
+    environment_from_os_pairs, parse_environment_assignments, spawn_hook_command,
+    validate_process_command, TerminalProfile,
 };
 use rmux_core::{EnvironmentStore, OptionStore};
 use rmux_proto::{OptionName, ProcessCommand, ScopeSelector, SessionName, SetOptionMode};
@@ -7,8 +8,11 @@ use rmux_proto::{OptionName, ProcessCommand, ScopeSelector, SessionName, SetOpti
 use rmux_pty::TerminalSize as PtyTerminalSize;
 use std::collections::HashMap;
 use std::error::Error;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(windows)]
@@ -21,6 +25,25 @@ use std::time::Instant;
 use tokio::time::sleep;
 
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(unix)]
+#[test]
+fn base_environment_snapshot_skips_non_utf8_pairs() {
+    let environment = environment_from_os_pairs([
+        (
+            OsString::from_vec(b"INVALID_NAME_\xff".to_vec()),
+            OsString::from("value"),
+        ),
+        (
+            OsString::from("INVALID_VALUE"),
+            OsString::from_vec(b"value_\xff".to_vec()),
+        ),
+        (OsString::from("VALID"), OsString::from("value")),
+    ]);
+
+    assert_eq!(environment.get("VALID").map(String::as_str), Some("value"));
+    assert_eq!(environment.len(), 1);
+}
 
 #[test]
 fn spawn_hook_command_requires_a_runtime_before_launching_a_child() {
@@ -77,6 +100,7 @@ fn terminal_profile_sets_rmux_term_shell_and_pane_context() {
         &session_name,
         7,
         temp_socket_path().as_path(),
+        None,
         true,
         Some(&["FOO=bar".to_owned()]),
         Some(rmux_core::PaneId::new(3)),
@@ -118,6 +142,50 @@ fn terminal_profile_sets_rmux_term_shell_and_pane_context() {
 }
 
 #[test]
+fn terminal_profile_applies_spawn_environment_before_explicit_overrides() {
+    let environment = EnvironmentStore::new();
+    let mut options = OptionStore::new();
+    let session_name = SessionName::new("alpha").expect("valid session name");
+    let spawn_environment = HashMap::from([
+        ("PATH".to_owned(), "/client/bin:/usr/bin".to_owned()),
+        ("RMUX_CLIENT_ONLY".to_owned(), "present".to_owned()),
+    ]);
+
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::DefaultShell,
+            default_shell_string(),
+            SetOptionMode::Replace,
+        )
+        .expect("default-shell succeeds");
+
+    let profile = TerminalProfile::for_session(
+        &environment,
+        &options,
+        &session_name,
+        7,
+        temp_socket_path().as_path(),
+        Some(&spawn_environment),
+        true,
+        Some(&["RMUX_CLIENT_ONLY=override".to_owned()]),
+        None,
+        None,
+        None,
+    )
+    .expect("profile");
+
+    assert_eq!(
+        profile.environment_value("PATH"),
+        Some("/client/bin:/usr/bin")
+    );
+    assert_eq!(
+        profile.environment_value("RMUX_CLIENT_ONLY"),
+        Some("override")
+    );
+}
+
+#[test]
 fn terminal_profile_honors_explicit_color_environment_overrides() {
     let mut environment = EnvironmentStore::new();
     let mut options = OptionStore::new();
@@ -148,6 +216,7 @@ fn terminal_profile_honors_explicit_color_environment_overrides() {
         &session_name,
         7,
         temp_socket_path().as_path(),
+        None,
         true,
         Some(&["NODE_DISABLE_COLORS=1".to_owned(), "CLICOLOR=0".to_owned()]),
         Some(rmux_core::PaneId::new(3)),
@@ -188,6 +257,7 @@ fn terminal_profile_applies_default_terminal_before_per_command_term_override() 
         &session_name,
         2,
         Path::new("/tmp/rmux.sock"),
+        None,
         true,
         None,
         None,
@@ -203,6 +273,7 @@ fn terminal_profile_applies_default_terminal_before_per_command_term_override() 
         &session_name,
         2,
         Path::new("/tmp/rmux.sock"),
+        None,
         true,
         Some(&["TERM=screen-256color".to_owned()]),
         None,
@@ -237,6 +308,7 @@ fn terminal_profile_prefers_rmux_term_program_for_default_window_name() {
         &session_name,
         7,
         Path::new("/tmp/rmux.sock"),
+        None,
         true,
         None,
         None,
@@ -246,6 +318,47 @@ fn terminal_profile_prefers_rmux_term_program_for_default_window_name() {
     .expect("profile");
 
     assert_eq!(profile.default_window_name().as_deref(), Some("rmux"));
+}
+
+#[test]
+fn terminal_profile_initial_pane_title_includes_user_host_and_cwd() {
+    let environment = EnvironmentStore::new();
+    let mut options = OptionStore::new();
+    let session_name = SessionName::new("alpha").expect("valid session name");
+    let home = std::env::current_dir().expect("current dir");
+    let home_text = home.to_string_lossy().into_owned();
+
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::DefaultShell,
+            "/bin/bash".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("default-shell succeeds");
+
+    let profile = TerminalProfile::for_session(
+        &environment,
+        &options,
+        &session_name,
+        7,
+        Path::new("/tmp/rmux.sock"),
+        None,
+        true,
+        Some(&[
+            "USER=alice".to_owned(),
+            format!("HOME={home_text}"),
+            "PWD=/ignored".to_owned(),
+        ]),
+        None,
+        Some(&home),
+        None,
+    )
+    .expect("profile");
+
+    let title = profile.initial_pane_title().expect("initial title");
+    assert!(title.starts_with("alice@"), "title was {title:?}");
+    assert!(title.ends_with(":~"), "title was {title:?}");
 }
 
 #[test]
@@ -269,6 +382,7 @@ fn terminal_profile_falls_back_to_shell_name_without_term_program() {
         &session_name,
         7,
         Path::new("/tmp/rmux.sock"),
+        None,
         false,
         None,
         None,
@@ -301,6 +415,7 @@ fn terminal_profile_ignores_non_rmux_term_program_for_default_window_name() {
         &session_name,
         7,
         Path::new("/tmp/rmux.sock"),
+        None,
         true,
         Some(&["TERM_PROGRAM=tmux".to_owned()]),
         None,
@@ -333,6 +448,7 @@ fn terminal_profile_runtime_window_name_tracks_spawned_command_shape() {
         &session_name,
         7,
         Path::new("/tmp/rmux.sock"),
+        None,
         true,
         None,
         None,
@@ -421,11 +537,20 @@ fn resolve_shell_path_prefers_explicit_default_shell_option_before_shell_env_fal
 
 #[cfg(unix)]
 #[test]
-fn resolve_shell_path_uses_shell_env_when_default_shell_is_empty() {
-    let options = OptionStore::new();
+fn resolve_shell_path_uses_shell_env_when_default_shell_is_explicitly_empty() {
+    let mut options = OptionStore::new();
+    let session_name = SessionName::new("alpha").expect("valid session name");
     let environment = HashMap::from([("SHELL".to_owned(), "/bin/zsh".to_owned())]);
+    options
+        .set(
+            ScopeSelector::Session(session_name.clone()),
+            OptionName::DefaultShell,
+            String::new(),
+            SetOptionMode::Replace,
+        )
+        .expect("default-shell accepts an empty override");
 
-    let resolved = super::resolve_shell_path(&options, None, &environment);
+    let resolved = super::resolve_shell_path(&options, Some(&session_name), &environment);
 
     assert_eq!(
         resolved,
@@ -525,6 +650,7 @@ fn windows_interactive_cmd_starts_in_profile_cwd_and_accepts_input() -> Result<(
         &session_name,
         7,
         temp_socket_path().as_path(),
+        None,
         true,
         None,
         Some(rmux_core::PaneId::new(3)),

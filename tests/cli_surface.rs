@@ -33,7 +33,8 @@ fn assert_nested_switch_client_error(output: &Output) {
     let stderr = stderr(output);
     assert!(
         stderr.contains("switch-client requires an attached client")
-            || stderr.contains("can't find client: 1"),
+            || stderr.contains("can't find client: 1")
+            || stderr.contains("no current client"),
         "stderr={stderr:?}"
     );
 }
@@ -81,7 +82,7 @@ fn named_socket_absent_server_keeps_connect_error_surface() -> Result<(), Box<dy
 }
 
 #[test]
-fn version_flag_reports_workspace_version_without_server_contact() -> Result<(), Box<dyn Error>> {
+fn version_flag_reports_rmux_version_without_server_contact() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("version-flag")?;
     let output = harness.run(&["-V"])?;
 
@@ -396,10 +397,38 @@ fn server_access_list_succeeds_against_running_server() -> Result<(), Box<dyn Er
     let harness = CliHarness::new("server-access-list")?;
     let _daemon = harness.start_hidden_daemon()?;
 
-    let output = harness.run(&["server-access", "-l"])?;
+    let output = harness.run(&["server-access", "-l", "ignored-user"])?;
 
     assert_eq!(output.status.code(), Some(0));
+    if !stdout(&output).is_empty() {
+        assert!(stdout(&output).contains(" (W)"));
+    }
     assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
+fn server_access_missing_user_is_reported_like_tmux() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("server-access-missing-user")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    let output = harness.run(&["server-access", "-r"])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty());
+    assert_eq!(stderr(&output), "missing user argument\n");
+    Ok(())
+}
+
+#[test]
+fn server_access_target_flag_reports_tmux_unknown_flag() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("server-access-target-flag")?;
+
+    let output = harness.run(&["server-access", "-t", "%0", "-l"])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty());
+    assert_eq!(stderr(&output), "command server-access: unknown flag -t\n");
     Ok(())
 }
 
@@ -719,6 +748,33 @@ fn new_session_trailing_shell_command_spawns_initial_pane_command() -> Result<()
 }
 
 #[test]
+fn new_session_uses_shell_env_when_default_shell_is_unset() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("new-session-shell-env")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let output_path = harness.tmpdir().join("shell.txt");
+    let expected_shell = "/bin/sh";
+    let shell_env = format!("SHELL={expected_shell}");
+    let shell_command = format!("printf '%s' \"$SHELL\" > {}", shell_quote(&output_path));
+
+    let clear_default_shell = harness.run(&["set-option", "-g", "default-shell", ""])?;
+    assert_success(&clear_default_shell);
+
+    let create = harness.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        "alpha",
+        "-e",
+        &shell_env,
+        &shell_command,
+    ])?;
+    assert_success(&create);
+
+    wait_for_file_contents(&output_path, expected_shell, ATTACH_TIMEOUT)?;
+    Ok(())
+}
+
+#[test]
 fn has_session_reports_absent_server_when_the_server_is_absent() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("has-session-absent")?;
     let output = harness.run(&["has-session", "-t", "alpha"])?;
@@ -1014,14 +1070,47 @@ fn new_session_without_detach_creates_then_attempts_nested_switch() -> Result<()
 }
 
 #[test]
-fn set_option_append_validation_happens_before_server_contact() -> Result<(), Box<dyn Error>> {
+fn set_option_append_without_server_matches_tmux_connect_surface() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("set-option-append-validation")?;
     let output = harness.run(&["set-option", "-a", "-g", "status", "off"])?;
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).contains("status is not an array option"));
+    assert_absent_server_error(&output, &harness, "set-option");
     assert!(stdout(&output).is_empty());
     assert!(!harness.socket_path().exists());
+    Ok(())
+}
+
+#[test]
+fn quiet_option_commands_suppress_unknown_option_errors() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("quiet-option-unknown")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    let set = harness.run(&[
+        "set-option",
+        "-q",
+        "-g",
+        "definitely-not-real-option",
+        "foo",
+    ])?;
+    assert_success(&set);
+    assert!(stdout(&set).is_empty());
+    assert!(stderr(&set).is_empty());
+
+    let show = harness.run(&["show-options", "-q", "-g", "definitely-not-real-option"])?;
+    assert_success(&show);
+    assert!(stdout(&show).is_empty());
+    assert!(stderr(&show).is_empty());
+
+    let target_error = harness.run(&["show-options", "-q", "-t", "missing", "status"])?;
+    assert_eq!(target_error.status.code(), Some(1));
+    let target_stderr = stderr(&target_error);
+    assert!(
+        target_stderr.contains("can't find session: missing")
+            || target_stderr.contains("session not found: missing"),
+        "quiet option lookup should not suppress target errors, got: {}",
+        target_stderr
+    );
     Ok(())
 }
 
@@ -1225,6 +1314,35 @@ fn window_option_commands_round_trip_with_explicit_window_targets() -> Result<()
 }
 
 #[test]
+fn set_option_without_target_uses_current_scope_not_global() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("set-option-current-scope")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "beta"])?);
+
+    assert_success(&harness.run(&["set-option", "status", "off"])?);
+    let alpha_status = harness.run(&["show-options", "-v", "-t", "alpha", "status"])?;
+    assert_eq!(stdout(&alpha_status), "");
+    let alpha_status_inherited = harness.run(&["show-options", "-Av", "-t", "alpha", "status"])?;
+    assert_eq!(stdout(&alpha_status_inherited), "on\n");
+    let beta_status = harness.run(&["show-options", "-v", "-t", "beta", "status"])?;
+    assert_eq!(stdout(&beta_status), "off\n");
+
+    assert_success(&harness.run(&["set-option", "mode-keys", "vi"])?);
+    let alpha_mode = harness.run(&["show-options", "-wv", "-t", "alpha", "mode-keys"])?;
+    assert_eq!(stdout(&alpha_mode), "");
+    let alpha_mode_inherited =
+        harness.run(&["show-options", "-wAv", "-t", "alpha", "mode-keys"])?;
+    assert_eq!(stdout(&alpha_mode_inherited), "emacs\n");
+    let beta_mode = harness.run(&["show-options", "-wv", "-t", "beta", "mode-keys"])?;
+    assert_eq!(stdout(&beta_mode), "vi\n");
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
 fn show_option_global_compatibility_shapes_ignore_targets_like_tmux() -> Result<(), Box<dyn Error>>
 {
     let harness = CliHarness::new("show-option-global-compat-shapes")?;
@@ -1284,11 +1402,7 @@ fn window_option_commands_surface_command_name_in_scope_errors() -> Result<(), B
 
     let show_options_p_without_pane = harness.run(&["show-options", "-p", "-t", "alpha"])?;
     assert_eq!(show_options_p_without_pane.status.code(), Some(1));
-    assert!(
-        stderr(&show_options_p_without_pane).contains("show-options -p requires a pane target"),
-        "show-options -p must require a pane target, got: {}",
-        stderr(&show_options_p_without_pane)
-    );
+    assert_absent_server_error(&show_options_p_without_pane, &harness, "show-options");
     assert!(!harness.socket_path().exists());
 
     Ok(())

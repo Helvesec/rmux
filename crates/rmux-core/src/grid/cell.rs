@@ -385,6 +385,30 @@ impl GridLine {
             .map_or(0, |index| index + 1)
     }
 
+    pub(super) fn tmux_cell_capacity(&self, line_width: usize) -> usize {
+        let used_end = self.used_end();
+        if used_end == 0 {
+            return 0;
+        }
+
+        let quarter = (line_width / 4).max(1);
+        let half = (line_width / 2).max(quarter);
+        if used_end < quarter {
+            quarter
+        } else if used_end < half {
+            half
+        } else {
+            line_width
+        }
+    }
+
+    pub(super) fn extended_cell_count(&self) -> usize {
+        self.cells[..self.used_end()]
+            .iter()
+            .filter(|cell| !cell.is_blank() && !cell.is_padding())
+            .count()
+    }
+
     pub(super) fn render_with_options(
         &self,
         options: GridRenderOptions,

@@ -12,6 +12,7 @@ use super::command_args::CommandListArgument;
 use super::format_context::{collect_parse_time_values, format_context_for_target};
 use super::prompt_parse::{ParsedCommandPromptCommand, ParsedConfirmBeforeCommand};
 use super::queue::{prompt_queue_action_from_result, QueueCommandAction, QueueExecutionContext};
+use super::runtime::spawn_background_async;
 use super::targets::active_session_target;
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 
@@ -22,6 +23,46 @@ impl RequestHandler {
         command: ParsedCommandPromptCommand,
         context: &QueueExecutionContext,
     ) -> Result<QueueCommandAction, RmuxError> {
+        let plan = self
+            .build_command_prompt_plan(requester_pid, command, context)
+            .await?;
+        let result = match self.start_command_prompt(plan).await? {
+            PromptStartOutcome::Immediate => {
+                return Ok(QueueCommandAction::Normal {
+                    output: None,
+                    error: None,
+                });
+            }
+            PromptStartOutcome::Waiting(receiver) => {
+                receiver.await.unwrap_or_else(|_| PromptQueueResult::noop())
+            }
+        };
+        Ok(prompt_queue_action_from_result(result))
+    }
+
+    pub(super) async fn start_attached_command_prompt_binding(
+        &self,
+        requester_pid: u32,
+        command: ParsedCommandPromptCommand,
+        context: &QueueExecutionContext,
+    ) -> Result<(), RmuxError> {
+        let plan = self
+            .build_command_prompt_plan(requester_pid, command, context)
+            .await?;
+        let PromptStartOutcome::Waiting(receiver) = self.start_command_prompt(plan).await? else {
+            return Ok(());
+        };
+
+        self.finish_attached_prompt_binding(requester_pid, receiver);
+        Ok(())
+    }
+
+    async fn build_command_prompt_plan(
+        &self,
+        requester_pid: u32,
+        command: ParsedCommandPromptCommand,
+        context: &QueueExecutionContext,
+    ) -> Result<CommandPromptPlan, RmuxError> {
         let session_candidate = if context.current_target.is_none() {
             self.current_session_candidate(requester_pid).await
         } else {
@@ -85,7 +126,7 @@ impl RequestHandler {
             (template, fields, collect_parse_time_values(&runtime))
         };
 
-        let plan = CommandPromptPlan {
+        Ok(CommandPromptPlan {
             requester_pid,
             target_client: command.target_client.clone(),
             context: context.clone(),
@@ -95,8 +136,19 @@ impl RequestHandler {
             prompt_type: command.prompt_type,
             background: command.background,
             format_values,
-        };
-        let result = match self.start_command_prompt(plan).await? {
+        })
+    }
+
+    pub(super) async fn execute_queued_confirm_before(
+        &self,
+        requester_pid: u32,
+        command: ParsedConfirmBeforeCommand,
+        context: &QueueExecutionContext,
+    ) -> Result<QueueCommandAction, RmuxError> {
+        let plan = self
+            .build_confirm_before_plan(requester_pid, command, context)
+            .await?;
+        let result = match self.start_confirm_before(plan).await? {
             PromptStartOutcome::Immediate => {
                 return Ok(QueueCommandAction::Normal {
                     output: None,
@@ -110,12 +162,43 @@ impl RequestHandler {
         Ok(prompt_queue_action_from_result(result))
     }
 
-    pub(super) async fn execute_queued_confirm_before(
+    pub(super) async fn start_attached_confirm_before_binding(
         &self,
         requester_pid: u32,
         command: ParsedConfirmBeforeCommand,
         context: &QueueExecutionContext,
-    ) -> Result<QueueCommandAction, RmuxError> {
+    ) -> Result<(), RmuxError> {
+        let plan = self
+            .build_confirm_before_plan(requester_pid, command, context)
+            .await?;
+        let PromptStartOutcome::Waiting(receiver) = self.start_confirm_before(plan).await? else {
+            return Ok(());
+        };
+
+        self.finish_attached_prompt_binding(requester_pid, receiver);
+        Ok(())
+    }
+
+    fn finish_attached_prompt_binding(
+        &self,
+        requester_pid: u32,
+        receiver: tokio::sync::oneshot::Receiver<PromptQueueResult>,
+    ) {
+        let handler = self.clone();
+        let task = finish_attached_prompt_binding_task(handler, requester_pid, receiver);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(task);
+        } else {
+            spawn_background_async("rmux-attached-prompt-finish", move || task);
+        }
+    }
+
+    async fn build_confirm_before_plan(
+        &self,
+        requester_pid: u32,
+        command: ParsedConfirmBeforeCommand,
+        context: &QueueExecutionContext,
+    ) -> Result<ConfirmBeforePlan, RmuxError> {
         let session_candidate = if context.current_target.is_none() {
             self.current_session_candidate(requester_pid).await
         } else {
@@ -168,7 +251,7 @@ impl RequestHandler {
             (prompt, template, format_values)
         };
 
-        let plan = ConfirmBeforePlan {
+        Ok(ConfirmBeforePlan {
             requester_pid,
             target_client: command.target_client.clone(),
             context: context.clone(),
@@ -178,19 +261,20 @@ impl RequestHandler {
             default_yes: command.default_yes,
             background: command.background,
             format_values,
-        };
-        let result = match self.start_confirm_before(plan).await? {
-            PromptStartOutcome::Immediate => {
-                return Ok(QueueCommandAction::Normal {
-                    output: None,
-                    error: None,
-                });
-            }
-            PromptStartOutcome::Waiting(receiver) => {
-                receiver.await.unwrap_or_else(|_| PromptQueueResult::noop())
-            }
-        };
-        Ok(prompt_queue_action_from_result(result))
+        })
+    }
+}
+
+async fn finish_attached_prompt_binding_task(
+    handler: RequestHandler,
+    requester_pid: u32,
+    receiver: tokio::sync::oneshot::Receiver<PromptQueueResult>,
+) {
+    let result = receiver.await.unwrap_or_else(|_| PromptQueueResult::noop());
+    if let Some((commands, context)) = result.inserted {
+        let _ = handler
+            .execute_parsed_commands(requester_pid, commands, context)
+            .await;
     }
 }
 

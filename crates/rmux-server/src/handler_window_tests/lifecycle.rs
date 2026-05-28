@@ -549,6 +549,7 @@ async fn kill_window_cleans_grouped_member_window_metadata_before_synchronizing(
             command: None,
             process_command: None,
             passthrough: false,
+            client_environment: None,
         }))
         .await;
     assert!(matches!(grouped, Response::NewSession(_)));

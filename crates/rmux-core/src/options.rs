@@ -38,6 +38,8 @@ use storage::{OptionEntry, OptionNode};
 pub enum ShowOptionsMode {
     /// Render the fully resolved view for each known option.
     Resolved,
+    /// Render the resolved view and mark inherited values with `*`, matching `show-options -A`.
+    ResolvedWithInheritanceMarkers,
     /// Render only entries explicitly present in the selected tree.
     Explicit,
 }

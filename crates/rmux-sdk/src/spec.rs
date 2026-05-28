@@ -232,6 +232,7 @@ impl From<NewSessionSpec> for rmux_proto::NewSessionExtRequest {
             command,
             process_command,
             passthrough: false,
+            client_environment: None,
         }
     }
 }

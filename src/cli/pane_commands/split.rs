@@ -3,11 +3,14 @@ use std::path::Path;
 use rmux_client::{connect, Connection};
 use rmux_proto::{ErrorResponse, ResizePaneAdjustment, Response};
 
+use super::super::format_print::print_target_format;
 use super::super::{
     expect_command_output, expect_command_success, resolve_current_pane_target,
     resolve_split_window_target_spec, unexpected_response, ExitFailure,
 };
 use crate::cli_args::SplitWindowArgs;
+
+const DEFAULT_SPLIT_WINDOW_PRINT_FORMAT: &str = "#{session_name}:#{window_index}.#{pane_index}";
 
 #[derive(Debug, Clone)]
 enum SplitAnchor {
@@ -26,6 +29,11 @@ pub(in crate::cli) fn run_split_window(
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     let direction = args.direction();
+    let print_target = args.print_target;
+    let print_format = args
+        .format
+        .clone()
+        .unwrap_or_else(|| DEFAULT_SPLIT_WINDOW_PRINT_FORMAT.to_owned());
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
     let target = match args.target.as_ref() {
@@ -76,6 +84,15 @@ pub(in crate::cli) fn run_split_window(
             .select_pane(anchor)
             .map_err(ExitFailure::from_client)?;
         expect_command_success(response, "select-pane")?;
+    }
+
+    if print_target {
+        print_target_format(
+            &mut connection,
+            "split-window",
+            rmux_proto::Target::Pane(pane),
+            &print_format,
+        )?;
     }
 
     Ok(0)

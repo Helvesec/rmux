@@ -19,14 +19,12 @@ pub(super) fn parse_set_option(
     mut args: CommandTokens,
     force_window: bool,
 ) -> Result<Request, RmuxError> {
-    let mut global = false;
-    let mut server = false;
-    let mut window = force_window;
-    let mut pane = false;
-    let mut append = false;
-    let mut only_if_unset = false;
-    let mut unset = false;
-    let mut unset_pane_overrides = false;
+    let command_name = if force_window {
+        "set-window-option"
+    } else {
+        "set-option"
+    };
+    let mut flags = SetOptionFlags::new(force_window);
     let mut target = None;
 
     while let Some(token) = args.peek() {
@@ -37,52 +35,59 @@ pub(super) fn parse_set_option(
             }
             "-g" => {
                 let _ = args.optional();
-                global = true;
+                flags.global = true;
             }
             "-s" => {
                 let _ = args.optional();
-                server = true;
+                flags.server = true;
             }
             "-w" if !force_window => {
                 let _ = args.optional();
-                window = true;
+                flags.window = true;
             }
             "-p" if !force_window => {
                 let _ = args.optional();
-                pane = true;
+                flags.pane = true;
+            }
+            "-q" => {
+                let _ = args.optional();
+            }
+            "-w" if force_window => {
+                let _ = args.optional();
             }
             "-a" => {
                 let _ = args.optional();
-                append = true;
+                flags.append = true;
             }
             "-o" => {
                 let _ = args.optional();
-                only_if_unset = true;
+                flags.only_if_unset = true;
             }
             "-u" => {
                 let _ = args.optional();
-                unset = true;
+                flags.unset = true;
             }
             "-U" if !force_window => {
                 let _ = args.optional();
-                unset_pane_overrides = true;
-                unset = true;
-                window = true;
+                flags.unset_pane_overrides = true;
+                flags.unset = true;
+                flags.window = true;
             }
             "-t" => {
                 let _ = args.optional();
                 target = Some(parse_target_arg("set-option", args.required("-t target")?)?);
             }
+            token if is_set_option_flag_cluster(token, force_window) => {
+                let token = args
+                    .optional()
+                    .expect("peeked set-option flag cluster must be present");
+                flags.apply_cluster(command_name, &token)?;
+            }
             _ => break,
         }
     }
 
-    if [server, window, pane]
-        .into_iter()
-        .filter(|flag| *flag)
-        .count()
-        > 1
-    {
+    if flags.scope_count() > 1 {
         return Err(RmuxError::Server(
             "set-option accepts at most one of -s, -w, or -p".to_owned(),
         ));
@@ -92,23 +97,96 @@ pub(super) fn parse_set_option(
     let value = args.optional();
     args.no_extra("set-option")?;
 
-    let scope = resolve_set_option_scope(&option, global, server, window, pane, target)?;
-    let mode = if append {
+    let scope = resolve_set_option_scope(
+        &option,
+        flags.global,
+        flags.server,
+        flags.window,
+        flags.pane,
+        target,
+    )?;
+    let mode = if flags.append {
         SetOptionMode::Append
     } else {
         SetOptionMode::Replace
     };
-    rmux_core::validate_option_name_mutation(&option, &scope, mode, value.as_deref(), unset)?;
+    rmux_core::validate_option_name_mutation(&option, &scope, mode, value.as_deref(), flags.unset)?;
 
     Ok(Request::SetOptionByName(SetOptionByNameRequest {
         scope,
         name: option,
         value,
         mode,
-        only_if_unset,
-        unset,
-        unset_pane_overrides,
+        only_if_unset: flags.only_if_unset,
+        unset: flags.unset,
+        unset_pane_overrides: flags.unset_pane_overrides,
     }))
+}
+
+struct SetOptionFlags {
+    global: bool,
+    server: bool,
+    window: bool,
+    pane: bool,
+    append: bool,
+    only_if_unset: bool,
+    unset: bool,
+    unset_pane_overrides: bool,
+}
+
+impl SetOptionFlags {
+    fn new(force_window: bool) -> Self {
+        Self {
+            global: false,
+            server: false,
+            window: force_window,
+            pane: false,
+            append: false,
+            only_if_unset: false,
+            unset: false,
+            unset_pane_overrides: false,
+        }
+    }
+
+    fn scope_count(&self) -> usize {
+        [self.server, self.window, self.pane]
+            .into_iter()
+            .filter(|flag| *flag)
+            .count()
+    }
+
+    fn apply_cluster(&mut self, command_name: &str, token: &str) -> Result<(), RmuxError> {
+        for flag in token[1..].chars() {
+            match flag {
+                'g' => self.global = true,
+                's' => self.server = true,
+                'w' => self.window = true,
+                'p' => self.pane = true,
+                'q' => {}
+                'a' => self.append = true,
+                'o' => self.only_if_unset = true,
+                'u' => self.unset = true,
+                'U' => {
+                    self.unset_pane_overrides = true;
+                    self.unset = true;
+                    self.window = true;
+                }
+                _ => return Err(unsupported_flag(command_name, &format!("-{flag}"))),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn is_set_option_flag_cluster(token: &str, force_window: bool) -> bool {
+    token.starts_with('-')
+        && !token.starts_with("--")
+        && token.len() > 2
+        && token[1..].chars().all(|flag| {
+            matches!(flag, 'g' | 'a' | 'o' | 'q' | 'u')
+                || (!force_window && matches!(flag, 's' | 'w' | 'p' | 'U'))
+                || (force_window && flag == 'w')
+        })
 }
 
 pub(super) fn parse_set_environment(mut args: CommandTokens) -> Result<Request, RmuxError> {
@@ -188,6 +266,7 @@ pub(super) fn parse_show_options(
     let mut window = force_window;
     let mut pane = false;
     let mut value_only = false;
+    let mut include_inherited = false;
     let mut target = None;
     let mut name = None;
 
@@ -226,6 +305,10 @@ pub(super) fn parse_show_options(
                 let _ = args.optional();
                 value_only = true;
             }
+            "-A" => {
+                let _ = args.optional();
+                include_inherited = true;
+            }
             "-q" if force_window => return Err(unsupported_flag(command_name, "-q")),
             "-q" => {
                 let _ = args.optional();
@@ -245,6 +328,7 @@ pub(super) fn parse_show_options(
                         'w' if !force_window => window = true,
                         'p' if !force_window => pane = true,
                         'v' => value_only = true,
+                        'A' => include_inherited = true,
                         'q' if force_window => return Err(unsupported_flag(command_name, "-q")),
                         'q' => {}
                         's' => return Err(unsupported_flag(command_name, "-s")),
@@ -276,6 +360,7 @@ pub(super) fn parse_show_options(
         scope,
         name,
         value_only,
+        include_inherited,
     }))
 }
 
@@ -332,7 +417,7 @@ fn is_show_options_flag_cluster(token: &str) -> bool {
         && token.len() > 2
         && token[1..]
             .chars()
-            .all(|flag| matches!(flag, 'g' | 's' | 'w' | 'p' | 'v' | 'q'))
+            .all(|flag| matches!(flag, 'A' | 'g' | 's' | 'w' | 'p' | 'v' | 'q'))
 }
 
 fn build_global_or_session_scope(

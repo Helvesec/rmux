@@ -247,6 +247,8 @@ pub(super) fn run_resize_pane(
         ResizePaneAdjustment::Left { cells }
     } else if let Some(cells) = args.right {
         ResizePaneAdjustment::Right { cells }
+    } else if let (Some(columns), Some(rows)) = (args.columns, args.rows) {
+        ResizePaneAdjustment::AbsoluteSize { columns, rows }
     } else if let Some(columns) = args.columns {
         ResizePaneAdjustment::AbsoluteWidth { columns }
     } else if let Some(rows) = args.rows {

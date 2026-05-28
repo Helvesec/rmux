@@ -231,6 +231,18 @@ mod tests {
     }
 
     #[test]
+    fn sixel_passthrough_drains_once() {
+        let mut parser = TerminalParser::new(size(20, 4), 10);
+        parser.feed(b"\x1b[2;3H\x1bPq#0!10~\x1b\\");
+        let passthroughs = parser.take_terminal_passthrough();
+        assert_eq!(passthroughs.len(), 1);
+        assert_eq!(passthroughs[0].cursor_x(), 2);
+        assert_eq!(passthroughs[0].cursor_y(), 1);
+        assert_eq!(passthroughs[0].payload(), b"q#0!10~");
+        assert!(parser.take_terminal_passthrough().is_empty());
+    }
+
+    #[test]
     fn resize_propagates_to_screen() {
         let mut parser = TerminalParser::new(size(5, 2), 10);
         parser.feed(b"abc");

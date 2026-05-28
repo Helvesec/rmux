@@ -181,27 +181,22 @@ fn decode_escape_key(input: &[u8], backspace: Option<u8>) -> AttachedKeyDecode {
         ExtendedKeyDecode::Invalid => {}
     }
 
-    if input.len() < 3 {
-        if let Some(&byte) = input.get(1) {
-            if byte.is_ascii() && !byte.is_ascii_control() {
-                return AttachedKeyDecode::Matched {
-                    size: 2,
-                    key: u64::from(byte) | rmux_core::KEYC_META | rmux_core::KEYC_IMPLIED_META,
-                };
-            }
+    match input.get(1).copied() {
+        Some(b'[') => return decode_csi_key(input),
+        Some(b'O') => return decode_ss3_key(input),
+        Some(byte) if input.len() < 3 && byte.is_ascii() && !byte.is_ascii_control() => {
+            return AttachedKeyDecode::Matched {
+                size: 2,
+                key: u64::from(byte) | rmux_core::KEYC_META | rmux_core::KEYC_IMPLIED_META,
+            };
         }
-        return AttachedKeyDecode::Partial;
+        Some(_) if input.len() < 3 => return AttachedKeyDecode::Partial,
+        None => return AttachedKeyDecode::Partial,
+        Some(_) => {}
     }
-    let key = match &input[..3] {
-        b"\x1b[A" | b"\x1bOA" => key_string_lookup_string("Up"),
-        b"\x1b[B" | b"\x1bOB" => key_string_lookup_string("Down"),
-        b"\x1b[C" | b"\x1bOC" => key_string_lookup_string("Right"),
-        b"\x1b[D" | b"\x1bOD" => key_string_lookup_string("Left"),
-        _ => None,
-    };
 
-    if let Some(key) = key {
-        return AttachedKeyDecode::Matched { size: 3, key };
+    if input.len() < 3 {
+        return AttachedKeyDecode::Partial;
     }
 
     if let Some(&byte) = input.get(1) {
@@ -214,6 +209,86 @@ fn decode_escape_key(input: &[u8], backspace: Option<u8>) -> AttachedKeyDecode {
     }
 
     AttachedKeyDecode::Invalid
+}
+
+fn decode_csi_key(input: &[u8]) -> AttachedKeyDecode {
+    let Some(third) = input.get(2).copied() else {
+        return AttachedKeyDecode::Partial;
+    };
+
+    if let Some(key) = match third {
+        b'A' => key_string_lookup_string("Up"),
+        b'B' => key_string_lookup_string("Down"),
+        b'C' => key_string_lookup_string("Right"),
+        b'D' => key_string_lookup_string("Left"),
+        b'H' => key_string_lookup_string("Home"),
+        b'F' => key_string_lookup_string("End"),
+        b'Z' => key_string_lookup_string("BTab"),
+        _ => None,
+    } {
+        return AttachedKeyDecode::Matched { size: 3, key };
+    }
+
+    let Some(tilde_index) = input[2..].iter().position(|byte| *byte == b'~') else {
+        return if input[2..].iter().all(u8::is_ascii_digit) {
+            AttachedKeyDecode::Partial
+        } else {
+            AttachedKeyDecode::Invalid
+        };
+    };
+    let tilde_index = tilde_index + 2;
+    let Ok(number) = std::str::from_utf8(&input[2..tilde_index])
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or(())
+    else {
+        return AttachedKeyDecode::Invalid;
+    };
+    let key_name = match number {
+        1 | 7 => "Home",
+        2 => "IC",
+        3 => "DC",
+        4 | 8 => "End",
+        5 => "PageUp",
+        6 => "PageDown",
+        15 => "F5",
+        17 => "F6",
+        18 => "F7",
+        19 => "F8",
+        20 => "F9",
+        21 => "F10",
+        23 => "F11",
+        24 => "F12",
+        _ => return AttachedKeyDecode::Invalid,
+    };
+    key_string_lookup_string(key_name).map_or(AttachedKeyDecode::Invalid, |key| {
+        AttachedKeyDecode::Matched {
+            size: tilde_index + 1,
+            key,
+        }
+    })
+}
+
+fn decode_ss3_key(input: &[u8]) -> AttachedKeyDecode {
+    let Some(third) = input.get(2).copied() else {
+        return AttachedKeyDecode::Partial;
+    };
+    let key_name = match third {
+        b'A' => "Up",
+        b'B' => "Down",
+        b'C' => "Right",
+        b'D' => "Left",
+        b'F' => "End",
+        b'H' => "Home",
+        b'P' => "F1",
+        b'Q' => "F2",
+        b'R' => "F3",
+        b'S' => "F4",
+        _ => return AttachedKeyDecode::Invalid,
+    };
+    key_string_lookup_string(key_name).map_or(AttachedKeyDecode::Invalid, |key| {
+        AttachedKeyDecode::Matched { size: 3, key }
+    })
 }
 
 fn control_byte_key(byte: u8) -> Option<KeyCode> {
@@ -268,5 +343,44 @@ mod tests {
             key_code_lookup_bits(key),
             key_code_lookup_bits(key_string_lookup_string("Down").expect("Down parses"))
         );
+    }
+
+    #[test]
+    fn attached_escape_prefix_waits_for_ambiguous_csi_and_ss3_prefixes() {
+        assert_eq!(
+            decode_attached_key(b"\x1b[", None),
+            AttachedKeyDecode::Partial
+        );
+        assert_eq!(
+            decode_attached_key(b"\x1bO", None),
+            AttachedKeyDecode::Partial
+        );
+    }
+
+    #[test]
+    fn attached_escape_prefix_decodes_navigation_and_function_sequences() {
+        for (sequence, name, size) in [
+            (b"\x1b[A".as_slice(), "Up", 3),
+            (b"\x1bOA".as_slice(), "Up", 3),
+            (b"\x1b[H".as_slice(), "Home", 3),
+            (b"\x1b[F".as_slice(), "End", 3),
+            (b"\x1b[Z".as_slice(), "BTab", 3),
+            (b"\x1bOP".as_slice(), "F1", 3),
+            (b"\x1bOS".as_slice(), "F4", 3),
+            (b"\x1b[3~".as_slice(), "DC", 4),
+            (b"\x1b[15~".as_slice(), "F5", 5),
+        ] {
+            let AttachedKeyDecode::Matched { size: actual, key } =
+                decode_attached_key(sequence, None)
+            else {
+                panic!("{name} should decode from {sequence:?}");
+            };
+            assert_eq!(actual, size, "{name} consumed size");
+            assert_eq!(
+                key_code_lookup_bits(key),
+                key_code_lookup_bits(key_string_lookup_string(name).expect("key parses")),
+                "{name} key bits"
+            );
+        }
     }
 }

@@ -33,6 +33,7 @@ fn terminal_profile_resolves_default_shell_with_command_environment_overrides() 
         &session_name,
         7,
         Path::new(r"\\.\pipe\rmux-test"),
+        None,
         true,
         Some(&[
             format!("PATH={}", path.to_string_lossy()),

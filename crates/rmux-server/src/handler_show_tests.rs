@@ -48,6 +48,7 @@ async fn show_options_returns_command_output_for_session_and_server_scopes() {
             scope: rmux_proto::OptionScopeSelector::Session(session_name("alpha")),
             name: None,
             value_only: false,
+            include_inherited: true,
         }))
         .await;
     let output = response
@@ -55,13 +56,14 @@ async fn show_options_returns_command_output_for_session_and_server_scopes() {
         .expect("show-options should return command output");
     let stdout = std::str::from_utf8(output.stdout()).expect("utf8 output");
     assert!(stdout.contains("status off\n"));
-    assert!(stdout.contains("base-index 0\n"));
+    assert!(stdout.contains("base-index* 0\n"));
 
     let response = handler
         .handle(Request::ShowOptions(ShowOptionsRequest {
             scope: rmux_proto::OptionScopeSelector::ServerGlobal,
             name: None,
             value_only: true,
+            include_inherited: true,
         }))
         .await;
     let output = response
@@ -70,6 +72,66 @@ async fn show_options_returns_command_output_for_session_and_server_scopes() {
     let stdout = std::str::from_utf8(output.stdout()).expect("utf8 output");
     assert!(stdout.contains("tmux-256color\n"));
     assert!(!stdout.contains("default-terminal "));
+}
+
+#[tokio::test]
+async fn show_options_without_a_omits_inherited_values() {
+    let handler = RequestHandler::new();
+    create_session(&handler, "alpha").await;
+
+    let response = handler
+        .handle(Request::ShowOptions(ShowOptionsRequest {
+            scope: rmux_proto::OptionScopeSelector::Session(session_name("alpha")),
+            name: Some("status".to_owned()),
+            value_only: false,
+            include_inherited: false,
+        }))
+        .await;
+    let output = response
+        .command_output()
+        .expect("show-options should return command output");
+
+    assert_eq!(output.stdout(), b"");
+}
+
+#[tokio::test]
+async fn show_options_global_scope_resolves_named_defaults_without_a_marker() {
+    let handler = RequestHandler::new();
+    create_session(&handler, "alpha").await;
+
+    let response = handler
+        .handle(Request::ShowOptions(ShowOptionsRequest {
+            scope: rmux_proto::OptionScopeSelector::SessionGlobal,
+            name: Some("status".to_owned()),
+            value_only: true,
+            include_inherited: false,
+        }))
+        .await;
+    let output = response
+        .command_output()
+        .expect("show-options -gqv should return command output");
+
+    assert_eq!(output.stdout(), b"on\n");
+}
+
+#[tokio::test]
+async fn show_options_a_marks_inherited_values() {
+    let handler = RequestHandler::new();
+    create_session(&handler, "alpha").await;
+
+    let response = handler
+        .handle(Request::ShowOptions(ShowOptionsRequest {
+            scope: rmux_proto::OptionScopeSelector::Session(session_name("alpha")),
+            name: Some("status".to_owned()),
+            value_only: false,
+            include_inherited: true,
+        }))
+        .await;
+    let output = response
+        .command_output()
+        .expect("show-options -A should return command output");
+
+    assert_eq!(output.stdout(), b"status* on\n");
 }
 
 #[tokio::test]
@@ -181,6 +243,7 @@ async fn show_options_window_global_scope_is_a_valid_explicit_request() {
             scope: rmux_proto::OptionScopeSelector::WindowGlobal,
             name: Some("pane-border-style".to_owned()),
             value_only: false,
+            include_inherited: true,
         }))
         .await;
     assert!(matches!(response, Response::ShowOptions(_)));
@@ -302,6 +365,7 @@ async fn show_options_for_nonexistent_session_returns_session_not_found() {
                 scope: rmux_proto::OptionScopeSelector::Session(session_name("missing")),
                 name: None,
                 value_only: false,
+                include_inherited: true,
             }))
             .await,
         Response::Error(ErrorResponse {
@@ -335,6 +399,7 @@ async fn show_options_at_window_scope_resolves_window_then_session_then_global()
             ))),
             name: None,
             value_only: false,
+            include_inherited: true,
         }))
         .await;
     let output = response

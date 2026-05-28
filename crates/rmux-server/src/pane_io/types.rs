@@ -117,6 +117,7 @@ pub(crate) struct AttachTarget {
     pub(crate) cursor_style: u32,
     pub(crate) active_pane_geometry: PaneGeometry,
     pub(crate) kitty_graphics_passthrough: bool,
+    pub(crate) sixel_passthrough: bool,
     pub(crate) persistent_overlay_state_id: Option<u64>,
     pub(crate) live_pane: Option<Box<LivePaneRender>>,
     /// Stable id of the pane this target was built for. Used by the
@@ -202,6 +203,7 @@ pub(super) struct OpenAttachTarget {
     pub(super) cursor_style: u32,
     pub(super) active_pane_geometry: PaneGeometry,
     pub(super) kitty_graphics_passthrough: bool,
+    pub(super) sixel_passthrough: bool,
     pub(super) persistent_overlay_state_id: Option<u64>,
     pub(super) live_pane: Option<Box<LivePaneRender>>,
     pub(super) active_pane_id: Option<PaneId>,

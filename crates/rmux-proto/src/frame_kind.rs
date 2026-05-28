@@ -1180,6 +1180,24 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         None,
         "v0.1.3 SDK byte wait endpoint with stable pane-id targeting; pinned bincode tag 111.",
     ),
+    entry(
+        c2s(112),
+        FrameDirection::ClientToServer,
+        ACTIVE,
+        "DaemonStatusRequest",
+        FrameFeature::Protocol,
+        None,
+        "Internal daemon status endpoint for seamless upgrades; pinned bincode tag 112.",
+    ),
+    entry(
+        c2s(113),
+        FrameDirection::ClientToServer,
+        ACTIVE,
+        "ShutdownIfIdleRequest",
+        FrameFeature::Server,
+        None,
+        "Internal idle-only daemon shutdown endpoint for seamless upgrades; pinned bincode tag 113.",
+    ),
     // Reserved client→server slot. Removed values must be listed and never reused.
     entry(
         c2s(0x7FFE),
@@ -2019,6 +2037,24 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         None,
         "v0.1.3 SDK app-owned session lease release response; pinned bincode tag 90.",
     ),
+    entry(
+        s2c(91),
+        FrameDirection::ServerToClient,
+        ACTIVE,
+        "DaemonStatusResponse",
+        FrameFeature::Protocol,
+        None,
+        "Internal daemon status response for seamless upgrades; pinned bincode tag 91.",
+    ),
+    entry(
+        s2c(92),
+        FrameDirection::ServerToClient,
+        ACTIVE,
+        "ShutdownIfIdleResponse",
+        FrameFeature::Server,
+        None,
+        "Internal idle-only daemon shutdown response for seamless upgrades; pinned bincode tag 92.",
+    ),
     // Reserved server→client slot. Removed values must be listed and never reused.
     entry(
         s2c(0x7FFE),
@@ -2160,6 +2196,8 @@ pub const fn frame_kind_for_request(request: &Request) -> FrameKind {
         Request::ReleaseSessionLease(_) => c2s(109),
         Request::SubscribePaneOutputRef(_) => c2s(110),
         Request::SdkWaitForOutputRef(_) => c2s(111),
+        Request::DaemonStatus(_) => c2s(112),
+        Request::ShutdownIfIdle(_) => c2s(113),
     }
 }
 
@@ -2258,6 +2296,8 @@ pub const fn frame_kind_for_response(response: &Response) -> FrameKind {
         Response::CreateSessionLease(_) => s2c(88),
         Response::RenewSessionLease(_) => s2c(89),
         Response::ReleaseSessionLease(_) => s2c(90),
+        Response::DaemonStatus(_) => s2c(91),
+        Response::ShutdownIfIdle(_) => s2c(92),
     }
 }
 

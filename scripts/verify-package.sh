@@ -114,13 +114,13 @@ tar -xzf "$archive_abs" -C "$tmpdir"
 package_root="$tmpdir/${archive_name%.tar.gz}"
 [ -d "$package_root" ] || die "archive root directory is missing: ${archive_name%.tar.gz}"
 
-for required in bin/rmux SHA256SUMS.txt docs/artifact-metadata.json share/man/man1/rmux.1; do
+for required in bin/rmux SHA256SUMS.txt share/rmux/artifact-metadata.json share/man/man1/rmux.1; do
   [ -e "$package_root/$required" ] || die "missing package file: $required"
 done
 [ -x "$package_root/bin/rmux" ] || die "packaged rmux is not executable"
 verify_checksum_manifest "$package_root" "$package_root/SHA256SUMS.txt"
 
-metadata="$package_root/docs/artifact-metadata.json"
+metadata="$package_root/share/rmux/artifact-metadata.json"
 metadata_binary_hash="$(sed -n 's/.*"binary_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$metadata" | head -n 1 | tr 'A-F' 'a-f')"
 [ -n "$metadata_binary_hash" ] || die "metadata binary_sha256 is missing or invalid"
 packaged_binary_hash="$(sha256_file "$package_root/bin/rmux")"

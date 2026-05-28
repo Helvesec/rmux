@@ -31,6 +31,8 @@ pub use states::InputState;
 use params::ParamList;
 use states::Transition;
 
+use crate::terminal_passthrough::MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES;
+
 /// Maximum number of parameters in a CSI/DCS sequence.
 const PARAM_LIST_MAX: usize = 24;
 
@@ -469,11 +471,9 @@ impl InputParser {
     }
 
     fn handle_input(&mut self) -> bool {
-        if self.input_buf.len() + 1 >= INPUT_BUF_MAX {
-            if self.flags & INPUT_DISCARD == 0
-                && self.state == InputState::ApcString
-                && passthrough::is_kitty_graphics_apc(&self.input_buf)
-            {
+        let input_limit = self.input_buffer_limit();
+        if self.input_buf.len() + 1 >= input_limit {
+            if self.flags & INPUT_DISCARD == 0 && self.is_terminal_passthrough_string() {
                 self.terminal_passthrough_dropped_count =
                     self.terminal_passthrough_dropped_count.saturating_add(1);
             }
@@ -482,6 +482,20 @@ impl InputParser {
             self.input_buf.push(self.ch);
         }
         false
+    }
+
+    fn input_buffer_limit(&self) -> usize {
+        if self.is_terminal_passthrough_string() {
+            return MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES;
+        }
+        INPUT_BUF_MAX
+    }
+
+    fn is_terminal_passthrough_string(&self) -> bool {
+        (self.state == InputState::ApcString && passthrough::is_kitty_graphics_apc(&self.input_buf))
+            || (self.state == InputState::DcsHandler
+                && self.interm_len == 0
+                && self.input_buf.first() == Some(&b'q'))
     }
 
     fn handle_end_bel(&mut self) -> bool {

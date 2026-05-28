@@ -197,6 +197,145 @@ async fn kill_session_last_session_requests_shutdown() {
 }
 
 #[tokio::test]
+async fn exit_empty_shutdown_is_cancelled_when_a_new_session_starts_first() {
+    let handler = RequestHandler::new();
+    let (shutdown_handle, mut shutdown_rx) = ShutdownHandle::new();
+    handler.install_shutdown_handle(shutdown_handle);
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name("alpha"),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+
+    let response = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: session_name("alpha"),
+            kill_all_except_target: false,
+            clear_alerts: false,
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::KillSession(rmux_proto::KillSessionResponse { existed: true })
+    );
+
+    let recreated = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name("beta"),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(recreated, Response::NewSession(_)));
+    assert!(
+        !handler.request_shutdown_if_pending(),
+        "stale exit-empty shutdown must not stop a newly non-empty server"
+    );
+    tokio::time::timeout(Duration::from_millis(50), &mut shutdown_rx)
+        .await
+        .expect_err("stale exit-empty shutdown should be cancelled");
+}
+
+#[tokio::test]
+async fn exit_empty_shutdown_retries_after_state_lock_contention() {
+    let handler = RequestHandler::new();
+    let (shutdown_handle, shutdown_rx) = ShutdownHandle::new();
+    handler.install_shutdown_handle(shutdown_handle);
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name("alpha"),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+
+    let response = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: session_name("alpha"),
+            kill_all_except_target: false,
+            clear_alerts: false,
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::KillSession(rmux_proto::KillSessionResponse { existed: true })
+    );
+
+    let state = handler.state.lock().await;
+    assert!(
+        !handler.request_shutdown_if_pending(),
+        "state lock contention should defer exit-empty shutdown"
+    );
+    drop(state);
+
+    tokio::time::timeout(Duration::from_millis(100), shutdown_rx)
+        .await
+        .expect("deferred exit-empty shutdown should be retried")
+        .expect("shutdown receiver should complete cleanly");
+}
+
+#[tokio::test]
+async fn exit_empty_does_not_downgrade_pending_kill_server_shutdown() {
+    let handler = RequestHandler::new();
+    let (shutdown_handle, shutdown_rx) = ShutdownHandle::new();
+    handler.install_shutdown_handle(shutdown_handle);
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name("alpha"),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+
+    let kill_server = handler
+        .handle(Request::KillServer(rmux_proto::KillServerRequest))
+        .await;
+    assert!(matches!(kill_server, Response::KillServer(_)));
+
+    let kill_session = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: session_name("alpha"),
+            kill_all_except_target: false,
+            clear_alerts: false,
+        }))
+        .await;
+    assert_eq!(
+        kill_session,
+        Response::KillSession(rmux_proto::KillSessionResponse { existed: true })
+    );
+
+    let recreated = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name("beta"),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(recreated, Response::NewSession(_)));
+    assert!(
+        handler.request_shutdown_if_pending(),
+        "explicit kill-server must not become a cancellable exit-empty shutdown"
+    );
+    tokio::time::timeout(Duration::from_millis(50), shutdown_rx)
+        .await
+        .expect("kill-server should still request shutdown")
+        .expect("shutdown receiver should complete cleanly");
+}
+
+#[tokio::test]
 async fn kill_session_last_session_respects_exit_empty_off() {
     let handler = RequestHandler::new();
     let (shutdown_handle, shutdown_rx) = ShutdownHandle::new();

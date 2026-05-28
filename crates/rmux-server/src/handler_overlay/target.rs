@@ -41,6 +41,7 @@ impl RequestHandler {
         } else {
             self.resolve_attached_client_pid(requester_pid, command_name)
                 .await
+                .map_err(|error| overlay_client_error(error, command_name))
         }
     }
 
@@ -103,5 +104,16 @@ impl RequestHandler {
             }
             _ => Ok(None),
         }
+    }
+}
+
+fn overlay_client_error(error: RmuxError, command_name: &str) -> RmuxError {
+    match &error {
+        RmuxError::Server(message)
+            if message == &format!("{command_name} requires an attached client") =>
+        {
+            RmuxError::Message("no current client".to_owned())
+        }
+        _ => error,
     }
 }

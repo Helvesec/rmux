@@ -39,10 +39,28 @@ fn dcs_passthrough_tmux_prefix() {
 }
 
 #[test]
+fn dcs_sixel_uses_passthrough() {
+    let (_p, w) = parse(b"\x1bPq\"1;1;2;2#0!10~\x1b\\");
+    assert!(w.has_call("sixel_passthrough(\"q\\\"1;1;2;2#0!10~\")"));
+}
+
+#[test]
+fn dcs_sixel_preserves_parameters() {
+    let (_p, w) = parse(b"\x1bP1;2q#0!10~\x1b\\");
+    assert!(w.has_call("sixel_passthrough(\"1;2q#0!10~\")"));
+}
+
+#[test]
 fn dcs_decrqss_unrecognized() {
     let (p, _w) = parse(b"\x1bP$qx\x1b\\");
     let replies = String::from_utf8_lossy(&p.reply_buf);
     assert!(replies.contains("\x1bP0$r\x1b\\"));
+}
+
+#[test]
+fn dcs_decrqss_is_not_sixel() {
+    let (_p, w) = parse(b"\x1bP$qm\x1b\\");
+    assert!(!w.has_call("sixel_passthrough"));
 }
 
 // ─── INPUT_LAST and REP tests ──────────────────────────────────────

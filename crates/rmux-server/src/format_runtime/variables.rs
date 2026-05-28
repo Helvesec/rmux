@@ -8,6 +8,24 @@ use crate::host_name::local_hostname;
 
 use super::{bool_string, server_start_time, RuntimeFormatContext};
 
+impl RuntimeFormatContext<'_> {
+    fn pane_history_all_bytes(&self) -> Option<String> {
+        let session = self.session?;
+        let pane = self.pane?;
+        let stats = self.state?.pane_history_stats(session.name(), pane.id())?;
+        Some(stats.all_bytes)
+    }
+
+    fn pane_pipe(&self) -> Option<String> {
+        let session = self.session?;
+        let pane = self.pane?;
+        let window_index = self.window_index?;
+        Some(bool_string(self.state.is_some_and(|state| {
+            state.pane_has_pipe(session.name(), window_index, pane.id())
+        })))
+    }
+}
+
 impl FormatVariables for RuntimeFormatContext<'_> {
     fn format_value(&self, variable: FormatVariable) -> Option<String> {
         if variable == FormatVariable::WindowName {
@@ -119,9 +137,11 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "active_window_index" => self
                 .session
                 .map(|session| session.active_window_index().to_string()),
+            "alternate_saved_x" | "alternate_saved_y" => Some(u32::MAX.to_string()),
             "buffer_full" => self
                 .buffer_head()
                 .map(|(_, content)| String::from_utf8_lossy(&content).into_owned()),
+            "buffer_mode_format" => Some("#{t/p:buffer_created}: #{buffer_sample}".to_owned()),
             "buffer_name" => self.buffer_head().map(|(name, _)| name),
             "buffer_sample" => self.buffer_head().map(|(_, content)| {
                 let text = String::from_utf8_lossy(&content);
@@ -130,9 +150,13 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "buffer_size" => self
                 .buffer_head()
                 .map(|(_, content)| content.len().to_string()),
+            "client_mode_format" => Some("#{t/p:client_activity}: session #{session_name}".to_owned()),
             "client_height" => self.client_size.map(|size| size.rows.to_string()),
             "client_width" => self.client_size.map(|size| size.cols.to_string()),
-            "config_files" => Some(String::new()),
+            "command" => Some("display-message".to_owned()),
+            "config_files" => Some("/dev/null".to_owned()),
+            "cursor_character" => Some(" ".to_owned()),
+            "cursor_flag" => Some("1".to_owned()),
             "cursor_x" => self
                 .pane_cursor_position()
                 .map(|(cursor_x, _)| cursor_x.to_string()),
@@ -140,11 +164,15 @@ impl FormatVariables for RuntimeFormatContext<'_> {
                 .pane_cursor_position()
                 .map(|(_, cursor_y)| cursor_y.to_string()),
             "history_bytes" => self.pane_history_bytes(),
+            "history_all_bytes" => self.pane_history_all_bytes(),
             "history_limit" => self.pane_history_limit(),
             "history_size" => self.pane_history_size(),
             "host" => local_hostname(),
             "host_short" => {
                 local_hostname().map(|host| host.split('.').next().unwrap_or_default().to_owned())
+            }
+            "insert_flag" | "keypad_cursor_flag" | "keypad_flag" | "origin_flag" => {
+                Some("0".to_owned())
             }
             "last_window_index" => self
                 .session
@@ -152,7 +180,7 @@ impl FormatVariables for RuntimeFormatContext<'_> {
                 .map(|value| value.to_string()),
             "next_session_id" => self
                 .session_store
-                .map(|sessions| sessions.next_session_id().as_u32().to_string()),
+                .map(|sessions| sessions.next_session_id().to_string()),
             "pane_at_left" => self.pane.map(|pane| bool_string(pane.geometry().x() == 0)),
             "pane_at_right" => self.pane.map(|pane| {
                 bool_string(self.window.is_some_and(|window| {
@@ -170,15 +198,17 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "mouse_sgr_flag" => self.pane_mode_flag(mode::MODE_MOUSE_SGR),
             "mouse_standard_flag" => self.pane_mode_flag(mode::MODE_MOUSE_STANDARD),
             "mouse_utf8_flag" => self.pane_mode_flag(mode::MODE_MOUSE_UTF8),
-            "pane_current_path" | "pane_path" | "session_path" => self
+            "pane_current_path" | "session_path" => self
                 .pane_current_path()
                 .or_else(|| self.environment_value_by_name("PWD"))
                 .or_else(|| self.environment_value_by_name("HOME")),
+            "pane_path" => Some(String::new()),
             "pane_current_command" => self.pane_current_command(),
             "pane_dead" => Some(bool_string(self.pane_dead())),
             "pane_dead_signal" => self.pane_dead_signal(),
             "pane_dead_status" => self.pane_dead_status(),
             "pane_dead_time" => self.pane_dead_time(),
+            "pane_bg" | "pane_fg" => Some("default".to_owned()),
             "pane_flags" => self.pane.map(|pane| {
                 let mut flags = String::new();
                 if self
@@ -199,6 +229,7 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             }),
             "pane_format" => Some(bool_string(self.pane.is_some())),
             "pane_in_mode" => Some(bool_string(self.pane_in_mode())),
+            "pane_input_off" => Some("0".to_owned()),
             "pane_marked" => self.pane_marked(),
             "pane_marked_set" => Some(bool_string(self.marked_pane_set())),
             "pane_last" => self.pane.map(|pane| {
@@ -214,6 +245,7 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "pane_lifecycle_revision" | "pane_revision" => self.pane_lifecycle_revision(),
             "pane_output_sequence" => self.pane_output_sequence(),
             "pane_pid" => self.pane_pid(),
+            "pane_pipe" => self.pane_pipe(),
             "pane_right" => self.pane.map(|pane| {
                 (pane.geometry().x() + pane.geometry().cols())
                     .saturating_sub(1)
@@ -227,11 +259,18 @@ impl FormatVariables for RuntimeFormatContext<'_> {
                 .pane_start_path()
                 .or_else(|| self.environment_value_by_name("PWD"))
                 .or_else(|| self.environment_value_by_name("HOME")),
+            "pane_synchronized" => Some("0".to_owned()),
+            "pane_tabs" => Some("8,16,24,32,40,48,56,64,72,80,88,96,104,112".to_owned()),
             "pane_tty" => self.pane_tty(),
             "pane_title" => self.pane_title(),
             "pane_top" => self.pane.map(|pane| pane.geometry().y().to_string()),
+            "pane_unseen_changes" => Some("0".to_owned()),
             "pane_zoomed_flag" => Some(bool_string(self.window.is_some_and(Window::is_zoomed))),
             "pid" => Some(std::process::id().to_string()),
+            "scroll_region_lower" => self
+                .visible_window_snapshot()
+                .map(|window| window.size().rows.saturating_sub(1).to_string()),
+            "scroll_region_upper" => Some("0".to_owned()),
             "scroll_position" => self
                 .pane_copy_mode_summary()
                 .map(|summary| summary.scroll_position.to_string()),
@@ -302,6 +341,7 @@ impl FormatVariables for RuntimeFormatContext<'_> {
                 .session_store
                 .map(|sessions| sessions.len().to_string()),
             "session_active" => Some(bool_string(self.session.is_some())),
+            "session_activity" => self.session.map(|session| session.activity_at().to_string()),
             "session_created" => self.session.map(|session| session.created_at().to_string()),
             "session_format" => Some(bool_string(
                 self.session.is_some() && self.window.is_none() && self.pane.is_none(),
@@ -335,11 +375,13 @@ impl FormatVariables for RuntimeFormatContext<'_> {
                 .map(|timestamp| timestamp.to_string()),
             "session_many_attached" => Some(bool_string(self.session_attached_count() > 1)),
             "session_marked" => Some(bool_string(self.session_marked())),
+            "session_stack" => Some("0".to_owned()),
             "socket_path" => Some(String::new()),
             "start_time" => Some(server_start_time().to_string()),
-            "uid" => std::env::var("UID").ok(),
+            "tree_mode_format" => Some("#{?pane_format,#{?pane_marked,#[reverse],}#{pane_current_command}#{?pane_active,*,}#{?pane_marked,M,}#{?#{&&:#{pane_title},#{!=:#{pane_title},#{host_short}}},: \"#{pane_title}\",},#{?window_format,#{?window_marked_flag,#[reverse],}#{window_name}#{window_flags}#{?#{&&:#{==:#{window_panes},1},#{&&:#{pane_title},#{!=:#{pane_title},#{host_short}}}},: \"#{pane_title}\",},#{session_windows} windows#{?session_grouped, (group #{session_group}: #{session_group_list}),}#{?session_attached, (attached),}}}".to_owned()),
+            "uid" => Some(crate::server_access::current_owner_uid().to_string()),
             "user" => std::env::var("USER").ok(),
-            "version" => Some(env!("CARGO_PKG_VERSION").to_owned()),
+            "version" => Some("3.4".to_owned()),
             "window_active_clients" => Some(
                 if self
                     .base
@@ -356,7 +398,17 @@ impl FormatVariables for RuntimeFormatContext<'_> {
                     .format_value(FormatVariable::WindowActive)
                     .is_some_and(|value| value == "1"),
             )),
+            "window_active_sessions_list" => Some(
+                self.base
+                    .format_value(FormatVariable::WindowActive)
+                    .filter(|value| value == "1")
+                    .and_then(|_| self.session_name().map(ToString::to_string))
+                    .unwrap_or_default(),
+            ),
+            "window_activity" => self.session.map(|session| session.activity_at().to_string()),
             "window_bigger" => Some("0".to_owned()),
+            "window_cell_height" => Some("32".to_owned()),
+            "window_cell_width" => Some("16".to_owned()),
             "window_end_flag" => self.window_index.map(|window_index| {
                 bool_string(
                     self.session
@@ -367,6 +419,7 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "window_format" => Some(bool_string(self.window.is_some() && self.pane.is_none())),
             "window_marked_flag" => Some(bool_string(self.window_marked())),
             "window_offset_x" | "window_offset_y" => Some("0".to_owned()),
+            "window_stack_index" => Some("0".to_owned()),
             "window_start_flag" => self.window_index.map(|window_index| {
                 bool_string(
                     self.session
@@ -375,6 +428,7 @@ impl FormatVariables for RuntimeFormatContext<'_> {
                 )
             }),
             "window_zoomed_flag" => Some(bool_string(self.window.is_some_and(Window::is_zoomed))),
+            "wrap_flag" => Some("1".to_owned()),
             _ => None,
         };
 

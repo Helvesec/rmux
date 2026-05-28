@@ -47,6 +47,7 @@ async fn create_passthrough_attached_session(
             ]),
             process_command: None,
             passthrough: true,
+            client_environment: None,
         }))
         .await;
     assert!(

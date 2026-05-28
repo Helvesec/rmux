@@ -224,6 +224,7 @@ async fn forward_attach_emits_stop_sequence_when_processing_errors() {
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         kitty_graphics_passthrough: false,
+        sixel_passthrough: false,
         persistent_overlay_state_id: None,
         live_pane: None,
         active_pane_id: None,
@@ -300,6 +301,24 @@ fn test_attach_target_with_output(
     pane_output: super::types::PaneOutputSender,
     kitty_graphics_passthrough: bool,
 ) -> AttachTarget {
+    test_attach_target_with_protocols(
+        session_name,
+        render_frame,
+        persistent_overlay_state_id,
+        pane_output,
+        kitty_graphics_passthrough,
+        false,
+    )
+}
+
+fn test_attach_target_with_protocols(
+    session_name: &SessionName,
+    render_frame: &[u8],
+    persistent_overlay_state_id: Option<u64>,
+    pane_output: super::types::PaneOutputSender,
+    kitty_graphics_passthrough: bool,
+    sixel_passthrough: bool,
+) -> AttachTarget {
     let pty = PtyPair::open().expect("open pty pair");
     let pane_master = pty.into_master();
     AttachTarget {
@@ -314,6 +333,7 @@ fn test_attach_target_with_output(
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         kitty_graphics_passthrough,
+        sixel_passthrough,
         persistent_overlay_state_id,
         live_pane: None,
         active_pane_id: None,
@@ -577,6 +597,7 @@ async fn forward_attach_emits_display_panes_overlay_for_prefix_q_keystrokes() {
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         kitty_graphics_passthrough: false,
+        sixel_passthrough: false,
         persistent_overlay_state_id: None,
         live_pane: None,
         active_pane_id: None,
@@ -681,6 +702,8 @@ async fn forward_attach_passthrough_forwards_pane_output_verbatim_without_alt_sc
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
         persistent_overlay_state_id: None,
         live_pane: None,
         active_pane_id: None,
@@ -779,6 +802,8 @@ async fn forward_attach_passthrough_replays_target_on_attach_control_switch() {
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
         persistent_overlay_state_id: None,
         live_pane: None,
         active_pane_id: None,
@@ -797,6 +822,8 @@ async fn forward_attach_passthrough_replays_target_on_attach_control_switch() {
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
         persistent_overlay_state_id: None,
         live_pane: None,
         active_pane_id: None,
@@ -924,6 +951,8 @@ async fn forward_attach_passthrough_never_paints_render_frame_or_alt_screen() {
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
         persistent_overlay_state_id: None,
         live_pane: None,
         active_pane_id: None,
@@ -1039,6 +1068,8 @@ async fn forward_attach_passthrough_emits_cursor_show_on_initial_attach() {
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
         persistent_overlay_state_id: None,
         live_pane: None,
         active_pane_id: None,
@@ -1121,6 +1152,8 @@ async fn forward_attach_passthrough_emits_detached_banner_on_detach() {
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
         persistent_overlay_state_id: None,
         live_pane: None,
         active_pane_id: None,
@@ -1265,6 +1298,8 @@ async fn forward_attach_passthrough_winches_new_window_on_switch() {
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
         persistent_overlay_state_id: None,
         live_pane: None,
         active_pane_id: None,
@@ -1281,6 +1316,8 @@ async fn forward_attach_passthrough_winches_new_window_on_switch() {
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
         persistent_overlay_state_id: None,
         live_pane: None,
         active_pane_id: None,
@@ -1387,6 +1424,7 @@ async fn create_passthrough_session_with_quiet_shell(
             ]),
             process_command: None,
             passthrough: true,
+            client_environment: None,
         }))
         .await;
     assert!(
@@ -1550,6 +1588,8 @@ async fn forward_attach_passthrough_switch_emits_mode_resets_and_alt_screen_brid
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
         persistent_overlay_state_id: None,
         live_pane: None,
         active_pane_id: Some(pane_zero),
@@ -1563,6 +1603,8 @@ async fn forward_attach_passthrough_switch_emits_mode_resets_and_alt_screen_brid
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
         persistent_overlay_state_id: None,
         live_pane: None,
         active_pane_id: Some(pane_one),
@@ -1721,6 +1763,8 @@ async fn forward_attach_passthrough_emits_alt_screen_exit_on_detach_if_host_in_a
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
         kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
         persistent_overlay_state_id: None,
         live_pane: None,
         active_pane_id: None,

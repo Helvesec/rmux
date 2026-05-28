@@ -30,10 +30,7 @@ fn tmux_compat_nested_attach_session_inside_tmux_uses_switch_client_surface(
     assert_eq!(nested_attach.status_code, Some(1));
     assert!(!nested_attach.timed_out);
     assert!(nested_attach.stdout.is_empty());
-    assert_eq!(
-        nested_attach.stderr_string(),
-        "server error: switch-client requires an attached client\n"
-    );
+    assert_eq!(nested_attach.stderr_string(), "no current client\n");
 
     let still_present = harness.run_rmux_with(&["has-session", "-t", "alpha"], &config)?;
     assert_rmux_metadata(

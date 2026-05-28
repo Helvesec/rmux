@@ -38,6 +38,7 @@ impl HandlerState {
         direction: SplitDirection,
         before: bool,
         socket_path: &Path,
+        spawn_environment: Option<&std::collections::HashMap<String, String>>,
         environment_overrides: Option<&[String]>,
         command: Option<&ProcessCommand>,
         start_directory: Option<&Path>,
@@ -85,6 +86,7 @@ impl HandlerState {
             &session_name,
             session_id.as_u32(),
             socket_path,
+            spawn_environment,
             true,
             environment_overrides,
             Some(new_pane_id),
@@ -98,6 +100,7 @@ impl HandlerState {
             }
         };
         let runtime_window_name = profile.runtime_window_name(command);
+        let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
         let terminal = match open_pane_terminal(
             new_pane_geometry,
@@ -145,6 +148,7 @@ impl HandlerState {
             new_pane_id,
             PaneOutputSpawn {
                 geometry: new_pane_geometry,
+                initial_title,
                 output_reader,
                 #[cfg(windows)]
                 exit_watcher: Some(exit_watcher),

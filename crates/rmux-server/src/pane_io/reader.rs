@@ -7,13 +7,29 @@ use rmux_pty::{PtyIo, PtyMaster};
 use tracing::warn;
 
 #[cfg(unix)]
-use super::wire::{open_pane_writer, read_from_pane};
+use super::wire::{open_pane_writer, read_from_pane, PaneReadinessState};
 use super::{
     PaneAlertCallback, PaneAlertEvent, PaneExitCallback, PaneExitEvent, PaneOutputSender,
     READ_BUFFER_SIZE,
 };
+#[cfg(unix)]
+use crate::pane_reader_runtime::PaneReaderRuntime;
 use crate::pane_transcript::SharedPaneTranscript;
 use crate::passthrough_replay::{append_to_log, SharedPassthroughReplayLog};
+
+struct PaneOutputReaderSpawn {
+    session_name: rmux_proto::SessionName,
+    pane_id: PaneId,
+    pane_master: PtyMaster,
+    transcript: SharedPaneTranscript,
+    pane_output: PaneOutputSender,
+    generation: Option<u64>,
+    pane_alert_callback: Option<PaneAlertCallback>,
+    pane_exit_callback: Option<PaneExitCallback>,
+    #[cfg(unix)]
+    runtime: PaneReaderRuntime,
+    replay_log: Option<SharedPassthroughReplayLog>,
+}
 
 #[allow(clippy::too_many_arguments)]
 #[cfg(unix)]
@@ -26,9 +42,39 @@ pub(crate) fn spawn_pane_output_reader(
     generation: Option<u64>,
     pane_alert_callback: Option<PaneAlertCallback>,
     pane_exit_callback: Option<PaneExitCallback>,
+    runtime: PaneReaderRuntime,
     replay_log: Option<SharedPassthroughReplayLog>,
 ) {
-    tokio::spawn(async move {
+    let spawn = PaneOutputReaderSpawn {
+        session_name,
+        pane_id,
+        pane_master,
+        transcript,
+        pane_output,
+        generation,
+        pane_alert_callback,
+        pane_exit_callback,
+        runtime,
+        replay_log,
+    };
+    spawn_async_pane_output_reader(spawn);
+}
+
+#[cfg(unix)]
+fn spawn_async_pane_output_reader(spawn: PaneOutputReaderSpawn) {
+    let PaneOutputReaderSpawn {
+        session_name,
+        pane_id,
+        pane_master,
+        transcript,
+        pane_output,
+        generation,
+        pane_alert_callback,
+        pane_exit_callback,
+        runtime,
+        replay_log,
+    } = spawn;
+    let task = async move {
         if let Err(error) = read_pane_output(
             pane_master,
             session_name.clone(),
@@ -48,7 +94,8 @@ pub(crate) fn spawn_pane_output_reader(
                 "pane output reader stopped: {error}"
             );
         }
-    });
+    };
+    runtime.spawn(task);
 }
 
 #[cfg(windows)]
@@ -98,37 +145,17 @@ pub(crate) fn spawn_pane_output_reader(
     pane_exit_callback: Option<PaneExitCallback>,
     replay_log: Option<SharedPassthroughReplayLog>,
 ) {
-    let thread_name = format!("rmux-pane-reader-{}", pane_id.as_u32());
-    let session_for_log = session_name.clone();
-    if let Err(error) = std::thread::Builder::new()
-        .name(thread_name.clone())
-        .spawn(move || {
-            if let Err(error) = read_pane_output_blocking(
-                pane_master,
-                session_name.clone(),
-                pane_id,
-                transcript,
-                pane_output,
-                generation,
-                pane_alert_callback,
-                pane_exit_callback,
-                replay_log,
-            ) {
-                warn!(
-                    session = %session_name,
-                    pane_id = pane_id.as_u32(),
-                    "pane output reader stopped: {error}"
-                );
-            }
-        })
-    {
-        warn!(
-            session = %session_for_log,
-            pane_id = pane_id.as_u32(),
-            thread = %thread_name,
-            "failed to spawn pane output reader: {error}"
-        );
-    }
+    spawn_blocking_pane_output_reader_inner(
+        session_name,
+        pane_id,
+        pane_master,
+        transcript,
+        pane_output,
+        generation,
+        pane_alert_callback,
+        pane_exit_callback,
+        replay_log,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -146,10 +173,20 @@ async fn read_pane_output(
 ) -> io::Result<()> {
     let (pane_reader, reply_writer) = open_pane_writer(pane_master)?;
     let mut buffer = [0_u8; READ_BUFFER_SIZE];
+    let mut readiness = PaneReadinessState::default();
 
     loop {
-        let bytes_read = read_from_pane(&pane_reader, &mut buffer).await?;
+        let bytes_read = read_from_pane(&pane_reader, &mut readiness, &mut buffer).await?;
         if bytes_read == 0 {
+            if readiness.startup_eio_exhausted() {
+                warn!(
+                    session = %session_name,
+                    pane_id = pane_id.as_u32(),
+                    generation = ?generation,
+                    startup_eio_reads = readiness.startup_eio_reads(),
+                    "pane PTY reader exhausted startup EIO retries before first output"
+                );
+            }
             let _ = pane_output.send_for_generation(generation, Vec::new());
             if let Some(callback) = &pane_exit_callback {
                 callback(PaneExitEvent {
@@ -303,20 +340,68 @@ fn write_parser_replies_to_pane_blocking(pane_writer: &PtyIo, replies: Vec<u8>) 
     pane_writer.write_all(&replies)
 }
 
+#[allow(clippy::too_many_arguments)]
+#[cfg(windows)]
+fn spawn_blocking_pane_output_reader_inner(
+    session_name: rmux_proto::SessionName,
+    pane_id: PaneId,
+    pane_master: PtyMaster,
+    transcript: SharedPaneTranscript,
+    pane_output: PaneOutputSender,
+    generation: Option<u64>,
+    pane_alert_callback: Option<PaneAlertCallback>,
+    pane_exit_callback: Option<PaneExitCallback>,
+    replay_log: Option<SharedPassthroughReplayLog>,
+) {
+    let thread_name = format!("rmux-pane-reader-{}", pane_id.as_u32());
+    let session_for_log = session_name.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name(thread_name.clone())
+        .spawn(move || {
+            if let Err(error) = read_pane_output_blocking(
+                pane_master,
+                session_name.clone(),
+                pane_id,
+                transcript,
+                pane_output,
+                generation,
+                pane_alert_callback,
+                pane_exit_callback,
+                replay_log,
+            ) {
+                warn!(
+                    session = %session_name,
+                    pane_id = pane_id.as_u32(),
+                    "pane output reader stopped: {error}"
+                );
+            }
+        })
+    {
+        warn!(
+            session = %session_for_log,
+            pane_id = pane_id.as_u32(),
+            thread = %thread_name,
+            "failed to spawn pane output reader: {error}"
+        );
+    }
+}
+
 #[cfg(all(test, unix))]
 mod unix_tests {
     use std::error::Error;
     use std::fs;
+    use std::io;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use rmux_core::PaneId;
+    use rmux_core::{GridRenderOptions, PaneId, ScreenCaptureRange};
     use rmux_proto::{SessionName, TerminalSize};
     use rmux_pty::{ChildCommand, TerminalSize as PtyTerminalSize};
 
     use super::spawn_pane_output_reader;
     use crate::pane_io::pane_output_channel;
+    use crate::pane_reader_runtime::PaneReaderRuntime;
     use crate::pane_transcript::PaneTranscript;
 
     #[tokio::test]
@@ -356,6 +441,7 @@ finally:
             None,
             None,
             None,
+            PaneReaderRuntime::current().expect("test runtime is active"),
             None,
         );
 
@@ -364,6 +450,62 @@ finally:
         let _ = fs::remove_file(&output);
 
         assert_eq!(contents, b"\x1b[?1;2c");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn async_output_reader_uses_server_runtime_when_spawned_from_temporary_runtime(
+    ) -> Result<(), Box<dyn Error>> {
+        let mut spawned = ChildCommand::new("sh")
+            .size(PtyTerminalSize::new(80, 24))
+            .spawn()?;
+        let output_reader = spawned.master().try_clone()?;
+        let writer = spawned.master().try_clone()?;
+        let transcript = PaneTranscript::shared(2_000, TerminalSize { cols: 80, rows: 24 });
+        let pane_output = pane_output_channel();
+        let server_runtime = tokio::runtime::Handle::current();
+        let transcript_for_assertion = transcript.clone();
+
+        std::thread::spawn(move || -> Result<(), String> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            runtime.block_on(async move {
+                spawn_pane_output_reader(
+                    SessionName::new("temporary-runtime").expect("valid session name"),
+                    PaneId::new(1),
+                    output_reader,
+                    transcript,
+                    pane_output,
+                    None,
+                    None,
+                    None,
+                    PaneReaderRuntime::from_handle(server_runtime),
+                    None,
+                );
+            });
+            Ok(())
+        })
+        .join()
+        .map_err(|_| "temporary runtime thread panicked")?
+        .map_err(io::Error::other)?;
+
+        writer.write_all(b"printf RMUX_SERVER_RUNTIME_OK\\n")?;
+        let captured = wait_for_transcript(
+            &transcript_for_assertion,
+            "RMUX_SERVER_RUNTIME_OK",
+            Duration::from_secs(4),
+        )
+        .await;
+
+        spawned.child().terminate_forcefully()?;
+        let _ = spawned.child_mut().wait();
+
+        assert!(
+            captured.contains("RMUX_SERVER_RUNTIME_OK"),
+            "expected marker in transcript, got {captured:?}"
+        );
         Ok(())
     }
 
@@ -403,6 +545,29 @@ finally:
                 }
             }
         }
+    }
+
+    async fn wait_for_transcript(
+        transcript: &crate::pane_transcript::SharedPaneTranscript,
+        needle: &str,
+        timeout: Duration,
+    ) -> String {
+        let deadline = Instant::now() + timeout;
+        let mut captured = String::new();
+        while Instant::now() < deadline {
+            captured = String::from_utf8_lossy(
+                &transcript
+                    .lock()
+                    .expect("pane transcript mutex must not be poisoned")
+                    .capture_main(ScreenCaptureRange::default(), GridRenderOptions::default()),
+            )
+            .into_owned();
+            if captured.contains(needle) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        captured
     }
 }
 

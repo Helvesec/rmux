@@ -402,7 +402,7 @@ async fn switch_and_detach_require_an_attached_client_before_any_session_lookup(
     assert_eq!(
         switch_response,
         Response::Error(rmux_proto::ErrorResponse {
-            error: RmuxError::Server("switch-client requires an attached client".to_owned()),
+            error: RmuxError::Message("no current client".to_owned()),
         })
     );
 
@@ -417,7 +417,7 @@ async fn switch_and_detach_require_an_attached_client_before_any_session_lookup(
     assert_eq!(
         missing_switch_response,
         Response::Error(rmux_proto::ErrorResponse {
-            error: RmuxError::Server("switch-client requires an attached client".to_owned()),
+            error: RmuxError::Message("no current client".to_owned()),
         })
     );
 

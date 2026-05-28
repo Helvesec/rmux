@@ -177,7 +177,7 @@ pub(crate) fn parse_request_from_parts(
         "new-window" => parse_new_window(args, sessions, find_context),
         "kill-window" => parse_kill_window(args, sessions, find_context),
         "list-windows" => parse_list_windows(args),
-        "list-panes" => parse_list_panes(args, sessions),
+        "list-panes" => parse_list_panes(args, sessions, find_context),
         "send-keys" => parse_send_keys(args),
         "bind-key" => parse_bind_key(args),
         "unbind-key" => parse_unbind_key(args),

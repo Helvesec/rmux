@@ -16,7 +16,7 @@ fn option_store_starts_without_explicit_overrides_but_resolves_defaults() {
     );
     assert_eq!(
         store.resolve_for_window(&session_name("alpha"), 0, OptionName::AutomaticRenameFormat),
-        Some("#{?pane_in_mode,[rmux],#{pane_current_command}}#{?pane_dead,[dead],}")
+        Some("#{?pane_in_mode,[tmux],#{pane_current_command}}#{?pane_dead,[dead],}")
     );
 }
 
@@ -151,25 +151,23 @@ fn append_to_non_appendable_options_is_rejected_without_creating_overrides() {
 }
 
 #[test]
-fn allow_passthrough_rejects_all_until_all_pane_routing_exists() {
+fn allow_passthrough_preserves_all_for_tmux_compatibility() {
     let mut store = OptionStore::new();
+    let alpha = session_name("alpha");
 
-    let error = store
+    store
         .set(
             ScopeSelector::Global,
             OptionName::AllowPassthrough,
             "all".to_owned(),
             SetOptionMode::Replace,
         )
-        .expect_err("all-pane passthrough is not implemented");
+        .expect("tmux-compatible all value is accepted");
 
     assert_eq!(
-        error,
-        rmux_proto::RmuxError::InvalidSetOption(
-            "allow-passthrough expects one of: off, on".to_owned()
-        )
+        store.resolve_for_window(&alpha, 0, OptionName::AllowPassthrough),
+        Some("all")
     );
-    assert!(store.is_empty());
 }
 
 #[test]

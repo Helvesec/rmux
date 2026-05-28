@@ -1,17 +1,22 @@
 use std::path::Path;
 
+#[path = "config_commands/hooks.rs"]
+mod hooks;
 #[path = "config_commands/options.rs"]
 mod options;
 
-use rmux_proto::{HookLifecycle, ScopeSelector, SetEnvironmentMode, Target};
+use rmux_client::connect;
+use rmux_proto::{ErrorResponse, Response, RmuxError, ScopeSelector, SetEnvironmentMode};
 
 use crate::cli::{
-    resolve_current_session_target, run_command, run_payload_command_resolved, ExitFailure,
+    expect_command_output, expect_command_success, resolve_current_session_target, run_command,
+    run_payload_command_resolved, write_command_output, ExitFailure,
 };
 use crate::cli_args::{
-    build_scope, SetEnvironmentArgs, SetHookArgs, SetOptionArgs, SetOptionCommandKind,
-    ShowEnvironmentArgs, ShowHooksArgs, ShowOptionsArgs, ShowOptionsCommandKind,
+    build_scope, SetEnvironmentArgs, SetOptionArgs, SetOptionCommandKind, ShowEnvironmentArgs,
+    ShowOptionsArgs, ShowOptionsCommandKind,
 };
+pub(crate) use hooks::{run_set_hook, run_show_hooks};
 use options::{resolve_set_option_args, resolve_show_options_scope};
 
 pub(crate) fn run_set_option(
@@ -19,10 +24,17 @@ pub(crate) fn run_set_option(
     args: SetOptionArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    let request = resolve_set_option_args(command, args)?;
+    let quiet = args.quiet;
+    let mut connection = connect(socket_path)
+        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let request = match resolve_set_option_args(&mut connection, command, args) {
+        Ok(request) => request,
+        Err(error) if quiet && quiet_option_failure(&error) => return Ok(0),
+        Err(error) => return Err(error),
+    };
 
-    run_command(socket_path, command.command_name(), move |connection| {
-        connection.set_option_by_name(
+    let response = connection
+        .set_option_by_name(
             request.scope,
             request.option,
             request.value,
@@ -31,7 +43,14 @@ pub(crate) fn run_set_option(
             request.unset,
             request.unset_pane_overrides,
         )
-    })
+        .map_err(ExitFailure::from_client)?;
+    match response {
+        response if quiet && quiet_option_response(&response) => Ok(0),
+        response => {
+            expect_command_success(response, command.command_name())?;
+            Ok(0)
+        }
+    }
 }
 
 pub(crate) fn run_set_environment(
@@ -64,15 +83,53 @@ pub(crate) fn run_show_options(
     args: ShowOptionsArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    let scope = resolve_show_options_scope(command, &args)?;
     let command_name = command.command_name();
+    let quiet = args.quiet;
+    let scope = match resolve_show_options_scope(command, &args) {
+        Ok(scope) => scope,
+        Err(error) if quiet && quiet_option_failure(&error) => return Ok(0),
+        Err(error) => return Err(error),
+    };
 
-    run_payload_command_resolved(socket_path, command_name, move |connection| {
-        let scope = scope.resolve(connection, command_name)?;
-        connection
-            .show_options(scope, args.name, args.value_only)
-            .map_err(ExitFailure::from_client)
-    })
+    let mut connection = connect(socket_path)
+        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let scope = match scope.resolve(&mut connection, command_name) {
+        Ok(scope) => scope,
+        Err(error) if quiet && quiet_option_failure(&error) => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let include_inherited = args.include_inherited;
+    let response = connection
+        .show_options(scope, args.name, args.value_only, include_inherited)
+        .map_err(ExitFailure::from_client)?;
+    match response {
+        response if quiet && quiet_option_response(&response) => Ok(0),
+        response => {
+            let output = expect_command_output(&response, command_name)?;
+            write_command_output(output)?;
+            Ok(0)
+        }
+    }
+}
+
+fn quiet_option_failure(error: &ExitFailure) -> bool {
+    let message = error.message();
+    message.starts_with("invalid option: ")
+        || message.starts_with("server error: unknown option: ")
+        || message.starts_with("server error: ambiguous option: ")
+}
+
+fn quiet_option_response(response: &Response) -> bool {
+    matches!(
+        response,
+        Response::Error(ErrorResponse {
+            error: RmuxError::Server(message),
+        }) if option_lookup_error(message)
+    )
+}
+
+fn option_lookup_error(message: &str) -> bool {
+    message.starts_with("unknown option: ") || message.starts_with("ambiguous option: ")
 }
 
 pub(crate) fn run_show_environment(
@@ -83,48 +140,6 @@ pub(crate) fn run_show_environment(
         let scope = resolve_show_environment_scope(connection, args.global, args.target)?;
         connection
             .show_environment(scope, args.name, args.hidden, args.shell_format)
-            .map_err(ExitFailure::from_client)
-    })
-}
-
-pub(crate) fn run_set_hook(args: SetHookArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
-    let scope = resolve_hook_scope("set-hook", args.global, args.window, args.pane, args.target)?;
-    rmux_core::validate_hook_registration(args.hook.hook, &scope)
-        .map_err(|error| ExitFailure::new(1, error.to_string()))?;
-
-    run_command(socket_path, "set-hook", move |connection| {
-        connection.set_hook_mutation(
-            scope,
-            args.hook.hook,
-            args.command,
-            HookLifecycle::Persistent,
-            args.append,
-            args.unset,
-            args.run_immediately,
-            args.hook.index,
-        )
-    })
-}
-
-pub(crate) fn run_show_hooks(args: ShowHooksArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
-    let scope = resolve_show_hooks_scope(args.global, args.window, args.pane, args.target)?;
-    let hook = args.hook;
-    let window = args.window;
-    let pane = args.pane;
-
-    run_payload_command_resolved(socket_path, "show-hooks", move |connection| {
-        let scope = match scope {
-            ShowHooksScope::Resolved(scope) => scope,
-            ShowHooksScope::CurrentSession => {
-                ScopeSelector::Session(resolve_current_session_target(connection)?)
-            }
-        };
-        if let Some(hook) = hook {
-            rmux_core::validate_hook_scope(hook, &scope)
-                .map_err(|error| ExitFailure::new(1, error.to_string()))?;
-        }
-        connection
-            .show_hooks(scope, window, pane, hook)
             .map_err(ExitFailure::from_client)
     })
 }
@@ -172,103 +187,24 @@ fn resolve_set_environment_mode(
     Ok(mode)
 }
 
-fn resolve_hook_scope(
-    command: &str,
-    global: bool,
-    window: bool,
-    pane: bool,
-    target: Option<Target>,
-) -> Result<ScopeSelector, ExitFailure> {
-    if window && pane {
-        return Err(ExitFailure::new(
-            1,
-            format!("{command} does not support combining -w and -p"),
-        ));
-    }
-
-    if global {
-        reject_target(command, target.as_ref(), "-g")?;
-        return Ok(ScopeSelector::Global);
-    }
-
-    match (window, pane, target) {
-        (true, false, Some(Target::Session(session_name))) => Ok(ScopeSelector::Window(
-            rmux_proto::WindowTarget::new(session_name),
-        )),
-        (true, false, Some(Target::Window(target))) => Ok(ScopeSelector::Window(target)),
-        (true, false, Some(Target::Pane(target))) => Ok(ScopeSelector::Window(
-            rmux_proto::WindowTarget::with_window(
-                target.session_name().clone(),
-                target.window_index(),
-            ),
-        )),
-        (true, false, None) => Err(ExitFailure::new(
-            1,
-            format!("{command} -w requires a target"),
-        )),
-        (false, true, Some(Target::Pane(target))) => Ok(ScopeSelector::Pane(target)),
-        (false, true, Some(_)) => Err(ExitFailure::new(
-            1,
-            format!("{command} -p requires a pane target"),
-        )),
-        (false, true, None) => Err(ExitFailure::new(
-            1,
-            format!("{command} -p requires a target"),
-        )),
-        (false, false, Some(Target::Session(session_name))) => {
-            Ok(ScopeSelector::Session(session_name))
-        }
-        (false, false, Some(Target::Window(target))) => Ok(ScopeSelector::Window(target)),
-        (false, false, Some(Target::Pane(target))) => Ok(ScopeSelector::Pane(target)),
-        (false, false, None) => Err(ExitFailure::new(
-            1,
-            format!("{command} requires -g or a target"),
-        )),
-        (true, true, _) => unreachable!("validated conflicting hook scope flags"),
-    }
-}
-
-fn resolve_show_hooks_scope(
-    global: bool,
-    window: bool,
-    pane: bool,
-    target: Option<Target>,
-) -> Result<ShowHooksScope, ExitFailure> {
-    if global {
-        reject_target("show-hooks", target.as_ref(), "-g")?;
-        return Ok(ShowHooksScope::Resolved(ScopeSelector::Global));
-    }
-
-    if !window && !pane && target.is_none() {
-        return Ok(ShowHooksScope::CurrentSession);
-    }
-
-    resolve_hook_scope("show-hooks", false, window, pane, target).map(ShowHooksScope::Resolved)
-}
-
-enum ShowHooksScope {
-    Resolved(ScopeSelector),
-    CurrentSession,
-}
-
-fn reject_target(command: &str, target: Option<&Target>, flag: &str) -> Result<(), ExitFailure> {
-    if target.is_some() {
-        Err(ExitFailure::new(
-            1,
-            format!("{command} {flag} does not accept a target"),
-        ))
-    } else {
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{options::ShowOptionsScope, resolve_set_option_args, resolve_show_options_scope};
-    use crate::cli_args::{
-        SetOptionArgs, SetOptionCommandKind, ShowOptionsArgs, ShowOptionsCommandKind,
+    use super::{
+        options::{
+            resolve_set_option_args_with_exact_targets as resolve_set_option_args,
+            ShowOptionsScope, UnresolvedShowOptionsScope,
+        },
+        resolve_show_options_scope,
     };
-    use rmux_proto::{OptionScopeSelector, PaneTarget, SessionName, Target, WindowTarget};
+    use crate::cli_args::{
+        parse_target_spec, SetOptionArgs, SetOptionCommandKind, ShowOptionsArgs,
+        ShowOptionsCommandKind, TargetSpec,
+    };
+    use rmux_proto::{OptionScopeSelector, SessionName, WindowTarget};
+
+    fn target_spec(value: &str) -> TargetSpec {
+        parse_target_spec(value).expect("valid target spec")
+    }
 
     fn global_set_args(option: &str, value: &str) -> SetOptionArgs {
         SetOptionArgs {
@@ -276,6 +212,7 @@ mod tests {
             server: false,
             window: false,
             pane: false,
+            quiet: false,
             append: false,
             only_if_unset: false,
             unset: false,
@@ -288,6 +225,7 @@ mod tests {
 
     fn show_global_args(name: Option<&str>) -> ShowOptionsArgs {
         ShowOptionsArgs {
+            include_inherited: false,
             global: true,
             server: false,
             window: false,
@@ -310,11 +248,12 @@ mod tests {
                 server: false,
                 window: false,
                 pane: false,
+                quiet: false,
                 append: false,
                 only_if_unset: false,
                 unset: false,
                 unset_pane_overrides: false,
-                target: Some(Target::Window(window.clone())),
+                target: Some(target_spec("alpha:0")),
                 option: "pane-border-style".to_owned(),
                 value: Some("fg=colour1".to_owned()),
             },
@@ -394,11 +333,12 @@ mod tests {
                 server: false,
                 window: false,
                 pane: false,
+                quiet: false,
                 append: false,
                 only_if_unset: false,
                 unset: false,
                 unset_pane_overrides: false,
-                target: Some(Target::Session(session.clone())),
+                target: Some(target_spec("alpha")),
                 option: "pane-border-style".to_owned(),
                 value: Some("fg=colour1".to_owned()),
             },
@@ -421,11 +361,12 @@ mod tests {
                 server: false,
                 window: false,
                 pane: false,
+                quiet: false,
                 append: false,
                 only_if_unset: false,
                 unset: false,
                 unset_pane_overrides: false,
-                target: Some(Target::Session(session.clone())),
+                target: Some(target_spec("alpha")),
                 option: "remain-on-exit".to_owned(),
                 value: Some("on".to_owned()),
             },
@@ -441,7 +382,6 @@ mod tests {
     #[test]
     fn set_window_option_uses_window_scope_for_pane_targets() {
         let session = SessionName::new("alpha").expect("valid session");
-        let pane = PaneTarget::with_window(session.clone(), 0, 1);
         let resolved = resolve_set_option_args(
             SetOptionCommandKind::SetWindowOption,
             SetOptionArgs {
@@ -449,11 +389,12 @@ mod tests {
                 server: false,
                 window: false,
                 pane: false,
+                quiet: false,
                 append: false,
                 only_if_unset: false,
                 unset: false,
                 unset_pane_overrides: false,
-                target: Some(Target::Pane(pane)),
+                target: Some(target_spec("alpha:0.1")),
                 option: "pane-border-style".to_owned(),
                 value: Some("fg=colour1".to_owned()),
             },
@@ -507,18 +448,17 @@ mod tests {
 
     #[test]
     fn show_window_options_accepts_window_targets_without_server_scope() {
-        let session = SessionName::new("alpha").expect("valid session");
-        let window = WindowTarget::with_window(session, 0);
         let scope = resolve_show_options_scope(
             ShowOptionsCommandKind::ShowWindowOptions,
             &ShowOptionsArgs {
+                include_inherited: false,
                 global: false,
                 server: false,
                 window: false,
                 pane: false,
                 quiet: false,
                 value_only: true,
-                target: Some(Target::Window(window.clone())),
+                target: Some(target_spec("alpha:0")),
                 name: Some("pane-border-style".to_owned()),
             },
         )
@@ -526,7 +466,10 @@ mod tests {
 
         assert_eq!(
             scope,
-            ShowOptionsScope::Resolved(OptionScopeSelector::Window(window))
+            ShowOptionsScope::Unresolved {
+                target: target_spec("alpha:0"),
+                kind: UnresolvedShowOptionsScope::Window,
+            }
         );
     }
 
@@ -535,6 +478,7 @@ mod tests {
         let scope = resolve_show_options_scope(
             ShowOptionsCommandKind::ShowWindowOptions,
             &ShowOptionsArgs {
+                include_inherited: false,
                 global: true,
                 server: false,
                 window: false,
@@ -558,15 +502,14 @@ mod tests {
         let scope = resolve_show_options_scope(
             ShowOptionsCommandKind::ShowOptions,
             &ShowOptionsArgs {
+                include_inherited: false,
                 global: true,
                 server: true,
                 window: false,
                 pane: false,
                 quiet: false,
                 value_only: true,
-                target: Some(Target::Session(
-                    SessionName::new("missing").expect("valid session"),
-                )),
+                target: Some(target_spec("missing")),
                 name: Some("message-limit".to_owned()),
             },
         )
@@ -583,15 +526,14 @@ mod tests {
         let scope = resolve_show_options_scope(
             ShowOptionsCommandKind::ShowWindowOptions,
             &ShowOptionsArgs {
+                include_inherited: false,
                 global: true,
                 server: false,
                 window: false,
                 pane: false,
                 quiet: false,
                 value_only: true,
-                target: Some(Target::Session(
-                    SessionName::new("missing").expect("valid session"),
-                )),
+                target: Some(target_spec("missing")),
                 name: Some("pane-border-style".to_owned()),
             },
         )
@@ -612,6 +554,7 @@ mod tests {
                 server: false,
                 window: false,
                 pane: false,
+                quiet: false,
                 append: false,
                 only_if_unset: false,
                 unset: false,

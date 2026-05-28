@@ -477,53 +477,28 @@ impl<'a> RuntimeFormatContext<'a> {
         None
     }
 
-    #[cfg(unix)]
     fn pane_exit_metadata(&self) -> Option<crate::pane_terminals::PaneExitMetadata> {
         let session = self.session?;
         let pane = self.pane?;
         self.state?.pane_exit_metadata(session.name(), pane.id())
     }
 
-    #[cfg(windows)]
-    fn pane_dead(&self) -> bool {
-        false
-    }
-
-    #[cfg(unix)]
     fn pane_dead(&self) -> bool {
         self.pane_exit_metadata().is_some()
     }
 
-    #[cfg(windows)]
-    fn pane_dead_signal(&self) -> Option<String> {
-        Some(String::new())
-    }
-
-    #[cfg(unix)]
     fn pane_dead_signal(&self) -> Option<String> {
         self.pane_exit_metadata()
             .and_then(|metadata| metadata.signal.map(|signal| signal.to_string()))
             .or_else(|| Some(String::new()))
     }
 
-    #[cfg(windows)]
-    fn pane_dead_status(&self) -> Option<String> {
-        Some(String::new())
-    }
-
-    #[cfg(unix)]
     fn pane_dead_status(&self) -> Option<String> {
         self.pane_exit_metadata()
             .and_then(|metadata| metadata.status.map(|status| status.to_string()))
             .or_else(|| Some(String::new()))
     }
 
-    #[cfg(windows)]
-    fn pane_dead_time(&self) -> Option<String> {
-        Some(String::new())
-    }
-
-    #[cfg(unix)]
     fn pane_dead_time(&self) -> Option<String> {
         self.pane_exit_metadata()
             .map(|metadata| metadata.time.to_string())

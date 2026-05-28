@@ -72,31 +72,66 @@ fn server_access_read_only_parses_with_user() {
 }
 
 #[test]
-fn server_access_rejects_conflicting_add_and_deny_flags() {
-    let error = parse_args(&["server-access", "-a", "-d", "alice"]).unwrap_err();
-    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+fn server_access_accepts_combined_add_and_deny_flags() {
+    let cli = parse_args(&["server-access", "-a", "-d", "alice"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::ServerAccess(args) => {
+            assert!(args.add);
+            assert!(args.deny);
+            assert_eq!(args.user.as_deref(), Some("alice"));
+        }
+        _ => panic!("expected ServerAccess command"),
+    }
 }
 
 #[test]
-fn server_access_rejects_conflicting_read_and_write_flags() {
-    let error = parse_args(&["server-access", "-r", "-w", "alice"]).unwrap_err();
-    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+fn server_access_accepts_combined_read_and_write_flags() {
+    let cli = parse_args(&["server-access", "-r", "-w", "alice"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::ServerAccess(args) => {
+            assert!(args.read_only);
+            assert!(args.write);
+            assert_eq!(args.user.as_deref(), Some("alice"));
+        }
+        _ => panic!("expected ServerAccess command"),
+    }
 }
 
 #[test]
-fn server_access_rejects_user_argument_with_list_flag() {
-    let error = parse_args(&["server-access", "-l", "alice"]).unwrap_err();
-    assert_eq!(error.kind(), clap::error::ErrorKind::TooManyValues);
+fn server_access_list_accepts_ignored_user_argument() {
+    let cli = parse_args(&["server-access", "-l", "alice"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::ServerAccess(args) => {
+            assert!(args.list);
+            assert_eq!(args.user.as_deref(), Some("alice"));
+        }
+        _ => panic!("expected ServerAccess command"),
+    }
 }
 
 #[test]
-fn server_access_requires_user_without_list_flag() {
-    let error = parse_args(&["server-access", "-r"]).unwrap_err();
-    assert_eq!(
-        error.kind(),
-        clap::error::ErrorKind::MissingRequiredArgument
-    );
-    assert!(error.to_string().contains("missing user argument"));
+fn server_access_missing_user_is_a_runtime_error() {
+    let cli = parse_args(&["server-access", "-r"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::ServerAccess(args) => {
+            assert!(args.read_only);
+            assert_eq!(args.user, None);
+        }
+        _ => panic!("expected ServerAccess command"),
+    }
+}
+
+#[test]
+fn server_access_rejects_unknown_target_flag() {
+    let error = parse_args(&["server-access", "-t", "%0", "-l"]).unwrap_err();
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    assert!(error
+        .to_string()
+        .contains("command server-access: unknown flag -t"));
 }
 
 #[test]
@@ -217,13 +252,29 @@ fn server_access_bare_user_parses() {
 }
 
 #[test]
-fn server_access_rejects_list_with_add() {
-    let error = parse_args(&["server-access", "-l", "-a", "alice"]).unwrap_err();
-    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+fn server_access_list_accepts_add_flag() {
+    let cli = parse_args(&["server-access", "-l", "-a", "alice"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::ServerAccess(args) => {
+            assert!(args.list);
+            assert!(args.add);
+            assert_eq!(args.user.as_deref(), Some("alice"));
+        }
+        _ => panic!("expected ServerAccess command"),
+    }
 }
 
 #[test]
-fn server_access_rejects_list_with_deny() {
-    let error = parse_args(&["server-access", "-l", "-d"]).unwrap_err();
-    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+fn server_access_list_accepts_deny_flag_without_user() {
+    let cli = parse_args(&["server-access", "-l", "-d"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::ServerAccess(args) => {
+            assert!(args.list);
+            assert!(args.deny);
+            assert_eq!(args.user, None);
+        }
+        _ => panic!("expected ServerAccess command"),
+    }
 }

@@ -54,9 +54,11 @@ pub(crate) fn encode_key(
     }
 
     if (pane_mode & mode::MODE_KEYS_EXTENDED_2) != 0 {
-        input_key_extended(key, format)
+        input_key_extended(key, format).or_else(|| input_key_vt10x(pane_mode, key))
     } else if (pane_mode & mode::MODE_KEYS_EXTENDED) != 0 {
-        input_key_mode1(key).or_else(|| input_key_extended(key, format))
+        input_key_mode1(key)
+            .or_else(|| input_key_extended(key, format))
+            .or_else(|| input_key_vt10x(pane_mode, key))
     } else {
         input_key_vt10x(pane_mode, key)
     }
@@ -232,21 +234,11 @@ fn key_from_modified_cursor_terminator(terminator: u8) -> Option<KeyCode> {
 }
 
 fn input_key_extended(key: KeyCode, format: ExtendedKeyFormat) -> Option<Vec<u8>> {
-    let mut modifiers = key & (KEYC_SHIFT | KEYC_META | KEYC_CTRL);
-    if (key & (KEYC_META | KEYC_IMPLIED_META)) != 0 {
-        modifiers |= KEYC_META;
+    if let Some(sequence) = input_key_modified_cursor(key) {
+        return Some(sequence);
     }
 
-    let modifier = match modifiers {
-        value if value == KEYC_SHIFT => 2,
-        value if value == KEYC_META => 3,
-        value if value == (KEYC_SHIFT | KEYC_META) => 4,
-        value if value == KEYC_CTRL => 5,
-        value if value == (KEYC_SHIFT | KEYC_CTRL) => 6,
-        value if value == (KEYC_META | KEYC_CTRL) => 7,
-        value if value == (KEYC_SHIFT | KEYC_META | KEYC_CTRL) => 8,
-        _ => return None,
-    };
+    let modifier = xterm_modifier_parameter(key)?;
     let key = key & KEYC_MASK_KEY;
 
     Some(match format {
@@ -255,10 +247,50 @@ fn input_key_extended(key: KeyCode, format: ExtendedKeyFormat) -> Option<Vec<u8>
     })
 }
 
+fn input_key_modified_cursor(key: KeyCode) -> Option<Vec<u8>> {
+    let modifier = xterm_modifier_parameter(key)?;
+    let base = key & !(KEYC_SHIFT | KEYC_META | KEYC_CTRL | KEYC_IMPLIED_META);
+    let final_byte = if base == (parse_named_key("Up") & !KEYC_IMPLIED_META) {
+        b'A'
+    } else if base == (parse_named_key("Down") & !KEYC_IMPLIED_META) {
+        b'B'
+    } else if base == (parse_named_key("Right") & !KEYC_IMPLIED_META) {
+        b'C'
+    } else if base == (parse_named_key("Left") & !KEYC_IMPLIED_META) {
+        b'D'
+    } else if base == (parse_named_key("End") & !KEYC_IMPLIED_META) {
+        b'F'
+    } else if base == (parse_named_key("Home") & !KEYC_IMPLIED_META) {
+        b'H'
+    } else {
+        return None;
+    };
+
+    Some(format!("\x1b[1;{}{}", modifier, char::from(final_byte)).into_bytes())
+}
+
+fn xterm_modifier_parameter(key: KeyCode) -> Option<u8> {
+    let modifiers = key & (KEYC_SHIFT | KEYC_META | KEYC_CTRL);
+    match modifiers {
+        value if value == KEYC_SHIFT => Some(2),
+        value if value == KEYC_META => Some(3),
+        value if value == (KEYC_SHIFT | KEYC_META) => Some(4),
+        value if value == KEYC_CTRL => Some(5),
+        value if value == (KEYC_SHIFT | KEYC_CTRL) => Some(6),
+        value if value == (KEYC_META | KEYC_CTRL) => Some(7),
+        value if value == (KEYC_SHIFT | KEYC_META | KEYC_CTRL) => Some(8),
+        _ => None,
+    }
+}
+
 fn input_key_vt10x(pane_mode: u32, key: KeyCode) -> Option<Vec<u8>> {
-    let mut output = Vec::new();
     let mut key = key;
 
+    if let Some(sequence) = input_key_modified_cursor(key) {
+        return Some(sequence);
+    }
+
+    let mut output = Vec::new();
     if (key & KEYC_META) != 0 {
         output.push(0x1b);
     }

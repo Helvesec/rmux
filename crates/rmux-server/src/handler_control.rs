@@ -17,6 +17,9 @@ use crate::pane_io::PaneOutputSender;
 #[cfg(test)]
 use crate::server_access::current_owner_uid;
 
+#[path = "handler_control/session_attach.rs"]
+mod session_attach;
+
 #[derive(Debug, Default)]
 pub(super) struct ActiveControlState {
     next_id: u64,
@@ -309,12 +312,31 @@ impl RequestHandler {
         });
     }
 
+    pub(super) async fn exit_control_session(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        reason: Option<String>,
+    ) {
+        let mut active_control = self.active_control.lock().await;
+        active_control.by_pid.retain(|_, active| {
+            if active.session_name.as_ref() != Some(session_name) {
+                return true;
+            }
+            active.closing.store(true, Ordering::SeqCst);
+            active
+                .event_tx
+                .send(ControlServerEvent::Exit(reason.clone()))
+                .is_ok()
+        });
+    }
+
     pub(super) async fn refresh_all_control_sessions(&self) {
         let session_names = {
             let active_control = self.active_control.lock().await;
             active_control
                 .by_pid
                 .values()
+                .filter(|active| !active.closing.load(Ordering::SeqCst))
                 .filter_map(|active| active.session_name.clone())
                 .collect::<Vec<_>>()
         };
@@ -385,10 +407,13 @@ impl RequestHandler {
             | LifecycleEvent::ClientDetached { .. }
             | LifecycleEvent::SessionRenamed { .. }
             | LifecycleEvent::SessionCreated { .. }
-            | LifecycleEvent::SessionClosed { .. }
             | LifecycleEvent::SessionWindowChanged { .. }
             | LifecycleEvent::PasteBufferChanged { .. }
             | LifecycleEvent::PasteBufferDeleted { .. } => {
+                self.refresh_all_control_sessions().await;
+            }
+            LifecycleEvent::SessionClosed { session_name, .. } => {
+                self.exit_control_session(session_name, None).await;
                 self.refresh_all_control_sessions().await;
             }
             LifecycleEvent::ClientAttached { .. }

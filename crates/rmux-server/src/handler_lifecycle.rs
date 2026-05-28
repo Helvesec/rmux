@@ -175,6 +175,7 @@ impl RequestHandler {
         request: &Request,
         response: &Response,
         parsed_command: Option<&ParsedCommand>,
+        suppressed_success_hooks: &[HookName],
     ) {
         if hooks_disabled() {
             return;
@@ -205,6 +206,9 @@ impl RequestHandler {
         let Some(hook) = HookName::from_str(&hook_name) else {
             return;
         };
+        if suppressed_success_hooks.contains(&hook) {
+            return;
+        }
         self.run_built_in_hook_dispatch(
             requester_pid,
             hook,

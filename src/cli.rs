@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 mod capture_pane;
 #[path = "cli/client_commands.rs"]
 mod client_commands;
+#[path = "cli/client_environment.rs"]
+mod client_environment;
 #[path = "cli/command_inventory.rs"]
 mod command_inventory;
 #[path = "cli/command_runner.rs"]
@@ -19,6 +21,8 @@ mod diagnose;
 mod dispatch;
 #[path = "cli/error.rs"]
 mod error;
+#[path = "cli/format_print.rs"]
+mod format_print;
 #[path = "cli/key_commands.rs"]
 mod key_commands;
 #[path = "cli/pane_commands.rs"]
@@ -78,7 +82,7 @@ use target_resolution::{
 use terminal_size::{build_terminal_size, current_terminal_size};
 use top_level::{
     accept_compatibility_options, infer_client_utf8_from_env, top_level_parse_failure,
-    validate_top_level_invocation,
+    top_level_version_requested, validate_top_level_invocation,
 };
 pub(crate) fn run<I, T>(args: I) -> Result<i32, ExitFailure>
 where
@@ -88,6 +92,12 @@ where
     let args: Vec<OsString> = args.into_iter().map(Into::into).collect();
     if let Some(error) = top_level_parse_failure(args.get(1..).unwrap_or(&[])) {
         return Err(error);
+    }
+    if top_level_version_requested(args.get(1..).unwrap_or(&[])) {
+        return Err(ExitFailure::new_stdout(
+            0,
+            format!("rmux {}", env!("CARGO_PKG_VERSION")),
+        ));
     }
     if let Some(invocation) = diagnose::parse_invocation(args.get(1..).unwrap_or(&[]))? {
         return diagnose::run(invocation);
@@ -364,6 +374,8 @@ mod tests {
                 target: Some(parse_target_spec("alpha").expect("valid target")),
                 name: None,
                 detached: false,
+                format: None,
+                print_target: false,
                 start_directory: None,
                 environment: Vec::new(),
                 command: Vec::new(),

@@ -15,8 +15,8 @@ pub use session::{
 #[path = "response/server.rs"]
 mod server;
 pub use server::{
-    KillServerResponse, LockClientResponse, LockServerResponse, LockSessionResponse,
-    ServerAccessResponse,
+    DaemonStatusResponse, KillServerResponse, LockClientResponse, LockServerResponse,
+    LockSessionResponse, ServerAccessResponse, ShutdownIfIdleResponse,
 };
 
 #[path = "response/target.rs"]
@@ -250,6 +250,10 @@ pub enum Response {
     RenewSessionLease(RenewSessionLeaseResponse),
     /// Success payload for releasing an app-owned session lease.
     ReleaseSessionLease(ReleaseSessionLeaseResponse),
+    /// Success payload for internal daemon version and activity status.
+    DaemonStatus(DaemonStatusResponse),
+    /// Success payload for internal idle-only daemon shutdown.
+    ShutdownIfIdle(ShutdownIfIdleResponse),
 }
 
 impl Response {
@@ -350,6 +354,8 @@ impl Response {
             Self::UnlinkWindow(_) => "unlink-window",
             Self::ResolveTarget(_) => "resolve-target",
             Self::Handshake(_) => "handshake",
+            Self::DaemonStatus(_) => "daemon-status",
+            Self::ShutdownIfIdle(_) => "shutdown-if-idle",
         }
     }
 
@@ -396,7 +402,9 @@ impl Response {
             | Self::PaneBroadcastInput(_)
             | Self::CreateSessionLease(_)
             | Self::RenewSessionLease(_)
-            | Self::ReleaseSessionLease(_) => None,
+            | Self::ReleaseSessionLease(_)
+            | Self::DaemonStatus(_)
+            | Self::ShutdownIfIdle(_) => None,
             _ => None,
         }
     }

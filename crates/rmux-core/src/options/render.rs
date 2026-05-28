@@ -12,6 +12,24 @@ pub(super) fn render_show_line(name: &str, value: &str, value_only: bool) -> Str
     }
 }
 
+pub(super) fn render_known_show_line(
+    query: &OptionQuery,
+    name: &str,
+    value: &str,
+    value_only: bool,
+) -> String {
+    if !value_only
+        && value.is_empty()
+        && matches!(
+            query.value_type(),
+            OptionValueType::String | OptionValueType::Command
+        )
+    {
+        return format!("{name} ''");
+    }
+    render_show_line(name, value, value_only)
+}
+
 fn render_show_value(value: &str) -> String {
     if !show_value_needs_quotes(value) {
         return value.to_owned();

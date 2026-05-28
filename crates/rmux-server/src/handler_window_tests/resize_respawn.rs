@@ -204,6 +204,7 @@ async fn respawn_window_retains_surviving_pane_lifecycle_counters_and_redacts_en
             command: None,
             process_command: None,
             passthrough: false,
+            client_environment: None,
         }))
         .await;
     assert!(matches!(created, Response::NewSession(_)));

@@ -5,8 +5,6 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-#[cfg(any(all(test, unix), not(any(unix, windows))))]
-use std::thread;
 use std::time::Duration;
 #[cfg(any(all(test, unix), not(any(unix, windows))))]
 use std::time::Instant;
@@ -24,11 +22,12 @@ use rmux_sdk::bootstrap::startup_windows::{
     STARTUP_POLL_INTERVAL,
 };
 
-#[cfg(not(any(unix, windows)))]
-use crate::connect_or_absent;
+use crate::shell_quote::shell_quote_path;
 #[cfg(any(all(test, unix), not(any(unix, windows))))]
 use crate::ConnectResult;
 use crate::{ClientError, Connection};
+
+mod upgrade_restart;
 
 #[cfg(not(any(unix, windows)))]
 const AUTO_START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -185,14 +184,12 @@ fn ensure_server_running_unix(
         STARTUP_POLL_INTERVAL,
     ));
 
-    let mut connection = startup_outcome_into_connection(
+    let connection = startup_outcome_into_connection(
         outcome.map_err(|error| auto_start_error_from_startup(error, &binary_path, socket_path))?,
     )?;
-    if !config.loads_startup_config() {
-        probe_server_readiness(&mut connection).map_err(AutoStartError::Client)?;
-    }
 
-    Ok(connection)
+    let connection = probe_connected_server(connection, &config)?;
+    upgrade_restart::ensure_daemon_fresh_or_restart(connection, socket_path, &binary_path, &config)
 }
 
 #[cfg(unix)]
@@ -215,7 +212,7 @@ fn ensure_server_running_windows(
     let binary_path = rmux_binary_path().map_err(AutoStartError::BinaryPath)?;
     let launcher_binary_path = binary_path.clone();
     let launcher_socket_path = socket_path.to_path_buf();
-    let launcher_config = config;
+    let launcher_config = config.clone();
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -234,14 +231,34 @@ fn ensure_server_running_windows(
         STARTUP_POLL_INTERVAL,
     ));
 
-    startup_outcome_into_connection(
+    let connection = startup_outcome_into_connection(
         outcome.map_err(|error| auto_start_error_from_startup(error, &binary_path, socket_path))?,
-    )
+    )?;
+    upgrade_restart::ensure_daemon_fresh_or_restart(connection, socket_path, &binary_path, &config)
 }
 
 #[cfg(windows)]
 fn startup_outcome_into_connection(outcome: StartupOutcome) -> Result<Connection, AutoStartError> {
     Connection::new(outcome.into_stream()).map_err(AutoStartError::Client)
+}
+
+#[cfg(not(windows))]
+fn probe_connected_server(
+    mut connection: Connection,
+    config: &AutoStartConfig,
+) -> Result<Connection, AutoStartError> {
+    if !config.loads_startup_config() {
+        probe_server_readiness(&mut connection).map_err(AutoStartError::Client)?;
+    }
+    Ok(connection)
+}
+
+#[cfg(windows)]
+fn probe_connected_server(
+    connection: Connection,
+    _config: &AutoStartConfig,
+) -> Result<Connection, AutoStartError> {
+    Ok(connection)
 }
 
 #[cfg(unix)]
@@ -335,7 +352,7 @@ fn ensure_server_running_polling(
             socket_path,
             AUTO_START_TIMEOUT,
             POLL_INTERVAL,
-            || connect_or_absent(socket_path),
+            || crate::connect_or_absent(socket_path),
             || launch_hidden_daemon(socket_path, &config),
             |_| Ok(()),
         );
@@ -345,7 +362,7 @@ fn ensure_server_running_polling(
         socket_path,
         AUTO_START_TIMEOUT,
         POLL_INTERVAL,
-        || connect_or_absent(socket_path),
+        || crate::connect_or_absent(socket_path),
         || launch_hidden_daemon(socket_path, &config),
     )
 }
@@ -363,6 +380,13 @@ pub enum AutoStartError {
         path: PathBuf,
         /// The underlying process-spawn error.
         error: io::Error,
+    },
+    /// A running daemon speaks an incompatible protocol version.
+    IncompatibleDaemon {
+        /// The socket path hosting the incompatible daemon.
+        socket_path: PathBuf,
+        /// Human-readable protocol mismatch detail.
+        message: String,
     },
     /// The socket never became reachable before the readiness deadline.
     TimedOut {
@@ -387,6 +411,15 @@ impl fmt::Display for AutoStartError {
                     path.display()
                 )
             }
+            Self::IncompatibleDaemon {
+                socket_path,
+                message,
+            } => write!(
+                formatter,
+                "{message} on '{}'; detach existing clients, then run `rmux -S {} kill-server` before retrying",
+                socket_path.display(),
+                shell_quote_path(socket_path)
+            ),
             Self::TimedOut {
                 socket_path,
                 waited,
@@ -406,6 +439,7 @@ impl std::error::Error for AutoStartError {
             Self::Client(error) => Some(error),
             Self::BinaryPath(error) => Some(error),
             Self::Launch { error, .. } => Some(error),
+            Self::IncompatibleDaemon { .. } => None,
             Self::TimedOut { .. } => None,
         }
     }
@@ -488,12 +522,12 @@ where
 
     loop {
         match connect() {
-            Ok(ConnectResult::Connected(mut connection)) => match probe(&mut connection) {
+            Ok(crate::ConnectResult::Connected(mut connection)) => match probe(&mut connection) {
                 Ok(()) => return Ok(connection),
                 Err(error) if is_transient_connect_error(&error) => {}
                 Err(error) => return Err(AutoStartError::Client(error)),
             },
-            Ok(ConnectResult::Absent) => {}
+            Ok(crate::ConnectResult::Absent) => {}
             Err(error) if is_transient_connect_error(&error) => {}
             Err(error) => return Err(AutoStartError::Client(error)),
         }
@@ -506,11 +540,10 @@ where
             });
         }
 
-        thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
+        std::thread::sleep(poll_interval.min(deadline.saturating_duration_since(now)));
     }
 }
 
-#[cfg(any(all(test, unix), not(any(unix, windows))))]
 fn is_transient_connect_error(error: &ClientError) -> bool {
     matches!(
         error,
@@ -589,7 +622,7 @@ fn hidden_daemon_command(
 }
 
 fn spawn_hidden_daemon(mut command: Command) -> io::Result<()> {
-    let child = command.spawn()?;
+    let child = rmux_os::daemon::spawn_hidden_daemon_command(&mut command)?;
     // Intentionally drop without `wait()`: the daemon must outlive the
     // short-lived client process that launched it.
     drop(child);

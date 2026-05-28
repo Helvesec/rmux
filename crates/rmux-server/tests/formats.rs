@@ -9,6 +9,8 @@ use rmux_proto::{
     Response, Target, TerminalSize,
 };
 
+const FORMAT_FIELD_SEPARATOR: char = '\x1f';
+
 fn default_shell_window_name() -> String {
     "bash".to_owned()
 }
@@ -22,7 +24,7 @@ fn assert_window_format_line(
     last: &str,
     conditional: &str,
 ) {
-    let fields: Vec<&str> = line.split(':').collect();
+    let fields: Vec<&str> = line.split(FORMAT_FIELD_SEPARATOR).collect();
     assert_eq!(fields.len(), 14, "unexpected format fields: {fields:?}");
     assert_eq!(fields[0], "alpha");
     assert_eq!(fields[1], "2");
@@ -92,7 +94,7 @@ async fn list_windows_uses_shared_formatter_through_real_socket() -> Result<(), 
         &Request::ListWindows(ListWindowsRequest {
             target: alpha,
             format: Some(
-                "#{session_name}:#{session_windows}:#{session_attached}:#{session_width}x#{session_height}:#{window_index}:#{window_name}:#{window_raw_flags}:#{window_active}:#{window_last_flag}:#{window_id}:#{missing}:#I#W#S:#{=21:pane_title}:#{?window_active,yes,no}"
+                "#{session_name}\x1f#{session_windows}\x1f#{session_attached}\x1f#{session_width}x#{session_height}\x1f#{window_index}\x1f#{window_name}\x1f#{window_raw_flags}\x1f#{window_active}\x1f#{window_last_flag}\x1f#{window_id}\x1f#{missing}\x1f#I#W#S\x1f#{=21:pane_title}\x1f#{?window_active,yes,no}"
                     .to_owned(),
             ),
             }),

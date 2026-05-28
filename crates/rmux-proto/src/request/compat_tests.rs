@@ -1,8 +1,10 @@
 use super::{
     NewSessionExtRequest, NewWindowRequest, RespawnPaneRequest, RespawnWindowRequest,
-    SplitWindowExtRequest, SplitWindowTarget,
+    ShowOptionsRequest, SplitWindowExtRequest, SplitWindowTarget,
 };
-use crate::{PaneTarget, SessionName, SplitDirection, TerminalSize, WindowTarget};
+use crate::{
+    OptionScopeSelector, PaneTarget, SessionName, SplitDirection, TerminalSize, WindowTarget,
+};
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -55,6 +57,13 @@ struct OldNewSessionExtRequest {
     print_session_info: bool,
     print_format: Option<String>,
     command: Option<Vec<String>>,
+}
+
+#[derive(Serialize)]
+struct OldShowOptionsRequest {
+    scope: OptionScopeSelector,
+    name: Option<String>,
+    value_only: bool,
 }
 
 fn session_name(value: &str) -> SessionName {
@@ -217,4 +226,24 @@ fn new_session_ext_request_deserializes_old_payloads_with_defaulted_fields() {
     assert_eq!(decoded.window_name.as_deref(), Some("main"));
     assert_eq!(decoded.command, Some(vec!["printf ready".to_owned()]));
     assert_eq!(decoded.process_command, None);
+    assert_eq!(decoded.client_environment, None);
+}
+
+#[test]
+fn show_options_request_deserializes_old_payloads_with_defaulted_fields() {
+    let scope = OptionScopeSelector::SessionGlobal;
+    let bytes = bincode::serialize(&OldShowOptionsRequest {
+        scope: scope.clone(),
+        name: Some("status-left".to_owned()),
+        value_only: true,
+    })
+    .expect("old show-options request serializes");
+
+    let decoded: ShowOptionsRequest =
+        bincode::deserialize(&bytes).expect("new request decodes old payload");
+
+    assert_eq!(decoded.scope, scope);
+    assert_eq!(decoded.name.as_deref(), Some("status-left"));
+    assert!(decoded.value_only);
+    assert!(!decoded.include_inherited);
 }

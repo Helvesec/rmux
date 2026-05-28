@@ -30,6 +30,26 @@ fn display_message_prints_expanded_format_without_attached_client() -> Result<()
 }
 
 #[test]
+fn display_message_all_formats_prints_without_print_flag() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("display-message-all-formats")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let output = harness.run(&["display-message", "-a", "-t", "alpha:0.0"])?;
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = stdout(&output);
+    assert!(stdout.contains("session_name=alpha"));
+    assert!(stdout.contains("pane_index=0"));
+    assert!(stdout.contains("version=3.4"));
+    assert!(stderr(&output).is_empty());
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
 fn bare_display_message_with_no_attached_display_is_a_noop() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("display-message-no-display")?;
     let mut daemon = harness.start_hidden_daemon()?;

@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use rmux_proto::{
-    KillServerRequest, LockClientRequest, LockServerRequest, LockSessionRequest, Request, Response,
-    ServerAccessRequest, SessionName,
+    DaemonStatusRequest, KillServerRequest, LockClientRequest, LockServerRequest,
+    LockSessionRequest, Request, Response, ServerAccessRequest, SessionName, ShutdownIfIdleRequest,
 };
 
 use crate::{
@@ -28,6 +28,16 @@ impl Connection {
     /// Sends a `kill-server` request over the detached RPC channel.
     pub fn kill_server(&mut self) -> Result<Response, ClientError> {
         self.roundtrip(&Request::KillServer(KillServerRequest))
+    }
+
+    /// Sends an internal daemon status request over the detached RPC channel.
+    pub fn daemon_status(&mut self) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::DaemonStatus(DaemonStatusRequest))
+    }
+
+    /// Sends an internal idle-only daemon shutdown request.
+    pub fn shutdown_if_idle(&mut self) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::ShutdownIfIdle(ShutdownIfIdleRequest))
     }
 
     /// Sends a `lock-server` request over the detached RPC channel.

@@ -190,8 +190,12 @@ impl PaneTranscript {
         self.terminal.screen().history_size()
     }
 
-    pub(crate) fn history_bytes(&self) -> usize {
-        self.terminal.screen().history_bytes()
+    pub(crate) fn tmux_history_bytes(&self) -> usize {
+        self.terminal.screen().tmux_history_bytes()
+    }
+
+    pub(crate) fn tmux_history_all_bytes(&self) -> String {
+        self.terminal.screen().tmux_history_all_bytes()
     }
 
     pub(crate) fn resize(&mut self, size: TerminalSize) {
@@ -392,6 +396,20 @@ mod tests {
     }
 
     #[test]
+    fn append_bytes_reports_sixel_passthrough_without_capturing_text() {
+        let mut transcript = transcript(40, 4, 10);
+        let result = transcript.append_bytes_with_effects(b"\x1b[2;3H\x1bPq#0!10~\x1b\\");
+
+        assert_eq!(result.passthroughs.len(), 1);
+        assert_eq!(result.passthroughs[0].payload(), b"q#0!10~");
+        let capture = String::from_utf8(
+            transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default()),
+        )
+        .expect("capture is utf8");
+        assert!(!capture.contains("#0!10~"));
+    }
+
+    #[test]
     fn append_bytes_reports_dropped_oversized_kitty_passthroughs() {
         let mut transcript = transcript(40, 4, 10);
         assert_eq!(
@@ -401,7 +419,7 @@ mod tests {
             0
         );
 
-        let chunk = vec![b'A'; 1_048_577];
+        let chunk = vec![b'A'; 8 * 1024 * 1024 + 1];
         let result = transcript.append_bytes_with_effects(&chunk);
 
         assert!(result.passthroughs.is_empty());

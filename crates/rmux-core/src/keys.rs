@@ -116,7 +116,7 @@ const KEYC_MOUSE: KeyCode = KEYC_NONE + 49;
 pub const KEYC_DRAGGING: KeyCode = KEYC_NONE + 50;
 
 /// Default `list-keys` template.
-pub const LIST_KEYS_TEMPLATE: &str = "#{?notes_only,#{key_prefix} #{p|#{key_string_width}:key_string} #{?key_note,#{key_note},#{key_command}},bind-key #{?key_has_repeat,#{?key_repeat,-r,  },} -T #{p|#{key_table_width}:key_table} #{p|#{key_string_width}:key_string} #{key_command}}";
+pub const LIST_KEYS_TEMPLATE: &str = "#{?notes_only,#{key_prefix} #{p|#{key_string_width}:key_string} #{?key_note,#{key_note},#{key_command}},bind-key#{?key_has_repeat, #{?key_repeat,-r,  },} -T #{p|#{key_table_width}:key_table} #{p|#{key_string_width}:key_string} #{key_command}}";
 
 /// Returns the key bits used for binding lookup.
 #[must_use]

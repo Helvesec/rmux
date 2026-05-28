@@ -14,7 +14,7 @@
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Release validation](https://github.com/Helvesec/rmux/actions/workflows/ci.yml/badge.svg)](https://github.com/Helvesec/rmux/actions/workflows/ci.yml)
-[![rmux 0.2.5](https://img.shields.io/badge/rmux-0.2.5-informational.svg)](#install)
+[![rmux 0.3.1](https://img.shields.io/badge/rmux-0.3.1-informational.svg)](#install)
 [![Platform: Linux | macOS | Windows](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#platform-support)
 [![Unsafe policy](https://img.shields.io/badge/unsafe-restricted-success.svg)](#verification)
 
@@ -26,7 +26,7 @@
 </div>
 
 > [!IMPORTANT]
-> 現在のリリースは **v0.2.0**、公開日は **2026年5月18日**。tmux 互換の 90 コマンドはすべて実装済みですが、まだ新しい公開プレビューのため不具合が残る可能性があります。問題は [issues](https://github.com/helvesec/rmux/issues) へ報告できます。
+> 現在のリリースは **v0.3.1**、公開日は **2026年5月25日**。tmux 互換の 90 コマンドはすべて実装済みですが、まだ新しい公開プレビューのため不具合が残る可能性があります。問題は [issues](https://github.com/helvesec/rmux/issues) へ報告できます。
 
 ## RMUX を選ぶ理由
 
@@ -45,7 +45,7 @@ RMUX を何に使えるかを示す短い実例です。
     <td align="center" width="20%"><a href="https://rmux.io/#demo-orchestration"><img src="https://rmux.io/demos/demo-orchestration.png" width="150" alt="マルチエージェント編成デモのプレビュー"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/demo-orchestration"><strong>マルチエージェント編成</strong></a></sub><br><sub>約 514 行</sub></td>
     <td align="center" width="20%"><a href="https://rmux.io/#demo-broadcast"><img src="https://rmux.io/demos/demo-broadcast.png" width="150" alt="Agent Broadcast Arena デモのプレビュー"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/broadcast-demo"><strong>Agent Broadcast Arena</strong></a></sub><br><sub>約 2,171 行</sub></td>
     <td align="center" width="20%"><a href="https://rmux.io/#demo-zellij"><img src="https://rmux.io/demos/demo-zellij.png" width="150" alt="Mini-Zellij デモのプレビュー"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/mini-zellij"><strong>Mini-Zellij</strong></a></sub><br><sub>約 944 行</sub></td>
-    <td align="center" width="20%"><a href="https://rmux.io/#demo-mirroring"><img src="https://rmux.io/demos/demo-mirroring.png" width="150" alt="ターミナルとブラウザのミラーリングデモのプレビュー"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/web-claude-demo"><strong>ターミナル &lt;&gt; ブラウザミラーリング</strong></a></sub><br><sub>約 649 行</sub></td>
+    <td align="center" width="20%"><a href="https://rmux.io/#demo-mirroring"><img src="https://rmux.io/demos/demo-mirroring.png" width="150" alt="ターミナルとブラウザのミラーリングデモのプレビュー"></a><br><sub><a href="https://rmux.io/#demo-mirroring"><strong>ターミナル &lt;&gt; ブラウザミラーリング</strong></a></sub><br><sub>約 649 行</sub></td>
     <td align="center" width="20%"><a href="https://rmux.io/#demo-playwright"><img src="https://rmux.io/demos/demo-playwright.png" width="150" alt="Playwright テストデモのプレビュー"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/terminal-playwright-demo"><strong>Playwright テスト</strong></a></sub><br><sub>約 1,495 行</sub></td>
   </tr>
 </table>
@@ -66,7 +66,7 @@ Windows PowerShell のビルド済みバイナリ：
 irm https://rmux.io/install.ps1 | iex
 ```
 
-直接ダウンロードと SHA256 チェックサムは [v0.2.5 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.2.5) で確認できます。
+直接ダウンロードと SHA256 チェックサムは [v0.3.1 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.3.1) で確認できます。
 
 Cargo で crates.io から：
 
@@ -114,7 +114,7 @@ rmux split-window --help
 
 ```toml
 [dependencies]
-rmux-sdk = "0.2"
+rmux-sdk = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -240,6 +240,29 @@ tmux のキーバインド、環境変数や端末機能の変更、プラグイ
 再帰的な `source-file` エントリ、未サポートのオプションは実行せずにスキップします。
 完全に無効化するには `RMUX_DISABLE_TMUX_FALLBACK=1` を設定してください。
 フォールバックファイルは可能な範囲で読み込まれ、通常ファイルではないものと 1 MiB を超えるものは無視されます。
+
+### ターミナル互換性のメモ
+
+RMUX は、fish のようにターミナル機能を問い合わせる shell と連携できます。
+端末属性問い合わせに応答し、Escape キーのタイミングも扱うため、RMUX pane 内でも
+fish のプロンプトやキーシーケンスが通常どおり動作します。
+
+Kitty graphics passthrough は、Kitty graphics protocol をサポートする外側のターミナルで利用できます。
+対象には Kitty、Ghostty、WezTerm が含まれます。これは明示的に有効化します：
+
+```tmux
+set -g allow-passthrough on
+```
+
+ターミナルが Kitty graphics をサポートしているのに自動検出されない場合は、
+terminal feature override を追加してください：
+
+```tmux
+set -as terminal-features 'xterm-kitty:kitty-graphics'
+```
+
+Windows では、OS が対応していれば RMUX は modern ConPTY passthrough を有効にします。
+診断のためにこの backend mode を無効化するには `RMUX_CONPTY_NO_PASSTHROUGH=1` を設定してください。
 
 <a id="verification"></a>
 

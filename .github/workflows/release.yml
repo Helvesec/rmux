@@ -42,6 +42,8 @@ jobs:
       RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
       TARGET: ${{ matrix.target }}
       BINARY: ${{ matrix.binary }}
+      BUILD_PROFILE: release
+      PROFILE_DIR: release
     steps:
       - name: Validate release ref
         shell: bash
@@ -65,20 +67,31 @@ jobs:
         run: cargo fetch --locked
 
       - name: Build rmux
-        run: cargo build --package rmux --locked --release --target "${{ matrix.target }}"
+        shell: bash
+        run: cargo build --package rmux --locked --profile "$BUILD_PROFILE" --target "$TARGET"
+
+      - name: Inspect release binary
+        shell: bash
+        run: |
+          bin="target/$TARGET/$PROFILE_DIR/$BINARY"
+          test -x "$bin"
+          ls -lh "$bin"
+          if [[ "$RUNNER_OS" != "Windows" ]]; then
+            file "$bin"
+          fi
 
       - name: Re-sign macOS binary
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          bin="target/$TARGET/release/$BINARY"
+          bin="target/$TARGET/$PROFILE_DIR/$BINARY"
           codesign --force --sign - "$bin"
           codesign --verify --verbose=2 "$bin"
 
       - name: Smoke binary
         shell: bash
         run: |
-          bin="target/$TARGET/release/$BINARY"
+          bin="target/$TARGET/$PROFILE_DIR/$BINARY"
           "$bin" -V | tee version.txt
           grep -F "rmux $VERSION" version.txt
 
@@ -88,7 +101,7 @@ jobs:
         run: |
           package="rmux-$TAG-$TARGET"
           mkdir -p "dist/$package"
-          cp "target/$TARGET/release/$BINARY" "dist/$package/rmux"
+          cp "target/$TARGET/$PROFILE_DIR/$BINARY" "dist/$package/rmux"
           cp README.md LICENSE-APACHE LICENSE-MIT rmux.1 "dist/$package/"
           chmod +x "dist/$package/rmux"
           tar -czf "dist/$package.tar.gz" -C dist "$package"
@@ -99,7 +112,7 @@ jobs:
         run: |
           $package = "rmux-$env:TAG-$env:TARGET"
           New-Item -ItemType Directory -Force -Path "dist/$package" | Out-Null
-          Copy-Item "target/$env:TARGET/release/$env:BINARY" "dist/$package/rmux.exe"
+          Copy-Item "target/$env:TARGET/$env:PROFILE_DIR/$env:BINARY" "dist/$package/rmux.exe"
           Copy-Item README.md, LICENSE-APACHE, LICENSE-MIT, rmux.1 "dist/$package/"
           Compress-Archive -Path "dist/$package" -DestinationPath "dist/$package.zip" -Force
 
