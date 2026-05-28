@@ -126,6 +126,7 @@ fn parsed_new_session_accepts_tmux_shell_command_after_double_dash() {
             print_format: None,
             command: Some(vec!["sleep".to_owned(), "30".to_owned()]),
             process_command: None,
+            passthrough: false,
             client_environment: None,
         })
     );

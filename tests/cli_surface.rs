@@ -87,9 +87,12 @@ fn version_flag_reports_rmux_version_without_server_contact() -> Result<(), Box<
     let output = harness.run(&["-V"])?;
 
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(
-        stdout(&output).trim(),
-        format!("rmux {}", env!("CARGO_PKG_VERSION"))
+    let version_line = stdout(&output).trim().to_owned();
+    let expected_prefix = format!("rmux {} (", env!("CARGO_PKG_VERSION"));
+    assert!(
+        version_line.starts_with(&expected_prefix) && version_line.ends_with(')'),
+        "expected `rmux {} (<git-hash>[-dirty])`, got: {version_line:?}",
+        env!("CARGO_PKG_VERSION"),
     );
     assert!(stderr(&output).is_empty());
     assert!(!harness.socket_path().exists());

@@ -1,5 +1,5 @@
 use rmux_proto::types::OptionScopeSelector;
-use rmux_proto::{RmuxError, ScopeSelector};
+use rmux_proto::{RmuxError, ScopeSelector, SessionName};
 
 use crate::pane_terminals::{session_not_found, HandlerState};
 
@@ -7,9 +7,34 @@ pub(crate) fn attached_client_required(command_name: &str) -> RmuxError {
     RmuxError::Server(format!("{command_name} requires an attached client"))
 }
 
-pub(crate) fn ambiguous_attached_client(command_name: &str) -> RmuxError {
+/// Lists the candidate PIDs and tells the caller how to pick one.
+/// Surfaces when running `rmux detach` (or another client-targeted
+/// command) from inside an rmux session where two or more clients are
+/// simultaneously attached — the server can't infer which one the
+/// requester means just from the socket peer's PID. Listing the
+/// candidates makes the workaround obvious without forcing the user
+/// to consult `list-clients`.
+pub(crate) fn ambiguous_attached_client_listing(
+    command_name: &str,
+    attach_pids: &[u32],
+    control_pids: &[u32],
+) -> RmuxError {
+    // Sort each family so the error message is stable across runs.
+    // Source maps are `HashMap`, so caller-side ordering is
+    // non-deterministic; without this the message changes between
+    // process invocations and tests/asserts/log scrapes get flaky.
+    let mut sorted_attach = attach_pids.to_vec();
+    sorted_attach.sort_unstable();
+    let mut sorted_control = control_pids.to_vec();
+    sorted_control.sort_unstable();
+    let mut all = Vec::with_capacity(sorted_attach.len() + sorted_control.len());
+    all.extend(sorted_attach.iter().map(|pid| format!("{pid}")));
+    all.extend(sorted_control.iter().map(|pid| format!("{pid} (control)")));
+    let joined = all.join(", ");
     RmuxError::Server(format!(
-        "{command_name} requires an unambiguous attached client"
+        "{command_name}: {} clients attached ({joined}); pick one with `-t <client>` \
+         or address a whole session with `-s <session>`",
+        sorted_attach.len() + sorted_control.len(),
     ))
 }
 
@@ -61,6 +86,24 @@ pub(crate) fn ensure_scope_session_exists(
             }
         }
     }
+}
+
+/// Rejects a pane operation when the addressed session is in passthrough
+/// mode. Passthrough sessions are single-window/single-pane by contract
+/// and any pane split/swap/kill/etc. would break that invariant.
+///
+/// Returns `Ok(())` if the session is missing — that case is left to the
+/// existing not-found error paths in each handler. Passthrough-ness is
+/// only enforced when the session is known to exist.
+pub(crate) fn reject_pane_op_in_passthrough(
+    state: &HandlerState,
+    session_name: &SessionName,
+    op: &str,
+) -> Result<(), RmuxError> {
+    if !state.sessions.contains_session(session_name) {
+        return Ok(());
+    }
+    rmux_core::reject_pane_op_if_passthrough(&state.options, session_name, op)
 }
 
 pub(crate) fn ensure_option_scope_exists(

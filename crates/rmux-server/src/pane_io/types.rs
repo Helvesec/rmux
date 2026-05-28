@@ -120,6 +120,11 @@ pub(crate) struct AttachTarget {
     pub(crate) sixel_passthrough: bool,
     pub(crate) persistent_overlay_state_id: Option<u64>,
     pub(crate) live_pane: Option<Box<LivePaneRender>>,
+    /// Stable id of the pane this target was built for. Used by the
+    /// passthrough attach forwarder to look up the pane's replay log
+    /// on attach and on window switch. `None` only in pre-existing
+    /// test fixtures.
+    pub(crate) active_pane_id: Option<PaneId>,
 }
 
 #[cfg(any(unix, windows))]
@@ -187,7 +192,11 @@ pub(crate) struct AttachSessionUpgrade {
 
 pub(super) struct OpenAttachTarget {
     pub(super) session_name: rmux_proto::SessionName,
-    pub(super) _pane_master: PtyMaster,
+    /// Master end of the pane's PTY. Kept alive for as long as the
+    /// target is open (closing it would orphan the slave) and used
+    /// by the passthrough forwarder to send SIGWINCH to the pane's
+    /// foreground pgrp on a window switch.
+    pub(super) pane_master: PtyMaster,
     pub(super) pane_output: Option<PaneOutputReceiver>,
     pub(super) render_frame: Vec<u8>,
     pub(super) outer_terminal: OuterTerminal,
@@ -197,6 +206,7 @@ pub(super) struct OpenAttachTarget {
     pub(super) sixel_passthrough: bool,
     pub(super) persistent_overlay_state_id: Option<u64>,
     pub(super) live_pane: Option<Box<LivePaneRender>>,
+    pub(super) active_pane_id: Option<PaneId>,
 }
 
 #[derive(Clone)]

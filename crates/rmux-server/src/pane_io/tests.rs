@@ -7,7 +7,8 @@ use rmux_core::events::OutputCursorItem;
 use rmux_core::{OptionStore, PaneGeometry};
 use rmux_proto::{
     encode_attach_message, AttachFrameDecoder, AttachMessage, AttachedKeystroke, KeyDispatched,
-    NewSessionRequest, Request, Response, SessionName, TerminalSize,
+    NewSessionExtRequest, NewSessionRequest, NewWindowRequest, Request, Response, SessionName,
+    TerminalSize,
 };
 use rmux_pty::PtyPair;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -17,9 +18,11 @@ use super::control::{apply_pending_attach_controls, PendingAttachAction};
 use super::wire::open_attach_target;
 use super::wire::recv_pane_output;
 use super::{
-    forward_attach, pane_output_channel, pane_output_channel_with_limits, process_socket_messages,
-    should_emit_overlay, AttachControl, AttachTarget, LiveAttachInputContext, OverlayFrame,
+    forward_attach, forward_attach_passthrough, pane_output_channel,
+    pane_output_channel_with_limits, process_socket_messages, should_emit_overlay,
+    AttachControl, AttachTarget, LiveAttachInputContext, OverlayFrame,
 };
+use crate::passthrough_replay::update_host_alt_screen;
 use crate::handler::RequestHandler;
 use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
 
@@ -224,6 +227,7 @@ async fn forward_attach_emits_stop_sequence_when_processing_errors() {
         sixel_passthrough: false,
         persistent_overlay_state_id: None,
         live_pane: None,
+        active_pane_id: None,
     };
     let invalid_initial_socket_bytes =
         encode_attach_message(&AttachMessage::Lock("unexpected".to_owned()))
@@ -332,6 +336,7 @@ fn test_attach_target_with_protocols(
         sixel_passthrough,
         persistent_overlay_state_id,
         live_pane: None,
+        active_pane_id: None,
     }
 }
 
@@ -595,6 +600,7 @@ async fn forward_attach_emits_display_panes_overlay_for_prefix_q_keystrokes() {
         sixel_passthrough: false,
         persistent_overlay_state_id: None,
         live_pane: None,
+        active_pane_id: None,
     };
 
     let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
@@ -670,5 +676,1178 @@ async fn forward_attach_emits_display_panes_overlay_for_prefix_q_keystrokes() {
     assert!(
         result.is_ok(),
         "forward_attach should stay healthy: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn forward_attach_passthrough_forwards_pane_output_verbatim_without_alt_screen() {
+    let handler = Arc::new(RequestHandler::new());
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let session_name = SessionName::new("alpha").expect("valid session name");
+
+    let pane_output = pane_output_channel();
+    let pty = PtyPair::open().expect("open pty pair");
+    let pane_master = pty.into_master();
+    let target = AttachTarget {
+        session_name: session_name.clone(),
+        pane_master,
+        pane_output: pane_output.clone(),
+        // Empty render_frame so the first bytes we see on the peer are
+        // strictly the pane-output bytes we push below.
+        render_frame: Vec::new(),
+        outer_terminal: OuterTerminal::resolve(
+            &OptionStore::default(),
+            OuterTerminalContext::default(),
+        ),
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: None,
+    };
+
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (_control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let live_input = LiveAttachInputContext {
+        handler,
+        attach_pid: std::process::id(),
+    };
+
+    let attach_task = tokio::spawn(forward_attach_passthrough(
+        stream,
+        target,
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        closing.clone(),
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+    ));
+
+    // Give the bypass loop time to enter its select before we publish
+    // — otherwise the subscribe() inside open_attach_target starts
+    // "from now" and would miss this byte.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = pane_output.send(b"hello passthrough\r\n".to_vec());
+
+    let mut collected = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while collected
+        .windows(b"hello passthrough".len())
+        .all(|window| window != b"hello passthrough")
+    {
+        let mut buf = [0_u8; 4096];
+        let read = tokio::time::timeout(deadline - tokio::time::Instant::now(), peer.read(&mut buf))
+            .await
+            .expect("peer read should not time out")
+            .expect("peer read");
+        if read == 0 {
+            break;
+        }
+        let mut decoder = AttachFrameDecoder::new();
+        decoder.push_bytes(&buf[..read]);
+        while let Some(AttachMessage::Data(bytes)) =
+            decoder.next_message().expect("decode attach frame")
+        {
+            collected.extend_from_slice(&bytes);
+        }
+    }
+
+    assert!(
+        collected
+            .windows(b"hello passthrough".len())
+            .any(|window| window == b"hello passthrough"),
+        "pane bytes must be forwarded verbatim, got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        !collected
+            .windows(b"\x1b[?1049h".len())
+            .any(|window| window == b"\x1b[?1049h"),
+        "passthrough must not put the host terminal into alt-screen, got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+
+    closing.store(true, std::sync::atomic::Ordering::SeqCst);
+    peer.shutdown().await.expect("close peer");
+    let _ = tokio::time::timeout(Duration::from_secs(2), attach_task)
+        .await
+        .expect("attach task join did not time out");
+}
+
+#[tokio::test]
+async fn forward_attach_passthrough_replays_target_on_attach_control_switch() {
+    let handler = Arc::new(RequestHandler::new());
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let session_name = SessionName::new("alpha").expect("valid session name");
+
+    let pane_output_one = pane_output_channel();
+    let pane_output_two = pane_output_channel();
+    let pty_one = PtyPair::open().expect("open pty pair 1");
+    let pty_two = PtyPair::open().expect("open pty pair 2");
+
+    let target_one = AttachTarget {
+        session_name: session_name.clone(),
+        pane_master: pty_one.into_master(),
+        pane_output: pane_output_one.clone(),
+        render_frame: Vec::new(),
+        outer_terminal: OuterTerminal::resolve(
+            &OptionStore::default(),
+            OuterTerminalContext::default(),
+        ),
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: None,
+    };
+    let target_two = AttachTarget {
+        session_name: session_name.clone(),
+        pane_master: pty_two.into_master(),
+        pane_output: pane_output_two.clone(),
+        // A distinctive render_frame for window 2 so we can prove the
+        // switch handler used the new target's bytes (not stale ones).
+        render_frame: b"WINDOW-TWO-PAINT".to_vec(),
+        outer_terminal: OuterTerminal::resolve(
+            &OptionStore::default(),
+            OuterTerminalContext::default(),
+        ),
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: None,
+    };
+
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let live_input = LiveAttachInputContext {
+        handler,
+        attach_pid: std::process::id(),
+    };
+
+    let attach_task = tokio::spawn(forward_attach_passthrough(
+        stream,
+        target_one,
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        closing.clone(),
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+    ));
+
+    // Trigger a switch and let the loop process it.
+    control_tx
+        .send(AttachControl::switch(target_two))
+        .expect("switch send");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Once switched, output on window 2's channel must reach the
+    // client; output on window 1's channel must not.
+    let _ = pane_output_two.send(b"WINDOW-TWO-OUTPUT".to_vec());
+    let _ = pane_output_one.send(b"STALE-WINDOW-ONE".to_vec());
+
+    let mut collected = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while collected
+        .windows(b"WINDOW-TWO-OUTPUT".len())
+        .all(|window| window != b"WINDOW-TWO-OUTPUT")
+    {
+        let mut buf = [0_u8; 4096];
+        let read = tokio::time::timeout(deadline - tokio::time::Instant::now(), peer.read(&mut buf))
+            .await
+            .expect("peer read should not time out")
+            .expect("peer read");
+        if read == 0 {
+            break;
+        }
+        let mut decoder = AttachFrameDecoder::new();
+        decoder.push_bytes(&buf[..read]);
+        while let Some(AttachMessage::Data(bytes)) =
+            decoder.next_message().expect("decode attach frame")
+        {
+            collected.extend_from_slice(&bytes);
+        }
+    }
+
+    let contains = |needle: &[u8]| {
+        collected
+            .windows(needle.len())
+            .any(|window| window == needle)
+    };
+    assert!(
+        !contains(b"WINDOW-TWO-PAINT"),
+        "passthrough switch must NOT paint the chrome-laden render_frame; \
+         the renderer-built frame contains status bar / borders which contradict \
+         passthrough's no-chrome contract — got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        contains(b"\x1b[2J"),
+        "switch must clear the host screen so previous window's content \
+         doesn't bleed under, got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        contains(b"WINDOW-TWO-OUTPUT"),
+        "post-switch pane output must reach the client, got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        !contains(b"STALE-WINDOW-ONE"),
+        "output on the previous window's channel must not reach the client after switch, got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        contains(b"\x1b]0;rmux: alpha\x07"),
+        "switch must emit a rmux-tagged OSC 0 title so the host bar doesn't keep the previous window's title, got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+
+    closing.store(true, std::sync::atomic::Ordering::SeqCst);
+    peer.shutdown().await.expect("close peer");
+    let _ = tokio::time::timeout(Duration::from_secs(2), attach_task)
+        .await
+        .expect("attach task join did not time out");
+}
+
+#[tokio::test]
+async fn forward_attach_passthrough_never_paints_render_frame_or_alt_screen() {
+    // Simulates the flip-mid-life path: a session was created in
+    // normal mode and accumulated a chrome-laden render_frame; the
+    // user then set `passthrough on`; on attach the forwarder must
+    // *not* paint that frame, and must never emit alt-screen enter.
+    let handler = Arc::new(RequestHandler::new());
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let session_name = SessionName::new("alpha").expect("valid session name");
+
+    // Build a render_frame that contains *both* chrome (status-bar
+    // sentinel) and an alt-screen enter — so any leak is loud.
+    let mut chrome_frame = Vec::new();
+    chrome_frame.extend_from_slice(b"\x1b[?1049h"); // alt-screen enter
+    chrome_frame.extend_from_slice(b"CHROME_STATUS_BAR_LEAK");
+
+    let pty = PtyPair::open().expect("open pty pair");
+    let target = AttachTarget {
+        session_name: session_name.clone(),
+        pane_master: pty.into_master(),
+        pane_output: pane_output_channel(),
+        render_frame: chrome_frame.clone(),
+        outer_terminal: OuterTerminal::resolve(
+            &OptionStore::default(),
+            OuterTerminalContext::default(),
+        ),
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: None,
+    };
+
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let live_input = LiveAttachInputContext {
+        handler,
+        attach_pid: std::process::id(),
+    };
+
+    let attach_task = tokio::spawn(forward_attach_passthrough(
+        stream,
+        target,
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        closing.clone(),
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+    ));
+
+    // Give the forwarder time to emit its initial state, then detach.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    control_tx
+        .send(AttachControl::Detach)
+        .expect("send detach control");
+    let _ = tokio::time::timeout(Duration::from_secs(2), attach_task).await;
+
+    let mut collected = Vec::new();
+    let mut buf = [0_u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(50), peer.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(read)) => {
+                let mut decoder = AttachFrameDecoder::new();
+                decoder.push_bytes(&buf[..read]);
+                while let Some(AttachMessage::Data(bytes)) =
+                    decoder.next_message().expect("decode attach frame")
+                {
+                    collected.extend_from_slice(&bytes);
+                }
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+
+    let contains = |needle: &[u8]| {
+        collected
+            .windows(needle.len())
+            .any(|window| window == needle)
+    };
+    assert!(
+        !contains(b"CHROME_STATUS_BAR_LEAK"),
+        "passthrough forwarder must NOT paint the supplied render_frame; \
+         that frame comes from the chrome-aware renderer and contains the \
+         status bar. Got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        !contains(b"\x1b[?1049h"),
+        "passthrough forwarder must NEVER emit alt-screen enter from its \
+         own bytes; host scrollback would silently break. Got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        contains(b"\x1b]0;rmux: alpha\x07"),
+        "passthrough forwarder must still emit the rmux-tagged title \
+         sequence on attach, got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        !contains(b"\x1b[2J"),
+        "passthrough INITIAL attach must NOT clear the host screen — \
+         that's a regression of the 'preserve host scrollback' promise. \
+         (Switching between windows IS allowed to clear, but the first \
+          attach must leave the user's pre-attach scrollback visible.) \
+         Got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+}
+
+#[tokio::test]
+async fn forward_attach_passthrough_emits_cursor_show_on_initial_attach() {
+    // Regression: in passthrough mode the host terminal's cursor
+    // visibility is whatever the previous inner program last left it
+    // as. A shell (zsh, bash) at the prompt assumes the cursor is
+    // visible and never emits `?25h` itself, so if anything earlier
+    // hid it (a prior TUI, a previous attach to a non-passthrough
+    // session, even a stuck terminal state), the user lands at a
+    // prompt with no visible cursor and no way to see where their
+    // line-editing is. The forwarder must guarantee a cursor-show on
+    // every attach so plain shells are usable; TUIs that legitimately
+    // want the cursor hidden can re-hide it via their own emit (their
+    // bytes flow through after ours).
+    let handler = Arc::new(RequestHandler::new());
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let session_name = SessionName::new("alpha").expect("valid session name");
+
+    let pty = PtyPair::open().expect("open pty pair");
+    let target = AttachTarget {
+        session_name: session_name.clone(),
+        pane_master: pty.into_master(),
+        pane_output: pane_output_channel(),
+        render_frame: Vec::new(),
+        outer_terminal: OuterTerminal::resolve(
+            &OptionStore::default(),
+            OuterTerminalContext::default(),
+        ),
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: None,
+    };
+
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let live_input = LiveAttachInputContext {
+        handler,
+        attach_pid: std::process::id(),
+    };
+
+    let attach_task = tokio::spawn(forward_attach_passthrough(
+        stream,
+        target,
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        closing.clone(),
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+    ));
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    control_tx
+        .send(AttachControl::Detach)
+        .expect("send detach control");
+    let _ = tokio::time::timeout(Duration::from_secs(2), attach_task).await;
+
+    let mut collected = Vec::new();
+    let mut buf = [0_u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(50), peer.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(read)) => {
+                let mut decoder = AttachFrameDecoder::new();
+                decoder.push_bytes(&buf[..read]);
+                while let Some(AttachMessage::Data(bytes)) =
+                    decoder.next_message().expect("decode attach frame")
+                {
+                    collected.extend_from_slice(&bytes);
+                }
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+
+    let contains = |needle: &[u8]| {
+        collected
+            .windows(needle.len())
+            .any(|window| window == needle)
+    };
+    assert!(
+        contains(b"\x1b[?25h"),
+        "passthrough initial attach must emit the cursor-show sequence \
+         `\\x1b[?25h` so a shell prompt is usable even if the host \
+         arrived at the attach with the cursor hidden. Got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+}
+
+#[tokio::test]
+async fn forward_attach_passthrough_emits_detached_banner_on_detach() {
+    let handler = Arc::new(RequestHandler::new());
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let session_name = SessionName::new("alpha").expect("valid session name");
+
+    let pane_output = pane_output_channel();
+    let pty = PtyPair::open().expect("open pty pair");
+    let outer_terminal =
+        OuterTerminal::resolve(&OptionStore::default(), OuterTerminalContext::default());
+    let target = AttachTarget {
+        session_name: session_name.clone(),
+        pane_master: pty.into_master(),
+        pane_output: pane_output.clone(),
+        render_frame: Vec::new(),
+        outer_terminal,
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: None,
+    };
+
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let live_input = LiveAttachInputContext {
+        handler,
+        attach_pid: std::process::id(),
+    };
+
+    let attach_task = tokio::spawn(forward_attach_passthrough(
+        stream,
+        target,
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        closing.clone(),
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+    ));
+
+    // Let the forwarder enter its select loop before triggering Detach.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    control_tx
+        .send(AttachControl::Detach)
+        .expect("send detach control");
+
+    tokio::time::timeout(Duration::from_secs(2), attach_task)
+        .await
+        .expect("attach task should exit within 2s after Detach")
+        .expect("attach task join")
+        .expect("attach task should return Ok on clean detach");
+
+    // Drain whatever the forwarder wrote — must include the
+    // outer-terminal attach-stop sequence so the client side
+    // recognises the teardown instead of erroring with "stream
+    // closed before attach-stop sequence".
+    let mut collected = Vec::new();
+    let mut buf = [0_u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(50), peer.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(read)) => {
+                let mut decoder = AttachFrameDecoder::new();
+                decoder.push_bytes(&buf[..read]);
+                while let Some(AttachMessage::Data(bytes)) =
+                    decoder.next_message().expect("decode attach frame")
+                {
+                    collected.extend_from_slice(&bytes);
+                }
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    let banner_prefix = b"[detached (from session alpha)]";
+    assert!(
+        collected
+            .windows(banner_prefix.len())
+            .any(|window| window == banner_prefix),
+        "passthrough forwarder must emit the user-readable detached banner on Detach; \
+         got: {:?}",
+        String::from_utf8_lossy(&collected),
+    );
+    assert!(
+        !collected
+            .windows(b"\x1b[2J".len())
+            .any(|window| window == b"\x1b[2J"),
+        "passthrough detach must NOT emit screen-clear; that would destroy the inner \
+         program's output that the user wanted preserved in host scrollback. Got: {:?}",
+        String::from_utf8_lossy(&collected),
+    );
+    assert!(
+        !collected
+            .windows(b"\x1b[?1049l".len())
+            .any(|window| window == b"\x1b[?1049l"),
+        "passthrough detach must NOT emit alt-screen exit — we were never in alt-screen. \
+         Got: {:?}",
+        String::from_utf8_lossy(&collected),
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn forward_attach_passthrough_winches_new_window_on_switch() {
+    use rmux_pty::ChildCommand;
+
+    let handler = Arc::new(RequestHandler::new());
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let session_name = SessionName::new("alpha").expect("valid session name");
+
+    // Window 1: idle PTY with no child. The forwarder starts here and
+    // we switch away before doing anything with it.
+    let pty_one = PtyPair::open().expect("open pty pair 1");
+
+    // Window 2: a real shell spawned under a fresh PTY via the same
+    // `ChildCommand::spawn` rmux uses in production. The shell traps
+    // WINCH and writes a sentinel to its stdout (= the slave) so we
+    // can observe delivery on the master.
+    let spawned = ChildCommand::new("/bin/sh")
+        .arg("-c")
+        .arg(
+            "trap 'printf RMUX_WINCH_OK' WINCH; \
+             i=0; while [ \"$i\" -lt 100 ]; do sleep 0.05; i=$((i+1)); done",
+        )
+        .spawn()
+        .expect("spawn /bin/sh under window 2 pty");
+    let (master_two, mut child_two) = spawned.into_parts();
+    // A second master handle so the reader thread doesn't fight the
+    // attach target for the fd.
+    let master_two_reader = master_two
+        .try_clone()
+        .expect("clone window 2 master for reader");
+
+    // Wait for the shell to claim the slave's fg pgrp.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while rmux_os::process::unix::foreground_pid(master_two.as_fd()).is_none() {
+        if tokio::time::Instant::now() >= deadline {
+            let _ = child_two.wait();
+            panic!("child shell did not claim window 2's fg pgrp within 2s");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Give the shell a beat to install its WINCH trap after exec.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let pane_output_one = pane_output_channel();
+    let pane_output_two = pane_output_channel();
+
+    let target_one = AttachTarget {
+        session_name: session_name.clone(),
+        pane_master: pty_one.into_master(),
+        pane_output: pane_output_one,
+        render_frame: Vec::new(),
+        outer_terminal: OuterTerminal::resolve(
+            &OptionStore::default(),
+            OuterTerminalContext::default(),
+        ),
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: None,
+    };
+    let target_two = AttachTarget {
+        session_name: session_name.clone(),
+        pane_master: master_two,
+        pane_output: pane_output_two,
+        render_frame: Vec::new(),
+        outer_terminal: OuterTerminal::resolve(
+            &OptionStore::default(),
+            OuterTerminalContext::default(),
+        ),
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: None,
+    };
+
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let live_input = LiveAttachInputContext {
+        handler,
+        attach_pid: std::process::id(),
+    };
+
+    let attach_task = tokio::spawn(forward_attach_passthrough(
+        stream,
+        target_one,
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        closing.clone(),
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+    ));
+
+    // The switch is the SIGWINCH delivery point.
+    control_tx
+        .send(AttachControl::switch(target_two))
+        .expect("switch send");
+
+    // Read from window 2's master on a blocking thread; the shell
+    // trap writes the sentinel via the slave and the master receives
+    // it. Use a timeout so a missed SIGWINCH surfaces as a clean fail.
+    let (sentinel_tx, sentinel_rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut collected = Vec::new();
+        let mut buffer = [0_u8; 256];
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            match master_two_reader.io().read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    collected.extend_from_slice(&buffer[..n]);
+                    if collected
+                        .windows(b"RMUX_WINCH_OK".len())
+                        .any(|window| window == b"RMUX_WINCH_OK")
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = sentinel_tx.send(collected);
+    });
+
+    let collected = tokio::time::timeout(Duration::from_secs(4), sentinel_rx)
+        .await
+        .expect("reader thread did not finish in time")
+        .expect("reader thread did not send");
+    let saw_sentinel = collected
+        .windows(b"RMUX_WINCH_OK".len())
+        .any(|window| window == b"RMUX_WINCH_OK");
+
+    closing.store(true, std::sync::atomic::Ordering::SeqCst);
+    peer.shutdown().await.ok();
+    let _ = tokio::time::timeout(Duration::from_secs(2), attach_task).await;
+    let _ = child_two.kill(rmux_pty::Signal::KILL);
+    let _ = child_two.wait();
+
+    assert!(
+        saw_sentinel,
+        "passthrough switch must deliver SIGWINCH to the new window's fg pgrp; \
+         got master read: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+}
+
+/// Spawns a passthrough session via the real handler pipeline and
+/// returns the populated handler. Pinned to a long-sleeping shell so
+/// the spawned PTY doesn't race the test by emitting prompt bytes
+/// (matches the helper in `handler_attach_tests/passthrough_input.rs`).
+async fn create_passthrough_session_with_quiet_shell(
+    handler: &RequestHandler,
+    session: &SessionName,
+) {
+    let response = handler
+        .handle(Request::NewSessionExt(NewSessionExtRequest {
+            session_name: Some(session.clone()),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "sleep 60".to_owned(),
+            ]),
+            process_command: None,
+            passthrough: true,
+            client_environment: None,
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::NewSession(_)),
+        "passthrough session must be created, got {response:?}"
+    );
+}
+
+#[tokio::test]
+async fn pane_screen_state_returns_mode_bits_alt_screen_and_cursor_style_from_transcript() {
+    // The new accessor that drives the switch-time mode diff. Feed
+    // the inner program's mode-setting bytes directly into the
+    // transcript and verify the handler-level lookup reports them.
+    // Pins the wiring from pane_screen_state → HandlerState lookup
+    // → transcripts hashmap → PaneTranscript::{mode,cursor_style,
+    // is_alternate}. A regression here would silently break the
+    // switch diff for every mode family at once.
+    use rmux_core::input::mode as mode_bits;
+
+    let handler = Arc::new(RequestHandler::new());
+    let alpha = SessionName::new("alpha").expect("valid session name");
+    create_passthrough_session_with_quiet_shell(&handler, &alpha).await;
+
+    let pane_id = handler
+        .pane_id_at_for_test(&alpha, 0)
+        .await
+        .expect("window 0 must have an active pane");
+
+    // Drive the pane into a "vim mid-session" state via raw bytes:
+    // enter alt-screen, enable SGR mouse + button-event tracking +
+    // bracketed paste, hide cursor, set a steady-bar cursor style.
+    handler
+        .feed_pane_transcript_for_test(
+            &alpha,
+            pane_id,
+            b"\x1b[?1049h\x1b[?1006h\x1b[?1002h\x1b[?2004h\x1b[?25l\x1b[6 q",
+        )
+        .await
+        .expect("feeding transcript should not fail");
+
+    let (modes, cursor_style, is_alternate) = handler
+        .pane_screen_state(&alpha, pane_id)
+        .await
+        .expect("pane_screen_state must return Some for a real pane");
+
+    assert!(is_alternate, "?1049h must flip the pane into alt-screen");
+    assert_eq!(
+        cursor_style, 6,
+        "DECSCUSR 6 (steady bar) must be tracked, got {cursor_style}"
+    );
+    assert!(
+        modes & mode_bits::MODE_MOUSE_SGR != 0,
+        "?1006h must set MODE_MOUSE_SGR; mode bits = {modes:#x}"
+    );
+    assert!(
+        modes & mode_bits::MODE_MOUSE_BUTTON != 0,
+        "?1002h must set MODE_MOUSE_BUTTON; mode bits = {modes:#x}"
+    );
+    assert!(
+        modes & mode_bits::MODE_BRACKETPASTE != 0,
+        "?2004h must set MODE_BRACKETPASTE; mode bits = {modes:#x}"
+    );
+    assert!(
+        modes & mode_bits::MODE_CURSOR == 0,
+        "?25l must clear MODE_CURSOR (cursor hidden); mode bits = {modes:#x}"
+    );
+}
+
+#[tokio::test]
+async fn forward_attach_passthrough_switch_emits_mode_resets_and_alt_screen_bridge() {
+    // End-to-end window-switch test: window 0 has a "vim" pane driven
+    // into alt-screen + mouse-SGR + bracketed paste + steady-bar
+    // cursor; window 1 has a fresh shell pane with no mode toggles.
+    // A switch from 0 → 1 must emit:
+    //   * `\x1b[?1049l` to bridge the host out of alt-screen
+    //     (otherwise scroll wheel in the shell window becomes arrow
+    //     keys per wezterm/iterm defaults, breaking line editing).
+    //   * `\x1b[?1006l` and `\x1b[?1002l` to disable mouse reporting
+    //     (otherwise scroll wheel events arrive at the shell as
+    //     mouse-event bytes and break input).
+    //   * `\x1b[0 q` to reset cursor style.
+    //   * `\x1b[?2004l` to disable bracketed paste only if the target
+    //     pane doesn't want it — its transcript has no `?2004h`, so
+    //     yes, it should be reset.
+    //
+    // The mode diff is idempotent (extra resets are no-ops at the
+    // host), so we test for the *presence* of each expected byte
+    // sequence — the exact ordering or interleaving with the
+    // snapshot-replay bytes is implementation detail.
+    let handler = Arc::new(RequestHandler::new());
+    let alpha = SessionName::new("alpha").expect("valid session name");
+    create_passthrough_session_with_quiet_shell(&handler, &alpha).await;
+
+    // Add window 1 with the same quiet shell so the spawned PTY
+    // doesn't churn bytes during the test.
+    let response = handler
+        .handle(Request::NewWindow(NewWindowRequest {
+            target: alpha.clone(),
+            name: None,
+            detached: true,
+            environment: None,
+            command: Some(vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "sleep 60".to_owned(),
+            ]),
+            start_directory: None,
+            target_window_index: None,
+            insert_at_target: false,
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::NewWindow(_)),
+        "new-window must succeed, got {response:?}"
+    );
+
+    let pane_zero = handler
+        .pane_id_at_for_test(&alpha, 0)
+        .await
+        .expect("window 0 pane");
+    let pane_one = handler
+        .pane_id_at_for_test(&alpha, 1)
+        .await
+        .expect("window 1 pane");
+    assert_ne!(pane_zero, pane_one, "pane IDs must differ across windows");
+
+    // Drive window 0's pane into "vim alt-screen with mouse on" state.
+    // Bracketed paste and steady-bar cursor mirror what a real
+    // editor session looks like.
+    handler
+        .feed_pane_transcript_for_test(
+            &alpha,
+            pane_zero,
+            b"\x1b[?1049h\x1b[?1006h\x1b[?1002h\x1b[?2004h\x1b[6 q",
+        )
+        .await
+        .expect("feed window 0 transcript");
+    // Window 1's pane stays untouched — fresh shell, no mode toggles.
+
+    // Build AttachTargets matched to the real pane IDs. PTY masters
+    // and pane_output channels are local stubs; the forwarder's
+    // switch path only uses them for SIGWINCH (ignored here) and
+    // output forwarding (no producer => no output).
+    let pty_zero = PtyPair::open().expect("pty 0");
+    let pty_one = PtyPair::open().expect("pty 1");
+    let outer_terminal = || {
+        OuterTerminal::resolve(&OptionStore::default(), OuterTerminalContext::default())
+    };
+    // Keep a handle to source-pane's output channel so we can drive
+    // the forwarder's host_in_alt_screen mirror to `true` via the
+    // same code path the inner program uses in production. Without
+    // this, the mirror stays at its initial `false` and the
+    // alt-screen bridge has no reason to emit `?1049l`.
+    let pane_output_zero = pane_output_channel();
+    let target_zero = AttachTarget {
+        session_name: alpha.clone(),
+        pane_master: pty_zero.into_master(),
+        pane_output: pane_output_zero.clone(),
+        render_frame: Vec::new(),
+        outer_terminal: outer_terminal(),
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: Some(pane_zero),
+    };
+    let target_one = AttachTarget {
+        session_name: alpha.clone(),
+        pane_master: pty_one.into_master(),
+        pane_output: pane_output_channel(),
+        render_frame: Vec::new(),
+        outer_terminal: outer_terminal(),
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: Some(pane_one),
+    };
+
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let live_input = LiveAttachInputContext {
+        handler: Arc::clone(&handler),
+        attach_pid: std::process::id(),
+    };
+
+    let attach_task = tokio::spawn(forward_attach_passthrough(
+        stream,
+        target_zero,
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        closing.clone(),
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+    ));
+
+    // Let the forwarder enter its select loop and emit the initial
+    // state for target_zero before we drive any state through the
+    // pane_output channel.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Simulate window-zero's "vim startup" — emit alt-screen-enter
+    // through the live pane_output channel so the forwarder's
+    // byte scanner picks it up and updates host_in_alt_screen to
+    // true. Bracketed paste / mouse modes don't need to flow here
+    // because the diff at switch time reads them from the target
+    // pane's Screen via the transcript we pre-populated above.
+    let _ = pane_output_zero.send(b"\x1b[?1049h".to_vec());
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    control_tx
+        .send(AttachControl::switch(target_one))
+        .expect("send switch");
+    // Then detach so the forwarder exits and we can join.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    control_tx
+        .send(AttachControl::Detach)
+        .expect("send detach");
+
+    let _ = tokio::time::timeout(Duration::from_secs(2), attach_task).await;
+
+    let mut collected = Vec::new();
+    let mut buf = [0_u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(50), peer.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(read)) => {
+                let mut decoder = AttachFrameDecoder::new();
+                decoder.push_bytes(&buf[..read]);
+                while let Some(AttachMessage::Data(bytes)) =
+                    decoder.next_message().expect("decode attach frame")
+                {
+                    collected.extend_from_slice(&bytes);
+                }
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+
+    let contains = |needle: &[u8]| {
+        collected
+            .windows(needle.len())
+            .any(|window| window == needle)
+    };
+
+    assert!(
+        contains(b"\x1b[?1049l"),
+        "alt-screen bridge must emit `?1049l` so the host returns to main \
+         screen before the shell takes over (otherwise wezterm-class \
+         terminals map scroll-in-alt-screen to arrow keys). Got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        contains(b"\x1b[?1006l"),
+        "SGR mouse encoding must be reset; otherwise scroll wheel events \
+         arrive at the shell as `\\x1b[<…M` and break line editing. \
+         Got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        contains(b"\x1b[?1002l"),
+        "button-event mouse tracking must be reset; got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        contains(b"\x1b[?2004l"),
+        "bracketed paste must be reset when the target pane doesn't \
+         have it set (its transcript was never fed `?2004h`). Got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+    assert!(
+        contains(b"\x1b[0 q"),
+        "DECSCUSR must be reset to terminal default when target's \
+         cursor style differs from source's (source had 6, target has 0). \
+         Got: {:?}",
+        String::from_utf8_lossy(&collected)
+    );
+}
+
+#[test]
+fn update_host_alt_screen_tracks_last_toggle_in_chunk() {
+    // No toggle → unchanged.
+    let mut state = false;
+    update_host_alt_screen(b"plain text with no CSI", &mut state);
+    assert!(!state, "no toggle must leave state unchanged");
+
+    // Enter sets true.
+    update_host_alt_screen(b"prelude \x1b[?1049h tail", &mut state);
+    assert!(state, "?1049h must flip to alt");
+
+    // Exit sets false.
+    update_host_alt_screen(b"\x1b[?1049l", &mut state);
+    assert!(!state, "?1049l must flip back to main");
+
+    // Multi-toggle chunk: final wins.
+    update_host_alt_screen(b"\x1b[?1049h some\x1b[?1049l content\x1b[?1049h", &mut state);
+    assert!(state, "final ?1049h in chunk must determine end state");
+
+    // Short buffer (< 8 bytes) early-returns without panic.
+    update_host_alt_screen(b"abc", &mut state);
+    assert!(state, "short buffer leaves state untouched");
+}
+
+#[tokio::test]
+async fn forward_attach_passthrough_emits_alt_screen_exit_on_detach_if_host_in_alt() {
+    // Regression: when the inner program drove the host into alt-screen
+    // (vim, less, htop), detach must emit `\x1b[?1049l` *before* the
+    // detached banner. Without it the banner lands in the alt buffer
+    // and is hidden the moment the terminal returns to main on
+    // disconnect — the user sees a blank screen and wonders what
+    // happened. Sister of `forward_attach_passthrough_emits_detached_banner_on_detach`
+    // which pins the no-alt-screen case (no spurious `?1049l`).
+    let handler = Arc::new(RequestHandler::new());
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let session_name = SessionName::new("alpha").expect("valid session name");
+
+    let pane_output = pane_output_channel();
+    let pty = PtyPair::open().expect("open pty pair");
+    let outer_terminal =
+        OuterTerminal::resolve(&OptionStore::default(), OuterTerminalContext::default());
+    let target = AttachTarget {
+        session_name: session_name.clone(),
+        pane_master: pty.into_master(),
+        pane_output: pane_output.clone(),
+        render_frame: Vec::new(),
+        outer_terminal,
+        cursor_style: 0,
+        active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        kitty_graphics_passthrough: false,
+
+        sixel_passthrough: false,
+        persistent_overlay_state_id: None,
+        live_pane: None,
+        active_pane_id: None,
+    };
+
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let live_input = LiveAttachInputContext {
+        handler,
+        attach_pid: std::process::id(),
+    };
+
+    let attach_task = tokio::spawn(forward_attach_passthrough(
+        stream,
+        target,
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        closing.clone(),
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+    ));
+
+    // Give the forwarder time to subscribe before we publish — same
+    // race as `forward_attach_passthrough_forwards_pane_output_verbatim`.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Simulate vim's first emit driving the host into alt-screen.
+    let _ = pane_output.send(b"\x1b[?1049h vim contents".to_vec());
+    // Let the forwarder drain that publish before detaching.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    control_tx
+        .send(AttachControl::Detach)
+        .expect("send detach control");
+
+    tokio::time::timeout(Duration::from_secs(2), attach_task)
+        .await
+        .expect("attach task should exit within 2s after Detach")
+        .expect("attach task join")
+        .expect("attach task should return Ok on clean detach");
+
+    let mut collected = Vec::new();
+    let mut buf = [0_u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(50), peer.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(read)) => {
+                let mut decoder = AttachFrameDecoder::new();
+                decoder.push_bytes(&buf[..read]);
+                while let Some(AttachMessage::Data(bytes)) =
+                    decoder.next_message().expect("decode attach frame")
+                {
+                    collected.extend_from_slice(&bytes);
+                }
+            }
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+
+    // Find positions: alt-enter must precede alt-exit, both must exist,
+    // alt-exit must precede the detached banner.
+    let find = |needle: &[u8]| {
+        collected
+            .windows(needle.len())
+            .position(|window| window == needle)
+    };
+    let alt_enter = find(b"\x1b[?1049h").expect("test publish drove host into alt-screen");
+    let alt_exit_after_enter = collected[alt_enter + 8..]
+        .windows(b"\x1b[?1049l".len())
+        .position(|window| window == b"\x1b[?1049l")
+        .map(|offset| offset + alt_enter + 8);
+    let alt_exit = alt_exit_after_enter
+        .expect("passthrough detach must emit `?1049l` after the host was driven into alt-screen");
+    let banner_at = collected
+        .windows(b"[detached".len())
+        .position(|window| window == b"[detached")
+        .expect("detached banner must be emitted");
+    assert!(
+        alt_exit < banner_at,
+        "alt-screen exit must come *before* the detached banner so the banner lands \
+         on the host's main buffer; got alt_exit={alt_exit}, banner={banner_at} in \
+         stream: {:?}",
+        String::from_utf8_lossy(&collected)
     );
 }

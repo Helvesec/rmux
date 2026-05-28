@@ -190,6 +190,7 @@ async fn attached_mouse_drag_copy_mode_refresh_keeps_prompt_visible() {
 
 #[tokio::test]
 async fn attached_copy_mode_unhandled_key_falls_back_to_prefix_table() {
+    if skip_if_passthrough("copy-mode prefix fallback setup uses SplitWindow") { return; }
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");

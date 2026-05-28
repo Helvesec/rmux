@@ -71,6 +71,7 @@ impl HandlerState {
             spawn.environment_overrides,
             Some(pane.id),
             requested_cwd,
+            Some(pane.window_index),
         )?;
         let automatic_window_name = profile.automatic_window_name(spawn.command);
         let runtime_window_name = profile.runtime_window_name(spawn.command);
@@ -211,6 +212,7 @@ impl HandlerState {
                 .start_directory
                 .filter(|path| !path.as_os_str().is_empty())
                 .or(requested_cwd),
+            Some(window_index),
         )?;
         let automatic_window_name = profile.automatic_window_name(spawn.command);
         let runtime_window_name = profile.runtime_window_name(spawn.command);
@@ -509,6 +511,7 @@ impl HandlerState {
             environment.as_deref(),
             Some(pane_id),
             start_directory.as_deref().or(requested_cwd),
+            Some(window_index),
         )?;
         let automatic_window_name = profile.automatic_window_name(process_command.as_ref());
         let runtime_window_name = profile.runtime_window_name(process_command.as_ref());

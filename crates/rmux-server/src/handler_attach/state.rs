@@ -12,7 +12,7 @@ use super::super::mode_tree_support::ModeTreeClientState;
 use super::super::overlay_support::ClientOverlayState;
 use super::super::prompt_support::ClientPromptState;
 use crate::client_flags::ClientFlags;
-use crate::handler_support::{ambiguous_attached_client, attached_client_required};
+use crate::handler_support::{ambiguous_attached_client_listing, attached_client_required};
 use crate::mouse::ClientMouseState;
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::AttachControl;
@@ -53,6 +53,16 @@ pub(in crate::handler) struct ActiveAttach {
     pub(in crate::handler) last_key: Option<KeyCode>,
     pub(in crate::handler) mouse: ClientMouseState,
     pub(in crate::handler) prompt: Option<ClientPromptState>,
+    /// Count of terminal queries (DA1/DA2/DSR/etc.) currently in flight
+    /// from the active pane out to the client.  Incremented when the
+    /// forwarder spots a query in pane→client bytes; decremented (and
+    /// the reply is forwarded) when a matching response arrives on
+    /// client→pane.  When a response arrives with a 0 count it's an
+    /// orphan — typically vim asked DA1, exited before the reply
+    /// round-tripped back across SSH, and the reply now lands at the
+    /// shell as visible garbage like `^[[?65;4;6;18;22c`.  We drop
+    /// orphans rather than forward them.
+    pub(in crate::handler) outstanding_terminal_queries: u32,
     pub(in crate::handler) mode_tree_state_id: u64,
     pub(in crate::handler) mode_tree: Option<ModeTreeClientState>,
     pub(in crate::handler) mode_tree_frame: Option<Vec<u8>>,
@@ -215,7 +225,11 @@ impl ActiveAttachState {
                 .keys()
                 .next()
                 .expect("single-entry attach map must have one key")),
-            _ => Err(ambiguous_attached_client(command_name)),
+            _ => {
+                let mut pids: Vec<u32> = self.by_pid.keys().copied().collect();
+                pids.sort_unstable();
+                Err(ambiguous_attached_client_listing(command_name, &pids, &[]))
+            }
         }
     }
 }

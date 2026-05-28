@@ -684,6 +684,7 @@ mod tests {
                 print_format: None,
                 command: None,
                 process_command: None,
+                passthrough: false,
                 client_environment: None,
             })
             .command_name(),

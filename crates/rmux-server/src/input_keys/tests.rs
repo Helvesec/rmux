@@ -2,10 +2,56 @@ use super::{
     decode_extended_key, decode_mouse, encode_key, encode_mouse_event, ExtendedKeyDecode,
     ExtendedKeyFormat, MouseDecode, MouseForwardEvent,
 };
+use crate::key_table::{decode_attached_key, AttachedKeyDecode};
 use rmux_core::{
     input::mode, key_string_lookup_string, KeyCode, KEYC_CTRL, KEYC_IMPLIED_META, KEYC_KEYPAD,
     KEYC_META, KEYC_SHIFT,
 };
+
+/// Design rationale for the passthrough raw-forwarding input path.
+///
+/// rmux only emulates the inner terminal in *non*-passthrough mode. So
+/// the encoder (`encode_key`) is only fed an accurate `pane_mode` outside
+/// passthrough. Inside passthrough, `pane_mode` is effectively 0
+/// (no `MODE_KCURSOR`, no `MODE_KKEYPAD`), and the encoder strips the
+/// cursor flag — re-encoding `\x1bOA` (host in app-cursor mode, e.g.
+/// because vim wrote `\x1b[?1h` which flowed verbatim to the host) as
+/// `\x1b[A`. Vim, expecting app-mode bytes, doesn't recognise the
+/// re-encoded sequence and arrow keys appear broken.
+///
+/// The fix is structural: in passthrough mode, bytes from the socket
+/// flow verbatim to the pane pty without going through
+/// `decode_attached_key` → `encode_key` at all. See
+/// `handle_attached_live_input_passthrough` in
+/// `handler_pane/attached_input/live.rs`.
+///
+/// This test pins down the underlying lossy round-trip so it stays
+/// visible: if someone fixes `encode_key` to track host mode (the other
+/// way out) this test will start passing the equality, the assertion
+/// flips, and we'll know we can simplify the passthrough path.
+#[test]
+fn lossy_arrow_round_trip_motivates_passthrough_bypass() {
+    let host_input = b"\x1bOA";
+    let AttachedKeyDecode::Matched { size, key } = decode_attached_key(host_input, None) else {
+        panic!("expected up-arrow to decode from `\\x1bOA`");
+    };
+    assert_eq!(size, 3, "decoder should consume exactly the 3 bytes of \\x1bOA");
+
+    // pane_mode = 0 models passthrough's lack of inner-terminal state.
+    let re_encoded = encode_key(0, ExtendedKeyFormat::Xterm, key);
+    assert_eq!(
+        re_encoded.as_deref(),
+        Some(&b"\x1b[A"[..]),
+        "the cursor-mode-stripped re-encode is the cause of the bug — \
+         passthrough's bypass exists to avoid this round-trip entirely",
+    );
+    assert_ne!(
+        re_encoded.as_deref(),
+        Some(host_input.as_slice()),
+        "if this stops being unequal, encode_key now preserves cursor \
+         mode and the passthrough bypass might be removable",
+    );
+}
 
 fn parse_key(name: &str) -> KeyCode {
     key_string_lookup_string(name).expect("key name parses")

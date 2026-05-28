@@ -321,7 +321,7 @@ async fn display_message_print_uses_stored_default_window_name_for_detached_sess
             .set(
                 ScopeSelector::Global,
                 OptionName::DefaultShell,
-                "/bin/bash".to_owned(),
+                crate::test_shell::test_bash_path(),
                 SetOptionMode::Replace,
             )
             .expect("test default-shell is valid");

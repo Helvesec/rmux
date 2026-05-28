@@ -340,6 +340,15 @@ impl PtyMaster {
         self.io.raw_fd()
     }
 
+    /// Borrows the master's file descriptor. Useful for read-only ioctl
+    /// queries (e.g. `tcgetpgrp`) and pgrp-targeted signals where the
+    /// caller does not want to take ownership.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.io.as_fd()
+    }
+
     #[cfg(windows)]
     pub(crate) fn windows_pty(&self) -> Arc<backend::WindowsPty> {
         Arc::clone(&self.io.pty)

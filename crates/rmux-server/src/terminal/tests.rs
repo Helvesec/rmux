@@ -105,6 +105,7 @@ fn terminal_profile_sets_rmux_term_shell_and_pane_context() {
         Some(&["FOO=bar".to_owned()]),
         Some(rmux_core::PaneId::new(3)),
         Some(std::env::temp_dir().as_path()),
+        Some(0),
     )
     .expect("profile");
     assert_eq!(profile.environment_value("TERM"), Some("tmux-256color"));
@@ -125,6 +126,8 @@ fn terminal_profile_sets_rmux_term_shell_and_pane_context() {
         Some(expected_rmux.as_str())
     );
     assert_eq!(profile.environment_value("RMUX_PANE"), Some("%3"));
+    assert_eq!(profile.environment_value("RMUX_SESSION"), Some("alpha"));
+    assert_eq!(profile.environment_value("RMUX_WINDOW"), Some("0"));
     assert_eq!(profile.environment_value("FOO"), Some("bar"));
     let expected_cwd = std::env::temp_dir();
     assert_eq!(
@@ -166,6 +169,7 @@ fn terminal_profile_applies_spawn_environment_before_explicit_overrides() {
         Some(&spawn_environment),
         true,
         Some(&["RMUX_CLIENT_ONLY=override".to_owned()]),
+        None,
         None,
         None,
     )
@@ -217,6 +221,7 @@ fn terminal_profile_honors_explicit_color_environment_overrides() {
         Some(&["NODE_DISABLE_COLORS=1".to_owned(), "CLICOLOR=0".to_owned()]),
         Some(rmux_core::PaneId::new(3)),
         Some(std::env::temp_dir().as_path()),
+        None,
     )
     .expect("profile");
 
@@ -257,6 +262,7 @@ fn terminal_profile_applies_default_terminal_before_per_command_term_override() 
         None,
         None,
         None,
+        None,
     )
     .expect("profile");
     assert_eq!(profile.environment_value("TERM"), Some("tmux-256color"));
@@ -270,6 +276,7 @@ fn terminal_profile_applies_default_terminal_before_per_command_term_override() 
         None,
         true,
         Some(&["TERM=screen-256color".to_owned()]),
+        None,
         None,
         None,
     )
@@ -303,6 +310,7 @@ fn terminal_profile_prefers_rmux_term_program_for_default_window_name() {
         Path::new("/tmp/rmux.sock"),
         None,
         true,
+        None,
         None,
         None,
         None,
@@ -344,6 +352,7 @@ fn terminal_profile_initial_pane_title_includes_user_host_and_cwd() {
         ]),
         None,
         Some(&home),
+        None,
     )
     .expect("profile");
 
@@ -375,6 +384,7 @@ fn terminal_profile_falls_back_to_shell_name_without_term_program() {
         Path::new("/tmp/rmux.sock"),
         None,
         false,
+        None,
         None,
         None,
         None,
@@ -410,6 +420,7 @@ fn terminal_profile_ignores_non_rmux_term_program_for_default_window_name() {
         Some(&["TERM_PROGRAM=tmux".to_owned()]),
         None,
         None,
+        None,
     )
     .expect("profile");
 
@@ -439,6 +450,7 @@ fn terminal_profile_runtime_window_name_tracks_spawned_command_shape() {
         Path::new("/tmp/rmux.sock"),
         None,
         true,
+        None,
         None,
         None,
         None,
@@ -643,6 +655,7 @@ fn windows_interactive_cmd_starts_in_profile_cwd_and_accepts_input() -> Result<(
         None,
         Some(rmux_core::PaneId::new(3)),
         Some(cwd.as_path()),
+        None,
     )?;
 
     let (master, mut child) =

@@ -3,7 +3,7 @@
 use std::error::Error;
 mod common;
 
-use common::{send_request, session_name, start_server, TestHarness};
+use common::{send_request, session_name, start_server, test_bash_path, TestHarness};
 use rmux_proto::{
     DisplayMessageRequest, ListWindowsRequest, NewSessionRequest, NewWindowRequest, Request,
     Response, Target, TerminalSize,
@@ -65,7 +65,7 @@ async fn list_windows_uses_shared_formatter_through_real_socket() -> Result<(), 
                 rows: 40,
             }),
             environment: Some(vec![
-                "SHELL=/bin/bash".to_owned(),
+                format!("SHELL={}", test_bash_path()),
                 "TERM_PROGRAM=tmux".to_owned(),
             ]),
         }),

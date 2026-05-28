@@ -41,6 +41,7 @@ fn terminal_profile_resolves_default_shell_with_command_environment_overrides() 
         ]),
         None,
         Some(root.as_path()),
+        None,
     )
     .expect("profile");
 

@@ -56,8 +56,13 @@ const STATUS_RIGHT_DEFAULT: &str =
 #[cfg(not(windows))]
 const STATUS_RIGHT_DEFAULT: &str =
     "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}\"#{=21:pane_title}\" %H:%M %d-%b-%y";
+// Empty default; the actual shell is resolved at spawn time via
+// `resolve_shell_path` (session-scope override → server-scope override →
+// `SHELL` env → /etc/passwd login shell → `/bin/sh` fallback). Hardcoding
+// `/bin/bash` here would break on systems where bash isn't at that path
+// (NixOS, FreeBSD, alpine/busybox, GitHub macOS runners with brew bash).
 #[cfg(unix)]
-const DEFAULT_SHELL: &str = "/bin/bash";
+const DEFAULT_SHELL: &str = "";
 #[cfg(windows)]
 const DEFAULT_SHELL: &str = "";
 
@@ -1088,6 +1093,32 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         ",",
         false,
         EFFECT_RENDER.union(EFFECT_STYLE_PARSE),
+    ),
+    option(
+        OptionName::Passthrough,
+        "passthrough",
+        &[],
+        SHOW_SESSION,
+        SCOPE_SESSION,
+        GlobalRoot::Session,
+        OptionValueType::Flag,
+        DefaultValue::Scalar("off"),
+        "",
+        false,
+        EFFECT_NONE,
+    ),
+    option(
+        OptionName::PassthroughReplayBytes,
+        "passthrough-replay-bytes",
+        &[],
+        SHOW_SERVER | SHOW_SESSION,
+        SCOPE_SERVER | SCOPE_SESSION,
+        GlobalRoot::Server,
+        OptionValueType::Number { minimum: 0 },
+        DefaultValue::Scalar("1048576"),
+        "",
+        false,
+        EFFECT_NONE,
     ),
     option(
         OptionName::PromptCursorColour,

@@ -15,6 +15,7 @@ use super::{
 #[cfg(unix)]
 use crate::pane_reader_runtime::PaneReaderRuntime;
 use crate::pane_transcript::SharedPaneTranscript;
+use crate::passthrough_replay::{append_to_log, SharedPassthroughReplayLog};
 
 struct PaneOutputReaderSpawn {
     session_name: rmux_proto::SessionName,
@@ -27,6 +28,7 @@ struct PaneOutputReaderSpawn {
     pane_exit_callback: Option<PaneExitCallback>,
     #[cfg(unix)]
     runtime: PaneReaderRuntime,
+    replay_log: Option<SharedPassthroughReplayLog>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -41,6 +43,7 @@ pub(crate) fn spawn_pane_output_reader(
     pane_alert_callback: Option<PaneAlertCallback>,
     pane_exit_callback: Option<PaneExitCallback>,
     runtime: PaneReaderRuntime,
+    replay_log: Option<SharedPassthroughReplayLog>,
 ) {
     let spawn = PaneOutputReaderSpawn {
         session_name,
@@ -52,6 +55,7 @@ pub(crate) fn spawn_pane_output_reader(
         pane_alert_callback,
         pane_exit_callback,
         runtime,
+        replay_log,
     };
     spawn_async_pane_output_reader(spawn);
 }
@@ -68,6 +72,7 @@ fn spawn_async_pane_output_reader(spawn: PaneOutputReaderSpawn) {
         pane_alert_callback,
         pane_exit_callback,
         runtime,
+        replay_log,
     } = spawn;
     let task = async move {
         if let Err(error) = read_pane_output(
@@ -79,6 +84,7 @@ fn spawn_async_pane_output_reader(spawn: PaneOutputReaderSpawn) {
             generation,
             pane_alert_callback,
             pane_exit_callback,
+            replay_log,
         )
         .await
         {
@@ -137,6 +143,7 @@ pub(crate) fn spawn_pane_output_reader(
     generation: Option<u64>,
     pane_alert_callback: Option<PaneAlertCallback>,
     pane_exit_callback: Option<PaneExitCallback>,
+    replay_log: Option<SharedPassthroughReplayLog>,
 ) {
     spawn_blocking_pane_output_reader_inner(
         session_name,
@@ -147,6 +154,7 @@ pub(crate) fn spawn_pane_output_reader(
         generation,
         pane_alert_callback,
         pane_exit_callback,
+        replay_log,
     );
 }
 
@@ -161,6 +169,7 @@ async fn read_pane_output(
     generation: Option<u64>,
     pane_alert_callback: Option<PaneAlertCallback>,
     pane_exit_callback: Option<PaneExitCallback>,
+    replay_log: Option<SharedPassthroughReplayLog>,
 ) -> io::Result<()> {
     let (pane_reader, reply_writer) = open_pane_writer(pane_master)?;
     let mut buffer = [0_u8; READ_BUFFER_SIZE];
@@ -190,14 +199,20 @@ async fn read_pane_output(
         }
 
         let bytes = buffer[..bytes_read].to_vec();
+        // Order is load-bearing: feed the transcript FIRST so that the
+        // replay log's snapshot refresh (triggered by over-budget here,
+        // or by alt-screen-exit detection later) sees a screen state
+        // that already reflects these bytes — not the previous chunk.
+        let append_result = apply_bytes_to_transcript(&transcript, &bytes);
+        append_to_log(replay_log.as_ref(), &transcript, &bytes);
         let replies = publish_pane_bytes(
             &session_name,
             pane_id,
-            &transcript,
             &pane_output,
             generation,
             pane_alert_callback.as_ref(),
             bytes,
+            append_result,
         );
         write_parser_replies_to_pane(&reply_writer, replies).await?;
     }
@@ -214,6 +229,7 @@ fn read_pane_output_blocking(
     generation: Option<u64>,
     pane_alert_callback: Option<PaneAlertCallback>,
     _pane_exit_callback: Option<PaneExitCallback>,
+    replay_log: Option<SharedPassthroughReplayLog>,
 ) -> io::Result<()> {
     let pane_reader = pane_master.into_io();
     let mut buffer = [0_u8; READ_BUFFER_SIZE];
@@ -229,37 +245,55 @@ fn read_pane_output_blocking(
             return Ok(());
         }
 
+        let bytes = buffer[..bytes_read].to_vec();
+        // See unix sibling for the load-bearing transcript-first order.
+        let append_result = apply_bytes_to_transcript(&transcript, &bytes);
+        append_to_log(replay_log.as_ref(), &transcript, &bytes);
         let replies = publish_pane_bytes(
             &session_name,
             pane_id,
-            &transcript,
             &pane_output,
             generation,
             pane_alert_callback.as_ref(),
-            buffer[..bytes_read].to_vec(),
+            bytes,
+            append_result,
         );
         write_parser_replies_to_pane_blocking(&pane_reader, replies)?;
     }
 }
 
+/// Feeds a chunk of inner-PTY bytes through the pane's `PaneTranscript`
+/// and returns the side effects (parser replies, terminal passthroughs,
+/// bell count). Pulled out of [`publish_pane_bytes`] so the reader loop
+/// can do this BEFORE [`append_to_log`] runs — that way a snapshot
+/// refresh inside the replay log sees a transcript that already
+/// reflects the bytes that just arrived.
+fn apply_bytes_to_transcript(
+    transcript: &SharedPaneTranscript,
+    bytes: &[u8],
+) -> crate::pane_transcript::PaneAppendResult {
+    let mut transcript = transcript
+        .lock()
+        .expect("pane transcript mutex must not be poisoned");
+    transcript.append_bytes_with_effects(bytes)
+}
+
+/// Publishes `bytes` (already applied to the transcript via
+/// [`apply_bytes_to_transcript`]) to the pane's output channel and
+/// fires alert / dropped-passthrough side effects. Returns the parser
+/// replies the caller must write back to the inner PTY.
 fn publish_pane_bytes(
     session_name: &rmux_proto::SessionName,
     pane_id: PaneId,
-    transcript: &SharedPaneTranscript,
     pane_output: &PaneOutputSender,
     generation: Option<u64>,
     pane_alert_callback: Option<&PaneAlertCallback>,
     bytes: Vec<u8>,
+    append_result: crate::pane_transcript::PaneAppendResult,
 ) -> Vec<u8> {
     if !pane_output.accepts_generation(generation) {
         return Vec::new();
     }
-    let append_result = {
-        let mut transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
-        transcript.append_bytes_with_effects(&bytes)
-    };
     let replies = append_result.replies;
     let dropped_passthrough_count = append_result.dropped_passthrough_count;
     if pane_output
@@ -317,6 +351,7 @@ fn spawn_blocking_pane_output_reader_inner(
     generation: Option<u64>,
     pane_alert_callback: Option<PaneAlertCallback>,
     pane_exit_callback: Option<PaneExitCallback>,
+    replay_log: Option<SharedPassthroughReplayLog>,
 ) {
     let thread_name = format!("rmux-pane-reader-{}", pane_id.as_u32());
     let session_for_log = session_name.clone();
@@ -332,6 +367,7 @@ fn spawn_blocking_pane_output_reader_inner(
                 generation,
                 pane_alert_callback,
                 pane_exit_callback,
+                replay_log,
             ) {
                 warn!(
                     session = %session_name,
@@ -406,6 +442,7 @@ finally:
             None,
             None,
             PaneReaderRuntime::current().expect("test runtime is active"),
+            None,
         );
 
         let contents = wait_for_file_contents(&output, Duration::from_secs(4)).await?;
@@ -445,6 +482,7 @@ finally:
                     None,
                     None,
                     PaneReaderRuntime::from_handle(server_runtime),
+                    None,
                 );
             });
             Ok(())
@@ -570,6 +608,7 @@ mod tests {
             output_reader,
             transcript.clone(),
             pane_output,
+            None,
             None,
             None,
             None,

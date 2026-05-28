@@ -272,6 +272,64 @@ impl HandlerState {
         (receiver, sender)
     }
 
+    /// Returns the per-pane replay log for a passthrough session,
+    /// allocating one the first time it's requested. Returns `None`
+    /// when the session is not in passthrough mode — non-passthrough
+    /// panes pay no memory cost.
+    pub(crate) fn passthrough_log_for_pane(
+        &mut self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> Option<crate::passthrough_replay::SharedPassthroughReplayLog> {
+        if !rmux_core::is_passthrough_session(&self.options, session_name) {
+            return None;
+        }
+        let entry = self
+            .replay_logs
+            .entry(session_name.clone())
+            .or_default()
+            .entry(pane_id)
+            .or_insert_with(|| crate::passthrough_replay::new_shared_log(&self.options, session_name));
+        Some(entry.clone())
+    }
+
+    /// Looks up the existing replay log for a pane without allocating.
+    /// Used by the attach forwarder to grab the active pane's log on
+    /// attach or window switch.
+    pub(crate) fn passthrough_log_lookup(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> Option<crate::passthrough_replay::SharedPassthroughReplayLog> {
+        self.replay_logs
+            .get(session_name)
+            .and_then(|panes| panes.get(&pane_id))
+            .cloned()
+    }
+
+    /// Snapshot of a pane's `(mode_bits, cursor_style, is_alternate)`.
+    /// Used by the passthrough attach forwarder at window-switch time to
+    /// compute the diff between the source pane's state and the
+    /// target's, so it can emit reset toggles for modes the target
+    /// doesn't want — e.g. a TUI in source set `?1006h` for mouse but
+    /// the shell in target doesn't want it; without the diff, mouse
+    /// stays on at the host and scroll events arrive at the shell as
+    /// input bytes. `is_alternate` covers the same hazard for the
+    /// alt-screen buffer bit, which lives outside the mode bitmap.
+    pub(crate) fn pane_screen_state_lookup(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> Option<(u32, u32, bool)> {
+        let transcript = self.transcripts.get(session_name)?.get(&pane_id)?;
+        let transcript = transcript.lock().ok()?;
+        Some((
+            transcript.mode(),
+            transcript.cursor_style(),
+            transcript.is_alternate(),
+        ))
+    }
+
     pub(crate) fn session_pane_outputs(
         &self,
         session_name: &SessionName,
@@ -363,6 +421,7 @@ impl HandlerState {
             );
         }
         self.clear_attached_submitted_line(session_name, pane_id);
+        let replay_log = self.passthrough_log_for_pane(session_name, pane_id);
         spawn_pane_output_reader(
             session_name.clone(),
             pane_id,
@@ -374,6 +433,7 @@ impl HandlerState {
             spawn.pane_exit_callback,
             #[cfg(unix)]
             reader_runtime,
+            replay_log,
         );
         Ok(())
     }
@@ -431,6 +491,7 @@ impl HandlerState {
             );
         }
         self.clear_attached_submitted_line(session_name, pane_id);
+        let replay_log = self.passthrough_log_for_pane(session_name, pane_id);
         spawn_pane_output_reader(
             session_name.clone(),
             pane_id,
@@ -442,6 +503,7 @@ impl HandlerState {
             spawn.pane_exit_callback,
             #[cfg(unix)]
             reader_runtime,
+            replay_log,
         );
         Ok(())
     }
@@ -451,6 +513,7 @@ impl HandlerState {
         session_name: &SessionName,
     ) -> RemovedPaneOutputs {
         let _ = self.dead_panes.remove(session_name);
+        let _ = self.replay_logs.remove(session_name);
         let attached_submitted_rows = self
             .attached_submitted_rows
             .remove(session_name)
@@ -473,6 +536,9 @@ impl HandlerState {
     ) -> Option<(SharedPaneTranscript, PaneOutputSender)> {
         if let Some(dead_panes) = self.dead_panes.get_mut(session_name) {
             let _ = dead_panes.remove(&pane_id);
+        }
+        if let Some(panes) = self.replay_logs.get_mut(session_name) {
+            let _ = panes.remove(&pane_id);
         }
         self.clear_attached_submitted_line(session_name, pane_id);
         if let Some(generations) = self.pane_output_generations.get_mut(session_name) {
@@ -502,6 +568,9 @@ impl HandlerState {
         for pane_id in pane_ids {
             if let Some(dead_panes) = self.dead_panes.get_mut(session_name) {
                 let _ = dead_panes.remove(pane_id);
+            }
+            if let Some(panes) = self.replay_logs.get_mut(session_name) {
+                let _ = panes.remove(pane_id);
             }
             if let Some(absolute_y) = self.take_attached_submitted_line(session_name, *pane_id) {
                 removed.attached_submitted_rows.insert(*pane_id, absolute_y);

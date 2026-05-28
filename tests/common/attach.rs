@@ -1,6 +1,8 @@
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
@@ -78,6 +80,62 @@ impl AttachedSession {
         })
     }
 
+    /// Same as [`spawn`], but interpose a launcher shell between the
+    /// PTY and `rmux attach-session`.  This is how a real user
+    /// invokes the client: `zsh` (or whatever their interactive
+    /// shell is) execs the rmux binary, inheriting the same
+    /// controlling tty.  Useful for parameterising over POSIX shells
+    /// to catch quoting / env / signal-handling surprises on the
+    /// launcher boundary.
+    pub(crate) fn spawn_via_shell(
+        harness: &CliHarness,
+        session_name: &str,
+        size: TerminalSize,
+        shell_path: &Path,
+    ) -> Result<Self, Box<dyn Error>> {
+        let pty = PtyPair::open_with_size(size)?;
+        let master = File::from(pty.master().try_clone()?.into_owned_fd());
+        let terminal = File::from(pty.slave().try_clone()?.into_owned_fd());
+        let original_termios = prepare_canonical_termios(&terminal)?;
+
+        // Use the harness's `base_command` only to extract the env it
+        // would have configured, then thread that through the shell.
+        let template = harness.base_command();
+        let rmux_path = template.get_program().to_os_string();
+        let mut shell_command = Command::new(shell_path);
+        for (key, value) in template.get_envs() {
+            match value {
+                Some(value) => {
+                    shell_command.env(key, value);
+                }
+                None => {
+                    shell_command.env_remove(key);
+                }
+            }
+        }
+        let inner = format!(
+            "exec {} attach-session -t {}",
+            shell_quote_path(&rmux_path),
+            shell_quote(session_name),
+        );
+        shell_command
+            .arg("-c")
+            .arg(inner)
+            .stdin(Stdio::from(pty.slave().try_clone()?.into_owned_fd()))
+            .stdout(Stdio::from(pty.slave().try_clone()?.into_owned_fd()))
+            .stderr(Stdio::from(pty.slave().try_clone()?.into_owned_fd()));
+        drop(pty);
+
+        let child = shell_command.spawn()?;
+
+        Ok(Self {
+            master,
+            terminal,
+            original_termios,
+            child,
+        })
+    }
+
     pub(crate) fn master_mut(&mut self) -> &mut File {
         &mut self.master
     }
@@ -139,6 +197,14 @@ impl Drop for AttachedSession {
     fn drop(&mut self) {
         let _ = terminate_child(&mut self.child);
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+fn shell_quote_path(value: &OsStr) -> String {
+    shell_quote(&value.to_string_lossy())
 }
 
 fn prepare_canonical_termios<Fd>(fd: &Fd) -> Result<Termios, Box<dyn Error>>

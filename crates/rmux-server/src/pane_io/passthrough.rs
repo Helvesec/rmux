@@ -77,7 +77,7 @@ mod tests {
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            _pane_master: pty.into_master(),
+            pane_master: pty.into_master(),
             pane_output: Some(pane_output.subscribe()),
             render_frame: Vec::new(),
             outer_terminal: OuterTerminal::resolve(
@@ -90,6 +90,7 @@ mod tests {
             sixel_passthrough: false,
             persistent_overlay_state_id: None,
             live_pane: None,
+            active_pane_id: None,
         };
 
         let frame = render_passthroughs(
@@ -109,7 +110,7 @@ mod tests {
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            _pane_master: pty.into_master(),
+            pane_master: pty.into_master(),
             pane_output: Some(pane_output.subscribe()),
             render_frame: Vec::new(),
             outer_terminal: OuterTerminal::resolve(
@@ -122,6 +123,7 @@ mod tests {
             sixel_passthrough: false,
             persistent_overlay_state_id: None,
             live_pane: None,
+            active_pane_id: None,
         };
 
         let frame = render_passthroughs(
@@ -144,7 +146,7 @@ mod tests {
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            _pane_master: pty.into_master(),
+            pane_master: pty.into_master(),
             pane_output: Some(pane_output.subscribe()),
             render_frame: Vec::new(),
             outer_terminal: OuterTerminal::resolve(
@@ -157,6 +159,7 @@ mod tests {
             sixel_passthrough: true,
             persistent_overlay_state_id: None,
             live_pane: None,
+            active_pane_id: None,
         };
 
         let frame = render_passthroughs(
@@ -172,7 +175,7 @@ mod tests {
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            _pane_master: pty.into_master(),
+            pane_master: pty.into_master(),
             pane_output: Some(pane_output.subscribe()),
             render_frame: Vec::new(),
             outer_terminal: OuterTerminal::resolve(
@@ -185,6 +188,7 @@ mod tests {
             sixel_passthrough: false,
             persistent_overlay_state_id: None,
             live_pane: None,
+            active_pane_id: None,
         };
 
         let frame = render_passthroughs(
@@ -204,7 +208,7 @@ mod tests {
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            _pane_master: pty.into_master(),
+            pane_master: pty.into_master(),
             pane_output: Some(pane_output.subscribe()),
             render_frame: Vec::new(),
             outer_terminal: OuterTerminal::resolve(
@@ -217,6 +221,7 @@ mod tests {
             sixel_passthrough: true,
             persistent_overlay_state_id: None,
             live_pane: None,
+            active_pane_id: None,
         };
 
         let frame = render_passthroughs(

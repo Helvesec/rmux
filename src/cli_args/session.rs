@@ -23,6 +23,12 @@ pub(crate) struct NewSessionArgs {
     pub(crate) window_name: Option<String>,
     #[arg(short = 'P', action = ArgAction::SetTrue)]
     pub(crate) print_session_info: bool,
+    /// Create the session in passthrough mode. The host terminal stays in
+    /// the main screen buffer (no alt-screen toggle), inner-PTY bytes
+    /// flow verbatim to the client, and pane operations are rejected.
+    /// Window operations (`new-window`, `select-window`, …) still work.
+    #[arg(long = "passthrough", action = ArgAction::SetTrue)]
+    pub(crate) passthrough: bool,
     #[arg(short = 's', value_parser = parse_session_name)]
     pub(crate) session_name: Option<SessionName>,
     #[arg(short = 't', value_parser = parse_session_name)]

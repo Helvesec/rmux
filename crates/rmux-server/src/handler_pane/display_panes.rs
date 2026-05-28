@@ -35,6 +35,13 @@ impl RequestHandler {
         let session_name = request.target;
         let (response, overlay_frame, clear_frame, duration) = {
             let state = self.state.lock().await;
+            if let Err(error) = crate::handler_support::reject_pane_op_in_passthrough(
+                &state,
+                &session_name,
+                "display-panes",
+            ) {
+                return Response::Error(ErrorResponse { error });
+            }
             match state.sessions.session(&session_name) {
                 Some(session) => {
                     let overlay_frame =

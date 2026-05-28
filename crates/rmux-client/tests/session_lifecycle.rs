@@ -290,6 +290,7 @@ fn grouped_new_session_without_explicit_name_round_trips_through_the_real_socket
         print_format: Some("#{session_name}".to_owned()),
         command: None,
         process_command: None,
+        passthrough: false,
         client_environment: None,
     }))?;
 

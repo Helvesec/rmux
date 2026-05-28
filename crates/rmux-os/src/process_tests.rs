@@ -150,6 +150,151 @@ fn parses_nul_separated_environment() {
     assert_eq!(environment.get("B").map(String::as_str), Some("two"));
 }
 
+#[cfg(unix)]
+#[test]
+fn winch_foreground_pgrp_returns_false_for_non_tty_fd() {
+    use std::os::fd::AsFd;
+    // A pipe has no controlling pgrp, so `tcgetpgrp` returns -1 and
+    // the helper should bail without attempting `killpg`. rustix's
+    // `pipe()` returns owned fds directly, no `from_raw_fd` unsafe.
+    let (read_end, _write_end) = rustix::pipe::pipe().expect("create pipe");
+    assert!(!unix::winch_foreground_pgrp(read_end.as_fd()));
+}
+
+#[cfg(unix)]
+#[test]
+fn winch_foreground_pgrp_delivers_signal_to_pty_session_leader() {
+    use std::io::Read;
+    use std::os::fd::AsFd;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    // Allocate a PTY pair via rustix. We hold the master; the spawned
+    // shell will adopt the slave as its controlling terminal so the
+    // kernel knows who to deliver SIGWINCH to.
+    //
+    // rustix doesn't expose a one-shot `openpty`, so we drive the
+    // four POSIX primitives directly: open the multiplexer, grant
+    // the slave permissions, unlock it, then open its pts path.
+    // All four wrappers are safe; no `from_raw_fd` dance.
+    let master = rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
+        .expect("openpt");
+    rustix::pty::grantpt(&master).expect("grantpt");
+    rustix::pty::unlockpt(&master).expect("unlockpt");
+    let slave_name = rustix::pty::ptsname(&master, Vec::new()).expect("ptsname");
+    let slave = rustix::fs::open(
+        slave_name.as_c_str(),
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY,
+        rustix::fs::Mode::empty(),
+    )
+    .expect("open slave pts");
+    let slave_stdin = slave.try_clone().expect("clone slave for stdin");
+    let slave_stdout = slave.try_clone().expect("clone slave for stdout");
+    let slave_stderr = slave;
+
+    // The shell installs a SIGWINCH trap that writes a sentinel to
+    // stdout (= the slave PTY), then loops. `sleep 0.05` keeps the
+    // wait short so the trap fires promptly; the outer loop bounds
+    // child lifetime in case the test asserts before reaching kill.
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg("trap 'printf WINCHED' WINCH; i=0; while [ \"$i\" -lt 100 ]; do sleep 0.05; i=$((i+1)); done");
+    cmd.stdin(Stdio::from(slave_stdin))
+        .stdout(Stdio::from(slave_stdout))
+        .stderr(Stdio::from(slave_stderr));
+    // `Command::pre_exec` itself is `unsafe` (async-signal-safety
+    // contract on what may run between fork and exec) — that outer
+    // unsafe is structural, not avoidable. But the *body* can be
+    // pure rustix calls instead of raw libc, which keeps the
+    // unsafe surface as small as possible.
+    unsafe {
+        cmd.pre_exec(|| {
+            use std::os::fd::BorrowedFd;
+            rustix::process::setsid().map_err(std::io::Error::from)?;
+            // fd 0 is the slave PTY, wired up by `Command::stdin`
+            // above. Borrowing it for the TIOCSCTTY ioctl is safe
+            // — we don't own it, just need a BorrowedFd handle.
+            // SAFETY: the kernel has just dup2'd the slave to fd 0
+            // as part of `posix_spawn`'s fd setup; it's a real,
+            // open descriptor for the lifetime of pre_exec.
+            let stdin_fd = BorrowedFd::borrow_raw(0);
+            rustix::process::ioctl_tiocsctty(stdin_fd).map_err(std::io::Error::from)?;
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().expect("spawn shell under pty");
+
+    // Wait until the shell has the slave as its foreground pgrp.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut pgrp = None;
+    while pgrp.is_none() {
+        pgrp = unix::foreground_pid(master.as_fd());
+        if pgrp.is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let exited = child.try_wait().expect("try_wait").is_some();
+            child.kill().ok();
+            child.wait().ok();
+            panic!(
+                "child shell did not claim foreground pgrp within 2s (child exited prematurely: {exited})"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let fg_pgrp = pgrp.expect("fg pgrp set above");
+    // Give the shell a moment to install its WINCH trap after the
+    // pgrp is set — the foreground pgrp is set by setsid+TIOCSCTTY,
+    // which runs before the shell parses `trap '...' WINCH`.
+    std::thread::sleep(Duration::from_millis(100));
+
+    assert!(
+        unix::winch_foreground_pgrp(master.as_fd()),
+        "killpg should succeed against a live fg pgrp (pgrp={fg_pgrp}, child={})",
+        child.id()
+    );
+
+    // Read until we see the sentinel. The master is blocking, so use a
+    // background-thread + recv pattern with a deadline.
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let master_for_reader = master.try_clone().expect("clone master");
+    std::thread::spawn(move || {
+        let mut file = std::fs::File::from(master_for_reader);
+        let mut buffer = [0_u8; 256];
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send(buffer[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let mut collected = Vec::new();
+    let read_deadline = Instant::now() + Duration::from_secs(3);
+    while !collected.windows(7).any(|window| window == b"WINCHED") {
+        let remaining = read_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(chunk) => collected.extend_from_slice(&chunk),
+            Err(_) => break,
+        }
+    }
+    let saw_sentinel = collected.windows(7).any(|window| window == b"WINCHED");
+    child.kill().ok();
+    child.wait().ok();
+    assert!(
+        saw_sentinel,
+        "expected SIGWINCH sentinel from shell; got: {:?}",
+        String::from_utf8_lossy(&collected),
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn parses_macos_procargs_environment() {

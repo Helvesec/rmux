@@ -9,6 +9,12 @@ description = "Tokio daemon and request dispatcher for the RMUX terminal multipl
 keywords = ["terminal", "multiplexer", "daemon"]
 categories = ["command-line-interface"]
 
+[features]
+# Compile the `handler_attach_tests/*` test suite a second time with every
+# session defaulted to `passthrough: true`.  Lets a single `cargo test` run
+# both modes and surface render-expectation divergence mechanically.
+passthrough-global-tests = []
+
 [dependencies]
 async-recursion = "=1.1.1"
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }

@@ -85,6 +85,9 @@ mod pane_terminals;
 mod pane_transcript;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
+mod passthrough_replay;
+#[cfg(any(unix, windows))]
+#[cfg_attr(windows, allow(dead_code))]
 mod renderer;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
@@ -103,6 +106,8 @@ mod terminal;
 mod test_env;
 #[cfg(test)]
 mod test_shell;
+#[cfg(any(unix, windows))]
+mod terminal_query;
 #[cfg(unix)]
 mod unix_socket;
 #[cfg(any(unix, windows))]

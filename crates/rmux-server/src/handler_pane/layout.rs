@@ -19,6 +19,13 @@ impl RequestHandler {
         };
         let response = {
             let mut state = self.state.lock().await;
+            if let Err(error) = crate::handler_support::reject_pane_op_in_passthrough(
+                &state,
+                &session_name,
+                "select-layout",
+            ) {
+                return Response::Error(ErrorResponse { error });
+            }
             let option_size = layout_main_pane_size_for_select_target(&state, &request.target);
             match state.mutate_session_and_resize_terminals(&session_name, |session| {
                 let window_index = layout_window_index(session, &request.target);
@@ -69,6 +76,13 @@ impl RequestHandler {
         };
         let response = {
             let mut state = self.state.lock().await;
+            if let Err(error) = crate::handler_support::reject_pane_op_in_passthrough(
+                &state,
+                &session_name,
+                "select-layout",
+            ) {
+                return Response::Error(ErrorResponse { error });
+            }
             match state.mutate_session_and_resize_terminals(&session_name, |session| {
                 let window_index = layout_window_index(session, &request.target);
                 session.save_old_layout_in_window(window_index)?;
@@ -107,6 +121,13 @@ impl RequestHandler {
         };
         let response = {
             let mut state = self.state.lock().await;
+            if let Err(error) = crate::handler_support::reject_pane_op_in_passthrough(
+                &state,
+                &session_name,
+                "select-layout",
+            ) {
+                return Response::Error(ErrorResponse { error });
+            }
             match state.mutate_session_and_resize_terminals(&session_name, |session| {
                 let window_index = layout_window_index(session, &request.target);
                 let _ = session.reapply_old_layout_in_window(window_index)?;
@@ -144,6 +165,13 @@ impl RequestHandler {
         };
         let response = {
             let mut state = self.state.lock().await;
+            if let Err(error) = crate::handler_support::reject_pane_op_in_passthrough(
+                &state,
+                &session_name,
+                "spread-layout",
+            ) {
+                return Response::Error(ErrorResponse { error });
+            }
             match state.mutate_session_and_resize_terminals(&session_name, |session| {
                 let window_index = layout_window_index(session, &request.target);
                 session.save_old_layout_in_window(window_index)?;
@@ -179,6 +207,13 @@ impl RequestHandler {
         let session_name = request.target.session_name().clone();
         let response = {
             let mut state = self.state.lock().await;
+            if let Err(error) = crate::handler_support::reject_pane_op_in_passthrough(
+                &state,
+                &session_name,
+                "next-layout",
+            ) {
+                return Response::Error(ErrorResponse { error });
+            }
             let option_size = layout_main_pane_size_for_window_target(&state, &request.target);
             match state.mutate_session_and_resize_terminals(&session_name, |session| {
                 session.save_old_layout_in_window(request.target.window_index())?;
@@ -212,6 +247,13 @@ impl RequestHandler {
         let session_name = request.target.session_name().clone();
         let response = {
             let mut state = self.state.lock().await;
+            if let Err(error) = crate::handler_support::reject_pane_op_in_passthrough(
+                &state,
+                &session_name,
+                "previous-layout",
+            ) {
+                return Response::Error(ErrorResponse { error });
+            }
             let option_size = layout_main_pane_size_for_window_target(&state, &request.target);
             match state.mutate_session_and_resize_terminals(&session_name, |session| {
                 session.save_old_layout_in_window(request.target.window_index())?;
@@ -250,6 +292,13 @@ impl RequestHandler {
             PaneTarget::with_window(session_name.clone(), window_index, pane_index);
         let response = {
             let mut state = self.state.lock().await;
+            if let Err(error) = crate::handler_support::reject_pane_op_in_passthrough(
+                &state,
+                &session_name,
+                "resize-pane",
+            ) {
+                return Response::Error(ErrorResponse { error });
+            }
             match state.mutate_session_and_resize_terminals(&session_name, |session| {
                 session.resize_pane_in_window(window_index, pane_index, adjustment)?;
 

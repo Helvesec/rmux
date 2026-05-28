@@ -4,6 +4,10 @@ const FROZEN_OPTIONS_TABLE_PATH: &str = "/opt/rmux/reference/tmux/options-table.
 const FROZEN_OPTIONS_TABLE_ENV: &str = "RMUX_FROZEN_OPTIONS_TABLE";
 const REQUIRE_FROZEN_TMUX_ENV: &str = "RMUX_REQUIRE_FROZEN_TMUX";
 
+/// Option names that exist in rmux but not in the frozen tmux source —
+/// rmux-specific extensions. Excluded from frozen-inventory comparisons.
+const RMUX_EXTENSION_NAMES: &[&str] = &["passthrough", "passthrough-replay-bytes"];
+
 #[test]
 fn option_registry_is_closed_unique_and_contains_full_frozen_inventory() {
     let metadata = registry::registry();
@@ -16,9 +20,10 @@ fn option_registry_is_closed_unique_and_contains_full_frozen_inventory() {
         .map(|entry| entry.name())
         .collect::<HashSet<_>>();
 
-    assert_eq!(metadata.len(), 146);
-    assert_eq!(unique_options.len(), 146);
-    assert_eq!(unique_names.len(), 146);
+    let expected = 146 + RMUX_EXTENSION_NAMES.len();
+    assert_eq!(metadata.len(), expected);
+    assert_eq!(unique_options.len(), expected);
+    assert_eq!(unique_names.len(), expected);
 }
 
 #[test]
@@ -39,6 +44,7 @@ fn option_registry_matches_frozen_tmux_option_names() {
     let registry_names = registry::registry()
         .iter()
         .map(|entry| entry.name().to_owned())
+        .filter(|name| !RMUX_EXTENSION_NAMES.contains(&name.as_str()))
         .collect::<HashSet<_>>();
 
     assert_eq!(tmux_names.len(), 146);

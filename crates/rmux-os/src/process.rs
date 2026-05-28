@@ -98,6 +98,40 @@ pub mod unix {
         }
         u32::try_from(pgrp).ok()
     }
+
+    /// Sends `SIGWINCH` to the foreground process group of the terminal
+    /// referenced by `fd`. Returns `true` when the signal was delivered.
+    ///
+    /// **Why:** the kernel only emits `SIGWINCH` to the slave's foreground
+    /// pgrp when the master's winsize *changes* — re-applying the same
+    /// size is a no-op. When an outer rmux event (e.g. a window switch in
+    /// passthrough mode) leaves a lazy-redraw TUI like `vim` with stale
+    /// glyphs and the geometry hasn't changed, we still want it to
+    /// repaint. Delivering `SIGWINCH` directly to the fg pgrp gives the
+    /// same nudge without faking a size flap.
+    ///
+    /// Returns `false` when `fd` has no foreground pgrp (not a tty, or
+    /// nothing currently has it as ctty), or when the `killpg` call
+    /// itself fails (caller treats the failure as a benign no-op).
+    pub fn winch_foreground_pgrp(fd: BorrowedFd<'_>) -> bool {
+        let Some(pgrp) = foreground_pid(fd) else {
+            return false;
+        };
+        // rustix's `Pid::from_raw` accepts non-zero, non-negative pid_t.
+        // `foreground_pid` already filtered `tcgetpgrp <= 0`, so this
+        // conversion only fails on a u32 that doesn't fit in pid_t —
+        // treat that as "no fg pgrp, benign no-op".
+        let Ok(pgrp_pid_t) = i32::try_from(pgrp) else {
+            return false;
+        };
+        let Some(pid) = rustix::process::Pid::from_raw(pgrp_pid_t) else {
+            return false;
+        };
+        // ESRCH (process group exited) surfaces as `Err`; we map any
+        // failure to `false` since the caller treats it as a benign
+        // no-op.
+        rustix::process::kill_process_group(pid, rustix::process::Signal::WINCH).is_ok()
+    }
 }
 
 #[cfg(target_os = "linux")]

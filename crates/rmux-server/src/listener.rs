@@ -165,6 +165,7 @@ async fn serve_connection(
                         ));
                     };
                     let session_name = response.session_name.clone();
+                    let session_name_for_route = session_name.clone();
                     let terminal_context = attach.target.outer_terminal.context().clone();
                     let attach_id = handler
                         .register_attach_with_access(
@@ -193,20 +194,37 @@ async fn serve_connection(
                             "preserving buffered bytes at attach upgrade boundary"
                         );
                     }
-                    let result = pane_io::forward_attach(
-                        stream,
-                        attach.target,
-                        buffered_bytes,
-                        shutdown,
-                        attach.control_rx,
-                        attach.closing,
-                        attach.persistent_overlay_epoch,
-                        pane_io::LiveAttachInputContext {
-                            handler: Arc::clone(&handler),
-                            attach_pid: requester.pid,
-                        },
-                    )
-                    .await;
+                    let result = if handler.is_session_passthrough(&session_name_for_route).await {
+                        pane_io::forward_attach_passthrough(
+                            stream,
+                            attach.target,
+                            buffered_bytes,
+                            shutdown,
+                            attach.control_rx,
+                            attach.closing,
+                            attach.persistent_overlay_epoch,
+                            pane_io::LiveAttachInputContext {
+                                handler: Arc::clone(&handler),
+                                attach_pid: requester.pid,
+                            },
+                        )
+                        .await
+                    } else {
+                        pane_io::forward_attach(
+                            stream,
+                            attach.target,
+                            buffered_bytes,
+                            shutdown,
+                            attach.control_rx,
+                            attach.closing,
+                            attach.persistent_overlay_epoch,
+                            pane_io::LiveAttachInputContext {
+                                handler: Arc::clone(&handler),
+                                attach_pid: requester.pid,
+                            },
+                        )
+                        .await
+                    };
                     handler.finish_attach(requester.pid, attach_id).await;
                     return result;
                 }

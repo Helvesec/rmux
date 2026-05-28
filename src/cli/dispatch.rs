@@ -54,6 +54,7 @@ pub(super) fn default_client_command() -> Command {
         print_format: None,
         window_name: None,
         print_session_info: false,
+        passthrough: false,
         group_target: None,
         kill_other_clients: false,
         cols: None,

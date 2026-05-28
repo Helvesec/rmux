@@ -38,6 +38,7 @@ impl TerminalProfile {
         overrides: Option<&[String]>,
         pane_id: Option<PaneId>,
         requested_cwd: Option<&Path>,
+        window_index: Option<u32>,
     ) -> Result<Self, RmuxError> {
         Self::for_session_with_spawn_environment(
             environment,
@@ -50,6 +51,7 @@ impl TerminalProfile {
             overrides,
             pane_id,
             requested_cwd,
+            window_index,
         )
     }
 
@@ -65,6 +67,7 @@ impl TerminalProfile {
         overrides: Option<&[String]>,
         pane_id: Option<PaneId>,
         requested_cwd: Option<&Path>,
+        window_index: Option<u32>,
     ) -> Result<Self, RmuxError> {
         Self::for_session_with_spawn_environment(
             environment,
@@ -77,6 +80,7 @@ impl TerminalProfile {
             overrides,
             pane_id,
             requested_cwd,
+            window_index,
         )
     }
 
@@ -92,6 +96,7 @@ impl TerminalProfile {
         overrides: Option<&[String]>,
         pane_id: Option<PaneId>,
         requested_cwd: Option<&Path>,
+        window_index: Option<u32>,
     ) -> Result<Self, RmuxError> {
         let mut resolved = base_process_environment();
         environment.apply_to_process_environment(Some(session_name), &mut resolved);
@@ -143,6 +148,17 @@ impl TerminalProfile {
 
         if let Some(pane_id) = pane_id {
             resolved.insert("RMUX_PANE".to_owned(), format!("%{}", pane_id.as_u32()));
+        }
+
+        // Prompt-chrome aids: session name is always known at session-pane
+        // spawn; window index is known wherever the caller has a pane in a
+        // specific window. Both are static for the lifetime of the spawned
+        // shell — they don't track renames or renumbering. Sufficient for
+        // `Ctrl-b n` style window switches in passthrough mode, where the
+        // next window has its *own* shell with its own RMUX_WINDOW baked in.
+        resolved.insert("RMUX_SESSION".to_owned(), session_name.as_str().to_owned());
+        if let Some(window_index) = window_index {
+            resolved.insert("RMUX_WINDOW".to_owned(), window_index.to_string());
         }
 
         set_environment_value(

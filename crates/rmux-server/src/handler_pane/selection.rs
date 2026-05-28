@@ -54,6 +54,17 @@ impl RequestHandler {
         let title = request.title.clone();
         let (response, pane_changed) = {
             let mut state = self.state.lock().await;
+            // `set-pane-title` (title.is_some) is harmless in passthrough mode
+            // — it doesn't change pane structure. Reject only true selection.
+            if title.is_none() {
+                if let Err(error) = crate::handler_support::reject_pane_op_in_passthrough(
+                    &state,
+                    &session_name,
+                    "select-pane",
+                ) {
+                    return Response::Error(ErrorResponse { error });
+                }
+            }
             let pane_changed = title.is_none()
                 && state
                     .sessions
@@ -116,6 +127,13 @@ impl RequestHandler {
         let anchor_pane_index = request.target.pane_index();
         let (response, pane_changed) = {
             let mut state = self.state.lock().await;
+            if let Err(error) = crate::handler_support::reject_pane_op_in_passthrough(
+                &state,
+                &session_name,
+                "select-pane",
+            ) {
+                return Response::Error(ErrorResponse { error });
+            }
             let active_before = state
                 .sessions
                 .session(&session_name)
@@ -169,6 +187,13 @@ impl RequestHandler {
         let window_index = request.target.window_index();
         let response = {
             let mut state = self.state.lock().await;
+            if let Err(error) = crate::handler_support::reject_pane_op_in_passthrough(
+                &state,
+                &session_name,
+                "select-pane -m",
+            ) {
+                return Response::Error(ErrorResponse { error });
+            }
             match (|| -> Result<SelectPaneResponse, RmuxError> {
                 if let Some(title) = request.title.as_deref() {
                     state.set_pane_title(&request.target, title)?;

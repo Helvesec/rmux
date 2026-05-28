@@ -65,6 +65,7 @@ async fn attached_prefix_c_creates_window_across_separate_reads() {
 
 #[tokio::test]
 async fn attached_kill_last_pane_exits_the_session() {
+    if skip_if_passthrough("pane-kill lifecycle uses a multi-pane setup via SplitWindow") { return; }
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");

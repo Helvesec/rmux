@@ -52,10 +52,11 @@ pub(super) fn open_attach_target(target: AttachTarget) -> io::Result<OpenAttachT
         sixel_passthrough,
         persistent_overlay_state_id,
         live_pane,
+        active_pane_id,
     } = target;
     Ok(OpenAttachTarget {
         session_name,
-        _pane_master: pane_master,
+        pane_master,
         pane_output: Some(pane_output.subscribe()),
         render_frame,
         outer_terminal,
@@ -65,6 +66,7 @@ pub(super) fn open_attach_target(target: AttachTarget) -> io::Result<OpenAttachT
         sixel_passthrough,
         persistent_overlay_state_id,
         live_pane,
+        active_pane_id,
     })
 }
 

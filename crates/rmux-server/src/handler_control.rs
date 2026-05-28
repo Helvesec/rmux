@@ -11,7 +11,7 @@ use crate::control::{ControlClientFlags, ControlModeUpgrade, ControlServerEvent}
 use crate::control_notifications::{
     collect_control_notifications, ControlClientSnapshot, PreparedControlNotification,
 };
-use crate::handler_support::{ambiguous_attached_client, attached_client_required};
+use crate::handler_support::{ambiguous_attached_client_listing, attached_client_required};
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::PaneOutputSender;
 #[cfg(test)]
@@ -248,7 +248,11 @@ impl RequestHandler {
                     ))
                 }
             }
-            _ => Err(ambiguous_attached_client(command_name)),
+            _ => Err(ambiguous_attached_client_listing(
+                command_name,
+                &attach_candidates,
+                &control_candidates,
+            )),
         }
     }
 

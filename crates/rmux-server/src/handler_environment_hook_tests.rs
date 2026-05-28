@@ -917,6 +917,7 @@ async fn new_session_ext_client_environment_respects_tmux_precedence() {
             print_format: None,
             command: None,
             process_command: None,
+            passthrough: false,
             client_environment: Some(vec![
                 "PATH=/tmp/rmux-client-bin:/usr/bin".to_owned(),
                 "SSH_AUTH_SOCK=/tmp/rmux-client-agent.sock".to_owned(),

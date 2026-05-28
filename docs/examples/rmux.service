@@ -1,0 +1,58 @@
+# rmux user-mode systemd unit — persistent server that survives SSH logout.
+#
+# Install:
+#   1. Copy this file to ~/.config/systemd/user/rmux.service
+#   2. Enable lingering so user@.service stays up across logout:
+#        sudo loginctl enable-linger $USER
+#   3. Reload and start:
+#        systemctl --user daemon-reload
+#        systemctl --user enable --now rmux.service
+#
+# Why this works:
+#   * `rmux -D` runs the server in the foreground (no fork), so
+#     systemd's Type=simple owns the real daemon process — no PID
+#     guessing, no Restart silently missing a crash.
+#   * The unit lives in `app.slice`, not in your SSH session-XX.scope.
+#     When you close the SSH connection, only the session scope is
+#     destroyed; `app.slice` (and the rmux daemon inside it) survives.
+#   * Lingering keeps `user@<uid>.service` alive across logout, which
+#     is what hosts `app.slice` in the first place.
+#
+# Gotcha — upgrading the binary safely:
+#   `Restart=on-failure` only fires for failures, so a clean
+#   `systemctl --user stop` (exit 0) will NOT bounce. If you do
+#   `systemctl stop && cp new-binary && systemctl start` and the
+#   chain is interrupted between stop and start, sessions are gone.
+#   Prefer atomic swap + restart in a single transaction:
+#       cp -f target/release/rmux ~/.cargo/bin/rmux.new
+#       mv -f  ~/.cargo/bin/rmux.new ~/.cargo/bin/rmux  # atomic rename
+#       systemctl --user restart rmux.service
+#   The running process keeps the old inode open until restart;
+#   `restart` is one systemd job so an interrupt can't leave the
+#   unit half-stopped.
+#
+# Connect to it with:
+#   rmux attach -t persistent
+
+[Unit]
+Description=rmux server (persistent)
+Documentation=https://github.com/gilescope/rmux
+After=default.target
+
+[Service]
+Type=simple
+# `-S` pins the socket path so the unit doesn't depend on a TMPDIR.
+ExecStart=%h/.cargo/bin/rmux -D -S %t/rmux-%U/default
+# Seed a long-lived session once the server is bound. Best-effort:
+# if the session already exists from a previous boot, this is a
+# no-op-with-warning, which is fine.
+ExecStartPost=-%h/.cargo/bin/rmux -S %t/rmux-%U/default new-session -d --passthrough -s persistent
+ExecStop=%h/.cargo/bin/rmux -S %t/rmux-%U/default kill-server
+Restart=on-failure
+RestartSec=2
+# Don't aggressively kill children when the unit stops; rmux's own
+# pane cleanup handles per-session shells.
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

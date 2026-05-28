@@ -434,6 +434,76 @@ impl RequestHandler {
         }
     }
 
+    /// Returns true when the session resolves the `passthrough` option
+    /// to `on`. Used at the attach boundary to route to the
+    /// passthrough forwarder instead of the full renderer pipeline.
+    pub(crate) async fn is_session_passthrough(
+        &self,
+        session_name: &rmux_proto::SessionName,
+    ) -> bool {
+        let state = self.state.lock().await;
+        rmux_core::is_passthrough_session(&state.options, session_name)
+    }
+
+    /// Looks up the per-pane passthrough replay log without allocating.
+    /// Used by the passthrough attach forwarder on attach and window
+    /// switch to reproduce the active pane's recent history.
+    pub(crate) async fn passthrough_log_for_pane(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        pane_id: rmux_core::PaneId,
+    ) -> Option<crate::passthrough_replay::SharedPassthroughReplayLog> {
+        let state = self.state.lock().await;
+        state.passthrough_log_lookup(session_name, pane_id)
+    }
+
+    /// Snapshot of a pane's `(mode_bits, cursor_style, is_alternate)`.
+    /// Used by the passthrough attach forwarder to compute the source-
+    /// vs-target mode diff (plus the alt-screen bridge) at window-switch
+    /// time.
+    pub(crate) async fn pane_screen_state(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        pane_id: rmux_core::PaneId,
+    ) -> Option<(u32, u32, bool)> {
+        let state = self.state.lock().await;
+        state.pane_screen_state_lookup(session_name, pane_id)
+    }
+
+    /// Test helper: returns the active pane's ID for a given window
+    /// index, or `None` if the session/window/pane chain is missing.
+    /// Lets the passthrough switch-diff tests resolve pane IDs without
+    /// going through the chrome-laden attach_target_for_session path.
+    #[cfg(test)]
+    pub(crate) async fn pane_id_at_for_test(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        window_index: u32,
+    ) -> Option<rmux_core::PaneId> {
+        let state = self.state.lock().await;
+        state
+            .sessions
+            .session(session_name)?
+            .window_at(window_index)?
+            .active_pane()
+            .map(|pane| pane.id())
+    }
+
+    /// Test helper: feeds raw bytes into a pane's transcript so the
+    /// `Screen` records the inner-program's mode toggles without
+    /// actually spawning that program. Used by the switch-diff tests
+    /// to drive a pane into a known mode state.
+    #[cfg(test)]
+    pub(crate) async fn feed_pane_transcript_for_test(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        pane_id: rmux_core::PaneId,
+        bytes: &[u8],
+    ) -> Result<(), rmux_proto::RmuxError> {
+        let mut state = self.state.lock().await;
+        state.append_bytes_to_runtime_pane_transcript(session_name, pane_id, bytes)
+    }
+
     pub(crate) fn install_shutdown_handle(&self, shutdown_handle: ShutdownHandle) {
         *self
             .shutdown_handle
@@ -447,6 +517,37 @@ impl RequestHandler {
             .ok()
             .and_then(|server_access| server_access.mode_for_identity(&peer.user))
     }
+
+    /// Clears a queued **exit-empty** auto-shutdown. Call this when
+    /// something that makes the server non-empty happens (e.g. a new
+    /// session is created) so a stale flag from a just-destroyed
+    /// session can't tear down the freshly-created one.
+    ///
+    /// Without this, the race is: last session exits ->
+    /// `queue_shutdown_if_server_empty` sets the flag -> user
+    /// creates a new session -> next consumer of the flag (e.g.
+    /// retained-exited-outputs TTL expiry, ~5s later) fires the
+    /// shutdown anyway and detaches the new attach.
+    ///
+    /// Deliberately scoped to `ExitEmpty`: an explicit `kill-server`
+    /// (reason `KillServer`) or a `SeamlessUpgradeIdle` shutdown must
+    /// *not* be cancellable by "session was just created" — those
+    /// represent user / orchestrator intent that outranks the
+    /// new-session signal. Without this scope, an explicit
+    /// `kill-server` followed by `kill-session` + `new-session`
+    /// would silently swallow the kill request.
+    pub(crate) fn cancel_pending_shutdown(&self) {
+        let mut reason = self
+            .shutdown_reason
+            .lock()
+            .expect("shutdown reason mutex must not be poisoned");
+        if !matches!(*reason, Some(PendingShutdownReason::ExitEmpty)) {
+            return;
+        }
+        *reason = None;
+        self.shutdown_requested.store(false, Ordering::SeqCst);
+    }
+
 
     #[cfg(test)]
     fn install_paste_buffer_delete_pause(&self) -> Arc<PasteBufferDeletePause> {
@@ -505,8 +606,12 @@ mod input_capture;
 mod tests;
 
 #[cfg(test)]
-#[path = "handler_attach_tests.rs"]
+#[path = "handler_attach_tests_normal_mount.rs"]
 mod attach_tests;
+
+#[cfg(all(test, feature = "passthrough-global-tests"))]
+#[path = "handler_attach_tests_passthrough_mount.rs"]
+mod attach_tests_passthrough;
 
 #[cfg(test)]
 #[path = "handler_window_tests.rs"]

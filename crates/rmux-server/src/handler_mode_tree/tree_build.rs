@@ -255,7 +255,13 @@ fn render_tree_pane_line(
         render_runtime_template("#{pane_current_command}", &context, false),
         render_runtime_template("#{pane_flags}", &context, false)
     );
-    render_tree_named_line(
+    let cwd = render_runtime_template("#{pane_current_path}", &context, false);
+    let cwd_suffix = if cwd.is_empty() {
+        None
+    } else {
+        Some(abbreviate_home(&cwd))
+    };
+    let (mut line, mut search_text, filter, preview) = render_tree_named_line(
         mode,
         context,
         &pane.index().to_string(),
@@ -264,7 +270,37 @@ fn render_tree_pane_line(
             .unwrap_or(TMUX_WINDOW_TREE_DEFAULT_FORMAT),
         default,
         Vec::new(),
-    )
+    );
+    if let Some(path) = cwd_suffix {
+        // rmux extension over tmux: show each pane's live foreground-process
+        // cwd (/proc/$pid/cwd, so it tracks the user *into* vim, cargo, etc.)
+        // so the picker is useful when you have many shells across many trees.
+        line.push_str(" · ");
+        line.push_str(&path);
+        search_text.push_str(" · ");
+        search_text.push_str(&path);
+    }
+    (line, search_text, filter, preview)
+}
+
+fn abbreviate_home(path: &str) -> String {
+    let Some(home) = std::env::var_os("HOME") else {
+        return path.to_owned();
+    };
+    let home = home.to_string_lossy();
+    if home.is_empty() {
+        return path.to_owned();
+    }
+    let trimmed = home.trim_end_matches('/');
+    if path == trimmed {
+        return "~".to_owned();
+    }
+    if let Some(rest) = path.strip_prefix(trimmed) {
+        if rest.starts_with('/') {
+            return format!("~{rest}");
+        }
+    }
+    path.to_owned()
 }
 
 fn render_tree_named_line<'a>(

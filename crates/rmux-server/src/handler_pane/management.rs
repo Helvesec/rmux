@@ -46,6 +46,20 @@ impl RequestHandler {
             WindowTarget::with_window(target_session_name.clone(), request.target.window_index());
         let response = {
             let mut state = self.state.lock().await;
+            if let Err(error) = crate::handler_support::reject_pane_op_in_passthrough(
+                &state,
+                &source_session_name,
+                "swap-pane",
+            )
+            .and_then(|()| {
+                crate::handler_support::reject_pane_op_in_passthrough(
+                    &state,
+                    &target_session_name,
+                    "swap-pane",
+                )
+            }) {
+                return Response::Error(ErrorResponse { error });
+            }
             match state.swap_pane(request) {
                 Ok(response) => Response::SwapPane(response),
                 Err(error) => Response::Error(ErrorResponse { error }),
@@ -84,6 +98,20 @@ impl RequestHandler {
             WindowTarget::with_window(target_session_name.clone(), request.target.window_index());
         let (response, source_window_unlinked) = {
             let mut state = self.state.lock().await;
+            if let Err(error) = crate::handler_support::reject_pane_op_in_passthrough(
+                &state,
+                &source_session_name,
+                "join-pane",
+            )
+            .and_then(|()| {
+                crate::handler_support::reject_pane_op_in_passthrough(
+                    &state,
+                    &target_session_name,
+                    "join-pane",
+                )
+            }) {
+                return Response::Error(ErrorResponse { error });
+            }
             let source_window_unlinked = join_pane_unlinked_window_snapshot(&state, &request);
             match state.join_pane(request) {
                 Ok(response) => (Response::JoinPane(response), source_window_unlinked),
@@ -202,6 +230,20 @@ impl RequestHandler {
         let print_format = request.format.clone();
         let response = {
             let mut state = self.state.lock().await;
+            if let Err(error) = crate::handler_support::reject_pane_op_in_passthrough(
+                &state,
+                &source_session_name,
+                "break-pane",
+            )
+            .and_then(|()| {
+                crate::handler_support::reject_pane_op_in_passthrough(
+                    &state,
+                    &target_session_name,
+                    "break-pane",
+                )
+            }) {
+                return Response::Error(ErrorResponse { error });
+            }
             match state.break_pane(request) {
                 Ok(response) => Response::BreakPane(response),
                 Err(error) => Response::Error(ErrorResponse { error }),
@@ -331,6 +373,16 @@ impl RequestHandler {
             rmux_proto::SplitWindowTarget::Session(session_name) => session_name.clone(),
             rmux_proto::SplitWindowTarget::Pane(target) => target.session_name().clone(),
         };
+        {
+            let state = self.state.lock().await;
+            if let Err(error) = crate::handler_support::reject_pane_op_in_passthrough(
+                &state,
+                &session_name,
+                "split-window",
+            ) {
+                return Response::Error(ErrorResponse { error });
+            }
+        }
         let socket_path = self.socket_path();
         let process_command = process_command
             .or_else(|| rmux_proto::ProcessCommand::from_legacy_command(command.as_deref()));
@@ -396,6 +448,13 @@ impl RequestHandler {
             removed_pane_ids,
         ) = {
             let mut state = self.state.lock().await;
+            if let Err(error) = crate::handler_support::reject_pane_op_in_passthrough(
+                &state,
+                &session_name,
+                "kill-pane",
+            ) {
+                return Response::Error(ErrorResponse { error });
+            }
             let removed_subscription_keys = state
                 .pane_output_subscription_keys_for_kill(&request.target, request.kill_all_except)
                 .unwrap_or_default();
@@ -533,6 +592,13 @@ impl RequestHandler {
         };
         let response = {
             let mut state = self.state.lock().await;
+            if let Err(error) = crate::handler_support::reject_pane_op_in_passthrough(
+                &state,
+                &session_name,
+                "pipe-pane",
+            ) {
+                return Response::Error(ErrorResponse { error });
+            }
             let command = match request.command.as_deref() {
                 Some(command) => {
                     let runtime = match format_context_for_target(

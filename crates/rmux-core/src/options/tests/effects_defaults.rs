@@ -28,13 +28,22 @@ fn known_options_do_not_cross_global_roots_during_resolve() {
 
 #[cfg(unix)]
 #[test]
-fn unix_default_shell_matches_tmux_default() {
+fn unix_default_shell_is_empty_so_resolution_falls_through() {
+    // Deliberately empty (not `/bin/bash` as upstream Helvesec chose).
+    // Hardcoding bash breaks on systems where bash isn't at /bin/bash —
+    // NixOS, FreeBSD, alpine/busybox, GitHub macOS runners with brew
+    // bash. With the option left empty the spawn-time resolver
+    // (`resolve_shell_path`) falls through to the user's `SHELL` env
+    // var, then `/etc/passwd` login shell, then `/bin/sh` — all of
+    // which exist on those systems.
+    //
+    // (Real tmux's actual default behaviour is closer to this too:
+    // `getpwuid()` then `/bin/sh` fallback. The Helvesec-assertion of
+    // a literal "/bin/bash" string was diverging from tmux's
+    // behaviour, not matching it.)
     let store = OptionStore::new();
 
-    assert_eq!(
-        store.resolve(None, OptionName::DefaultShell),
-        Some("/bin/bash")
-    );
+    assert_eq!(store.resolve(None, OptionName::DefaultShell), Some(""));
 }
 
 #[test]
@@ -242,6 +251,10 @@ fn frozen_registry_scope_counts_match_tmux_partitioning() {
         .iter()
         .filter(|entry| entry.scope_mask() == registry::SCOPE_SESSION)
         .count();
+    let server_session_count = metadata
+        .iter()
+        .filter(|entry| entry.scope_mask() == (registry::SCOPE_SERVER | registry::SCOPE_SESSION))
+        .count();
     let window_only_count = metadata
         .iter()
         .filter(|entry| entry.scope_mask() == registry::SCOPE_WINDOW)
@@ -251,9 +264,18 @@ fn frozen_registry_scope_counts_match_tmux_partitioning() {
         .filter(|entry| entry.scope_mask() == (registry::SCOPE_WINDOW | registry::SCOPE_PANE))
         .count();
 
-    // tmux frozen: 25 server, 54 session, 67 window (51 window-only + 16 window|pane)
-    assert_eq!(server_count, 25, "server options");
-    assert_eq!(session_count, 54, "session options");
+    // tmux frozen: 25 server, 54 session, 67 window (51 window-only + 16 window|pane).
+    // rmux extensions:
+    //   +1 session (passthrough — session mode bit, session-scope only)
+    //   +1 server|session (passthrough-replay-bytes — server default with
+    //     per-session override, since one session may run heavy TUIs
+    //     wanting a deeper replay buffer without bloating others)
+    assert_eq!(server_count, 25, "server-only options");
+    assert_eq!(session_count, 55, "session-only options");
+    assert_eq!(
+        server_session_count, 1,
+        "server|session dual-scope options (rmux passthrough-replay-bytes)"
+    );
     assert_eq!(
         window_only_count + window_pane_count,
         67,
