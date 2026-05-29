@@ -1860,3 +1860,55 @@ async fn pane_snapshot_revision_changes_after_clear_history() {
         "clearing scrollback must change the snapshot revision",
     );
 }
+
+#[tokio::test]
+async fn list_panes_pane_index_respects_pane_base_index() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    create_session(&handler, &alpha).await;
+
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(alpha.clone()),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        rmux_proto::Response::SplitWindow(_)
+    ));
+
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Global,
+                option: OptionName::PaneBaseIndex,
+                value: "1".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        rmux_proto::Response::SetOption(_)
+    ));
+
+    let listed = handler
+        .handle(Request::ListPanes(ListPanesRequest {
+            target: alpha.clone(),
+            target_window_index: None,
+            format: Some("#{pane_index}".to_owned()),
+        }))
+        .await;
+    let stdout = match listed {
+        rmux_proto::Response::ListPanes(response) => {
+            String::from_utf8(response.output.stdout).expect("list-panes utf8")
+        }
+        response => panic!("expected list-panes success, got {response:?}"),
+    };
+
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["1", "2"],
+        "pane_index should honor pane-base-index"
+    );
+}

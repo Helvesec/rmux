@@ -112,6 +112,20 @@ impl<'a> RuntimeFormatContext<'a> {
         self
     }
 
+    fn pane_index_with_base(&self) -> Option<String>{
+        let raw = self
+            .base
+            .format_value(FormatVariable::PaneIndex)?
+            .parse::<u32>()
+            .ok()?;
+        let base = self
+            .option_store()
+            .and_then(|store| store.resolve(self.session_name(), OptionName::PaneBaseIndex))
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        Some(raw.saturating_add(base).to_string())
+    }
+
     fn option_store(&self) -> Option<&OptionStore> {
         self.options
     }

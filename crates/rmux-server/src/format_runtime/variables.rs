@@ -86,6 +86,7 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "pane_width" => self
                 .visible_pane_snapshot()
                 .map(|pane| pane.geometry().cols().to_string()),
+            "pane_index" => self.pane_index_with_base(),
             "session_activity_flag" => self.session_flag(WINLINK_ACTIVITY),
             "session_alert" => self.session_alert(),
             "session_alerts" => self.session_alerts(),
