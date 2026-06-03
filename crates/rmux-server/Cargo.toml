@@ -1,6 +1,6 @@
 [package]
 name = "rmux-server"
-version = "0.4.1"
+version = "0.4.2"
 edition.workspace = true
 publish = true
 license.workspace = true
@@ -18,12 +18,12 @@ glob = "0.3"
 hkdf = { version = "0.12", optional = true }
 httparse = { version = "1.9", optional = true }
 regex = "1.12.2"
-rmux-core = { path = "../rmux-core", version = "0.4.1" }
-rmux-ipc = { path = "../rmux-ipc", version = "0.4.1" }
-rmux-os = { path = "../rmux-os", version = "0.4.1" }
-rmux-proto = { path = "../rmux-proto", version = "0.4.1" }
-rmux-pty = { path = "../rmux-pty", version = "0.4.1" }
-rmux-web-crypto = { path = "../rmux-web-crypto", version = "0.4.1", optional = true }
+rmux-core = { path = "../rmux-core", version = "0.4.2" }
+rmux-ipc = { path = "../rmux-ipc", version = "0.4.2" }
+rmux-os = { path = "../rmux-os", version = "0.4.2" }
+rmux-proto = { path = "../rmux-proto", version = "0.4.2" }
+rmux-pty = { path = "../rmux-pty", version = "0.4.2" }
+rmux-web-crypto = { path = "../rmux-web-crypto", version = "0.4.2", optional = true }
 zeroize = { version = "1", default-features = false, optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }

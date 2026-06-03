@@ -14,7 +14,7 @@
 
 [![Licence : MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Validation de release](https://github.com/Helvesec/rmux/actions/workflows/ci.yml/badge.svg)](https://github.com/Helvesec/rmux/actions/workflows/ci.yml)
-[![rmux 0.4.1](https://img.shields.io/badge/rmux-0.4.1-informational.svg)](#install)
+[![rmux 0.4.2](https://img.shields.io/badge/rmux-0.4.2-informational.svg)](#install)
 [![Plateformes : Linux | macOS | Windows](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#platform-support)
 [![Politique unsafe](https://img.shields.io/badge/unsafe-restricted-success.svg)](#verification)
 
@@ -66,7 +66,7 @@ Binaire précompilé pour Windows PowerShell :
 irm https://rmux.io/install.ps1 | iex
 ```
 
-Les téléchargements directs et checksums SHA256 sont disponibles dans la [GitHub Release v0.4.1](https://github.com/helvesec/rmux/releases/tag/v0.4.1).
+Les téléchargements directs et checksums SHA256 sont disponibles dans la [GitHub Release v0.4.2](https://github.com/helvesec/rmux/releases/tag/v0.4.2).
 
 Depuis crates.io avec Cargo :
 

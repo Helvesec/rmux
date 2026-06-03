@@ -13,7 +13,7 @@ English · [Français](README.fr.md) · [简体中文](README.zh-CN.md) · [日�
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Release validation](https://github.com/Helvesec/rmux/actions/workflows/ci.yml/badge.svg)](https://github.com/Helvesec/rmux/actions/workflows/ci.yml)
-[![rmux 0.4.1](https://img.shields.io/badge/rmux-0.4.1-informational.svg)](#install)
+[![rmux 0.4.2](https://img.shields.io/badge/rmux-0.4.2-informational.svg)](#install)
 [![Platform: Linux | macOS | Windows](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#platform-support)
 [![Unsafe policy](https://img.shields.io/badge/unsafe-restricted-success.svg)](#verification)
 
@@ -90,7 +90,7 @@ Portable installer:
 curl -fsSL https://rmux.io/install.sh | sh
 ```
 
-Direct downloads are available from the [v0.4.1 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.4.1):
+Direct downloads are available from the [v0.4.2 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.4.2):
 
 - `rmux-0.4.1-linux-x86_64.tar.gz`
 - `rmux_0.4.1_amd64.deb`
@@ -104,7 +104,7 @@ Portable installer:
 curl -fsSL https://rmux.io/install.sh | sh
 ```
 
-Direct downloads are available from the [v0.4.1 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.4.1):
+Direct downloads are available from the [v0.4.2 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.4.2):
 
 - `rmux-0.4.1-macos-aarch64.tar.gz`
 - `rmux-0.4.1-macos-x86_64.tar.gz`
@@ -117,7 +117,7 @@ PowerShell installer:
 irm https://rmux.io/install.ps1 | iex
 ```
 
-Direct downloads are available from the [v0.4.1 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.4.1):
+Direct downloads are available from the [v0.4.2 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.4.2):
 
 - `rmux-0.4.1-windows-x86_64.zip`
 
