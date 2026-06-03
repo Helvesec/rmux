@@ -3,6 +3,8 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+#[path = "cli/alias_fallback.rs"]
+mod alias_fallback;
 #[path = "cli/capture_pane.rs"]
 mod capture_pane;
 #[path = "cli/client_commands.rs"]
@@ -45,6 +47,8 @@ mod terminal_theme;
 mod top_level;
 #[path = "cli/web_commands.rs"]
 mod web_commands;
+#[path = "cli/web_share_display.rs"]
+mod web_share_display;
 #[path = "cli/window_commands.rs"]
 mod window_commands;
 
@@ -158,6 +162,9 @@ fn parse_failure_or_absent_server(
         .map_err(ExitFailure::from_client)?;
 
     match connect(&resolved) {
+        Ok(_) if error.kind() == clap::error::ErrorKind::InvalidSubcommand => {
+            alias_fallback::run_unknown_command_through_server_aliases(args, &resolved)
+        }
         Ok(_) => Err(ExitFailure::from_clap(error)),
         Err(connect_error) => Err(ExitFailure::from_client_connect(&resolved, connect_error)),
     }

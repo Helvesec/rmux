@@ -11,6 +11,13 @@ impl Connection {
                 supported: Vec::new(),
             }));
         }
-        self.roundtrip(&Request::WebShare(request))
+        let request = Request::WebShare(request);
+        if matches!(request, Request::WebShare(WebShareRequest::Create(_))) {
+            // Tunnel providers can legitimately take longer than the ordinary
+            // detached RPC timeout while waiting for their public endpoint.
+            self.roundtrip_without_read_timeout(&request)
+        } else {
+            self.roundtrip(&request)
+        }
     }
 }

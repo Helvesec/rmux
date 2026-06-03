@@ -28,7 +28,7 @@ impl Default for WebShareState {
             records: HashMap::new(),
             expired_actions: HashMap::new(),
             token_ids: HashMap::new(),
-            listener: WebListenerState::Available,
+            listener: WebListenerState::Unavailable("not started".to_owned()),
         }
     }
 }
@@ -37,6 +37,12 @@ impl Default for WebShareState {
 pub(super) enum WebListenerState {
     Available,
     Unavailable(String),
+}
+
+impl WebListenerState {
+    pub(super) const fn is_available(&self) -> bool {
+        matches!(self, Self::Available)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -48,14 +54,16 @@ pub(super) struct WebCapability {
 
 impl WebShareState {
     pub(super) fn insert(&mut self, record: WebShareRecord) {
-        self.token_ids.insert(
-            record.read_token_hash.token_id(),
-            WebCapability {
-                share_id: record.share_id.clone(),
-                role: WebShareConnectRole::Read,
-                secret_hash: record.read_token_hash,
-            },
-        );
+        if let Some(hash) = record.spectator_token_hash {
+            self.token_ids.insert(
+                hash.token_id(),
+                WebCapability {
+                    share_id: record.share_id.clone(),
+                    role: WebShareConnectRole::Spectator,
+                    secret_hash: hash,
+                },
+            );
+        }
         if let Some(hash) = record.operator_token_hash {
             self.token_ids.insert(
                 hash.token_id(),
@@ -163,7 +171,9 @@ impl WebShareState {
     }
 
     fn remove_tokens(&mut self, record: &WebShareRecord) {
-        self.token_ids.remove(&record.read_token_hash.token_id());
+        if let Some(hash) = record.spectator_token_hash {
+            self.token_ids.remove(&hash.token_id());
+        }
         if let Some(hash) = record.operator_token_hash {
             self.token_ids.remove(&hash.token_id());
         }

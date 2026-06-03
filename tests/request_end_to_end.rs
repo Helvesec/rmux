@@ -134,9 +134,20 @@ fn cli_command_surface_matches_public_help_enum_and_dispatch() -> Result<(), Box
         "Command::",
     )?;
 
+    // The bare `list-commands` listing is byte-compared against tmux, so it omits
+    // RMUX extensions (web-share). They stay in the clap enum, dispatch and
+    // --help. Keep this in sync with RMUX_EXTENSION_COMMANDS in
+    // src/cli/command_inventory.rs.
+    let rmux_extensions: BTreeSet<String> = ["web-share"]
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    let listed_expected: BTreeSet<String> =
+        expected.difference(&rmux_extensions).cloned().collect();
+
     assert_eq!(expected.len(), COMMAND_SURFACE.len());
     assert_eq!(list_output.status.code(), Some(0));
-    assert_eq!(listed_commands, expected);
+    assert_eq!(listed_commands, listed_expected);
     assert_eq!(enum_commands, expected);
     assert_eq!(dispatch_commands, expected);
     Ok(())

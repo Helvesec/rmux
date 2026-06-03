@@ -1,29 +1,29 @@
 use std::io;
 
-use aes_gcm::aead::{Aead, Payload};
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use base64::Engine;
-use hkdf::Hkdf;
+use rmux_web_crypto::{Message, Opener, Sealer};
 use serde::Deserialize;
-use sha2::Sha256;
+use zeroize::Zeroizing;
 
-use super::secrets::SecretHash;
 use super::websocket::{WebSocketMessage, WebSocketReader, WebSocketWriter};
 
 pub(super) const E2EE_CAPABILITY: &str = "e2ee-token-auth";
 
-const ENCRYPTED_FRAME: u8 = 0xE0;
-const PLAINTEXT_TEXT: u8 = 0x00;
-const PLAINTEXT_BINARY: u8 = 0x01;
-const CLIENT_DIRECTION: &[u8] = b"c2s";
-const SERVER_DIRECTION: &[u8] = b"s2c";
-const KEY_INFO_PREFIX: &[u8] = b"rmux web-share e2ee v1 key ";
-const NONCE_INFO_PREFIX: &[u8] = b"rmux web-share e2ee v1 nonce ";
-
+/// A parsed v4 client hello.
+///
+/// `raw` is the EXACT hello text received on the wire. It is bound into the
+/// session key schedule as part of the handshake transcript, so it must be the
+/// untouched bytes, not a re-serialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ClientHello {
     pub(super) token_id: String,
     pub(super) client_nonce: String,
+    pub(super) client_public: [u8; 32],
+    /// The client's ML-KEM-768 encapsulation key, length-validated to exactly
+    /// 1184 bytes at parse time (a [u8; N>32] does not derive Eq/Debug, so it is
+    /// held as a Vec). Its ML-KEM validity is checked at encapsulation time.
+    pub(super) client_ml_kem_ek: Vec<u8>,
+    pub(super) raw: String,
 }
 
 pub(super) struct EncryptedWebSocketReader {
@@ -36,16 +36,20 @@ pub(super) struct EncryptedWebSocketWriter {
     sealer: FrameSealer,
 }
 
+/// Thin newtype around the [`rmux_web_crypto::Opener`] (server-to-client opener
+/// from the caller's point of view: the server opens client-to-server frames).
 pub(super) struct FrameOpener {
-    cipher: Aes256Gcm,
-    nonce_prefix: [u8; 4],
-    next_seq: u64,
+    opener: Opener,
 }
 
+/// Thin newtype around the [`rmux_web_crypto::Sealer`].
 pub(super) struct FrameSealer {
-    cipher: Aes256Gcm,
-    nonce_prefix: [u8; 4],
-    next_seq: u64,
+    sealer: Sealer,
+}
+
+/// Encodes bytes as base64url without padding (the web-share wire encoding).
+pub(super) fn base64url(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 pub(super) fn random_handshake_nonce() -> io::Result<String> {
@@ -56,17 +60,28 @@ pub(super) fn random_handshake_nonce() -> io::Result<String> {
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce))
 }
 
+/// Derives the server side of a v4 session from the token-derived PSK, the
+/// X25519 DH shared secret, the ML-KEM shared secret, and the exact handshake
+/// transcript bytes.
+///
+/// Returns the opener for client-to-server frames and the sealer for
+/// server-to-client frames, ready to wrap into the encrypted reader/writer.
 pub(super) fn derive_server_crypto(
-    secret: SecretHash,
-    token_id: &str,
-    client_nonce: &str,
-    server_nonce: &str,
+    psk: &[u8],
+    dh: &[u8; 32],
+    ml_kem_secret: &[u8; 32],
+    client_hello_bytes: &[u8],
+    server_challenge_bytes: &[u8],
 ) -> io::Result<(FrameOpener, FrameSealer)> {
-    let material = SessionMaterial::derive(secret, token_id, client_nonce, server_nonce)?;
-    Ok((
-        material.opener(CLIENT_DIRECTION)?,
-        material.sealer(SERVER_DIRECTION)?,
-    ))
+    let (sealer, opener) = rmux_web_crypto::derive_server_session(
+        psk,
+        dh,
+        ml_kem_secret,
+        client_hello_bytes,
+        server_challenge_bytes,
+    )
+    .map_err(|error| io::Error::other(format!("failed to derive web-share session: {error}")))?;
+    Ok((FrameOpener { opener }, FrameSealer { sealer }))
 }
 
 pub(super) fn parse_client_hello(text: &str, protocol_version: u16) -> Result<ClientHello, ()> {
@@ -86,10 +101,60 @@ pub(super) fn parse_client_hello(text: &str, protocol_version: u16) -> Result<Cl
     {
         return Err(());
     }
+    let client_public = decode_client_public(&hello.client_public)?;
+    let client_ml_kem_ek = decode_ml_kem_ek(&hello.client_ml_kem_ek)?;
     Ok(ClientHello {
         token_id: hello.token_id,
         client_nonce: hello.client_nonce,
+        client_public,
+        client_ml_kem_ek,
+        raw: text.to_owned(),
     })
+}
+
+/// Decodes and length-validates the client's ML-KEM-768 encapsulation key
+/// (base64url, exactly 1184 bytes). A wrong length is rejected here; ML-KEM
+/// validity is enforced at encapsulation time.
+fn decode_ml_kem_ek(encoded: &str) -> Result<Vec<u8>, ()> {
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| ())?;
+    if decoded.len() != rmux_web_crypto::ml_kem::ENCAPSULATION_KEY_LEN {
+        return Err(());
+    }
+    Ok(decoded)
+}
+
+/// The result of a successful ML-KEM encapsulation: the public ciphertext for
+/// the challenge and the (zeroizing) shared secret for the key schedule.
+type MlKemEncapsulation = (
+    [u8; rmux_web_crypto::ml_kem::CIPHERTEXT_LEN],
+    Zeroizing<[u8; 32]>,
+);
+
+/// Encapsulates to the client's ML-KEM encapsulation key, returning the
+/// ciphertext (for the challenge) and the shared secret (for the schedule).
+///
+/// `Ok(None)` means the key failed ML-KEM validation — the caller MUST collapse
+/// that to the uniform pre-ready rejection (fail closed), not bypass the delay.
+/// `Err` is a server RNG failure.
+pub(super) fn encapsulate_ml_kem(
+    client_ml_kem_ek: &[u8],
+) -> io::Result<Option<MlKemEncapsulation>> {
+    let Ok(ek) =
+        <&[u8; rmux_web_crypto::ml_kem::ENCAPSULATION_KEY_LEN]>::try_from(client_ml_kem_ek)
+    else {
+        return Ok(None);
+    };
+    let mut randomness = Zeroizing::new([0u8; rmux_web_crypto::ml_kem::ENCAPS_RANDOMNESS_LEN]);
+    getrandom::fill(randomness.as_mut()).map_err(|error| {
+        io::Error::other(format!(
+            "failed to create ml-kem encaps randomness: {error}"
+        ))
+    })?;
+    // The ciphertext is public; the shared secret is wiped when it drops.
+    Ok(rmux_web_crypto::ml_kem::encapsulate(ek, *randomness)
+        .map(|(ciphertext, shared_secret)| (ciphertext, Zeroizing::new(shared_secret))))
 }
 
 impl EncryptedWebSocketReader {
@@ -118,7 +183,7 @@ impl EncryptedWebSocketWriter {
     }
 
     pub(super) async fn write_text(&mut self, text: &str) -> io::Result<()> {
-        let frame = self.sealer.seal_text(text.as_bytes())?;
+        let frame = self.sealer.seal_text(text)?;
         self.writer.write_binary(&frame).await
     }
 
@@ -142,164 +207,29 @@ impl EncryptedWebSocketWriter {
 
 impl FrameOpener {
     pub(super) fn open_message(&mut self, frame: &[u8]) -> io::Result<WebSocketMessage> {
-        let plain = self.open(frame)?;
-        let Some((&kind, body)) = plain.split_first() else {
-            return Err(invalid_data("empty e2ee plaintext"));
-        };
-        match kind {
-            PLAINTEXT_TEXT => {
-                let text = String::from_utf8(body.to_vec())
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                Ok(WebSocketMessage::Text(text))
-            }
-            PLAINTEXT_BINARY => Ok(WebSocketMessage::Binary(body.to_vec())),
-            _ => Err(invalid_data("unknown e2ee plaintext kind")),
+        match self
+            .opener
+            .open(frame)
+            .map_err(|_| invalid_data("e2ee open failed"))?
+        {
+            Message::Text(text) => Ok(WebSocketMessage::Text(text)),
+            Message::Binary(payload) => Ok(WebSocketMessage::Binary(payload)),
         }
-    }
-
-    fn open(&mut self, frame: &[u8]) -> io::Result<Vec<u8>> {
-        if frame.len() < 1 + 8 + 16 || frame[0] != ENCRYPTED_FRAME {
-            return Err(invalid_data("invalid e2ee frame"));
-        }
-        let mut seq_bytes = [0u8; 8];
-        seq_bytes.copy_from_slice(&frame[1..9]);
-        let seq = u64::from_be_bytes(seq_bytes);
-        if seq != self.next_seq {
-            return Err(invalid_data("out-of-order e2ee frame"));
-        }
-        let nonce = nonce_from_parts(self.nonce_prefix, seq);
-        let aad = &frame[..9];
-        let plain = self
-            .cipher
-            .decrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: &frame[9..],
-                    aad,
-                },
-            )
-            .map_err(|_| invalid_data("e2ee decrypt failed"))?;
-        self.next_seq = self.next_seq.saturating_add(1);
-        Ok(plain)
     }
 }
 
 impl FrameSealer {
-    pub(super) fn seal_text(&mut self, text: &[u8]) -> io::Result<Vec<u8>> {
-        self.seal(PLAINTEXT_TEXT, text)
+    pub(super) fn seal_text(&mut self, text: &str) -> io::Result<Vec<u8>> {
+        self.sealer
+            .seal_text(text)
+            .map_err(|_| io::Error::other("e2ee seal failed"))
     }
 
     pub(super) fn seal_binary(&mut self, payload: &[u8]) -> io::Result<Vec<u8>> {
-        self.seal(PLAINTEXT_BINARY, payload)
+        self.sealer
+            .seal_binary(payload)
+            .map_err(|_| io::Error::other("e2ee seal failed"))
     }
-
-    fn seal(&mut self, kind: u8, payload: &[u8]) -> io::Result<Vec<u8>> {
-        let seq = self.next_seq;
-        let mut plain = Vec::with_capacity(1 + payload.len());
-        plain.push(kind);
-        plain.extend_from_slice(payload);
-        let mut out = Vec::with_capacity(1 + 8 + plain.len() + 16);
-        out.push(ENCRYPTED_FRAME);
-        out.extend_from_slice(&seq.to_be_bytes());
-        let nonce = nonce_from_parts(self.nonce_prefix, seq);
-        let ciphertext = self
-            .cipher
-            .encrypt(
-                Nonce::from_slice(&nonce),
-                Payload {
-                    msg: &plain,
-                    aad: &out,
-                },
-            )
-            .map_err(|_| io::Error::other("e2ee encrypt failed"))?;
-        out.extend_from_slice(&ciphertext);
-        self.next_seq = self.next_seq.saturating_add(1);
-        Ok(out)
-    }
-}
-
-#[cfg(test)]
-pub(super) fn derive_client_crypto_for_test(
-    secret: SecretHash,
-    token_id: &str,
-    client_nonce: &str,
-    server_nonce: &str,
-) -> io::Result<(FrameOpener, FrameSealer)> {
-    let material = SessionMaterial::derive(secret, token_id, client_nonce, server_nonce)?;
-    Ok((
-        material.opener(SERVER_DIRECTION)?,
-        material.sealer(CLIENT_DIRECTION)?,
-    ))
-}
-
-struct SessionMaterial {
-    secret: [u8; 32],
-    salt: Vec<u8>,
-}
-
-impl SessionMaterial {
-    fn derive(
-        secret: SecretHash,
-        token_id: &str,
-        client_nonce: &str,
-        server_nonce: &str,
-    ) -> io::Result<Self> {
-        let mut salt = Vec::with_capacity(token_id.len() + 32);
-        salt.extend_from_slice(token_id.as_bytes());
-        salt.extend_from_slice(&decode_nonce(client_nonce)?);
-        salt.extend_from_slice(&decode_nonce(server_nonce)?);
-        Ok(Self {
-            secret: secret.as_bytes(),
-            salt,
-        })
-    }
-
-    fn sealer(&self, direction: &[u8]) -> io::Result<FrameSealer> {
-        let (cipher, nonce_prefix) = self.cipher(direction)?;
-        Ok(FrameSealer {
-            cipher,
-            nonce_prefix,
-            next_seq: 0,
-        })
-    }
-
-    fn opener(&self, direction: &[u8]) -> io::Result<FrameOpener> {
-        let (cipher, nonce_prefix) = self.cipher(direction)?;
-        Ok(FrameOpener {
-            cipher,
-            nonce_prefix,
-            next_seq: 0,
-        })
-    }
-
-    fn cipher(&self, direction: &[u8]) -> io::Result<(Aes256Gcm, [u8; 4])> {
-        let (key, nonce_prefix) = self.derive_direction(direction)?;
-        Ok((
-            Aes256Gcm::new_from_slice(&key).map_err(|_| io::Error::other("invalid e2ee key"))?,
-            nonce_prefix,
-        ))
-    }
-
-    fn derive_direction(&self, direction: &[u8]) -> io::Result<([u8; 32], [u8; 4])> {
-        let hk = Hkdf::<Sha256>::new(Some(&self.salt), &self.secret);
-        let mut key = [0u8; 32];
-        let mut nonce_prefix = [0u8; 4];
-        hk.expand(&direction_info(KEY_INFO_PREFIX, direction), &mut key)
-            .map_err(|_| io::Error::other("failed to derive e2ee key"))?;
-        hk.expand(
-            &direction_info(NONCE_INFO_PREFIX, direction),
-            &mut nonce_prefix,
-        )
-        .map_err(|_| io::Error::other("failed to derive e2ee nonce"))?;
-        Ok((key, nonce_prefix))
-    }
-}
-
-fn direction_info(prefix: &[u8], direction: &[u8]) -> Vec<u8> {
-    let mut info = Vec::with_capacity(prefix.len() + direction.len());
-    info.extend_from_slice(prefix);
-    info.extend_from_slice(direction);
-    info
 }
 
 fn decode_nonce(nonce: &str) -> io::Result<Vec<u8>> {
@@ -312,11 +242,11 @@ fn decode_nonce(nonce: &str) -> io::Result<Vec<u8>> {
     Ok(decoded)
 }
 
-fn nonce_from_parts(prefix: [u8; 4], seq: u64) -> [u8; 12] {
-    let mut nonce = [0u8; 12];
-    nonce[..4].copy_from_slice(&prefix);
-    nonce[4..].copy_from_slice(&seq.to_be_bytes());
-    nonce
+fn decode_client_public(client_public: &str) -> Result<[u8; 32], ()> {
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(client_public)
+        .map_err(|_| ())?;
+    <[u8; 32]>::try_from(decoded.as_slice()).map_err(|_| ())
 }
 
 fn invalid_data(message: &'static str) -> io::Error {
@@ -332,6 +262,8 @@ struct ClientHelloWire {
     capabilities: Vec<String>,
     token_id: String,
     client_nonce: String,
+    client_public: String,
+    client_ml_kem_ek: String,
 }
 
 #[cfg(test)]
@@ -339,6 +271,11 @@ mod tests {
     use super::{derive_server_crypto, WebSocketMessage};
     use crate::web::secrets::SecretHash;
     use base64::Engine;
+    use rmux_web_crypto::{derive_client_session, generate_ephemeral};
+
+    fn b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
 
     #[test]
     fn token_id_is_stable_and_not_the_secret_hash() {
@@ -357,16 +294,32 @@ mod tests {
     #[test]
     fn e2ee_round_trips_text_and_binary_in_order() {
         let secret = SecretHash::from_secret("token");
-        let token_id = secret.token_id();
-        let client_nonce = "AQIDBAUGBwgJCgsMDQ4PEA";
-        let server_nonce = "EDEODQwLCgkIBwYFBAMCAQ";
+        let psk = secret.as_bytes();
+
+        // Full X25519 agreement, exactly as the live handshake performs it.
+        let client_eph = generate_ephemeral();
+        let server_eph = generate_ephemeral();
+        let client_public = client_eph.public_bytes();
+        let server_public = server_eph.public_bytes();
+
+        let client_hello = br#"{"type":"hello","client_public":"..."}"#;
+        let server_challenge = br#"{"type":"challenge","server_public":"..."}"#;
+
+        let client_dh = client_eph.into_shared_secret(&server_public);
+        let server_dh = server_eph.into_shared_secret(&client_public);
+        assert_eq!(*client_dh, *server_dh, "X25519 agreement must converge");
+
+        // A matching ML-KEM shared secret on both sides (the agreement itself is
+        // tested in rmux-web-crypto); this exercises the hybrid record layer.
+        let ml_kem_ss = [0x55u8; 32];
         let (mut server_open, mut server_seal) =
-            derive_server_crypto(secret, &token_id, client_nonce, server_nonce).expect("derive");
-        let (mut client_open, mut client_seal) =
-            super::derive_client_crypto_for_test(secret, &token_id, client_nonce, server_nonce)
+            derive_server_crypto(&psk, &server_dh, &ml_kem_ss, client_hello, server_challenge)
+                .expect("derive server");
+        let (mut client_seal, mut client_open) =
+            derive_client_session(&psk, &client_dh, &ml_kem_ss, client_hello, server_challenge)
                 .expect("derive client");
 
-        let frame = client_seal.seal_text(br#"{"type":"auth"}"#).expect("seal");
+        let frame = client_seal.seal_text(r#"{"type":"auth"}"#).expect("seal");
         assert_eq!(
             server_open.open_message(&frame).expect("open"),
             WebSocketMessage::Text(r#"{"type":"auth"}"#.to_owned())
@@ -374,15 +327,72 @@ mod tests {
 
         let frame = server_seal.seal_binary(&[0x10, b'o', b'k']).expect("seal");
         assert_eq!(
-            client_open.open_message(&frame).expect("open"),
-            WebSocketMessage::Binary(vec![0x10, b'o', b'k'])
+            client_open.open(&frame).expect("open"),
+            rmux_web_crypto::Message::Binary(vec![0x10, b'o', b'k'])
         );
     }
 
     #[test]
     fn client_hello_rejects_missing_e2ee_capability() {
-        let text = r#"{"type":"hello","protocol_version":3,"capabilities":["token-auth"],"token_id":"aaaaaaaaaaaaaaaaaaaaaa","client_nonce":"AQIDBAUGBwgJCgsMDQ4PEA"}"#;
+        let client_public = b64(&generate_ephemeral().public_bytes());
+        let ek = b64(&rmux_web_crypto::ml_kem::KeyPair::generate([1u8; 64]).encapsulation_key());
+        let text = format!(
+            r#"{{"type":"hello","protocol_version":1,"capabilities":["token-auth"],"token_id":"aaaaaaaaaaaaaaaaaaaaaa","client_nonce":"AQIDBAUGBwgJCgsMDQ4PEA","client_public":"{client_public}","client_ml_kem_ek":"{ek}"}}"#
+        );
 
-        assert!(super::parse_client_hello(text, 3).is_err());
+        assert!(super::parse_client_hello(&text, 1).is_err());
+    }
+
+    #[test]
+    fn client_hello_preserves_exact_raw_wire_text() {
+        let client_public = b64(&generate_ephemeral().public_bytes());
+        let ek = b64(&rmux_web_crypto::ml_kem::KeyPair::generate([1u8; 64]).encapsulation_key());
+        let text = format!(
+            r#"{{"type":"hello","protocol_version":1,"capabilities":["terminal-palette-v1","e2ee-token-auth"],"token_id":"VANRFV6FYQX1QTOi-BMVrQ","client_nonce":"AQIDBAUGBwgJCgsMDQ4PEA","client_public":"{client_public}","client_ml_kem_ek":"{ek}"}}"#
+        );
+
+        let hello = super::parse_client_hello(&text, 1).expect("valid hello");
+        assert_eq!(hello.raw, text);
+    }
+
+    #[test]
+    fn e2ee_wrong_token_fails_to_open() {
+        // Identical handshake transcript + DH, but the client authenticated with
+        // a different token (PSK). The server's AEAD must reject the first frame
+        // — implicit authentication by the token, end to end at the server layer.
+        let server_secret = SecretHash::from_secret("server-token");
+        let wrong_secret = SecretHash::from_secret("attacker-token");
+        let client_eph = generate_ephemeral();
+        let server_eph = generate_ephemeral();
+        let client_public = client_eph.public_bytes();
+        let server_public = server_eph.public_bytes();
+        let client_hello = br#"{"type":"hello"}"#;
+        let server_challenge = br#"{"type":"challenge"}"#;
+        let client_dh = client_eph.into_shared_secret(&server_public);
+        let server_dh = server_eph.into_shared_secret(&client_public);
+
+        let ml_kem_ss = [0x55u8; 32];
+        let (mut server_open, _server_seal) = derive_server_crypto(
+            &server_secret.as_bytes(),
+            &server_dh,
+            &ml_kem_ss,
+            client_hello,
+            server_challenge,
+        )
+        .expect("derive server");
+        let (mut client_seal, _client_open) = derive_client_session(
+            &wrong_secret.as_bytes(),
+            &client_dh,
+            &ml_kem_ss,
+            client_hello,
+            server_challenge,
+        )
+        .expect("derive client");
+
+        let frame = client_seal.seal_text(r#"{"type":"auth"}"#).expect("seal");
+        assert!(
+            server_open.open_message(&frame).is_err(),
+            "a frame sealed under the wrong token must fail AEAD authentication"
+        );
     }
 }

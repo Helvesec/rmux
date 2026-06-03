@@ -20,22 +20,22 @@ use rmux_proto::{
     decode_frame, encode_frame, frame_kind_for_request, frame_kind_for_response, ledger_entry_for,
     BindKeyRequest, CancelSdkWaitRequest, CancelSdkWaitResponse, CapturePaneRequest,
     ClientTerminalContext, ClockModeRequest, ControlMode, ControlModeRequest, ControlModeResponse,
-    DetachClientRequest, ErrorResponse, FrameDecoder, FrameDirection, FrameFeature, FrameKind,
-    FrameStatus, HandshakeRequest, HandshakeResponse, HasSessionRequest, HasSessionResponse,
-    HookLifecycle, HookName, KillServerResponse, KillSessionRequest, ListBuffersRequest,
-    NewSessionResponse, OptionName, PaneId, PaneInputRequest, PaneKillRequest, PaneOutputCursor,
-    PaneOutputCursorRequest, PaneOutputCursorResponse, PaneOutputEvent, PaneOutputLagNotice,
-    PaneOutputLagResponse, PaneOutputSubscriptionId, PaneOutputSubscriptionStart, PaneRecentOutput,
-    PaneResizeRequest, PaneRespawnRequest, PaneSelectRequest, PaneSnapshotCursor,
-    PaneSnapshotRefRequest, PaneSnapshotResponse, PaneTarget, PaneTargetRef, Request,
-    ResizePaneAdjustment, ResolveTargetRequest, ResolveTargetType, Response, RmuxError,
-    ScopeSelector, SdkWaitForOutputRefRequest, SdkWaitForOutputRequest, SdkWaitForOutputResponse,
-    SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId, SendKeysRequest, SendKeysResponse, SessionName,
-    SetHookRequest, SetOptionMode, SetOptionRequest, SubscribePaneOutputRefRequest,
-    SubscribePaneOutputRequest, SubscribePaneOutputResponse, TerminalSize,
-    UnsubscribePaneOutputRequest, UnsubscribePaneOutputResponse, WebShareConfigRequest,
-    WebShareListener, WebShareRequest, WebShareResponse, WindowTarget, RMUX_FRAME_MAGIC,
-    RMUX_WIRE_VERSION, V1_FRAME_LEDGER,
+    DetachClientRequest, DisplayMessageExtRequest, ErrorResponse, FrameDecoder, FrameDirection,
+    FrameFeature, FrameKind, FrameStatus, HandshakeRequest, HandshakeResponse, HasSessionRequest,
+    HasSessionResponse, HookLifecycle, HookName, KillServerResponse, KillSessionRequest,
+    ListBuffersRequest, NewSessionResponse, OptionName, PaneId, PaneInputRequest, PaneKillRequest,
+    PaneOutputCursor, PaneOutputCursorRequest, PaneOutputCursorResponse, PaneOutputEvent,
+    PaneOutputLagNotice, PaneOutputLagResponse, PaneOutputSubscriptionId,
+    PaneOutputSubscriptionStart, PaneRecentOutput, PaneResizeRequest, PaneRespawnRequest,
+    PaneSelectRequest, PaneSnapshotCursor, PaneSnapshotRefRequest, PaneSnapshotResponse,
+    PaneTarget, PaneTargetRef, Request, ResizePaneAdjustment, ResolveTargetRequest,
+    ResolveTargetType, Response, RmuxError, ScopeSelector, SdkWaitForOutputRefRequest,
+    SdkWaitForOutputRequest, SdkWaitForOutputResponse, SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId,
+    SendKeysExt2Request, SendKeysRequest, SendKeysResponse, SessionName, SetHookRequest,
+    SetOptionMode, SetOptionRequest, SubscribePaneOutputRefRequest, SubscribePaneOutputRequest,
+    SubscribePaneOutputResponse, TerminalSize, UnsubscribePaneOutputRequest,
+    UnsubscribePaneOutputResponse, WebShareConfigRequest, WebShareListener, WebShareRequest,
+    WebShareResponse, WindowTarget, RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION, V1_FRAME_LEDGER,
 };
 
 fn fixture_root() -> PathBuf {
@@ -523,7 +523,7 @@ fn cross_section_requests() -> Vec<Request> {
         Request::SdkWaitForOutputRef(SdkWaitForOutputRefRequest {
             owner_id: SdkWaitOwnerId::new(3),
             wait_id: SdkWaitId::new(5),
-            target: PaneTargetRef::slot(pane),
+            target: PaneTargetRef::slot(pane.clone()),
             bytes: b"ready".to_vec(),
             start: PaneOutputSubscriptionStart::Now,
         }),
@@ -561,6 +561,25 @@ fn cross_section_requests() -> Vec<Request> {
             title: Some("agent".to_owned()),
         }),
         Request::WebShare(WebShareRequest::Config(WebShareConfigRequest)),
+        Request::DisplayMessageExt(DisplayMessageExtRequest {
+            target: Some(rmux_proto::Target::Session(alpha.clone())),
+            print: true,
+            message: Some("#{client_name}".to_owned()),
+            target_client: Some("=".to_owned()),
+        }),
+        Request::SendKeysExt2(SendKeysExt2Request {
+            target: Some(pane.clone()),
+            keys: vec!["A".to_owned()],
+            expand_formats: false,
+            hex: false,
+            literal: true,
+            dispatch_key_table: false,
+            copy_mode_command: false,
+            forward_mouse_event: false,
+            reset_terminal: false,
+            repeat_count: None,
+            target_client: Some("=".to_owned()),
+        }),
     ]
 }
 
@@ -764,8 +783,8 @@ fn ledger_active_size_matches_request_and_response_variant_count() {
         .iter()
         .filter(|entry| matches!(entry.status, FrameStatus::Active))
         .count();
-    // Active entries = 115 Request variants + 94 Response variants.
-    assert_eq!(active_count, 115 + 94, "active ledger size mismatch");
+    // Active entries = 117 Request variants + 94 Response variants.
+    assert_eq!(active_count, 117 + 94, "active ledger size mismatch");
 }
 
 #[test]

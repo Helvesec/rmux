@@ -29,6 +29,9 @@ pub struct CreateWebShareRequest {
     /// Optional public WS origin forwarded to the daemon.
     #[serde(default)]
     pub public_base_url: Option<String>,
+    /// Optional named tunnel preset spawned by the daemon.
+    #[serde(default)]
+    pub tunnel_provider: Option<String>,
     /// Optional browser frontend URL used for this share.
     #[serde(default)]
     pub frontend_url: Option<String>,
@@ -38,22 +41,34 @@ pub struct CreateWebShareRequest {
     /// Optional absolute expiration timestamp as UNIX seconds.
     #[serde(default)]
     pub expires_at_unix: Option<u64>,
-    /// Optional cap for concurrent read-only clients.
+    /// Optional cap for concurrent spectator clients.
     #[serde(default)]
-    pub max_readers: Option<u16>,
-    /// Presentation options encoded into generated read-only URLs.
+    pub max_spectators: Option<u16>,
+    /// Optional cap for concurrent operator clients.
+    #[serde(default)]
+    pub max_operators: Option<u16>,
+    /// Presentation options encoded into generated spectator URLs.
     #[serde(default)]
     pub url_options: WebShareUrlOptions,
     /// Whether clients must provide the out-of-band pairing code during auth.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub require_pin: bool,
+    /// Optional operator pairing code supplied by the caller.
+    #[serde(default)]
+    pub operator_pin: Option<String>,
+    /// Optional spectator pairing code supplied by the caller.
+    #[serde(default)]
+    pub spectator_pin: Option<String>,
     /// Terminal palette captured by the CLI for browser-side "User" theme.
     #[serde(default)]
     pub terminal_palette: Option<Box<WebTerminalPalette>>,
     /// Whether an operator URL should be minted.
-    #[serde(default)]
-    pub writable: bool,
-    /// Whether writable session shares may execute whitelisted rmux controls.
+    #[serde(default = "default_true")]
+    pub operator: bool,
+    /// Whether a spectator URL should be minted.
+    #[serde(default = "default_true")]
+    pub spectator: bool,
+    /// Internal capability bit; the daemon derives it for operator session shares.
     #[serde(default)]
     pub controls: bool,
     /// Whether the target session should be killed when this share expires.
@@ -95,7 +110,7 @@ impl fmt::Display for WebShareScope {
 }
 
 /// Browser presentation options for generated web-share URLs.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WebShareUrlOptions {
     /// Hide the share navigation bar for this generated URL.
     #[serde(default)]
@@ -104,11 +119,30 @@ pub struct WebShareUrlOptions {
     #[serde(default)]
     pub no_disclaimer: bool,
     /// Show the live connected browser count in generated URLs.
-    #[serde(default)]
+    #[serde(default = "default_show_viewers")]
     pub show_viewers: bool,
-    /// Optional initial terminal theme for generated read-only URLs.
+    /// Optional initial terminal theme for generated spectator URLs.
     #[serde(default)]
     pub terminal_theme: Option<WebTerminalTheme>,
+}
+
+impl Default for WebShareUrlOptions {
+    fn default() -> Self {
+        Self {
+            no_navbar: false,
+            no_disclaimer: false,
+            show_viewers: true,
+            terminal_theme: None,
+        }
+    }
+}
+
+const fn default_show_viewers() -> bool {
+    true
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 /// Initial terminal theme selected by the share URL.

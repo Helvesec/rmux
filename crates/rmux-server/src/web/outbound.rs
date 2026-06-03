@@ -90,11 +90,6 @@ impl WebSocketOutbound {
         write_with_timeout(writer.write_text(text)).await
     }
 
-    pub(crate) async fn write_binary(&self, payload: &[u8]) -> io::Result<()> {
-        let mut writer = self.writer.lock().await;
-        write_with_timeout(writer.write_binary(payload)).await
-    }
-
     pub(crate) async fn write_close(&self) -> io::Result<()> {
         let mut writer = self.writer.lock().await;
         write_with_timeout(writer.write_close()).await

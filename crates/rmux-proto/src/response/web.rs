@@ -42,22 +42,38 @@ pub struct WebShareCreatedResponse {
     pub share_id: String,
     /// Shared browser scope.
     pub scope: WebShareScope,
-    /// Browser URL for read-only access.
-    pub read_url: String,
-    /// Browser URL for the single writable operator, when requested.
+    /// Browser URL for spectator access, when requested.
+    #[serde(default)]
+    pub spectator_url: Option<String>,
+    /// Browser URL for operator access, when requested.
     #[serde(default)]
     pub operator_url: Option<String>,
+    /// Named tunnel provider used by the daemon, when a tunnel preset was spawned.
+    #[serde(default)]
+    pub tunnel_provider: Option<String>,
+    /// Public tunnel origin used by generated URLs, when available.
+    #[serde(default)]
+    pub tunnel_public_url: Option<String>,
     /// Expiration timestamp as UNIX seconds, when a TTL was requested.
     #[serde(default)]
     pub expires_at_unix: Option<u64>,
-    /// Out-of-band pairing code required by this share, when requested.
+    /// Out-of-band pairing code required by operator clients, when requested.
     #[serde(default)]
-    pub pairing_code: Option<String>,
-    /// Effective cap for concurrent read-only clients.
-    pub max_readers: u16,
+    pub operator_pairing_code: Option<String>,
+    /// Out-of-band pairing code required by spectator clients, when requested.
+    #[serde(default)]
+    pub spectator_pairing_code: Option<String>,
+    /// Effective cap for concurrent spectator clients, when capped.
+    #[serde(default)]
+    pub max_spectators: Option<u16>,
+    /// Effective cap for concurrent operator clients, when capped.
+    #[serde(default)]
+    pub max_operators: Option<u16>,
     /// Whether an operator URL was minted.
-    pub writable: bool,
-    /// Whether this operator share can execute whitelisted rmux controls.
+    pub operator: bool,
+    /// Whether a spectator URL was minted.
+    pub spectator: bool,
+    /// Whether this operator share can execute rmux controls.
     pub controls: bool,
     /// Whether the target session is killed when this share expires.
     pub kill_session_on_expire: bool,
@@ -120,19 +136,25 @@ pub struct WebShareSummary {
     pub share_id: String,
     /// Shared browser scope.
     pub scope: WebShareScope,
-    /// Redacted read-only URL, when available for display.
+    /// Redacted spectator URL, when available for display.
     #[serde(default)]
-    pub read_url: Option<String>,
+    pub spectator_url: Option<String>,
     /// Whether an operator URL exists for this share.
-    pub writable: bool,
-    /// Whether this share can execute whitelisted rmux controls.
+    pub operator: bool,
+    /// Whether a spectator URL exists for this share.
+    pub spectator: bool,
+    /// Whether this share can execute rmux controls.
     pub controls: bool,
-    /// Active read-only clients.
-    pub active_readers: u16,
-    /// Effective cap for concurrent read-only clients.
-    pub max_readers: u16,
-    /// Whether the single operator slot is currently connected.
-    pub operator_connected: bool,
+    /// Active spectator clients.
+    pub active_spectators: u16,
+    /// Active operator clients.
+    pub active_operators: u16,
+    /// Effective cap for concurrent spectator clients, when capped.
+    #[serde(default)]
+    pub max_spectators: Option<u16>,
+    /// Effective cap for concurrent operator clients, when capped.
+    #[serde(default)]
+    pub max_operators: Option<u16>,
     /// Expiration timestamp as UNIX seconds, when a TTL was requested.
     #[serde(default)]
     pub expires_at_unix: Option<u64>,

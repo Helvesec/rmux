@@ -7,18 +7,20 @@ pub struct WebShareSummary {
     pub id: String,
     /// Shared pane or session scope.
     pub scope: WebShareScope,
-    /// Redacted read-only URL, if available.
-    pub read_url_redacted: Option<String>,
+    /// Redacted spectator URL, if available.
+    pub spectator_url_redacted: Option<String>,
     /// Whether this share has an operator URL.
-    pub writable: bool,
-    /// Whether this share grants remote rmux controls.
-    pub controls: bool,
-    /// Active read-only client count.
-    pub active_readers: u16,
-    /// Maximum read-only clients allowed.
-    pub max_readers: u16,
-    /// Whether the single operator slot is occupied.
-    pub operator_connected: bool,
+    pub operator: bool,
+    /// Whether this share has a spectator URL.
+    pub spectator: bool,
+    /// Active spectator client count.
+    pub active_spectators: u16,
+    /// Active operator client count.
+    pub active_operators: u16,
+    /// Maximum spectator clients allowed, when capped.
+    pub max_spectators: Option<u16>,
+    /// Maximum operator clients allowed, when capped.
+    pub max_operators: Option<u16>,
     /// Expiration timestamp in UNIX seconds.
     pub expires_at_unix: Option<u64>,
     /// Whether the daemon kills the target session when this share expires.
@@ -41,12 +43,13 @@ impl From<rmux_proto::WebShareSummary> for WebShareSummary {
         Self {
             id: value.share_id,
             scope: value.scope,
-            read_url_redacted: value.read_url,
-            writable: value.writable,
-            controls: value.controls,
-            active_readers: value.active_readers,
-            max_readers: value.max_readers,
-            operator_connected: value.operator_connected,
+            spectator_url_redacted: value.spectator_url,
+            operator: value.operator,
+            spectator: value.spectator,
+            active_spectators: value.active_spectators,
+            active_operators: value.active_operators,
+            max_spectators: value.max_spectators,
+            max_operators: value.max_operators,
             expires_at_unix: value.expires_at_unix,
             kill_session_on_expire: value.kill_session_on_expire,
         }

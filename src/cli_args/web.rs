@@ -2,13 +2,22 @@ use clap::{ArgAction, ArgGroup, Args, ValueEnum};
 
 use super::{parse_command_args, parse_target_spec, TargetSpec};
 
+pub(crate) const WEB_SHARE_TUNNEL_PROVIDERS: &[&str] = &[
+    "localhost-run",
+    "sandhole",
+    "serveo",
+    "srv-us",
+    "tailscale-funnel",
+    "tailscale-serve",
+];
+
 pub(crate) fn parse_web_share_args(arguments: Vec<String>) -> Result<WebShareArgs, clap::Error> {
     parse_command_args("web-share", normalize_web_share_args(arguments))
 }
 
 #[derive(Debug, Clone, Args)]
 #[command(
-    after_help = "Local web-share mode opens https://share.rmux.io/ against ws://127.0.0.1:<port>/share. -t accepts a pane target or a session name; pane targets expose one pane, session targets expose the attached session view. Pass -w for operator input. Pass --controls with -w on a session target to allow whitelisted rmux commands. Use `web-share stop <share-id>` or `web-share disconnect <share-id>` to revoke one active share without stopping the rmux daemon. Use --ttl seconds or --expires-at RFC3339 to set expiry; --kill-session-on-expire is session-only and intentionally destructive. Pass --tunnel-url for a bring-your-own public endpoint. Pass --frontend-url to use a self-hosted frontend. Pass --theme user|light|dark to choose the initial browser terminal palette. Pass --show-viewers to show a live connected browser count in the navbar. Pass --pin to require an out-of-band pairing code. Chromium-based browsers may require allowing Local Network access for local mode. In-app webviews are not guaranteed."
+    after_help = WEB_SHARE_AFTER_HELP
 )]
 #[command(group(
     ArgGroup::new("mode")
@@ -31,27 +40,50 @@ pub(crate) struct WebShareArgs {
     pub(crate) config: bool,
     #[arg(short = 't', value_parser = parse_target_spec)]
     pub(crate) target: Option<TargetSpec>,
-    #[arg(short = 'w', long = "writable", action = ArgAction::SetTrue)]
-    pub(crate) writable: bool,
-    #[arg(long = "controls", action = ArgAction::SetTrue)]
-    pub(crate) controls: bool,
+    #[arg(long = "operator-only", action = ArgAction::SetTrue, conflicts_with = "spectator_only")]
+    pub(crate) operator_only: bool,
+    #[arg(long = "spectator-only", action = ArgAction::SetTrue, conflicts_with = "operator_only")]
+    pub(crate) spectator_only: bool,
     #[arg(long = "ttl", value_name = "seconds")]
     pub(crate) ttl_seconds: Option<u64>,
     #[arg(long = "expires-at", value_name = "RFC3339")]
     pub(crate) expires_at: Option<String>,
     #[arg(long = "kill-session-on-expire", action = ArgAction::SetTrue)]
     pub(crate) kill_session_on_expire: bool,
-    #[arg(long = "max-readers", value_name = "count")]
-    pub(crate) max_readers: Option<u16>,
+    #[arg(long = "max-spectators", value_name = "count")]
+    pub(crate) max_spectators: Option<u16>,
+    #[arg(long = "max-operators", value_name = "count")]
+    pub(crate) max_operators: Option<u16>,
     #[arg(long = "frontend-url", alias = "web-frontend", value_name = "url")]
     pub(crate) frontend_url: Option<String>,
-    #[arg(long = "tunnel-url", alias = "public-url", value_name = "url")]
+    #[arg(
+        long = "tunnel-url",
+        alias = "public-url",
+        value_name = "url",
+        conflicts_with = "tunnel_provider"
+    )]
     pub(crate) public_base_url: Option<String>,
+    #[arg(
+        long = "tunnel-provider",
+        value_name = "provider",
+        num_args = 0..=1,
+        default_missing_value = "",
+        conflicts_with = "public_base_url"
+    )]
+    pub(crate) tunnel_provider: Option<String>,
     #[arg(long = "no-navbar", action = ArgAction::SetTrue)]
     pub(crate) no_navbar: bool,
     #[arg(long = "no-disclaimer", action = ArgAction::SetTrue)]
     pub(crate) no_disclaimer: bool,
-    #[arg(long = "show-viewers", alias = "show-viewer-count", action = ArgAction::SetTrue)]
+    #[arg(long = "hide-viewers", alias = "hide-viewer-count", action = ArgAction::SetTrue)]
+    pub(crate) hide_viewers: bool,
+    #[arg(
+        long = "show-viewers",
+        alias = "show-viewer-count",
+        action = ArgAction::SetTrue,
+        hide = true,
+        conflicts_with = "hide_viewers"
+    )]
     pub(crate) show_viewers: bool,
     #[arg(
         long = "theme",
@@ -60,9 +92,43 @@ pub(crate) struct WebShareArgs {
         value_name = "user|light|dark"
     )]
     pub(crate) terminal_theme: Option<WebShareTerminalThemeArg>,
-    #[arg(long = "pin", alias = "pairing-code", action = ArgAction::SetTrue)]
-    pub(crate) require_pin: bool,
+    #[arg(long = "no-pin", action = ArgAction::SetTrue)]
+    pub(crate) no_pin: bool,
+    #[arg(
+        long = "pin-operator",
+        value_name = "PIN",
+        conflicts_with_all = ["no_pin", "spectator_only"]
+    )]
+    pub(crate) pin_operator: Option<String>,
+    #[arg(
+        long = "pin-spectator",
+        value_name = "PIN",
+        conflicts_with_all = ["no_pin", "operator_only"]
+    )]
+    pub(crate) pin_spectator: Option<String>,
+    #[arg(
+        long = "pin",
+        alias = "pairing-code",
+        action = ArgAction::SetTrue,
+        hide = true,
+        conflicts_with = "no_pin"
+    )]
+    pub(crate) pin: bool,
 }
+
+const WEB_SHARE_AFTER_HELP: &str = "\
+Notes:
+  -t accepts a pane target or a session name.
+  Pane targets expose one pane; session targets expose the attached session view.
+  By default rmux mints a private operator URL and a spectator URL.
+  Use --operator-only or --spectator-only to restrict roles.
+  Pairing PINs are required by default; use --no-pin to disable them.
+  Use --pin-operator PIN and --pin-spectator PIN to supply 6-digit role PINs.
+  Use web-share stop <share-id> to revoke an active share.
+  Use --tunnel-provider NAME for internet access, or --tunnel-url for your own endpoint.
+  Available tunnel providers: localhost-run, sandhole, serveo, srv-us, tailscale-funnel, tailscale-serve.
+  Use --frontend-url to host your own static frontend.
+";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum WebShareTerminalThemeArg {

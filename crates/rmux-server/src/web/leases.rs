@@ -1,91 +1,112 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub(crate) struct LeaseBook {
-    current_readers: AtomicUsize,
-    max_readers: usize,
-    operator_connected: AtomicBool,
+    current_operators: AtomicUsize,
+    current_spectators: AtomicUsize,
+    max_operators: Option<usize>,
+    max_spectators: Option<usize>,
+    next_operator_id: AtomicU64,
+    operator_order: Mutex<Vec<u64>>,
 }
 
 impl LeaseBook {
-    pub(crate) fn new(max_readers: usize) -> Arc<Self> {
+    pub(crate) fn new(max_spectators: Option<usize>, max_operators: Option<usize>) -> Arc<Self> {
         Arc::new(Self {
-            current_readers: AtomicUsize::new(0),
-            max_readers,
-            operator_connected: AtomicBool::new(false),
+            current_operators: AtomicUsize::new(0),
+            current_spectators: AtomicUsize::new(0),
+            max_operators,
+            max_spectators,
+            next_operator_id: AtomicU64::new(1),
+            operator_order: Mutex::new(Vec::new()),
         })
     }
 
-    pub(crate) fn operator_connected(&self) -> bool {
-        self.operator_connected.load(Ordering::Acquire)
+    pub(crate) fn operator_count(&self) -> usize {
+        self.current_operators.load(Ordering::Acquire)
     }
 
     pub(crate) fn try_operator(self: &Arc<Self>) -> Option<OperatorLease> {
-        self.operator_connected
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| OperatorLease {
-                book: Arc::clone(self),
-                active: true,
-            })
+        increment_bounded(&self.current_operators, self.max_operators)?;
+        let id = self.next_operator_id.fetch_add(1, Ordering::AcqRel);
+        self.operator_order
+            .lock()
+            .expect("operator order mutex must not be poisoned")
+            .push(id);
+        Some(OperatorLease {
+            book: Arc::clone(self),
+            id,
+        })
     }
 
-    pub(crate) fn try_read(self: &Arc<Self>) -> Option<ReadLease> {
-        let mut current = self.current_readers.load(Ordering::Acquire);
-        loop {
-            if current >= self.max_readers {
-                return None;
-            }
-            match self.current_readers.compare_exchange(
-                current,
-                current + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Some(ReadLease {
-                        book: Arc::clone(self),
-                    });
-                }
-                Err(observed) => current = observed,
-            }
+    pub(crate) fn try_spectator(self: &Arc<Self>) -> Option<SpectatorLease> {
+        increment_bounded(&self.current_spectators, self.max_spectators)?;
+        Some(SpectatorLease {
+            book: Arc::clone(self),
+        })
+    }
+
+    pub(crate) fn spectator_count(&self) -> usize {
+        self.current_spectators.load(Ordering::Acquire)
+    }
+
+    fn release_operator(&self, id: u64) {
+        self.current_operators.fetch_sub(1, Ordering::AcqRel);
+        self.operator_order
+            .lock()
+            .expect("operator order mutex must not be poisoned")
+            .retain(|candidate| *candidate != id);
+    }
+
+    fn current_resize_operator(&self) -> Option<u64> {
+        self.operator_order
+            .lock()
+            .expect("operator order mutex must not be poisoned")
+            .last()
+            .copied()
+    }
+}
+
+fn increment_bounded(count: &AtomicUsize, max: Option<usize>) -> Option<()> {
+    let mut current = count.load(Ordering::Acquire);
+    loop {
+        if max.is_some_and(|max| current >= max) {
+            return None;
         }
-    }
-
-    pub(crate) fn reader_count(&self) -> usize {
-        self.current_readers.load(Ordering::Acquire)
+        match count.compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Some(()),
+            Err(observed) => current = observed,
+        }
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct ReadLease {
+pub(crate) struct SpectatorLease {
     book: Arc<LeaseBook>,
 }
 
-impl Drop for ReadLease {
+impl Drop for SpectatorLease {
     fn drop(&mut self) {
-        self.book.current_readers.fetch_sub(1, Ordering::AcqRel);
+        self.book.current_spectators.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct OperatorLease {
     book: Arc<LeaseBook>,
-    active: bool,
+    id: u64,
 }
 
 impl OperatorLease {
-    fn release_operator_slot(&self) {
-        self.book.operator_connected.store(false, Ordering::Release);
+    pub(crate) fn is_resize_authority(&self) -> bool {
+        self.book.current_resize_operator() == Some(self.id)
     }
 }
 
 impl Drop for OperatorLease {
     fn drop(&mut self) {
-        if self.active {
-            self.release_operator_slot();
-        }
+        self.book.release_operator(self.id);
     }
 }
 
@@ -94,28 +115,52 @@ mod tests {
     use super::LeaseBook;
 
     #[test]
-    fn read_lease_tracks_count_until_drop() {
-        let book = LeaseBook::new(1);
-        let read = book.try_read().expect("read slot should be free");
+    fn spectator_lease_tracks_count_until_drop() {
+        let book = LeaseBook::new(Some(1), None);
+        let spectator = book.try_spectator().expect("spectator slot should be free");
 
-        assert_eq!(book.reader_count(), 1);
-        assert!(book.try_read().is_none());
+        assert_eq!(book.spectator_count(), 1);
+        assert!(book.try_spectator().is_none());
 
-        drop(read);
-        assert_eq!(book.reader_count(), 0);
-        assert!(book.try_read().is_some());
+        drop(spectator);
+        assert_eq!(book.spectator_count(), 0);
+        assert!(book.try_spectator().is_some());
     }
 
     #[test]
-    fn operator_lease_tracks_connected_state_until_drop() {
-        let book = LeaseBook::new(1);
+    fn uncapped_spectator_lease_has_no_limit() {
+        let book = LeaseBook::new(None, None);
+
+        let _first = book.try_spectator().expect("uncapped slot");
+        let _second = book.try_spectator().expect("uncapped slot");
+
+        assert_eq!(book.spectator_count(), 2);
+    }
+
+    #[test]
+    fn operator_lease_tracks_count_until_drop() {
+        let book = LeaseBook::new(None, Some(1));
         let operator = book.try_operator().expect("operator slot should be free");
 
-        assert!(book.operator_connected());
+        assert_eq!(book.operator_count(), 1);
         assert!(book.try_operator().is_none());
 
         drop(operator);
-        assert!(!book.operator_connected());
+        assert_eq!(book.operator_count(), 0);
         assert!(book.try_operator().is_some());
+    }
+
+    #[test]
+    fn newest_operator_is_resize_authority_until_it_drops() {
+        let book = LeaseBook::new(None, None);
+        let first = book.try_operator().expect("first operator");
+        assert!(first.is_resize_authority());
+
+        let second = book.try_operator().expect("second operator");
+        assert!(!first.is_resize_authority());
+        assert!(second.is_resize_authority());
+
+        drop(second);
+        assert!(first.is_resize_authority());
     }
 }

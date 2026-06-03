@@ -209,27 +209,35 @@ The
 target may be a pane or a session name. Pane targets share one pane. Session
 targets mirror the active window layout and can switch windows through the web
 client.
-By default shares are read-only. Pass
-.B -w
-for operator input into the active pane. Pass
-.B --controls
-with
-.B -w
-on a session target to allow whitelisted rmux commands from the browser.
+By default both URLs are minted: a private operator URL and a spectator URL for
+sharing. Pass
+.B --operator-only
+or
+.B --spectator-only
+to restrict the share to one role. Operator session shares can use rmux prefix
+commands from the browser.
+Treat the private operator URL as equivalent to a local attached rmux client:
+an authenticated operator is trusted to control the targeted session.
 It requires a browser that allows public-origin access to loopback
 WS connections. Chromium-based browsers may block this under Local Network
 Access; allow Local Network access for
 .B share.rmux.io .
 Pass
 .B --tunnel-url
-to use a bring-your-own public endpoint, and
+to use a bring-your-own public endpoint, pass
+.B --tunnel-provider NAME
+to spawn a configured tunnel preset, and pass
 .B --frontend-url
 to use a self-hosted frontend.
-Pass
-.B --pin
-to require the out-of-band pairing code printed by
+The out-of-band pairing code printed by
 .B web-share
-before a browser can authenticate. Pass
+is required by default before a browser can authenticate. Pass
+.B --no-pin
+to disable it. Shares do not expire unless
+.B --ttl
+or
+.B --expires-at
+is supplied. Pass
 .B --ttl SECONDS
 or
 .B --expires-at RFC3339
@@ -238,18 +246,24 @@ it does not stop the rmux daemon. Pass
 .B --kill-session-on-expire
 only on a session share when the target session should be destroyed at expiry.
 Pass
+.B --max-spectators COUNT
+to cap concurrent spectators, and
+.B --max-operators COUNT
+to cap concurrent operators. Spectator caps require a spectator URL; operator
+caps require an operator URL.
+Pass
 .B --no-navbar
 or
 .B --no-disclaimer
-to generate a minimal viewer URL.
-Pass
-.B --show-viewers
-to show a live connected browser count in the viewer navbar.
+to generate a minimal spectator URL.
+The live connected browser count is shown in the navbar by default. Pass
+.B --hide-viewers
+to hide it.
 Use
 .B web-share stop SHARE-ID
 or
 .B web-share disconnect SHARE-ID
-to revoke one active browser share and close its viewers. These commands do not
+to revoke one active browser share and close its clients. These commands do not
 stop the rmux daemon or the web-share listener.
 Pass
 .B start-server --web-port PORT --frontend-url URL

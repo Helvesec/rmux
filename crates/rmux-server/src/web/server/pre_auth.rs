@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use tokio::sync::oneshot;
 #[derive(Clone)]
 pub(super) struct PreAuthQueue {
     inner: Arc<Mutex<PreAuthQueueState>>,
@@ -17,13 +16,11 @@ struct PreAuthQueueState {
 
 struct PreAuthEntry {
     id: u64,
-    evict: oneshot::Sender<()>,
 }
 
 pub(super) struct PreAuthGuard {
     queue: PreAuthQueue,
     id: u64,
-    evicted: oneshot::Receiver<()>,
 }
 
 impl PreAuthQueue {
@@ -35,22 +32,18 @@ impl PreAuthQueue {
         }
     }
 
-    pub(super) fn register(&self) -> PreAuthGuard {
-        let (evict, evicted) = oneshot::channel();
+    pub(super) fn try_register(&self) -> Option<PreAuthGuard> {
         let mut state = self.inner.lock().expect("pre-auth queue lock poisoned");
+        if state.entries.len() >= self.capacity {
+            return None;
+        }
         let id = state.next_id;
         state.next_id = state.next_id.wrapping_add(1);
-        state.entries.push_back(PreAuthEntry { id, evict });
-        if state.entries.len() > self.capacity {
-            if let Some(oldest) = state.entries.pop_front() {
-                let _ = oldest.evict.send(());
-            }
-        }
-        PreAuthGuard {
+        state.entries.push_back(PreAuthEntry { id });
+        Some(PreAuthGuard {
             queue: self.clone(),
             id,
-            evicted,
-        }
+        })
     }
 
     fn remove(&self, id: u64) {
@@ -67,12 +60,6 @@ impl PreAuthQueue {
             .expect("pre-auth queue lock poisoned")
             .entries
             .len()
-    }
-}
-
-impl PreAuthGuard {
-    pub(super) async fn evicted(&mut self) {
-        let _ = (&mut self.evicted).await;
     }
 }
 

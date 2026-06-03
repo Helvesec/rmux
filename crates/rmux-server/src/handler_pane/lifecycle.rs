@@ -20,11 +20,13 @@ const DEAD_PANE_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 enum PaneExitPlan {
     Ignore,
     KeepDead {
+        runtime_session_name: rmux_proto::SessionName,
         target: PaneTarget,
         prepare_dead: bool,
         output: ExitedPaneOutput,
     },
     RemovePane {
+        runtime_session_name: rmux_proto::SessionName,
         session_name: rmux_proto::SessionName,
         target: PaneTarget,
         window_destroyed: bool,
@@ -33,6 +35,7 @@ enum PaneExitPlan {
         output: ExitedPaneOutput,
     },
     RemoveSession {
+        runtime_session_name: rmux_proto::SessionName,
         session_name: rmux_proto::SessionName,
         session_id: SessionId,
         target: PaneTarget,
@@ -49,9 +52,13 @@ struct ExitedPaneOutput {
 }
 
 impl ExitedPaneOutput {
-    fn capture(state: &HandlerState, event: &PaneExitEvent) -> Self {
+    fn capture(
+        state: &HandlerState,
+        runtime_session_name: &rmux_proto::SessionName,
+        pane_id: rmux_core::PaneId,
+    ) -> Self {
         let (receiver, sender) =
-            state.runtime_pane_output_drain_handles(&event.session_name, event.pane_id);
+            state.runtime_pane_output_drain_handles(runtime_session_name, pane_id);
         Self { receiver, sender }
     }
 
@@ -95,27 +102,28 @@ impl RequestHandler {
         let plan = loop {
             let plan = {
                 let mut state = self.state.lock().await;
-                if !state.pane_output_generation_matches(
+                let Some(runtime_session_name) = state.resolve_pane_event_runtime_session(
                     &event.session_name,
                     event.pane_id,
                     event.generation,
-                ) {
+                ) else {
                     return;
-                }
+                };
                 let Some(target) =
-                    state.pane_target_for_runtime_pane(&event.session_name, event.pane_id)
+                    state.pane_target_for_runtime_pane(&runtime_session_name, event.pane_id)
                 else {
                     return;
                 };
                 let was_dead = state.pane_is_dead(target.session_name(), event.pane_id);
-                let output = ExitedPaneOutput::capture(&state, &event);
+                let output =
+                    ExitedPaneOutput::capture(&state, &runtime_session_name, event.pane_id);
                 let metadata =
-                    match state.observe_runtime_pane_exit(&event.session_name, event.pane_id) {
+                    match state.observe_runtime_pane_exit(&runtime_session_name, event.pane_id) {
                         Ok(Some(metadata)) => Some(metadata),
                         Ok(None) => None,
                         Err(error) => {
                             warn!(
-                                session = %event.session_name,
+                                session = %runtime_session_name,
                                 pane_id = event.pane_id.as_u32(),
                                 "failed to observe pane exit: {error}"
                             );
@@ -126,6 +134,7 @@ impl RequestHandler {
                 if let Some(metadata) = metadata {
                     if should_keep_dead_pane(&state, &target, metadata) {
                         Some(PaneExitPlan::KeepDead {
+                            runtime_session_name,
                             target,
                             prepare_dead: !was_dead,
                             output,
@@ -196,6 +205,7 @@ impl RequestHandler {
                                 );
                             }
                             Some(PaneExitPlan::RemoveSession {
+                                runtime_session_name,
                                 session_name: target.session_name().clone(),
                                 session_id: removed_session.id(),
                                 target,
@@ -217,6 +227,7 @@ impl RequestHandler {
                                         let _ = state.hooks.remove_pane(&target);
                                     }
                                     Some(PaneExitPlan::RemovePane {
+                                        runtime_session_name,
                                         session_name: target.session_name().clone(),
                                         target,
                                         window_destroyed: result.response.window_destroyed,
@@ -254,14 +265,19 @@ impl RequestHandler {
         match plan {
             PaneExitPlan::Ignore => {}
             PaneExitPlan::KeepDead {
+                runtime_session_name,
                 target,
                 prepare_dead,
                 output,
             } => {
                 output.ensure_eof(event.generation).await;
                 if prepare_dead {
-                    self.prepare_kept_dead_pane_transcript(&event, &target)
-                        .await;
+                    self.prepare_kept_dead_pane_transcript(
+                        &runtime_session_name,
+                        event.pane_id,
+                        &target,
+                    )
+                    .await;
                 }
                 let session_names = if self.attached_count(target.session_name()).await == 0 {
                     let mut state = self.state.lock().await;
@@ -285,6 +301,7 @@ impl RequestHandler {
                 }
             }
             PaneExitPlan::RemovePane {
+                runtime_session_name,
                 session_name,
                 target,
                 window_destroyed,
@@ -292,10 +309,16 @@ impl RequestHandler {
                 pane_event,
                 output,
             } => {
-                self.retain_removed_pane_output(&event, &target, &output);
+                self.retain_removed_pane_output(
+                    &runtime_session_name,
+                    event.pane_id,
+                    &target,
+                    &output,
+                );
                 output.ensure_eof(event.generation).await;
                 self.forget_pane_snapshot_coalescers(&removed_pane_ids);
-                self.cleanup_exited_pane_output_subscription(&event).await;
+                self.cleanup_exited_pane_output_subscription(&runtime_session_name, event.pane_id)
+                    .await;
                 self.emit_prepared(pane_event);
                 self.sync_session_silence_timers(&session_name).await;
                 if !window_destroyed {
@@ -311,6 +334,7 @@ impl RequestHandler {
                 self.refresh_control_session(&session_name).await;
             }
             PaneExitPlan::RemoveSession {
+                runtime_session_name,
                 session_name,
                 session_id,
                 target,
@@ -320,11 +344,17 @@ impl RequestHandler {
                 output,
             } => {
                 self.prune_web_session(Some((session_name.clone(), session_id)));
-                self.retain_removed_pane_output(&event, &target, &output);
+                self.retain_removed_pane_output(
+                    &runtime_session_name,
+                    event.pane_id,
+                    &target,
+                    &output,
+                );
                 self.remove_session_leases(std::slice::from_ref(&session_name));
                 output.ensure_eof(event.generation).await;
                 self.forget_pane_snapshot_coalescers(&removed_pane_ids);
-                self.cleanup_exited_pane_output_subscription(&event).await;
+                self.cleanup_exited_pane_output_subscription(&runtime_session_name, event.pane_id)
+                    .await;
                 self.exit_attached_session(&session_name).await;
                 self.cancel_session_silence_timers(&session_name).await;
                 self.emit_prepared(pane_event);
@@ -337,54 +367,64 @@ impl RequestHandler {
 
     fn retain_removed_pane_output(
         &self,
-        event: &PaneExitEvent,
+        runtime_session_name: &rmux_proto::SessionName,
+        pane_id: rmux_core::PaneId,
         target: &PaneTarget,
         output: &ExitedPaneOutput,
     ) {
         if let Some(sender) = output.sender() {
             self.retain_exited_pane_output(
                 target.clone(),
-                PaneOutputSubscriptionKey::new(event.session_name.clone(), event.pane_id),
+                PaneOutputSubscriptionKey::new(runtime_session_name.clone(), pane_id),
                 sender,
             );
         }
     }
 
-    async fn cleanup_exited_pane_output_subscription(&self, event: &PaneExitEvent) {
-        let key = PaneOutputSubscriptionKey::new(event.session_name.clone(), event.pane_id);
+    async fn cleanup_exited_pane_output_subscription(
+        &self,
+        runtime_session_name: &rmux_proto::SessionName,
+        pane_id: rmux_core::PaneId,
+    ) {
+        let key = PaneOutputSubscriptionKey::new(runtime_session_name.clone(), pane_id);
         self.drain_exited_pane_output_subscriptions(key).await;
     }
 
-    async fn prepare_kept_dead_pane_transcript(&self, event: &PaneExitEvent, target: &PaneTarget) {
+    async fn prepare_kept_dead_pane_transcript(
+        &self,
+        runtime_session_name: &rmux_proto::SessionName,
+        pane_id: rmux_core::PaneId,
+        target: &PaneTarget,
+    ) {
         let (retry_strip, output_rx) = {
             let mut state = self.state.lock().await;
             let cleared_respawned_transcript = match state
                 .clear_runtime_pane_transcript_for_dead_exit_if_marked(
-                    &event.session_name,
-                    event.pane_id,
+                    runtime_session_name,
+                    pane_id,
                 ) {
                 Ok(cleared) => cleared,
                 Err(error) => {
                     warn!(
-                        session = %event.session_name,
-                        pane_id = event.pane_id.as_u32(),
+                        session = %runtime_session_name,
+                        pane_id = pane_id.as_u32(),
                         "failed to prepare dead pane transcript: {error}"
                     );
                     false
                 }
             };
             let output_rx = (!cleared_respawned_transcript)
-                .then(|| state.subscribe_runtime_pane_output(&event.session_name, event.pane_id))
+                .then(|| state.subscribe_runtime_pane_output(runtime_session_name, pane_id))
                 .flatten();
             let stripped = if cleared_respawned_transcript {
                 false
             } else {
-                match state.strip_attached_submitted_line(&event.session_name, event.pane_id) {
+                match state.strip_attached_submitted_line(runtime_session_name, pane_id) {
                     Ok(stripped) => stripped,
                     Err(error) => {
                         warn!(
-                            session = %event.session_name,
-                            pane_id = event.pane_id.as_u32(),
+                            session = %runtime_session_name,
+                            pane_id = pane_id.as_u32(),
                             "failed to strip attached submitted line for dead pane: {error}"
                         );
                         false
@@ -403,20 +443,19 @@ impl RequestHandler {
 
         let mut state = self.state.lock().await;
         if retry_strip {
-            if let Err(error) =
-                state.strip_attached_submitted_line(&event.session_name, event.pane_id)
-            {
+            if let Err(error) = state.strip_attached_submitted_line(runtime_session_name, pane_id) {
                 warn!(
-                    session = %event.session_name,
-                    pane_id = event.pane_id.as_u32(),
+                    session = %runtime_session_name,
+                    pane_id = pane_id.as_u32(),
                     "failed to retry attached submitted line strip for dead pane: {error}"
                 );
             }
         }
-        if let Err(error) = append_remain_on_exit_message(&mut state, &event.session_name, target) {
+        if let Err(error) = append_remain_on_exit_message(&mut state, runtime_session_name, target)
+        {
             warn!(
-                session = %event.session_name,
-                pane_id = event.pane_id.as_u32(),
+                session = %runtime_session_name,
+                pane_id = pane_id.as_u32(),
                 "failed to append remain-on-exit message: {error}"
             );
         }
@@ -546,7 +585,13 @@ fn apply_dead_pane_automatic_window_name(
             )
         })?;
         window.name() != Some(rendered.as_str())
-            && (tracked || window.automatic_rename() || window.name().is_none())
+            && crate::automatic_rename::window_allows_automatic_rename(
+                &state.options,
+                target.session_name(),
+                target.window_index(),
+                window,
+                tracked,
+            )
     };
     if !should_update {
         return Ok(vec![target.session_name().clone()]);

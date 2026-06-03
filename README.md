@@ -256,9 +256,12 @@ is opt-in:
 
 ```tmux
 set -g allow-passthrough on
-# or, for tmux-compatible "all" passthrough:
-set -g allow-passthrough all
 ```
+
+RMUX processes passthrough for the attached pane, so `on` enables it. The tmux
+value `all` (which also passes through unattached panes) is accepted for
+configuration compatibility, but because RMUX renders the attached pane it
+currently behaves the same as `on` rather than adding unattached-pane passthrough.
 
 If your terminal supports either protocol but is not detected automatically,
 add a terminal feature override:
@@ -299,6 +302,18 @@ Release artifact checks are driven by:
 ```sh
 scripts/release-local.sh
 scripts/package-unix.sh
+scripts/package-debian.sh
+scripts/verify-debian-package.sh
+scripts/package-rpm.sh
+scripts/verify-rpm-package.sh
+scripts/package-windows.ps1
+scripts/verify-package-windows.ps1
+scripts/generate-apt-repository.sh
+scripts/generate-rpm-repository.sh
+scripts/generate-homebrew-formula.sh
+scripts/generate-winget-manifest.sh
+scripts/generate-scoop-manifest.sh
+scripts/generate-chocolatey-package.sh
 ```
 
 `#![forbid(unsafe_code)]` is used in the upper-level crates. OS and terminal boundary code is isolated in the lower-level runtime crates.

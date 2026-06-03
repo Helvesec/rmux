@@ -19,15 +19,19 @@ pub struct WebShareBuilder<'a> {
     scope: WebShareScope,
     frontend_url: Option<String>,
     public_base_url: Option<String>,
+    tunnel_provider: Option<String>,
     ttl_seconds: Option<u64>,
     expires_at_unix: Option<u64>,
-    max_readers: Option<u16>,
+    max_operators: Option<u16>,
+    max_spectators: Option<u16>,
     url_options: WebShareUrlOptions,
     require_pin: bool,
+    operator_pin: Option<String>,
+    spectator_pin: Option<String>,
     terminal_theme: Option<WebTerminalTheme>,
     terminal_palette: Option<WebTerminalPalette>,
-    writable: bool,
-    controls: bool,
+    operator: bool,
+    spectator: bool,
     kill_session_on_expire: bool,
 }
 
@@ -38,15 +42,19 @@ impl<'a> WebShareBuilder<'a> {
             scope,
             frontend_url: None,
             public_base_url: None,
+            tunnel_provider: None,
             ttl_seconds: None,
             expires_at_unix: None,
-            max_readers: None,
+            max_operators: None,
+            max_spectators: None,
             url_options: WebShareUrlOptions::default(),
-            require_pin: false,
+            require_pin: true,
+            operator_pin: None,
+            spectator_pin: None,
             terminal_theme: None,
             terminal_palette: None,
-            writable: false,
-            controls: false,
+            operator: true,
+            spectator: true,
             kill_session_on_expire: false,
         }
     }
@@ -66,10 +74,17 @@ impl<'a> WebShareBuilder<'a> {
         Ok(self)
     }
 
-    /// Sets the maximum number of concurrent read-only clients.
+    /// Sets the maximum number of concurrent spectator clients.
     #[must_use]
-    pub const fn max_readers(mut self, max_readers: u16) -> Self {
-        self.max_readers = Some(max_readers);
+    pub const fn max_spectators(mut self, max_spectators: u16) -> Self {
+        self.max_spectators = Some(max_spectators);
+        self
+    }
+
+    /// Sets the maximum number of concurrent operator clients.
+    #[must_use]
+    pub const fn max_operators(mut self, max_operators: u16) -> Self {
+        self.max_operators = Some(max_operators);
         self
     }
 
@@ -84,6 +99,15 @@ impl<'a> WebShareBuilder<'a> {
     #[must_use]
     pub fn tunnel_url(mut self, url: impl Into<String>) -> Self {
         self.public_base_url = Some(url.into());
+        self.tunnel_provider = None;
+        self
+    }
+
+    /// Spawns a named daemon-side tunnel preset for this share.
+    #[must_use]
+    pub fn tunnel_provider(mut self, provider: impl Into<String>) -> Self {
+        self.tunnel_provider = Some(provider.into());
+        self.public_base_url = None;
         self
     }
 
@@ -101,6 +125,13 @@ impl<'a> WebShareBuilder<'a> {
         self
     }
 
+    /// Hides the live connected browser count in generated share URLs.
+    #[must_use]
+    pub const fn hide_viewers(mut self) -> Self {
+        self.url_options.show_viewers = false;
+        self
+    }
+
     /// Shows the live connected browser count in generated share URLs.
     #[must_use]
     pub const fn show_viewers(mut self) -> Self {
@@ -108,7 +139,20 @@ impl<'a> WebShareBuilder<'a> {
         self
     }
 
-    /// Requires an out-of-band pairing code in addition to the URL secret.
+    /// Alias for [`Self::show_viewers`].
+    #[must_use]
+    pub const fn show_viewer_count(self) -> Self {
+        self.show_viewers()
+    }
+
+    /// Disables the out-of-band pairing code.
+    #[must_use]
+    pub const fn no_pin(mut self) -> Self {
+        self.require_pin = false;
+        self
+    }
+
+    /// Requires the out-of-band pairing code.
     #[must_use]
     pub const fn pin(mut self) -> Self {
         self.require_pin = true;
@@ -119,6 +163,20 @@ impl<'a> WebShareBuilder<'a> {
     #[must_use]
     pub const fn pairing_code(self) -> Self {
         self.pin()
+    }
+
+    /// Supplies the 6-digit operator pairing PIN instead of generating one.
+    #[must_use]
+    pub fn operator_pin(mut self, pin: impl Into<String>) -> Self {
+        self.operator_pin = Some(pin.into());
+        self
+    }
+
+    /// Supplies the 6-digit spectator pairing PIN instead of generating one.
+    #[must_use]
+    pub fn spectator_pin(mut self, pin: impl Into<String>) -> Self {
+        self.spectator_pin = Some(pin.into());
+        self
     }
 
     /// Sets the initial browser terminal theme for generated share URLs.
@@ -159,20 +217,19 @@ impl<'a> WebShareBuilder<'a> {
         self
     }
 
-    /// Enables the single-operator writable URL.
+    /// Mints only the operator URL.
     #[must_use]
-    pub const fn writable(mut self) -> Self {
-        self.writable = true;
+    pub const fn operator_only(mut self) -> Self {
+        self.operator = true;
+        self.spectator = false;
         self
     }
 
-    /// Enables remote rmux controls for session shares.
-    ///
-    /// Controls require a session share and imply writable operator access.
+    /// Mints only the spectator URL.
     #[must_use]
-    pub const fn controls(mut self) -> Self {
-        self.writable = true;
-        self.controls = true;
+    pub const fn spectator_only(mut self) -> Self {
+        self.operator = false;
+        self.spectator = true;
         self
     }
 
@@ -185,34 +242,32 @@ impl<'a> WebShareBuilder<'a> {
         self
     }
 
-    /// Keeps the share read-only.
-    #[must_use]
-    pub const fn read_only(mut self) -> Self {
-        self.writable = false;
-        self.controls = false;
-        self
-    }
-
     async fn run(self) -> Result<WebShareHandle> {
         require_web_share(self.transport).await?;
+        let controls = self.operator && matches!(&self.scope, WebShareScope::Session(_));
         let response = self
             .transport
             .request(Request::WebShare(WebShareRequest::Create(
                 CreateWebShareRequest {
                     scope: self.scope,
                     public_base_url: self.public_base_url,
+                    tunnel_provider: self.tunnel_provider,
                     frontend_url: self.frontend_url,
                     ttl_seconds: self.ttl_seconds,
                     expires_at_unix: self.expires_at_unix,
-                    max_readers: self.max_readers,
+                    max_spectators: self.max_spectators,
+                    max_operators: self.max_operators,
                     url_options: WebShareUrlOptions {
                         terminal_theme: self.terminal_theme,
                         ..self.url_options
                     },
                     require_pin: self.require_pin,
+                    operator_pin: self.operator_pin,
+                    spectator_pin: self.spectator_pin,
                     terminal_palette: self.terminal_palette.map(Box::new),
-                    writable: self.writable,
-                    controls: self.controls,
+                    operator: self.operator,
+                    spectator: self.spectator,
+                    controls,
                     kill_session_on_expire: self.kill_session_on_expire,
                 },
             )))
@@ -281,7 +336,9 @@ fn system_time_to_unix(value: SystemTime) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{system_time_to_unix, whole_seconds_ceil};
+    use super::{system_time_to_unix, whole_seconds_ceil, WebShareBuilder};
+    use crate::transport::TransportClient;
+    use rmux_proto::{SessionName, WebShareScope};
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
@@ -307,5 +364,20 @@ mod tests {
         assert!(error
             .to_string()
             .contains("web-share expiration must not be before the Unix epoch"));
+    }
+
+    #[tokio::test]
+    async fn positive_compat_aliases_restore_default_web_share_choices() {
+        let (client, _server) = tokio::io::duplex(64);
+        let transport = TransportClient::spawn(client);
+        let scope = WebShareScope::Session(SessionName::new("alpha").expect("valid session"));
+        let builder = WebShareBuilder::new(&transport, scope)
+            .hide_viewers()
+            .show_viewer_count()
+            .no_pin()
+            .pairing_code();
+
+        assert!(builder.url_options.show_viewers);
+        assert!(builder.require_pin);
     }
 }

@@ -623,6 +623,22 @@ async fn forward_attach_emits_display_panes_overlay_for_prefix_q_keystrokes() {
         .await
     });
 
+    let mut frame_bytes = [0_u8; 4096];
+    let mut decoder = AttachFrameDecoder::new();
+    while let Ok(Ok(bytes_read)) =
+        tokio::time::timeout(Duration::from_millis(25), peer.read(&mut frame_bytes)).await
+    {
+        if bytes_read == 0 {
+            break;
+        }
+        decoder.push_bytes(&frame_bytes[..bytes_read]);
+        while decoder
+            .next_message()
+            .expect("decode initial attach frame")
+            .is_some()
+        {}
+    }
+
     let encoded = encode_attach_message(&AttachMessage::Keystroke(AttachedKeystroke::new(
         b"\x02q".to_vec(),
     )))
@@ -631,10 +647,9 @@ async fn forward_attach_emits_display_panes_overlay_for_prefix_q_keystrokes() {
         .await
         .expect("send prefix q");
 
+    let overlay_marker = b"\x1b[s\x1b[?25l";
     let mut collected = Vec::new();
     let mut saw_ack = false;
-    let mut frame_bytes = [0_u8; 4096];
-    let mut decoder = AttachFrameDecoder::new();
     while let Ok(Ok(bytes_read)) =
         tokio::time::timeout(Duration::from_millis(250), peer.read(&mut frame_bytes)).await
     {
@@ -650,8 +665,9 @@ async fn forward_attach_emits_display_panes_overlay_for_prefix_q_keystrokes() {
             }
         }
         if collected
-            .windows(b"\x1b[?25l".len())
-            .any(|window| window == b"\x1b[?25l")
+            .windows(overlay_marker.len())
+            .any(|window| window == overlay_marker)
+            && saw_ack
         {
             break;
         }
@@ -663,8 +679,8 @@ async fn forward_attach_emits_display_panes_overlay_for_prefix_q_keystrokes() {
     );
     assert!(
         collected
-            .windows(b"\x1b[?25l".len())
-            .any(|window| window == b"\x1b[?25l"),
+            .windows(overlay_marker.len())
+            .any(|window| window == overlay_marker),
         "prefix q should emit a display-panes overlay frame, got: {:?}",
         String::from_utf8_lossy(&collected)
     );

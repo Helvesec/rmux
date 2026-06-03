@@ -5,6 +5,9 @@
 
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
+mod automatic_rename;
+#[cfg(any(unix, windows))]
+#[cfg_attr(windows, allow(dead_code))]
 mod client_flags;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
@@ -63,6 +66,9 @@ mod mouse;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod outer_terminal;
+#[cfg(any(unix, windows))]
+#[cfg_attr(windows, allow(dead_code))]
+mod pane_indices;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod pane_io;

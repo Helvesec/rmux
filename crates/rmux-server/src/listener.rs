@@ -52,10 +52,11 @@ pub(crate) async fn serve(
     handler.set_socket_path(&socket_path);
     handler.load_startup_config(options.config_load).await;
     #[cfg(all(any(unix, windows), feature = "web"))]
-    if let Err(error) = crate::web::spawn(Arc::clone(&handler)).await {
-        if web_required {
-            return Err(error);
-        }
+    if web_required {
+        handler
+            .ensure_web_share_listener_running()
+            .await
+            .map_err(|error| io::Error::new(io::ErrorKind::AddrNotAvailable, error.to_string()))?;
     }
     let (connection_shutdown, connection_shutdown_rx) = watch::channel(());
     let mut connection_tasks = JoinSet::new();

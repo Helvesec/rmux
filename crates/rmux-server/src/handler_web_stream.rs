@@ -11,7 +11,7 @@ use crate::web::{
     WebSessionTarget, WebShareAccess, WebShareConnectionCounts, WebShareRevokeReason,
 };
 
-use super::WebPaneSnapshot;
+use super::{WebPaneSnapshot, WebSessionSnapshot};
 
 const ATTACH_READ_BUFFER_SIZE: usize = 8192;
 
@@ -30,9 +30,10 @@ pub(crate) enum WebShareStream {
 
 pub(crate) struct WebSessionStream {
     pub(crate) access: WebShareAccess,
+    pub(crate) attach_pid: u32,
     pub(crate) revoke_rx: tokio::sync::watch::Receiver<Option<WebShareRevokeReason>>,
     pub(crate) target: WebSessionTarget,
-    pub(crate) initial_size: TerminalSize,
+    pub(crate) snapshot: WebSessionSnapshot,
     pub(crate) writer: WriteHalf<DuplexStream>,
     pub(crate) reader: Option<WebSessionAttachReader>,
 }
@@ -43,6 +44,11 @@ pub(crate) struct WebSessionAttachReader {
     read_buffer: [u8; ATTACH_READ_BUFFER_SIZE],
 }
 
+pub(crate) enum WebSessionAttachEvent {
+    Data(Vec<u8>),
+    Resize,
+}
+
 impl WebPaneStream {
     pub(crate) fn origin_allowed(&self, received: &str) -> bool {
         self.access.origin_allowed(received)
@@ -50,6 +56,14 @@ impl WebPaneStream {
 
     pub(crate) fn is_operator(&self) -> bool {
         self.access.is_operator()
+    }
+
+    pub(crate) fn has_operator_access(&self) -> bool {
+        self.access.has_operator_access()
+    }
+
+    pub(crate) fn has_spectator_access(&self) -> bool {
+        self.access.has_spectator_access()
     }
 
     pub(crate) fn share_id(&self) -> &str {
@@ -92,10 +106,38 @@ impl WebShareStream {
         }
     }
 
+    pub(crate) fn has_operator_access(&self) -> bool {
+        match self {
+            Self::Pane(stream) => stream.has_operator_access(),
+            Self::Session(stream) => stream.has_operator_access(),
+        }
+    }
+
+    pub(crate) fn has_spectator_access(&self) -> bool {
+        match self {
+            Self::Pane(stream) => stream.has_spectator_access(),
+            Self::Session(stream) => stream.has_spectator_access(),
+        }
+    }
+
     pub(crate) fn share_id(&self) -> &str {
         match self {
             Self::Pane(stream) => stream.share_id(),
             Self::Session(stream) => stream.share_id(),
+        }
+    }
+
+    pub(crate) fn session_name(&self) -> Option<&str> {
+        match self {
+            Self::Pane(_) => None,
+            Self::Session(stream) => Some(stream.target().name().as_str()),
+        }
+    }
+
+    pub(crate) fn expires_at(&self) -> Option<std::time::SystemTime> {
+        match self {
+            Self::Pane(stream) => stream.expires_at(),
+            Self::Session(stream) => stream.expires_at(),
         }
     }
 
@@ -131,7 +173,7 @@ impl WebShareStream {
         if self.is_operator() {
             "operator"
         } else {
-            "read"
+            "spectator"
         }
     }
 }
@@ -145,12 +187,24 @@ impl WebSessionStream {
         self.access.is_operator()
     }
 
+    pub(crate) fn has_operator_access(&self) -> bool {
+        self.access.has_operator_access()
+    }
+
+    pub(crate) fn has_spectator_access(&self) -> bool {
+        self.access.has_spectator_access()
+    }
+
     pub(crate) fn share_id(&self) -> &str {
         self.access.share_id()
     }
 
     pub(crate) fn controls(&self) -> bool {
         self.access.controls()
+    }
+
+    pub(crate) fn is_resize_authority(&self) -> bool {
+        self.access.is_resize_authority()
     }
 
     pub(crate) fn expires_at(&self) -> Option<std::time::SystemTime> {
@@ -165,8 +219,12 @@ impl WebSessionStream {
         &self.target
     }
 
-    pub(crate) const fn initial_size(&self) -> TerminalSize {
-        self.initial_size
+    pub(crate) const fn attach_pid(&self) -> u32 {
+        self.attach_pid
+    }
+
+    pub(crate) const fn size(&self) -> TerminalSize {
+        self.snapshot.size
     }
 
     pub(crate) fn terminal_palette(&self) -> Option<&WebTerminalPalette> {
@@ -188,9 +246,8 @@ impl WebSessionStream {
             .await
     }
 
-    pub(crate) async fn send_resize(&mut self, cols: u16, rows: u16) -> io::Result<()> {
-        self.write_attach_message(AttachMessage::Resize(TerminalSize { cols, rows }))
-            .await
+    pub(crate) async fn send_attach_resize(&mut self, size: TerminalSize) -> io::Result<()> {
+        self.write_attach_message(AttachMessage::Resize(size)).await
     }
 
     async fn write_attach_message(&mut self, message: AttachMessage) -> io::Result<()> {
@@ -209,7 +266,7 @@ impl WebSessionAttachReader {
         }
     }
 
-    pub(crate) async fn read_attach_bytes(&mut self) -> io::Result<Option<Vec<u8>>> {
+    pub(crate) async fn read_event(&mut self) -> io::Result<Option<WebSessionAttachEvent>> {
         loop {
             if let Some(message) = self
                 .decoder
@@ -217,7 +274,17 @@ impl WebSessionAttachReader {
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?
             {
                 match message {
-                    AttachMessage::Data(bytes) => return Ok(Some(bytes)),
+                    AttachMessage::Data(bytes) => {
+                        if !bytes.is_empty() {
+                            return Ok(Some(WebSessionAttachEvent::Data(bytes)));
+                        }
+                    }
+                    AttachMessage::Resize(_size) => {
+                        return Ok(Some(WebSessionAttachEvent::Resize));
+                    }
+                    AttachMessage::ResizeGeometry(_geometry) => {
+                        return Ok(Some(WebSessionAttachEvent::Resize));
+                    }
                     AttachMessage::KeyDispatched(_) => continue,
                     AttachMessage::Lock(_)
                     | AttachMessage::LockShellCommand(_)
@@ -226,8 +293,6 @@ impl WebSessionAttachReader {
                     | AttachMessage::DetachKill
                     | AttachMessage::DetachExec(_)
                     | AttachMessage::DetachExecShellCommand(_)
-                    | AttachMessage::Resize(_)
-                    | AttachMessage::ResizeGeometry(_)
                     | AttachMessage::Keystroke(_) => continue,
                 }
             }

@@ -73,7 +73,10 @@ mod web_support;
 #[path = "handler_web_disabled.rs"]
 mod web_support;
 #[cfg(all(any(unix, windows), feature = "web"))]
-pub(crate) use web_support::{WebPaneSnapshot, WebPaneStream, WebSessionStream, WebShareStream};
+pub(crate) use web_support::{
+    WebPaneSnapshot, WebPaneStream, WebSessionAttachEvent, WebSessionSnapshot, WebSessionStream,
+    WebShareStream,
+};
 #[path = "handler_window.rs"]
 mod window_support;
 use crate::pane_terminals::HandlerState;
@@ -110,7 +113,7 @@ use subscription_support::OutputSubscriptionState;
 pub(in crate::handler) use target_support::{
     active_session_target, active_window_target, fallback_current_target,
     resolve_existing_session_target, resolve_session_lookup, target_for_request_response,
-    target_for_scope_selector, target_to_scope, SessionLookup,
+    target_for_scope_selector, target_to_scope, with_visible_pane_bases, SessionLookup,
 };
 use wait_support::SdkWaitState;
 
@@ -157,6 +160,8 @@ pub(crate) struct RequestHandler {
     pane_snapshot_revisions: Arc<StdMutex<PaneSnapshotRevisionRegistry>>,
     #[cfg(all(any(unix, windows), feature = "web"))]
     web_shares: Arc<WebShareRegistry>,
+    #[cfg(all(any(unix, windows), feature = "web"))]
+    web_listener_start: Arc<Mutex<()>>,
     task_runtime: Option<tokio::runtime::Handle>,
     #[cfg(test)]
     cleanup_on_drop: bool,
@@ -194,6 +199,8 @@ impl Clone for RequestHandler {
             pane_snapshot_revisions: self.pane_snapshot_revisions.clone(),
             #[cfg(all(any(unix, windows), feature = "web"))]
             web_shares: self.web_shares.clone(),
+            #[cfg(all(any(unix, windows), feature = "web"))]
+            web_listener_start: self.web_listener_start.clone(),
             task_runtime: self.task_runtime.clone(),
             #[cfg(test)]
             cleanup_on_drop: false,
@@ -232,6 +239,8 @@ pub(crate) struct WeakRequestHandler {
     pane_snapshot_revisions: Weak<StdMutex<PaneSnapshotRevisionRegistry>>,
     #[cfg(all(any(unix, windows), feature = "web"))]
     web_shares: Weak<WebShareRegistry>,
+    #[cfg(all(any(unix, windows), feature = "web"))]
+    web_listener_start: Weak<Mutex<()>>,
     task_runtime: Option<tokio::runtime::Handle>,
     #[cfg(test)]
     paste_buffer_delete_pause: Weak<StdMutex<Option<Arc<PasteBufferDeletePause>>>>,
@@ -267,6 +276,8 @@ impl WeakRequestHandler {
             pane_snapshot_revisions: self.pane_snapshot_revisions.upgrade()?,
             #[cfg(all(any(unix, windows), feature = "web"))]
             web_shares: self.web_shares.upgrade()?,
+            #[cfg(all(any(unix, windows), feature = "web"))]
+            web_listener_start: self.web_listener_start.upgrade()?,
             task_runtime: self.task_runtime.clone(),
             #[cfg(test)]
             cleanup_on_drop: false,
@@ -395,6 +406,8 @@ impl RequestHandler {
             )),
             #[cfg(all(any(unix, windows), feature = "web"))]
             web_shares: Arc::new(WebShareRegistry::default()),
+            #[cfg(all(any(unix, windows), feature = "web"))]
+            web_listener_start: Arc::new(Mutex::new(())),
             task_runtime,
             #[cfg(test)]
             cleanup_on_drop: true,
@@ -432,6 +445,8 @@ impl RequestHandler {
             pane_snapshot_revisions: Arc::downgrade(&self.pane_snapshot_revisions),
             #[cfg(all(any(unix, windows), feature = "web"))]
             web_shares: Arc::downgrade(&self.web_shares),
+            #[cfg(all(any(unix, windows), feature = "web"))]
+            web_listener_start: Arc::downgrade(&self.web_listener_start),
             task_runtime: self.task_runtime.clone(),
             #[cfg(test)]
             paste_buffer_delete_pause: Arc::downgrade(&self.paste_buffer_delete_pause),

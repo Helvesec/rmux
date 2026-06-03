@@ -5,9 +5,11 @@ use sha1::{Digest, Sha1};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+use tokio::time::{timeout, Duration};
 
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const CLIENT_FRAME_LIMIT: u64 = 8 * 1024;
+const FRAME_CONTINUATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WebSocketMessage {
@@ -150,9 +152,23 @@ struct WebSocketFrame {
 }
 
 async fn read_frame(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<WebSocketFrame> {
+    read_frame_with_continuation_timeout(stream, FRAME_CONTINUATION_TIMEOUT).await
+}
+
+async fn read_frame_with_continuation_timeout(
+    stream: &mut (impl AsyncRead + Unpin),
+    continuation_timeout: Duration,
+) -> io::Result<WebSocketFrame> {
     let mut head = [0u8; 2];
-    stream.read_exact(&mut head).await?;
+    read_frame_continuation(stream, &mut head[..1], continuation_timeout).await?;
+    read_frame_continuation(stream, &mut head[1..], continuation_timeout).await?;
     let fin = head[0] & 0x80 != 0;
+    if head[0] & 0x70 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "websocket extensions are not negotiated",
+        ));
+    }
     if !fin {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -160,6 +176,12 @@ async fn read_frame(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<WebSock
         ));
     }
     let opcode = head[0] & 0x0f;
+    if !valid_client_opcode(opcode) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported websocket frame opcode",
+        ));
+    }
     let masked = head[1] & 0x80 != 0;
     if !masked {
         return Err(io::Error::new(
@@ -168,13 +190,19 @@ async fn read_frame(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<WebSock
         ));
     }
     let mut len = u64::from(head[1] & 0x7f);
+    if is_control_opcode(opcode) && len >= 126 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "websocket control frame payload is too long",
+        ));
+    }
     if len == 126 {
         let mut bytes = [0u8; 2];
-        stream.read_exact(&mut bytes).await?;
+        read_frame_continuation(stream, &mut bytes, continuation_timeout).await?;
         len = u64::from(u16::from_be_bytes(bytes));
     } else if len == 127 {
         let mut bytes = [0u8; 8];
-        stream.read_exact(&mut bytes).await?;
+        read_frame_continuation(stream, &mut bytes, continuation_timeout).await?;
         len = u64::from_be_bytes(bytes);
     }
     if len > CLIENT_FRAME_LIMIT {
@@ -183,14 +211,35 @@ async fn read_frame(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<WebSock
             "websocket frame exceeds rmux web limit",
         ));
     }
+    if opcode == OPCODE_CLOSE && len == 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "websocket close frame payload is invalid",
+        ));
+    }
     let mut mask = [0u8; 4];
-    stream.read_exact(&mut mask).await?;
+    read_frame_continuation(stream, &mut mask, continuation_timeout).await?;
     let mut payload = vec![0u8; len as usize];
-    stream.read_exact(&mut payload).await?;
+    read_frame_continuation(stream, &mut payload, continuation_timeout).await?;
     for (index, byte) in payload.iter_mut().enumerate() {
         *byte ^= mask[index % mask.len()];
     }
     Ok(WebSocketFrame { opcode, payload })
+}
+
+async fn read_frame_continuation(
+    stream: &mut (impl AsyncRead + Unpin),
+    buffer: &mut [u8],
+    continuation_timeout: Duration,
+) -> io::Result<()> {
+    match timeout(continuation_timeout, stream.read_exact(buffer)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "websocket frame read timed out",
+        )),
+    }
 }
 
 async fn write_frame(
@@ -219,6 +268,17 @@ const OPCODE_CLOSE: u8 = 0x8;
 const OPCODE_PING: u8 = 0x9;
 const OPCODE_PONG: u8 = 0xA;
 
+fn valid_client_opcode(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        OPCODE_TEXT | OPCODE_BINARY | OPCODE_CLOSE | OPCODE_PING | OPCODE_PONG
+    )
+}
+
+fn is_control_opcode(opcode: u8) -> bool {
+    opcode & 0x08 != 0
+}
+
 fn websocket_accept_key(key: &str) -> String {
     let mut hasher = Sha1::new();
     hasher.update(key.as_bytes());
@@ -245,7 +305,24 @@ pub(crate) fn fuzz_client_frame(data: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{valid_client_key, websocket_accept_key};
+    use super::{
+        read_frame, read_frame_with_continuation_timeout, valid_client_key, websocket_accept_key,
+        OPCODE_CLOSE, OPCODE_PING, OPCODE_TEXT,
+    };
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    fn masked_frame(first: u8, payload: &[u8]) -> Vec<u8> {
+        let mask = [0x11, 0x22, 0x33, 0x44];
+        let mut frame = Vec::with_capacity(2 + mask.len() + payload.len());
+        frame.push(first);
+        frame.push(0x80 | u8::try_from(payload.len()).expect("short test payload"));
+        frame.extend_from_slice(&mask);
+        for (index, byte) in payload.iter().enumerate() {
+            frame.push(byte ^ mask[index % mask.len()]);
+        }
+        frame
+    }
 
     #[test]
     fn websocket_accept_key_matches_rfc_fixture() {
@@ -260,5 +337,77 @@ mod tests {
         assert!(valid_client_key("dGhlIHNhbXBsZSBub25jZQ=="));
         assert!(!valid_client_key("not-base64"));
         assert!(!valid_client_key("Zm9v"));
+    }
+
+    #[tokio::test]
+    async fn client_frames_reject_rsv_bits_without_extensions() {
+        let mut frame = std::io::Cursor::new(masked_frame(0x80 | 0x40 | OPCODE_TEXT, b"hi"));
+        let error = read_frame(&mut frame)
+            .await
+            .expect_err("RSV bits must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "websocket extensions are not negotiated");
+    }
+
+    #[tokio::test]
+    async fn client_frames_reject_reserved_opcodes_before_payload() {
+        let mut frame = std::io::Cursor::new(masked_frame(0x80 | 0x3, b"hi"));
+        let error = read_frame(&mut frame)
+            .await
+            .expect_err("reserved opcode must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "unsupported websocket frame opcode");
+    }
+
+    #[tokio::test]
+    async fn control_frames_reject_extended_lengths() {
+        let mut frame = std::io::Cursor::new(vec![0x80 | OPCODE_PING, 0x80 | 126]);
+        let error = read_frame(&mut frame)
+            .await
+            .expect_err("extended control lengths must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "websocket control frame payload is too long"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_frames_reject_single_byte_payloads() {
+        let mut frame = std::io::Cursor::new(masked_frame(0x80 | OPCODE_CLOSE, &[0]));
+        let error = read_frame(&mut frame)
+            .await
+            .expect_err("single-byte close payload must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            "websocket close frame payload is invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn frame_continuation_times_out_after_first_byte() {
+        let (mut client, mut server) = tokio::io::duplex(8);
+        client
+            .write_all(&[0x80 | OPCODE_TEXT])
+            .await
+            .expect("write first byte");
+
+        let error = read_frame_with_continuation_timeout(&mut server, Duration::from_millis(1))
+            .await
+            .expect_err("partial frame must time out");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn frame_read_times_out_before_first_byte() {
+        let (_client, mut server) = tokio::io::duplex(8);
+
+        let error = read_frame_with_continuation_timeout(&mut server, Duration::from_millis(1))
+            .await
+            .expect_err("idle client must time out before first frame byte");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 }

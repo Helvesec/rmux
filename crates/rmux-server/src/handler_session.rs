@@ -6,8 +6,8 @@ use rmux_core::{
 };
 use rmux_proto::request::NewSessionExtRequest;
 use rmux_proto::{
-    ErrorResponse, HasSessionResponse, KillSessionResponse, ListSessionsResponse,
-    NewSessionResponse, OptionName, Response, RmuxError, SessionId, SessionName,
+    ErrorResponse, KillSessionResponse, ListSessionsResponse, NewSessionResponse, OptionName,
+    Response, RmuxError, SessionId, SessionName,
 };
 
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
@@ -18,19 +18,23 @@ use crate::terminal::validate_process_command;
 mod client_environment;
 #[path = "handler_session/control_mode.rs"]
 mod control_mode;
+#[path = "handler_session/has.rs"]
+mod has;
 #[path = "handler_session/list.rs"]
 mod list;
+#[path = "handler_session/options.rs"]
+mod options;
 #[path = "handler_session/output.rs"]
 mod output;
 
 use client_environment::new_session_client_environment;
 use list::{sort_list_sessions, ListSessionSnapshot};
+use options::resolve_session_creation_options;
 
 use super::{
-    client_spawn_environment, command_output_from_lines, option_value_u32,
-    parse_session_sort_order, prepare_lifecycle_event, resolve_existing_session_target,
-    resolve_session_lookup, update_environment_from_client, PendingShutdownReason, RequestHandler,
-    SessionLookup, SessionSortOrder, DEFAULT_SESSION_SIZE,
+    client_spawn_environment, command_output_from_lines, parse_session_sort_order,
+    prepare_lifecycle_event, resolve_existing_session_target, update_environment_from_client,
+    PendingShutdownReason, RequestHandler, SessionSortOrder,
 };
 
 impl RequestHandler {
@@ -119,24 +123,31 @@ impl RequestHandler {
             }
         }
 
-        let size = request.size.unwrap_or(DEFAULT_SESSION_SIZE);
+        let requested_size = request.size;
         let detached = request.detached;
         let environment_overrides = request.environment;
         let group_target = request.group_target;
         let working_directory = request.working_directory;
         let command = request.command;
-        let process_command = request
+        let requested_process_command = request
             .process_command
             .or_else(|| rmux_proto::ProcessCommand::from_legacy_command(command.as_deref()));
-        if let Err(error) = validate_process_command(process_command.as_ref()) {
-            return Response::Error(ErrorResponse { error });
-        }
         let requested_name = request.session_name;
         let socket_path = self.socket_path();
         let response = {
             let mut state = self.state.lock().await;
-            let base_index =
-                option_value_u32(&state.options, None, rmux_proto::OptionName::BaseIndex);
+            let creation_options = resolve_session_creation_options(
+                &state.options,
+                requested_size,
+                requested_process_command,
+            );
+            if let Err(error) = validate_process_command(creation_options.process_command.as_ref())
+            {
+                return Response::Error(ErrorResponse { error });
+            }
+            let size = creation_options.size;
+            let base_index = creation_options.base_index;
+            let process_command = creation_options.process_command;
             let (session_name, created_group) = match (requested_name.clone(), group_target.clone())
             {
                 (Some(session_name), Some(group_target)) => {
@@ -281,20 +292,6 @@ impl RequestHandler {
         }
     }
 
-    pub(in crate::handler) async fn handle_has_session(
-        &self,
-        request: rmux_proto::HasSessionRequest,
-    ) -> Response {
-        let state = self.state.lock().await;
-        let exists = match resolve_session_lookup(&state.sessions, "has-session", &request.target) {
-            Ok(SessionLookup::Found(_)) => true,
-            Ok(SessionLookup::Missing) => false,
-            Err(error) => return Response::Error(ErrorResponse { error }),
-        };
-
-        Response::HasSession(HasSessionResponse { exists })
-    }
-
     pub(in crate::handler) async fn handle_kill_session(
         &self,
         request: rmux_proto::KillSessionRequest,
@@ -353,7 +350,7 @@ impl RequestHandler {
         };
 
         for session_name in &sessions_to_remove {
-            self.detach_attached_session(session_name).await;
+            self.exit_attached_session(session_name).await;
             self.cancel_session_silence_timers(session_name).await;
         }
 

@@ -107,18 +107,39 @@ fn web_share_accepts_frontend_and_tunnel_url_flags() {
         args.public_base_url.as_deref(),
         Some("https://terminal.example.com")
     );
+
+    let cli = parse_args(&["web-share", "--tunnel-provider", "srv-us"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert_eq!(args.tunnel_provider.as_deref(), Some("srv-us"));
+
+    let cli = parse_args(&["web-share", "--tunnel-provider"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert_eq!(args.tunnel_provider.as_deref(), Some(""));
+
+    assert!(parse_args(&[
+        "web-share",
+        "--tunnel-url",
+        "https://terminal.example.com",
+        "--tunnel-provider",
+        "srv-us",
+    ])
+    .is_err());
 }
 
 #[test]
-fn web_share_accepts_read_presentation_and_pin_flags() {
+fn web_share_accepts_presentation_and_pairing_opt_out_flags() {
     let cli = parse_args(&[
         "web-share",
         "--no-navbar",
         "--no-disclaimer",
-        "--show-viewers",
+        "--hide-viewers",
         "--theme",
         "user",
-        "--pin",
+        "--no-pin",
     ])
     .unwrap();
     let Some(super::super::Command::WebShare(args)) = cli.command else {
@@ -126,14 +147,14 @@ fn web_share_accepts_read_presentation_and_pin_flags() {
     };
     assert!(args.no_navbar);
     assert!(args.no_disclaimer);
-    assert!(args.show_viewers);
+    assert!(args.hide_viewers);
     assert!(matches!(
         args.terminal_theme,
         Some(super::super::WebShareTerminalThemeArg::User)
     ));
-    assert!(args.require_pin);
+    assert!(args.no_pin);
 
-    let cli = parse_args(&["web-share", "--terminal-theme", "dark", "--pairing-code"]).unwrap();
+    let cli = parse_args(&["web-share", "--terminal-theme", "dark"]).unwrap();
     let Some(super::super::Command::WebShare(args)) = cli.command else {
         panic!("expected web-share command");
     };
@@ -141,7 +162,68 @@ fn web_share_accepts_read_presentation_and_pin_flags() {
         args.terminal_theme,
         Some(super::super::WebShareTerminalThemeArg::Dark)
     ));
-    assert!(args.require_pin);
+    assert!(!args.hide_viewers);
+    assert!(!args.no_pin);
+
+    let cli = parse_args(&["web-share", "--show-viewers", "--pin"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert!(args.show_viewers);
+    assert!(args.pin);
+
+    let cli = parse_args(&["web-share", "--show-viewer-count", "--pairing-code"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert!(args.show_viewers);
+    assert!(args.pin);
+
+    assert!(parse_args(&["web-share", "--show-viewers", "--hide-viewers"]).is_err());
+    assert!(parse_args(&["web-share", "--pin", "--no-pin"]).is_err());
+}
+
+#[test]
+fn web_share_accepts_role_specific_pairing_pins() {
+    let cli = parse_args(&[
+        "web-share",
+        "--pin-operator",
+        "123456",
+        "--pin-spectator",
+        "654321",
+    ])
+    .unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert_eq!(args.pin_operator.as_deref(), Some("123456"));
+    assert_eq!(args.pin_spectator.as_deref(), Some("654321"));
+
+    assert!(parse_args(&["web-share", "--no-pin", "--pin-operator", "123456"]).is_err());
+    assert!(parse_args(&["web-share", "--no-pin", "--pin-spectator", "654321"]).is_err());
+    assert!(parse_args(&["web-share", "--spectator-only", "--pin-operator", "123456",]).is_err());
+    assert!(parse_args(&["web-share", "--operator-only", "--pin-spectator", "654321",]).is_err());
+}
+
+#[test]
+fn web_share_accepts_role_restriction_and_cap_flags() {
+    let cli = parse_args(&["web-share", "--spectator-only", "--max-spectators", "25"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert!(!args.operator_only);
+    assert!(args.spectator_only);
+    assert_eq!(args.max_spectators, Some(25));
+
+    let cli = parse_args(&["web-share", "--operator-only", "--max-operators", "3"]).unwrap();
+    let Some(super::super::Command::WebShare(args)) = cli.command else {
+        panic!("expected web-share command");
+    };
+    assert!(args.operator_only);
+    assert!(!args.spectator_only);
+    assert_eq!(args.max_operators, Some(3));
+
+    assert!(parse_args(&["web-share", "--operator-only", "--spectator-only"]).is_err());
 }
 
 #[test]

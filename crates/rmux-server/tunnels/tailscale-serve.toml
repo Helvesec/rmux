@@ -1,0 +1,7 @@
+name = "tailscale-serve"
+program = "tailscale"
+args = ["serve", "--yes", "{port}"]
+url_pattern = "https://[a-z0-9.-]+\\.ts\\.net"
+url_source = "both"
+ready_timeout_secs = 30
+install_hint = "Install Tailscale, run tailscale up, and grant this user operator rights with: sudo tailscale set --operator=$USER"

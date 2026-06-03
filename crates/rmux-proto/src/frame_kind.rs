@@ -1209,6 +1209,24 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         None,
         "Browser-visible pane sharing command family; pinned bincode tag 114.",
     ),
+    entry(
+        c2s(115),
+        FrameDirection::ClientToServer,
+        ACTIVE,
+        "DisplayMessageExtRequest",
+        FrameFeature::Formats,
+        None,
+        "Target-client aware display-message extension; pinned bincode tag 115.",
+    ),
+    entry(
+        c2s(116),
+        FrameDirection::ClientToServer,
+        ACTIVE,
+        "SendKeysExt2Request",
+        FrameFeature::Panes,
+        None,
+        "Target-client aware send-keys extension; pinned bincode tag 116.",
+    ),
     // Reserved client→server slot. Removed values must be listed and never reused.
     entry(
         c2s(0x7FFE),
@@ -2219,6 +2237,8 @@ pub const fn frame_kind_for_request(request: &Request) -> FrameKind {
         Request::DaemonStatus(_) => c2s(112),
         Request::ShutdownIfIdle(_) => c2s(113),
         Request::WebShare(_) => c2s(114),
+        Request::DisplayMessageExt(_) => c2s(115),
+        Request::SendKeysExt2(_) => c2s(116),
     }
 }
 

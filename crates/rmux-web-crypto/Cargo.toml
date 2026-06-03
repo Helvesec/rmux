@@ -1,0 +1,42 @@
+[package]
+name = "rmux-web-crypto"
+version = "0.4.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "rmux web-share E2EE core: X25519 + ML-KEM-768 hybrid sessions, ChaCha20-Poly1305 records, and WASM bindings."
+repository.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["x25519"]
+# Native ephemeral X25519 (x25519-dalek). Disabled for the browser/WASM build,
+# where WebCrypto performs X25519 and only the DH shared-secret bytes are passed
+# in — keeping x25519-dalek (and curve25519-dalek) out of the WASM bundle.
+x25519 = ["dep:x25519-dalek"]
+wasm = ["dep:wasm-bindgen"]
+wasm-test = ["wasm"]
+
+[dependencies]
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+hkdf = "0.12"
+# Post-quantum hybrid: ML-KEM-768 alongside X25519 in native daemon and browser
+# WASM builds. The v1 handshake is hybrid by construction, never X25519-only.
+# Randomness is passed in explicitly, so no internal RNG / getrandom is pulled
+# into the WASM bundle.
+libcrux-ml-kem = { version = "0.0.9", default-features = false, features = ["mlkem768"] }
+sha2 = { version = "0.10", default-features = false }
+subtle = { version = "2.6", default-features = false }
+wasm-bindgen = { version = "0.2", optional = true }
+x25519-dalek = { version = "2", features = ["zeroize", "getrandom"], optional = true }
+zeroize = { version = "1", default-features = false, features = ["derive"] }
+
+[dev-dependencies]
+hex-literal = "0.4"
+
+[package.metadata.wasm-pack.profile.release]
+# wasm-pack's bundled wasm-opt can lag browser/Rust target features and reject
+# bulk-memory modules. Keep the canonical release build deterministic; downstream
+# packagers may run a newer wasm-opt explicitly if they want an extra size pass.
+wasm-opt = false

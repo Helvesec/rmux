@@ -32,6 +32,8 @@ pub const CAPABILITY_SDK_PANE_BROADCAST: &str = "sdk.pane.broadcast";
 pub const CAPABILITY_SDK_SESSION_LEASE: &str = "sdk.session.lease";
 /// Stable feature id for explicit SDK process launch modes.
 pub const CAPABILITY_SDK_PROCESS_COMMAND: &str = "sdk.process.command";
+/// Stable feature id for target-client aware command request variants.
+pub const CAPABILITY_TARGET_CLIENT_COMMANDS: &str = "commands.target_client";
 /// Stable feature id for browser-visible pane sharing.
 ///
 /// This optional capability is advertised by daemons compiled with their web
@@ -54,6 +56,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     CAPABILITY_SDK_PANE_BROADCAST,
     CAPABILITY_SDK_SESSION_LEASE,
     CAPABILITY_SDK_PROCESS_COMMAND,
+    CAPABILITY_TARGET_CLIENT_COMMANDS,
 ];
 
 /// Client-to-server version and capability negotiation request.

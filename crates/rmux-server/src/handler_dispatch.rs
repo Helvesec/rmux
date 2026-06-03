@@ -282,6 +282,9 @@ impl RequestHandler {
             Request::SendKeysExt(request) => HandleOutcome::response(
                 Box::pin(self.handle_send_keys_ext(requester_pid, request)).await,
             ),
+            Request::SendKeysExt2(request) => HandleOutcome::response(
+                Box::pin(self.handle_send_keys_ext2(requester_pid, request)).await,
+            ),
             Request::PaneBroadcastInput(request) => {
                 HandleOutcome::response(self.handle_pane_broadcast_input(request).await)
             }
@@ -395,6 +398,10 @@ impl RequestHandler {
             Request::DisplayMessage(request) => {
                 HandleOutcome::response(self.handle_display_message(requester_pid, request).await)
             }
+            Request::DisplayMessageExt(request) => HandleOutcome::response(
+                self.handle_display_message_ext(requester_pid, request)
+                    .await,
+            ),
             Request::ResolveTarget(request) => {
                 HandleOutcome::response(self.handle_resolve_target(request).await)
             }

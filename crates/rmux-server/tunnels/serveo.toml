@@ -1,0 +1,13 @@
+name = "serveo"
+program = "ssh"
+args = [
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "ServerAliveInterval=15",
+    "-o", "ExitOnForwardFailure=yes",
+    "-R", "80:{host}:{port}",
+    "serveo.net",
+]
+url_pattern = "https://[a-z0-9-]+\\.serveousercontent\\.com"
+url_source = "both"
+ready_timeout_secs = 30
+install_hint = "Install OpenSSH client, for example: brew install openssh"

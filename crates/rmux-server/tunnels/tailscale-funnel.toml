@@ -1,0 +1,7 @@
+name = "tailscale-funnel"
+program = "tailscale"
+args = ["funnel", "--yes", "{port}"]
+url_pattern = "https://[a-z0-9.-]+\\.ts\\.net"
+url_source = "both"
+ready_timeout_secs = 30
+install_hint = "Install Tailscale, run tailscale up, enable Funnel, and grant this user operator rights with: sudo tailscale set --operator=$USER"

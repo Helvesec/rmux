@@ -81,7 +81,7 @@ pub(crate) use window::{
 };
 #[path = "cli_args/web.rs"]
 mod web;
-pub(crate) use web::{WebShareArgs, WebShareTerminalThemeArg};
+pub(crate) use web::{WebShareArgs, WebShareTerminalThemeArg, WEB_SHARE_TUNNEL_PROVIDERS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DocumentedCliAlias {

@@ -8,9 +8,12 @@ use rmux_proto::{
 use serde::Serialize;
 use tokio::sync::watch;
 
-use super::leases::{LeaseBook, OperatorLease, ReadLease};
+use super::connection_limit::ConnectionPermit;
+use super::leases::{LeaseBook, OperatorLease, SpectatorLease};
 use super::origin::origin_allowed;
-use super::secrets::{secret_eq, SecretHash};
+use super::pairing::WebSharePairingCodes;
+use super::secrets::SecretHash;
+use super::tunnel::TunnelHandle;
 
 const DEFAULT_LOCAL_WEBSOCKET_ENDPOINT: &str = "ws://127.0.0.1:9777/share";
 
@@ -23,26 +26,31 @@ pub(super) struct WebShareRecord {
     pub(super) frontend_url: String,
     pub(super) kill_session_on_expire: bool,
     pub(super) lease_book: Arc<LeaseBook>,
-    pub(super) max_readers: u16,
+    pub(super) max_operators: Option<u16>,
+    pub(super) max_spectators: Option<u16>,
     pub(super) operator_token_hash: Option<SecretHash>,
-    pub(super) pairing_code: Option<String>,
+    pub(super) pairing_codes: WebSharePairingCodes,
     pub(super) revoke_tx: watch::Sender<Option<WebShareRevokeReason>>,
     pub(super) controls: bool,
     pub(super) share_id: String,
     pub(super) target: WebShareTarget,
     pub(super) terminal_palette: Option<WebTerminalPalette>,
     pub(super) url_options: WebShareUrlOptions,
-    pub(super) read_token_hash: SecretHash,
-    pub(super) writable: bool,
+    pub(super) spectator_token_hash: Option<SecretHash>,
+    pub(super) _tunnel: Option<TunnelHandle>,
+    pub(super) operator: bool,
+    pub(super) spectator: bool,
 }
 
 impl WebShareRecord {
-    pub(super) fn read_url(&self, token: &str) -> String {
-        share_url(self, Some(token))
+    pub(super) fn spectator_url(&self, token: Option<&str>) -> Option<String> {
+        self.spectator_token_hash
+            .is_some()
+            .then(|| share_url(self, token))
     }
 
-    pub(super) fn redacted_read_url(&self) -> String {
-        share_url(self, None)
+    pub(super) fn redacted_spectator_url(&self) -> Option<String> {
+        self.spectator_url(None)
     }
 
     pub(super) fn operator_url(&self, token: Option<&str>) -> Option<String> {
@@ -55,12 +63,14 @@ impl WebShareRecord {
         WebShareSummary {
             share_id: self.share_id.clone(),
             scope: self.target.scope(),
-            read_url: Some(self.redacted_read_url()),
-            writable: self.writable,
+            spectator_url: self.redacted_spectator_url(),
+            operator: self.operator,
+            spectator: self.spectator,
             controls: self.controls,
-            active_readers: u16::try_from(self.lease_book.reader_count()).unwrap_or(u16::MAX),
-            max_readers: self.max_readers,
-            operator_connected: self.lease_book.operator_connected(),
+            active_spectators: u16::try_from(self.lease_book.spectator_count()).unwrap_or(u16::MAX),
+            active_operators: u16::try_from(self.lease_book.operator_count()).unwrap_or(u16::MAX),
+            max_spectators: self.max_spectators,
+            max_operators: self.max_operators,
             expires_at_unix: self.expires_at.and_then(system_time_to_unix),
             kill_session_on_expire: self.kill_session_on_expire,
         }
@@ -78,27 +88,37 @@ impl WebShareRecord {
         &self,
         pin: Option<&str>,
         role: WebShareConnectRole,
+        connection_permit: ConnectionPermit,
     ) -> Result<WebShareAccess, RmuxError> {
         match role {
-            WebShareConnectRole::Read => {
-                self.check_pairing_code(pin)?;
-                let lease = self
-                    .lease_book
-                    .try_read()
-                    .ok_or_else(|| RmuxError::Server("web-share read limit reached".to_owned()))?;
-                Ok(self.access(Some(lease), None, WebShareRole::Read))
+            WebShareConnectRole::Spectator => {
+                if self.spectator_token_hash.is_none() {
+                    return Err(RmuxError::Server(
+                        "web-share has no spectator access".to_owned(),
+                    ));
+                }
+                self.pairing_codes.check(pin, role)?;
+                let lease = self.lease_book.try_spectator().ok_or_else(|| {
+                    RmuxError::Server("web-share spectator limit reached".to_owned())
+                })?;
+                Ok(self.access(
+                    Some(lease),
+                    None,
+                    connection_permit,
+                    WebShareRole::Spectator,
+                ))
             }
             WebShareConnectRole::Operator => {
                 if self.operator_token_hash.is_none() {
                     return Err(RmuxError::Server(
-                        "web-share is not writable for operator role".to_owned(),
+                        "web-share has no operator access".to_owned(),
                     ));
                 };
-                self.check_pairing_code(pin)?;
+                self.pairing_codes.check(pin, role)?;
                 let lease = self.lease_book.try_operator().ok_or_else(|| {
-                    RmuxError::Server("web-share operator is already connected".to_owned())
+                    RmuxError::Server("web-share operator limit reached".to_owned())
                 })?;
-                Ok(self.access(None, Some(lease), WebShareRole::Operator))
+                Ok(self.access(None, Some(lease), connection_permit, WebShareRole::Operator))
             }
         }
     }
@@ -107,35 +127,25 @@ impl WebShareRecord {
         let _ = self.revoke_tx.send(Some(reason));
     }
 
-    fn check_pairing_code(&self, pin: Option<&str>) -> Result<(), RmuxError> {
-        let Some(expected) = self.pairing_code.as_deref() else {
-            return Ok(());
-        };
-        if pin.is_some_and(|provided| secret_eq(provided, expected)) {
-            return Ok(());
-        }
-        let message = if pin.is_some() {
-            "invalid web-share pairing code"
-        } else {
-            "missing web-share pairing code"
-        };
-        Err(RmuxError::Server(message.to_owned()))
-    }
-
     fn access(
         &self,
-        read_lease: Option<ReadLease>,
+        spectator_lease: Option<SpectatorLease>,
         operator_lease: Option<OperatorLease>,
+        connection_permit: ConnectionPermit,
         role: WebShareRole,
     ) -> WebShareAccess {
         WebShareAccess {
             allow_loopback_development_origins: self.allow_loopback_development_origins,
             expected_origin: self.frontend_origin.clone(),
             expires_at: self.expires_at,
-            _read_lease: read_lease,
+            _connection_permit: connection_permit,
+            _spectator_lease: spectator_lease,
             _operator_lease: operator_lease,
             lease_book: Arc::clone(&self.lease_book),
-            max_readers: self.max_readers,
+            max_operators: self.max_operators,
+            max_spectators: self.max_spectators,
+            operator: self.operator,
+            spectator: self.spectator,
             role,
             share_id: self.share_id.clone(),
             revoke_rx: self.revoke_tx.subscribe(),
@@ -193,7 +203,16 @@ impl WebSessionTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WebShareConnectRole {
     Operator,
-    Read,
+    Spectator,
+}
+
+impl WebShareConnectRole {
+    pub(super) const fn backoff_label(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Spectator => "spectator",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,10 +239,14 @@ pub(crate) struct WebShareAccess {
     allow_loopback_development_origins: bool,
     expected_origin: String,
     expires_at: Option<SystemTime>,
-    _read_lease: Option<ReadLease>,
+    _connection_permit: ConnectionPermit,
+    _spectator_lease: Option<SpectatorLease>,
     _operator_lease: Option<OperatorLease>,
     lease_book: Arc<LeaseBook>,
-    max_readers: u16,
+    max_operators: Option<u16>,
+    max_spectators: Option<u16>,
+    operator: bool,
+    spectator: bool,
     revoke_rx: watch::Receiver<Option<WebShareRevokeReason>>,
     role: WebShareRole,
     share_id: String,
@@ -246,15 +269,29 @@ impl WebShareAccess {
         matches!(self.role, WebShareRole::Operator)
     }
 
+    pub(crate) const fn has_operator_access(&self) -> bool {
+        self.operator
+    }
+
+    pub(crate) const fn has_spectator_access(&self) -> bool {
+        self.spectator
+    }
+
     pub(crate) fn connect_role(&self) -> WebShareConnectRole {
         match self.role {
             WebShareRole::Operator => WebShareConnectRole::Operator,
-            WebShareRole::Read => WebShareConnectRole::Read,
+            WebShareRole::Spectator => WebShareConnectRole::Spectator,
         }
     }
 
     pub(crate) fn controls(&self) -> bool {
         self.controls && self.is_operator()
+    }
+
+    pub(crate) fn is_resize_authority(&self) -> bool {
+        self._operator_lease
+            .as_ref()
+            .is_some_and(OperatorLease::is_resize_authority)
     }
 
     pub(crate) fn share_id(&self) -> &str {
@@ -267,9 +304,10 @@ impl WebShareAccess {
 
     pub(crate) fn connection_counts(&self) -> WebShareConnectionCounts {
         WebShareConnectionCounts::new(
-            u16::try_from(self.lease_book.reader_count()).unwrap_or(u16::MAX),
-            self.max_readers,
-            self.lease_book.operator_connected(),
+            u16::try_from(self.lease_book.spectator_count()).unwrap_or(u16::MAX),
+            self.max_spectators,
+            u16::try_from(self.lease_book.operator_count()).unwrap_or(u16::MAX),
+            self.max_operators,
         )
     }
 
@@ -292,23 +330,28 @@ impl WebShareAccess {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub(crate) struct WebShareConnectionCounts {
-    pub(crate) readers_active: u16,
-    pub(crate) readers_max: u16,
-    pub(crate) operator_connected: bool,
+    pub(crate) spectators_active: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) spectators_max: Option<u16>,
+    pub(crate) operators_active: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) operators_max: Option<u16>,
     pub(crate) viewers_connected: u16,
 }
 
 impl WebShareConnectionCounts {
-    pub(crate) fn new(readers_active: u16, readers_max: u16, operator_connected: bool) -> Self {
+    pub(crate) fn new(
+        spectators_active: u16,
+        spectators_max: Option<u16>,
+        operators_active: u16,
+        operators_max: Option<u16>,
+    ) -> Self {
         Self {
-            readers_active,
-            readers_max,
-            operator_connected,
-            viewers_connected: readers_active.saturating_add(if operator_connected {
-                1
-            } else {
-                0
-            }),
+            spectators_active,
+            spectators_max,
+            operators_active,
+            operators_max,
+            viewers_connected: spectators_active.saturating_add(operators_active),
         }
     }
 }
@@ -316,7 +359,7 @@ impl WebShareConnectionCounts {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WebShareRole {
     Operator,
-    Read,
+    Spectator,
 }
 
 pub(super) fn websocket_endpoint(base_url: &str) -> String {

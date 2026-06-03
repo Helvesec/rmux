@@ -14,6 +14,8 @@ use crate::pane_io::AttachControl;
 use crate::pane_terminals::HandlerState;
 use crate::terminal::validate_process_command;
 
+use super::pane_split_effects::{apply_split_window_effects, split_window_effects};
+
 const DEFAULT_BREAK_PANE_FORMAT: &str = "#{session_name}:#{window_index}.#{pane_index}";
 
 #[derive(Debug, Clone)]
@@ -32,6 +34,9 @@ struct SplitWindowParts {
     process_command: Option<rmux_proto::ProcessCommand>,
     start_directory: Option<std::path::PathBuf>,
     keep_alive_on_exit: Option<bool>,
+    detached: bool,
+    size: Option<String>,
+    preserve_zoom: bool,
 }
 
 impl RequestHandler {
@@ -287,6 +292,9 @@ impl RequestHandler {
                 process_command: None,
                 start_directory: None,
                 keep_alive_on_exit: None,
+                detached: false,
+                size: None,
+                preserve_zoom: false,
             },
         )
         .await
@@ -308,6 +316,9 @@ impl RequestHandler {
                 process_command: request.process_command,
                 start_directory: request.start_directory,
                 keep_alive_on_exit: request.keep_alive_on_exit,
+                detached: request.detached,
+                size: request.size,
+                preserve_zoom: request.preserve_zoom,
             },
         )
         .await
@@ -327,6 +338,9 @@ impl RequestHandler {
             process_command,
             start_directory,
             keep_alive_on_exit,
+            detached,
+            size,
+            preserve_zoom,
         } = parts;
         let session_name = match &target {
             rmux_proto::SplitWindowTarget::Session(session_name) => session_name.clone(),
@@ -342,6 +356,12 @@ impl RequestHandler {
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
         let response = {
             let mut state = self.state.lock().await;
+            let split_effects =
+                split_window_effects(&state, &target, direction, detached, size.as_deref());
+            let split_effects = match split_effects {
+                Ok(effects) => effects,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
             match state.split_window(
                 target,
                 direction,
@@ -352,10 +372,19 @@ impl RequestHandler {
                 process_command.as_ref(),
                 start_directory.as_deref(),
                 keep_alive_on_exit,
+                split_effects.size,
                 Some(self.pane_alert_callback()),
                 Some(self.pane_exit_callback()),
             ) {
-                Ok(response) => Response::SplitWindow(response),
+                Ok(response) => match apply_split_window_effects(
+                    &mut state,
+                    &response.pane,
+                    split_effects,
+                    preserve_zoom,
+                ) {
+                    Ok(()) => Response::SplitWindow(response),
+                    Err(error) => Response::Error(ErrorResponse { error }),
+                },
                 Err(error) => Response::Error(ErrorResponse { error }),
             }
         };
@@ -524,102 +553,6 @@ impl RequestHandler {
                     active.mode_tree_state_id,
                 ));
         }
-    }
-
-    pub(in crate::handler) async fn handle_pipe_pane(
-        &self,
-        _requester_pid: u32,
-        request: rmux_proto::PipePaneRequest,
-    ) -> Response {
-        let session_name = request.target.session_name().clone();
-        let target = request.target.clone();
-        let attached_count = self.attached_count(&session_name).await;
-        let write_to_pipe = if !request.stdin && !request.stdout {
-            true
-        } else {
-            request.stdout
-        };
-        let response = {
-            let mut state = self.state.lock().await;
-            let command = match request.command.as_deref() {
-                Some(command) => {
-                    let runtime = match format_context_for_target(
-                        &state,
-                        &Target::Pane(target.clone()),
-                        attached_count,
-                    ) {
-                        Ok(runtime) => runtime,
-                        Err(error) => return Response::Error(ErrorResponse { error }),
-                    };
-                    Some(render_runtime_template(command, &runtime, true))
-                }
-                None => None,
-            };
-
-            match state.pipe_pane(
-                target.clone(),
-                command,
-                request.stdin,
-                write_to_pipe,
-                request.once,
-            ) {
-                Ok(response) => Response::PipePane(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
-            }
-        };
-
-        if matches!(response, Response::PipePane(_)) {
-            self.queue_inline_hook(
-                HookName::AfterPipePane,
-                ScopeSelector::Pane(target.clone()),
-                Some(Target::Pane(target)),
-                PendingInlineHookFormat::AfterCommand,
-            );
-        }
-
-        response
-    }
-
-    pub(in crate::handler) async fn handle_respawn_pane(
-        &self,
-        requester_pid: u32,
-        request: rmux_proto::RespawnPaneRequest,
-    ) -> Response {
-        let session_name = request.target.session_name().clone();
-        let socket_path = self.socket_path();
-        let client_environment = client_environment_snapshot(requester_pid);
-        let spawn_environment = client_spawn_environment(client_environment.as_ref());
-        let response = {
-            let mut state = self.state.lock().await;
-            match state.respawn_pane(
-                request,
-                &socket_path,
-                spawn_environment.as_ref(),
-                Some(self.pane_alert_callback()),
-                Some(self.pane_exit_callback()),
-                |state, replaced| {
-                    let queued = prepare_lifecycle_event(
-                        state,
-                        &LifecycleEvent::PaneExited {
-                            target: replaced.target.clone(),
-                            pane_id: Some(replaced.pane_id),
-                            window_id: Some(replaced.window_id),
-                            window_name: Some(replaced.window_name.clone()),
-                        },
-                    );
-                    self.emit_prepared(queued);
-                },
-            ) {
-                Ok(response) => Response::RespawnPane(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
-            }
-        };
-
-        if matches!(response, Response::RespawnPane(_)) {
-            self.refresh_attached_session(&session_name).await;
-        }
-
-        response
     }
 }
 

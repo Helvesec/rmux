@@ -166,7 +166,7 @@ fn attach_sequences_follow_focus_and_extended_key_options() {
     let start = String::from_utf8(terminal.attach_start_sequence()).expect("utf8");
     let stop = String::from_utf8(terminal.attach_stop_sequence()).expect("utf8");
 
-    assert!(start.starts_with("\u{1b}[?1049h"));
+    assert!(start.starts_with("\u{1b}[?1049h\u{1b}[22;0;0t\u{1b}[0m\u{1b}[?25l\u{1b}[H\u{1b}[2J"));
     assert!(start.contains("\u{1b}[22;0;0t"));
     assert!(start.contains("\u{1b}[?2004h"));
     assert!(start.contains("\u{1b}[?1006h"));

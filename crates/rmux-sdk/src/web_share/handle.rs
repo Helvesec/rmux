@@ -22,13 +22,15 @@ pub struct WebShareHandle {
     transport: TransportClient,
     id: String,
     scope: WebShareScope,
-    read_url: String,
+    spectator_url: Option<String>,
     operator_url: Option<String>,
     expires_at_unix: Option<u64>,
-    pairing_code: Option<String>,
-    max_readers: u16,
-    writable: bool,
-    controls: bool,
+    operator_pairing_code: Option<String>,
+    spectator_pairing_code: Option<String>,
+    max_operators: Option<u16>,
+    max_spectators: Option<u16>,
+    operator: bool,
+    spectator: bool,
     kill_session_on_expire: bool,
 }
 
@@ -41,13 +43,15 @@ impl WebShareHandle {
             transport,
             id: created.share_id,
             scope: created.scope,
-            read_url: created.read_url,
+            spectator_url: created.spectator_url,
             operator_url: created.operator_url,
             expires_at_unix: created.expires_at_unix,
-            pairing_code: created.pairing_code,
-            max_readers: created.max_readers,
-            writable: created.writable,
-            controls: created.controls,
+            operator_pairing_code: created.operator_pairing_code,
+            spectator_pairing_code: created.spectator_pairing_code,
+            max_operators: created.max_operators,
+            max_spectators: created.max_spectators,
+            operator: created.operator,
+            spectator: created.spectator,
             kill_session_on_expire: created.kill_session_on_expire,
         }
     }
@@ -75,14 +79,14 @@ impl WebShareHandle {
 
     /// Returns whether this share minted an operator URL.
     #[must_use]
-    pub const fn writable(&self) -> bool {
-        self.writable
+    pub const fn operator(&self) -> bool {
+        self.operator
     }
 
-    /// Returns whether this share grants remote rmux controls.
+    /// Returns whether this share minted a spectator URL.
     #[must_use]
-    pub const fn controls(&self) -> bool {
-        self.controls
+    pub const fn spectator(&self) -> bool {
+        self.spectator
     }
 
     /// Returns whether this share kills its target session on expiry.
@@ -91,28 +95,19 @@ impl WebShareHandle {
         self.kill_session_on_expire
     }
 
-    /// Returns the read-only browser URL.
+    /// Returns the spectator browser URL.
     #[must_use]
-    pub fn read_url(&self) -> &str {
-        &self.read_url
+    pub fn spectator_url(&self) -> Option<&str> {
+        self.spectator_url.as_deref()
     }
 
-    /// Returns the read-only capability token carried in the browser URL, when present.
+    /// Returns the spectator capability token carried in the browser URL, when present.
     #[must_use]
-    pub fn read_token(&self) -> Option<&str> {
-        token_from_url(&self.read_url)
+    pub fn spectator_token(&self) -> Option<&str> {
+        self.spectator_url.as_deref().and_then(token_from_url)
     }
 
-    /// Returns the read-only capability token carried in the browser URL, when present.
-    ///
-    /// This is retained as a compatibility alias for earlier SDK examples that
-    /// called the URL capability a key.
-    #[must_use]
-    pub fn read_key(&self) -> Option<&str> {
-        self.read_token()
-    }
-
-    /// Returns the privileged operator URL, when this share is writable.
+    /// Returns the privileged operator URL, when this share has an operator.
     #[must_use]
     pub fn operator_url(&self) -> Option<&str> {
         self.operator_url.as_deref()
@@ -124,25 +119,28 @@ impl WebShareHandle {
         self.operator_url.as_deref().and_then(token_from_url)
     }
 
-    /// Returns the operator capability token carried in the operator URL, when present.
-    ///
-    /// This is retained as a compatibility alias for earlier SDK examples that
-    /// called the URL capability a key.
+    /// Returns the out-of-band operator pairing code required by this share.
     #[must_use]
-    pub fn operator_key(&self) -> Option<&str> {
-        self.operator_token()
+    pub fn operator_pairing_code(&self) -> Option<&str> {
+        self.operator_pairing_code.as_deref()
     }
 
-    /// Returns the out-of-band pairing code required by this share, when requested.
+    /// Returns the out-of-band spectator pairing code required by this share.
     #[must_use]
-    pub fn pairing_code(&self) -> Option<&str> {
-        self.pairing_code.as_deref()
+    pub fn spectator_pairing_code(&self) -> Option<&str> {
+        self.spectator_pairing_code.as_deref()
     }
 
-    /// Returns the effective cap for concurrent read-only clients.
+    /// Returns the effective cap for concurrent spectator clients, when capped.
     #[must_use]
-    pub const fn max_readers(&self) -> u16 {
-        self.max_readers
+    pub const fn max_spectators(&self) -> Option<u16> {
+        self.max_spectators
+    }
+
+    /// Returns the effective cap for concurrent operator clients, when capped.
+    #[must_use]
+    pub const fn max_operators(&self) -> Option<u16> {
+        self.max_operators
     }
 
     /// Returns the expiration timestamp in UNIX seconds.
@@ -156,14 +154,14 @@ impl WebShareHandle {
         lookup_summary(&self.transport, &self.id).await
     }
 
-    /// Returns the current number of read-only clients.
-    pub async fn readers_active(&self) -> Result<u16> {
-        Ok(self.summary().await?.active_readers)
+    /// Returns the current number of spectator clients.
+    pub async fn spectators_active(&self) -> Result<u16> {
+        Ok(self.summary().await?.active_spectators)
     }
 
-    /// Returns whether the single operator slot is occupied.
-    pub async fn operator_connected(&self) -> Result<bool> {
-        Ok(self.summary().await?.operator_connected)
+    /// Returns the current number of operator clients.
+    pub async fn operators_active(&self) -> Result<u16> {
+        Ok(self.summary().await?.active_operators)
     }
 
     /// Stops this share on the daemon.
@@ -204,20 +202,20 @@ impl WebShareLookup {
 
     /// Returns whether this share has an operator URL.
     #[must_use]
-    pub const fn writable(&self) -> bool {
-        self.summary.writable
+    pub const fn operator(&self) -> bool {
+        self.summary.operator
     }
 
-    /// Returns whether this share grants remote rmux controls.
+    /// Returns whether this share has a spectator URL.
     #[must_use]
-    pub const fn controls(&self) -> bool {
-        self.summary.controls
+    pub const fn spectator(&self) -> bool {
+        self.summary.spectator
     }
 
-    /// Returns the redacted read-only URL, when available.
+    /// Returns the redacted spectator URL, when available.
     #[must_use]
-    pub fn read_url_redacted(&self) -> Option<&str> {
-        self.summary.read_url_redacted.as_deref()
+    pub fn spectator_url_redacted(&self) -> Option<&str> {
+        self.summary.spectator_url_redacted.as_deref()
     }
 
     /// Returns the cached summary from the lookup response.

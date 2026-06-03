@@ -216,7 +216,7 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ("source-file", "(source) [-Fnqv] [-t target-pane] path ..."),
     (
         "split-window",
-        "(splitw) [-bdefhIPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-t target-pane][shell-command]",
+        "(splitw) [-bdefhPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-t target-pane][shell-command]",
     ),
     ("start-server", "(start) [--web-port port] [--frontend-url url]"),
     ("suspend-client", "(suspendc) [-t target-client]"),
@@ -231,9 +231,20 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ("wait-for", "(wait) [-L|-S|-U] channel"),
     (
         "web-share",
-        "[-lwX] [-K share-id] [disconnect share-id] [--config] [--lookup share-id] [--ttl seconds|--expires-at RFC3339] [--kill-session-on-expire] [--max-readers count] [--frontend-url url] [--tunnel-url url] [--no-navbar] [--no-disclaimer] [--show-viewers] [--theme user|light|dark] [--pin] [--controls] [-t pane|session]",
+        "[-lX] [-K share-id] [disconnect share-id] [--config] [--lookup share-id] [--operator-only|--spectator-only] [--ttl seconds|--expires-at RFC3339] [--kill-session-on-expire] [--max-operators count] [--max-spectators count] [--frontend-url url] [--tunnel-url url|--tunnel-provider provider] [--no-navbar] [--no-disclaimer] [--hide-viewers] [--theme user|light|dark] [--no-pin] [-t pane|session]",
     ),
 ];
+
+/// Commands that are RMUX extensions rather than part of the tmux command
+/// surface. They stay in `implemented_command_surface()` (so `--help`, the man
+/// page and dispatch keep them) but are hidden from the bare `list-commands`
+/// listing, which is byte-compared against tmux via `#{command_list_name}`. They
+/// remain reachable by explicit name (`list-commands web-share`).
+const RMUX_EXTENSION_COMMANDS: &[&str] = &["web-share"];
+
+fn is_rmux_extension(name: &str) -> bool {
+    RMUX_EXTENSION_COMMANDS.contains(&name)
+}
 
 pub(super) fn run_list_commands(args: ListCommandsArgs) -> Result<i32, ExitFailure> {
     let entries = implemented_command_surface();
@@ -246,7 +257,11 @@ pub(super) fn run_list_commands(args: ListCommandsArgs) -> Result<i32, ExitFailu
     let lines = entries
         .iter()
         .copied()
-        .filter(|entry| requested.map(|name| entry.name == name).unwrap_or(true))
+        .filter(|entry| {
+            // Explicit lookup shows exactly the requested command (extensions
+            // included); the bare listing hides RMUX extensions for tmux parity.
+            requested.map_or_else(|| !is_rmux_extension(entry.name), |name| entry.name == name)
+        })
         .map(|entry| render_list_commands_line(format, entry.name, entry.alias))
         .collect::<Vec<_>>();
 
@@ -316,6 +331,39 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn bare_list_commands_hides_rmux_extensions_but_surface_keeps_them() {
+        let surface: Vec<&str> = implemented_command_surface()
+            .iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(
+            surface.contains(&"web-share"),
+            "RMUX extensions stay in the help/dispatch surface"
+        );
+
+        // The bare listing (no explicit command requested) drops extensions only.
+        let listed: Vec<&str> = implemented_command_surface()
+            .iter()
+            .filter(|entry| !is_rmux_extension(entry.name))
+            .map(|entry| entry.name)
+            .collect();
+        assert!(
+            !listed.contains(&"web-share"),
+            "bare list-commands must omit RMUX extensions for tmux byte-parity"
+        );
+        assert_eq!(listed.len(), surface.len() - RMUX_EXTENSION_COMMANDS.len());
+    }
+
+    #[test]
+    fn explicit_list_commands_still_resolves_rmux_extensions() {
+        // The explicit-name path stays usable for RMUX users.
+        assert_eq!(
+            resolve_list_commands_target("web-share").expect("web-share resolves"),
+            "web-share"
+        );
     }
 
     #[test]
