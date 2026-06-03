@@ -9,7 +9,7 @@
 
 **Web sharing for RMUX terminal panes and sessions.**
 
-[![rmux 0.4.0](https://img.shields.io/badge/rmux-0.4.0-informational.svg)](https://github.com/Helvesec/rmux/releases/tag/v0.4.0)
+[![rmux 0.4.1](https://img.shields.io/badge/rmux-0.4.1-informational.svg)](https://github.com/Helvesec/rmux/releases/tag/v0.4.1)
 [![E2EE](https://img.shields.io/badge/E2EE-ChaCha20--Poly1305-success.svg)](#cryptography)
 [![Post-quantum](https://img.shields.io/badge/PQ-X25519%20%2B%20ML--KEM--768-blue.svg)](#cryptography)
 [![Frontend](https://img.shields.io/badge/frontend-static-lightgrey.svg)](#key-features)

@@ -16,7 +16,7 @@ rmux-<semver>-linux-x86_64.tar.gz
 Generate `Formula/rmux.rb` for the official tap:
 
 ```sh
-tag=v0.4.0
+tag=v0.4.1
 version="${tag#v}"
 curl -fsSL "https://github.com/Helvesec/rmux/releases/download/$tag/SHA256SUMS" -o /tmp/rmux-SHA256SUMS
 scripts/generate-homebrew-formula.sh \

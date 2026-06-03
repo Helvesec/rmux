@@ -36,7 +36,7 @@ For a local package-manager dry run, use the `dist/SHA256SUMS.txt` produced by
 the downloaded release checksum file instead.
 
 ```sh
-version=0.4.0
+version=0.4.1
 checksums=dist/SHA256SUMS.txt
 scripts/generate-winget-manifest.sh \
   --version "$version" \

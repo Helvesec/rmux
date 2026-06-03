@@ -1,6 +1,6 @@
 [package]
 name = "rmux-web-crypto"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "rmux web-share E2EE core: X25519 + ML-KEM-768 hybrid sessions, ChaCha20-Poly1305 records, and WASM bindings."
