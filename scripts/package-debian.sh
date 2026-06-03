@@ -199,7 +199,7 @@ binary_sha256="$(sha256_file "$binary")"
 binary_bytes="$(wc -c < "$binary" | tr -d ' ')"
 git_commit="$(git rev-parse HEAD)"
 git_dirty=false
-if [ -n "$(git status --porcelain)" ]; then
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   git_dirty=true
 fi
 release_artifact=true

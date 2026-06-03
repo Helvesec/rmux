@@ -157,7 +157,7 @@ $binaryAbs = [System.IO.Path]::GetFullPath($binary)
 $binarySha256 = Sha256File $binaryAbs
 $binaryBytes = (Get-Item -LiteralPath $binaryAbs).Length
 $gitCommit = GitOutput @("rev-parse", "HEAD")
-$gitStatus = GitOutput @("status", "--porcelain")
+$gitStatus = GitOutput @("status", "--porcelain", "--untracked-files=no")
 $gitDirty = -not [string]::IsNullOrWhiteSpace($gitStatus)
 $releaseArtifact = (-not $SkipBuild) -and (-not $gitDirty)
 $generatedAtUtc = GitOutput @("show", "-s", "--format=%cI", "HEAD")
