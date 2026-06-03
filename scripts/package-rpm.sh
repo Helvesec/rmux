@@ -228,6 +228,7 @@ cp README.md LICENSE-APACHE LICENSE-MIT rmux.1 "$work_dir/SOURCES/"
 
 cat > "$spec_path" <<EOF
 %global debug_package %{nil}
+%global __os_install_post %{nil}
 
 Name: rmux
 Version: $version
