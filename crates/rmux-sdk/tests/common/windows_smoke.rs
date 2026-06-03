@@ -22,7 +22,7 @@ pub type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 // Windows CI can be slow to start ConPTY-backed shells while the workspace
 // test run is still compiling sibling crates. Keep this high enough to catch
 // real prompt/output transitions without making successful tests slower.
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 pub const OUTPUT_BUDGET: usize = 64 * 1024;
 
 pub static LIVE_DAEMON_LOCK: Mutex<()> = Mutex::const_new(());
@@ -308,7 +308,7 @@ fn resolve_rmux_binary() -> TestResult<PathBuf> {
 
 fn target_dir() -> TestResult<PathBuf> {
     if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR") {
-        return Ok(PathBuf::from(target_dir));
+        return Ok(absolutize_target_dir(PathBuf::from(target_dir)));
     }
 
     let current = std::env::current_exe()?;
@@ -318,6 +318,14 @@ fn target_dir() -> TestResult<PathBuf> {
         .and_then(Path::parent)
         .map(Path::to_path_buf)
         .ok_or_else(|| "test executable is not under a target directory".into())
+}
+
+fn absolutize_target_dir(target_dir: PathBuf) -> PathBuf {
+    if target_dir.is_absolute() {
+        target_dir
+    } else {
+        workspace_root().join(target_dir)
+    }
 }
 
 fn workspace_root() -> PathBuf {

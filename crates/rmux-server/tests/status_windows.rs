@@ -23,7 +23,7 @@ mod windows_cli_serial;
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 #[cfg(windows)]
-const STEP_TIMEOUT: Duration = Duration::from_secs(20);
+const STEP_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(windows)]
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -260,7 +260,7 @@ fn resolve_rmux_binary() -> TestResult<PathBuf> {
 #[cfg(windows)]
 fn target_dir() -> TestResult<PathBuf> {
     if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR") {
-        return Ok(PathBuf::from(target_dir));
+        return Ok(absolutize_target_dir(PathBuf::from(target_dir)));
     }
     let current = std::env::current_exe()?;
     current
@@ -269,6 +269,15 @@ fn target_dir() -> TestResult<PathBuf> {
         .and_then(Path::parent)
         .map(Path::to_path_buf)
         .ok_or_else(|| "test executable is not under a target directory".into())
+}
+
+#[cfg(windows)]
+fn absolutize_target_dir(target_dir: PathBuf) -> PathBuf {
+    if target_dir.is_absolute() {
+        target_dir
+    } else {
+        workspace_root().join(target_dir)
+    }
 }
 
 #[cfg(windows)]
