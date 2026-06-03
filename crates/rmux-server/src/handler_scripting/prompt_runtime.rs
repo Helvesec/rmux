@@ -10,6 +10,7 @@ use super::super::prompt_support::{
 use super::super::RequestHandler;
 use super::command_args::CommandListArgument;
 use super::format_context::{collect_parse_time_values, format_context_for_target};
+use super::parser_context::command_parser_from_state;
 use super::prompt_parse::{ParsedCommandPromptCommand, ParsedConfirmBeforeCommand};
 use super::queue::{prompt_queue_action_from_result, QueueCommandAction, QueueExecutionContext};
 use super::runtime::spawn_background_async;
@@ -226,8 +227,7 @@ impl RequestHandler {
             let parsed = match &command.command {
                 CommandListArgument::Parsed(commands) => commands.clone(),
                 CommandListArgument::String(value) => {
-                    let mut parser =
-                        CommandParser::new().with_environment_store(&state.environment);
+                    let mut parser = command_parser_from_state(&state);
                     for (name, value) in &format_values {
                         parser = parser.with_format_value(name, value.clone());
                     }

@@ -1,6 +1,7 @@
 use rmux_core::formats::{is_known_format_variable_name, FormatVariable, FormatVariables};
 use rmux_core::input::mode;
 use rmux_core::{Session, Window, WINLINK_ACTIVITY, WINLINK_BELL, WINLINK_SILENCE};
+use rmux_proto::OptionName;
 
 use crate::hook_runtime::current_hook_format_value;
 
@@ -24,12 +25,33 @@ impl RuntimeFormatContext<'_> {
             state.pane_has_pipe(session.name(), window_index, pane.id())
         })))
     }
+
+    fn pane_synchronized(&self) -> Option<String> {
+        let session = self.session?;
+        let window_index = self.window_index?;
+        Some(bool_string(
+            self.options?.resolve_for_window(
+                session.name(),
+                window_index,
+                OptionName::SynchronizePanes,
+            ) == Some("on"),
+        ))
+    }
+
+    fn window_stack_index(&self) -> Option<String> {
+        let session = self.session?;
+        let window_index = self.window_index?;
+        window_stack(session)
+            .iter()
+            .position(|candidate| *candidate == window_index)
+            .map(|index| index.to_string())
+    }
 }
 
 impl FormatVariables for RuntimeFormatContext<'_> {
     fn format_value(&self, variable: FormatVariable) -> Option<String> {
-        if variable == FormatVariable::WindowName {
-            return self.window_name();
+        if let Some(value) = self.runtime_format_value(variable) {
+            return Some(value);
         }
         self.base.format_value(variable)
     }
@@ -69,6 +91,12 @@ impl FormatVariables for RuntimeFormatContext<'_> {
     }
 
     fn format_value_by_name(&self, name: &str) -> Option<String> {
+        if let Some(variable) = FormatVariable::from_name(name) {
+            if let Some(value) = self.runtime_format_value(variable) {
+                return Some(value);
+            }
+        }
+
         let runtime_value = match name {
             "pane_at_bottom" => self.visible_pane_snapshot().map(|pane| {
                 bool_string(self.visible_window_snapshot().is_some_and(|window| {
@@ -86,7 +114,6 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "pane_width" => self
                 .visible_pane_snapshot()
                 .map(|pane| pane.geometry().cols().to_string()),
-            "pane_index" => self.pane_index_with_base(),
             "session_activity_flag" => self.session_flag(WINLINK_ACTIVITY),
             "session_alert" => self.session_alert(),
             "session_alerts" => self.session_alerts(),
@@ -260,7 +287,7 @@ impl FormatVariables for RuntimeFormatContext<'_> {
                 .pane_start_path()
                 .or_else(|| self.environment_value_by_name("PWD"))
                 .or_else(|| self.environment_value_by_name("HOME")),
-            "pane_synchronized" => Some("0".to_owned()),
+            "pane_synchronized" => self.pane_synchronized(),
             "pane_tabs" => Some("8,16,24,32,40,48,56,64,72,80,88,96,104,112".to_owned()),
             "pane_tty" => self.pane_tty(),
             "pane_title" => self.pane_title(),
@@ -376,12 +403,12 @@ impl FormatVariables for RuntimeFormatContext<'_> {
                 .map(|timestamp| timestamp.to_string()),
             "session_many_attached" => Some(bool_string(self.session_attached_count() > 1)),
             "session_marked" => Some(bool_string(self.session_marked())),
-            "session_stack" => Some("0".to_owned()),
+            "session_stack" => self.session.map(session_stack),
             "socket_path" => Some(String::new()),
             "start_time" => Some(server_start_time().to_string()),
             "tree_mode_format" => Some("#{?pane_format,#{?pane_marked,#[reverse],}#{pane_current_command}#{?pane_active,*,}#{?pane_marked,M,}#{?#{&&:#{pane_title},#{!=:#{pane_title},#{host_short}}},: \"#{pane_title}\",},#{?window_format,#{?window_marked_flag,#[reverse],}#{window_name}#{window_flags}#{?#{&&:#{==:#{window_panes},1},#{&&:#{pane_title},#{!=:#{pane_title},#{host_short}}}},: \"#{pane_title}\",},#{session_windows} windows#{?session_grouped, (group #{session_group}: #{session_group_list}),}#{?session_attached, (attached),}}}".to_owned()),
             "uid" => Some(crate::server_access::current_owner_uid().to_string()),
-            "user" => std::env::var("USER").ok(),
+            "user" => current_user_name(),
             "version" => Some("3.4".to_owned()),
             "window_active_clients" => Some(
                 if self
@@ -420,7 +447,7 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "window_format" => Some(bool_string(self.window.is_some() && self.pane.is_none())),
             "window_marked_flag" => Some(bool_string(self.window_marked())),
             "window_offset_x" | "window_offset_y" => Some("0".to_owned()),
-            "window_stack_index" => Some("0".to_owned()),
+            "window_stack_index" => self.window_stack_index(),
             "window_start_flag" => self.window_index.map(|window_index| {
                 bool_string(
                     self.session
@@ -450,5 +477,82 @@ impl FormatVariables for RuntimeFormatContext<'_> {
         }
 
         None
+    }
+}
+
+fn session_stack(session: &Session) -> String {
+    window_stack(session)
+        .into_iter()
+        .map(|index| index.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn window_stack(session: &Session) -> Vec<u32> {
+    let mut stack = Vec::with_capacity(session.windows().len());
+    push_existing_window(&mut stack, session, session.active_window_index());
+    if let Some(last_window) = session.last_window_index() {
+        push_existing_window(&mut stack, session, last_window);
+    }
+    for window_index in session.windows().keys().copied() {
+        push_existing_window(&mut stack, session, window_index);
+    }
+    stack
+}
+
+fn push_existing_window(stack: &mut Vec<u32>, session: &Session, window_index: u32) {
+    if session.window_at(window_index).is_some() && !stack.contains(&window_index) {
+        stack.push(window_index);
+    }
+}
+
+fn current_user_name() -> Option<String> {
+    user_name_from_env(|name| std::env::var(name).ok())
+}
+
+fn user_name_from_env(mut lookup: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    lookup("USER")
+        .filter(|value| !value.is_empty())
+        .or_else(|| lookup("USERNAME").filter(|value| !value.is_empty()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::user_name_from_env;
+
+    fn lookup<'a>(values: &'a HashMap<&str, &str>) -> impl FnMut(&str) -> Option<String> + 'a {
+        |name| values.get(name).map(|value| (*value).to_owned())
+    }
+
+    #[test]
+    fn user_name_prefers_unix_user_when_present() {
+        let values = HashMap::from([("USER", "alice"), ("USERNAME", "windows-alice")]);
+
+        assert_eq!(
+            user_name_from_env(lookup(&values)).as_deref(),
+            Some("alice")
+        );
+    }
+
+    #[test]
+    fn user_name_falls_back_to_windows_username() {
+        let values = HashMap::from([("USERNAME", "shadow")]);
+
+        assert_eq!(
+            user_name_from_env(lookup(&values)).as_deref(),
+            Some("shadow")
+        );
+    }
+
+    #[test]
+    fn user_name_ignores_empty_values() {
+        let values = HashMap::from([("USER", ""), ("USERNAME", "shadow")]);
+
+        assert_eq!(
+            user_name_from_env(lookup(&values)).as_deref(),
+            Some("shadow")
+        );
     }
 }

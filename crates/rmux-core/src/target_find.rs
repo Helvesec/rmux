@@ -66,10 +66,7 @@ impl SessionStore {
             return self.mouse_target_for_type(find_type, context);
         }
         if matches!(raw, "~" | "{marked}") {
-            return Err(RmuxError::Server(
-                "target form {marked} is recognized but deferred until marked-pane state exists"
-                    .to_owned(),
-            ));
+            return self.marked_target_for_type(find_type, context);
         }
 
         let mut parts = TargetParts::parse(raw, find_type);
@@ -118,6 +115,7 @@ impl SessionStore {
                         &window.session_name,
                         window.window_index,
                         pane,
+                        context,
                     )?;
                     return Ok(target_for_type(find_type, pane));
                 }
@@ -128,6 +126,7 @@ impl SessionStore {
                 raw,
                 &session_name,
                 parts.pane.expect("pane branch requires pane"),
+                context,
             )?;
             return Ok(target_for_type(find_type, pane));
         }
@@ -141,6 +140,7 @@ impl SessionStore {
                     &window.session_name,
                     window.window_index,
                     pane,
+                    context,
                 )?;
                 return Ok(target_for_type(find_type, pane));
             }
@@ -395,7 +395,13 @@ impl SessionStore {
             }
             Err(error) => return Err(error),
         };
-        match self.resolve_pane_in_window(raw, &current.session_name, current.window_index, value) {
+        match self.resolve_pane_in_window(
+            raw,
+            &current.session_name,
+            current.window_index,
+            value,
+            context,
+        ) {
             Ok(pane) => Ok(pane),
             Err(error) if !only_pane => {
                 match self.resolve_window_from_context(raw, value, false, flags, context) {
@@ -426,6 +432,7 @@ impl SessionStore {
         raw: &str,
         session_name: &SessionName,
         value: &str,
+        context: &TargetFindContext,
     ) -> Result<ResolvedParts, RmuxError> {
         if value.starts_with('%') {
             let pane_id = crate::PaneId::new(parse_required_prefixed_id(value, '%')?);
@@ -446,7 +453,7 @@ impl SessionStore {
             .session(session_name)
             .ok_or_else(|| target_not_found(session_name.as_str(), "session"))?
             .active_window_index();
-        self.resolve_pane_in_window(raw, session_name, window_index, value)
+        self.resolve_pane_in_window(raw, session_name, window_index, value, context)
     }
 
     fn resolve_pane_in_window(
@@ -455,6 +462,7 @@ impl SessionStore {
         session_name: &SessionName,
         window_index: u32,
         value: &str,
+        context: &TargetFindContext,
     ) -> Result<ResolvedParts, RmuxError> {
         let session = self
             .session(session_name)
@@ -504,12 +512,22 @@ impl SessionStore {
             ));
         }
 
-        if let Ok(pane_index) = value.parse::<u32>() {
-            if window.pane(pane_index).is_some() {
+        if let Ok(visible_pane_index) = value.parse::<u32>() {
+            let pane_base_index = context.pane_base_index(session_name, window_index);
+            if let Some(pane_index) = visible_pane_index.checked_sub(pane_base_index) {
+                if window.pane(pane_index).is_some() {
+                    return Ok(ResolvedParts::pane(
+                        session_name.clone(),
+                        window_index,
+                        pane_index,
+                    ));
+                }
+            }
+            if pane_base_index == 0 && window.pane(visible_pane_index).is_some() {
                 return Ok(ResolvedParts::pane(
                     session_name.clone(),
                     window_index,
-                    pane_index,
+                    visible_pane_index,
                 ));
             }
         }

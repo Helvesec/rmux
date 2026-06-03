@@ -43,6 +43,7 @@ impl HandlerState {
         command: Option<&ProcessCommand>,
         start_directory: Option<&Path>,
         keep_alive_on_exit: Option<bool>,
+        split_size: Option<u32>,
         pane_alert_callback: Option<PaneAlertCallback>,
         pane_exit_callback: Option<PaneExitCallback>,
     ) -> Result<SplitWindowResponse, RmuxError> {
@@ -68,6 +69,7 @@ impl HandlerState {
                 new_pane_index,
                 internal_direction,
                 before,
+                split_size,
             )?;
         let new_target =
             PaneTarget::with_window(session_name.clone(), window_index, new_pane_index);
@@ -219,6 +221,7 @@ impl HandlerState {
         expected_pane_index: u32,
         direction: SplitDirection,
         before: bool,
+        split_size: Option<u32>,
     ) -> Result<
         (
             rmux_core::SessionId,
@@ -249,6 +252,14 @@ impl HandlerState {
             before,
         )?;
         debug_assert_eq!(committed_index, expected_pane_index);
+        if let Some(split_size) = split_size {
+            session.resize_pane_to_in_window(
+                target_window_index,
+                committed_index,
+                direction,
+                split_size,
+            )?;
+        }
         let pane = session
             .window_at(window_index)
             .expect("split target window must exist")

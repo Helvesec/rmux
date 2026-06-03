@@ -1,4 +1,6 @@
-use rmux_proto::Target;
+use std::collections::HashMap;
+
+use rmux_proto::{SessionName, Target};
 
 /// The target type requested by a tmux command's `cmd_entry_flag`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,15 +85,19 @@ impl UnresolvedTarget {
 pub struct TargetFindContext {
     current: Option<Target>,
     mouse_target: Option<Target>,
+    marked_target: Option<Target>,
+    pane_base_indices: HashMap<(SessionName, u32), u32>,
 }
 
 impl TargetFindContext {
     /// Creates a context with an optional current target.
     #[must_use]
-    pub const fn new(current: Option<Target>) -> Self {
+    pub fn new(current: Option<Target>) -> Self {
         Self {
             current,
             mouse_target: None,
+            marked_target: None,
+            pane_base_indices: HashMap::new(),
         }
     }
 
@@ -101,6 +107,8 @@ impl TargetFindContext {
         Self {
             current: Some(target),
             mouse_target: None,
+            marked_target: None,
+            pane_base_indices: HashMap::new(),
         }
     }
 
@@ -121,6 +129,36 @@ impl TargetFindContext {
     #[must_use]
     pub const fn mouse_target(&self) -> Option<&Target> {
         self.mouse_target.as_ref()
+    }
+
+    /// Returns a context extended with the server-wide marked pane target.
+    #[must_use]
+    pub fn with_marked_target(mut self, marked_target: Option<Target>) -> Self {
+        self.marked_target = marked_target;
+        self
+    }
+
+    /// Returns the marked pane target when one is available.
+    #[must_use]
+    pub const fn marked_target(&self) -> Option<&Target> {
+        self.marked_target.as_ref()
+    }
+
+    /// Returns a context extended with visible pane-index bases.
+    #[must_use]
+    pub fn with_pane_base_indices(
+        mut self,
+        pane_base_indices: HashMap<(SessionName, u32), u32>,
+    ) -> Self {
+        self.pane_base_indices = pane_base_indices;
+        self
+    }
+
+    pub(super) fn pane_base_index(&self, session_name: &SessionName, window_index: u32) -> u32 {
+        self.pane_base_indices
+            .get(&(session_name.clone(), window_index))
+            .copied()
+            .unwrap_or(0)
     }
 }
 

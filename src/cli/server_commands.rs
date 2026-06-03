@@ -1,10 +1,11 @@
 use std::path::Path;
 
 use rmux_client::{connect, ClientError, Connection, StartServerError};
+use rmux_proto::ListSessionsRequest;
 
 use super::{
-    expect_command_success, resolve_session_target_or_current, run_command, run_command_resolved,
-    run_payload_command, write_command_output, ExitFailure, StartupOptions,
+    expect_command_output, expect_command_success, resolve_session_target_or_current, run_command,
+    run_command_resolved, run_payload_command, write_command_output, ExitFailure, StartupOptions,
 };
 use crate::cli_args::{ClientTargetArgs, ServerAccessArgs, SessionTargetArgs};
 
@@ -12,7 +13,7 @@ pub(super) fn run_start_server(
     socket_path: &Path,
     startup: StartupOptions,
 ) -> Result<i32, ExitFailure> {
-    let _connection = Connection::start_server(
+    let mut connection = Connection::start_server(
         socket_path,
         startup.no_start_server,
         startup.config,
@@ -21,6 +22,15 @@ pub(super) fn run_start_server(
         StartServerError::Client(error) => ExitFailure::from_client_connect(socket_path, error),
         StartServerError::AutoStart(error) => ExitFailure::from_auto_start(error),
     })?;
+    let response = connection
+        .list_sessions(ListSessionsRequest {
+            format: None,
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })
+        .map_err(ExitFailure::from_client)?;
+    let _ = expect_command_output(&response, "list-sessions")?;
     Ok(0)
 }
 

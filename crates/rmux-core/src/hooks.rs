@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use rmux_proto::{
     HookLifecycle, HookName, PaneTarget, RmuxError, ScopeSelector, SessionName, WindowTarget,
@@ -308,6 +308,43 @@ impl HookStore {
         self.panes.remove(target).is_some()
     }
 
+    /// Rekeys window and pane hooks after a session window reindex.
+    pub fn remap_session_window_indices(
+        &mut self,
+        session_name: &SessionName,
+        index_map: &BTreeMap<u32, u32>,
+    ) -> Result<(), RmuxError> {
+        let mut remapped_windows = HashMap::with_capacity(self.windows.len());
+        for (target, bindings) in &self.windows {
+            let next_target = remapped_window_target(target, session_name, index_map);
+            if remapped_windows
+                .insert(next_target.clone(), bindings.clone())
+                .is_some()
+            {
+                return Err(RmuxError::Server(format!(
+                    "hooks already exist for {next_target}"
+                )));
+            }
+        }
+
+        let mut remapped_panes = HashMap::with_capacity(self.panes.len());
+        for (target, bindings) in &self.panes {
+            let next_target = remapped_pane_target(target, session_name, index_map);
+            if remapped_panes
+                .insert(next_target.clone(), bindings.clone())
+                .is_some()
+            {
+                return Err(RmuxError::Server(format!(
+                    "hooks already exist for {next_target}"
+                )));
+            }
+        }
+
+        self.windows = remapped_windows;
+        self.panes = remapped_panes;
+        Ok(())
+    }
+
     /// Rekeys all hooks owned by the given session.
     pub fn rename_session(
         &mut self,
@@ -481,6 +518,36 @@ impl HookStore {
 
         self.dispatch_window(scope, hook)
     }
+}
+
+fn remapped_window_target(
+    target: &WindowTarget,
+    session_name: &SessionName,
+    index_map: &BTreeMap<u32, u32>,
+) -> WindowTarget {
+    if target.session_name() != session_name {
+        return target.clone();
+    }
+    index_map.get(&target.window_index()).copied().map_or_else(
+        || target.clone(),
+        |window_index| WindowTarget::with_window(session_name.clone(), window_index),
+    )
+}
+
+fn remapped_pane_target(
+    target: &PaneTarget,
+    session_name: &SessionName,
+    index_map: &BTreeMap<u32, u32>,
+) -> PaneTarget {
+    if target.session_name() != session_name {
+        return target.clone();
+    }
+    index_map.get(&target.window_index()).copied().map_or_else(
+        || target.clone(),
+        |window_index| {
+            PaneTarget::with_window(session_name.clone(), window_index, target.pane_index())
+        },
+    )
 }
 
 #[cfg(test)]

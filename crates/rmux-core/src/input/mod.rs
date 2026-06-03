@@ -10,6 +10,7 @@ mod colour;
 mod commands;
 mod csi_helpers;
 mod dispatch;
+pub mod mode;
 mod params;
 mod passthrough;
 mod sgr;
@@ -53,57 +54,6 @@ const INPUT_DISCARD: u32 = 0x1;
 /// Last printable character was emitted (for REP).
 const INPUT_LAST: u32 = 0x2;
 
-/// Mode flag bits matching tmux `tmux.h:660–680`.
-pub mod mode {
-    /// Cursor visible.
-    pub const MODE_CURSOR: u32 = 0x1;
-    /// Insert mode.
-    pub const MODE_INSERT: u32 = 0x2;
-    /// Application cursor keys.
-    pub const MODE_KCURSOR: u32 = 0x4;
-    /// Application keypad.
-    pub const MODE_KKEYPAD: u32 = 0x8;
-    /// Auto wrap.
-    pub const MODE_WRAP: u32 = 0x10;
-    /// Standard mouse reporting (1000).
-    pub const MODE_MOUSE_STANDARD: u32 = 0x20;
-    /// Button-event mouse tracking (1002).
-    pub const MODE_MOUSE_BUTTON: u32 = 0x40;
-    /// Cursor blinking.
-    pub const MODE_CURSOR_BLINKING: u32 = 0x80;
-    /// Mouse UTF-8 mode (1005).
-    pub const MODE_MOUSE_UTF8: u32 = 0x100;
-    /// SGR mouse mode (1006).
-    pub const MODE_MOUSE_SGR: u32 = 0x200;
-    /// Bracketed paste.
-    pub const MODE_BRACKETPASTE: u32 = 0x400;
-    /// Focus in/out events.
-    pub const MODE_FOCUSON: u32 = 0x800;
-    /// All mouse tracking (1003).
-    pub const MODE_MOUSE_ALL: u32 = 0x1000;
-    /// Origin mode.
-    pub const MODE_ORIGIN: u32 = 0x2000;
-    /// CR+LF mode.
-    pub const MODE_CRLF: u32 = 0x4000;
-    /// Extended keys mode.
-    pub const MODE_KEYS_EXTENDED: u32 = 0x8000;
-    /// Cursor very visible (blinking block, from DECTCEM handling).
-    pub const MODE_CURSOR_VERY_VISIBLE: u32 = 0x1_0000;
-    /// Cursor blinking explicitly set.
-    pub const MODE_CURSOR_BLINKING_SET: u32 = 0x2_0000;
-    /// Extended keys mode 2.
-    pub const MODE_KEYS_EXTENDED_2: u32 = 0x4_0000;
-    /// Theme updates from application.
-    pub const MODE_THEME_UPDATES: u32 = 0x8_0000;
-    /// Synchronized output.
-    pub const MODE_SYNC: u32 = 0x10_0000;
-
-    /// All mouse modes combined.
-    pub const ALL_MOUSE_MODES: u32 = MODE_MOUSE_STANDARD | MODE_MOUSE_BUTTON | MODE_MOUSE_ALL;
-    /// Extended key modes combined.
-    pub const EXTENDED_KEY_MODES: u32 = MODE_KEYS_EXTENDED | MODE_KEYS_EXTENDED_2;
-}
-
 /// Type of string terminator seen for OSC/DCS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputEndType {
@@ -133,6 +83,7 @@ pub struct InputParser {
 
     /// Dynamic input/string buffer.
     input_buf: Vec<u8>,
+    input_buf_max: usize,
     /// Which terminator ended the string.
     input_end: InputEndType,
 
@@ -179,6 +130,7 @@ impl InputParser {
             param_buf: [0; PARAM_BUF_MAX],
             param_len: 0,
             input_buf: Vec::with_capacity(INPUT_BUF_START),
+            input_buf_max: INPUT_BUF_MAX,
             input_end: InputEndType::St,
             param_list: ParamList::new(),
             cell: CellState::default(),
@@ -193,6 +145,15 @@ impl InputParser {
             reply_buf: Vec::new(),
             terminal_passthrough_dropped_count: 0,
         }
+    }
+
+    /// Updates the maximum regular string buffer size used for OSC/DCS input.
+    pub fn set_input_buffer_limit(&mut self, limit: usize) {
+        self.input_buf_max = limit.max(INPUT_BUF_START);
+    }
+
+    pub(crate) const fn configured_input_buffer_limit(&self) -> usize {
+        self.input_buf_max
     }
 
     /// Returns the current parser state.
@@ -488,7 +449,7 @@ impl InputParser {
         if self.is_terminal_passthrough_string() {
             return MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES;
         }
-        INPUT_BUF_MAX
+        self.input_buf_max
     }
 
     fn is_terminal_passthrough_string(&self) -> bool {

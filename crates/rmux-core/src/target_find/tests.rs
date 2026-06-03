@@ -423,10 +423,8 @@ fn recognizes_gated_mouse_and_marked_whole_target_forms() {
         .to_string()
         .contains("target form {mouse} is recognized"));
 
-    let marked = resolve(&store, "~", TargetFindType::Pane).expect_err("marked is deferred");
-    assert!(marked
-        .to_string()
-        .contains("target form {marked} is recognized"));
+    let marked = resolve(&store, "~", TargetFindType::Pane).expect_err("marked is unavailable");
+    assert!(marked.to_string().contains("can't find pane: {marked}"));
 }
 
 #[test]
@@ -452,6 +450,40 @@ fn resolves_mouse_targets_when_context_carries_mouse_state() {
             &context,
         )
         .expect("mouse window resolves");
+
+    assert_eq!(
+        pane,
+        Target::Pane(PaneTarget::with_window(session_name("alpha"), 1, 0))
+    );
+    assert_eq!(
+        window,
+        Target::Window(WindowTarget::with_window(session_name("alpha"), 1))
+    );
+}
+
+#[test]
+fn resolves_marked_targets_when_context_carries_marked_state() {
+    let store = populated_store();
+    let context = TargetFindContext::new(None).with_marked_target(Some(Target::Pane(
+        PaneTarget::with_window(session_name("alpha"), 1, 0),
+    )));
+
+    let pane = store
+        .resolve_unresolved_target(
+            &UnresolvedTarget::new("~"),
+            TargetFindType::Pane,
+            TargetFindFlags::NONE,
+            &context,
+        )
+        .expect("marked pane resolves");
+    let window = store
+        .resolve_unresolved_target(
+            &UnresolvedTarget::new("{marked}"),
+            TargetFindType::Window,
+            TargetFindFlags::NONE,
+            &context,
+        )
+        .expect("marked window resolves");
 
     assert_eq!(
         pane,

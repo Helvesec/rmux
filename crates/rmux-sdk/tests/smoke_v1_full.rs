@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod common;
+
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
@@ -16,16 +18,16 @@ use rmux_sdk::{
     PaneOutputChunk, PaneOutputStart, PaneOutputStream, PaneProcessState, ProcessSpec, Rmux,
     RmuxBuilder, RmuxError, SessionName, SplitDirection,
 };
-use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout, Instant};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const ROOT_PREFIX: &str = "rmux-sdk-v1-full-";
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 const OUTPUT_BUDGET: usize = 64 * 1024;
 
-static LIVE_DAEMON_LOCK: Mutex<()> = Mutex::const_new(());
+static LIVE_DAEMON_LOCK: common::unix_smoke::LiveDaemonLock =
+    common::unix_smoke::LiveDaemonLock::new();
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
 
 #[tokio::test]

@@ -20,6 +20,8 @@ pub(crate) struct SendKeysArgs {
     pub(crate) reset_terminal: bool,
     #[arg(short = 'X', action = ArgAction::SetTrue)]
     pub(crate) copy_mode: bool,
+    #[arg(short = 'c', allow_hyphen_values = true)]
+    pub(crate) client_target: Option<String>,
     #[arg(short = 't', value_parser = parse_target_spec)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]

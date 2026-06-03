@@ -6,6 +6,7 @@ use super::values::{missing_argument, parse_usize};
 
 pub(super) fn parse_send_keys(mut args: CommandTokens) -> Result<Request, RmuxError> {
     let mut target = None;
+    let mut target_client = None;
     let mut expand_formats = false;
     let mut hex = false;
     let mut literal = false;
@@ -58,6 +59,10 @@ pub(super) fn parse_send_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
                 let _ = args.optional();
                 copy_mode_command = true;
             }
+            "-c" => {
+                let _ = args.optional();
+                target_client = Some(args.required("-c target-client")?);
+            }
             "-t" => {
                 let _ = args.optional();
                 target = Some(parse_pane_target("send-keys", args.required("-t target")?)?);
@@ -76,10 +81,27 @@ pub(super) fn parse_send_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
         && !forward_mouse_event
         && !reset_terminal
         && repeat_count.is_none()
+        && target_client.is_none()
     {
         return Ok(Request::SendKeys(SendKeysRequest {
             target: target.ok_or_else(|| missing_argument("send-keys", "-t target"))?,
             keys,
+        }));
+    }
+
+    if target_client.is_some() {
+        return Ok(Request::SendKeysExt2(rmux_proto::SendKeysExt2Request {
+            target,
+            keys,
+            expand_formats,
+            hex,
+            literal,
+            dispatch_key_table,
+            copy_mode_command,
+            forward_mouse_event,
+            reset_terminal,
+            repeat_count,
+            target_client,
         }));
     }
 

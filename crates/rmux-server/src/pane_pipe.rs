@@ -315,10 +315,14 @@ async fn forward_pane_output_to_pipe(
 ) {
     loop {
         tokio::select! {
+            biased;
             _ = wait_for_pipe_stop(&mut stop_rx) => break,
             next = pane_output.recv() => {
                 match next {
                     OutputCursorItem::Event(event) => {
+                        if *stop_rx.borrow() {
+                            break;
+                        }
                         let bytes = event.into_bytes();
                         if bytes.is_empty() {
                             break;
@@ -345,11 +349,15 @@ async fn forward_pipe_output_to_pane<R>(
     let mut buffer = [0_u8; 8192];
     loop {
         tokio::select! {
+            biased;
             _ = wait_for_pipe_stop(&mut stop_rx) => break,
             read = reader.read(&mut buffer) => {
                 match read {
                     Ok(0) | Err(_) => break,
                     Ok(size) => {
+                        if *stop_rx.borrow() {
+                            break;
+                        }
                         if write_pipe_output_to_pane(&pane_master, buffer[..size].to_vec())
                             .await
                             .is_err()

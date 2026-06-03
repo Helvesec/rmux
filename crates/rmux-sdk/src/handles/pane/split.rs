@@ -52,6 +52,9 @@ pub(super) async fn split_pane_with_process(
             process_command,
             start_directory: cwd,
             keep_alive_on_exit,
+            detached: false,
+            size: None,
+            preserve_zoom: false,
         }))
         .await?
     {

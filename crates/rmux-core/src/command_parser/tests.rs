@@ -76,6 +76,32 @@ fn rejects_invalid_escape_sequences() {
         .contains("invalid \\u argument"));
 }
 
+#[cfg(windows)]
+#[test]
+fn preserves_quoted_windows_drive_path_backslashes() {
+    let commands = CommandParser::new()
+        .parse(r#"set-environment -g AUDIT_PATH "C:\Users\Shadow\Documents\rmux""#)
+        .unwrap();
+
+    assert_eq!(
+        commands.commands()[0].arguments()[2].as_string(),
+        Some(r"C:\Users\Shadow\Documents\rmux")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn preserves_standard_escaped_backslashes_in_windows_drive_paths() {
+    let commands = CommandParser::new()
+        .parse(r#"set-environment -g AUDIT_PATH "C:\\Users\\Shadow""#)
+        .unwrap();
+
+    assert_eq!(
+        commands.commands()[0].arguments()[2].as_string(),
+        Some(r"C:\Users\Shadow")
+    );
+}
+
 #[test]
 fn expands_variables_and_tilde_at_tokenization_boundary() {
     let commands = CommandParser::new()
@@ -91,6 +117,15 @@ fn expands_variables_and_tilde_at_tokenization_boundary() {
         .collect::<Vec<_>>();
 
     assert_eq!(args, ["alpha", "", "/tmp/home/x", "/home/bob/y"]);
+}
+
+#[test]
+fn preserves_bare_marked_target_at_end_of_command() {
+    let commands = CommandParser::new()
+        .parse("select-pane -t ~")
+        .expect("marked target parses");
+
+    assert_eq!(commands.commands()[0].arguments()[1].as_string(), Some("~"));
 }
 
 #[test]
@@ -333,6 +368,23 @@ fn resolves_user_defined_command_aliases_before_lookup() {
 }
 
 #[test]
+fn resolved_command_alias_option_entries_replace_default_aliases() {
+    let commands = CommandParser::new()
+        .with_command_aliases(["say=display-message -p"])
+        .parse("say hello")
+        .expect("custom alias should parse");
+
+    assert_eq!(commands.commands()[0].name(), "display-message");
+    assert!(
+        CommandParser::new()
+            .with_command_aliases(["say=display-message -p"])
+            .parse("choose-window")
+            .is_err(),
+        "runtime command-alias array should be the source of truth"
+    );
+}
+
+#[test]
 fn command_alias_reparse_sees_parse_time_assignments() {
     let commands = CommandParser::new()
         .with_command_alias("say=display-message \"$FOO\"")
@@ -477,6 +529,31 @@ fn continuation_joins_lines_outside_quotes() {
 }
 
 #[test]
+fn continuation_joins_crlf_lines() {
+    let commands = CommandParser::new()
+        .parse("display-message hel\\\r\nlo")
+        .unwrap();
+
+    assert_eq!(
+        commands.commands()[0].arguments()[0].as_string(),
+        Some("hello")
+    );
+}
+
+#[test]
+fn carriage_return_line_endings_are_normalized() {
+    let commands = CommandParser::new()
+        .parse("display-message first\rdisplay-message second")
+        .unwrap();
+
+    assert_eq!(commands.commands().len(), 2);
+    assert_eq!(
+        commands.commands()[1].arguments()[0].as_string(),
+        Some("second")
+    );
+}
+
+#[test]
 fn double_backslash_before_newline_preserves_literal_backslash() {
     let commands = CommandParser::new()
         .parse("display-message \"val\\\\\\\nnext\"")
@@ -525,4 +602,45 @@ fn only_comments_produce_no_commands() {
 fn only_whitespace_produces_no_commands() {
     let commands = CommandParser::new().parse("   \n\n  \t  \n").unwrap();
     assert!(commands.commands().is_empty());
+}
+
+#[test]
+fn deeply_nested_command_blocks_fail_closed_instead_of_overflowing() {
+    // `{ … }` blocks recurse through parse_command -> parse_until. Without a cap
+    // this overflows the native stack (SIGABRT). 400 > the 256 cap, and the cap
+    // returns a parse error before the recursion ever reaches the stack limit.
+    let depth = 400;
+    let input = "if-shell true { ".repeat(depth) + &"}".repeat(depth);
+    let error = CommandParser::new().parse(&input).unwrap_err();
+    assert!(
+        error.to_string().contains("command nesting too deep"),
+        "expected nesting error, got: {error}"
+    );
+}
+
+#[test]
+fn deeply_nested_conditionals_fail_closed_instead_of_overflowing() {
+    // The %if branch recurses through parse_condition -> parse_until, a second
+    // unbounded cycle that the brace cap must also cover (shared at parse_until).
+    let depth = 400;
+    let input = "%if 1\n".repeat(depth) + &"%endif\n".repeat(depth);
+    let error = CommandParser::new().parse(&input).unwrap_err();
+    assert!(
+        error.to_string().contains("command nesting too deep"),
+        "expected nesting error, got: {error}"
+    );
+}
+
+#[test]
+fn modest_block_and_conditional_nesting_still_parses() {
+    // The cap must not regress real configs: nesting well under 256 still parses.
+    let depth = 64;
+    let braces = "if-shell true { ".repeat(depth) + "display-message ok " + &"}".repeat(depth);
+    CommandParser::new()
+        .parse(&braces)
+        .expect("nested blocks parse");
+    let conds = "%if 1\n".repeat(depth) + "display-message ok\n" + &"%endif\n".repeat(depth);
+    CommandParser::new()
+        .parse(&conds)
+        .expect("nested conditionals parse");
 }

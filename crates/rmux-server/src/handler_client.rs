@@ -103,6 +103,47 @@ impl RequestHandler {
         )))
     }
 
+    pub(in crate::handler) async fn find_target_attach_client_pid(
+        &self,
+        requester_pid: u32,
+        target_client: &str,
+        command_name: &str,
+    ) -> Result<Option<u32>, RmuxError> {
+        let target_client = normalize_target_client(target_client);
+        if target_client == "=" {
+            return self
+                .resolve_target_attach_client_pid(requester_pid, Some(target_client), command_name)
+                .await
+                .map(Some);
+        }
+
+        {
+            let active_attach = self.active_attach.lock().await;
+            if let Ok(pid) = target_client.parse::<u32>() {
+                if active_attach.by_pid.contains_key(&pid) {
+                    return Ok(Some(pid));
+                }
+            } else if let Some((&pid, _)) = active_attach
+                .by_pid
+                .iter()
+                .find(|(pid, _)| attached_client_matches_target(**pid, target_client))
+            {
+                return Ok(Some(pid));
+            }
+        }
+
+        let active_control = self.active_control.lock().await;
+        if let Ok(pid) = target_client.parse::<u32>() {
+            if active_control.by_pid.contains_key(&pid) {
+                return Err(RmuxError::Server(format!(
+                    "{command_name} requires an attached client"
+                )));
+            }
+        }
+
+        Ok(None)
+    }
+
     pub(in crate::handler) async fn resolve_target_attach_client_pid(
         &self,
         requester_pid: u32,
@@ -421,11 +462,21 @@ impl RequestHandler {
                             .map(ToString::to_string)
                             .unwrap_or_default(),
                     )
+                    .with_named_value(
+                        "client_session",
+                        client
+                            .session_name
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_default(),
+                    )
                     .with_named_value("client_width", client.width.to_string())
                     .with_named_value("client_height", client.height.to_string())
                     .with_named_value("client_termfeatures", client.termfeatures.clone())
                     .with_named_value("client_termname", client.termname.clone())
                     .with_named_value("client_termtype", client.termtype.clone())
+                    .with_named_value("client_key_table", client.key_table_name())
+                    .with_named_value("client_prefix", client.prefix_value())
                     .with_named_value("client_uid", format_client_uid(client.uid))
                     .with_named_value("client_user", format_client_user(client.uid, &client.user))
                     .with_named_value("client_utf8", if client.utf8 { "1" } else { "0" })

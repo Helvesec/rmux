@@ -18,7 +18,7 @@ use crate::RmuxError;
 ///
 /// Empty strings are rejected. `:` and `.` characters are rewritten to `_`
 /// to keep names safe for use inside exact target syntax (`session`,
-/// `session:window`, `session:window.pane`). Non-printable bytes are
+/// `session:window`, `session:window.pane`). Non-printable characters are
 /// rendered using tmux's `vis`-style escape sequences so display output is
 /// always single-line and non-controlling.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -34,7 +34,7 @@ impl SessionName {
             return Err(RmuxError::EmptySessionName);
         }
 
-        Ok(Self(sanitize_session_name(value.as_bytes())))
+        Ok(Self(sanitize_session_name(&value)))
     }
 
     /// Returns the sanitized validated session name.
@@ -50,41 +50,72 @@ impl SessionName {
     }
 }
 
-fn sanitize_session_name(input: &[u8]) -> String {
+fn sanitize_session_name(input: &str) -> String {
     let mut sanitized = String::with_capacity(input.len());
-    for &byte in input {
-        let rewritten = match byte {
-            b':' | b'.' => b'_',
+    for character in input.chars() {
+        let rewritten = match character {
+            ':' | '.' => '_',
             other => other,
         };
-        push_session_name_byte(rewritten, &mut sanitized);
+        push_session_name_character(rewritten, &mut sanitized);
     }
     sanitized
 }
 
-fn push_session_name_byte(byte: u8, output: &mut String) {
-    if (0x20..=0x7e).contains(&byte) && byte != b'\\' {
-        output.push(char::from(byte));
-        return;
-    }
-
-    match byte {
-        b'\0' => output.push_str("\\000"),
-        b'\x07' => output.push_str("\\a"),
-        b'\x08' => output.push_str("\\b"),
-        b'\t' => output.push_str("\\t"),
-        b'\n' => output.push_str("\\n"),
-        b'\x0b' => output.push_str("\\v"),
-        b'\x0c' => output.push_str("\\f"),
-        b'\r' => output.push_str("\\r"),
-        b'\\' => output.push_str("\\\\"),
-        _ => {
+fn push_session_name_character(character: char, output: &mut String) {
+    match character {
+        '\0' => output.push_str("\\000"),
+        '\x07' => output.push_str("\\a"),
+        '\x08' => output.push_str("\\b"),
+        '\t' => output.push_str("\\t"),
+        '\n' => output.push_str("\\n"),
+        '\x0b' => output.push_str("\\v"),
+        '\x0c' => output.push_str("\\f"),
+        '\r' => output.push_str("\\r"),
+        control if control.is_control() => {
+            let value = control as u32;
             output.push('\\');
-            output.push(char::from(b'0' + ((byte >> 6) & 0x7)));
-            output.push(char::from(b'0' + ((byte >> 3) & 0x7)));
-            output.push(char::from(b'0' + (byte & 0x7)));
+            output.push(char::from(b'0' + ((value >> 6) & 0x7) as u8));
+            output.push(char::from(b'0' + ((value >> 3) & 0x7) as u8));
+            output.push(char::from(b'0' + (value & 0x7) as u8));
+        }
+        // Line/paragraph separators, bidi overrides and zero-width marks are NOT
+        // Unicode Cc controls, so `is_control()` misses them, yet they still break
+        // the single-line, non-controlling display invariant (and bidi overrides
+        // can spoof the rendered name). Escape each UTF-8 byte octally — the same
+        // `\NNN` form as the control arm and tmux's byte-oriented vis. The leading
+        // backslash is never itself escaped, so the output re-sanitizes to itself
+        // and stays idempotent through serde's re-sanitizing Deserialize.
+        format_char if is_display_unsafe_format_char(format_char) => {
+            let mut buffer = [0_u8; 4];
+            for byte in format_char.encode_utf8(&mut buffer).bytes() {
+                output.push('\\');
+                output.push(char::from(b'0' + ((byte >> 6) & 0x7)));
+                output.push(char::from(b'0' + ((byte >> 3) & 0x7)));
+                output.push(char::from(b'0' + (byte & 0x7)));
+            }
+        }
+        _ => {
+            output.push(character);
         }
     }
+}
+
+/// Non-`Cc` code points that still violate the single-line, non-controlling
+/// session-name invariant: line/paragraph separators, bidi embeddings, overrides
+/// and isolates, and zero-width / invisible formatting marks.
+fn is_display_unsafe_format_char(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x00AD               // SOFT HYPHEN
+            | 0x061C         // ARABIC LETTER MARK
+            | 0x200B..=0x200F // ZWSP, ZWNJ, ZWJ, LRM, RLM
+            | 0x2028         // LINE SEPARATOR
+            | 0x2029         // PARAGRAPH SEPARATOR
+            | 0x202A..=0x202E // LRE, RLE, PDF, LRO, RLO (bidi embeddings/overrides)
+            | 0x2066..=0x2069 // LRI, RLI, FSI, PDI (bidi isolates)
+            | 0xFEFF         // ZERO WIDTH NO-BREAK SPACE / BOM
+    )
 }
 
 impl AsRef<str> for SessionName {
@@ -258,7 +289,7 @@ impl From<u32> for PaneId {
 
 #[cfg(test)]
 mod tests {
-    use super::{PaneId, SessionId, SessionName, WindowId};
+    use super::{is_display_unsafe_format_char, PaneId, SessionId, SessionName, WindowId};
     use crate::RmuxError;
 
     #[test]
@@ -323,6 +354,44 @@ mod tests {
             .expect("rewrites colons")
             .into_inner();
         assert_eq!(owned, "alpha_beta");
+    }
+
+    #[test]
+    fn session_name_escapes_line_and_paragraph_separators() {
+        // U+2028/U+2029 are not Cc controls but break the single-line invariant.
+        assert_eq!(
+            SessionName::new("a\u{2028}b\u{2029}c")
+                .expect("escaped")
+                .as_str(),
+            "a\\342\\200\\250b\\342\\200\\251c"
+        );
+    }
+
+    #[test]
+    fn session_name_escapes_bidi_overrides_and_zero_width_marks() {
+        // A right-to-left override could otherwise spoof the rendered name; a
+        // zero-width space could hide content. Both must be escaped.
+        let rendered = SessionName::new("a\u{202e}b\u{200b}c").expect("escaped");
+        assert_eq!(rendered.as_str(), "a\\342\\200\\256b\\342\\200\\213c");
+        assert!(!rendered.as_str().chars().any(is_display_unsafe_format_char));
+    }
+
+    #[test]
+    fn session_name_sanitization_is_idempotent_through_serde() {
+        // Deserialize re-runs sanitize_session_name, so an escaped name must
+        // survive a second pass unchanged (no doubled backslashes).
+        let original =
+            SessionName::new("tab\there\u{2028}line\u{202e}rtl\x01ctl").expect("escaped");
+        let bytes = bincode::serialize(&original).expect("encodes");
+        let restored: SessionName = bincode::deserialize(&bytes).expect("decodes");
+        assert_eq!(restored, original, "re-sanitizing must be a no-op");
+        // And a direct second sanitize pass is also a no-op.
+        assert_eq!(
+            SessionName::new(original.as_str())
+                .expect("re-sanitizes")
+                .as_str(),
+            original.as_str()
+        );
     }
 
     #[test]

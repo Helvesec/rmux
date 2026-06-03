@@ -166,6 +166,108 @@ async fn move_window_reindex_compacts_sparse_window_indices() {
 }
 
 #[tokio::test]
+async fn move_window_reindex_starts_at_base_index() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    create_session(&handler, "alpha").await;
+    insert_window(&handler, &alpha, 3).await;
+    insert_window(&handler, &alpha, 7).await;
+
+    let set_base_index = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Session(alpha.clone()),
+            option: OptionName::BaseIndex,
+            value: "2".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(set_base_index, Response::SetOption(_)));
+
+    let response = handler
+        .handle(Request::MoveWindow(MoveWindowRequest {
+            source: None,
+            target: MoveWindowTarget::Session(alpha.clone()),
+            renumber: true,
+            kill_destination: false,
+            detached: true,
+        }))
+        .await;
+
+    assert_eq!(
+        response,
+        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+            session_name: alpha.clone(),
+            target: None,
+        })
+    );
+
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("alpha should exist");
+    assert_eq!(
+        session.windows().keys().copied().collect::<Vec<_>>(),
+        vec![2, 3, 4]
+    );
+}
+
+#[tokio::test]
+async fn move_window_reindex_remaps_window_metadata() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    create_session(&handler, "alpha").await;
+    insert_window(&handler, &alpha, 2).await;
+    insert_window(&handler, &alpha, 3).await;
+
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 3)),
+                option: OptionName::WindowStyle,
+                value: "fg=colour3".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SetHook(rmux_proto::SetHookRequest {
+                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 3)),
+                hook: HookName::WindowLayoutChanged,
+                command: "display-message remapped".to_owned(),
+                lifecycle: HookLifecycle::Persistent,
+            }))
+            .await,
+        Response::SetHook(_)
+    ));
+
+    let response = handler
+        .handle(Request::MoveWindow(MoveWindowRequest {
+            source: None,
+            target: MoveWindowTarget::Session(alpha.clone()),
+            renumber: true,
+            kill_destination: false,
+            detached: true,
+        }))
+        .await;
+    assert!(matches!(response, Response::MoveWindow(_)));
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state
+            .options
+            .resolve_for_window(&alpha, 2, OptionName::WindowStyle),
+        Some("fg=colour3")
+    );
+    assert_eq!(
+        state.hooks.window_command(
+            &WindowTarget::with_window(alpha, 2),
+            HookName::WindowLayoutChanged
+        ),
+        Some("display-message remapped")
+    );
+}
+
+#[tokio::test]
 async fn move_window_across_sessions_restores_terminal_ownership_when_resize_fails() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");

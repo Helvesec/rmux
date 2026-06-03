@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod common;
+
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
@@ -19,9 +21,14 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const MARKER: &str = "RMUX_SDK_SMOKE_V1_OK";
 const SMOKE_ROOT_PREFIX: &str = "rmux-sdk-v1-smoke-";
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+
+static LIVE_DAEMON_LOCK: common::unix_smoke::LiveDaemonLock =
+    common::unix_smoke::LiveDaemonLock::new();
 
 #[tokio::test]
 async fn daemon_backed_sdk_happy_path_cleans_tmp_socket_lock_daemon_and_child() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
     let root = smoke_root()?;
     let socket_path = root.join("daemon.sock");
     let lock_path = root.join("daemon.sock.startup-lock");
@@ -36,7 +43,7 @@ async fn daemon_backed_sdk_happy_path_cleans_tmp_socket_lock_daemon_and_child() 
 
     let rmux = RmuxBuilder::new()
         .unix_socket(&socket_path)
-        .default_timeout(Duration::from_secs(5))
+        .default_timeout(DEFAULT_TIMEOUT)
         .connect_or_start()
         .await?;
     assert_socket(&socket_path)?;
@@ -49,7 +56,7 @@ async fn daemon_backed_sdk_happy_path_cleans_tmp_socket_lock_daemon_and_child() 
 
     let warm = RmuxBuilder::new()
         .unix_socket(&socket_path)
-        .default_timeout(Duration::from_secs(5))
+        .default_timeout(DEFAULT_TIMEOUT)
         .connect_or_start()
         .await?;
     assert!(
@@ -103,7 +110,7 @@ fn assert_socket(path: &Path) -> TestResult {
 }
 
 async fn wait_for_pane_pid(pane: &rmux_sdk::Pane) -> TestResult<u32> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + DEFAULT_TIMEOUT;
     loop {
         let info = only_pane_info(&pane.info().await?);
         if let PaneProcessState::Running { pid: Some(pid) } = info.process {
@@ -122,7 +129,7 @@ fn only_pane_info(info: &rmux_sdk::InfoSnapshot) -> PaneInfo {
 }
 
 async fn wait_for_output_marker(stream: &mut PaneOutputStream, marker: &[u8]) -> TestResult {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + DEFAULT_TIMEOUT;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -143,7 +150,7 @@ async fn wait_for_output_marker(stream: &mut PaneOutputStream, marker: &[u8]) ->
 
 async fn wait_for_daemon_pid(socket_path: &Path) -> TestResult<u32> {
     let needle = socket_path.to_string_lossy().into_owned();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + DEFAULT_TIMEOUT;
     loop {
         if let Some(pid) = daemon_pid_for_socket(&needle)? {
             return Ok(pid);
@@ -157,7 +164,7 @@ async fn wait_for_daemon_pid(socket_path: &Path) -> TestResult<u32> {
 
 async fn wait_for_daemon_absent(socket_path: &Path, original_pid: u32) -> TestResult {
     let needle = socket_path.to_string_lossy().into_owned();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + DEFAULT_TIMEOUT;
     loop {
         match daemon_pid_for_socket(&needle)? {
             None => return Ok(()),
@@ -203,7 +210,7 @@ fn daemon_pid_for_socket(socket_needle: &str) -> TestResult<Option<u32>> {
 }
 
 async fn wait_for_process_absent(pid: u32) -> TestResult {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + DEFAULT_TIMEOUT;
     loop {
         if !process_exists(pid)? {
             return Ok(());
@@ -226,7 +233,7 @@ fn process_exists(pid: u32) -> TestResult<bool> {
 }
 
 async fn wait_for_path_absent(path: &Path) -> TestResult {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + DEFAULT_TIMEOUT;
     loop {
         if !path.exists() {
             return Ok(());

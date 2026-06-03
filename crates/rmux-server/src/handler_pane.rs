@@ -22,6 +22,8 @@ mod pane_layout;
 mod pane_lifecycle;
 #[path = "handler_pane/management.rs"]
 mod pane_management;
+#[path = "handler_pane/process.rs"]
+mod pane_process;
 #[path = "handler_pane/prompt_input.rs"]
 mod pane_prompt_input;
 #[path = "handler_pane/selection.rs"]
@@ -30,6 +32,8 @@ mod pane_selection;
 mod pane_send_keys;
 #[path = "handler_pane/snapshot.rs"]
 mod pane_snapshot;
+#[path = "handler_pane/split_effects.rs"]
+mod pane_split_effects;
 
 pub(super) use pane_attached_input::retain_partial_attached_control_input;
 pub(super) use pane_by_id::resolve_pane_target_ref;
@@ -40,8 +44,8 @@ pub(super) use pane_inspection::{
 pub(super) use pane_io_encoding::write_bracketed_pane_payload;
 use pane_io_encoding::{
     encode_key_for_target, encode_mouse_for_target, encode_tokens_for_target,
-    expand_send_key_tokens, prepare_pane_input_write, write_bytes_to_target,
-    write_bytes_to_target_io,
+    expand_send_key_tokens, prepare_pane_input_write, prepare_synchronized_pane_input_writes,
+    write_bytes_to_target, write_bytes_to_target_io, write_bytes_to_targets,
 };
 pub(super) use pane_prompt_input::decode_prompt_input_event;
 pub(in crate::handler) use pane_snapshot::PaneSnapshotRevisionRegistry;

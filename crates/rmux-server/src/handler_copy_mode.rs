@@ -525,6 +525,12 @@ fn copy_mode_context(
             target.pane_index(),
             OptionName::ModeKeys,
         )),
+        wrap_search: state.options.resolve_for_pane(
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+            OptionName::WrapSearch,
+        ) != Some("off"),
         word_separators,
         default_shell,
         working_directory,

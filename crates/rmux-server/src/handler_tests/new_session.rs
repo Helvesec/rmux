@@ -64,6 +64,94 @@ async fn new_session_uses_the_default_size_when_request_omits_geometry() {
 }
 
 #[tokio::test]
+async fn new_session_honors_global_base_index_and_default_size() {
+    let handler = RequestHandler::new();
+
+    for (option, value) in [
+        (OptionName::BaseIndex, "3"),
+        (OptionName::DefaultSize, "120x32"),
+    ] {
+        let response = handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Global,
+                option,
+                value: value.to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await;
+        assert!(matches!(response, Response::SetOption(_)));
+    }
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name("alpha"),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+
+    let state = handler.state.lock().await;
+    let session = state
+        .sessions
+        .session(&session_name("alpha"))
+        .expect("created session must exist");
+    let window = session
+        .window_at(3)
+        .expect("base-index must drive the first window index");
+    assert_eq!(session.active_window_index(), 3);
+    assert_eq!(
+        window.size(),
+        TerminalSize {
+            cols: 120,
+            rows: 32
+        }
+    );
+}
+
+#[tokio::test]
+async fn new_session_uses_default_command_when_request_omits_command() {
+    let handler = RequestHandler::new();
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::DefaultCommand,
+            value: "printf default-command".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)));
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name("alpha"),
+            detached: true,
+            size: Some(DEFAULT_SESSION_SIZE),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+
+    let state = handler.state.lock().await;
+    let session = state
+        .sessions
+        .session(&session_name("alpha"))
+        .expect("created session must exist");
+    let pane = session
+        .window_at(0)
+        .and_then(|window| window.pane(0))
+        .expect("initial pane must exist");
+    let lifecycle = state
+        .pane_lifecycle(pane.id())
+        .expect("initial pane lifecycle must be recorded");
+    assert_eq!(
+        lifecycle.command(),
+        Some(["printf default-command".to_owned()].as_slice())
+    );
+}
+
+#[tokio::test]
 async fn duplicate_new_session_returns_the_duplicate_session_error() {
     let handler = RequestHandler::new();
     let request = Request::NewSession(NewSessionRequest {

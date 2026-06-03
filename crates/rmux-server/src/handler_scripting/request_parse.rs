@@ -12,10 +12,11 @@ use super::client_parse::{
     parse_detach_client, parse_list_clients, parse_lock_client, parse_refresh_client,
     parse_server_access, parse_suspend_client, parse_switch_client,
 };
-use super::command_args::command_arguments_as_strings;
+use super::command_args::{command_arguments_as_strings, command_arguments_with_blocks_as_strings};
 use super::config_parse::{
-    parse_set_environment, parse_set_hook, parse_set_option, parse_show_environment,
-    parse_show_hooks, parse_show_options,
+    default_set_option_target, parse_set_environment, parse_set_hook, parse_set_option,
+    parse_set_option_invocation, parse_show_environment, parse_show_hooks, parse_show_options,
+    ParsedSetOptionCommand,
 };
 use super::display_parse::{
     parse_capture_pane, parse_clear_history, parse_display_message, parse_show_messages,
@@ -24,11 +25,14 @@ use super::key_parse::{
     parse_bind_key, parse_list_keys, parse_send_keys, parse_send_prefix, parse_unbind_key,
 };
 use super::layout_parse::{parse_display_panes, parse_resize_pane, parse_select_layout};
-use super::list_parse::{parse_list_panes, parse_list_sessions, parse_list_windows};
+use super::list_parse::{
+    parse_list_panes, parse_list_sessions, parse_list_windows, parse_queued_list_panes_all,
+};
 use super::mode_parse::{parse_clock_mode, parse_copy_mode};
 use super::pane_parse::{
     parse_break_pane, parse_join_pane, parse_move_pane, parse_pane_request, parse_pipe_pane,
-    parse_respawn_pane, parse_select_pane, parse_split_window, parse_swap_pane,
+    parse_queued_split_window, parse_respawn_pane, parse_select_pane, parse_split_window,
+    parse_swap_pane,
 };
 use super::prompt_parse::{
     parse_prompt_history_queue_command, parse_queued_command_prompt, parse_queued_confirm_before,
@@ -68,6 +72,12 @@ pub(super) fn parse_queue_invocation(
         return parse_queued_source_file(command, caller_cwd, sessions, find_context)
             .map(QueueInvocation::SourceFile);
     }
+    if command.name() == "list-panes" {
+        let arguments = command_arguments_as_strings(command.name(), command.arguments())?;
+        if let Some(command) = parse_queued_list_panes_all(CommandTokens::new(arguments))? {
+            return Ok(QueueInvocation::ListPanesAll(command));
+        }
+    }
     if command.name() == "command-prompt" {
         return parse_queued_command_prompt(command).map(QueueInvocation::CommandPrompt);
     }
@@ -79,12 +89,43 @@ pub(super) fn parse_queue_invocation(
     }
 
     let command_name = command.name().to_owned();
+    if matches!(command_name.as_str(), "bind-key" | "set-hook") {
+        let arguments = command_arguments_with_blocks_as_strings(command.arguments());
+        let arguments = if command_name == "set-hook" {
+            resolve_queue_target_arguments(&command_name, arguments, sessions, find_context)?
+        } else {
+            arguments
+        };
+        return parse_request_from_parts(
+            command_name,
+            arguments,
+            caller_cwd,
+            sessions,
+            find_context,
+        )
+        .map(QueueInvocation::Request);
+    }
     let arguments = resolve_queue_target_arguments(
         &command_name,
         command_arguments_as_strings(&command_name, command.arguments())?,
         sessions,
         find_context,
     )?;
+    if matches!(command_name.as_str(), "set-option" | "set-window-option") {
+        let force_window = command_name == "set-window-option";
+        return match parse_set_option_invocation(
+            CommandTokens::new(arguments),
+            force_window,
+            default_set_option_target(sessions, find_context),
+        )? {
+            ParsedSetOptionCommand::Request(request) => Ok(QueueInvocation::Request(*request)),
+            ParsedSetOptionCommand::NoOp => Ok(QueueInvocation::NoOp),
+        };
+    }
+    if command_name == "split-window" {
+        return parse_queued_split_window(CommandTokens::new(arguments), sessions, find_context)
+            .map(QueueInvocation::SplitWindow);
+    }
     if let Some(command) =
         RequestHandler::parse_overlay_queue_command(&command_name, arguments.clone())?
     {
@@ -114,8 +155,16 @@ pub(crate) fn parse_request_from_parts(
         "run-shell" => parse_run_shell(args),
         "if-shell" => parse_if_shell(args, caller_cwd),
         "wait-for" => parse_wait_for(args),
-        "set-option" => parse_set_option(args, false),
-        "set-window-option" => parse_set_option(args, true),
+        "set-option" => parse_set_option(
+            args,
+            false,
+            default_set_option_target(sessions, find_context),
+        ),
+        "set-window-option" => parse_set_option(
+            args,
+            true,
+            default_set_option_target(sessions, find_context),
+        ),
         "set-environment" => parse_set_environment(args),
         "set-hook" => parse_set_hook(args),
         "show-options" => parse_show_options(args, false),
@@ -153,7 +202,7 @@ pub(crate) fn parse_request_from_parts(
         "last-window" => parse_session_request(args, "last-window", sessions, find_context),
         "link-window" => parse_link_window(args),
         "move-window" => parse_move_window(args, sessions, find_context),
-        "swap-window" => parse_swap_window(args),
+        "swap-window" => parse_swap_window(args, sessions, find_context),
         "rotate-window" => parse_rotate_window(args, sessions, find_context),
         "resize-window" => parse_resize_window(args),
         "respawn-window" => parse_respawn_window(args, sessions, find_context),
@@ -161,8 +210,8 @@ pub(crate) fn parse_request_from_parts(
         "display-panes" => parse_display_panes(args, sessions, find_context),
         "last-pane" => parse_window_request(args, "last-pane", sessions, find_context),
         "swap-pane" => parse_swap_pane(args, sessions, find_context),
-        "join-pane" => parse_join_pane(args),
-        "move-pane" => parse_move_pane(args),
+        "join-pane" => parse_join_pane(args, sessions, find_context),
+        "move-pane" => parse_move_pane(args, sessions, find_context),
         "break-pane" => parse_break_pane(args, sessions, find_context),
         "pipe-pane" => parse_pipe_pane(args),
         "kill-pane" => parse_pane_request(args, "kill-pane", sessions, find_context),

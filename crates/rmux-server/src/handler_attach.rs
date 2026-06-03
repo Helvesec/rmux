@@ -1,34 +1,26 @@
+use std::borrow::Cow;
 use std::sync::atomic::Ordering;
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicU64};
-#[cfg(test)]
-use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(test)]
-use rmux_os::identity::UserIdentity;
 use rmux_proto::{
     AttachShellCommand, AttachedKeystroke, KeyDispatched, OptionName, PaneTarget, TerminalSize,
 };
-#[cfg(test)]
-use tokio::sync::mpsc;
 use tokio::time::sleep;
 
 use super::RequestHandler;
 use crate::handler_support::attached_client_required;
-use crate::mouse::ClientMouseState;
 use crate::outer_terminal::{CursorScope, OuterTerminal, OuterTerminalContext};
 use crate::pane_io::{AttachControl, AttachTarget, LivePaneRender, OverlayFrame};
 use crate::pane_terminals::{session_not_found, HandlerState};
 use crate::renderer;
-#[cfg(test)]
-use crate::server_access::current_owner_uid;
 use crate::terminal::TerminalProfile;
 
 #[path = "handler_attach/key_table.rs"]
 mod key_table;
 #[path = "handler_attach/refresh.rs"]
 mod refresh;
+#[path = "handler_attach/registration.rs"]
+mod registration;
 #[path = "handler_attach/state.rs"]
 mod state;
 
@@ -39,177 +31,6 @@ pub(super) use state::{
 };
 
 impl RequestHandler {
-    #[cfg(test)]
-    pub(crate) async fn register_attach(
-        &self,
-        requester_pid: u32,
-        session_name: rmux_proto::SessionName,
-        control_tx: mpsc::UnboundedSender<AttachControl>,
-    ) -> u64 {
-        self.register_attach_with_terminal_context(
-            requester_pid,
-            session_name,
-            control_tx,
-            OuterTerminalContext::default(),
-        )
-        .await
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn register_attach_with_terminal_context(
-        &self,
-        requester_pid: u32,
-        session_name: rmux_proto::SessionName,
-        control_tx: mpsc::UnboundedSender<AttachControl>,
-        terminal_context: OuterTerminalContext,
-    ) -> u64 {
-        self.register_attach_with_closing(
-            requester_pid,
-            session_name,
-            control_tx,
-            Arc::new(AtomicBool::new(false)),
-            terminal_context,
-            ClientFlags::default(),
-        )
-        .await
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn register_attach_with_closing(
-        &self,
-        requester_pid: u32,
-        session_name: rmux_proto::SessionName,
-        control_tx: mpsc::UnboundedSender<AttachControl>,
-        closing: Arc<AtomicBool>,
-        terminal_context: OuterTerminalContext,
-        flags: ClientFlags,
-    ) -> u64 {
-        self.register_attach_with_access(
-            requester_pid,
-            session_name,
-            AttachRegistration {
-                control_tx,
-                closing,
-                persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
-                terminal_context,
-                flags,
-                uid: current_owner_uid(),
-                user: UserIdentity::Uid(current_owner_uid()),
-                can_write: true,
-                client_size: None,
-            },
-        )
-        .await
-    }
-
-    pub(crate) async fn register_attach_with_access(
-        &self,
-        requester_pid: u32,
-        session_name: rmux_proto::SessionName,
-        registration: AttachRegistration,
-    ) -> u64 {
-        let mut replaced_key_table = None;
-        let attached_session_name = session_name.clone();
-        let client_size = if let Some(client_size) = registration.client_size {
-            client_size
-        } else {
-            let state = self.state.lock().await;
-            state
-                .sessions
-                .session(&attached_session_name)
-                .map(|session| session.window().size())
-                .unwrap_or(super::DEFAULT_SESSION_SIZE)
-        };
-        let mut active_attach = self.active_attach.lock().await;
-        let attach_id = active_attach.next_id;
-        active_attach.next_id += 1;
-        if let Some(mut previous) = active_attach.by_pid.insert(
-            requester_pid,
-            ActiveAttach {
-                id: attach_id,
-                session_name,
-                last_session: None,
-                flags: registration.flags,
-                pan_window: None,
-                pan_ox: 0,
-                pan_oy: 0,
-                control_tx: registration.control_tx,
-                uid: registration.uid,
-                user: registration.user,
-                can_write: registration.can_write,
-                suspended: false,
-                closing: registration.closing,
-                terminal_context: registration.terminal_context,
-                client_size,
-                client_pixels: None,
-                persistent_overlay_epoch: registration.persistent_overlay_epoch,
-                render_generation: 0,
-                overlay_generation: 0,
-                overlay_state_id: 0,
-                display_panes_state_id: 0,
-                key_table_name: None,
-                key_table_set_at: None,
-                repeat_deadline: None,
-                repeat_active: false,
-                last_key: None,
-                mouse: ClientMouseState {
-                    slider_mpos: -1,
-                    ..ClientMouseState::default()
-                },
-                prompt: None,
-                mode_tree_state_id: 0,
-                mode_tree: None,
-                mode_tree_frame: None,
-                overlay: None,
-                display_panes: None,
-            },
-        ) {
-            replaced_key_table = previous.key_table_name.clone();
-            terminate_overlay_job(previous.overlay.take());
-            previous.closing.store(true, Ordering::SeqCst);
-            let _ = previous.control_tx.send(AttachControl::Detach);
-        }
-        drop(active_attach);
-
-        if let Some(table_name) = replaced_key_table {
-            let mut state = self.state.lock().await;
-            state.key_bindings.unref_table(&table_name);
-        }
-
-        let mut state = self.state.lock().await;
-        if let Some(session) = state.sessions.session_mut(&attached_session_name) {
-            session.touch_attached();
-        }
-        drop(state);
-        self.refresh_clock_overlays_for_session(&attached_session_name)
-            .await;
-        attach_id
-    }
-
-    pub(crate) async fn finish_attach(&self, requester_pid: u32, attach_id: u64) {
-        let (removed_key_table, removed_overlay) = {
-            let mut active_attach = self.active_attach.lock().await;
-            if active_attach
-                .by_pid
-                .get(&requester_pid)
-                .is_some_and(|active| active.id == attach_id)
-            {
-                active_attach
-                    .by_pid
-                    .remove(&requester_pid)
-                    .map(|active| (active.key_table_name, active.overlay))
-                    .unwrap_or((None, None))
-            } else {
-                (None, None)
-            }
-        };
-        terminate_overlay_job(removed_overlay);
-        if let Some(table_name) = removed_key_table {
-            let mut state = self.state.lock().await;
-            state.key_bindings.unref_table(&table_name);
-        }
-    }
-
     pub(crate) async fn handle_attached_keystroke(
         &self,
         attach_pid: u32,
@@ -370,11 +191,6 @@ impl RequestHandler {
         Ok(previous_session_name)
     }
 
-    pub(super) async fn detach_attached_session(&self, session_name: &rmux_proto::SessionName) {
-        self.close_attached_session(session_name, || AttachControl::Detach)
-            .await;
-    }
-
     pub(super) async fn exit_attached_session(&self, session_name: &rmux_proto::SessionName) {
         self.close_attached_session(session_name, || AttachControl::Exited)
             .await;
@@ -463,6 +279,54 @@ impl RequestHandler {
 
         delivered
     }
+
+    pub(super) async fn send_attached_overlay_to_client(
+        &self,
+        attach_pid: u32,
+        overlay_frame: Vec<u8>,
+        clear_frame: Vec<u8>,
+        duration: Duration,
+    ) -> bool {
+        let handler = self.clone();
+        let mut active_attach = self.active_attach.lock().await;
+        let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
+            return false;
+        };
+        if active.suspended {
+            return false;
+        }
+
+        let session_name = active.session_name.clone();
+        active.overlay_generation = active.overlay_generation.saturating_add(1);
+        let render_generation = active.render_generation;
+        let overlay_generation = active.overlay_generation;
+        if active
+            .control_tx
+            .send(AttachControl::Overlay(OverlayFrame::new(
+                overlay_frame,
+                render_generation,
+                overlay_generation,
+            )))
+            .is_err()
+        {
+            active_attach.by_pid.remove(&attach_pid);
+            return false;
+        }
+
+        let control_tx = active.control_tx.clone();
+        tokio::spawn(async move {
+            sleep(duration).await;
+            let _ = control_tx.send(AttachControl::Overlay(OverlayFrame::new(
+                clear_frame,
+                render_generation,
+                overlay_generation,
+            )));
+            handler
+                .refresh_persistent_overlays_for_session(&session_name)
+                .await;
+        });
+        true
+    }
 }
 
 fn terminate_overlay_job(overlay: Option<super::overlay_support::ClientOverlayState>) {
@@ -486,6 +350,7 @@ pub(super) fn attach_target_for_session(
         None,
         None,
         terminal_context,
+        None,
     )
 }
 
@@ -496,11 +361,14 @@ fn attach_target_for_session_with_prompt(
     prompt: Option<&renderer::RenderedPrompt>,
     key_table: Option<&str>,
     terminal_context: &OuterTerminalContext,
+    render_size: Option<TerminalSize>,
 ) -> Result<AttachTarget, rmux_proto::RmuxError> {
-    let session = state
+    let canonical_session = state
         .sessions
         .session(session_name)
         .ok_or_else(|| session_not_found(session_name))?;
+    let session = sized_session(canonical_session, render_size);
+    let session = session.as_ref();
     let outer_terminal = OuterTerminal::resolve_for_session(
         &state.options,
         Some(session_name),
@@ -567,6 +435,9 @@ fn attach_target_for_session_with_prompt(
             }
         }
     }
+    render_frame.extend_from_slice(
+        renderer::render_pane_border_status_lines(session, &state.options, Some(state)).as_slice(),
+    );
     let live_pane =
         live_pane_render_for_target(state, session, &state.options, session_name, prompt);
     if prompt.is_none() {
@@ -611,6 +482,21 @@ fn attach_target_for_session_with_prompt(
         persistent_overlay_state_id: None,
         live_pane,
     })
+}
+
+pub(super) fn sized_session(
+    session: &rmux_core::Session,
+    size: Option<TerminalSize>,
+) -> Cow<'_, rmux_core::Session> {
+    let Some(size) = size.filter(|size| size.cols > 0 && size.rows > 0) else {
+        return Cow::Borrowed(session);
+    };
+    if size == session.window().size() {
+        return Cow::Borrowed(session);
+    }
+    let mut resized = session.clone();
+    resized.resize_terminal(size);
+    Cow::Owned(resized)
 }
 
 fn pane_passthrough_enabled(

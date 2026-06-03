@@ -21,6 +21,7 @@ impl RequestHandler {
                             .as_ref()
                             .map(ClientPromptState::rendered_prompt),
                         active.terminal_context.clone(),
+                        active.client_size,
                         active.mode_tree_state_id,
                         active.mode_tree.is_some(),
                         active.key_table_name.clone(),
@@ -57,8 +58,15 @@ impl RequestHandler {
         let targets = {
             let state = self.state.lock().await;
             let mut targets = Vec::with_capacity(prompts.len());
-            for (pid, prompt, terminal_context, mode_tree_state_id, mode_tree_active, key_table) in
-                &prompts
+            for (
+                pid,
+                prompt,
+                terminal_context,
+                client_size,
+                mode_tree_state_id,
+                mode_tree_active,
+                key_table,
+            ) in &prompts
             {
                 let Ok(mut target) = super::attach_target_for_session_with_prompt(
                     &state,
@@ -67,6 +75,7 @@ impl RequestHandler {
                     prompt.as_ref(),
                     key_table.as_deref(),
                     terminal_context,
+                    Some(*client_size),
                 ) else {
                     return;
                 };
@@ -126,14 +135,21 @@ impl RequestHandler {
                             .as_ref()
                             .map(ClientPromptState::rendered_prompt),
                         active.terminal_context.clone(),
+                        active.client_size,
                         active.mode_tree_state_id,
                         active.mode_tree.is_some(),
                         active.key_table_name.clone(),
                     )
                 })
         };
-        let Some((prompt, terminal_context, mode_tree_state_id, mode_tree_active, key_table)) =
-            prompt
+        let Some((
+            prompt,
+            terminal_context,
+            client_size,
+            mode_tree_state_id,
+            mode_tree_active,
+            key_table,
+        )) = prompt
         else {
             return;
         };
@@ -146,6 +162,7 @@ impl RequestHandler {
                 prompt.as_ref(),
                 key_table.as_deref(),
                 &terminal_context,
+                Some(client_size),
             )
             .ok()
         };
@@ -195,14 +212,21 @@ impl RequestHandler {
                             .as_ref()
                             .map(ClientPromptState::rendered_prompt),
                         active.terminal_context.clone(),
+                        active.client_size,
                         active.mode_tree_state_id,
                         active.mode_tree.is_some(),
                         active.key_table_name.clone(),
                     )
                 })
         };
-        let Some((prompt, terminal_context, mode_tree_state_id, mode_tree_active, key_table)) =
-            prompt
+        let Some((
+            prompt,
+            terminal_context,
+            client_size,
+            mode_tree_state_id,
+            mode_tree_active,
+            key_table,
+        )) = prompt
         else {
             return;
         };
@@ -215,6 +239,7 @@ impl RequestHandler {
                 prompt.as_ref(),
                 key_table.as_deref(),
                 &terminal_context,
+                Some(client_size),
             )
             .ok()
         };

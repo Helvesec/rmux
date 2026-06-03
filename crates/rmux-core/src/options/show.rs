@@ -293,6 +293,12 @@ impl OptionStore {
         if mode != ShowOptionsMode::ResolvedWithInheritanceMarkers {
             return name.to_owned();
         }
+        if matches!(
+            scope,
+            ShowScope::Server | ShowScope::SessionGlobal | ShowScope::WindowGlobal
+        ) {
+            return name.to_owned();
+        }
         if self
             .node_for_show_scope(scope)
             .is_some_and(|node| node.contains(query.canonical_name(), index))

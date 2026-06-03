@@ -7,6 +7,8 @@ use rmux_core::{
 };
 use rmux_proto::{CommandOutput, ErrorResponse, Request, Response, RmuxError, Target};
 
+use super::list_parse::ParsedListPanesAllCommand;
+use super::pane_parse::ParsedSplitWindowCommand;
 use super::prompt_parse::{
     ParsedCommandPromptCommand, ParsedConfirmBeforeCommand, ParsedPromptHistoryCommand,
 };
@@ -97,10 +99,13 @@ pub(super) enum QueueMode {
 #[derive(Debug, Clone)]
 pub(super) enum QueueInvocation {
     Request(Request),
+    NoOp,
     StartServer,
     NewWindow(ParsedNewWindowCommand),
     IfShell(ParsedIfShellCommand),
     SourceFile(ParsedSourceFileCommand),
+    ListPanesAll(ParsedListPanesAllCommand),
+    SplitWindow(ParsedSplitWindowCommand),
     CommandPrompt(ParsedCommandPromptCommand),
     ConfirmBefore(ParsedConfirmBeforeCommand),
     ModeTree(super::super::mode_tree_support::ParsedModeTreeCommand),

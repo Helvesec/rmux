@@ -68,6 +68,50 @@ impl HandlerState {
         None
     }
 
+    pub(crate) fn resolve_pane_event_runtime_session(
+        &self,
+        event_session_name: &SessionName,
+        pane_id: PaneId,
+        generation: Option<u64>,
+    ) -> Option<SessionName> {
+        if self.pane_output_generation_matches(event_session_name, pane_id, generation)
+            && self
+                .pane_target_for_runtime_pane(event_session_name, pane_id)
+                .is_some()
+        {
+            return Some(event_session_name.clone());
+        }
+
+        self.runtime_session_candidates()
+            .into_iter()
+            .filter(|candidate| candidate != event_session_name)
+            .find(|candidate| {
+                self.pane_output_generation_matches(candidate, pane_id, generation)
+                    && self
+                        .pane_target_for_runtime_pane(candidate, pane_id)
+                        .is_some()
+            })
+    }
+
+    fn runtime_session_candidates(&self) -> Vec<SessionName> {
+        let mut candidates = self
+            .sessions
+            .iter()
+            .flat_map(|(session_name, session)| {
+                session
+                    .windows()
+                    .keys()
+                    .map(|window_index| {
+                        self.runtime_session_name_for_window(session_name, *window_index)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        candidates.dedup();
+        candidates
+    }
+
     pub(crate) fn contains_session_terminals(&self, session_name: &SessionName) -> bool {
         self.terminals
             .contains_session(&self.runtime_session_name(session_name))

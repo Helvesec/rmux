@@ -340,34 +340,24 @@ pub(super) fn resolve_current_pane_target(
     connection: &mut Connection,
     command_name: &str,
 ) -> Result<rmux_proto::PaneTarget, ExitFailure> {
-    let session_name = resolve_session_listing_target(connection, None, command_name)?;
-    let response = connection
-        .list_panes(
-            session_name.clone(),
-            Some("#{window_index}:#{pane_index}:#{window_active}:#{pane_active}".to_owned()),
-        )
-        .map_err(ExitFailure::from_client)?;
-    let output = expect_command_output(&response, "list-panes")?;
-    let stdout = String::from_utf8_lossy(output.stdout());
-    let active_line = stdout
-        .lines()
-        .find(|line| {
-            let mut fields = line.rsplit(':');
-            fields.next() == Some("1") && fields.next() == Some("1")
-        })
-        .ok_or_else(|| ExitFailure::new(1, "select-pane could not resolve the active pane"))?;
-    let mut parts = active_line.splitn(4, ':');
-    let window_index = parts
-        .next()
-        .and_then(|value| value.parse::<u32>().ok())
-        .ok_or_else(|| ExitFailure::new(1, "select-pane received an invalid window index"))?;
-    let pane_index = parts
-        .next()
-        .and_then(|value| value.parse::<u32>().ok())
-        .ok_or_else(|| ExitFailure::new(1, "select-pane received an invalid pane index"))?;
-    Ok(rmux_proto::PaneTarget::with_window(
-        session_name,
-        window_index,
-        pane_index,
-    ))
+    match connection
+        .resolve_target(None, ResolveTargetType::Pane, false, false)
+        .map_err(ExitFailure::from_client)?
+    {
+        Response::ResolveTarget(response) => match response.target {
+            rmux_proto::Target::Pane(target) => Ok(target),
+            other => Err(ExitFailure::new(
+                1,
+                format!(
+                    "resolve-target produced {} where a pane target was required",
+                    response_name_for_target(&other)
+                ),
+            )),
+        },
+        Response::Error(ErrorResponse { error }) => Err(ExitFailure::new(
+            1,
+            target_resolution_error_message(&error, ResolveTargetType::Pane, command_name),
+        )),
+        other => Err(unexpected_response("resolve-target", &other)),
+    }
 }

@@ -15,11 +15,12 @@ use rmux_proto::{
 use crate::pane_io::{PaneAlertCallback, PaneExitCallback, PaneOutputSender};
 #[cfg(unix)]
 use crate::pane_reader_runtime::PaneReaderRuntime;
-use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::pane_transcript::SharedPaneTranscript;
 
 #[path = "pane_terminals/lifecycle_state.rs"]
 mod lifecycle_state;
+#[path = "pane_terminals/marked_pane.rs"]
+mod marked_pane;
 #[path = "pane_terminals/pane_access.rs"]
 mod pane_access;
 #[path = "pane_terminals/pane_lifecycle.rs"]
@@ -28,6 +29,9 @@ mod pane_lifecycle;
 mod pane_outputs;
 #[path = "pane_pipe.rs"]
 mod pane_pipe;
+#[cfg(feature = "web")]
+#[path = "pane_terminals/pane_scrollback.rs"]
+mod pane_scrollback;
 #[path = "pane_terminal_store.rs"]
 mod pane_terminal_store;
 #[path = "pane_terminals/pane_transcripts.rs"]
@@ -42,6 +46,8 @@ mod rollback;
 mod session_mutation;
 #[path = "pane_terminals/session_runtime.rs"]
 mod session_runtime;
+#[path = "pane_terminals/window_indices.rs"]
+mod window_indices;
 #[path = "pane_terminals/window_links.rs"]
 mod window_links;
 #[path = "pane_terminals_window.rs"]
@@ -51,6 +57,7 @@ mod window_support;
 pub(crate) use lifecycle_state::PaneLifecycleProcessState;
 use lifecycle_state::PaneLifecycleSpawn;
 pub(crate) use lifecycle_state::PaneLifecycleState;
+use marked_pane::MarkedPane;
 pub(crate) use pane_outputs::PaneExitMetadata;
 use pane_outputs::{AttachedSubmittedLine, PaneOutputSpawn, RemovedPaneOutputs};
 use pane_pipe::PanePipeStore;
@@ -110,7 +117,7 @@ pub(crate) struct HandlerState {
     #[cfg(test)]
     pane_input_captures: StdMutex<HashMap<String, Vec<u8>>>,
     dead_panes: HashMap<SessionName, HashMap<PaneId, PaneExitMetadata>>,
-    marked_pane: Option<PaneId>,
+    marked_pane: Option<MarkedPane>,
     pipes: PanePipeStore,
     auto_named_windows: HashSet<(SessionName, u32)>,
     window_link_groups: HashMap<u64, WindowLinkGroup>,
@@ -251,76 +258,6 @@ impl HandlerState {
             .unwrap_or(1000)
     }
 
-    pub(crate) fn marked_pane_target(&self) -> Option<PaneTarget> {
-        let pane_id = self.marked_pane?;
-        self.sessions.iter().find_map(|(session_name, session)| {
-            let window_index = session.window_index_for_pane_id(pane_id)?;
-            let pane_index = session
-                .window_at(window_index)?
-                .panes()
-                .iter()
-                .find(|pane| pane.id() == pane_id)
-                .map(|pane| pane.index())?;
-            Some(PaneTarget::with_window(
-                session_name.clone(),
-                window_index,
-                pane_index,
-            ))
-        })
-    }
-
-    pub(crate) fn pane_is_marked(&self, target: &PaneTarget) -> bool {
-        pane_id_for_target(
-            &self.sessions,
-            target.session_name(),
-            target.window_index(),
-            target.pane_index(),
-        )
-        .ok()
-            == self.marked_pane
-    }
-
-    pub(crate) fn session_has_marked_pane(&self, session_name: &SessionName) -> bool {
-        self.marked_pane_target()
-            .is_some_and(|target| target.session_name() == session_name)
-    }
-
-    pub(crate) fn window_has_marked_pane(
-        &self,
-        session_name: &SessionName,
-        window_index: u32,
-    ) -> bool {
-        self.marked_pane_target().is_some_and(|target| {
-            target.session_name() == session_name && target.window_index() == window_index
-        })
-    }
-
-    pub(crate) fn clear_marked_pane(&mut self) {
-        self.marked_pane = None;
-    }
-
-    pub(crate) fn toggle_marked_pane(&mut self, target: &PaneTarget) -> Result<bool, RmuxError> {
-        let pane_id = pane_id_for_target(
-            &self.sessions,
-            target.session_name(),
-            target.window_index(),
-            target.pane_index(),
-        )?;
-        if self.marked_pane == Some(pane_id) {
-            self.marked_pane = None;
-            Ok(false)
-        } else {
-            self.marked_pane = Some(pane_id);
-            Ok(true)
-        }
-    }
-
-    fn clear_marked_pane_if_id(&mut self, pane_id: PaneId) {
-        if self.marked_pane == Some(pane_id) {
-            self.marked_pane = None;
-        }
-    }
-
     fn apply_automatic_window_name(
         &mut self,
         session_name: &SessionName,
@@ -330,12 +267,21 @@ impl HandlerState {
         let Some(window_name) = automatic_window_name else {
             return Ok(());
         };
+        let tracked = self.tracks_auto_named_window(session_name, window_index);
         let session = self
             .sessions
-            .session_mut(session_name)
+            .session(session_name)
             .ok_or_else(|| session_not_found(session_name))?;
         let should_update = match session.window_at(window_index) {
-            Some(window) => window.automatic_rename() && window.name().is_none(),
+            Some(window) => {
+                crate::automatic_rename::window_allows_automatic_rename(
+                    &self.options,
+                    session_name,
+                    window_index,
+                    window,
+                    tracked,
+                ) && window.name().is_none()
+            }
             None => {
                 return Err(RmuxError::invalid_target(
                     format!("{session_name}:{window_index}"),
@@ -346,7 +292,10 @@ impl HandlerState {
         if !should_update {
             return Ok(());
         }
-        session.rename_window(window_index, window_name)?;
+        self.sessions
+            .session_mut(session_name)
+            .expect("existing session must accept automatic rename update")
+            .rename_window(window_index, window_name)?;
         self.mark_auto_named_window(session_name, window_index);
         self.synchronize_linked_window_from_slot(session_name, window_index)?;
         self.synchronize_session_group_from(session_name)?;
@@ -515,5 +464,51 @@ mod tests {
         assert!(state.transcripts.contains_key(&alpha));
         assert!(state.pane_outputs.contains_key(&alpha));
         assert!(state.pane_outputs.contains_key(&gamma));
+    }
+
+    #[tokio::test]
+    async fn rename_session_migrates_runtime_output_generations() {
+        let mut state = HandlerState::default();
+        let alpha = session_name("alpha");
+        let beta = session_name("beta");
+
+        state
+            .sessions
+            .create_session(alpha.clone(), TerminalSize { cols: 80, rows: 24 })
+            .expect("session create succeeds");
+        state
+            .insert_initial_session_terminal(
+                &alpha,
+                InitialPaneSpawnOptions {
+                    socket_path: std::path::Path::new("/tmp/rmux-test.sock"),
+                    spawn_environment: None,
+                    environment_overrides: None,
+                    command: None,
+                    pane_alert_callback: None,
+                    pane_exit_callback: None,
+                },
+            )
+            .expect("initial terminals exist");
+
+        let pane_id = state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.active_pane())
+            .map(|pane| pane.id())
+            .expect("initial pane exists");
+        let generation = state.pane_output_generation(&alpha, pane_id);
+        assert!(generation > 0);
+
+        state
+            .rename_session(&alpha, &beta)
+            .expect("rename succeeds");
+
+        assert!(!state.pane_output_generations.contains_key(&alpha));
+        assert_eq!(
+            state.pane_output_generation(&beta, pane_id),
+            generation,
+            "rename must preserve pane output generations for stale reader callbacks"
+        );
+        state.shutdown_terminals_for_test();
     }
 }

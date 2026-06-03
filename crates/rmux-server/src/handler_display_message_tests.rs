@@ -1,14 +1,20 @@
 use super::RequestHandler;
 use crate::pane_io::AttachControl;
 use rmux_proto::{
-    DisplayMessageRequest, NewSessionRequest, NewWindowRequest, OptionName, OptionScopeSelector,
-    PaneTarget, Request, Response, ScopeSelector, SelectPaneMarkRequest, SessionName,
-    SetOptionMode, SplitDirection, SplitWindowRequest, SplitWindowTarget, Target, TerminalSize,
+    DisplayMessageExtRequest, DisplayMessageRequest, NewSessionRequest, NewWindowRequest,
+    OptionName, OptionScopeSelector, PaneTarget, Request, Response, ScopeSelector,
+    SelectPaneMarkRequest, SelectWindowRequest, SessionName, SetOptionMode, SetOptionRequest,
+    SplitDirection, SplitWindowRequest, SplitWindowTarget, Target, TerminalSize, WindowTarget,
 };
 #[cfg(windows)]
 use std::path::Path;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
+
+#[path = "handler_display_message_tests/pane_base_index.rs"]
+mod pane_base_index;
+#[path = "handler_display_message_tests/synchronize_panes.rs"]
+mod synchronize_panes;
 
 fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
@@ -21,7 +27,7 @@ fn default_shell_window_name() -> String {
 
 #[cfg(windows)]
 fn default_shell_window_name() -> String {
-    if windows_command_exists("pwsh.exe") {
+    if windows_command_path("pwsh.exe").is_some() {
         return "pwsh.exe".to_owned();
     }
     if windows_powershell_path().is_some_and(|path| path.is_file()) {
@@ -35,21 +41,32 @@ fn default_shell_window_name() -> String {
 }
 
 #[cfg(windows)]
-fn windows_command_exists(command: &str) -> bool {
-    let Some(path_value) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path_value).any(|directory| {
+fn windows_command_path(command: &str) -> Option<std::path::PathBuf> {
+    let path_value = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_value).find_map(|directory| {
         let candidate = directory.join(command);
-        candidate.is_file() && windows_shell_candidate_is_usable(&candidate)
+        if candidate.is_file() && windows_shell_candidate_is_usable(&candidate) {
+            Some(candidate)
+        } else {
+            None
+        }
     })
 }
 
 #[cfg(windows)]
 fn windows_shell_candidate_is_usable(path: &Path) -> bool {
-    !path
+    !windows_shell_candidate_is_windowsapps_alias(path)
+}
+
+#[cfg(windows)]
+fn windows_shell_candidate_is_windowsapps_alias(path: &Path) -> bool {
+    let components = path
         .components()
-        .any(|component| component.as_os_str().eq_ignore_ascii_case("WindowsApps"))
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>();
+    components.windows(2).any(|window| {
+        window[0].eq_ignore_ascii_case("Microsoft") && window[1].eq_ignore_ascii_case("WindowsApps")
+    })
 }
 
 #[cfg(windows)]
@@ -158,6 +175,78 @@ async fn display_message_last_window_index_is_highest_session_window_index() {
         .command_output()
         .expect("display-message -p returns output");
     assert_eq!(output.stdout(), b"0:1\n");
+}
+
+#[tokio::test]
+async fn display_message_reports_session_and_window_stack_order() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    for index in 1..=2 {
+        assert!(matches!(
+            handler
+                .handle(Request::NewWindow(NewWindowRequest {
+                    target: alpha.clone(),
+                    name: Some(format!("w{index}")),
+                    detached: true,
+                    start_directory: None,
+                    environment: None,
+                    command: None,
+                    target_window_index: Some(index),
+                    insert_at_target: false,
+                }))
+                .await,
+            Response::NewWindow(_)
+        ));
+    }
+
+    for index in [0, 2] {
+        assert!(matches!(
+            handler
+                .handle(Request::SelectWindow(SelectWindowRequest {
+                    target: WindowTarget::with_window(alpha.clone(), index),
+                }))
+                .await,
+            Response::SelectWindow(_)
+        ));
+    }
+
+    for (window_index, expected_index) in [(2, "0"), (0, "1"), (1, "2")] {
+        let response = handler
+            .handle(Request::DisplayMessage(DisplayMessageRequest {
+                target: Some(Target::Pane(PaneTarget::with_window(
+                    alpha.clone(),
+                    window_index,
+                    0,
+                ))),
+                print: true,
+                message: Some("#{session_stack}:#{window_stack_index}".to_owned()),
+            }))
+            .await;
+
+        let Response::DisplayMessage(response) = response else {
+            panic!("expected display-message response");
+        };
+        let output = response
+            .command_output()
+            .expect("display-message -p returns output");
+        assert_eq!(
+            output.stdout(),
+            format!("2,0,1:{expected_index}\n").as_bytes()
+        );
+    }
 }
 
 #[tokio::test]
@@ -698,6 +787,136 @@ async fn bare_display_message_uses_status_overlay_for_attached_session() {
     let frame = String::from_utf8(overlay.frame).expect("overlay is utf-8");
     assert!(frame.contains("hello alpha"));
     assert!(frame.contains("\u{1b}[4;1H"));
+}
+
+#[tokio::test]
+async fn display_message_target_client_delivers_only_to_that_client() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+    let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 20, rows: 4 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    handler.register_attach(42, alpha.clone(), first_tx).await;
+    handler.register_attach(43, alpha, second_tx).await;
+
+    let response = handler
+        .handle(Request::DisplayMessageExt(DisplayMessageExtRequest {
+            target: None,
+            print: false,
+            message: Some("for second".to_owned()),
+            target_client: Some("43".to_owned()),
+        }))
+        .await;
+
+    assert_eq!(
+        response,
+        Response::DisplayMessage(rmux_proto::DisplayMessageResponse::no_output())
+    );
+    assert!(first_rx.try_recv().is_err());
+    let overlay = second_rx.try_recv().expect("targeted overlay control");
+    let AttachControl::Overlay(overlay) = overlay else {
+        panic!("expected display-message overlay");
+    };
+    let frame = String::from_utf8(overlay.frame).expect("overlay is utf-8");
+    assert!(frame.contains("for second"));
+}
+
+#[tokio::test]
+async fn display_message_missing_target_client_is_noop_unless_printing() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha,
+                detached: true,
+                size: Some(TerminalSize { cols: 20, rows: 4 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let response = handler
+        .handle(Request::DisplayMessageExt(DisplayMessageExtRequest {
+            target: None,
+            print: false,
+            message: Some("hidden".to_owned()),
+            target_client: Some("999999".to_owned()),
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::DisplayMessage(rmux_proto::DisplayMessageResponse::no_output())
+    );
+
+    let response = handler
+        .handle(Request::DisplayMessageExt(DisplayMessageExtRequest {
+            target: None,
+            print: true,
+            message: Some("hello".to_owned()),
+            target_client: Some("999999".to_owned()),
+        }))
+        .await;
+    assert_eq!(
+        response.command_output().map(|output| output.stdout()),
+        Some(b"hello\n".as_slice())
+    );
+}
+
+#[tokio::test]
+async fn display_message_target_client_uses_client_session_for_overlay_delivery() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+
+    for session_name in [alpha.clone(), beta.clone()] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name,
+                    detached: true,
+                    size: Some(TerminalSize { cols: 20, rows: 4 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
+    handler.register_attach(42, alpha, control_tx).await;
+
+    let response = handler
+        .handle(Request::DisplayMessageExt(DisplayMessageExtRequest {
+            target: Some(Target::Session(beta)),
+            print: false,
+            message: Some("format #{session_name}".to_owned()),
+            target_client: Some("42".to_owned()),
+        }))
+        .await;
+
+    assert_eq!(
+        response,
+        Response::DisplayMessage(rmux_proto::DisplayMessageResponse::no_output())
+    );
+    let overlay = control_rx.try_recv().expect("targeted overlay control");
+    let AttachControl::Overlay(overlay) = overlay else {
+        panic!("expected display-message overlay");
+    };
+    let frame = String::from_utf8(overlay.frame).expect("overlay is utf-8");
+    assert!(frame.contains("format beta"));
 }
 
 #[tokio::test]

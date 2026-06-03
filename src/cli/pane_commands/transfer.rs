@@ -6,7 +6,7 @@ use super::super::{
     resolve_pane_target_or_current, resolve_pane_target_spec, resolve_window_target_spec,
     run_command_resolved, ExitFailure,
 };
-use crate::cli_args::{BreakPaneArgs, JoinPaneArgs, SwapPaneArgs};
+use crate::cli_args::{parse_target_spec, BreakPaneArgs, JoinPaneArgs, SwapPaneArgs, TargetSpec};
 
 pub(in crate::cli) fn run_swap_pane(
     args: SwapPaneArgs,
@@ -36,11 +36,8 @@ pub(in crate::cli) fn run_swap_pane(
         });
     }
 
-    let source = args.source.ok_or_else(|| {
-        ExitFailure::new(1, "swap-pane requires -s source-pane unless -D/-U is used")
-    })?;
     run_command_resolved(socket_path, "swap-pane", move |connection| {
-        let source = resolve_pane_target_spec(connection, &source)?;
+        let source = resolve_pane_source_or_marked(connection, args.source.as_ref())?;
         let target = resolve_pane_target_or_current(connection, args.target.as_ref(), "swap-pane")?;
         connection
             .swap_pane(source, target, args.detached, args.preserve_zoom)
@@ -55,7 +52,7 @@ pub(in crate::cli) fn run_join_pane(
     let direction = args.direction();
     let size = parse_pane_split_size(args.size_spec().as_deref())?;
     run_command_resolved(socket_path, "join-pane", move |connection| {
-        let source = resolve_pane_target_spec(connection, &args.source)?;
+        let source = resolve_pane_source_or_marked(connection, args.source.as_ref())?;
         let target = resolve_pane_target_or_current(connection, args.target.as_ref(), "join-pane")?;
         connection
             .join_pane(JoinPaneRequest {
@@ -105,7 +102,7 @@ pub(in crate::cli) fn run_move_pane(
     let direction = args.direction();
     let size = parse_pane_split_size(args.size_spec().as_deref())?;
     run_command_resolved(socket_path, "move-pane", move |connection| {
-        let source = resolve_pane_target_spec(connection, &args.source)?;
+        let source = resolve_pane_source_or_marked(connection, args.source.as_ref())?;
         let target = resolve_pane_target_or_current(connection, args.target.as_ref(), "move-pane")?;
         connection
             .move_pane(MovePaneRequest {
@@ -119,6 +116,21 @@ pub(in crate::cli) fn run_move_pane(
             })
             .map_err(ExitFailure::from_client)
     })
+}
+
+fn resolve_pane_source_or_marked(
+    connection: &mut rmux_client::Connection,
+    source: Option<&TargetSpec>,
+) -> Result<rmux_proto::PaneTarget, ExitFailure> {
+    let marked;
+    let source = match source {
+        Some(source) => source,
+        None => {
+            marked = parse_target_spec("{marked}").map_err(|error| ExitFailure::new(1, error))?;
+            &marked
+        }
+    };
+    resolve_pane_target_spec(connection, source)
 }
 
 fn parse_pane_split_size(value: Option<&str>) -> Result<Option<PaneSplitSize>, ExitFailure> {

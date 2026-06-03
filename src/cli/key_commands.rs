@@ -7,7 +7,8 @@ use rmux_core::{
     KeyBindingStore, KEYC_NONE, KEYC_UNKNOWN, LIST_KEYS_TEMPLATE,
 };
 use rmux_proto::{
-    BindKeyRequest, CommandOutput, ListKeysRequest, SendKeysExtRequest, UnbindKeyRequest,
+    BindKeyRequest, CommandOutput, ListKeysRequest, SendKeysExt2Request, SendKeysExtRequest,
+    UnbindKeyRequest,
 };
 
 use super::{
@@ -36,8 +37,22 @@ pub(super) fn run_send_keys(args: SendKeysArgs, socket_path: &Path) -> Result<i3
             .as_ref()
             .map(|target| resolve_pane_target_spec(connection, target))
             .transpose()?;
-        connection
-            .send_keys_extended(SendKeysExtRequest {
+        let response = if let Some(target_client) = args.client_target {
+            connection.send_keys_extended_target_client(SendKeysExt2Request {
+                target,
+                keys: args.keys,
+                expand_formats: args.expand_formats,
+                hex: args.hex,
+                literal: args.literal,
+                dispatch_key_table: args.key_table,
+                copy_mode_command: args.copy_mode,
+                forward_mouse_event: args.mouse,
+                reset_terminal: args.reset_terminal,
+                repeat_count: args.repeat_count,
+                target_client: Some(target_client),
+            })
+        } else {
+            connection.send_keys_extended(SendKeysExtRequest {
                 target,
                 keys: args.keys,
                 expand_formats: args.expand_formats,
@@ -49,12 +64,14 @@ pub(super) fn run_send_keys(args: SendKeysArgs, socket_path: &Path) -> Result<i3
                 reset_terminal: args.reset_terminal,
                 repeat_count: args.repeat_count,
             })
-            .map_err(ExitFailure::from_client)
+        };
+        response.map_err(ExitFailure::from_client)
     })
 }
 
 fn send_keys_uses_legacy_path(args: &SendKeysArgs) -> bool {
     args.target.is_some()
+        && args.client_target.is_none()
         && !args.expand_formats
         && !args.hex
         && !args.literal

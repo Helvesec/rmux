@@ -104,6 +104,10 @@ impl PaneTranscript {
         }
     }
 
+    pub(crate) fn set_input_buffer_limit(&mut self, limit: usize) {
+        self.terminal.set_input_buffer_limit(limit);
+    }
+
     pub(crate) fn capture_main(
         &self,
         range: ScreenCaptureRange,

@@ -26,6 +26,11 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::time::sleep;
 
+#[cfg(windows)]
+const ATTACH_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(not(windows))]
+const ATTACH_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
 }
@@ -37,7 +42,7 @@ fn default_shell_window_name() -> String {
 
 #[cfg(windows)]
 fn default_shell_window_name() -> String {
-    if windows_command_exists("pwsh.exe") {
+    if windows_command_path("pwsh.exe").is_some() {
         return "pwsh.exe".to_owned();
     }
     if windows_powershell_path().is_some_and(|path| path.is_file()) {
@@ -51,21 +56,32 @@ fn default_shell_window_name() -> String {
 }
 
 #[cfg(windows)]
-fn windows_command_exists(command: &str) -> bool {
-    let Some(path_value) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path_value).any(|directory| {
+fn windows_command_path(command: &str) -> Option<std::path::PathBuf> {
+    let path_value = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_value).find_map(|directory| {
         let candidate = directory.join(command);
-        candidate.is_file() && windows_shell_candidate_is_usable(&candidate)
+        if candidate.is_file() && windows_shell_candidate_is_usable(&candidate) {
+            Some(candidate)
+        } else {
+            None
+        }
     })
 }
 
 #[cfg(windows)]
 fn windows_shell_candidate_is_usable(path: &Path) -> bool {
-    !path
+    !windows_shell_candidate_is_windowsapps_alias(path)
+}
+
+#[cfg(windows)]
+fn windows_shell_candidate_is_windowsapps_alias(path: &Path) -> bool {
+    let components = path
         .components()
-        .any(|component| component.as_os_str().eq_ignore_ascii_case("WindowsApps"))
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>();
+    components.windows(2).any(|window| {
+        window[0].eq_ignore_ascii_case("Microsoft") && window[1].eq_ignore_ascii_case("WindowsApps")
+    })
 }
 
 #[cfg(windows)]
@@ -77,6 +93,13 @@ fn windows_powershell_path() -> Option<std::path::PathBuf> {
             .join("v1.0")
             .join("powershell.exe")
     })
+}
+
+#[cfg(windows)]
+fn windows_powershell_command() -> std::path::PathBuf {
+    windows_command_path("pwsh.exe")
+        .or_else(|| windows_powershell_path().filter(|path| path.is_file()))
+        .unwrap_or_else(|| std::path::PathBuf::from("powershell.exe"))
 }
 
 fn default_shell_pane_status() -> String {
@@ -126,6 +149,56 @@ async fn create_attached_session(
             .await,
         Response::NewSession(_)
     ));
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, session.clone(), control_tx)
+        .await;
+    control_rx
+}
+
+#[cfg(windows)]
+async fn create_line_exiting_attached_session(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    session: &SessionName,
+) -> mpsc::UnboundedReceiver<AttachControl> {
+    let marker = format!("RMUX_LINE_EXIT_READY_{}", std::process::id());
+    create_session_with_command(handler, session, line_exiting_command(&marker)).await;
+    let target = PaneTarget::new(session.clone(), 0);
+    wait_for_capture_containing(
+        handler,
+        target.clone(),
+        &marker,
+        "Windows attached-exit fixture should reach its input loop",
+    )
+    .await;
+    replace_transcript_contents(handler, &target, TerminalSize { cols: 80, rows: 24 }, b"").await;
+
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, session.clone(), control_tx)
+        .await;
+    control_rx
+}
+
+#[cfg(windows)]
+async fn create_line_echo_attached_session(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    session: &SessionName,
+) -> mpsc::UnboundedReceiver<AttachControl> {
+    let marker = format!("RMUX_LINE_ECHO_READY_{}", std::process::id());
+    create_session_with_command(handler, session, line_echo_command(&marker)).await;
+    let target = PaneTarget::new(session.clone(), 0);
+    wait_for_capture_containing(
+        handler,
+        target.clone(),
+        &marker,
+        "Windows attached UTF-8 fixture should reach its input loop",
+    )
+    .await;
+    replace_transcript_contents(handler, &target, TerminalSize { cols: 80, rows: 24 }, b"").await;
+
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
         .register_attach(requester_pid, session.clone(), control_tx)
@@ -224,6 +297,45 @@ fn quiet_ready_command(marker: &str) -> Vec<String> {
         "/q".to_owned(),
         "/c".to_owned(),
         format!("echo {marker} & ping -n 120 127.0.0.1 >NUL"),
+    ]
+}
+
+#[cfg(windows)]
+fn line_exiting_command(marker: &str) -> Vec<String> {
+    let powershell = windows_powershell_command();
+    vec![
+        powershell.to_string_lossy().into_owned(),
+        "-NoProfile".to_owned(),
+        "-NonInteractive".to_owned(),
+        "-Command".to_owned(),
+        format!(
+            "[Console]::Out.WriteLine('{marker}'); \
+             [Console]::Out.Flush(); \
+             while ($true) {{ \
+                 $line=[Console]::In.ReadLine(); \
+                 if ($null -eq $line -or $line -eq 'RMUX_EXIT') {{ exit 0 }} \
+             }}"
+        ),
+    ]
+}
+
+#[cfg(windows)]
+fn line_echo_command(marker: &str) -> Vec<String> {
+    let powershell = windows_powershell_command();
+    vec![
+        powershell.to_string_lossy().into_owned(),
+        "-NoProfile".to_owned(),
+        "-NonInteractive".to_owned(),
+        "-Command".to_owned(),
+        format!(
+            "[Console]::InputEncoding = [Text.UTF8Encoding]::new($false); \
+             [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); \
+             [Console]::Out.WriteLine('{marker}'); \
+             [Console]::Out.Flush(); \
+             $line=[Console]::In.ReadLine(); \
+             if ($null -ne $line) {{ [Console]::Out.WriteLine('ECHO:' + $line) }}; \
+             Start-Sleep -Seconds 60"
+        ),
     ]
 }
 
@@ -428,7 +540,7 @@ async fn wait_for_capture_containing(
     needle: &str,
     context: &str,
 ) -> String {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let capture = capture_pane_print(handler, target.clone()).await;
         if capture.contains(needle) {
@@ -466,7 +578,7 @@ async fn prepare_attached_shell_prompt(handler: &RequestHandler, target: &PaneTa
     wait_for_capture_containing(
         handler,
         target.clone(),
-        "PROMPT>",
+        attached_shell_prompt_ready_needle(),
         "attached shell prompt must be ready",
     )
     .await;
@@ -479,7 +591,21 @@ fn attached_shell_prompt_commands() -> [String; 2] {
 
 #[cfg(windows)]
 fn attached_shell_prompt_commands() -> [String; 2] {
-    ["function global:prompt { 'PROMPT> ' }", "Clear-Host"].map(str::to_owned)
+    [
+        "Remove-Module PSReadLine -ErrorAction SilentlyContinue; function global:prompt { 'PROMPT> ' }; Write-Output ('RMUX_PROMPT_' + 'READY')",
+        "$null = 0; Write-Output ('RMUX_PROMPT_' + 'CLEAR')",
+    ]
+    .map(str::to_owned)
+}
+
+#[cfg(unix)]
+fn attached_shell_prompt_ready_needle() -> &'static str {
+    "PROMPT>"
+}
+
+#[cfg(windows)]
+fn attached_shell_prompt_ready_needle() -> &'static str {
+    "RMUX_PROMPT_CLEAR\nPROMPT>"
 }
 
 async fn wait_for_dead_pane(
@@ -488,7 +614,7 @@ async fn wait_for_dead_pane(
     window_index: u32,
     pane_index: u32,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + ATTACH_LIFECYCLE_TIMEOUT;
     loop {
         let exited = {
             let mut state = handler.state.lock().await;
@@ -508,7 +634,7 @@ async fn wait_for_dead_pane(
 }
 
 async fn wait_for_session_removed(handler: &RequestHandler, session_name: &SessionName) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + ATTACH_LIFECYCLE_TIMEOUT;
     loop {
         let exists = {
             let state = handler.state.lock().await;

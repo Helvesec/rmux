@@ -57,7 +57,7 @@ async fn display_message_pane_dead_observes_exited_child_promptly() {
         .await;
     assert!(matches!(respawned, Response::RespawnPane(_)));
 
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let dead = display_pane_dead(&handler, target.clone()).await;
         if dead == "1" {

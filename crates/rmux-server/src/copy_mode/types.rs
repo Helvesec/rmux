@@ -20,6 +20,7 @@ impl ModeKeys {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CopyModeCommandContext {
     pub(crate) mode_keys: ModeKeys,
+    pub(crate) wrap_search: bool,
     pub(crate) word_separators: String,
     pub(crate) default_shell: String,
     pub(crate) working_directory: Option<PathBuf>,

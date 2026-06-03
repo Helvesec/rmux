@@ -8,16 +8,25 @@ use rmux_proto::{
 };
 
 use super::tokens::{rebuild_shell_command, CommandTokens};
-use super::values::missing_argument;
+use super::values::{missing_argument, unsupported_flag};
 use super::{
-    implicit_pane_target, implicit_split_target, parse_pane_target, parse_split_window_target,
-    parse_window_target,
+    implicit_pane_target, implicit_split_target, marked_pane_target, parse_pane_target,
+    parse_split_window_target, parse_window_target,
 };
+
+const DEFAULT_SPLIT_WINDOW_PRINT_FORMAT: &str = "#{session_name}:#{window_index}.#{pane_index}";
 
 #[path = "pane_parse/join_move.rs"]
 mod join_move;
 
 pub(super) use self::join_move::{parse_join_pane, parse_move_pane};
+
+#[derive(Debug, Clone)]
+pub(super) struct ParsedSplitWindowCommand {
+    pub(super) request: Request,
+    pub(super) print_target: bool,
+    pub(super) format: String,
+}
 
 pub(super) fn parse_pane_request(
     mut args: CommandTokens,
@@ -149,16 +158,38 @@ pub(super) fn parse_select_pane(
 }
 
 pub(super) fn parse_split_window(
-    mut args: CommandTokens,
+    args: CommandTokens,
     sessions: &SessionStore,
     find_context: &TargetFindContext,
 ) -> Result<Request, RmuxError> {
+    parse_split_window_command(args, sessions, find_context, false).map(|command| command.request)
+}
+
+pub(super) fn parse_queued_split_window(
+    args: CommandTokens,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Result<ParsedSplitWindowCommand, RmuxError> {
+    parse_split_window_command(args, sessions, find_context, true)
+}
+
+fn parse_split_window_command(
+    mut args: CommandTokens,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+    allow_print_flags: bool,
+) -> Result<ParsedSplitWindowCommand, RmuxError> {
     let mut direction = SplitDirection::Vertical;
     let mut direction_set = false;
     let mut before = false;
     let mut environment = Vec::new();
     let mut target = None;
     let mut start_directory: Option<std::path::PathBuf> = None;
+    let mut detached = false;
+    let mut size = None;
+    let mut preserve_zoom = false;
+    let mut print_target = false;
+    let mut format = None;
 
     while let Some(token) = args.peek() {
         match token {
@@ -190,6 +221,29 @@ pub(super) fn parse_split_window(
                 let _ = args.optional();
                 before = true;
             }
+            "-d" => {
+                let _ = args.optional();
+                detached = true;
+            }
+            "-Z" => {
+                let _ = args.optional();
+                preserve_zoom = true;
+            }
+            "-l" => {
+                let _ = args.optional();
+                size = Some(args.required("-l size")?);
+            }
+            "-P" if allow_print_flags => {
+                let _ = args.optional();
+                print_target = true;
+            }
+            "-F" if allow_print_flags => {
+                let _ = args.optional();
+                format = Some(args.required("-F format")?);
+            }
+            "-F" | "-I" | "-P" => {
+                return Err(unsupported_flag("split-window", token));
+            }
             "-c" => {
                 let _ = args.optional();
                 start_directory = Some(std::path::PathBuf::from(
@@ -214,8 +268,13 @@ pub(super) fn parse_split_window(
         "split-window",
     )?);
 
-    if command.is_some() || start_directory.is_some() {
-        return Ok(Request::SplitWindowExt(SplitWindowExtRequest {
+    let request = if command.is_some()
+        || start_directory.is_some()
+        || detached
+        || size.is_some()
+        || preserve_zoom
+    {
+        Request::SplitWindowExt(SplitWindowExtRequest {
             target,
             direction,
             before,
@@ -224,15 +283,24 @@ pub(super) fn parse_split_window(
             process_command: None,
             start_directory,
             keep_alive_on_exit: None,
-        }));
-    }
+            detached,
+            size,
+            preserve_zoom,
+        })
+    } else {
+        Request::SplitWindow(SplitWindowRequest {
+            target,
+            direction,
+            before,
+            environment: (!environment.is_empty()).then_some(environment),
+        })
+    };
 
-    Ok(Request::SplitWindow(SplitWindowRequest {
-        target,
-        direction,
-        before,
-        environment: (!environment.is_empty()).then_some(environment),
-    }))
+    Ok(ParsedSplitWindowCommand {
+        request,
+        print_target,
+        format: format.unwrap_or_else(|| DEFAULT_SPLIT_WINDOW_PRINT_FORMAT.to_owned()),
+    })
 }
 
 pub(super) fn parse_swap_pane(
@@ -299,9 +367,7 @@ pub(super) fn parse_swap_pane(
     }
     let source = match direction {
         Some(_) => target.clone(),
-        None => source.ok_or_else(|| {
-            RmuxError::Server("swap-pane requires -s source-pane unless -D/-U is used".to_owned())
-        })?,
+        None => source.unwrap_or(marked_pane_target(sessions, find_context, "swap-pane")?),
     };
 
     Ok(Request::SwapPane(SwapPaneRequest {

@@ -1,27 +1,34 @@
+use rmux_core::{SessionStore, TargetFindContext};
 use rmux_proto::{
     JoinPaneRequest, MovePaneRequest, PaneSplitSize, Request, RmuxError, SplitDirection,
 };
 
-use super::super::parse_pane_target;
 use super::super::tokens::CommandTokens;
 use super::super::values::{missing_argument, parse_percentage, parse_u32};
+use super::super::{marked_pane_target, parse_pane_target};
 
 pub(in crate::handler::scripting_support) fn parse_join_pane(
     mut args: CommandTokens,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
 ) -> Result<Request, RmuxError> {
-    parse_join_or_move_pane(&mut args, "join-pane", false)
+    parse_join_or_move_pane(&mut args, "join-pane", false, sessions, find_context)
 }
 
 pub(in crate::handler::scripting_support) fn parse_move_pane(
     mut args: CommandTokens,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
 ) -> Result<Request, RmuxError> {
-    parse_join_or_move_pane(&mut args, "move-pane", true)
+    parse_join_or_move_pane(&mut args, "move-pane", true, sessions, find_context)
 }
 
 fn parse_join_or_move_pane(
     args: &mut CommandTokens,
     command: &str,
     as_move: bool,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
 ) -> Result<Request, RmuxError> {
     let mut detached = false;
     let mut before = false;
@@ -110,7 +117,7 @@ fn parse_join_or_move_pane(
     args.no_extra(command)?;
 
     let request = JoinPaneRequest {
-        source: source.ok_or_else(|| missing_argument(command, "-s target"))?,
+        source: source.unwrap_or(marked_pane_target(sessions, find_context, command)?),
         target: target.ok_or_else(|| missing_argument(command, "-t target"))?,
         direction,
         detached,

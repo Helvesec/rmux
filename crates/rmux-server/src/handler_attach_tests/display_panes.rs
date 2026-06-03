@@ -68,6 +68,18 @@ async fn attached_prefix_x_during_display_panes_opens_kill_pane_prompt() {
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
     let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .options
+            .set(
+                ScopeSelector::Session(alpha.clone()),
+                OptionName::DisplayPanesTime,
+                "60000".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("extend display-panes timeout for prompt dispatch test");
+    }
     assert!(matches!(
         handler
             .handle(Request::SplitWindow(SplitWindowRequest {
@@ -104,7 +116,7 @@ async fn attached_prefix_x_during_display_panes_opens_kill_pane_prompt() {
         .handle_attached_live_input_for_test(requester_pid, b"\x02x")
         .await
         .expect("prefix x input during display-panes");
-    let prompt = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+    let prompt = tokio::time::timeout(ATTACH_LIFECYCLE_TIMEOUT, async {
         loop {
             if let Some(prompt) = handler.attached_prompt_render(requester_pid).await {
                 break prompt;
@@ -165,6 +177,77 @@ async fn attached_prefix_q_emits_a_display_panes_overlay_when_prefix_and_q_arriv
         matches!(overlay, AttachControl::Overlay(_)),
         "expected display-panes overlay, got {overlay:?}"
     );
+}
+
+#[tokio::test]
+async fn display_panes_input_uses_visible_pane_base_index_labels() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let alpha = session_name("alpha");
+    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(alpha.clone()),
+                direction: rmux_proto::SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SelectPane(SelectPaneRequest {
+                target: PaneTarget::with_window(alpha.clone(), 0, 0),
+                title: None,
+            }))
+            .await,
+        Response::SelectPane(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+                option: OptionName::PaneBaseIndex,
+                value: "10".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .options
+            .set(
+                ScopeSelector::Session(alpha.clone()),
+                OptionName::DisplayPanesTime,
+                "60000".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("extend display-panes timeout for multi-digit input test");
+    }
+    drain_attach_controls(&mut control_rx);
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x02q")
+        .await
+        .expect("prefix q input");
+    let overlay = recv_overlay_frame(&mut control_rx, "display-panes overlay").await;
+    assert!(
+        overlay.contains("\x1b[?25l"),
+        "prefix q should enter display-panes, got {overlay:?}"
+    );
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"11")
+        .await
+        .expect("visible display-panes label");
+
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("session exists");
+    assert_eq!(session.active_pane_index(), 1);
 }
 
 #[tokio::test]

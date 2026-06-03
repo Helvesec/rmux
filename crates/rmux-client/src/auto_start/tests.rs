@@ -10,6 +10,10 @@ use std::time::Duration;
 use super::{ensure_server_running_with_probe, AutoStartError};
 use crate::{ClientError, ConnectResult, Connection};
 
+// Success-path tests exercise retry behavior, not scheduler precision.
+const POLL_SUCCESS_TIMEOUT: Duration = Duration::from_secs(2);
+const POLL_INTERVAL: Duration = Duration::from_millis(1);
+
 #[test]
 fn auto_start_returns_existing_connection_without_launching() {
     let launch_calls = AtomicUsize::new(0);
@@ -57,8 +61,8 @@ fn auto_start_launches_then_polls_until_connected() {
 
     let result = ensure_server_running_with_probe(
         PathBuf::from("/tmp/rmux-auto-start-poll.sock").as_path(),
-        Duration::from_millis(50),
-        Duration::from_millis(1),
+        POLL_SUCCESS_TIMEOUT,
+        POLL_INTERVAL,
         &mut connect,
         &mut launch,
         |_| Ok(()),
@@ -156,8 +160,8 @@ fn auto_start_retries_transient_poll_errors_after_launch() {
 
     let result = ensure_server_running_with_probe(
         PathBuf::from("/tmp/rmux-auto-start-would-block.sock").as_path(),
-        Duration::from_millis(50),
-        Duration::from_millis(1),
+        POLL_SUCCESS_TIMEOUT,
+        POLL_INTERVAL,
         &mut connect,
         &mut launch,
         |_| Ok(()),
@@ -180,10 +184,8 @@ fn auto_start_waits_for_a_ready_response_after_connecting() {
         match call {
             0 => Ok(ConnectResult::Absent),
             _ => {
-                std::thread::spawn(move || {
-                    drop(server);
-                });
                 let connection = Connection::new(client).expect("connection with timeout");
+                drop(server);
                 Ok(ConnectResult::Connected(connection))
             }
         }
@@ -199,8 +201,8 @@ fn auto_start_waits_for_a_ready_response_after_connecting() {
 
     let result = ensure_server_running_with_probe(
         PathBuf::from("/tmp/rmux-auto-start-ready.sock").as_path(),
-        Duration::from_millis(50),
-        Duration::from_millis(1),
+        POLL_SUCCESS_TIMEOUT,
+        POLL_INTERVAL,
         &mut connect,
         &mut launch,
         &mut probe,
@@ -270,8 +272,8 @@ fn auto_start_treats_competing_startup_success_as_connected() {
 
     let result = ensure_server_running_with_probe(
         PathBuf::from("/tmp/rmux-auto-start-race.sock").as_path(),
-        Duration::from_millis(20),
-        Duration::from_millis(1),
+        POLL_SUCCESS_TIMEOUT,
+        POLL_INTERVAL,
         &mut connect,
         &mut launch,
         |_| Ok(()),

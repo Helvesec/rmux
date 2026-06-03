@@ -43,6 +43,7 @@ use glob::format_fnmatch;
 use modifiers::{parse_modifiers, FormatModifier};
 use scan::format_skip;
 pub use scan::format_skip_delimiter;
+pub use time::expand_time_tokens;
 use time::format_time_string;
 use transforms::{
     apply_substitution, format_unescape, shell_quote, style_quote, truncate_left, truncate_right,

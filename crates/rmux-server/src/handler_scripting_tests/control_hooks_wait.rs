@@ -28,6 +28,114 @@ async fn parsed_queue_accepts_display_message_format_flag() {
 }
 
 #[tokio::test]
+async fn parsed_queue_display_message_consumes_neutral_compat_flags_before_message() {
+    let handler = RequestHandler::new();
+
+    let parsed = CommandParser::new()
+        .parse("display-message -p -d 10 -I -l -N -v hello")
+        .expect("display-message compat flags parse");
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("display-message compat flags execute");
+
+    assert_eq!(output.stdout(), b"hello\n");
+}
+
+#[tokio::test]
+async fn parsed_queue_display_message_c_missing_client_is_noop() {
+    let handler = RequestHandler::new();
+
+    let parsed = CommandParser::new()
+        .parse("display-message -c 999999 hello")
+        .expect("display-message -c parses");
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("missing target-client is a tmux-compatible noop");
+
+    assert!(output.stdout().is_empty());
+}
+
+#[tokio::test]
+async fn parsed_queue_display_message_print_ignores_missing_target_client() {
+    let handler = RequestHandler::new();
+
+    let parsed = CommandParser::new()
+        .parse("display-message -p -c 999999 hello")
+        .expect("display-message -p -c parses");
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("print with missing target-client still succeeds");
+
+    assert_eq!(output.stdout(), b"hello\n");
+}
+
+#[tokio::test]
+async fn parsed_queue_send_keys_c_missing_client_is_noop() {
+    let handler = RequestHandler::new();
+
+    let parsed = CommandParser::new()
+        .parse("send-keys -c 999999 A")
+        .expect("send-keys -c parses");
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("missing target-client is a tmux-compatible noop");
+
+    assert!(output.stdout().is_empty());
+}
+
+#[tokio::test]
+async fn parsed_queue_display_message_all_formats_uses_core_inventory() {
+    let handler = RequestHandler::new();
+
+    let parsed = CommandParser::new()
+        .parse("display-message -a")
+        .expect("display-message -a parses");
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("display-message -a executes");
+    let stdout = std::str::from_utf8(output.stdout()).expect("display-message -a utf8");
+
+    assert!(stdout.contains("client_session="), "{stdout}");
+    assert!(stdout.contains("window_offset_x="), "{stdout}");
+    assert!(stdout.contains("command=display-message"), "{stdout}");
+}
+
+#[tokio::test]
+async fn parsed_queue_list_panes_all_does_not_require_current_target() {
+    let handler = RequestHandler::new();
+    for name in ["alpha", "beta"] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session_name(name),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
+
+    let parsed = CommandParser::new()
+        .parse("list-panes -a -F '#{session_name}:#{pane_index}'")
+        .expect("list-panes -a parses");
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("list-panes -a executes");
+    let stdout = std::str::from_utf8(output.stdout()).expect("list-panes utf8");
+
+    assert!(stdout.contains("alpha:0\n"), "{stdout}");
+    assert!(stdout.contains("beta:0\n"), "{stdout}");
+}
+
+#[tokio::test]
 async fn parse_control_commands_rejects_invalid_prompt_history_type() {
     let handler = RequestHandler::new();
 

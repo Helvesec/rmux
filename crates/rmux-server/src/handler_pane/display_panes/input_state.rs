@@ -14,8 +14,8 @@ pub(super) fn update_display_panes_state(
     event: PromptInputEvent,
 ) -> DisplayPanesOutcome {
     match event {
-        PromptInputEvent::Char(ch) if ch.is_ascii_digit() => {
-            state.input.push(ch);
+        PromptInputEvent::Char(ch) if ch.is_ascii_alphanumeric() => {
+            state.input.push(ch.to_ascii_lowercase());
             match match_display_panes_label(state) {
                 DisplayPanesMatch::Exact(_label, true) => DisplayPanesOutcome::Stay,
                 DisplayPanesMatch::Exact(label, false) => DisplayPanesOutcome::Select(label),
@@ -66,5 +66,38 @@ fn match_display_panes_label(state: &DisplayPanesClientState) -> DisplayPanesMat
         DisplayPanesMatch::Prefix
     } else {
         DisplayPanesMatch::None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmux_proto::{PaneTarget, SessionName, WindowTarget};
+
+    fn session_name(value: &str) -> SessionName {
+        SessionName::new(value).expect("valid session")
+    }
+
+    #[test]
+    fn accepts_letter_alias_labels() {
+        let alpha = session_name("alpha");
+        let mut state = DisplayPanesClientState {
+            id: 1,
+            window: WindowTarget::with_window(alpha.clone(), 0),
+            labels: vec![DisplayPanesLabel {
+                label: "a".to_owned(),
+                target: PaneTarget::with_window(alpha, 0, 10),
+                target_string: "=alpha:0.%10".to_owned(),
+            }],
+            input: String::new(),
+            template: None,
+            clear_frame: Vec::new(),
+        };
+
+        match update_display_panes_state(&mut state, PromptInputEvent::Char('A')) {
+            DisplayPanesOutcome::Select(label) => assert_eq!(label.label, "a"),
+            DisplayPanesOutcome::Stay => panic!("letter alias should select"),
+            DisplayPanesOutcome::Close => panic!("letter alias should not close"),
+        }
     }
 }

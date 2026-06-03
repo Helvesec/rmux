@@ -190,14 +190,31 @@ fn list_keys_uses_default_table_without_server() -> Result<(), Box<dyn Error>> {
 fn help_and_list_commands_cover_the_full_tmux_command_table() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("full-command-surface")?;
     let list = harness.run(&["list-commands"])?;
+    // The bare `list-commands` listing is byte-compared against tmux, so it omits
+    // RMUX extensions even though they stay in COMMAND_TABLE for dispatch/help.
+    // Keep this in sync with RMUX_EXTENSION_COMMANDS in
+    // src/cli/command_inventory.rs.
+    const RMUX_EXTENSION_COMMANDS: &[&str] = &["web-share"];
     let expected = COMMAND_TABLE
         .iter()
         .map(|entry| entry.name.to_owned())
+        .filter(|name| !RMUX_EXTENSION_COMMANDS.contains(&name.as_str()))
         .collect::<Vec<_>>();
 
     assert_eq!(list.status.code(), Some(0));
     assert_eq!(list_command_names(&stdout(&list)), expected);
     assert!(stderr(&list).is_empty());
+
+    // Extensions stay reachable by explicit name even though the bare listing
+    // hides them for tmux parity.
+    let explicit = harness.run(&["list-commands", "web-share"])?;
+    assert_eq!(explicit.status.code(), Some(0));
+    assert_eq!(
+        list_command_names(&stdout(&explicit)),
+        vec!["web-share".to_owned()]
+    );
+    assert!(stderr(&explicit).is_empty());
+
     assert!(!harness.socket_path().exists());
     Ok(())
 }
@@ -765,6 +782,26 @@ fn new_session_uses_shell_env_when_default_shell_is_unset() -> Result<(), Box<dy
         &shell_env,
         &shell_command,
     ])?;
+    assert_success(&create);
+
+    wait_for_file_contents(&output_path, expected_shell, ATTACH_TIMEOUT)?;
+    Ok(())
+}
+
+#[test]
+fn new_session_uses_client_shell_env_by_default() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("new-session-client-shell-env")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let output_path = harness.tmpdir().join("client-shell.txt");
+    let expected_shell = "/bin/sh";
+    let shell_command = format!("printf '%s' \"$SHELL\" > {}", shell_quote(&output_path));
+
+    let create = harness.run_with(
+        &["new-session", "-d", "-s", "alpha", &shell_command],
+        |command| {
+            command.env("SHELL", expected_shell);
+        },
+    )?;
     assert_success(&create);
 
     wait_for_file_contents(&output_path, expected_shell, ATTACH_TIMEOUT)?;

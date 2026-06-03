@@ -6,7 +6,8 @@ use rmux_proto::{
 use super::super::RequestHandler;
 use super::{
     encode_key_for_target, encode_mouse_for_target, encode_tokens_for_target,
-    expand_send_key_tokens, prepare_pane_input_write, resolve_input_target, write_bytes_to_target,
+    expand_send_key_tokens, prepare_pane_input_write, prepare_synchronized_pane_input_writes,
+    resolve_input_target, write_bytes_to_target, write_bytes_to_targets,
 };
 use crate::keys::{parse_key_code, resolve_hex_key};
 
@@ -22,13 +23,14 @@ impl RequestHandler {
                 Ok(resolved) => resolved,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
-            let write = match prepare_pane_input_write(&state, &request.target, &resolved) {
-                Ok(write) => write,
-                Err(error) => return Response::Error(ErrorResponse { error }),
-            };
-            (write, resolved)
+            let writes =
+                match prepare_synchronized_pane_input_writes(&state, &request.target, &resolved) {
+                    Ok(writes) => writes,
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                };
+            (writes, resolved)
         };
-        write_bytes_to_target(prepared.0, prepared.1, key_count).await
+        write_bytes_to_targets(prepared.0, prepared.1, key_count).await
     }
 
     #[async_recursion::async_recursion]
@@ -37,9 +39,55 @@ impl RequestHandler {
         requester_pid: u32,
         request: rmux_proto::SendKeysExtRequest,
     ) -> Response {
+        self.handle_send_keys_ext_inner(requester_pid, request, None)
+            .await
+    }
+
+    pub(in crate::handler) async fn handle_send_keys_ext2(
+        &self,
+        requester_pid: u32,
+        request: rmux_proto::SendKeysExt2Request,
+    ) -> Response {
+        let target_client = request.target_client;
+        let request = rmux_proto::SendKeysExtRequest {
+            target: request.target,
+            keys: request.keys,
+            expand_formats: request.expand_formats,
+            hex: request.hex,
+            literal: request.literal,
+            dispatch_key_table: request.dispatch_key_table,
+            copy_mode_command: request.copy_mode_command,
+            forward_mouse_event: request.forward_mouse_event,
+            reset_terminal: request.reset_terminal,
+            repeat_count: request.repeat_count,
+        };
+        self.handle_send_keys_ext_inner(requester_pid, request, target_client)
+            .await
+    }
+
+    #[async_recursion::async_recursion]
+    async fn handle_send_keys_ext_inner(
+        &self,
+        requester_pid: u32,
+        request: rmux_proto::SendKeysExtRequest,
+        target_client: Option<String>,
+    ) -> Response {
+        let target_attach_pid = match target_client.as_deref() {
+            Some(target_client) => match self
+                .find_target_attach_client_pid(requester_pid, target_client, "send-keys")
+                .await
+            {
+                Ok(Some(attach_pid)) => Some(attach_pid),
+                Ok(None) => {
+                    return Response::SendKeys(SendKeysResponse { key_count: 0 });
+                }
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            },
+            None => None,
+        };
         let attached_session = {
             let active_attach = self.active_attach.lock().await;
-            active_attach.current_session_candidate(requester_pid)
+            active_attach.current_session_candidate(target_attach_pid.unwrap_or(requester_pid))
         };
         let target = {
             let state = self.state.lock().await;
@@ -59,7 +107,7 @@ impl RequestHandler {
 
         if request.copy_mode_command {
             return Box::pin(self.handle_send_keys_copy_mode(
-                requester_pid,
+                target_attach_pid.unwrap_or(requester_pid),
                 &request,
                 target,
                 &tokens,
@@ -68,13 +116,17 @@ impl RequestHandler {
         }
 
         if request.dispatch_key_table {
-            let attach_pid = match self
-                .resolve_attached_client_pid(requester_pid, "send-keys")
-                .await
-            {
-                Ok(attach_pid) => attach_pid,
-                Err(error) => return Response::Error(ErrorResponse { error }),
+            let attach_pid = match target_attach_pid {
+                Some(attach_pid) => attach_pid,
+                None => match self
+                    .resolve_attached_client_pid(requester_pid, "send-keys")
+                    .await
+                {
+                    Ok(attach_pid) => attach_pid,
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                },
             };
+            let effective_requester_pid = target_attach_pid.unwrap_or(requester_pid);
             let repeat_count = request.repeat_count.unwrap_or(1).max(1);
             for token in &tokens {
                 let key = if request.hex {
@@ -90,7 +142,7 @@ impl RequestHandler {
                 for _ in 0..repeat_count {
                     if let Err(error) = Box::pin(self.dispatch_attached_key(
                         attach_pid,
-                        requester_pid,
+                        effective_requester_pid,
                         &target,
                         key,
                     ))
@@ -113,12 +165,15 @@ impl RequestHandler {
                 Ok(false) => {}
                 Err(error) => return Response::Error(ErrorResponse { error }),
             }
-            let attach_pid = match self
-                .resolve_attached_client_pid(requester_pid, "send-keys")
-                .await
-            {
-                Ok(attach_pid) => attach_pid,
-                Err(error) => return Response::Error(ErrorResponse { error }),
+            let attach_pid = match target_attach_pid {
+                Some(attach_pid) => attach_pid,
+                None => match self
+                    .resolve_attached_client_pid(requester_pid, "send-keys")
+                    .await
+                {
+                    Ok(attach_pid) => attach_pid,
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                },
             };
             let mouse_event = {
                 let active_attach = self.active_attach.lock().await;
@@ -170,13 +225,13 @@ impl RequestHandler {
             }
             let repeat_count = request.repeat_count.unwrap_or(1).max(1);
             let repeated = bytes.repeat(repeat_count);
-            let write = match prepare_pane_input_write(&state, &target, &repeated) {
-                Ok(write) => write,
+            let writes = match prepare_synchronized_pane_input_writes(&state, &target, &repeated) {
+                Ok(writes) => writes,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
-            (write, repeated)
+            (writes, repeated)
         };
-        write_bytes_to_target(prepared.0, prepared.1, tokens.len()).await
+        write_bytes_to_targets(prepared.0, prepared.1, tokens.len()).await
     }
 
     pub(in crate::handler) async fn handle_send_prefix(
@@ -196,7 +251,7 @@ impl RequestHandler {
             }
         };
 
-        let (write, encoded, canonical_key) = {
+        let (writes, encoded, canonical_key) = {
             let state = self.state.lock().await;
             let option = if request.secondary {
                 OptionName::Prefix2
@@ -226,14 +281,14 @@ impl RequestHandler {
                 }
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
-            let write = match prepare_pane_input_write(&state, &target, &encoded) {
-                Ok(write) => write,
+            let writes = match prepare_synchronized_pane_input_writes(&state, &target, &encoded) {
+                Ok(writes) => writes,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
-            (write, encoded, canonical_key)
+            (writes, encoded, canonical_key)
         };
 
-        match write_bytes_to_target(write, encoded, 1).await {
+        match write_bytes_to_targets(writes, encoded, 1).await {
             Response::SendKeys(_) => Response::SendPrefix(SendPrefixResponse {
                 target: Some(target),
                 key: canonical_key,

@@ -1,5 +1,5 @@
 use rmux_core::{
-    command_parser::{CommandParseError, CommandParser, ParsedCommand, ParsedCommands},
+    command_parser::{CommandParseError, ParsedCommand, ParsedCommands},
     command_queue::CommandQueue,
     LifecycleEvent, ENVIRON_HIDDEN,
 };
@@ -36,6 +36,8 @@ mod mode_parse;
 mod new_window_runtime;
 #[path = "handler_scripting/pane_parse.rs"]
 mod pane_parse;
+#[path = "handler_scripting/parser_context.rs"]
+mod parser_context;
 #[path = "handler_scripting/prompt_parse.rs"]
 mod prompt_parse;
 #[path = "handler_scripting/prompt_runtime.rs"]
@@ -58,6 +60,8 @@ mod shell_runtime;
 mod source_files;
 #[path = "handler_scripting/source_runtime.rs"]
 mod source_runtime;
+#[path = "handler_scripting/split_window_runtime.rs"]
+mod split_window_runtime;
 #[path = "handler_scripting/targets.rs"]
 mod targets;
 #[path = "handler_scripting/tmux_compat.rs"]
@@ -72,6 +76,7 @@ mod wait_for_runtime;
 mod window_parse;
 
 pub(super) use self::format_context::format_context_for_target;
+pub(in crate::handler) use self::parser_context::command_parser_from_state;
 pub(super) use self::prompt_parse::{ParsedPromptHistoryCommand, PromptHistoryAction};
 use self::queue::{queue_action_from_response, remove_group_contexts, QueueInvocation, QueueMode};
 pub(super) use self::queue::{QueueCommandAction, QueueExecutionContext};
@@ -81,7 +86,7 @@ pub(crate) use self::request_parse::parse_request_from_parts;
 pub(super) use self::runtime::spawn_background_async;
 use self::targets::{
     implicit_pane_target, implicit_session_name, implicit_split_target, implicit_window_target,
-    is_unsupported_named_layout, parse_layout_name, parse_move_window_target,
+    is_unsupported_named_layout, marked_pane_target, parse_layout_name, parse_move_window_target,
     parse_new_window_target_argument, parse_pane_target, parse_select_layout_target,
     parse_session_name, parse_split_window_target, parse_target_arg, parse_window_target,
     queue_target_find_context,
@@ -109,7 +114,7 @@ impl RequestHandler {
         command: &str,
     ) -> Result<ParsedCommands, RmuxError> {
         let state = self.state.lock().await;
-        let parser = CommandParser::new().with_environment_store(&state.environment);
+        let parser = command_parser_from_state(&state);
         parser
             .parse_one_group(command)
             .map_err(command_parse_error_to_rmux)
@@ -171,12 +176,15 @@ impl RequestHandler {
         let attached_session = self.current_session_candidate(requester_pid).await;
         let invocation = {
             let state = self.state.lock().await;
+            let marked_target = state.marked_pane_target();
             let find_context = queue_target_find_context(
                 &state.sessions,
+                &state.options,
                 requester_pid,
                 attached_session.as_ref(),
                 context.current_target.as_ref(),
                 context.mouse_target.as_ref(),
+                marked_target.as_ref(),
             );
             parse_queue_invocation(
                 command,
@@ -287,12 +295,15 @@ impl RequestHandler {
         let attached_session = self.current_session_candidate(requester_pid).await;
         let invocation = {
             let state = self.state.lock().await;
+            let marked_target = state.marked_pane_target();
             let find_context = queue_target_find_context(
                 &state.sessions,
+                &state.options,
                 requester_pid,
                 attached_session.as_ref(),
                 context.current_target.as_ref(),
                 context.mouse_target.as_ref(),
+                marked_target.as_ref(),
             );
             parse_queue_invocation(
                 command,
@@ -316,10 +327,16 @@ impl RequestHandler {
         };
         let request_invocation = matches!(
             &invocation,
-            QueueInvocation::Request(_) | QueueInvocation::NewWindow(_)
+            QueueInvocation::Request(_)
+                | QueueInvocation::NewWindow(_)
+                | QueueInvocation::SplitWindow(_)
         );
 
         let result = match invocation {
+            QueueInvocation::NoOp => Ok(QueueCommandAction::Normal {
+                output: None,
+                error: None,
+            }),
             QueueInvocation::Request(request) => {
                 let can_write = self.requester_can_write(requester_pid).await;
                 let request = crate::server_access::apply_access_policy(request, can_write)?;
@@ -369,6 +386,13 @@ impl RequestHandler {
             }
             QueueInvocation::SourceFile(command) => {
                 self.execute_queued_source_file(requester_pid, command, context)
+                    .await
+            }
+            QueueInvocation::ListPanesAll(command) => {
+                self.execute_queued_list_panes_all(command).await
+            }
+            QueueInvocation::SplitWindow(command) => {
+                self.execute_queued_split_window(requester_pid, &command_for_hooks, command)
                     .await
             }
             QueueInvocation::CommandPrompt(command) => {
@@ -423,6 +447,48 @@ impl RequestHandler {
                 },
             );
         }
+    }
+
+    async fn execute_queued_list_panes_all(
+        &self,
+        command: self::list_parse::ParsedListPanesAllCommand,
+    ) -> Result<QueueCommandAction, RmuxError> {
+        let mut session_names = {
+            let state = self.state.lock().await;
+            state
+                .sessions
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>()
+        };
+        session_names.sort_by_key(ToString::to_string);
+
+        let mut stdout = Vec::new();
+        for session_name in session_names {
+            let response = self
+                .handle_list_panes(rmux_proto::ListPanesRequest {
+                    target: session_name,
+                    target_window_index: None,
+                    format: command.format.clone(),
+                })
+                .await;
+            let action = queue_action_from_response(response)?;
+            if let QueueCommandAction::Normal {
+                output: Some(output),
+                error,
+            } = action
+            {
+                stdout.extend_from_slice(output.stdout());
+                if let Some(error) = error {
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(QueueCommandAction::Normal {
+            output: Some(CommandOutput::from_stdout(stdout)),
+            error: None,
+        })
     }
 }
 
@@ -503,146 +569,5 @@ fn command_parse_error_to_rmux(error: CommandParseError) -> RmuxError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::source_files::{default_config_paths, default_tmux_fallback_paths};
-    #[cfg(windows)]
-    use super::source_files::{source_inputs_for_path, SourceReadPolicy};
-    use crate::test_env::EnvVarGuard;
-
-    #[cfg(unix)]
-    #[test]
-    fn default_config_paths_use_rmux_locations() {
-        let _lock = crate::test_env::lock_blocking();
-        let _home = EnvVarGuard::set("HOME", Some("/tmp/rmux-home"));
-        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", Some("/tmp/rmux-xdg"));
-
-        let paths = default_config_paths();
-
-        assert_eq!(
-            paths,
-            vec![
-                "/etc/rmux.conf".to_owned(),
-                "/tmp/rmux-home/.rmux.conf".to_owned(),
-                "/tmp/rmux-xdg/rmux/rmux.conf".to_owned(),
-                "/tmp/rmux-home/.config/rmux/rmux.conf".to_owned(),
-            ]
-        );
-        assert!(
-            paths.iter().all(|path| !path.contains("tmux")),
-            "default config search path must not include tmux locations: {paths:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn tmux_fallback_paths_use_tmux_locations() {
-        let _lock = crate::test_env::lock_blocking();
-        let _disable = EnvVarGuard::set("RMUX_DISABLE_TMUX_FALLBACK", None);
-        let _home = EnvVarGuard::set("HOME", Some("/tmp/rmux-home"));
-        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", Some("/tmp/rmux-xdg"));
-
-        let paths = default_tmux_fallback_paths();
-
-        assert_eq!(
-            paths,
-            vec![
-                "/etc/tmux.conf".to_owned(),
-                "/tmp/rmux-home/.tmux.conf".to_owned(),
-                "/tmp/rmux-xdg/tmux/tmux.conf".to_owned(),
-                "/tmp/rmux-home/.config/tmux/tmux.conf".to_owned(),
-            ]
-        );
-        assert!(
-            paths.iter().all(|path| !path.ends_with("rmux.conf")),
-            "tmux fallback paths must not include rmux config files: {paths:?}"
-        );
-    }
-
-    #[test]
-    fn tmux_fallback_paths_can_be_disabled_by_env() {
-        let _lock = crate::test_env::lock_blocking();
-        let _disable = EnvVarGuard::set("RMUX_DISABLE_TMUX_FALLBACK", Some("1"));
-
-        assert!(default_tmux_fallback_paths().is_empty());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn default_config_paths_use_documented_windows_locations() {
-        let _lock = crate::test_env::lock_blocking();
-        let _rmux_config = EnvVarGuard::set("RMUX_CONFIG_FILE", Some(r"C:\rmux\custom.conf"));
-        let _appdata = EnvVarGuard::set("APPDATA", Some(r"C:\Users\tester\AppData\Roaming"));
-        let _userprofile = EnvVarGuard::set("USERPROFILE", Some(r"C:\Users\tester"));
-        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", Some(r"C:\Users\tester\.config"));
-
-        let paths = default_config_paths();
-
-        assert_eq!(
-            paths,
-            vec![
-                path_string(r"C:\Users\tester\.config\rmux\rmux.conf"),
-                path_string(r"C:\Users\tester\.rmux.conf"),
-                path_string(r"C:\Users\tester\AppData\Roaming\rmux\rmux.conf"),
-                path_string(r"C:\rmux\custom.conf"),
-            ]
-        );
-        assert_eq!(
-            paths
-                .iter()
-                .filter(|path| path.contains("rmux.conf"))
-                .count(),
-            3,
-            "Windows search path must not add undocumented rmux.conf locations: {paths:?}"
-        );
-        assert!(
-            paths.iter().all(|path| !path.contains("tmux")),
-            "Windows default config search path must not include tmux locations: {paths:?}"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn tmux_fallback_paths_use_documented_windows_tmux_locations() {
-        let _lock = crate::test_env::lock_blocking();
-        let _disable = EnvVarGuard::set("RMUX_DISABLE_TMUX_FALLBACK", None);
-        let _appdata = EnvVarGuard::set("APPDATA", Some(r"C:\Users\tester\AppData\Roaming"));
-        let _userprofile = EnvVarGuard::set("USERPROFILE", Some(r"C:\Users\tester"));
-        let _xdg = EnvVarGuard::set("XDG_CONFIG_HOME", Some(r"C:\Users\tester\.config"));
-
-        let paths = default_tmux_fallback_paths();
-
-        assert_eq!(
-            paths,
-            vec![
-                path_string(r"C:\Users\tester\.config\tmux\tmux.conf"),
-                path_string(r"C:\Users\tester\.tmux.conf"),
-                path_string(r"C:\Users\tester\AppData\Roaming\tmux\tmux.conf"),
-            ]
-        );
-        assert!(
-            paths.iter().all(|path| !path.ends_with("rmux.conf")),
-            "tmux fallback paths must not include rmux config files: {paths:?}"
-        );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_nul_config_path_is_empty() {
-        let inputs = source_inputs_for_path("NUL", None, false, None, SourceReadPolicy::Strict)
-            .expect("NUL should behave like an empty config file");
-        assert_eq!(inputs.len(), 1);
-        assert!(inputs[0].contents.is_empty());
-
-        let inputs = source_inputs_for_path("nul", None, false, None, SourceReadPolicy::Strict)
-            .expect("nul should be case-insensitive");
-        assert_eq!(inputs.len(), 1);
-        assert!(inputs[0].contents.is_empty());
-    }
-
-    #[cfg(windows)]
-    fn path_string(path: &str) -> String {
-        std::path::PathBuf::from(path)
-            .to_string_lossy()
-            .into_owned()
-    }
-}
+#[path = "handler_scripting/config_path_tests.rs"]
+mod config_path_tests;

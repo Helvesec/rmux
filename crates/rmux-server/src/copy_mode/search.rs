@@ -199,27 +199,39 @@ impl CopyModeState {
         let next = match direction {
             SearchDirection::Forward => {
                 // Advance to the next match after the current one.
-                current
-                    .map(|index| {
+                let next = current
+                    .and_then(|index| {
                         if index + 1 < self.search_results.len() {
-                            index + 1
+                            Some(index + 1)
+                        } else if self.wrap_search {
+                            Some(0)
                         } else {
-                            0
+                            None
                         }
                     })
-                    .or_else(|| self.find_search_match(direction))
+                    .or_else(|| self.find_search_match(direction));
+                if next.is_none() && current.is_some() {
+                    return;
+                }
+                next
             }
             SearchDirection::Backward => {
                 // Go to the previous match before the current one.
-                current
-                    .map(|index| {
+                let next = current
+                    .and_then(|index| {
                         if index > 0 {
-                            index - 1
+                            Some(index - 1)
+                        } else if self.wrap_search {
+                            Some(self.search_results.len() - 1)
                         } else {
-                            self.search_results.len() - 1
+                            None
                         }
                     })
-                    .or_else(|| self.find_search_match(direction))
+                    .or_else(|| self.find_search_match(direction));
+                if next.is_none() && current.is_some() {
+                    return;
+                }
+                next
             }
         };
         self.search_current = next;
@@ -243,7 +255,7 @@ impl CopyModeState {
                 .enumerate()
                 .find(|(_, result)| position_ge(result.start, self.cursor))
                 .map(|(index, _)| index)
-                .or_else(|| (!self.search_results.is_empty()).then_some(0)),
+                .or_else(|| (self.wrap_search && !self.search_results.is_empty()).then_some(0)),
             SearchDirection::Backward => self
                 .search_results
                 .iter()
@@ -251,7 +263,11 @@ impl CopyModeState {
                 .rev()
                 .find(|(_, result)| position_le(result.end, self.cursor))
                 .map(|(index, _)| index)
-                .or_else(|| self.search_results.len().checked_sub(1)),
+                .or_else(|| {
+                    self.wrap_search
+                        .then(|| self.search_results.len().checked_sub(1))
+                        .flatten()
+                }),
         }
     }
 

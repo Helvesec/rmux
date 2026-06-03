@@ -177,6 +177,11 @@ impl HandlerState {
                     self.refresh_transcript_utf8_config();
                 }
             }
+            OptionName::InputBufferSize => {
+                if matches!(scope, ScopeSelector::Global) {
+                    self.refresh_transcript_input_buffer_limits();
+                }
+            }
             _ => {}
         }
     }
@@ -485,6 +490,25 @@ impl HandlerState {
                     .set_utf8_config(utf8_config.clone());
             }
         }
+    }
+
+    fn refresh_transcript_input_buffer_limits(&mut self) {
+        let limit = self.input_buffer_limit();
+        for transcripts in self.transcripts.values_mut() {
+            for transcript in transcripts.values() {
+                transcript
+                    .lock()
+                    .expect("pane transcript mutex must not be poisoned")
+                    .set_input_buffer_limit(limit);
+            }
+        }
+    }
+
+    pub(in crate::pane_terminals) fn input_buffer_limit(&self) -> usize {
+        self.options
+            .resolve(None, OptionName::InputBufferSize)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1_048_576)
     }
 
     pub(in crate::pane_terminals) fn resize_transcripts(

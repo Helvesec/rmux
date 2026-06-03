@@ -1,14 +1,15 @@
 use super::RequestHandler;
 use crate::pane_io::AttachControl;
 use rmux_proto::{
-    HookLifecycle, HookName, KillWindowRequest, LastWindowRequest, LinkWindowRequest,
-    ListPanesRequest, ListWindowsRequest, MoveWindowRequest, MoveWindowTarget,
-    NewSessionExtRequest, NewSessionRequest, NewWindowRequest, NextWindowRequest, OptionName,
-    PreviousWindowRequest, RenameWindowRequest, Request, ResizeWindowAdjustment,
-    ResizeWindowRequest, RespawnWindowRequest, Response, RotateWindowDirection,
-    RotateWindowRequest, ScopeSelector, SelectWindowRequest, SessionName, SetOptionMode,
-    SplitWindowRequest, SplitWindowTarget, SwapWindowRequest, TerminalSize, UnlinkWindowRequest,
-    WindowTarget,
+    DisplayMessageRequest, HookLifecycle, HookName, KillSessionRequest, KillWindowRequest,
+    LastWindowRequest, LinkWindowRequest, ListPanesRequest, ListWindowsRequest, MoveWindowRequest,
+    MoveWindowTarget, NewSessionExtRequest, NewSessionRequest, NewWindowRequest, NextWindowRequest,
+    OptionName, PaneTarget, PreviousWindowRequest, RenameSessionRequest, RenameWindowRequest,
+    Request, ResizeWindowAdjustment, ResizeWindowRequest, ResolveTargetRequest, ResolveTargetType,
+    RespawnWindowRequest, Response, RotateWindowDirection, RotateWindowRequest, ScopeSelector,
+    SelectWindowRequest, SessionName, SetOptionMode, SetOptionRequest, SplitDirection,
+    SplitWindowRequest, SplitWindowTarget, SwapWindowRequest, Target, TerminalSize,
+    UnlinkWindowRequest, WindowTarget,
 };
 use std::path::Path;
 use tokio::sync::mpsc;
@@ -71,11 +72,26 @@ fn assert_refresh(control: AttachControl) {
 }
 
 async fn drain_attach_controls(control_rx: &mut mpsc::UnboundedReceiver<AttachControl>) {
-    while let Ok(Some(_)) = timeout(Duration::from_millis(250), control_rx.recv()).await {}
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        let idle = remaining.min(Duration::from_millis(250));
+        match timeout(idle, control_rx.recv()).await {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => break,
+        }
+    }
 }
 
 #[path = "handler_window_tests/lifecycle.rs"]
 mod lifecycle;
+
+#[path = "handler_window_tests/renumber.rs"]
+mod renumber;
 
 #[path = "handler_window_tests/listing_refresh.rs"]
 mod listing_refresh;

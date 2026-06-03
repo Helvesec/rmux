@@ -1,11 +1,11 @@
-use rmux_core::command_parser::CommandParser;
 use rmux_proto::{OptionName, RmuxError};
 use tokio::sync::oneshot;
 use tracing::warn;
 
 use super::super::control_support::ManagedClient;
 use super::super::scripting_support::{
-    spawn_background_async, ParsedPromptHistoryCommand, PromptHistoryAction, QueueCommandAction,
+    command_parser_from_state, spawn_background_async, ParsedPromptHistoryCommand,
+    PromptHistoryAction, QueueCommandAction,
 };
 use super::super::RequestHandler;
 use super::events::process_prompt_event;
@@ -373,7 +373,7 @@ impl RequestHandler {
     ) -> Result<rmux_core::command_parser::ParsedCommands, RmuxError> {
         let substituted = substitute_prompt_template(template, responses);
         let state = self.state.lock().await;
-        let mut parser = CommandParser::new().with_environment_store(&state.environment);
+        let mut parser = command_parser_from_state(&state);
         for (name, value) in format_values {
             parser = parser.with_format_value(name, value.clone());
         }

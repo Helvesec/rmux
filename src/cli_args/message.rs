@@ -4,6 +4,8 @@ use super::QueuedCommand;
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct DisplayMessageArgs {
+    #[arg(short = 'c', allow_hyphen_values = true)]
+    pub(crate) target_client: Option<String>,
     #[arg(short = 't', allow_hyphen_values = true)]
     pub(crate) target: Option<String>,
     #[arg(short = 'p', action = ArgAction::SetTrue)]

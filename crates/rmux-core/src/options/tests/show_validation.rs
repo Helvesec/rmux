@@ -258,3 +258,28 @@ fn show_options_server_scope_excludes_session_and_window_options() {
         .iter()
         .any(|line| line.starts_with("main-pane-width ")));
 }
+
+#[test]
+fn show_options_inheritance_markers_do_not_mark_global_defaults() {
+    let store = OptionStore::new();
+
+    let session_global = store
+        .show_options_lines_with_mode_filtered(
+            &OptionScopeSelector::SessionGlobal,
+            Some("status"),
+            false,
+            ShowOptionsMode::ResolvedWithInheritanceMarkers,
+        )
+        .expect("global session option shows");
+    assert_eq!(session_global, vec!["status on".to_owned()]);
+
+    let window_global = store
+        .show_options_lines_with_mode_filtered(
+            &OptionScopeSelector::WindowGlobal,
+            Some("pane-border-lines"),
+            false,
+            ShowOptionsMode::ResolvedWithInheritanceMarkers,
+        )
+        .expect("global window option shows");
+    assert_eq!(window_global, vec!["pane-border-lines single".to_owned()]);
+}

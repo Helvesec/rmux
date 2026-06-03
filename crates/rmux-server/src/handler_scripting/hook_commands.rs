@@ -1,7 +1,8 @@
-use rmux_core::command_parser::{CommandParser, ParsedCommands};
+use rmux_core::command_parser::ParsedCommands;
 use rmux_proto::{RmuxError, SessionName, Target};
 
 use super::super::RequestHandler;
+use super::parser_context::command_parser_from_state;
 use super::queue::QueueExecutionContext;
 use crate::hook_runtime::current_hook_formats;
 use crate::terminal::{spawn_hook_command_with_profile, TerminalProfile};
@@ -48,7 +49,7 @@ impl RequestHandler {
     ) -> Result<ParsedCommands, RmuxError> {
         let mut parser = {
             let state = self.state.lock().await;
-            CommandParser::new().with_environment_store(&state.environment)
+            command_parser_from_state(&state)
         };
         for (name, value) in current_hook_formats() {
             parser = parser.with_format_value(name, value);

@@ -5,7 +5,6 @@ use super::super::super::{
     scripting_support::{spawn_background_async, QueueExecutionContext},
     RequestHandler,
 };
-use crate::client_flags::ClientFlags;
 
 pub(super) struct AttachedBindingCommandContext {
     pub(super) attach_pid: u32,
@@ -35,20 +34,6 @@ pub(super) async fn execute_attached_binding_commands(
     let context = QueueExecutionContext::without_caller_cwd()
         .with_current_target(Some(dispatch_target.clone()))
         .with_mouse_target(mouse_target);
-
-    if attached_live_input
-        && web_controls_client(handler, attach_pid).await
-        && !web_controls_commands_allowed(&commands)
-    {
-        handler
-            .report_attached_command_error(
-                &session_name,
-                attach_pid,
-                &RmuxError::Server("command is not allowed through web controls".to_owned()),
-            )
-            .await;
-        return Ok(());
-    }
 
     if parsed_commands_block_for_prompt(&commands) {
         if attached_live_input
@@ -102,87 +87,6 @@ pub(super) async fn execute_attached_binding_commands(
     }
 
     Ok(())
-}
-
-async fn web_controls_client(handler: &RequestHandler, attach_pid: u32) -> bool {
-    let active_attach = handler.active_attach.lock().await;
-    active_attach
-        .by_pid
-        .get(&attach_pid)
-        .is_some_and(|active| active.flags.contains(ClientFlags::WEB_CONTROLS))
-}
-
-fn web_controls_commands_allowed(commands: &ParsedCommands) -> bool {
-    commands.commands().iter().all(web_controls_command_allowed)
-}
-
-fn web_controls_command_allowed(command: &ParsedCommand) -> bool {
-    let allowed = matches!(
-        command.name(),
-        "split-window"
-            | "new-window"
-            | "display-message"
-            | "last-window"
-            | "list-keys"
-            | "next-window"
-            | "previous-window"
-            | "select-pane"
-            | "select-window"
-            | "resize-pane"
-            | "rename-window"
-            | "display-panes"
-    );
-    allowed
-        && !contains_cross_target_option(command)
-        && command.arguments().iter().all(|argument| match argument {
-            CommandArgument::String(_) => true,
-            CommandArgument::Commands(commands) => web_controls_commands_allowed(commands),
-        })
-}
-
-fn contains_cross_target_option(command: &ParsedCommand) -> bool {
-    let args = command
-        .arguments()
-        .iter()
-        .filter_map(CommandArgument::as_string)
-        .collect::<Vec<_>>();
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index];
-        if arg == "--" {
-            break;
-        }
-        if is_target_option(arg) {
-            return true;
-        }
-        index += 1;
-    }
-    false
-}
-
-fn is_target_option(arg: &str) -> bool {
-    if !arg.starts_with('-') || arg == "-" {
-        return false;
-    }
-    if matches!(
-        arg,
-        "--target" | "--target-pane" | "--session" | "--source" | "--src-pane" | "--dst-pane"
-    ) {
-        return true;
-    }
-    if arg.starts_with("--target=")
-        || arg.starts_with("--target-pane=")
-        || arg.starts_with("--session=")
-        || arg.starts_with("--source=")
-        || arg.starts_with("--src-pane=")
-        || arg.starts_with("--dst-pane=")
-    {
-        return true;
-    }
-    if arg.starts_with("--") {
-        return false;
-    }
-    arg[1..].chars().any(|flag| matches!(flag, 't' | 's'))
 }
 
 fn parsed_commands_block_for_prompt(commands: &ParsedCommands) -> bool {
@@ -254,33 +158,5 @@ mod tests {
             .parse_one_group("display-panes -b")
             .unwrap();
         assert!(!parsed_commands_block_for_prompt(&parsed));
-    }
-
-    #[test]
-    fn web_controls_whitelist_excludes_cross_session_inventory_and_destructive_commands() {
-        use rmux_core::command_parser::CommandParser;
-
-        let parser = CommandParser::new();
-        let split = parser.parse_one_group("split-window -h").unwrap();
-        assert!(web_controls_commands_allowed(&split));
-
-        let split_other = parser.parse_one_group("split-window -t other -h").unwrap();
-        assert!(!web_controls_commands_allowed(&split_other));
-
-        let rename_other = parser
-            .parse_one_group("rename-window -t other:0 web")
-            .unwrap();
-        assert!(!web_controls_commands_allowed(&rename_other));
-
-        let choose_tree = parser.parse_one_group("choose-tree").unwrap();
-        assert!(!web_controls_commands_allowed(&choose_tree));
-
-        let kill_session = parser.parse_one_group("kill-session").unwrap();
-        assert!(!web_controls_commands_allowed(&kill_session));
-
-        let nested_run_shell = parser
-            .parse_one_group("if-shell true { run-shell 'touch /tmp/rmux-pwned' }")
-            .unwrap();
-        assert!(!web_controls_commands_allowed(&nested_run_shell));
     }
 }

@@ -135,6 +135,19 @@ fn input_buf_overflow_sets_discard() {
 }
 
 #[test]
+fn input_buffer_limit_can_be_configured() {
+    let mut parser = InputParser::new();
+    let mut writer = RecordingWriter::new(80, 24);
+    parser.set_input_buffer_limit(64);
+
+    parser.parse(b"\x1b]2;", &mut writer);
+    parser.parse(&[b'A'; 65], &mut writer);
+    parser.parse(b"\x1b\\", &mut writer);
+
+    assert!(!writer.has_call("set_title"));
+}
+
+#[test]
 fn oversized_kitty_apc_records_a_passthrough_drop() {
     let mut parser = InputParser::new();
     let mut writer = RecordingWriter::new(80, 24);

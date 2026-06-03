@@ -1,10 +1,7 @@
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
-use rmux_core::{
-    command_parser::{CommandParser, ParsedCommands},
-    formats::FormatContext,
-};
+use rmux_core::{command_parser::ParsedCommands, formats::FormatContext};
 use rmux_proto::{
     CommandOutput, ErrorResponse, PaneTarget, Response, RmuxError, SourceFileRequest,
     SourceFileResponse, Target,
@@ -12,6 +9,7 @@ use rmux_proto::{
 
 use super::super::RequestHandler;
 use super::format_context::{format_context_for_target, parser_with_parse_time_context};
+use super::parser_context::command_parser_from_state;
 use super::queue::{QueueCommandAction, QueueExecutionContext};
 use super::source_files::{
     default_config_paths, default_tmux_fallback_paths, source_inputs_for_path, source_parse_error,
@@ -25,7 +23,6 @@ use crate::{ConfigFileSelection, ConfigLoadOptions};
 impl RequestHandler {
     pub(crate) async fn load_startup_config(&self, config_load: ConfigLoadOptions) {
         self.config_loading_depth.fetch_add(1, Ordering::Relaxed);
-        let queue_errors = !matches!(config_load.selection(), ConfigFileSelection::Files(_));
         let (paths, tmux_fallback_paths) = match config_load.selection() {
             ConfigFileSelection::Disabled => {
                 self.config_loading_depth.fetch_sub(1, Ordering::Relaxed);
@@ -57,9 +54,7 @@ impl RequestHandler {
         let loaded = match self.load_source_file_command(&command, 1).await {
             Ok(loaded) => loaded,
             Err(error) => {
-                if queue_errors {
-                    self.startup_config_errors.lock().await.push(error);
-                }
+                self.startup_config_errors.lock().await.push(error);
                 self.config_loading_depth.fetch_sub(1, Ordering::Relaxed);
                 return;
             }
@@ -100,10 +95,8 @@ impl RequestHandler {
         {
             errors.push(error);
         }
-        if queue_errors {
-            if let Some(error) = super::aggregate_rmux_errors(errors) {
-                self.startup_config_errors.lock().await.push(error);
-            }
+        if let Some(error) = super::aggregate_rmux_errors(errors) {
+            self.startup_config_errors.lock().await.push(error);
         }
         self.config_loading_depth.fetch_sub(1, Ordering::Relaxed);
     }
@@ -338,7 +331,7 @@ impl RequestHandler {
             0
         };
         let state = self.state.lock().await;
-        let mut parser = CommandParser::new().with_environment_store(&state.environment);
+        let mut parser = command_parser_from_state(&state);
         let context = match target {
             Some(target) => {
                 format_context_for_target(&state, &Target::Pane(target.clone()), attached_count)?
@@ -408,6 +401,36 @@ mod tests {
         assert!(
             rendered.contains(".rmux.conf"),
             "expected rmux config load error, got {rendered}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn explicit_startup_config_errors_are_retained() {
+        let _lock = crate::test_env::lock_async().await;
+        let root = unique_temp_root("explicit-load-error");
+        let config_path = root.join("bad.conf");
+        write_test_config(config_path.clone(), "definitely-not-a-command\n");
+        let handler = RequestHandler::new();
+        let config = DaemonConfig::new(root.join("rmux.sock")).with_config_files(
+            vec![config_path],
+            false,
+            Some(root.clone()),
+        );
+
+        handler
+            .load_startup_config(config.config_load().clone())
+            .await;
+
+        let errors = handler.startup_config_errors.lock().await;
+        let rendered = errors
+            .first()
+            .expect("explicit config load error should be retained")
+            .to_string();
+        assert!(
+            rendered.contains("definitely-not-a-command"),
+            "expected explicit config error, got {rendered}"
         );
 
         let _ = fs::remove_dir_all(root);

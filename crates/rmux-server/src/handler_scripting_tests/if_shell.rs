@@ -36,6 +36,83 @@ async fn if_shell_format_mode_dispatches_selected_rmux_command() {
 }
 
 #[tokio::test]
+async fn source_file_if_shell_true_executes_brace_command_list() {
+    let handler = RequestHandler::new();
+    let root = temp_root("if-shell-true-brace");
+    let config = root.join("main.conf");
+    write_config(&config, "if-shell true { set-buffer -b chosen selected }\n");
+
+    let response = handler
+        .handle(source_file_request(
+            vec!["main.conf".to_owned()],
+            Some(root.clone()),
+        ))
+        .await;
+    assert_eq!(
+        response,
+        Response::SourceFile(rmux_proto::SourceFileResponse { output: None })
+    );
+
+    let response = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("chosen".to_owned()),
+        }))
+        .await;
+    assert_eq!(
+        response
+            .command_output()
+            .expect("show-buffer output")
+            .stdout(),
+        b"selected"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn if_shell_pane_id_target_resolves_like_display_message() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let display_message = CommandParser::new()
+        .parse("display-message -p -t %0 OKDM")
+        .expect("display-message parses");
+    let display_output = handler
+        .execute_parsed_commands(
+            std::process::id(),
+            display_message,
+            QueueExecutionContext::without_caller_cwd(),
+        )
+        .await
+        .expect("display-message -t %0 should resolve");
+    assert_eq!(String::from_utf8_lossy(&display_output.stdout), "OKDM\n");
+
+    let if_shell = CommandParser::new()
+        .parse("if-shell -F -t %0 1 \"display-message -p XOK\"")
+        .expect("if-shell parses");
+    let if_shell_output = handler
+        .execute_parsed_commands(
+            std::process::id(),
+            if_shell,
+            QueueExecutionContext::without_caller_cwd(),
+        )
+        .await
+        .expect("if-shell -t %0 should resolve");
+    assert_eq!(String::from_utf8_lossy(&if_shell_output.stdout), "XOK\n");
+}
+
+#[tokio::test]
 async fn if_shell_false_without_else_is_a_successful_noop() {
     let handler = RequestHandler::new();
 

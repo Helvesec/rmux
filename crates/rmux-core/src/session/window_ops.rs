@@ -232,20 +232,40 @@ impl Session {
 
     /// Reindexes sparse window slots into a contiguous `0..n` range without rewriting the windows themselves.
     pub fn reindex_windows(&mut self) -> Result<BTreeMap<u32, u32>, RmuxError> {
-        let previous_windows = std::mem::take(&mut self.windows);
-        let mut reindexed = BTreeMap::new();
-        let mut index_map = BTreeMap::new();
-        let mut next_index = 0_u32;
+        self.reindex_windows_from(0)
+    }
 
-        for (window_index, window) in previous_windows {
-            index_map.insert(window_index, next_index);
-            reindexed.insert(next_index, window);
-            next_index = next_index.checked_add(1).ok_or_else(|| {
+    /// Reindexes sparse window slots into a contiguous range starting at `first_index`.
+    pub fn reindex_windows_from(
+        &mut self,
+        first_index: u32,
+    ) -> Result<BTreeMap<u32, u32>, RmuxError> {
+        if !self.windows.is_empty() {
+            let last_offset = self.windows.len().saturating_sub(1) as u32;
+            first_index.checked_add(last_offset).ok_or_else(|| {
                 RmuxError::Server(format!(
                     "window index space exhausted for session {}",
                     self.name
                 ))
             })?;
+        }
+        let previous_windows = std::mem::take(&mut self.windows);
+        let mut reindexed = BTreeMap::new();
+        let mut index_map = BTreeMap::new();
+        let mut next_index = first_index;
+
+        let window_count = previous_windows.len();
+        for (position, (window_index, window)) in previous_windows.into_iter().enumerate() {
+            index_map.insert(window_index, next_index);
+            reindexed.insert(next_index, window);
+            if position + 1 < window_count {
+                next_index = next_index.checked_add(1).ok_or_else(|| {
+                    RmuxError::Server(format!(
+                        "window index space exhausted for session {}",
+                        self.name
+                    ))
+                })?;
+            }
         }
 
         self.windows = reindexed;

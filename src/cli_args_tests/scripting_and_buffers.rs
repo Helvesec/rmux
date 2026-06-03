@@ -22,6 +22,20 @@ fn display_message_accepts_print_target_and_hyphen_prefixed_format_text() {
 }
 
 #[test]
+fn display_message_accepts_target_client_without_treating_it_as_message() {
+    let cli = parse_args(&["display-message", "-c", "123", "-p", "hello"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::DisplayMessage(args) => {
+            assert_eq!(args.target_client.as_deref(), Some("123"));
+            assert!(args.print);
+            assert_eq!(args.message, vec!["hello"]);
+        }
+        _ => panic!("expected DisplayMessage command"),
+    }
+}
+
+#[test]
 fn run_shell_accepts_background_and_hyphen_prefixed_shell_text() {
     let cli = parse_args(&["run-shell", "-b", "-printf", "ok"]).unwrap();
 

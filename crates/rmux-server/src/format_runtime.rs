@@ -2,11 +2,10 @@ use std::sync::OnceLock;
 
 use crate::pane_terminals::HandlerState;
 use chrono::Local;
-use rmux_core::formats::{render_template, FormatContext, FormatVariable, FormatVariables};
-use rmux_core::{
-    AlertFlags, BufferStore, EnvironmentStore, OptionStore, Pane, Session, SessionStore, Window,
-    WINLINK_ACTIVITY, WINLINK_BELL, WINLINK_SILENCE,
+use rmux_core::formats::{
+    expand_time_tokens, render_template, FormatContext, FormatVariable, FormatVariables,
 };
+use rmux_core::{BufferStore, EnvironmentStore, OptionStore, Pane, Session, SessionStore, Window};
 use rmux_proto::OptionName;
 use rmux_proto::{SessionName, TerminalSize};
 
@@ -14,6 +13,8 @@ static SERVER_START_TIME: OnceLock<i64> = OnceLock::new();
 
 #[path = "format_runtime/geometry.rs"]
 mod geometry;
+#[path = "format_runtime/index.rs"]
+mod index;
 #[path = "format_runtime/loops.rs"]
 mod loops;
 #[path = "format_runtime/path.rs"]
@@ -22,6 +23,8 @@ mod path;
 mod process;
 #[path = "format_runtime/variables.rs"]
 mod variables;
+#[path = "format_runtime/window.rs"]
+mod window;
 
 pub(crate) struct RuntimeFormatContext<'a> {
     base: FormatContext,
@@ -112,20 +115,6 @@ impl<'a> RuntimeFormatContext<'a> {
         self
     }
 
-    fn pane_index_with_base(&self) -> Option<String>{
-        let raw = self
-            .base
-            .format_value(FormatVariable::PaneIndex)?
-            .parse::<u32>()
-            .ok()?;
-        let base = self
-            .option_store()
-            .and_then(|store| store.resolve(self.session_name(), OptionName::PaneBaseIndex))
-            .and_then(|value| value.parse::<u32>().ok())
-            .unwrap_or(0);
-        Some(raw.saturating_add(base).to_string())
-    }
-
     fn option_store(&self) -> Option<&OptionStore> {
         self.options
     }
@@ -136,182 +125,6 @@ impl<'a> RuntimeFormatContext<'a> {
 
     fn session_name(&self) -> Option<&SessionName> {
         self.session.map(Session::name)
-    }
-
-    fn session_group_name(&self) -> Option<SessionName> {
-        let session = self.session?;
-        self.session_store
-            .and_then(|store| store.session_group_name(session.name()).cloned())
-            .or_else(|| session.group_name().cloned())
-    }
-
-    fn session_group_members(&self) -> Vec<SessionName> {
-        let Some(session) = self.session else {
-            return Vec::new();
-        };
-        self.session_store
-            .map(|store| store.session_group_members(session.name()))
-            .unwrap_or_else(|| vec![session.name().clone()])
-    }
-
-    fn session_attached_count(&self) -> usize {
-        self.base
-            .format_value(FormatVariable::SessionAttached)
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(0)
-    }
-
-    fn window_flags(&self) -> Option<String> {
-        Some(self.printable_window_flags(true))
-    }
-
-    #[cfg(unix)]
-    fn window_linked(&self) -> Option<String> {
-        let session_name = self.session_name()?;
-        let window_index = self.window_index?;
-        Some(bool_string(
-            self.state?
-                .window_link_count(session_name, window_index)
-                .saturating_sub(1)
-                > 0,
-        ))
-    }
-
-    #[cfg(windows)]
-    fn window_linked(&self) -> Option<String> {
-        None
-    }
-
-    #[cfg(unix)]
-    fn window_linked_sessions(&self) -> Option<String> {
-        let session_name = self.session_name()?;
-        let window_index = self.window_index?;
-        Some(
-            self.state?
-                .window_linked_session_count(session_name, window_index)
-                .to_string(),
-        )
-    }
-
-    #[cfg(windows)]
-    fn window_linked_sessions(&self) -> Option<String> {
-        None
-    }
-
-    #[cfg(unix)]
-    fn window_linked_sessions_list(&self) -> Option<String> {
-        let session_name = self.session_name()?;
-        let window_index = self.window_index?;
-        Some(
-            self.state?
-                .window_linked_sessions_list(session_name, window_index)
-                .into_iter()
-                .map(|session_name| session_name.to_string())
-                .collect::<Vec<_>>()
-                .join(","),
-        )
-    }
-
-    #[cfg(windows)]
-    fn window_linked_sessions_list(&self) -> Option<String> {
-        None
-    }
-
-    fn window_alert_flags(&self) -> AlertFlags {
-        self.session
-            .zip(self.window_index)
-            .map(|(session, window_index)| session.winlink_alert_flags(window_index))
-            .unwrap_or_else(AlertFlags::empty)
-    }
-
-    fn printable_window_flags(&self, escape_activity: bool) -> String {
-        let active = self
-            .base
-            .format_value(FormatVariable::WindowActive)
-            .is_some_and(|value| value == "1");
-        let last = self
-            .base
-            .format_value(FormatVariable::WindowLastFlag)
-            .is_some_and(|value| value == "1");
-        let zoomed = self.window.is_some_and(Window::is_zoomed);
-        let alerts = self.window_alert_flags();
-
-        let mut flags = String::new();
-        if alerts.contains(WINLINK_ACTIVITY) {
-            if escape_activity {
-                flags.push_str("##");
-            } else {
-                flags.push('#');
-            }
-        }
-        if alerts.contains(WINLINK_BELL) {
-            flags.push('!');
-        }
-        if alerts.contains(WINLINK_SILENCE) {
-            flags.push('~');
-        }
-        if active {
-            flags.push('*');
-        } else if last {
-            flags.push('-');
-        }
-        if zoomed {
-            flags.push('Z');
-        }
-        flags
-    }
-
-    fn session_alert(&self) -> Option<String> {
-        let session = self.session?;
-        let flags = session.session_alert_flags();
-        let mut value = String::new();
-        if flags.contains(WINLINK_ACTIVITY) {
-            value.push('#');
-        }
-        if flags.contains(WINLINK_BELL) {
-            value.push('!');
-        }
-        if flags.contains(WINLINK_SILENCE) {
-            value.push('~');
-        }
-        Some(value)
-    }
-
-    fn session_alerts(&self) -> Option<String> {
-        let session = self.session?;
-        let alerts = session
-            .alerted_window_indexes()
-            .into_iter()
-            .filter_map(|window_index| {
-                let flags = session.winlink_alert_flags(window_index);
-                if flags.is_empty() {
-                    return None;
-                }
-
-                let mut value = window_index.to_string();
-                if flags.contains(WINLINK_ACTIVITY) {
-                    value.push('#');
-                }
-                if flags.contains(WINLINK_BELL) {
-                    value.push('!');
-                }
-                if flags.contains(WINLINK_SILENCE) {
-                    value.push('~');
-                }
-                Some(value)
-            })
-            .collect::<Vec<_>>();
-        Some(alerts.join(","))
-    }
-
-    fn session_flag(&self, flag: AlertFlags) -> Option<String> {
-        self.session
-            .map(|session| bool_string(session.session_alert_flags().contains(flag)))
-    }
-
-    fn window_flag(&self, flag: AlertFlags) -> Option<String> {
-        self.window_index
-            .map(|_| bool_string(self.window_alert_flags().contains(flag)))
     }
 
     fn pane_history_size(&self) -> Option<String> {
@@ -413,7 +226,13 @@ impl<'a> RuntimeFormatContext<'a> {
         let window_index = self.window_index?;
         let window = self.window?;
         let tracked = state.tracks_auto_named_window(session_name, window_index);
-        if !(tracked || window.automatic_rename() || window.name().is_none()) {
+        if !crate::automatic_rename::window_allows_automatic_rename(
+            &state.options,
+            session_name,
+            window_index,
+            window,
+            tracked,
+        ) {
             return None;
         }
 
@@ -652,7 +471,7 @@ where
     V: FormatVariables + ?Sized,
 {
     let template = if expand_time {
-        Local::now().format(template).to_string()
+        expand_time_tokens(template)
     } else {
         template.to_owned()
     };
@@ -691,5 +510,13 @@ mod tests {
         assert_eq!(bytes[2], b':');
         assert!(bytes[3].is_ascii_digit());
         assert!(bytes[4].is_ascii_digit());
+    }
+
+    #[test]
+    fn render_runtime_template_keeps_invalid_percent_literals() {
+        assert_eq!(
+            render_runtime_template("cpu 100%", &FormatContext::new(), true),
+            "cpu 100%"
+        );
     }
 }

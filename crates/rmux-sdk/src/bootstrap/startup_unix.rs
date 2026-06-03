@@ -48,7 +48,11 @@ pub const SOCKET_DIRECTORY_MODE: u32 = 0o700;
 /// World/group bit mask; any of these set on a socket-related path is unsafe.
 pub const UNSAFE_PERMISSION_MASK: u32 = 0o077;
 /// Default deadline a startup owner waits for the launched daemon to bind.
-pub const DEFAULT_STARTUP_DEADLINE: Duration = Duration::from_secs(5);
+///
+/// Hidden daemon startup can contend with other release-gate suites on macOS
+/// runners. A longer deadline keeps the bootstrap fail-closed while avoiding
+/// false negatives when the child process is merely slow to bind the socket.
+pub const DEFAULT_STARTUP_DEADLINE: Duration = Duration::from_secs(20);
 /// Default poll interval used while waiting for the daemon to become ready.
 pub const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 

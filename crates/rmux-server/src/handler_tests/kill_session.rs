@@ -381,7 +381,7 @@ async fn kill_session_last_session_respects_exit_empty_off() {
 }
 
 #[tokio::test]
-async fn kill_session_last_session_detaches_attached_clients_before_shutdown() {
+async fn kill_session_last_session_exits_attached_clients_before_shutdown() {
     let handler = RequestHandler::new();
     let (shutdown_handle, shutdown_rx) = ShutdownHandle::new();
     handler.install_shutdown_handle(shutdown_handle);
@@ -422,7 +422,7 @@ async fn kill_session_last_session_detaches_attached_clients_before_shutdown() {
         response,
         Response::KillSession(rmux_proto::KillSessionResponse { existed: true })
     );
-    assert!(matches!(control_rx.try_recv(), Ok(AttachControl::Detach)));
+    assert!(matches!(control_rx.try_recv(), Ok(AttachControl::Exited)));
     let active_attach = handler.active_attach.lock().await;
     assert!(
         active_attach.by_pid.is_empty(),
@@ -431,7 +431,7 @@ async fn kill_session_last_session_detaches_attached_clients_before_shutdown() {
     drop(active_attach);
     assert!(
         handler.request_shutdown_if_pending(),
-        "last-session kill should queue shutdown after detaching clients"
+        "last-session kill should queue shutdown after exiting clients"
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(50), shutdown_rx)

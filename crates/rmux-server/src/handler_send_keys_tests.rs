@@ -8,8 +8,8 @@ use rmux_proto::{
     BindKeyRequest, CopyModeRequest, ErrorResponse, ListKeysRequest, ListPanesRequest,
     NewSessionRequest, OptionName, PaneBroadcastInputRequest, PaneId, PaneTarget, PaneTargetRef,
     Request, Response, RmuxError, ScopeSelector, SelectPaneRequest, SendKeysExtRequest,
-    SendKeysRequest, SendKeysResponse, SendPrefixRequest, SetOptionMode, SetOptionRequest,
-    ShowBufferRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget,
+    SendKeysRequest, SendKeysResponse, SendPrefixRequest, SendPrefixResponse, SetOptionMode,
+    SetOptionRequest, ShowBufferRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget,
     SwitchClientExtRequest, TerminalSize, UnbindKeyRequest, WindowTarget, DEFAULT_MAX_FRAME_LENGTH,
 };
 use std::time::Duration;
@@ -18,6 +18,9 @@ use tokio::time::sleep;
 
 #[path = "handler_send_keys_tests/basic_dispatch.rs"]
 mod basic_dispatch;
+
+#[path = "handler_send_keys_tests/target_client.rs"]
+mod target_client;
 
 #[path = "handler_send_keys_tests/bindings_timeouts.rs"]
 mod bindings_timeouts;
@@ -35,6 +38,9 @@ mod bracketed_paste_large;
 
 #[path = "handler_send_keys_tests/kitty_graphics_live.rs"]
 mod kitty_graphics_live;
+
+#[path = "handler_send_keys_tests/synchronize_panes.rs"]
+mod synchronize_panes;
 
 #[path = "handler_send_keys_tests/attached_input_bounds.rs"]
 mod attached_input_bounds;

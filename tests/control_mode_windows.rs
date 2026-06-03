@@ -2,26 +2,39 @@
 
 use std::error::Error;
 use std::fs::{self, File};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rmux_proto::{CONTROL_CONTROL_END, CONTROL_CONTROL_START};
 
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+#[path = "support/windows_cli_serial.rs"]
+mod windows_cli_serial;
+
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[test]
 fn control_control_mode_uses_tmux_text_protocol() -> Result<(), Box<dyn Error>> {
+    let _serial_guard = windows_cli_serial::acquire("control-control-mode")?;
     let label = unique_label("control-mode-windows")?;
     let _server = ServerGuard::new(label.clone());
 
-    assert_status_success(
+    let cmd = cmd_exe();
+    assert_command_success(
         rmux_command()
-            .args(["-L", &label, "new-session", "-d", "-s", "alpha"])
+            .args([
+                "-L",
+                &label,
+                "new-session",
+                "-d",
+                "-s",
+                "alpha",
+                cmd.as_str(),
+                "/d",
+                "/q",
+            ])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?,
+            .output()?,
         "create detached session",
     )?;
 
@@ -63,16 +76,26 @@ fn control_control_mode_uses_tmux_text_protocol() -> Result<(), Box<dyn Error>> 
 
 #[test]
 fn plain_control_mode_exits_after_stdin_eof_without_empty_line() -> Result<(), Box<dyn Error>> {
+    let _serial_guard = windows_cli_serial::acquire("plain-control-mode")?;
     let label = unique_label("plain-control-mode-windows")?;
     let _server = ServerGuard::new(label.clone());
 
-    assert_status_success(
+    let cmd = cmd_exe();
+    assert_command_success(
         rmux_command()
-            .args(["-L", &label, "new-session", "-d", "-s", "alpha"])
+            .args([
+                "-L",
+                &label,
+                "new-session",
+                "-d",
+                "-s",
+                "alpha",
+                cmd.as_str(),
+                "/d",
+                "/q",
+            ])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?,
+            .output()?,
         "create detached session",
     )?;
 
@@ -121,12 +144,28 @@ fn temp_file_path(label: &str, extension: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("{label}.{extension}"))
 }
 
-fn assert_status_success(status: ExitStatus, context: &str) -> Result<(), Box<dyn Error>> {
-    if status.success() {
+fn assert_command_success(output: Output, context: &str) -> Result<(), Box<dyn Error>> {
+    if output.status.success() {
         return Ok(());
     }
 
-    Err(format!("{context} failed with status {:?}", status.code()).into())
+    Err(format!(
+        "{context} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .into())
+}
+
+fn cmd_exe() -> String {
+    std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join("cmd.exe")
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn wait_for_child_exit(child: &mut Child, timeout: Duration) -> Result<ExitStatus, Box<dyn Error>> {

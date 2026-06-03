@@ -329,11 +329,9 @@ async fn parsed_queue_uses_current_target_for_new_window_split_and_zoom() {
 }
 
 #[tokio::test]
-async fn parsed_queue_split_window_accepts_start_directory() {
+async fn parsed_queue_reports_missing_target_client_before_input() {
     let handler = RequestHandler::new();
-    let alpha = session_name("split-cwd");
-    let cwd = temp_root("split-cwd");
-    fs::create_dir_all(&cwd).expect("split cwd");
+    let alpha = session_name("alpha");
     assert!(matches!(
         handler
             .handle(Request::NewSession(NewSessionRequest {
@@ -346,33 +344,30 @@ async fn parsed_queue_split_window_accepts_start_directory() {
         Response::NewSession(_)
     ));
 
+    for command in [
+        "send-keys -c 999999 -t alpha:0.0 echo SHOULD_NOT_TYPE",
+        "display-message -c 999999 hello",
+    ] {
+        let parsed = CommandParser::new()
+            .parse(command)
+            .expect("command parses at queue layer");
+        let output = handler
+            .execute_parsed_commands_for_test(std::process::id(), parsed)
+            .await
+            .expect("missing target-client is a tmux-compatible noop");
+
+        assert!(output.stdout().is_empty());
+    }
+
     let parsed = CommandParser::new()
-        .parse(&format!("split-window -c {}", shell_quote(&cwd)))
-        .expect("command parses");
-    handler
-        .execute_parsed_commands(
-            std::process::id(),
-            parsed,
-            QueueExecutionContext::without_caller_cwd().with_current_target(Some(Target::Pane(
-                PaneTarget::with_window(alpha.clone(), 0, 0),
-            ))),
-        )
+        .parse("display-message -p -c 999999 hello")
+        .expect("command parses at queue layer");
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
         .await
-        .expect("split-window -c succeeds");
+        .expect("print with missing target-client still succeeds");
 
-    let state = handler.state.lock().await;
-    let session = state.sessions.session(&alpha).expect("session exists");
-    let pane = session
-        .window_at(0)
-        .expect("window exists")
-        .pane(1)
-        .expect("split pane exists");
-    let lifecycle = state
-        .pane_lifecycle(pane.id())
-        .expect("split lifecycle exists");
-    assert_eq!(lifecycle.working_directory(), Some(cwd.as_path()));
-
-    let _ = fs::remove_dir_all(cwd);
+    assert_eq!(output.stdout(), b"hello\n");
 }
 
 #[tokio::test]
@@ -410,6 +405,40 @@ async fn parsed_queue_uses_current_target_for_display_panes_without_t() {
         .expect("display-panes should use the current target");
 
     let _overlay = control_rx.recv().await.expect("display-panes overlay");
+}
+
+#[tokio::test]
+async fn parsed_queue_display_panes_t_reports_target_client_errors_like_cli() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha,
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    for (command, expected) in [
+        ("display-panes -t 999999", "can't find client: 999999"),
+        ("display-panes -t alpha", "can't find client: alpha"),
+        ("display-panes -t alpha:0", "can't find client: alpha:0"),
+        ("display-panes -t alpha:", "can't find client: alpha"),
+    ] {
+        let parsed = CommandParser::new()
+            .parse(command)
+            .expect("display-panes command parses");
+        let error = handler
+            .execute_parsed_commands_for_test(std::process::id(), parsed)
+            .await
+            .expect_err("missing target-client should fail");
+
+        assert_eq!(error, rmux_proto::RmuxError::Message(expected.to_owned()));
+    }
 }
 
 #[tokio::test]

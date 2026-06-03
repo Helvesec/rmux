@@ -298,6 +298,18 @@ fn send_keys_accepts_hyphen_prefixed_values() {
 }
 
 #[test]
+fn send_keys_parses_target_client_without_treating_it_as_input() {
+    let cli = parse_args(&["send-keys", "-c", "123", "-t", "alpha:0.0", "Enter"]).unwrap();
+    match cli.command.expect("parsed command") {
+        super::super::Command::SendKeys(args) => {
+            assert_eq!(args.client_target.as_deref(), Some("123"));
+            assert_eq!(args.keys, vec!["Enter"]);
+        }
+        _ => panic!("expected SendKeys command"),
+    }
+}
+
+#[test]
 fn capture_pane_accepts_public_command_name_and_flags() {
     let cli = parse_args(&[
         "capture-pane",

@@ -12,12 +12,13 @@ use rmux_core::command_parser::CommandParser;
 use rmux_core::TargetFindContext;
 use rmux_proto::{
     BreakPaneRequest, CommandOutput, DisplayMessageRequest, IfShellRequest, KillWindowRequest,
-    NewSessionExtRequest, NewSessionRequest, NewWindowRequest, OptionName, PaneTarget, Request,
-    RespawnPaneRequest, RespawnWindowRequest, Response, RotateWindowDirection, RotateWindowRequest,
-    RunShellRequest, RunShellResponse, ScopeSelector, SelectPaneRequest, SessionName,
-    SetEnvironmentRequest, SetOptionMode, SetOptionRequest, ShowBufferRequest, SourceFileRequest,
-    SplitDirection, SplitWindowRequest, SplitWindowTarget, SwapPaneDirection, SwapPaneRequest,
-    Target, TerminalSize, WaitForMode, WaitForRequest, WaitForResponse, WindowTarget,
+    LinkWindowRequest, NewSessionExtRequest, NewSessionRequest, NewWindowRequest, OptionName,
+    OptionScopeSelector, PaneTarget, Request, RespawnPaneRequest, RespawnWindowRequest, Response,
+    RotateWindowDirection, RotateWindowRequest, RunShellRequest, RunShellResponse, ScopeSelector,
+    SelectPaneRequest, SessionName, SetEnvironmentRequest, SetOptionMode, SetOptionRequest,
+    ShowBufferRequest, ShowOptionsRequest, SourceFileRequest, SplitDirection, SplitWindowRequest,
+    SplitWindowTarget, SwapPaneDirection, SwapPaneRequest, Target, TerminalSize, WaitForMode,
+    WaitForRequest, WaitForResponse, WindowTarget,
 };
 
 fn session_name(value: &str) -> SessionName {
@@ -158,6 +159,9 @@ mod if_shell;
 #[path = "handler_scripting_tests/parsed_queue_core.rs"]
 mod parsed_queue_core;
 
+#[path = "handler_scripting_tests/parsed_queue_split.rs"]
+mod parsed_queue_split;
+
 #[path = "handler_scripting_tests/parsed_queue_targets.rs"]
 mod parsed_queue_targets;
 
@@ -166,3 +170,9 @@ mod parsed_queue_windows_mouse;
 
 #[path = "handler_scripting_tests/control_hooks_wait.rs"]
 mod control_hooks_wait;
+
+#[path = "handler_scripting_tests/command_alias.rs"]
+mod command_alias;
+
+#[path = "handler_scripting_tests/command_blocks.rs"]
+mod command_blocks;

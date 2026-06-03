@@ -13,6 +13,7 @@ fn build_screen(cols: u16, rows: u16, content: &str) -> Screen {
 fn test_context() -> CopyModeCommandContext {
     CopyModeCommandContext {
         mode_keys: ModeKeys::Emacs,
+        wrap_search: true,
         word_separators: " -_@".to_owned(),
         default_shell: "/bin/sh".to_owned(),
         working_directory: None,
@@ -48,6 +49,7 @@ fn summary_top_line_time_is_preserved_for_history_lines() {
 fn vi_context() -> CopyModeCommandContext {
     CopyModeCommandContext {
         mode_keys: ModeKeys::Vi,
+        wrap_search: true,
         word_separators: " -_@".to_owned(),
         default_shell: "/bin/sh".to_owned(),
         working_directory: None,
@@ -170,6 +172,28 @@ fn search_again_advances_to_next_match() {
         first,
         second,
     );
+}
+
+#[test]
+fn search_again_respects_wrap_search_off() {
+    let screen = build_screen(30, 3, "foo bar foo baz foo");
+    let mut context = test_context();
+    context.wrap_search = false;
+    let mut state = CopyModeState::new(screen, None, false, &context, false, true);
+    state.cursor = CopyPosition { x: 0, y: 0 };
+
+    let _ = state.execute_command(
+        "search-forward",
+        &["--".to_owned(), "foo".to_owned()],
+        &context,
+    );
+    let _ = state.execute_command("search-again", &[], &context);
+    let _ = state.execute_command("search-again", &[], &context);
+    let last = state.cursor;
+
+    let _ = state.execute_command("search-again", &[], &context);
+
+    assert_eq!(state.cursor, last, "search-again should not wrap");
 }
 
 #[test]

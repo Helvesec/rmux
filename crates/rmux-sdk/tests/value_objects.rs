@@ -432,6 +432,9 @@ fn command_value_object_round_trip_and_materializes_proto_request() {
             process_command: None,
             start_directory: None,
             keep_alive_on_exit: None,
+            detached: false,
+            size: None,
+            preserve_zoom: false,
         })
     ));
 }

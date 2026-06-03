@@ -28,6 +28,8 @@ use templates::{
     render_string_template, render_sync_template, sync_toggle,
 };
 
+const ATTACH_SCREEN_RESET_SEQUENCE: &[u8] = b"\x1b[0m\x1b[?25l\x1b[H\x1b[2J";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CursorScope {
     Pane,
@@ -170,6 +172,7 @@ impl OuterTerminal {
     pub(crate) fn attach_start_sequence(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(alternate_screen_enter_sequence(self.context.term_name()));
+        bytes.extend_from_slice(ATTACH_SCREEN_RESET_SEQUENCE);
         if let Some(sequence) = &self.enable_bpaste {
             bytes.extend_from_slice(sequence.as_bytes());
         }

@@ -1,3 +1,4 @@
+use rmux_core::{SessionStore, TargetFindContext};
 use rmux_proto::request::Request;
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
@@ -6,6 +7,7 @@ use rmux_proto::{
     WindowTarget,
 };
 
+use super::targets::implicit_pane_target;
 use super::tokens::CommandTokens;
 use super::values::unsupported_flag;
 use super::{parse_session_name, parse_target_arg};
@@ -15,10 +17,29 @@ mod hooks;
 
 pub(super) use hooks::{parse_set_hook, parse_show_hooks};
 
+pub(super) enum ParsedSetOptionCommand {
+    Request(Box<Request>),
+    NoOp,
+}
+
 pub(super) fn parse_set_option(
+    args: CommandTokens,
+    force_window: bool,
+    default_target: Option<Target>,
+) -> Result<Request, RmuxError> {
+    match parse_set_option_invocation(args, force_window, default_target)? {
+        ParsedSetOptionCommand::Request(request) => Ok(*request),
+        ParsedSetOptionCommand::NoOp => Err(RmuxError::Server(
+            "server scope is not supported for this option".to_owned(),
+        )),
+    }
+}
+
+pub(super) fn parse_set_option_invocation(
     mut args: CommandTokens,
     force_window: bool,
-) -> Result<Request, RmuxError> {
+    default_target: Option<Target>,
+) -> Result<ParsedSetOptionCommand, RmuxError> {
     let command_name = if force_window {
         "set-window-option"
     } else {
@@ -103,8 +124,12 @@ pub(super) fn parse_set_option(
         flags.server,
         flags.window,
         flags.pane,
-        target,
+        flags.append,
+        target.or(default_target),
     )?;
+    let Some(scope) = scope.into_scope() else {
+        return Ok(ParsedSetOptionCommand::NoOp);
+    };
     let mode = if flags.append {
         SetOptionMode::Append
     } else {
@@ -112,15 +137,26 @@ pub(super) fn parse_set_option(
     };
     rmux_core::validate_option_name_mutation(&option, &scope, mode, value.as_deref(), flags.unset)?;
 
-    Ok(Request::SetOptionByName(SetOptionByNameRequest {
-        scope,
-        name: option,
-        value,
-        mode,
-        only_if_unset: flags.only_if_unset,
-        unset: flags.unset,
-        unset_pane_overrides: flags.unset_pane_overrides,
-    }))
+    Ok(ParsedSetOptionCommand::Request(Box::new(
+        Request::SetOptionByName(SetOptionByNameRequest {
+            scope,
+            name: option,
+            value,
+            mode,
+            only_if_unset: flags.only_if_unset,
+            unset: flags.unset,
+            unset_pane_overrides: flags.unset_pane_overrides,
+        }),
+    )))
+}
+
+pub(super) fn default_set_option_target(
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Option<Target> {
+    implicit_pane_target(sessions, find_context, "set-option")
+        .ok()
+        .map(Target::Pane)
 }
 
 struct SetOptionFlags {
@@ -440,8 +476,9 @@ fn resolve_set_option_scope(
     server: bool,
     window: bool,
     pane: bool,
+    append: bool,
     target: Option<Target>,
-) -> Result<OptionScopeSelector, RmuxError> {
+) -> Result<ResolvedSetOptionScope, RmuxError> {
     rmux_core::resolve_option_name(option)?;
     let is_user = option
         .split('[')
@@ -454,12 +491,10 @@ fn resolve_set_option_scope(
 
     if server {
         let scope = OptionScopeSelector::ServerGlobal;
-        if !is_user && !supports_scope(&scope) {
-            return Err(RmuxError::Server(
-                "server scope is not supported for this option".to_owned(),
-            ));
+        if is_user || supports_scope(&scope) {
+            return Ok(scope.into());
         }
-        return Ok(scope);
+        return Ok(ResolvedSetOptionScope::NoOp);
     }
 
     if pane {
@@ -474,7 +509,7 @@ fn resolve_set_option_scope(
                 "pane scope is not supported for this option".to_owned(),
             ));
         }
-        return Ok(scope);
+        return Ok(scope.into());
     }
 
     if window {
@@ -485,7 +520,7 @@ fn resolve_set_option_scope(
                     "window scope is not supported for this option".to_owned(),
                 ));
             }
-            return Ok(scope);
+            return Ok(scope.into());
         }
 
         let Some(target) = target else {
@@ -508,7 +543,7 @@ fn resolve_set_option_scope(
                 "window scope is not supported for this option".to_owned(),
             ));
         }
-        return Ok(scope);
+        return Ok(scope.into());
     }
 
     if global {
@@ -518,13 +553,22 @@ fn resolve_set_option_scope(
                 "global scope is not supported for this option".to_owned(),
             ));
         }
-        return Ok(scope);
+        return Ok(scope.into());
     }
 
     let Some(target) = target else {
-        return Err(RmuxError::Server(
-            "set-option requires a target or one of -g, -s, -w, or -p".to_owned(),
-        ));
+        if !(server && append) {
+            return Err(RmuxError::Server(
+                "set-option requires a target or one of -g, -s, -w, or -p".to_owned(),
+            ));
+        }
+        let scope = rmux_core::default_global_scope_for_option_name(option)?;
+        if !is_user && !supports_scope(&scope) {
+            return Err(RmuxError::Server(
+                "global scope is not supported for this option".to_owned(),
+            ));
+        }
+        return Ok(scope.into());
     };
 
     let scope = match target {
@@ -563,7 +607,27 @@ fn resolve_set_option_scope(
         ));
     }
 
-    Ok(scope)
+    Ok(scope.into())
+}
+
+enum ResolvedSetOptionScope {
+    Scope(OptionScopeSelector),
+    NoOp,
+}
+
+impl ResolvedSetOptionScope {
+    fn into_scope(self) -> Option<OptionScopeSelector> {
+        match self {
+            Self::Scope(scope) => Some(scope),
+            Self::NoOp => None,
+        }
+    }
+}
+
+impl From<OptionScopeSelector> for ResolvedSetOptionScope {
+    fn from(scope: OptionScopeSelector) -> Self {
+        Self::Scope(scope)
+    }
 }
 
 fn resolve_show_options_scope(

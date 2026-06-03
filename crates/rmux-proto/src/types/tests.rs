@@ -188,10 +188,20 @@ fn session_name_rewrites_only_special_chars() {
 }
 
 #[test]
-fn session_name_vis_encodes_control_and_non_ascii_bytes() {
+fn session_name_vis_encodes_controls_and_preserves_unicode() {
     let name = SessionName::new(String::from_utf8_lossy(b"a\x01\x7f\xc3\xa9").into_owned())
         .expect("rewritten");
-    assert_eq!(name.as_str(), "a\\001\\177\\303\\251");
+    assert_eq!(name.as_str(), "a\\001\\177é");
+}
+
+#[test]
+fn session_name_unicode_round_trips_through_serde() {
+    let name = SessionName::new("café-日本").expect("valid unicode session");
+    let encoded = bincode::serialize(&name).expect("session name encodes");
+    let decoded: SessionName = bincode::deserialize(&encoded).expect("session name decodes");
+
+    assert_eq!(decoded, name);
+    assert_eq!(decoded.as_str(), "café-日本");
 }
 
 #[test]
@@ -216,6 +226,36 @@ fn resize_pane_absolute_width_keeps_its_existing_bincode_tag() {
         bincode::deserialize::<ResizePaneAdjustment>(&encoded).expect("absolute width decodes"),
         ResizePaneAdjustment::AbsoluteWidth { columns: 34 }
     );
+}
+
+#[test]
+fn resize_pane_adjustment_bincode_tags_keep_existing_order_append_only() {
+    let cases = [
+        (ResizePaneAdjustment::AbsoluteWidth { columns: 1 }, 0_u32),
+        (ResizePaneAdjustment::AbsoluteHeight { rows: 1 }, 1),
+        (ResizePaneAdjustment::Zoom, 2),
+        (ResizePaneAdjustment::Up { cells: 1 }, 3),
+        (ResizePaneAdjustment::Down { cells: 1 }, 4),
+        (ResizePaneAdjustment::Left { cells: 1 }, 5),
+        (ResizePaneAdjustment::Right { cells: 1 }, 6),
+        (ResizePaneAdjustment::NoOp, 7),
+        (
+            ResizePaneAdjustment::AbsoluteSize {
+                columns: 1,
+                rows: 1,
+            },
+            8,
+        ),
+    ];
+
+    for (adjustment, expected_tag) in cases {
+        let encoded = bincode::serialize(&adjustment).expect("adjustment encodes");
+        assert_eq!(
+            &encoded[..4],
+            &expected_tag.to_le_bytes(),
+            "{adjustment:?} must keep its bincode enum tag"
+        );
+    }
 }
 
 #[test]

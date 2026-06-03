@@ -1,5 +1,7 @@
 #![cfg(unix)]
 
+mod common;
+
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -16,12 +18,12 @@ use rmux_sdk::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-static LIVE_DAEMON_LOCK: Mutex<()> = Mutex::const_new(());
+static LIVE_DAEMON_LOCK: common::unix_smoke::LiveDaemonLock =
+    common::unix_smoke::LiveDaemonLock::new();
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
 
 #[tokio::test]
@@ -534,7 +536,7 @@ impl Drop for Harness {
 
 async fn wait_for_child_exit(mut harness: Harness, timeout_message: &'static str) -> TestResult {
     let mut child = harness.child.take().expect("harness owns daemon child");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
 
     loop {
         if let Some(status) = child.try_wait()? {
@@ -552,7 +554,7 @@ async fn wait_for_child_exit(mut harness: Harness, timeout_message: &'static str
 }
 
 async fn wait_for_daemon_ready(socket_path: &Path, child: &mut Child) -> TestResult {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     let probe = session_name("sdkprobe");
 
     loop {

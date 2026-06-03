@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 #[cfg(not(windows))]
-const CLIENT_SPAWN_ENVIRONMENT_NAMES: &[&str] = &["PATH"];
+const CLIENT_SPAWN_ENVIRONMENT_NAMES: &[&str] = &["PATH", "SHELL"];
 #[cfg(windows)]
 const CLIENT_SPAWN_ENVIRONMENT_NAMES: &[&str] = &["PATH", "PATHEXT"];
 
@@ -65,6 +65,23 @@ mod tests {
             Some("/tmp/client-bin:/usr/bin")
         );
         assert!(!spawn_environment.contains_key("RMUX_CLIENT_ENV_SENTINEL"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_spawn_environment_keeps_shell_for_default_shell_resolution() {
+        let client_environment = HashMap::from([
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            ("SHELL".to_owned(), "/usr/bin/fish".to_owned()),
+        ]);
+
+        let spawn_environment =
+            client_spawn_environment(Some(&client_environment)).expect("spawn env is retained");
+
+        assert_eq!(
+            spawn_environment.get("SHELL").map(String::as_str),
+            Some("/usr/bin/fish")
+        );
     }
 
     #[test]

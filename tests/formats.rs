@@ -446,7 +446,7 @@ fn format_consuming_option_defaults_use_only_the_closed_surface() {
     assert_eq!(status_left, "[#{session_name}] ");
     assert_eq!(
         status_right,
-        r##"#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}"#{=21:pane_title}" %H:%M %d-%b-%y"##
+        r##"#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}"#{=21:host_short}" %H:%M %d-%b-%y"##
     );
     assert_eq!(
         window_status_current,

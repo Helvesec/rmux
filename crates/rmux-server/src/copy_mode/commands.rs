@@ -18,6 +18,7 @@ impl CopyModeState {
     ) -> Result<CopyModeCommandOutcome, RmuxError> {
         let args = strip_leading_separator(args);
         self.mode_keys = context.mode_keys;
+        self.wrap_search = context.wrap_search;
         self.word_separators = context.word_separators.clone();
         if self.view_mode && !is_readonly_command(command) {
             return Ok(CopyModeCommandOutcome::nothing());

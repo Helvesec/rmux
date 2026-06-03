@@ -6,7 +6,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rmux_core::events::{SubscriptionLimits, DEFAULT_OUTPUT_RING_CAPACITY};
 use rmux_proto::{
@@ -20,6 +20,9 @@ use rmux_proto::{
 use rmux_server::{DaemonConfig, ServerDaemon, ServerHandle};
 
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
+const LAG_OUTPUT_EVENT_TARGET: usize = DEFAULT_OUTPUT_RING_CAPACITY + 64;
+const LAG_OUTPUT_COMMAND: &str =
+    "i=0; while [ \"$i\" -lt 1408 ]; do printf 'rmux_subscription_lag_%04d\\n' \"$i\"; i=$((i+1)); sleep 0.002; done";
 
 struct Harness {
     runtime: tokio::runtime::Runtime,
@@ -265,18 +268,18 @@ fn slow_subscriber_batch_cap_then_lag_resumes_at_oldest_retained_event(
     let cursor_sequence = wait_for_limited_cursor(&mut subscriber, subscription.subscription_id)
         .map_err(|error| io::Error::other(format!("limited cursor failed: {error}")))?;
 
-    send_keys(
-        &mut sender,
-        target.clone(),
-        "yes rmux_subscription_lag | head -c 10000000",
-    )
-    .map_err(|error| io::Error::other(format!("lag send-keys failed: {error}")))?;
+    send_keys(&mut sender, target.clone(), LAG_OUTPUT_COMMAND)
+        .map_err(|error| io::Error::other(format!("lag send-keys failed: {error}")))?;
     wait_for_output_sequence(
         &mut sender,
         target.clone(),
-        cursor_sequence + u64::try_from(DEFAULT_OUTPUT_RING_CAPACITY)? + 16,
+        cursor_sequence + u64::try_from(LAG_OUTPUT_EVENT_TARGET)?,
     )
     .map_err(|error| io::Error::other(format!("lag output failed: {error}")))?;
+    interrupt_pane(&mut sender, target.clone())
+        .map_err(|error| io::Error::other(format!("lag interrupt failed: {error}")))?;
+    wait_for_output_quiescence(&mut sender, target.clone())
+        .map_err(|error| io::Error::other(format!("lag output did not settle: {error}")))?;
     let lag = wait_for_lag(&mut subscriber, subscription.subscription_id)
         .map_err(|error| io::Error::other(format!("lag cursor failed: {error}")))?;
     let resume_sequence = lag.lag.resume_sequence;
@@ -434,6 +437,15 @@ fn send_keys(
     Ok(())
 }
 
+fn interrupt_pane(connection: &mut Connection, target: PaneTarget) -> Result<(), Box<dyn Error>> {
+    let response = connection.roundtrip(&Request::SendKeys(SendKeysRequest {
+        target,
+        keys: vec!["C-c".to_owned()],
+    }))?;
+    assert!(matches!(response, Response::SendKeys(_)), "{response:?}");
+    Ok(())
+}
+
 fn wait_for_limited_cursor(
     connection: &mut Connection,
     subscription_id: PaneOutputSubscriptionId,
@@ -465,7 +477,10 @@ fn wait_for_output_sequence(
     target: PaneTarget,
     minimum_sequence: u64,
 ) -> Result<(), Box<dyn Error>> {
-    for _ in 0..200 {
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut last_sequence = 0;
+
+    while Instant::now() < deadline {
         let response = connection.roundtrip(&Request::ListPanes(ListPanesRequest {
             target: target.session_name().clone(),
             format: Some("#{pane_output_sequence}".to_owned()),
@@ -476,12 +491,38 @@ fn wait_for_output_sequence(
         };
         let stdout = String::from_utf8(response.output.stdout().to_vec())?;
         let sequence = stdout.trim().parse::<u64>()?;
+        last_sequence = sequence;
         if sequence >= minimum_sequence {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(25));
     }
-    Err(format!("pane output sequence did not reach {minimum_sequence}").into())
+    Err(format!("pane output sequence reached {last_sequence}, below {minimum_sequence}").into())
+}
+
+fn wait_for_output_quiescence(
+    connection: &mut Connection,
+    target: PaneTarget,
+) -> Result<u64, Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut last_sequence = listed_output_sequence(connection, target.clone())?;
+    let mut stable_polls = 0_u8;
+
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+        let sequence = listed_output_sequence(connection, target.clone())?;
+        if sequence == last_sequence {
+            stable_polls = stable_polls.saturating_add(1);
+            if stable_polls >= 4 {
+                return Ok(sequence);
+            }
+        } else {
+            last_sequence = sequence;
+            stable_polls = 0;
+        }
+    }
+
+    Err(format!("pane output sequence stayed active at {last_sequence}").into())
 }
 
 fn wait_for_lag(
@@ -566,7 +607,8 @@ fn wait_for_cursor_after_lag(
     subscription_id: PaneOutputSubscriptionId,
     mut resume_sequence: u64,
 ) -> Result<(u64, rmux_proto::PaneOutputCursorResponse), Box<dyn Error>> {
-    for _ in 0..400 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
         let response =
             connection.roundtrip(&Request::PaneOutputCursor(PaneOutputCursorRequest {
                 subscription_id,
@@ -589,7 +631,7 @@ fn wait_for_cursor_after_lag(
         }
         thread::sleep(Duration::from_millis(25));
     }
-    Err("cursor did not deliver the oldest retained event after lag (10s timeout)".into())
+    Err("cursor did not deliver the oldest retained event after lag (30s timeout)".into())
 }
 
 fn assert_limit_error(response: Response) {

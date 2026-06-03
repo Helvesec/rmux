@@ -161,6 +161,55 @@ async fn source_file_stdin_dash_without_stdin_returns_error() {
 }
 
 #[tokio::test]
+async fn source_file_ignores_server_scope_for_non_server_options_like_tmux() {
+    let handler = RequestHandler::new();
+    let root = temp_root("set-option-server-scope");
+    fs::create_dir_all(&root).expect("create temp root");
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let response = handler
+        .handle(Request::SourceFile(SourceFileRequest {
+            paths: vec!["-".to_owned()],
+            quiet: false,
+            parse_only: false,
+            verbose: false,
+            expand_paths: false,
+            target: Some(PaneTarget::with_window(alpha, 0, 0)),
+            caller_cwd: Some(root),
+            stdin: Some("set-option -s status off\n".to_owned()),
+        }))
+        .await;
+
+    assert_eq!(
+        response,
+        Response::SourceFile(rmux_proto::SourceFileResponse { output: None })
+    );
+    let response = handler
+        .handle(Request::ShowOptions(ShowOptionsRequest {
+            scope: OptionScopeSelector::SessionGlobal,
+            name: Some("status".to_owned()),
+            value_only: true,
+            include_inherited: false,
+        }))
+        .await;
+    assert_eq!(
+        response.command_output().expect("status output").stdout(),
+        b"on\n"
+    );
+}
+
+#[tokio::test]
 async fn source_file_routes_window_show_commands_and_global_show_scope_compatibility() {
     let handler = RequestHandler::new();
     let root = temp_root("show-options-compat");
@@ -193,6 +242,7 @@ set -gq status off\n\
 set -gw pane-border-style fg=colour3\n\
 set-window-option -gw pane-active-border-style fg=colour5\n\
 set -gw copy-mode-selection-style bg=cyan,fg=black\n\
+set-option -ag status-left append\n\
 	show-options -gqsv -t alpha message-limit\n\
 show-options -gqv status\n\
 show-window-options -g -t alpha -v pane-border-style\n\
@@ -209,6 +259,36 @@ show-window-options -g -v copy-mode-selection-style\n"
             .unwrap_or_else(|| panic!("queued show-options output, got {response:?}"))
             .stdout(),
         b"77\noff\nfg=colour3\nfg=colour5\nbg=cyan,fg=black\n"
+    );
+}
+
+#[tokio::test]
+async fn source_file_without_target_routes_append_to_default_global_scope() {
+    let handler = RequestHandler::new();
+    let root = temp_root("set-option-append-no-target");
+    fs::create_dir_all(&root).expect("create temp root");
+
+    let response = handler
+        .handle(Request::SourceFile(SourceFileRequest {
+            paths: vec!["-".to_owned()],
+            quiet: false,
+            parse_only: false,
+            verbose: false,
+            expand_paths: false,
+            target: None,
+            caller_cwd: Some(root),
+            stdin: Some("set-option -ag status-left append\n".to_owned()),
+        }))
+        .await;
+
+    assert!(
+        matches!(response, Response::SourceFile(_)),
+        "set-option append without a current target should load, got {response:?}"
+    );
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.options.global_value(OptionName::StatusLeft),
+        Some("[#{session_name}] append")
     );
 }
 

@@ -456,6 +456,9 @@ impl From<SplitSpec> for rmux_proto::SplitWindowExtRequest {
             process_command,
             start_directory: None,
             keep_alive_on_exit: None,
+            detached: false,
+            size: None,
+            preserve_zoom: false,
         }
     }
 }

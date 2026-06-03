@@ -88,7 +88,22 @@ fn swap_window_preserves_session_targets_for_runtime_resolution() {
     let cli = parse_args(&["swap-window", "-s", "alpha", "-t", "beta:1"]).unwrap();
     match cli.command.expect("parsed command") {
         super::super::Command::SwapWindow(args) => {
-            assert_eq!(args.source.to_string(), "alpha");
+            assert_eq!(
+                args.source.as_ref().expect("source exists").to_string(),
+                "alpha"
+            );
+            assert_eq!(args.target.as_ref().expect("target").to_string(), "beta:1");
+        }
+        _ => panic!("expected SwapWindow command"),
+    }
+}
+
+#[test]
+fn swap_window_accepts_implicit_marked_source() {
+    let cli = parse_args(&["swap-window", "-t", "beta:1"]).unwrap();
+    match cli.command.expect("parsed command") {
+        super::super::Command::SwapWindow(args) => {
+            assert!(args.source.is_none());
             assert_eq!(args.target.as_ref().expect("target").to_string(), "beta:1");
         }
         _ => panic!("expected SwapWindow command"),

@@ -111,6 +111,13 @@ impl Screen {
         self.cursor_style
     }
 
+    /// Returns the DECSTBM scroll region as `(top, bottom)` rows, 0-based and
+    /// inclusive. A full-screen region is `(0, rows - 1)`.
+    #[must_use]
+    pub const fn scroll_region(&self) -> (u32, u32) {
+        (self.rupper, self.rlower)
+    }
+
     /// Returns the screen size.
     #[must_use]
     pub fn size(&self) -> TerminalSize {

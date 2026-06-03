@@ -478,13 +478,6 @@ pub enum ResizePaneAdjustment {
         /// The requested pane height in rows.
         rows: u16,
     },
-    /// Sets the absolute pane width and height.
-    AbsoluteSize {
-        /// The requested pane width in columns.
-        columns: u16,
-        /// The requested pane height in rows.
-        rows: u16,
-    },
     /// Toggles zoom for the targeted pane's window.
     Zoom,
     /// Shrinks the pane height upward by a relative amount.
@@ -509,6 +502,13 @@ pub enum ResizePaneAdjustment {
     },
     /// Resolves the target and reports success without changing layout.
     NoOp,
+    /// Sets the absolute pane width and height.
+    AbsoluteSize {
+        /// The requested pane width in columns.
+        columns: u16,
+        /// The requested pane height in rows.
+        rows: u16,
+    },
 }
 
 fn parse_pane_index(target: &str, pane_index: &str) -> Result<u32, RmuxError> {

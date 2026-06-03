@@ -119,11 +119,22 @@ fn search_path_in(path: &Path, path_value: &OsStr, pathext: Option<&OsStr>) -> O
 
 #[cfg(windows)]
 fn is_usable_shell_candidate(path: &Path) -> bool {
-    // WindowsApps entries are app-execution aliases; CreateProcessW can reject
-    // their package paths with AccessDenied when they are used as ConPTY shells.
-    !path
+    // `%LOCALAPPDATA%\Microsoft\WindowsApps` entries are app-execution aliases;
+    // launching them as ConPTY shells is unreliable. Packaged applications may
+    // also live under `C:\Program Files\WindowsApps\...`; those are real package
+    // executables and should remain eligible.
+    !is_windowsapps_alias_candidate(path)
+}
+
+#[cfg(windows)]
+fn is_windowsapps_alias_candidate(path: &Path) -> bool {
+    let components = path
         .components()
-        .any(|component| component.as_os_str().eq_ignore_ascii_case("WindowsApps"))
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>();
+    components.windows(2).any(|window| {
+        window[0].eq_ignore_ascii_case("Microsoft") && window[1].eq_ignore_ascii_case("WindowsApps")
+    })
 }
 
 #[cfg(windows)]
@@ -229,7 +240,7 @@ mod tests {
     #[test]
     fn search_path_skips_windowsapps_alias_candidates() {
         let root = unique_test_dir("windowsapps-alias");
-        let windows_apps = root.join("WindowsApps");
+        let windows_apps = root.join("Microsoft").join("WindowsApps");
         let regular_bin = root.join("regular-bin");
         fs::create_dir_all(&windows_apps).expect("windowsapps test directory");
         fs::create_dir_all(&regular_bin).expect("regular test directory");
@@ -252,7 +263,7 @@ mod tests {
     #[test]
     fn search_path_rejects_only_windowsapps_alias_candidates() {
         let root = unique_test_dir("only-windowsapps");
-        let windows_apps = root.join("WindowsApps");
+        let windows_apps = root.join("Microsoft").join("WindowsApps");
         fs::create_dir_all(&windows_apps).expect("windowsapps test directory");
         fs::write(windows_apps.join("pwsh.exe"), b"").expect("windowsapps pwsh fixture");
         let path = env::join_paths([windows_apps.as_os_str()]).expect("joined PATH");
@@ -264,6 +275,28 @@ mod tests {
         );
 
         assert_eq!(resolved, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn search_path_allows_packaged_windowsapps_executables() {
+        let root = unique_test_dir("packaged-windowsapps");
+        let packaged = root
+            .join("Program Files")
+            .join("WindowsApps")
+            .join("Microsoft.PowerShell_7.6.1.0_x64__8wekyb3d8bbwe");
+        fs::create_dir_all(&packaged).expect("packaged windowsapps test directory");
+        fs::write(packaged.join("pwsh.exe"), b"").expect("packaged pwsh fixture");
+        let path = env::join_paths([packaged.as_os_str()]).expect("joined PATH");
+
+        let resolved = search_path_in(
+            Path::new("pwsh.exe"),
+            path.as_os_str(),
+            Some(OsStr::new(".EXE")),
+        )
+        .expect("packaged pwsh should resolve");
+
+        assert_eq!(resolved, packaged.join("pwsh.exe"));
         let _ = fs::remove_dir_all(root);
     }
 

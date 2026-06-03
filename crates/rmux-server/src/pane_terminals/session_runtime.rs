@@ -92,6 +92,8 @@ impl HandlerState {
             }
         }
 
+        self.rename_window_link_session(session_name, new_name);
+
         if let Some(pixels) = self.attached_terminal_pixels.remove(session_name) {
             self.attached_terminal_pixels
                 .insert(new_name.clone(), pixels);
@@ -107,9 +109,11 @@ impl HandlerState {
         next_runtime_owner: Option<&SessionName>,
     ) -> Result<bool, RmuxError> {
         let Some(current_runtime_owner) = current_runtime_owner else {
+            self.remove_window_link_session_slots(session_name);
             return Ok(false);
         };
         if current_runtime_owner != session_name {
+            self.remove_window_link_session_slots(session_name);
             return Ok(true);
         }
 
@@ -117,9 +121,14 @@ impl HandlerState {
             self.terminals
                 .rename_session(session_name, next_runtime_owner)?;
             self.rename_runtime_session_state(session_name, next_runtime_owner)?;
+            self.rename_window_link_runtime_session(session_name, next_runtime_owner);
+            self.remove_window_link_session_slots(session_name);
             self.sync_pane_lifecycle_dimensions_for_session(next_runtime_owner);
             return Ok(true);
         }
+
+        self.transfer_linked_window_runtimes_before_session_removal(session_name)?;
+        self.remove_window_link_session_slots(session_name);
 
         if self.session_has_marked_pane(session_name) {
             self.clear_marked_pane();
@@ -144,6 +153,63 @@ impl HandlerState {
             }
         }
         Ok(removed_terminals.is_some())
+    }
+
+    fn transfer_linked_window_runtimes_before_session_removal(
+        &mut self,
+        session_name: &SessionName,
+    ) -> Result<(), RmuxError> {
+        for slot in self.linked_runtime_transfer_slots_for_removed_session(session_name) {
+            let destination_runtime_session = self.runtime_session_name(&slot.session_name);
+            if destination_runtime_session == *session_name {
+                return Err(RmuxError::Server(format!(
+                    "linked window survivor {}:{} still resolves to removed runtime session {}",
+                    slot.session_name, slot.window_index, session_name
+                )));
+            }
+
+            let pane_ids = self
+                .sessions
+                .session(&slot.session_name)
+                .and_then(|session| session.window_at(slot.window_index))
+                .map(|window| {
+                    window
+                        .panes()
+                        .iter()
+                        .map(|pane| pane.id())
+                        .collect::<Vec<_>>()
+                })
+                .ok_or_else(|| {
+                    RmuxError::invalid_target(
+                        format!("{}:{}", slot.session_name, slot.window_index),
+                        "linked window survivor no longer exists",
+                    )
+                })?;
+            if pane_ids.is_empty() {
+                continue;
+            }
+
+            self.terminals.move_panes_between_sessions(
+                session_name,
+                &destination_runtime_session,
+                &pane_ids,
+            )?;
+            if let Err(error) = self.move_pane_outputs_between_sessions(
+                session_name,
+                &destination_runtime_session,
+                &pane_ids,
+            ) {
+                self.terminals.move_panes_between_sessions(
+                    &destination_runtime_session,
+                    session_name,
+                    &pane_ids,
+                )?;
+                return Err(error);
+            }
+            self.set_window_link_runtime_session_for_slot(&slot, destination_runtime_session);
+        }
+
+        Ok(())
     }
 
     fn rename_runtime_session_state(
@@ -171,9 +237,17 @@ impl HandlerState {
                 "pane output channels already exist for session {new_name}"
             )));
         }
+        if self.pane_output_generations.contains_key(new_name) {
+            return Err(RmuxError::Server(format!(
+                "pane output generations already exist for session {new_name}"
+            )));
+        }
+
+        self.pipes.rename_session(session_name, new_name)?;
 
         let mut transcripts = std::mem::take(&mut self.transcripts);
         let mut pane_outputs = std::mem::take(&mut self.pane_outputs);
+        let mut pane_output_generations = std::mem::take(&mut self.pane_output_generations);
         let mut dead_panes = std::mem::take(&mut self.dead_panes);
         let mut attached_submitted_rows = std::mem::take(&mut self.attached_submitted_rows);
 
@@ -183,26 +257,33 @@ impl HandlerState {
         let session_outputs = pane_outputs
             .remove(session_name)
             .expect("prevalidated pane outputs must exist");
+        let session_output_generations = pane_output_generations
+            .remove(session_name)
+            .unwrap_or_default();
         let session_dead_panes = dead_panes.remove(session_name).unwrap_or_default();
         let session_attached_rows = attached_submitted_rows
             .remove(session_name)
             .unwrap_or_default();
 
-        debug_assert!(transcripts
-            .insert(new_name.clone(), session_transcripts)
-            .is_none());
-        debug_assert!(pane_outputs
-            .insert(new_name.clone(), session_outputs)
-            .is_none());
+        let previous_transcripts = transcripts.insert(new_name.clone(), session_transcripts);
+        debug_assert!(previous_transcripts.is_none());
+
+        let previous_outputs = pane_outputs.insert(new_name.clone(), session_outputs);
+        debug_assert!(previous_outputs.is_none());
+
+        if !session_output_generations.is_empty() {
+            let previous_generations =
+                pane_output_generations.insert(new_name.clone(), session_output_generations);
+            debug_assert!(previous_generations.is_none());
+        }
         if !session_dead_panes.is_empty() {
-            debug_assert!(dead_panes
-                .insert(new_name.clone(), session_dead_panes)
-                .is_none());
+            let previous_dead_panes = dead_panes.insert(new_name.clone(), session_dead_panes);
+            debug_assert!(previous_dead_panes.is_none());
         }
         if !session_attached_rows.is_empty() {
-            debug_assert!(attached_submitted_rows
-                .insert(new_name.clone(), session_attached_rows)
-                .is_none());
+            let previous_attached_rows =
+                attached_submitted_rows.insert(new_name.clone(), session_attached_rows);
+            debug_assert!(previous_attached_rows.is_none());
         }
         let auto_named_windows = std::mem::take(&mut self.auto_named_windows)
             .into_iter()
@@ -217,10 +298,10 @@ impl HandlerState {
 
         self.transcripts = transcripts;
         self.pane_outputs = pane_outputs;
+        self.pane_output_generations = pane_output_generations;
         self.dead_panes = dead_panes;
         self.attached_submitted_rows = attached_submitted_rows;
         self.auto_named_windows = auto_named_windows;
-        self.pipes.rename_session(session_name, new_name)?;
         Ok(())
     }
 

@@ -340,6 +340,9 @@ impl Connection {
                 process_command: None,
                 start_directory,
                 keep_alive_on_exit: None,
+                detached: false,
+                size: None,
+                preserve_zoom: false,
             }));
         }
         self.split_window_with_options(SplitWindowOptions {
@@ -373,6 +376,9 @@ impl Connection {
                 process_command: None,
                 start_directory: None,
                 keep_alive_on_exit: None,
+                detached: false,
+                size: None,
+                preserve_zoom: false,
             }));
         }
         self.roundtrip(&Request::SplitWindow(SplitWindowRequest {

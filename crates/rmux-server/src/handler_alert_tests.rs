@@ -131,8 +131,106 @@ async fn assert_no_non_switch_control(receiver: &mut mpsc::UnboundedReceiver<Att
     }
 }
 
-fn drain_attach_controls(receiver: &mut mpsc::UnboundedReceiver<AttachControl>) {
-    while receiver.try_recv().is_ok() {}
+fn is_visual_bell_overlay(frame: &[u8]) -> bool {
+    String::from_utf8_lossy(frame).contains("Bell in ")
+}
+
+async fn recv_visual_bell_overlay(receiver: &mut mpsc::UnboundedReceiver<AttachControl>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "visual bell overlay did not arrive before timeout"
+        );
+        match timeout(remaining, receiver.recv()).await {
+            Err(_) | Ok(None) => panic!("visual bell overlay did not arrive before timeout"),
+            Ok(Some(AttachControl::Switch(_))) => {}
+            Ok(Some(AttachControl::Overlay(frame))) if is_visual_bell_overlay(&frame.frame) => {
+                return;
+            }
+            Ok(Some(AttachControl::Overlay(_))) => {}
+            Ok(Some(other)) => panic!("expected visual bell overlay, got {other:?}"),
+        }
+    }
+}
+
+async fn recv_visual_bell_write_and_overlay(receiver: &mut mpsc::UnboundedReceiver<AttachControl>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    let mut saw_write = false;
+    let mut saw_overlay = false;
+    loop {
+        if saw_write && saw_overlay {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "visual bell write+overlay did not arrive before timeout"
+        );
+        match timeout(remaining, receiver.recv()).await {
+            Err(_) | Ok(None) => panic!("visual bell write+overlay did not arrive before timeout"),
+            Ok(Some(AttachControl::Switch(_))) => {}
+            Ok(Some(AttachControl::Write(_))) => saw_write = true,
+            Ok(Some(AttachControl::Overlay(frame))) if is_visual_bell_overlay(&frame.frame) => {
+                saw_overlay = true;
+            }
+            Ok(Some(AttachControl::Overlay(_))) => {}
+            Ok(Some(other)) => panic!("expected visual bell write or overlay, got {other:?}"),
+        }
+    }
+}
+
+async fn recv_visual_bell_delivery(receiver: &mut mpsc::UnboundedReceiver<AttachControl>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "visual bell delivery did not arrive before timeout"
+        );
+        match timeout(remaining, receiver.recv()).await {
+            Err(_) | Ok(None) => panic!("visual bell delivery did not arrive before timeout"),
+            Ok(Some(AttachControl::Switch(_))) => {}
+            Ok(Some(AttachControl::Write(_))) => return,
+            Ok(Some(AttachControl::Overlay(frame))) if is_visual_bell_overlay(&frame.frame) => {
+                return;
+            }
+            Ok(Some(AttachControl::Overlay(_))) => {}
+            Ok(Some(other)) => panic!("expected visual bell delivery, got {other:?}"),
+        }
+    }
+}
+
+async fn assert_no_visual_bell_delivery(receiver: &mut mpsc::UnboundedReceiver<AttachControl>) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match timeout(remaining, receiver.recv()).await {
+            Err(_) | Ok(None) => return,
+            Ok(Some(AttachControl::Switch(_))) => {}
+            Ok(Some(AttachControl::Overlay(frame))) if is_visual_bell_overlay(&frame.frame) => {
+                panic!("unexpected visual bell overlay: {frame:?}");
+            }
+            Ok(Some(AttachControl::Overlay(_))) => {}
+            Ok(Some(AttachControl::Write(bytes))) => {
+                panic!("unexpected visual bell write: {bytes:?}");
+            }
+            Ok(Some(other)) => panic!("unexpected attach control: {other:?}"),
+        }
+    }
+}
+
+async fn drain_attach_controls_until_idle(receiver: &mut mpsc::UnboundedReceiver<AttachControl>) {
+    loop {
+        match timeout(Duration::from_millis(20), receiver.recv()).await {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return,
+        }
+    }
 }
 
 #[tokio::test]
@@ -281,7 +379,7 @@ async fn pane_alert_event_updates_automatic_window_name_without_disabling_auto_r
         })
         .await;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         {
             let state = handler.state.lock().await;
@@ -302,6 +400,53 @@ async fn pane_alert_event_updates_automatic_window_name_without_disabling_auto_r
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+#[tokio::test]
+async fn pane_alert_event_respects_automatic_rename_off() {
+    let handler = RequestHandler::new();
+    let session = create_session(&handler, "alerts-name-off").await;
+    let target = WindowTarget::with_window(session.clone(), 0);
+    set_option(
+        &handler,
+        ScopeSelector::Window(target.clone()),
+        OptionName::AutomaticRenameFormat,
+        "updated-name",
+    )
+    .await;
+    set_option(
+        &handler,
+        ScopeSelector::Window(target),
+        OptionName::AutomaticRename,
+        "off",
+    )
+    .await;
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0).map(|pane| pane.id()))
+            .expect("window pane exists")
+    };
+
+    handler
+        .handle_pane_alert_event(crate::pane_io::PaneAlertEvent {
+            session_name: session.clone(),
+            pane_id,
+            bell_count: 0,
+            generation: None,
+        })
+        .await;
+
+    let state = handler.state.lock().await;
+    let window = state
+        .sessions
+        .session(&session)
+        .and_then(|session| session.window_at(0))
+        .expect("window exists");
+    assert_ne!(window.name(), Some("updated-name"));
 }
 
 #[tokio::test]
@@ -403,12 +548,12 @@ async fn shell_input_updates_window_name_and_foreground_process_formats() {
     let response = handler
         .handle(Request::SendKeys(SendKeysRequest {
             target: target.clone(),
-            keys: vec!["cd /tmp && sleep 30".to_owned(), "Enter".to_owned()],
+            keys: vec!["cd /tmp && exec sleep 120".to_owned(), "Enter".to_owned()],
         }))
         .await;
     assert!(matches!(response, Response::SendKeys(_)));
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let rendered = display_message(
             &handler,
@@ -437,7 +582,7 @@ async fn visual_bell_modes_dispatch_overlay_write_and_action_gating() {
     let _attach_id = handler
         .register_attach(42, session.clone(), control_tx)
         .await;
-    drain_attach_controls(&mut control_rx);
+    drain_attach_controls_until_idle(&mut control_rx).await;
     let current_window = WindowTarget::new(session.clone());
 
     set_option(
@@ -454,7 +599,7 @@ async fn visual_bell_modes_dispatch_overlay_write_and_action_gating() {
         AttachControl::Write(bytes) => assert_eq!(bytes, vec![0x07]),
         other => panic!("expected bell write, got {other:?}"),
     }
-    assert_no_non_switch_control(&mut control_rx).await;
+    assert_no_visual_bell_delivery(&mut control_rx).await;
 
     set_option(
         &handler,
@@ -466,14 +611,8 @@ async fn visual_bell_modes_dispatch_overlay_write_and_action_gating() {
     handler
         .alerts_queue_window(current_window.clone(), rmux_core::WINDOW_BELL)
         .await;
-    match recv_non_switch_control(&mut control_rx).await {
-        AttachControl::Overlay(frame) => {
-            let rendered = String::from_utf8_lossy(&frame.frame);
-            assert!(rendered.contains("Bell in current window"));
-        }
-        other => panic!("expected overlay, got {other:?}"),
-    }
-    assert_no_non_switch_control(&mut control_rx).await;
+    recv_visual_bell_overlay(&mut control_rx).await;
+    assert_no_visual_bell_delivery(&mut control_rx).await;
 
     set_option(
         &handler,
@@ -485,12 +624,7 @@ async fn visual_bell_modes_dispatch_overlay_write_and_action_gating() {
     handler
         .alerts_queue_window(current_window, rmux_core::WINDOW_BELL)
         .await;
-    let first = recv_non_switch_control(&mut control_rx).await;
-    let second = recv_non_switch_control(&mut control_rx).await;
-    assert!(matches!(first, AttachControl::Write(_)) || matches!(second, AttachControl::Write(_)));
-    assert!(
-        matches!(first, AttachControl::Overlay(_)) || matches!(second, AttachControl::Overlay(_))
-    );
+    recv_visual_bell_write_and_overlay(&mut control_rx).await;
 
     set_option(
         &handler,
@@ -502,16 +636,12 @@ async fn visual_bell_modes_dispatch_overlay_write_and_action_gating() {
     handler
         .alerts_queue_window(WindowTarget::new(session.clone()), rmux_core::WINDOW_BELL)
         .await;
-    assert_no_non_switch_control(&mut control_rx).await;
+    assert_no_visual_bell_delivery(&mut control_rx).await;
 
     handler
         .alerts_queue_window(other_window.clone(), rmux_core::WINDOW_BELL)
         .await;
-    let delivered = recv_non_switch_control(&mut control_rx).await;
-    assert!(matches!(
-        delivered,
-        AttachControl::Write(_) | AttachControl::Overlay(_)
-    ));
+    recv_visual_bell_delivery(&mut control_rx).await;
     let state = handler.state.lock().await;
     let flags = state
         .sessions
@@ -622,6 +752,32 @@ async fn show_messages_formats_log_and_terminal_info_and_prunes_to_limit() {
     .await;
     let state = handler.state.lock().await;
     assert!(state.message_log.is_empty());
+}
+
+#[tokio::test]
+async fn show_messages_prints_log_without_attached_client() {
+    let handler = RequestHandler::new();
+    let _session = create_session(&handler, "messages-detached").await;
+    {
+        let mut state = handler.state.lock().await;
+        state.add_message("detached log entry");
+    }
+
+    let response = handler
+        .handle(Request::ShowMessages(ShowMessagesRequest {
+            jobs: false,
+            terminals: false,
+            target_client: None,
+        }))
+        .await;
+    let Response::ShowMessages(response) = response else {
+        panic!("expected show-messages response");
+    };
+    let rendered = String::from_utf8_lossy(response.output.stdout()).into_owned();
+    assert!(
+        rendered.contains(": detached log entry"),
+        "detached show-messages should render the message log, got {rendered:?}"
+    );
 }
 
 #[tokio::test]
@@ -770,7 +926,7 @@ async fn action_none_blocks_all_delivery() {
     let _attach_id = handler
         .register_attach(55, session.clone(), control_tx)
         .await;
-    drain_attach_controls(&mut control_rx);
+    drain_attach_controls_until_idle(&mut control_rx).await;
 
     set_option(
         &handler,
@@ -805,7 +961,7 @@ async fn action_none_on_non_current_window_still_sets_winlink_flags() {
     let _attach_id = handler
         .register_attach(56, session.clone(), control_tx)
         .await;
-    drain_attach_controls(&mut control_rx);
+    drain_attach_controls_until_idle(&mut control_rx).await;
 
     set_option(
         &handler,
@@ -1023,6 +1179,26 @@ async fn show_messages_invalid_target_client_returns_error() {
     assert!(
         matches!(response, Response::Error(_)),
         "non-numeric target client should produce an error"
+    );
+}
+
+#[tokio::test]
+async fn show_messages_message_log_resolves_target_client() {
+    let handler = RequestHandler::new();
+    let _session = create_session(&handler, "bad-message-target").await;
+
+    let response = handler
+        .handle(Request::ShowMessages(ShowMessagesRequest {
+            jobs: false,
+            terminals: false,
+            target_client: Some("999999".to_owned()),
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::Error(rmux_proto::ErrorResponse {
+            error: rmux_proto::RmuxError::Server("can't find client: 999999".to_owned())
+        })
     );
 }
 

@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
 use rmux_core::{
-    command_target_metadata, CommandTargetSpec, SessionStore, TargetFindContext, TargetFindFlags,
-    TargetFindType, UnresolvedTarget,
+    command_target_metadata, CommandTargetSpec, OptionStore, SessionStore, TargetFindContext,
+    TargetFindFlags, TargetFindType, UnresolvedTarget,
 };
 use rmux_proto::{
     MoveWindowTarget, PaneTarget, RmuxError, SelectLayoutTarget, SessionName, SplitWindowTarget,
@@ -121,7 +121,7 @@ fn queue_target_spec_for_flag(
 fn hook_target_find_type(value: &str, arguments: &[String]) -> TargetFindType {
     if arguments.iter().any(|arg| arg == "-p") {
         TargetFindType::Pane
-    } else if arguments.iter().any(|arg| arg == "-w") {
+    } else if arguments.iter().any(|arg| arg == "-w") || value == "." {
         TargetFindType::Window
     } else if value.starts_with('%') || value.rsplit_once('.').is_some() {
         TargetFindType::Pane
@@ -167,7 +167,6 @@ fn queue_target_resolution_enabled(command_name: &str) -> bool {
             | "capture-pane"
             | "display-message"
             | "display-menu"
-            | "display-panes"
             | "display-popup"
             | "has-session"
             | "if-shell"
@@ -217,10 +216,12 @@ fn queue_target_resolution_enabled(command_name: &str) -> bool {
 
 pub(super) fn queue_target_find_context(
     sessions: &SessionStore,
+    options: &OptionStore,
     requester_pid: u32,
     attached_session: Option<&SessionName>,
     current_target: Option<&Target>,
     mouse_target: Option<&Target>,
+    marked_target: Option<&PaneTarget>,
 ) -> TargetFindContext {
     let context = if let Some(current_target) = current_target {
         TargetFindContext::from_target(current_target.clone())
@@ -233,7 +234,10 @@ pub(super) fn queue_target_find_context(
         TargetFindContext::new(current)
     };
 
-    context.with_mouse_target(mouse_target.cloned())
+    let context = context
+        .with_mouse_target(mouse_target.cloned())
+        .with_marked_target(marked_target.cloned().map(Target::Pane));
+    crate::handler::with_visible_pane_bases(context, sessions, options)
 }
 
 fn latest_detached_session_target(sessions: &SessionStore) -> Option<Target> {
@@ -338,6 +342,27 @@ pub(super) fn implicit_pane_target(
         Target::Pane(target) => Ok(target),
         _ => unreachable!("pane target lookup must return a pane"),
     }
+}
+
+pub(super) fn marked_pane_target(
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+    command_name: &str,
+) -> Result<PaneTarget, RmuxError> {
+    sessions
+        .resolve_unresolved_target(
+            &UnresolvedTarget::new("{marked}"),
+            TargetFindType::Pane,
+            TargetFindFlags::NONE,
+            find_context,
+        )
+        .map(|target| match target {
+            Target::Pane(target) => target,
+            _ => unreachable!("marked pane target lookup must return a pane"),
+        })
+        .map_err(|error| {
+            RmuxError::Server(format!("{command_name} requires a marked pane: {error}"))
+        })
 }
 
 pub(super) fn implicit_split_target(

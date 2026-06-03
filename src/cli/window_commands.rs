@@ -70,7 +70,7 @@ pub(super) fn run_swap_window(
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     run_command_resolved(socket_path, "swap-window", move |connection| {
-        let source = resolve_window_target_spec(connection, &args.source, false)?;
+        let source = resolve_window_source_or_marked(connection, args.source.as_ref())?;
         let target = resolve_existing_window_target_or_current(
             connection,
             args.target.as_ref(),
@@ -80,6 +80,22 @@ pub(super) fn run_swap_window(
             .swap_window(source, target, args.detached)
             .map_err(ExitFailure::from_client)
     })
+}
+
+fn resolve_window_source_or_marked(
+    connection: &mut Connection,
+    source: Option<&TargetSpec>,
+) -> Result<rmux_proto::WindowTarget, ExitFailure> {
+    let marked;
+    let source = match source {
+        Some(source) => source,
+        None => {
+            marked = crate::cli_args::parse_target_spec("{marked}")
+                .map_err(|error| ExitFailure::new(1, error))?;
+            &marked
+        }
+    };
+    resolve_window_target_spec(connection, source, false)
 }
 
 pub(super) fn run_rotate_window(

@@ -291,3 +291,258 @@ async fn parsed_queue_resolves_select_pane_mark_against_the_current_pane() {
         "alpha:0.1"
     );
 }
+
+#[tokio::test]
+async fn parsed_queue_uses_marked_pane_as_default_swap_source() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
+                direction: SplitDirection::Horizontal,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+
+    let (pane_zero_id, pane_one_id) = {
+        let state = handler.state.lock().await;
+        let window = state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.window_at(0))
+            .expect("window exists");
+        (
+            window.pane(0).expect("pane 0 exists").id(),
+            window.pane(1).expect("pane 1 exists").id(),
+        )
+    };
+
+    let mark = CommandParser::new()
+        .parse("select-pane -m")
+        .expect("mark command parses");
+    handler
+        .execute_parsed_commands(
+            std::process::id(),
+            mark,
+            QueueExecutionContext::without_caller_cwd().with_current_target(Some(Target::Pane(
+                PaneTarget::with_window(alpha.clone(), 0, 1),
+            ))),
+        )
+        .await
+        .expect("mark pane 1");
+
+    let swap = CommandParser::new()
+        .parse("swap-pane -t alpha:0.0")
+        .expect("swap command parses");
+    handler
+        .execute_parsed_commands(
+            std::process::id(),
+            swap,
+            QueueExecutionContext::without_caller_cwd().with_current_target(Some(Target::Pane(
+                PaneTarget::with_window(alpha.clone(), 0, 0),
+            ))),
+        )
+        .await
+        .expect("swap-pane should use the marked pane as source");
+
+    let state = handler.state.lock().await;
+    let window = state
+        .sessions
+        .session(&alpha)
+        .and_then(|session| session.window_at(0))
+        .expect("window exists");
+    assert_eq!(window.pane(0).expect("pane 0 exists").id(), pane_one_id);
+    assert_eq!(window.pane(1).expect("pane 1 exists").id(), pane_zero_id);
+}
+
+#[tokio::test]
+async fn parsed_queue_uses_marked_pane_window_as_default_swap_window_source() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::NewWindow(NewWindowRequest {
+                target: alpha.clone(),
+                name: Some("marked-window".to_owned()),
+                detached: true,
+                start_directory: None,
+                environment: None,
+                command: None,
+                target_window_index: Some(1),
+                insert_at_target: false,
+            }))
+            .await,
+        Response::NewWindow(_)
+    ));
+
+    let mark = CommandParser::new()
+        .parse("select-pane -m")
+        .expect("mark command parses");
+    handler
+        .execute_parsed_commands(
+            std::process::id(),
+            mark,
+            QueueExecutionContext::without_caller_cwd().with_current_target(Some(Target::Pane(
+                PaneTarget::with_window(alpha.clone(), 1, 0),
+            ))),
+        )
+        .await
+        .expect("mark pane in window 1");
+
+    let swap = CommandParser::new()
+        .parse("swap-window -t alpha:0")
+        .expect("swap-window command parses");
+    handler
+        .execute_parsed_commands(
+            std::process::id(),
+            swap,
+            QueueExecutionContext::without_caller_cwd().with_current_target(Some(Target::Pane(
+                PaneTarget::with_window(alpha.clone(), 0, 0),
+            ))),
+        )
+        .await
+        .expect("swap-window should use the marked pane window as source");
+
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("session exists");
+    assert_eq!(
+        session.window_at(0).expect("window 0 exists").name(),
+        Some("marked-window")
+    );
+}
+
+#[tokio::test]
+async fn parsed_queue_resolves_explicit_marked_pane_targets() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
+                direction: SplitDirection::Horizontal,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+
+    let mark = CommandParser::new()
+        .parse("select-pane -m")
+        .expect("mark command parses");
+    handler
+        .execute_parsed_commands(
+            std::process::id(),
+            mark,
+            QueueExecutionContext::without_caller_cwd().with_current_target(Some(Target::Pane(
+                PaneTarget::with_window(alpha.clone(), 0, 1),
+            ))),
+        )
+        .await
+        .expect("mark pane 1");
+
+    let command = CommandParser::new()
+        .parse("display-message -p -t ~ '#{pane_index}'")
+        .expect("display-message command parses");
+    let output = handler
+        .execute_parsed_commands(
+            std::process::id(),
+            command,
+            QueueExecutionContext::without_caller_cwd().with_current_target(Some(Target::Pane(
+                PaneTarget::with_window(alpha.clone(), 0, 0),
+            ))),
+        )
+        .await
+        .expect("display-message should resolve marked pane");
+
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n");
+}
+
+#[tokio::test]
+async fn marked_pane_prefers_original_linked_window_slot() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    for session_name in [&alpha, &beta] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session_name.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
+
+    assert!(matches!(
+        handler
+            .handle(Request::LinkWindow(LinkWindowRequest {
+                source: WindowTarget::with_window(alpha.clone(), 0),
+                target: WindowTarget::with_window(beta.clone(), 1),
+                after: false,
+                before: false,
+                kill_destination: false,
+                detached: false,
+            }))
+            .await,
+        Response::LinkWindow(_)
+    ));
+
+    let mark = CommandParser::new()
+        .parse("select-pane -t alpha:0.0 -m")
+        .expect("mark command parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), mark)
+        .await
+        .expect("mark linked pane through alpha");
+
+    let command = CommandParser::new()
+        .parse("display-message -p -t '{marked}' '#{session_name}:#{window_index}.#{pane_index}'")
+        .expect("display-message command parses");
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), command)
+        .await
+        .expect("marked pane should resolve through the marked slot");
+
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "alpha:0.0\n");
+}

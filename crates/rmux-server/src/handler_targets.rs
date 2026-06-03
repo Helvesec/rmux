@@ -1,8 +1,13 @@
-use rmux_core::{command_target_metadata, TargetFindContext, UnresolvedTarget};
+use std::collections::HashMap;
+
+use rmux_core::{
+    command_target_metadata, OptionStore, SessionStore, TargetFindContext, UnresolvedTarget,
+};
 use rmux_proto::request::{Request, ResolveTargetType};
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
-    ErrorResponse, ResolveTargetResponse, Response, RmuxError, ScopeSelector, Target, WindowTarget,
+    ErrorResponse, OptionName, ResolveTargetResponse, Response, RmuxError, ScopeSelector, Target,
+    WindowTarget,
 };
 
 use super::RequestHandler;
@@ -65,16 +70,40 @@ impl RequestHandler {
         let current_target = preferred_session
             .as_ref()
             .and_then(|session_name| active_session_target(&state.sessions, session_name));
-        match state.sessions.resolve_unresolved_target(
-            &unresolved,
-            find_type,
-            flags,
-            &TargetFindContext::new(current_target),
-        ) {
+        let marked_target = state.marked_pane_target().map(Target::Pane);
+        let context = with_visible_pane_bases(
+            TargetFindContext::new(current_target).with_marked_target(marked_target),
+            &state.sessions,
+            &state.options,
+        );
+        match state
+            .sessions
+            .resolve_unresolved_target(&unresolved, find_type, flags, &context)
+        {
             Ok(target) => Response::ResolveTarget(ResolveTargetResponse { target }),
             Err(error) => Response::Error(ErrorResponse { error }),
         }
     }
+}
+
+pub(in crate::handler) fn with_visible_pane_bases(
+    context: TargetFindContext,
+    sessions: &SessionStore,
+    options: &OptionStore,
+) -> TargetFindContext {
+    let mut pane_base_indices = HashMap::new();
+    for (session_name, session) in sessions.iter() {
+        for window_index in session.windows().keys().copied() {
+            let pane_base_index = options
+                .resolve_for_window(session_name, window_index, OptionName::PaneBaseIndex)
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(0);
+            if pane_base_index > 0 {
+                pane_base_indices.insert((session_name.clone(), window_index), pane_base_index);
+            }
+        }
+    }
+    context.with_pane_base_indices(pane_base_indices)
 }
 
 fn unresolved_target_needs_current_session(raw: &str) -> bool {
@@ -264,6 +293,11 @@ pub(in crate::handler) fn target_for_request_response(
                 .as_ref()
                 .map(|target| Target::Pane(target.clone()))
                 .or_else(|| fallback_current_target(state, attached_session)),
+            Request::SendKeysExt2(request) => request
+                .target
+                .as_ref()
+                .map(|target| Target::Pane(target.clone()))
+                .or_else(|| fallback_current_target(state, attached_session)),
             Request::SendPrefix(request) => request
                 .target
                 .as_ref()
@@ -285,6 +319,17 @@ pub(in crate::handler) fn target_for_request_response(
                 .and_then(|session_name| active_session_target(&state.sessions, session_name))
                 .or_else(|| fallback_current_target(state, attached_session)),
             Request::DisplayMessage(request) => request
+                .target
+                .as_ref()
+                .and_then(|target| match target {
+                    Target::Session(session_name) => {
+                        active_session_target(&state.sessions, session_name)
+                    }
+                    Target::Window(target) => active_window_target(&state.sessions, target),
+                    Target::Pane(target) => Some(Target::Pane(target.clone())),
+                })
+                .or_else(|| fallback_current_target(state, attached_session)),
+            Request::DisplayMessageExt(request) => request
                 .target
                 .as_ref()
                 .and_then(|target| match target {

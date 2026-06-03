@@ -47,6 +47,7 @@ pub(crate) struct CopyModeState {
     show_position: bool,
     exit_on_scroll: bool,
     mode_keys: ModeKeys,
+    wrap_search: bool,
     word_separators: String,
     search_pattern: String,
     search_direction: SearchDirection,
@@ -83,6 +84,7 @@ impl CopyModeState {
             show_position,
             exit_on_scroll,
             mode_keys: context.mode_keys,
+            wrap_search: context.wrap_search,
             word_separators: context.word_separators.clone(),
             search_pattern: String::new(),
             search_direction: SearchDirection::Forward,
@@ -107,6 +109,7 @@ impl CopyModeState {
             false,
             &CopyModeCommandContext {
                 mode_keys: ModeKeys::Emacs,
+                wrap_search: true,
                 word_separators: " -_@".to_owned(),
                 default_shell: "/bin/sh".to_owned(),
                 working_directory: None,

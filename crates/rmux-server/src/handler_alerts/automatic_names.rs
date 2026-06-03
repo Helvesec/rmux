@@ -70,7 +70,13 @@ impl RequestHandler {
                     Some(window) => {
                         !window_name.is_empty()
                             && window.name() != Some(window_name)
-                            && (tracked || window.automatic_rename() || window.name().is_none())
+                            && crate::automatic_rename::window_allows_automatic_rename(
+                                &state.options,
+                                target.session_name(),
+                                target.window_index(),
+                                window,
+                                tracked,
+                            )
                     }
                     None => return Vec::new(),
                 }

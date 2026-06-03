@@ -67,6 +67,13 @@ impl OptionNode {
             .filter_map(|entry| entry.known_option.map(|option| (option, entry.rendered)))
             .collect()
     }
+
+    pub(super) fn with_scope(mut self, scope: OptionScopeSelector) -> Self {
+        for entry in self.entries.values_mut() {
+            entry.scope = scope.clone();
+        }
+        self
+    }
 }
 
 impl OptionEntry {

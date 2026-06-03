@@ -10,7 +10,6 @@ use super::values::{parse_u16, parse_u64};
 use super::{
     implicit_pane_target, implicit_session_name, implicit_window_target,
     is_unsupported_named_layout, parse_layout_name, parse_pane_target, parse_select_layout_target,
-    parse_session_name,
 };
 
 pub(super) fn parse_display_panes(
@@ -18,7 +17,6 @@ pub(super) fn parse_display_panes(
     sessions: &SessionStore,
     find_context: &TargetFindContext,
 ) -> Result<Request, RmuxError> {
-    let mut target = None;
     let mut duration_ms = None;
     let mut non_blocking = false;
     let mut no_command = false;
@@ -47,7 +45,9 @@ pub(super) fn parse_display_panes(
             }
             "-t" => {
                 let _ = args.optional();
-                target = Some(parse_session_name(args.required("-t target")?)?);
+                return Err(display_panes_client_target_not_found(
+                    &args.required("-t target-client")?,
+                ));
             }
             _ => break,
         }
@@ -56,16 +56,19 @@ pub(super) fn parse_display_panes(
     let template = (!args.is_empty()).then(|| args.remaining_joined());
 
     Ok(Request::DisplayPanes(DisplayPanesRequest {
-        target: target.unwrap_or(implicit_session_name(
-            sessions,
-            find_context,
-            "display-panes",
-        )?),
+        target: implicit_session_name(sessions, find_context, "display-panes")?,
         duration_ms,
         non_blocking,
         no_command,
         template,
     }))
+}
+
+fn display_panes_client_target_not_found(raw_target: &str) -> RmuxError {
+    RmuxError::Message(format!(
+        "can't find client: {}",
+        raw_target.strip_suffix(':').unwrap_or(raw_target)
+    ))
 }
 
 pub(super) fn parse_select_layout(

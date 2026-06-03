@@ -130,3 +130,51 @@ fn reindex_windows_compacts_sparse_slots_and_remaps_last_tracking() {
     assert_eq!(session.active_window_index(), 1);
     assert_eq!(session.last_window_index(), Some(0));
 }
+
+#[test]
+fn reindex_windows_overflow_preserves_existing_windows() {
+    let mut session = Session::new(
+        session_name("alpha"),
+        TerminalSize {
+            cols: 120,
+            rows: 40,
+        },
+    );
+    session
+        .insert_window_with_initial_pane(2, TerminalSize { cols: 90, rows: 30 })
+        .expect("window 2 insert succeeds");
+    let before = session.windows().keys().copied().collect::<Vec<_>>();
+
+    let error = session
+        .reindex_windows_from(u32::MAX)
+        .expect_err("reindex overflow is rejected");
+
+    assert!(error.to_string().contains("window index space exhausted"));
+    assert_eq!(
+        session.windows().keys().copied().collect::<Vec<_>>(),
+        before
+    );
+    assert_eq!(session.active_window_index(), 0);
+}
+
+#[test]
+fn reindex_single_window_at_max_index_does_not_drop_the_window() {
+    let mut session = Session::new(
+        session_name("alpha"),
+        TerminalSize {
+            cols: 120,
+            rows: 40,
+        },
+    );
+
+    let mapping = session
+        .reindex_windows_from(u32::MAX)
+        .expect("single-window max reindex succeeds");
+
+    assert_eq!(mapping.into_iter().collect::<Vec<_>>(), vec![(0, u32::MAX)]);
+    assert_eq!(
+        session.windows().keys().copied().collect::<Vec<_>>(),
+        vec![u32::MAX]
+    );
+    assert_eq!(session.active_window_index(), u32::MAX);
+}

@@ -157,18 +157,11 @@ async fn attach_session_upgrade_renders_only_the_active_window() {
         render_frame.contains("visible-active-pane"),
         "attach must replay the active pane screen, got {render_frame:?}"
     );
-    #[cfg(windows)]
-    {
-        let host = crate::host_name::local_hostname().expect("Windows host name must resolve");
-        assert!(
-            render_frame.contains(&format!("\"{host}\"")),
-            "Windows attach status must render the host name, got {render_frame:?}"
-        );
-    }
-    #[cfg(not(windows))]
+    let host = crate::host_name::local_hostname().expect("host name must resolve");
+    let host_short = host.split('.').next().unwrap_or(&host);
     assert!(
-        render_frame.contains("\"pane-host\""),
-        "attach status must render the active pane title like tmux, got {render_frame:?}"
+        render_frame.contains(&format!("\"{host_short}\"")),
+        "attach status must render the host name, got {render_frame:?}"
     );
     assert!(!render_frame.contains('┬'));
     assert!(!render_frame.contains('┴'));
@@ -261,6 +254,9 @@ async fn attach_session_replays_all_visible_pane_screens() {
                 process_command: None,
                 start_directory: None,
                 keep_alive_on_exit: None,
+                detached: false,
+                size: None,
+                preserve_zoom: false,
             }))
             .await,
         Response::SplitWindow(_)

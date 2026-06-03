@@ -19,7 +19,10 @@ use tokio::time::{sleep, timeout, Instant};
 
 pub type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+// Windows CI can be slow to start ConPTY-backed shells while the workspace
+// test run is still compiling sibling crates. Keep this high enough to catch
+// real prompt/output transitions without making successful tests slower.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 pub const OUTPUT_BUDGET: usize = 64 * 1024;
 
 pub static LIVE_DAEMON_LOCK: Mutex<()> = Mutex::const_new(());

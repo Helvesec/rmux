@@ -48,12 +48,16 @@ impl RequestHandler {
             ));
         }
 
-        let attached_session = self.current_session_candidate(requester_pid).await;
-        if attached_session.is_none() {
-            return Response::Error(ErrorResponse {
-                error: RmuxError::Message("no current client".to_owned()),
-            });
-        }
+        let attached_session = match request.target_client.as_deref() {
+            Some(target_client) => match self
+                .resolve_show_messages_log_session(requester_pid, target_client)
+                .await
+            {
+                Ok(session) => session,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            },
+            None => self.current_session_candidate(requester_pid).await,
+        };
         let lines = {
             let state = self.state.lock().await;
             state
@@ -108,6 +112,25 @@ impl RequestHandler {
             .parse::<u32>()
             .map(Some)
             .map_err(|_| RmuxError::invalid_target(target_client, "invalid client identifier"))
+    }
+
+    async fn resolve_show_messages_log_session(
+        &self,
+        requester_pid: u32,
+        target_client: &str,
+    ) -> Result<Option<rmux_proto::SessionName>, RmuxError> {
+        match self
+            .resolve_target_managed_client(requester_pid, Some(target_client), "show-messages")
+            .await?
+        {
+            ManagedClient::Attach(attach_pid) => {
+                let active_attach = self.active_attach.lock().await;
+                active_attach.session_for_attached_client(attach_pid, "show-messages")
+            }
+            ManagedClient::Control(control_pid) => {
+                Ok(self.current_session_candidate(control_pid).await)
+            }
+        }
     }
 
     async fn show_message_terminals(&self, filter: Option<u32>) -> Vec<String> {

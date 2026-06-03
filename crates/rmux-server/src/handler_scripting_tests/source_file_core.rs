@@ -41,6 +41,37 @@ async fn source_file_uses_shared_parser_for_conditions_comments_and_continuation
 }
 
 #[tokio::test]
+async fn source_file_handles_crlf_backslash_continuations() {
+    let handler = RequestHandler::new();
+    let root = temp_root("crlf-continuation");
+    let config = root.join("main.conf");
+    write_config(&config, "set-buffer -b crlf win\\\r\ndows\r\n");
+
+    let response = handler
+        .handle(source_file_request(
+            vec!["main.conf".to_owned()],
+            Some(root),
+        ))
+        .await;
+
+    assert_eq!(
+        response,
+        Response::SourceFile(rmux_proto::SourceFileResponse { output: None })
+    );
+    assert_eq!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("crlf".to_owned()),
+            }))
+            .await
+            .command_output()
+            .expect("crlf buffer output")
+            .stdout(),
+        b"windows"
+    );
+}
+
+#[tokio::test]
 async fn source_file_parse_only_reports_parse_without_executing() {
     let handler = RequestHandler::new();
     let root = temp_root("parse-only");

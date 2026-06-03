@@ -56,8 +56,8 @@ pub(in crate::handler::scripting_support) fn parse_set_hook(
         }
     }
 
-    let scope = resolve_hook_scope("set-hook", global, window, pane, target)?;
     let hook = parse_hook_spec(&args.required("set-hook hook")?)?;
+    let scope = resolve_hook_scope("set-hook", hook.hook, global, window, pane, target)?;
     let command = if run_immediately || unset {
         args.optional()
     } else {
@@ -134,6 +134,7 @@ struct ParsedHookSpec {
 
 fn resolve_hook_scope(
     command: &str,
+    hook: HookName,
     global: bool,
     window: bool,
     pane: bool,
@@ -154,7 +155,7 @@ fn resolve_hook_scope(
         return Ok(ScopeSelector::Global);
     }
 
-    match (window, pane, target) {
+    let scope = match (window, pane, target) {
         (true, false, Some(Target::Session(session_name))) => {
             Ok(ScopeSelector::Window(WindowTarget::new(session_name)))
         }
@@ -168,16 +169,45 @@ fn resolve_hook_scope(
             "{command} -p requires a pane target"
         ))),
         (false, true, None) => Err(RmuxError::Server(format!("{command} -p requires a target"))),
-        (false, false, Some(Target::Session(session_name))) => {
-            Ok(ScopeSelector::Session(session_name))
-        }
-        (false, false, Some(Target::Window(target))) => Ok(ScopeSelector::Window(target)),
-        (false, false, Some(Target::Pane(target))) => Ok(ScopeSelector::Pane(target)),
+        (false, false, Some(target)) => resolve_implicit_hook_target_scope(hook, target),
         (false, false, None) => Err(RmuxError::Server(format!(
             "{command} requires -g or a target"
         ))),
         (true, true, _) => unreachable!("validated conflicting hook scope flags"),
+    }?;
+    rmux_core::validate_hook_registration(hook, &scope)?;
+    Ok(scope)
+}
+
+fn resolve_implicit_hook_target_scope(
+    hook: HookName,
+    target: Target,
+) -> Result<ScopeSelector, RmuxError> {
+    let candidates = match target {
+        Target::Session(session_name) => vec![ScopeSelector::Session(session_name)],
+        Target::Window(target) => vec![
+            ScopeSelector::Window(target.clone()),
+            ScopeSelector::Session(target.session_name().clone()),
+        ],
+        Target::Pane(target) => vec![
+            ScopeSelector::Pane(target.clone()),
+            ScopeSelector::Window(WindowTarget::with_window(
+                target.session_name().clone(),
+                target.window_index(),
+            )),
+            ScopeSelector::Session(target.session_name().clone()),
+        ],
+    };
+
+    let mut first_error = None;
+    for scope in candidates {
+        match rmux_core::validate_hook_registration(hook, &scope) {
+            Ok(()) => return Ok(scope),
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
     }
+    Err(first_error.unwrap_or_else(|| RmuxError::Server("invalid hook target".to_owned())))
 }
 
 fn resolve_show_hooks_scope(

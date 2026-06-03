@@ -209,36 +209,39 @@ impl RequestHandler {
     }
 
     pub(super) async fn handle_pane_alert_event(&self, event: PaneAlertEvent) {
-        let Some((window_index, refresh_for_inactive_pane_output)) = ({
+        let Some((target, refresh_for_inactive_pane_output)) = ({
             let state = self.state.lock().await;
-            if !state.pane_output_generation_matches(
+            let Some(runtime_session_name) = state.resolve_pane_event_runtime_session(
                 &event.session_name,
                 event.pane_id,
                 event.generation,
-            ) {
+            ) else {
                 return;
-            }
-            let Some(window_index) =
-                state.window_index_for_pane_id(&event.session_name, event.pane_id)
+            };
+            let Some(pane_target) =
+                state.pane_target_for_runtime_pane(&runtime_session_name, event.pane_id)
             else {
                 return;
             };
+            let window_index = pane_target.window_index();
             let refresh_for_inactive_pane_output = state
                 .sessions
-                .session(&event.session_name)
+                .session(pane_target.session_name())
                 .is_some_and(|session| {
                     session.active_window_index() != window_index
                         || session.active_pane_id() != Some(event.pane_id)
                 });
-            Some((window_index, refresh_for_inactive_pane_output))
+            Some((
+                WindowTarget::with_window(pane_target.session_name().clone(), window_index),
+                refresh_for_inactive_pane_output,
+            ))
         }) else {
             return;
         };
-        let target = WindowTarget::with_window(event.session_name.clone(), window_index);
         self.refresh_automatic_window_name_for_window_target(&target)
             .await;
         if refresh_for_inactive_pane_output {
-            self.refresh_attached_session(&event.session_name).await;
+            self.refresh_attached_session(target.session_name()).await;
         }
         // Combine activity + bell into a single queue call when both are present.
         // Bells are flag-based (not counted), so one queue call is sufficient.

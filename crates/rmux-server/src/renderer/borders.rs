@@ -11,9 +11,12 @@ use super::{apply_runtime_style_overlay, cursor_position_bytes, style_sgr_bytes,
 
 #[path = "borders/layout.rs"]
 mod layout;
+#[path = "borders/status.rs"]
+mod status;
 
 use self::layout::border_layout_cells_with_geometry;
 pub(super) use self::layout::content_pane_geometry;
+pub(super) use self::status::render_pane_border_status_lines;
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn border_cells(
@@ -71,6 +74,11 @@ pub(super) fn runtime_border_cells(
         geometry,
         indicators_colour,
     );
+    let line_style = PaneBorderLineStyle::from_option(options.resolve_for_window(
+        session.name(),
+        window_index,
+        OptionName::PaneBorderLines,
+    ));
     let mut style_cache = BTreeMap::<(u32, bool), BorderStyle>::new();
 
     layout_cells
@@ -101,7 +109,7 @@ pub(super) fn runtime_border_cells(
             BorderCell {
                 x: cell.x,
                 y: cell.y,
-                glyph: cell.glyph,
+                glyph: line_style.map_glyph(cell.glyph),
                 style,
             }
         })
@@ -140,7 +148,88 @@ pub(super) fn render_cells(cells: &[BorderCell]) -> Vec<u8> {
 }
 
 pub(super) type BorderStyle = Style;
-fn resolve_border_style_for_pane(
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PaneBorderLineStyle {
+    Single,
+    Double,
+    Heavy,
+    Simple,
+    Spaces,
+}
+
+impl PaneBorderLineStyle {
+    pub(super) fn from_option(value: Option<&str>) -> Self {
+        match value {
+            Some("double") => Self::Double,
+            Some("heavy") => Self::Heavy,
+            Some("simple") => Self::Simple,
+            Some("spaces") => Self::Spaces,
+            _ => Self::Single,
+        }
+    }
+
+    pub(super) fn map_glyph(self, glyph: char) -> char {
+        match self {
+            Self::Single => glyph,
+            Self::Double => map_border_glyph(glyph, DOUBLE_BORDER_GLYPHS),
+            Self::Heavy => map_border_glyph(glyph, HEAVY_BORDER_GLYPHS),
+            Self::Simple => map_border_glyph(glyph, SIMPLE_BORDER_GLYPHS),
+            Self::Spaces => ' ',
+        }
+    }
+}
+
+fn map_border_glyph(glyph: char, glyphs: &[(char, char)]) -> char {
+    glyphs
+        .iter()
+        .find_map(|(from, to)| (*from == glyph).then_some(*to))
+        .unwrap_or(glyph)
+}
+
+const DOUBLE_BORDER_GLYPHS: &[(char, char)] = &[
+    ('│', '║'),
+    ('─', '═'),
+    ('┼', '╬'),
+    ('┬', '╦'),
+    ('┴', '╩'),
+    ('┤', '╣'),
+    ('├', '╠'),
+    ('┘', '╝'),
+    ('┐', '╗'),
+    ('└', '╚'),
+    ('┌', '╔'),
+];
+
+const HEAVY_BORDER_GLYPHS: &[(char, char)] = &[
+    ('│', '┃'),
+    ('─', '━'),
+    ('┼', '╋'),
+    ('┬', '┳'),
+    ('┴', '┻'),
+    ('┤', '┫'),
+    ('├', '┣'),
+    ('┘', '┛'),
+    ('┐', '┓'),
+    ('└', '┗'),
+    ('┌', '┏'),
+];
+
+const SIMPLE_BORDER_GLYPHS: &[(char, char)] = &[
+    ('│', '|'),
+    ('─', '-'),
+    ('┼', '+'),
+    ('┬', '+'),
+    ('┴', '+'),
+    ('┤', '+'),
+    ('├', '+'),
+    ('┘', '+'),
+    ('┐', '+'),
+    ('└', '+'),
+    ('┌', '+'),
+];
+
+pub(super) fn resolve_border_style_for_pane(
     session: &Session,
     options: &OptionStore,
     window_index: u32,

@@ -1,5 +1,5 @@
 use super::command_args::command_arguments_as_strings;
-use super::config_parse::parse_set_option;
+use super::config_parse::{parse_set_option_invocation, ParsedSetOptionCommand};
 use super::key_parse::parse_unbind_key;
 use super::source_files::SourceInput;
 use super::tokens::CommandTokens;
@@ -159,54 +159,67 @@ fn compatible_line(line: &str) -> Option<String> {
         return None;
     }
 
-    compatible_commands(&parsed).map(|commands| commands.join(" ; "))
+    compatible_commands(&parsed)
+        .and_then(|commands| (!commands.is_empty()).then(|| commands.join(" ; ")))
 }
 
 fn compatible_commands(parsed: &ParsedCommands) -> Option<Vec<String>> {
-    (!parsed.is_empty())
-        .then(|| {
-            parsed
-                .commands()
-                .iter()
-                .map(compatible_command)
-                .collect::<Option<Vec<_>>>()
-        })
-        .flatten()
-}
-
-fn compatible_command(command: &ParsedCommand) -> Option<String> {
-    match command.name() {
-        "set-option" => validate_set_option(command, false),
-        "set-window-option" => validate_set_option(command, true),
-        "unbind-key" => validate_unbind_key(command),
-        _ => false,
+    if parsed.is_empty() {
+        return None;
     }
-    .then(|| compatible_command_string(command))
-    .flatten()
+
+    let mut commands = Vec::new();
+    for command in parsed.commands() {
+        match compatible_command(command)? {
+            CompatibleCommand::Keep(command) => commands.push(command),
+            CompatibleCommand::Skip => {}
+        }
+    }
+    Some(commands)
 }
 
-fn validate_set_option(command: &ParsedCommand, force_window: bool) -> bool {
+enum CompatibleCommand {
+    Keep(String),
+    Skip,
+}
+
+fn compatible_command(command: &ParsedCommand) -> Option<CompatibleCommand> {
+    match command.name() {
+        "set-option" => compatible_set_option(command, false),
+        "set-window-option" => compatible_set_option(command, true),
+        "unbind-key" => validate_unbind_key(command)
+            .then(|| compatible_command_string(command).map(CompatibleCommand::Keep))
+            .flatten(),
+        _ => None,
+    }
+}
+
+fn compatible_set_option(command: &ParsedCommand, force_window: bool) -> Option<CompatibleCommand> {
     let Ok(arguments) = command_arguments_as_strings(command.name(), command.arguments()) else {
-        return false;
+        return None;
     };
     let arguments = expand_leading_compact_flags(arguments, "gswpaouU");
-    let Ok(Request::SetOptionByName(request)) =
-        parse_set_option(CommandTokens::new(arguments), force_window)
-    else {
-        return false;
+    let request =
+        match parse_set_option_invocation(CommandTokens::new(arguments), force_window, None) {
+            Ok(ParsedSetOptionCommand::Request(request)) => request,
+            Ok(ParsedSetOptionCommand::NoOp) => return Some(CompatibleCommand::Skip),
+            Err(_) => return None,
+        };
+    let Request::SetOptionByName(request) = *request else {
+        return None;
     };
 
     if request.name.starts_with('@') {
-        return false;
+        return None;
     }
     if !allowed_static_option_name(&request.name) {
-        return false;
+        return None;
     }
     if request.value.as_deref().is_some_and(contains_format_job) {
-        return false;
+        return None;
     }
 
-    OptionStore::new()
+    let valid = OptionStore::new()
         .set_by_name(
             request.scope,
             &request.name,
@@ -216,7 +229,10 @@ fn validate_set_option(command: &ParsedCommand, force_window: bool) -> bool {
             request.unset,
             request.unset_pane_overrides,
         )
-        .is_ok()
+        .is_ok();
+    valid
+        .then(|| compatible_command_string(command).map(CompatibleCommand::Keep))
+        .flatten()
 }
 
 fn validate_unbind_key(command: &ParsedCommand) -> bool {
@@ -638,6 +654,13 @@ mod tests {
 
         let filtered = filter("set -g status-format[0] '#[bold]#{session_name}'\n");
         assert!(filtered.contains("set-option -g status-format[0] '#[bold]#{session_name}'"));
+    }
+
+    #[test]
+    fn server_scope_noops_do_not_reject_safe_compound_commands() {
+        let filtered = filter("set -s status off ; set -g status on\n");
+
+        assert_eq!(filtered, "set-option -g status on\n");
     }
 
     #[test]

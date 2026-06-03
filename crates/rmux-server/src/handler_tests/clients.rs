@@ -171,7 +171,7 @@ async fn list_clients_exposes_pid_and_tty_format_variables_for_attached_clients(
 
     let response = handler
         .handle(Request::ListClients(rmux_proto::ListClientsRequest {
-            format: Some("#{client_name}|#{client_pid}|#{client_tty}".to_owned()),
+            format: Some("#{client_name}|#{client_pid}|#{client_tty}|#{client_session}".to_owned()),
             target_session: None,
             filter: None,
             sort_order: None,
@@ -184,12 +184,72 @@ async fn list_clients_exposes_pid_and_tty_format_variables_for_attached_clients(
     let output = String::from_utf8(response.output.stdout().to_vec()).expect("utf-8");
     let line = output.lines().next().expect("client line");
     let parts = line.split('|').collect::<Vec<_>>();
-    assert_eq!(parts.len(), 3);
+    assert_eq!(parts.len(), 4);
     assert_eq!(parts[1], requester_pid.to_string());
+    assert_eq!(parts[3], "alpha");
     #[cfg(unix)]
     assert!(!parts[2].is_empty(), "client_tty should be populated");
     #[cfg(windows)]
     assert_eq!(parts[2], "");
+}
+
+#[tokio::test]
+async fn list_clients_exposes_attached_key_table_and_prefix_state() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let alpha = session_name("alpha");
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    assert_eq!(
+        list_client_prefix_state(&handler).await,
+        "0|root\n",
+        "idle attached clients should report the root key table"
+    );
+
+    handler
+        .set_attached_key_table(
+            requester_pid,
+            Some("prefix".to_owned()),
+            Some(std::time::Instant::now()),
+        )
+        .await
+        .expect("prefix table should be tracked");
+
+    assert_eq!(
+        list_client_prefix_state(&handler).await,
+        "1|prefix\n",
+        "prefix-active attached clients should report the prefix table"
+    );
+}
+
+async fn list_client_prefix_state(handler: &RequestHandler) -> String {
+    let response = handler
+        .handle(Request::ListClients(rmux_proto::ListClientsRequest {
+            format: Some("#{client_prefix}|#{client_key_table}".to_owned()),
+            target_session: None,
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        }))
+        .await;
+    let Response::ListClients(response) = response else {
+        panic!("expected list-clients response");
+    };
+    String::from_utf8(response.output.stdout().to_vec()).expect("utf-8")
 }
 
 #[tokio::test]

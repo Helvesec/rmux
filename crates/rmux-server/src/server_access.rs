@@ -255,6 +255,7 @@ fn read_only_request_allowed(request: &Request) -> bool {
             | Request::SdkWaitForOutputRef(_)
             | Request::CancelSdkWait(_)
             | Request::DisplayMessage(_)
+            | Request::DisplayMessageExt(_)
             | Request::ShowMessages(_)
             | Request::ListSessions(_)
             | Request::ListKeys(_)

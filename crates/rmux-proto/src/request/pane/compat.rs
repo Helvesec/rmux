@@ -25,6 +25,9 @@ impl<'de> Visitor<'de> for SplitWindowExtRequestVisitor {
         let process_command = compat_next_element(&mut seq)?;
         let start_directory = compat_next_element(&mut seq)?;
         let keep_alive_on_exit = compat_next_element(&mut seq)?;
+        let detached = compat_next_element(&mut seq)?;
+        let size: Option<String> = compat_next_element(&mut seq)?;
+        let preserve_zoom = compat_next_element(&mut seq)?;
 
         Ok(SplitWindowExtRequest {
             target,
@@ -35,6 +38,9 @@ impl<'de> Visitor<'de> for SplitWindowExtRequestVisitor {
             process_command,
             start_directory,
             keep_alive_on_exit,
+            detached,
+            size,
+            preserve_zoom,
         })
     }
 
@@ -50,6 +56,9 @@ impl<'de> Visitor<'de> for SplitWindowExtRequestVisitor {
         let mut process_command = None;
         let mut start_directory = None;
         let mut keep_alive_on_exit = None;
+        let mut detached = None;
+        let mut size = None;
+        let mut preserve_zoom = None;
 
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
@@ -61,6 +70,9 @@ impl<'de> Visitor<'de> for SplitWindowExtRequestVisitor {
                 "process_command" => process_command = Some(map.next_value()?),
                 "start_directory" => start_directory = Some(map.next_value()?),
                 "keep_alive_on_exit" => keep_alive_on_exit = Some(map.next_value()?),
+                "detached" => detached = Some(map.next_value()?),
+                "size" => size = Some(map.next_value()?),
+                "preserve_zoom" => preserve_zoom = Some(map.next_value()?),
                 _ => {
                     let _: de::IgnoredAny = map.next_value()?;
                 }
@@ -76,6 +88,9 @@ impl<'de> Visitor<'de> for SplitWindowExtRequestVisitor {
             process_command: process_command.unwrap_or_default(),
             start_directory: start_directory.unwrap_or_default(),
             keep_alive_on_exit: keep_alive_on_exit.unwrap_or_default(),
+            detached: detached.unwrap_or_default(),
+            size: size.unwrap_or_default(),
+            preserve_zoom: preserve_zoom.unwrap_or_default(),
         })
     }
 }

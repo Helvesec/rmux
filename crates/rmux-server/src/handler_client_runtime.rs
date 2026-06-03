@@ -19,6 +19,11 @@ use super::{
     control_support, option_value_u32, prompt_support, RequestHandler,
 };
 
+#[path = "handler_client_runtime/list_clients.rs"]
+mod list_clients;
+
+pub(in crate::handler) use list_clients::ListClientSnapshot;
+
 pub(in crate::handler) const LIST_CLIENTS_TEMPLATE: &str = "#{client_name}: #{session_name} [#{client_width}x#{client_height} #{client_termname}]#{?#{==:#{client_uid},#{uid}},, [user #{?client_user,#{client_user},#{client_uid}}]}#{?client_flags, (#{client_flags}),}";
 
 impl RequestHandler {
@@ -109,6 +114,7 @@ impl RequestHandler {
                         termtype: String::new(),
                         termfeatures: outer_terminal.features_string(),
                         utf8: active.terminal_context.utf8(),
+                        key_table: active.key_table_name.clone(),
                         uid: active.uid,
                         user: active.user.clone(),
                         flags: format_attached_client_flags(active),
@@ -134,6 +140,7 @@ impl RequestHandler {
                     termtype: String::new(),
                     termfeatures: active.terminal_context.explicit_features_string(),
                     utf8: active.terminal_context.utf8(),
+                    key_table: None,
                     uid: active.uid,
                     user: active.user.clone(),
                     flags: format_control_client_flags(active),
@@ -149,7 +156,7 @@ impl RequestHandler {
         session_name: &rmux_proto::SessionName,
     ) -> Result<(), RmuxError> {
         let attached_count = self.attached_count(session_name).await;
-        let (prompt, terminal_context, key_table) = {
+        let (prompt, terminal_context, client_size, key_table) = {
             let active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
@@ -161,6 +168,7 @@ impl RequestHandler {
                     .as_ref()
                     .map(prompt_support::ClientPromptState::rendered_prompt),
                 active.terminal_context.clone(),
+                active.client_size,
                 active.key_table_name.clone(),
             )
         };
@@ -170,9 +178,10 @@ impl RequestHandler {
                 .sessions
                 .session(session_name)
                 .ok_or_else(|| session_not_found(session_name))?;
+            let session = attach_support::sized_session(session, Some(client_size));
             let outer_terminal = OuterTerminal::resolve(&state.options, terminal_context);
             let frame = crate::renderer::render_status_only_with_attached_count_and_prompt(
-                session,
+                session.as_ref(),
                 &state.options,
                 attached_count,
                 prompt.as_ref(),
@@ -216,25 +225,6 @@ pub(in crate::handler) fn command_output_from_lines(lines: &[String]) -> Command
 
 pub(in crate::handler) fn normalize_target_client(target_client: &str) -> &str {
     target_client.strip_suffix(':').unwrap_or(target_client)
-}
-
-#[derive(Debug, Clone)]
-pub(in crate::handler) struct ListClientSnapshot {
-    pub(in crate::handler) name: String,
-    pub(in crate::handler) pid: u32,
-    pub(in crate::handler) tty: String,
-    pub(in crate::handler) control: bool,
-    pub(in crate::handler) session_name: Option<rmux_proto::SessionName>,
-    pub(in crate::handler) order: u64,
-    pub(in crate::handler) width: u16,
-    pub(in crate::handler) height: u16,
-    pub(in crate::handler) termname: String,
-    pub(in crate::handler) termtype: String,
-    pub(in crate::handler) termfeatures: String,
-    pub(in crate::handler) utf8: bool,
-    pub(in crate::handler) uid: u32,
-    pub(in crate::handler) user: UserIdentity,
-    pub(in crate::handler) flags: String,
 }
 
 #[cfg(windows)]

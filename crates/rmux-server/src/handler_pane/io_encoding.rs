@@ -52,6 +52,74 @@ pub(super) fn prepare_pane_input_write(
     })
 }
 
+pub(super) fn prepare_attached_pane_input_writes(
+    state: &HandlerState,
+    target: &PaneTarget,
+    bytes: &[u8],
+) -> Result<Vec<PaneInputWrite>, RmuxError> {
+    prepare_synchronized_pane_input_writes(state, target, bytes)
+}
+
+pub(super) fn prepare_synchronized_pane_input_writes(
+    state: &HandlerState,
+    target: &PaneTarget,
+    bytes: &[u8],
+) -> Result<Vec<PaneInputWrite>, RmuxError> {
+    synchronized_input_targets(state, target)?
+        .into_iter()
+        .map(|target| prepare_pane_input_write(state, &target, bytes))
+        .collect()
+}
+
+fn synchronized_input_targets(
+    state: &HandlerState,
+    target: &PaneTarget,
+) -> Result<Vec<PaneTarget>, RmuxError> {
+    let session_name = target.session_name();
+    let window_index = target.window_index();
+    let pane_index = target.pane_index();
+    let synchronized =
+        state
+            .options
+            .resolve_for_window(session_name, window_index, OptionName::SynchronizePanes)
+            == Some("on");
+    let panes = {
+        let session = state
+            .sessions
+            .session(session_name)
+            .ok_or_else(|| session_not_found(session_name))?;
+        let window = session.window_at(window_index).ok_or_else(|| {
+            RmuxError::invalid_target(
+                format!("{session_name}:{window_index}"),
+                "window index does not exist in session",
+            )
+        })?;
+        let Some(target_pane) = window.pane(pane_index) else {
+            return Err(RmuxError::invalid_target(
+                target.to_string(),
+                "pane index does not exist in window",
+            ));
+        };
+        if synchronized {
+            window
+                .panes()
+                .iter()
+                .map(|pane| (pane.index(), pane.id()))
+                .collect::<Vec<_>>()
+        } else {
+            vec![(pane_index, target_pane.id())]
+        }
+    };
+
+    Ok(panes
+        .into_iter()
+        .filter(|(_, pane_id)| !state.pane_is_dead(session_name, *pane_id))
+        .map(|(pane_index, _)| {
+            PaneTarget::with_window(session_name.clone(), window_index, pane_index)
+        })
+        .collect())
+}
+
 pub(super) async fn write_bytes_to_target(
     write: PaneInputWrite,
     bytes: Vec<u8>,
@@ -61,6 +129,19 @@ pub(super) async fn write_bytes_to_target(
         Ok(()) => Response::SendKeys(SendKeysResponse { key_count }),
         Err(error) => Response::Error(ErrorResponse { error }),
     }
+}
+
+pub(super) async fn write_bytes_to_targets(
+    writes: Vec<PaneInputWrite>,
+    bytes: Vec<u8>,
+    key_count: usize,
+) -> Response {
+    for write in writes {
+        if let Err(error) = write_bytes_to_target_io(write, bytes.clone()).await {
+            return Response::Error(ErrorResponse { error });
+        }
+    }
+    Response::SendKeys(SendKeysResponse { key_count })
 }
 
 pub(super) async fn write_bytes_to_target_io(

@@ -13,11 +13,11 @@ where
     pairs
         .into_iter()
         .filter_map(|(name, value)| {
-            Some(format!(
-                "{}={}",
-                name.into_string().ok()?,
-                value.into_string().ok()?
-            ))
+            let name = name.into_string().ok()?;
+            if name.is_empty() || name.starts_with('=') {
+                return None;
+            }
+            Some(format!("{}={}", name, value.into_string().ok()?))
         })
         .collect()
 }
@@ -25,9 +25,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::client_environment_assignments;
-    #[cfg(unix)]
     use super::environment_assignments_from_pairs;
-    #[cfg(unix)]
     use std::ffi::OsString;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
@@ -46,6 +44,17 @@ mod tests {
         sorted.sort_unstable();
 
         assert_eq!(assignments, sorted);
+    }
+
+    #[test]
+    fn environment_assignments_skip_empty_and_windows_pseudo_names() {
+        let assignments = environment_assignments_from_pairs([
+            (OsString::from(""), OsString::from("empty")),
+            (OsString::from("=C:"), OsString::from(r"C:\workspace")),
+            (OsString::from("VALID"), OsString::from("value")),
+        ]);
+
+        assert_eq!(assignments, ["VALID=value"]);
     }
 
     #[cfg(unix)]

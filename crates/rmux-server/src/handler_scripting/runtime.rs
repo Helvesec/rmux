@@ -64,6 +64,13 @@ pub(super) async fn shell_condition_is_true(
     command: String,
     profile: &TerminalProfile,
 ) -> Result<bool, RmuxError> {
+    #[cfg(windows)]
+    match command.trim() {
+        "true" => return Ok(true),
+        "false" => return Ok(false),
+        _ => {}
+    }
+
     let mut command_builder = profile.shell_command(&command);
     command_builder
         .stdin(Stdio::null())

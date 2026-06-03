@@ -151,6 +151,44 @@ fn append_to_non_appendable_options_is_rejected_without_creating_overrides() {
 }
 
 #[test]
+fn status_line_counts_are_preserved_for_tmux_compatibility() {
+    let mut store = OptionStore::new();
+
+    store
+        .set(
+            ScopeSelector::Global,
+            OptionName::Status,
+            "2".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("tmux-compatible status line count is accepted");
+
+    assert_eq!(
+        store.resolve(Some(&session_name("alpha")), OptionName::Status),
+        Some("2")
+    );
+}
+
+#[test]
+fn pane_border_lines_number_is_preserved_for_tmux_compatibility() {
+    let mut store = OptionStore::new();
+
+    store
+        .set(
+            ScopeSelector::Global,
+            OptionName::PaneBorderLines,
+            "number".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("tmux-compatible numbered pane border value is accepted");
+
+    assert_eq!(
+        store.resolve_for_window(&session_name("alpha"), 0, OptionName::PaneBorderLines),
+        Some("number")
+    );
+}
+
+#[test]
 fn allow_passthrough_preserves_all_for_tmux_compatibility() {
     let mut store = OptionStore::new();
     let alpha = session_name("alpha");

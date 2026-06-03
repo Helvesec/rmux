@@ -144,6 +144,13 @@ impl<'a> Lexer<'a> {
             return Err(CommandParseError::new(self.line, "invalid escape"));
         };
 
+        #[cfg(windows)]
+        if is_windows_path_escape_context(buffer) && !matches!(ch, '\\' | '\'' | '"') {
+            buffer.push('\\');
+            buffer.push(ch);
+            return Ok(());
+        }
+
         if matches!(ch, '4'..='7') {
             return Err(CommandParseError::new(self.line, "invalid octal escape"));
         }
@@ -277,15 +284,26 @@ impl<'a> Lexer<'a> {
 
     fn read_tilde(&mut self, buffer: &mut String) -> Result<(), CommandParseError> {
         let mut user = String::new();
+        let mut delimiter = None;
         while let Some(ch) = self.get_char() {
             if matches!(ch, '/' | ' ' | '\t' | '\n' | '"' | '\'') {
                 self.unget_char(ch);
+                if user.is_empty() && ch != '/' {
+                    buffer.push('~');
+                    return Ok(());
+                }
+                delimiter = Some(ch);
                 break;
             }
             if user.len() >= 1022 {
                 return Err(CommandParseError::new(self.line, "user name is too long"));
             }
             user.push(ch);
+        }
+
+        if user.is_empty() && delimiter.is_none() {
+            buffer.push('~');
+            return Ok(());
         }
 
         let Some(home) = self.expand_tilde(&user) else {
@@ -331,4 +349,34 @@ fn is_var_char(ch: char, first: bool) -> bool {
         return false;
     }
     ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+#[cfg(windows)]
+fn is_windows_path_escape_context(buffer: &str) -> bool {
+    if has_windows_drive_prefix(buffer) {
+        return true;
+    }
+
+    if buffer
+        .chars()
+        .last()
+        .is_some_and(|ch| matches!(ch, '\\' | '/'))
+    {
+        return true;
+    }
+
+    let mut chars = buffer.chars().rev();
+    matches!(
+        (chars.next(), chars.next(), chars.next()),
+        (Some(':'), Some(drive), None) if drive.is_ascii_alphabetic()
+    )
+}
+
+#[cfg(windows)]
+fn has_windows_drive_prefix(buffer: &str) -> bool {
+    let mut chars = buffer.chars();
+    matches!(
+        (chars.next(), chars.next()),
+        (Some(drive), Some(':')) if drive.is_ascii_alphabetic()
+    )
 }

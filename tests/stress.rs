@@ -21,7 +21,7 @@ use rmux_proto::{
     CapturePaneRequest, KillSessionRequest, KillSessionResponse, LayoutName, NewSessionRequest,
     PaneTarget, Request, ResizePaneAdjustment, ResizePaneRequest, Response, SelectLayoutRequest,
     SelectLayoutResponse, SelectLayoutTarget, SendKeysRequest, SendKeysResponse,
-    SplitWindowRequest, SplitWindowResponse, SplitWindowTarget, TerminalSize,
+    SplitWindowRequest, SplitWindowResponse, SplitWindowTarget, Target, TerminalSize,
 };
 use rmux_server::{DaemonConfig, ServerDaemon};
 use support::{
@@ -65,7 +65,6 @@ fn twenty_pane_layout_produces_valid_geometry_and_resizes_all_ptys() -> Result<(
     let handle =
         runtime.block_on(ServerDaemon::new(DaemonConfig::new(socket_path.clone())).bind())?;
     let session_name = unique_session_name("stress-20pane");
-    let baseline_ttys = pane_tty_paths()?;
     let mut connection = connect(&socket_path)?;
     let mut tty_paths = HashMap::new();
     let mut expected_session = Session::new(
@@ -87,9 +86,10 @@ fn twenty_pane_layout_produces_valid_geometry_and_resizes_all_ptys() -> Result<(
     }))?;
     assert!(matches!(created, Response::NewSession(_)));
 
-    let after_create_ttys = pane_tty_paths()?;
-    tty_paths.insert(0, single_new_tty(&baseline_ttys, &after_create_ttys)?);
-    let mut previous_ttys = after_create_ttys;
+    tty_paths.insert(
+        0,
+        pane_tty_path(&mut connection, PaneTarget::new(session_name.clone(), 0))?,
+    );
 
     for expected_index in 1..PANE_COUNT as u32 {
         let split = connection.roundtrip(&Request::SplitWindow(SplitWindowRequest {
@@ -122,16 +122,16 @@ fn twenty_pane_layout_produces_valid_geometry_and_resizes_all_ptys() -> Result<(
         );
         expected_session.select_layout(LayoutName::EvenHorizontal);
 
-        let current_ttys = pane_tty_paths()?;
         tty_paths.insert(
             expected_index,
-            single_new_tty(&previous_ttys, &current_ttys)?,
+            pane_tty_path(
+                &mut connection,
+                PaneTarget::new(session_name.clone(), expected_index),
+            )?,
         );
-        previous_ttys = current_ttys;
     }
 
     assert_eq!(tty_paths.len(), PANE_COUNT);
-    assert_eq!(previous_ttys.difference(&baseline_ttys).count(), PANE_COUNT);
 
     let pty_sizes_before_layout = tty_sizes_by_index(&tty_paths)?;
 
@@ -340,6 +340,27 @@ fn session_name_rewrites_preserve_server_state() -> Result<(), Box<dyn Error>> {
 
     common::terminate_child(live_daemon.child_mut())?;
     Ok(())
+}
+
+fn pane_tty_path(
+    connection: &mut rmux_client::Connection,
+    target: PaneTarget,
+) -> Result<std::path::PathBuf, Box<dyn Error>> {
+    let response = connection.roundtrip(&Request::DisplayMessage(
+        rmux_proto::DisplayMessageRequest {
+            target: Some(Target::Pane(target)),
+            print: true,
+            message: Some("#{pane_tty}".to_owned()),
+        },
+    ))?;
+    let output = response
+        .command_output()
+        .ok_or("display-message -p #{pane_tty} did not return output")?;
+    let path = std::str::from_utf8(output.stdout())?.trim();
+    if path.is_empty() {
+        return Err("display-message returned an empty pane_tty".into());
+    }
+    Ok(std::path::PathBuf::from(path))
 }
 
 fn wait_for_pane_capture(

@@ -1,11 +1,21 @@
 use super::*;
 
+#[cfg(windows)]
+const ATTACHED_EXIT_INPUT: &[u8] = b"RMUX_EXIT\r\n";
+#[cfg(not(windows))]
+const ATTACHED_EXIT_INPUT: &[u8] = b"exit\r";
+
+#[cfg(windows)]
+const SUBMITTED_EXIT_LINE_NEEDLE: &str = "RMUX_EXIT";
+#[cfg(not(windows))]
+const SUBMITTED_EXIT_LINE_NEEDLE: &str = "PROMPT> exit";
+
 #[tokio::test]
 async fn attached_remain_on_exit_strips_the_submitted_exit_line_from_dead_pane_capture() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
-    let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let _control_rx = create_exit_attached_session(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
 
     assert!(matches!(
@@ -19,10 +29,10 @@ async fn attached_remain_on_exit_strips_the_submitted_exit_line_from_dead_pane_c
             .await,
         Response::SetOption(_)
     ));
-    prepare_attached_shell_prompt(&handler, &target).await;
+    prepare_exit_prompt(&handler, &target).await;
 
     handler
-        .handle_attached_live_input_for_test(requester_pid, b"exit\r")
+        .handle_attached_live_input_for_test(requester_pid, ATTACHED_EXIT_INPUT)
         .await
         .expect("attached exit input");
     wait_for_dead_pane(&handler, &alpha, 0, 0).await;
@@ -30,7 +40,7 @@ async fn attached_remain_on_exit_strips_the_submitted_exit_line_from_dead_pane_c
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let capture = loop {
         let capture = capture_pane_print(&handler, target.clone()).await;
-        if capture.contains("Pane is dead") && !capture.contains("PROMPT> exit") {
+        if capture.contains("Pane is dead") && !capture.contains(SUBMITTED_EXIT_LINE_NEEDLE) {
             break capture;
         }
         assert!(
@@ -40,7 +50,7 @@ async fn attached_remain_on_exit_strips_the_submitted_exit_line_from_dead_pane_c
         sleep(Duration::from_millis(20)).await;
     };
     assert!(
-        !capture.contains("PROMPT> exit"),
+        !capture.contains(SUBMITTED_EXIT_LINE_NEEDLE),
         "attached remain-on-exit capture must not keep the submitted exit line, got {capture:?}"
     );
     if default_shell_window_name() == "bash" {
@@ -95,18 +105,18 @@ async fn attached_exit_on_last_pane_closes_the_session_and_client() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
-    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = create_exit_attached_session(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
 
-    prepare_attached_shell_prompt(&handler, &target).await;
+    prepare_exit_prompt(&handler, &target).await;
     drain_attach_controls(&mut control_rx);
 
     handler
-        .handle_attached_live_input_for_test(requester_pid, b"exit\r")
+        .handle_attached_live_input_for_test(requester_pid, ATTACHED_EXIT_INPUT)
         .await
         .expect("attached exit input");
 
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(ATTACH_LIFECYCLE_TIMEOUT, async {
         loop {
             match control_rx.recv().await {
                 Some(AttachControl::Exited) => break,
@@ -118,6 +128,32 @@ async fn attached_exit_on_last_pane_closes_the_session_and_client() {
     .await
     .expect("timed out waiting for attach exit notification");
     wait_for_session_removed(&handler, &alpha).await;
+}
+
+#[cfg(windows)]
+async fn create_exit_attached_session(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    session: &SessionName,
+) -> mpsc::UnboundedReceiver<AttachControl> {
+    create_line_exiting_attached_session(handler, requester_pid, session).await
+}
+
+#[cfg(not(windows))]
+async fn create_exit_attached_session(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    session: &SessionName,
+) -> mpsc::UnboundedReceiver<AttachControl> {
+    create_attached_session(handler, requester_pid, session).await
+}
+
+#[cfg(windows)]
+async fn prepare_exit_prompt(_handler: &RequestHandler, _target: &PaneTarget) {}
+
+#[cfg(not(windows))]
+async fn prepare_exit_prompt(handler: &RequestHandler, target: &PaneTarget) {
+    prepare_attached_shell_prompt(handler, target).await;
 }
 
 #[tokio::test]
@@ -239,8 +275,12 @@ async fn attached_live_input_preserves_split_utf8_sequences() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
+    #[cfg(windows)]
+    let _control_rx = create_line_echo_attached_session(&handler, requester_pid, &alpha).await;
+    #[cfg(not(windows))]
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
+    #[cfg(not(windows))]
     prepare_attached_shell_prompt(&handler, &target).await;
 
     let mut pending_input = Vec::new();
@@ -284,11 +324,8 @@ fn split_utf8_echo_command() -> SplitUtf8EchoCommand {
 #[cfg(windows)]
 fn split_utf8_echo_command() -> SplitUtf8EchoCommand {
     SplitUtf8EchoCommand {
-        chunks: vec![b"Write-Output 'cafe \xe6", b"\x96", b"\x87'\r"],
-        output_needle: "\ncafe 文",
-        // PowerShell/PSReadLine can render split multibyte input as '?' in the
-        // interactive echo while still executing the decoded command correctly.
-        // The command output remains the portable oracle for RMUX input bytes.
+        chunks: vec![b"cafe \xe6", b"\x96", b"\x87\r\n"],
+        output_needle: "cafe 文",
         echoed_command: None,
     }
 }

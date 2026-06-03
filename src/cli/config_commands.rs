@@ -17,7 +17,7 @@ use crate::cli_args::{
     ShowOptionsArgs, ShowOptionsCommandKind,
 };
 pub(crate) use hooks::{run_set_hook, run_show_hooks};
-use options::{resolve_set_option_args, resolve_show_options_scope};
+use options::{resolve_set_option_args, resolve_show_options_scope, ResolvedSetOptionCommand};
 
 pub(crate) fn run_set_option(
     command: SetOptionCommandKind,
@@ -28,7 +28,8 @@ pub(crate) fn run_set_option(
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
     let request = match resolve_set_option_args(&mut connection, command, args) {
-        Ok(request) => request,
+        Ok(ResolvedSetOptionCommand::NoOp) => return Ok(0),
+        Ok(ResolvedSetOptionCommand::Request(request)) => request,
         Err(error) if quiet && quiet_option_failure(&error) => return Ok(0),
         Err(error) => return Err(error),
     };
@@ -191,8 +192,9 @@ fn resolve_set_environment_mode(
 mod tests {
     use super::{
         options::{
-            resolve_set_option_args_with_exact_targets as resolve_set_option_args,
-            ShowOptionsScope, UnresolvedShowOptionsScope,
+            resolve_set_option_args_with_exact_targets as resolve_set_option_command,
+            ResolvedSetOptionArgs, ResolvedSetOptionCommand, ShowOptionsScope,
+            UnresolvedShowOptionsScope,
         },
         resolve_show_options_scope,
     };
@@ -235,6 +237,25 @@ mod tests {
             target: None,
             name: name.map(str::to_owned),
         }
+    }
+
+    fn resolve_set_option_args(
+        command: SetOptionCommandKind,
+        args: SetOptionArgs,
+    ) -> Result<ResolvedSetOptionArgs, crate::cli::ExitFailure> {
+        match resolve_set_option_command(command, args)? {
+            ResolvedSetOptionCommand::Request(request) => Ok(request),
+            ResolvedSetOptionCommand::NoOp => {
+                panic!("expected set-option to resolve to a request")
+            }
+        }
+    }
+
+    fn resolve_set_option_noop(command: SetOptionCommandKind, args: SetOptionArgs) {
+        assert_eq!(
+            resolve_set_option_command(command, args).expect("set-option resolves"),
+            ResolvedSetOptionCommand::NoOp
+        );
     }
 
     #[test]
@@ -290,22 +311,26 @@ mod tests {
     }
 
     #[test]
-    fn set_option_server_flag_still_rejects_window_scoped_options() {
-        let result = resolve_set_option_args(
+    fn set_option_server_flag_ignores_non_server_options_like_tmux() {
+        resolve_set_option_noop(
             SetOptionCommandKind::SetOption,
             SetOptionArgs {
                 server: true,
                 ..global_set_args("mode-style", "fg=black,bg=red")
             },
         );
-        let error = match result {
-            Ok(_) => panic!("mode-style should not accept server scope"),
-            Err(error) => error,
-        };
 
-        assert_eq!(
-            error.message(),
-            "server scope is not supported for this option"
+        resolve_set_option_noop(
+            SetOptionCommandKind::SetOption,
+            SetOptionArgs {
+                global: false,
+                server: true,
+                append: true,
+                target: Some(target_spec("alpha")),
+                option: "status-left".to_owned(),
+                value: Some("append".to_owned()),
+                ..global_set_args("status-left", "append")
+            },
         );
     }
 

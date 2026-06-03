@@ -101,6 +101,8 @@ fn normalize_resize_pane_optional_delta(arguments: Vec<String>) -> Vec<String> {
         .args(["horizontal", "vertical"])
 ))]
 pub(crate) struct SplitWindowArgs {
+    #[arg(short = 'b', action = ArgAction::SetTrue)]
+    pub(crate) before: bool,
     #[arg(short = 'd', action = ArgAction::SetTrue)]
     pub(crate) detached: bool,
     #[arg(short = 'e')]
@@ -117,6 +119,10 @@ pub(crate) struct SplitWindowArgs {
     pub(crate) format: Option<String>,
     #[arg(short = 'P', action = ArgAction::SetTrue)]
     pub(crate) print_target: bool,
+    #[arg(short = 'Z', action = ArgAction::SetTrue)]
+    pub(crate) preserve_zoom: bool,
+    #[arg(short = 'I', action = ArgAction::SetTrue)]
+    pub(crate) stdin: bool,
     #[arg(short = 't', value_parser = parse_target_spec)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
@@ -173,7 +179,7 @@ pub(crate) struct JoinPaneArgs {
     #[arg(short = 'v', action = ArgAction::SetTrue, group = "direction")]
     pub(crate) vertical: bool,
     #[arg(short = 's', value_parser = parse_target_spec)]
-    pub(crate) source: TargetSpec,
+    pub(crate) source: Option<TargetSpec>,
     #[arg(short = 't', value_parser = parse_target_spec)]
     pub(crate) target: Option<TargetSpec>,
 }

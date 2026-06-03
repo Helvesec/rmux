@@ -112,6 +112,46 @@ fn split_window_accepts_start_directory_before_trailing_command() {
 }
 
 #[test]
+fn split_window_accepts_tmux_compat_flags_before_command() {
+    let cli = parse_args(&[
+        "split-window",
+        "-b",
+        "-d",
+        "-Z",
+        "-l",
+        "12",
+        "-t",
+        "alpha:0.0",
+        "sh",
+    ])
+    .unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::SplitWindow(args) => {
+            assert!(args.before);
+            assert!(args.detached);
+            assert!(args.preserve_zoom);
+            assert_eq!(args.size.as_deref(), Some("12"));
+            assert_eq!(args.command, vec!["sh".to_owned()]);
+        }
+        _ => panic!("expected SplitWindow command"),
+    }
+}
+
+#[test]
+fn split_window_parses_stdin_flag_without_treating_it_as_command() {
+    let cli = parse_args(&["split-window", "-I", "-t", "alpha:0.0"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::SplitWindow(args) => {
+            assert!(args.stdin);
+            assert!(args.command.is_empty());
+        }
+        _ => panic!("expected SplitWindow command"),
+    }
+}
+
+#[test]
 fn swap_pane_accepts_relative_direction_without_a_source() {
     let cli = parse_args(&["swap-pane", "-D", "-t", "alpha:2.3"]).unwrap();
 
@@ -177,9 +217,25 @@ fn join_pane_defaults_to_vertical_direction() {
 
     match cli.command.expect("parsed command") {
         super::super::Command::JoinPane(args) => {
-            assert_eq!(args.source.to_string(), "alpha:0.1");
+            assert_eq!(
+                args.source.as_ref().expect("source exists").to_string(),
+                "alpha:0.1"
+            );
             assert_eq!(target_text(&args.target), "alpha:1.0");
             assert_eq!(args.direction(), rmux_proto::SplitDirection::Vertical);
+        }
+        _ => panic!("expected JoinPane command"),
+    }
+}
+
+#[test]
+fn join_pane_accepts_implicit_marked_source() {
+    let cli = parse_args(&["join-pane", "-t", "alpha:1.0"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::JoinPane(args) => {
+            assert!(args.source.is_none());
+            assert_eq!(target_text(&args.target), "alpha:1.0");
         }
         _ => panic!("expected JoinPane command"),
     }
@@ -234,7 +290,10 @@ fn move_pane_parses_the_full_join_pane_flag_surface() {
             assert!(args.full_size);
             assert_eq!(args.direction(), rmux_proto::SplitDirection::Horizontal);
             assert_eq!(args.size_spec().as_deref(), Some("12"));
-            assert_eq!(args.source.to_string(), "alpha:0.1");
+            assert_eq!(
+                args.source.as_ref().expect("source exists").to_string(),
+                "alpha:0.1"
+            );
             assert_eq!(target_text(&args.target), "beta:1.2");
         }
         _ => panic!("expected MovePane command"),

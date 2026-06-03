@@ -86,7 +86,7 @@ pub(crate) struct SwapWindowArgs {
     #[arg(short = 'd', action = ArgAction::SetTrue)]
     pub(crate) detached: bool,
     #[arg(short = 's', value_parser = parse_target_spec)]
-    pub(crate) source: TargetSpec,
+    pub(crate) source: Option<TargetSpec>,
     #[arg(short = 't', value_parser = parse_target_spec)]
     pub(crate) target: Option<TargetSpec>,
 }

@@ -156,12 +156,34 @@ impl HandlerState {
             ));
         };
 
-        self.mutate_session_and_resize_terminals(&session_name, |session| {
-            session.reindex_windows()?;
-            Ok(MoveWindowResponse {
-                session_name: session_name.clone(),
-                target: None,
-            })
+        let previous_session = self
+            .sessions
+            .session(&session_name)
+            .cloned()
+            .ok_or_else(|| session_not_found(&session_name))?;
+        let previous_options = self.options.clone();
+        let previous_hooks = self.hooks.clone();
+        let previous_auto_named_windows = self.auto_named_windows.clone();
+        let previous_window_link_slots = self.window_link_slots.clone();
+        let previous_window_link_groups = self.window_link_groups.clone();
+
+        self.reindex_windows_from_base(&session_name)?;
+        if let Err(error) = self.resize_terminals(&session_name) {
+            self.replace_session(&session_name, previous_session)?;
+            self.options = previous_options;
+            self.hooks = previous_hooks;
+            self.auto_named_windows = previous_auto_named_windows;
+            self.window_link_slots = previous_window_link_slots;
+            self.window_link_groups = previous_window_link_groups;
+            return Err(error);
+        }
+
+        self.synchronize_session_group_from(&session_name)?;
+        self.sync_pane_lifecycle_dimensions_for_session(&session_name);
+
+        Ok(MoveWindowResponse {
+            session_name,
+            target: None,
         })
     }
 

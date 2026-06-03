@@ -129,41 +129,51 @@ pub(crate) fn display_pane_targets(
     session: &Session,
     options: &OptionStore,
 ) -> Vec<DisplayPaneTarget> {
-    display_pane_specs(session, options)
-        .into_iter()
-        .map(|spec| DisplayPaneTarget {
-            label: spec.label,
-            target: spec.target,
-            target_string: spec.target_string,
-        })
-        .collect()
+    let mut targets = Vec::new();
+    for spec in display_pane_specs(session, options) {
+        targets.push(DisplayPaneTarget {
+            label: spec.label.clone(),
+            target: spec.target.clone(),
+            target_string: spec.target_string.clone(),
+        });
+        if let Some(alias) = spec.alias {
+            targets.push(DisplayPaneTarget {
+                label: alias,
+                target: spec.target,
+                target_string: spec.target_string,
+            });
+        }
+    }
+    targets
 }
 
 fn display_pane_specs(session: &Session, options: &OptionStore) -> Vec<DisplayPaneSpec> {
     let window = session.window();
     let active_pane_index = window.active_pane_index();
+    let window_index = session.active_window_index();
     let inactive_colour =
         display_panes_colour(options.resolve(Some(session.name()), OptionName::DisplayPanesColour));
     let active_colour = display_panes_colour(
         options.resolve(Some(session.name()), OptionName::DisplayPanesActiveColour),
     );
-    let base_index = options
-        .resolve(Some(session.name()), 
-            OptionName::PaneBaseIndex)
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(0);
 
     display_panes(window)
         .into_iter()
         .filter_map(|pane| {
             let geometry = visible_pane_geometry(session, options, pane)?;
-            let label = pane.index().saturating_add(base_index).to_string();
+            let visible_index = crate::pane_indices::visible_pane_index(
+                session,
+                options,
+                window_index,
+                pane.index(),
+            );
+            let label = visible_index.to_string();
             let label_width = u16::try_from(label.len()).ok()?;
             if geometry.cols() < label_width || geometry.rows() == 0 {
                 return None;
             }
 
-            let alias = pane_alias(pane.index());
+            let alias = pane_alias(visible_index);
             let is_active = pane.index() == active_pane_index;
             let colour = if is_active {
                 active_colour.as_slice()
@@ -237,7 +247,7 @@ fn display_pane_specs(session: &Session, options: &OptionStore) -> Vec<DisplayPa
                         });
                     }
 
-                    if let Some(alias) = alias {
+                    if let Some(alias) = alias.as_ref() {
                         let x = geometry
                             .x()
                             .saturating_add(geometry.cols() / 2)
@@ -257,15 +267,12 @@ fn display_pane_specs(session: &Session, options: &OptionStore) -> Vec<DisplayPa
 
             Some(DisplayPaneSpec {
                 label,
-                target: PaneTarget::with_window(
-                    session.name().clone(),
-                    session.active_window_index(),
-                    pane.index(),
-                ),
+                alias,
+                target: PaneTarget::with_window(session.name().clone(), window_index, pane.index()),
                 target_string: format!(
                     "={}:{}.%{}",
                     session.name(),
-                    session.active_window_index(),
+                    window_index,
                     pane.id().as_u32()
                 ),
                 overlay_runs,
@@ -386,6 +393,7 @@ fn display_panes(window: &Window) -> Vec<&Pane> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DisplayPaneSpec {
     label: String,
+    alias: Option<String>,
     target: PaneTarget,
     target_string: String,
     overlay_runs: Vec<DisplayPaneRun>,
@@ -418,7 +426,9 @@ pub(crate) struct DisplayPaneTarget {
 mod tests {
     use super::*;
     use rmux_core::{OptionStore, Session};
-    use rmux_proto::{ResizePaneAdjustment, SessionName, TerminalSize, ScopeSelector, SetOptionMode};
+    use rmux_proto::{
+        ResizePaneAdjustment, ScopeSelector, SessionName, SetOptionMode, TerminalSize, WindowTarget,
+    };
 
     fn session_name(value: &str) -> SessionName {
         SessionName::new(value).expect("valid session name")
@@ -491,21 +501,31 @@ mod tests {
     }
 
     #[test]
-    fn display_panes_overlay_respects_pane_base_index() {
-        let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 8, rows: 4 }); 
+    fn display_panes_uses_window_local_pane_base_index_for_labels() {
+        let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 12, rows: 4 });
         session.split_active_pane().expect("split succeeds");
         let mut options = OptionStore::new();
-        options.set(
-                ScopeSelector::Global,
+        options
+            .set(
+                ScopeSelector::Window(WindowTarget::with_window(session.name().clone(), 0)),
                 OptionName::PaneBaseIndex,
-                "1".to_owned(),
+                "10".to_owned(),
                 SetOptionMode::Replace,
             )
-            .expect("set succeeds");
+            .expect("pane-base-index set succeeds");
 
-        let frame = String::from_utf8(render_display_panes_overlay(&session, &options)).expect("overlay is utf-8");
+        let targets = display_pane_targets(&session, &options);
 
-        assert!(frame.contains("\u{1b}[2;3H\u{1b}[0m\u{1b}[44m1"));
-        assert!(frame.contains("\u{1b}[2;7H\u{1b}[0m\u{1b}[41m2"));
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["10", "a", "11", "b"]
+        );
+        assert_eq!(targets[0].target.pane_index(), 0);
+        assert_eq!(targets[1].target.pane_index(), 0);
+        assert_eq!(targets[2].target.pane_index(), 1);
+        assert_eq!(targets[3].target.pane_index(), 1);
     }
 }

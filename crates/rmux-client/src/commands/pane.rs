@@ -3,8 +3,8 @@ use rmux_proto::{
     KillPaneRequest, LastPaneRequest, MovePaneRequest, PaneTarget, PipePaneRequest, Request,
     ResizePaneAdjustment, ResizePaneRequest, RespawnPaneRequest, Response,
     SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneMarkRequest, SelectPaneRequest,
-    SendKeysExtRequest, SendKeysRequest, SendPrefixRequest, SessionName, SwapPaneDirection,
-    SwapPaneRequest, WindowTarget,
+    SendKeysExt2Request, SendKeysExtRequest, SendKeysRequest, SendPrefixRequest, SessionName,
+    SwapPaneDirection, SwapPaneRequest, WindowTarget, CAPABILITY_TARGET_CLIENT_COMMANDS,
 };
 
 use crate::{connection::Connection, ClientError};
@@ -218,6 +218,22 @@ impl Connection {
         request: SendKeysExtRequest,
     ) -> Result<Response, ClientError> {
         self.roundtrip(&Request::SendKeysExt(request))
+    }
+
+    /// Sends a target-client aware `send-keys` request over detached RPC.
+    pub fn send_keys_extended_target_client(
+        &mut self,
+        request: SendKeysExt2Request,
+    ) -> Result<Response, ClientError> {
+        if !self.supports_capability(CAPABILITY_TARGET_CLIENT_COMMANDS)? {
+            return Err(ClientError::Protocol(
+                rmux_proto::RmuxError::UnsupportedCapability {
+                    feature: CAPABILITY_TARGET_CLIENT_COMMANDS.to_owned(),
+                    supported: Vec::new(),
+                },
+            ));
+        }
+        self.roundtrip(&Request::SendKeysExt2(request))
     }
 
     /// Sends a `send-prefix` request over the detached RPC channel.

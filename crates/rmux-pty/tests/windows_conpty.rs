@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rmux_pty::{ChildCommand, PtyMaster, PtyPair, TerminalSize};
+use rmux_pty::{ChildCommand, PtyMaster, PtyPair, SpawnedPty, TerminalSize};
 use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -170,30 +170,22 @@ fn conpty_force_kill_reaps_child() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn conpty_force_kill_reaps_grandchild_process_tree() -> Result<(), Box<dyn std::error::Error>> {
     let command = concat!(
-        "$child = Start-Process -FilePath powershell.exe ",
-        "-ArgumentList '-NoLogo','-NoProfile','-Command','Start-Sleep -Seconds 30' ",
+        "powershell -NoLogo -NoProfile -NonInteractive -Command ",
+        "\"$child = Start-Process -FilePath ($PSHOME + '\\powershell.exe') ",
+        "-ArgumentList '-NoLogo -NoProfile -NonInteractive -Command Start-Sleep -Seconds 30' ",
         "-WindowStyle Hidden -PassThru; ",
-        "Write-Output \"RMUX_GRANDCHILD=$($child.Id)\"; ",
-        "Start-Sleep -Seconds 30"
+        "[Console]::Out.WriteLine('RMUX_' + 'GRANDCHILD=' + $child.Id); ",
+        "[Console]::Out.Flush()\"\r\n"
     );
-    let mut spawned =
-        ChildCommand::new("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                command,
-            ])
-            .size(TerminalSize::new(100, 30))
-            .spawn()?;
+    let mut spawned = ChildCommand::new("C:\\Windows\\System32\\cmd.exe")
+        .args(["/D", "/K"])
+        .size(TerminalSize::new(100, 30))
+        .spawn()?;
+    let io = spawned.master().try_clone_io()?;
+    let _ = read_until_io(&io, b">", Duration::from_secs(2))?;
+    io.write_all(command.as_bytes())?;
 
-    let output = read_until(
-        spawned.master(),
-        b"RMUX_GRANDCHILD=",
-        Duration::from_secs(5),
-    )?;
+    let output = read_until_or_kill(&mut spawned, b"RMUX_GRANDCHILD=", Duration::from_secs(5))?;
     let grandchild_pid = parse_marker_pid(&output, "RMUX_GRANDCHILD=")?;
     assert!(
         process_is_running(grandchild_pid),
@@ -237,6 +229,30 @@ fn read_until(
     read_until_io(&io, needle, timeout)
 }
 
+fn read_until_or_kill(
+    spawned: &mut SpawnedPty,
+    needle: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let io = spawned.master().try_clone_io()?;
+    let needle = needle.to_vec();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = read_until_io(&io, &needle, timeout).map_err(|error| error.to_string());
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(timeout + Duration::from_secs(1)) {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(error)) => Err(error.into()),
+        Err(error) => {
+            let _ = spawned.child().terminate_forcefully();
+            let _ = spawned.child_mut().wait();
+            Err(format!("timed out waiting for ConPTY output: {error}").into())
+        }
+    }
+}
+
 fn read_until_io(
     io: &rmux_pty::PtyIo,
     needle: &[u8],
@@ -262,18 +278,19 @@ fn read_until_io(
 
 fn parse_marker_pid(bytes: &[u8], marker: &str) -> Result<u32, Box<dyn std::error::Error>> {
     let output = String::from_utf8_lossy(bytes);
-    let start = output
-        .find(marker)
-        .ok_or_else(|| format!("marker {marker:?} not found in output {output:?}"))?
-        + marker.len();
-    let digits = output[start..]
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    if digits.is_empty() {
-        return Err(format!("marker {marker:?} did not include a pid in {output:?}").into());
+    for start in output
+        .match_indices(marker)
+        .map(|(index, _)| index + marker.len())
+    {
+        let digits = output[start..]
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .collect::<String>();
+        if !digits.is_empty() {
+            return Ok(digits.parse()?);
+        }
     }
-    Ok(digits.parse()?)
+    Err(format!("marker {marker:?} did not include a pid in {output:?}").into())
 }
 
 fn process_is_running(pid: u32) -> bool {

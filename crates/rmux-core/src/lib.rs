@@ -10,6 +10,7 @@ mod box_lines;
 mod buffers;
 pub mod command_parser;
 pub mod command_queue;
+mod dec_modes;
 mod environment;
 /// Bounded event buffers and cursor accounting.
 pub mod events;
@@ -42,6 +43,7 @@ mod window;
 
 pub use box_lines::BoxLines;
 pub use buffers::{BufferStore, BufferView, RenameBufferOutcome, SetBufferOutcome};
+pub use dec_modes::{render_dec_modes, render_dec_modes_for_snapshot};
 pub use environment::{EnvironmentStore, ShowEnvironmentEntry, ENVIRON_HIDDEN};
 pub use formats::format_skip_delimiter;
 pub use grid::GridRenderOptions;

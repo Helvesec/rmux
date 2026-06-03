@@ -26,6 +26,7 @@ use windows_sys::Win32::System::Threading::{
 
 use crate::{ChildCommand, ProcessId, Result, Signal};
 
+use super::application::resolve_application_path;
 use super::command_line::{command_line, environment_block, wide_null};
 use super::{should_enable_dsr_bootstrap, WindowsPty};
 
@@ -136,7 +137,8 @@ fn create_suspended_process(
     startup.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
     startup.lpAttributeList = attributes.as_mut_ptr();
 
-    let application = wide_null(command.program.as_os_str());
+    let application_path = resolve_application_path(command)?;
+    let application = wide_null(application_path.as_os_str());
     let mut command_line = command_line(command);
     let mut environment = environment_block(command);
     let current_dir = command
@@ -263,8 +265,12 @@ pub(crate) fn kill_child(child: &WindowsChild, signal: Signal) -> Result<()> {
         Signal::INT => interrupt_child(child),
         Signal::CONT => Ok(()),
         Signal::TERM | Signal::KILL | Signal::HUP => {
+            child.pty.close_pseudoconsole();
             if let Some(job) = &child.job {
                 job.terminate(1)?;
+                if process_is_still_running(&child.process)? {
+                    let _ = terminate_process(&child.process, 1);
+                }
             } else {
                 return Err(io::Error::other(
                     "Windows child has no Job Object cleanup guard; refusing unsafe fallback kill",
@@ -273,6 +279,18 @@ pub(crate) fn kill_child(child: &WindowsChild, signal: Signal) -> Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+fn process_is_still_running(process: &OwnedHandle) -> io::Result<bool> {
+    // SAFETY: `process` is a live process handle owned by the caller; waiting
+    // with a short timeout only observes process state.
+    let wait = unsafe { WaitForSingleObject(process.as_raw_handle() as HANDLE, 500) };
+    match wait {
+        WAIT_OBJECT_0 => Ok(false),
+        WAIT_TIMEOUT => Ok(true),
+        WAIT_FAILED => Err(last_os_error()),
+        _ => Err(io::Error::other("unexpected process wait result")),
     }
 }
 

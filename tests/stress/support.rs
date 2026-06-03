@@ -1,6 +1,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
+use std::fs::{File, OpenOptions};
 use std::io;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -20,14 +22,45 @@ const NEW_TTY_POLL_INTERVAL: Duration = Duration::from_millis(20);
 static SESSION_ID: AtomicUsize = AtomicUsize::new(0);
 static SERIAL_EXECUTION_LOCK: Mutex<()> = Mutex::new(());
 
+pub(super) struct SerialExecutionGuard {
+    _local: MutexGuard<'static, ()>,
+    file: File,
+}
+
+impl Drop for SerialExecutionGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 pub(super) fn runtime() -> Result<Runtime, Box<dyn Error>> {
     Ok(Builder::new_multi_thread().enable_all().build()?)
 }
 
-pub(super) fn serialize_test_execution() -> MutexGuard<'static, ()> {
-    SERIAL_EXECUTION_LOCK
+pub(super) fn serialize_test_execution() -> SerialExecutionGuard {
+    let local = SERIAL_EXECUTION_LOCK
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let path = std::env::temp_dir().join("rmux-live-daemon-tests.lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap_or_else(|error| panic!("open live-daemon test lock {}: {error}", path.display()));
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    assert_eq!(
+        result,
+        0,
+        "lock live-daemon test gate {}: {}",
+        path.display(),
+        io::Error::last_os_error()
+    );
+    SerialExecutionGuard {
+        _local: local,
+        file,
+    }
 }
 
 pub(super) fn unique_session_name(prefix: &str) -> SessionName {

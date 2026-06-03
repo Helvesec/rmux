@@ -23,6 +23,8 @@ mod message;
 mod prompt;
 #[path = "status/runs.rs"]
 mod runs;
+#[path = "status/status_format.rs"]
+mod status_format;
 
 pub(super) use geometry::StatusGeometry;
 pub(super) use message::format_status_message_line;
@@ -31,17 +33,30 @@ pub(super) use runs::{sanitize_status_text, status_runs_width, StatusRun};
 
 use prompt::prompt_status_layout;
 use runs::{push_spaces, push_status_run, render_status_runs, truncate_status_runs, StatusStyle};
+use status_format::render_explicit_status_format_line;
 
-pub(super) fn render_status_bar(
-    session: &Session,
-    options: &OptionStore,
-    geometry: StatusGeometry,
-    attached_count: usize,
-    prompt: Option<&RenderedPrompt>,
-    pane_title: Option<&str>,
-    state: Option<&HandlerState>,
-    key_table: Option<&str>,
-) -> Vec<u8> {
+pub(super) struct StatusBarRenderRequest<'a> {
+    pub(super) session: &'a Session,
+    pub(super) options: &'a OptionStore,
+    pub(super) geometry: StatusGeometry,
+    pub(super) attached_count: usize,
+    pub(super) prompt: Option<&'a RenderedPrompt>,
+    pub(super) pane_title: Option<&'a str>,
+    pub(super) state: Option<&'a HandlerState>,
+    pub(super) key_table: Option<&'a str>,
+}
+
+pub(super) fn render_status_bar(request: StatusBarRenderRequest<'_>) -> Vec<u8> {
+    let StatusBarRenderRequest {
+        session,
+        options,
+        geometry,
+        attached_count,
+        prompt,
+        pane_title,
+        state,
+        key_table,
+    } = request;
     let Some(status_y) = geometry.status_y else {
         return Vec::new();
     };
@@ -199,6 +214,16 @@ fn status_bar_line_with_pane_title(
     }
     if let Some(pane_title) = pane_title {
         runtime = runtime.with_named_value("pane_title", pane_title);
+    }
+    if let Some(line) = render_explicit_status_format_line(
+        session_name,
+        options,
+        &runtime,
+        &base_style,
+        width,
+        &utf8_config,
+    ) {
+        return line;
     }
 
     let left_template = options

@@ -16,32 +16,36 @@ pub(super) fn resolve_set_option_args(
     connection: &mut Connection,
     command: SetOptionCommandKind,
     args: SetOptionArgs,
-) -> Result<ResolvedSetOptionArgs, ExitFailure> {
+) -> Result<ResolvedSetOptionCommand, ExitFailure> {
     validate_set_option_name(&args.option)?;
     let request = SetOptionScopeRequest::new(command, &args);
     let scope = resolve_set_option_scope(
         request,
         &mut ConnectionSetOptionTargetResolver { connection },
     )?;
-    build_resolved_set_option_args(args, scope)
+    build_resolved_set_option_command(args, scope)
 }
 
 #[cfg(test)]
 pub(super) fn resolve_set_option_args_with_exact_targets(
     command: SetOptionCommandKind,
     args: SetOptionArgs,
-) -> Result<ResolvedSetOptionArgs, ExitFailure> {
+) -> Result<ResolvedSetOptionCommand, ExitFailure> {
     validate_set_option_name(&args.option)?;
     let mut resolver = ExactSetOptionTargetResolver;
     let request = SetOptionScopeRequest::new(command, &args);
     let scope = resolve_set_option_scope(request, &mut resolver)?;
-    build_resolved_set_option_args(args, scope)
+    build_resolved_set_option_command(args, scope)
 }
 
-fn build_resolved_set_option_args(
+fn build_resolved_set_option_command(
     args: SetOptionArgs,
-    scope: OptionScopeSelector,
-) -> Result<ResolvedSetOptionArgs, ExitFailure> {
+    scope: ResolvedSetOptionScope,
+) -> Result<ResolvedSetOptionCommand, ExitFailure> {
+    let Some(scope) = scope.into_scope() else {
+        return Ok(ResolvedSetOptionCommand::NoOp);
+    };
+
     let mode = if args.append {
         SetOptionMode::Append
     } else {
@@ -57,7 +61,7 @@ fn build_resolved_set_option_args(
     )
     .map_err(|error| ExitFailure::new(1, error.to_string()))?;
 
-    Ok(ResolvedSetOptionArgs {
+    Ok(ResolvedSetOptionCommand::Request(ResolvedSetOptionArgs {
         scope,
         option: args.option,
         value: args.value,
@@ -65,9 +69,16 @@ fn build_resolved_set_option_args(
         only_if_unset: args.only_if_unset,
         unset: args.unset,
         unset_pane_overrides: args.unset_pane_overrides,
-    })
+    }))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ResolvedSetOptionCommand {
+    Request(ResolvedSetOptionArgs),
+    NoOp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ResolvedSetOptionArgs {
     pub(super) scope: OptionScopeSelector,
     pub(super) option: String,
@@ -76,6 +87,27 @@ pub(super) struct ResolvedSetOptionArgs {
     pub(super) only_if_unset: bool,
     pub(super) unset: bool,
     pub(super) unset_pane_overrides: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResolvedSetOptionScope {
+    Scope(OptionScopeSelector),
+    NoOp,
+}
+
+impl ResolvedSetOptionScope {
+    fn into_scope(self) -> Option<OptionScopeSelector> {
+        match self {
+            Self::Scope(scope) => Some(scope),
+            Self::NoOp => None,
+        }
+    }
+}
+
+impl From<OptionScopeSelector> for ResolvedSetOptionScope {
+    fn from(scope: OptionScopeSelector) -> Self {
+        Self::Scope(scope)
+    }
 }
 
 fn validate_set_option_name(name: &str) -> Result<(), ExitFailure> {
@@ -115,7 +147,7 @@ impl<'a> SetOptionScopeRequest<'a> {
 fn resolve_set_option_scope(
     request: SetOptionScopeRequest<'_>,
     resolver: &mut impl SetOptionTargetResolver,
-) -> Result<OptionScopeSelector, ExitFailure> {
+) -> Result<ResolvedSetOptionScope, ExitFailure> {
     let force_window = matches!(request.command, SetOptionCommandKind::SetWindowOption);
     let is_user = request
         .option
@@ -135,13 +167,10 @@ fn resolve_set_option_scope(
 
     if request.server {
         let scope = OptionScopeSelector::ServerGlobal;
-        if !is_user && !supports_scope(&scope) {
-            return Err(ExitFailure::new(
-                1,
-                "server scope is not supported for this option",
-            ));
+        if is_user || supports_scope(&scope) {
+            return Ok(scope.into());
         }
-        return Ok(scope);
+        return Ok(ResolvedSetOptionScope::NoOp);
     }
 
     if request.pane {
@@ -165,7 +194,7 @@ fn resolve_set_option_scope(
                 "pane scope is not supported for this option",
             ));
         }
-        return Ok(scope);
+        return Ok(scope.into());
     }
 
     if request.window || force_window {
@@ -177,7 +206,7 @@ fn resolve_set_option_scope(
                     "window scope is not supported for this option",
                 ));
             }
-            return Ok(scope);
+            return Ok(scope.into());
         }
 
         let target = match request.target {
@@ -200,7 +229,7 @@ fn resolve_set_option_scope(
                 "window scope is not supported for this option",
             ));
         }
-        return Ok(scope);
+        return Ok(scope.into());
     }
 
     if request.global {
@@ -212,7 +241,7 @@ fn resolve_set_option_scope(
                 "global scope is not supported for this option",
             ));
         }
-        return Ok(scope);
+        return Ok(scope.into());
     }
 
     let Some(target_spec) = request.target else {
@@ -227,7 +256,7 @@ fn resolve_set_option_scope(
         if matches!(global_scope, OptionScopeSelector::ServerGlobal)
             && supports_scope(&global_scope)
         {
-            return Ok(global_scope);
+            return Ok(global_scope.into());
         }
     }
 
@@ -278,24 +307,24 @@ fn resolve_set_option_scope(
         ));
     }
 
-    Ok(scope)
+    Ok(scope.into())
 }
 
 fn resolve_implicit_set_option_scope(
     option: &str,
     resolver: &mut impl SetOptionTargetResolver,
-) -> Result<OptionScopeSelector, ExitFailure> {
+) -> Result<ResolvedSetOptionScope, ExitFailure> {
     match rmux_core::default_global_scope_for_option_name(option)
         .map_err(|error| ExitFailure::new(1, error.to_string()))?
     {
-        OptionScopeSelector::ServerGlobal => Ok(OptionScopeSelector::ServerGlobal),
-        OptionScopeSelector::WindowGlobal => Ok(OptionScopeSelector::Window(
-            resolver.current_window("set-option")?,
-        )),
-        OptionScopeSelector::SessionGlobal => Ok(OptionScopeSelector::Session(
-            resolver.current_session("set-option")?,
-        )),
-        scope => Ok(scope),
+        OptionScopeSelector::ServerGlobal => Ok(OptionScopeSelector::ServerGlobal.into()),
+        OptionScopeSelector::WindowGlobal => {
+            Ok(OptionScopeSelector::Window(resolver.current_window("set-option")?).into())
+        }
+        OptionScopeSelector::SessionGlobal => {
+            Ok(OptionScopeSelector::Session(resolver.current_session("set-option")?).into())
+        }
+        scope => Ok(scope.into()),
     }
 }
 

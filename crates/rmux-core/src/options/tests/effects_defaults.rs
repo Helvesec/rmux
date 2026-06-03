@@ -28,13 +28,10 @@ fn known_options_do_not_cross_global_roots_during_resolve() {
 
 #[cfg(unix)]
 #[test]
-fn unix_default_shell_matches_tmux_default() {
+fn unix_default_shell_starts_empty_for_runtime_resolution() {
     let store = OptionStore::new();
 
-    assert_eq!(
-        store.resolve(None, OptionName::DefaultShell),
-        Some("/bin/bash")
-    );
+    assert_eq!(store.resolve(None, OptionName::DefaultShell), Some(""));
 }
 
 #[test]
@@ -194,22 +191,16 @@ fn status_format_array_default_resolves_tmux_entries_in_snapshot() {
 }
 
 #[test]
-fn status_right_default_uses_platform_title_source() {
+fn status_right_default_uses_machine_name() {
     let store = OptionStore::new();
     let alpha = session_name("alpha");
     let value = store
         .resolve(Some(&alpha), OptionName::StatusRight)
         .expect("status-right default resolves");
 
-    #[cfg(windows)]
     assert!(
         value.contains("#{=21:host_short}"),
-        "Windows status-right should show the machine name, got {value:?}"
-    );
-    #[cfg(not(windows))]
-    assert!(
-        value.contains("#{=21:pane_title}"),
-        "Unix status-right should keep tmux's pane-title default, got {value:?}"
+        "status-right should show the machine name, got {value:?}"
     );
 }
 

@@ -61,6 +61,15 @@ pub struct SplitWindowExtRequest {
     /// Optional pane-local `remain-on-exit` override applied before spawn.
     #[serde(default)]
     pub keep_alive_on_exit: Option<bool>,
+    /// Whether pane selection should stay on the original pane after split.
+    #[serde(default)]
+    pub detached: bool,
+    /// Optional tmux `-l` split size expression.
+    #[serde(default)]
+    pub size: Option<String>,
+    /// Whether an existing zoomed window should remain zoomed after split.
+    #[serde(default)]
+    pub preserve_zoom: bool,
 }
 
 impl<'de> Deserialize<'de> for SplitWindowExtRequest {
@@ -79,6 +88,9 @@ impl<'de> Deserialize<'de> for SplitWindowExtRequest {
                 "process_command",
                 "start_directory",
                 "keep_alive_on_exit",
+                "detached",
+                "size",
+                "preserve_zoom",
             ],
             compat::SplitWindowExtRequestVisitor,
         )
@@ -521,4 +533,35 @@ pub struct SendKeysExtRequest {
     pub reset_terminal: bool,
     /// Optional tmux repeat count for command or key dispatch.
     pub repeat_count: Option<usize>,
+}
+
+/// Further-extended request payload for `send-keys -c`.
+///
+/// This is intentionally separate from [`SendKeysExtRequest`] so the original
+/// bincode field order remains wire-compatible with older clients and daemons.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendKeysExt2Request {
+    /// The optional explicit pane target.
+    pub target: Option<PaneTarget>,
+    /// Key tokens in left-to-right order.
+    pub keys: Vec<String>,
+    /// Whether tmux format expansion should be applied to each token first.
+    pub expand_formats: bool,
+    /// Whether each token should be interpreted as a hexadecimal byte value.
+    pub hex: bool,
+    /// Whether tokens should be sent as literal bytes instead of key names.
+    #[serde(default)]
+    pub literal: bool,
+    /// Whether keys should be dispatched through the client's key table.
+    pub dispatch_key_table: bool,
+    /// Whether tokens describe copy-mode commands.
+    pub copy_mode_command: bool,
+    /// Whether the payload should be treated as a mouse event.
+    pub forward_mouse_event: bool,
+    /// Whether the target terminal should be reset before sending keys.
+    pub reset_terminal: bool,
+    /// Optional tmux repeat count for command or key dispatch.
+    pub repeat_count: Option<usize>,
+    /// Optional target client used for current-pane resolution and client key dispatch.
+    pub target_client: Option<String>,
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
@@ -242,9 +242,86 @@ impl OptionStore {
             .map(OptionNode::into_known_values)
     }
 
+    /// Copies exact window and pane overrides from one winlink slot to another.
+    pub fn copy_window_overrides(&mut self, source: &WindowTarget, target: &WindowTarget) {
+        if let Some(source_window) = self.windows.get(source).cloned() {
+            self.windows.insert(
+                target.clone(),
+                source_window.with_scope(OptionScopeSelector::Window(target.clone())),
+            );
+        } else {
+            self.windows.remove(target);
+        }
+
+        self.panes.retain(|pane_target, _| {
+            pane_target.session_name() != target.session_name()
+                || pane_target.window_index() != target.window_index()
+        });
+
+        let source_panes = self
+            .panes
+            .iter()
+            .filter(|(pane_target, _)| {
+                pane_target.session_name() == source.session_name()
+                    && pane_target.window_index() == source.window_index()
+            })
+            .map(|(pane_target, node)| {
+                let target_pane = PaneTarget::with_window(
+                    target.session_name().clone(),
+                    target.window_index(),
+                    pane_target.pane_index(),
+                );
+                (
+                    target_pane.clone(),
+                    node.clone()
+                        .with_scope(OptionScopeSelector::Pane(target_pane)),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        self.panes.extend(source_panes);
+    }
+
     /// Removes all pane option overrides owned by the given pane.
     pub fn remove_pane(&mut self, target: &PaneTarget) -> Option<HashMap<OptionName, String>> {
         self.panes.remove(target).map(OptionNode::into_known_values)
+    }
+
+    /// Rekeys window and pane option overrides after a session window reindex.
+    pub fn remap_session_window_indices(
+        &mut self,
+        session_name: &SessionName,
+        index_map: &BTreeMap<u32, u32>,
+    ) -> Result<(), RmuxError> {
+        let mut remapped_windows = HashMap::with_capacity(self.windows.len());
+        for (target, values) in &self.windows {
+            let next_target = remapped_window_target(target, session_name, index_map);
+            if remapped_windows
+                .insert(next_target.clone(), values.clone())
+                .is_some()
+            {
+                return Err(RmuxError::Server(format!(
+                    "window options already exist for {next_target}"
+                )));
+            }
+        }
+
+        let mut remapped_panes = HashMap::with_capacity(self.panes.len());
+        for (target, values) in &self.panes {
+            let next_target = remapped_pane_target(target, session_name, index_map);
+            if remapped_panes
+                .insert(next_target.clone(), values.clone())
+                .is_some()
+            {
+                return Err(RmuxError::Server(format!(
+                    "pane options already exist for {next_target}"
+                )));
+            }
+        }
+
+        self.windows = remapped_windows;
+        self.panes = remapped_panes;
+        Ok(())
     }
 
     fn set_query(
@@ -380,6 +457,36 @@ impl OptionStore {
             !node.is_empty()
         });
     }
+}
+
+fn remapped_window_target(
+    target: &WindowTarget,
+    session_name: &SessionName,
+    index_map: &BTreeMap<u32, u32>,
+) -> WindowTarget {
+    if target.session_name() != session_name {
+        return target.clone();
+    }
+    index_map.get(&target.window_index()).copied().map_or_else(
+        || target.clone(),
+        |window_index| WindowTarget::with_window(session_name.clone(), window_index),
+    )
+}
+
+fn remapped_pane_target(
+    target: &PaneTarget,
+    session_name: &SessionName,
+    index_map: &BTreeMap<u32, u32>,
+) -> PaneTarget {
+    if target.session_name() != session_name {
+        return target.clone();
+    }
+    index_map.get(&target.window_index()).copied().map_or_else(
+        || target.clone(),
+        |window_index| {
+            PaneTarget::with_window(session_name.clone(), window_index, target.pane_index())
+        },
+    )
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use rmux_proto::{RmuxError, SessionName};
+use rmux_proto::{RmuxError, SessionName, WindowTarget};
 
 use super::{session_not_found, HandlerState};
 
@@ -52,7 +52,7 @@ impl HandlerState {
                 group
                     .slots
                     .iter()
-                    .map(|slot| slot.session_name.clone())
+                    .map(|slot| &slot.session_name)
                     .collect::<HashSet<_>>()
                     .len()
             })
@@ -69,9 +69,11 @@ impl HandlerState {
             .get(&slot)
             .and_then(|group_id| self.window_link_groups.get(group_id))
             .map(|group| {
+                let mut seen = HashSet::new();
                 group
                     .slots
                     .iter()
+                    .filter(|slot| seen.insert(slot.session_name.clone()))
                     .map(|slot| slot.session_name.clone())
                     .collect()
             })
@@ -100,6 +102,20 @@ impl HandlerState {
             .and_then(|group_id| self.window_link_groups.get(group_id))
             .map(|group| group.slots.clone())
             .unwrap_or_else(|| vec![slot])
+    }
+
+    pub(crate) fn synchronize_linked_window_options_from_slot(
+        &mut self,
+        session_name: &SessionName,
+        window_index: u32,
+    ) {
+        let source = WindowTarget::with_window(session_name.clone(), window_index);
+        for slot in self.window_link_slots_for(session_name, window_index) {
+            let target = WindowTarget::with_window(slot.session_name, slot.window_index);
+            if target != source {
+                self.options.copy_window_overrides(&source, &target);
+            }
+        }
     }
 
     fn window_link_group_id_for_slot_or_group_peer(
@@ -251,6 +267,142 @@ impl HandlerState {
         }
     }
 
+    pub(in crate::pane_terminals) fn remap_window_indexed_state(
+        &mut self,
+        session_name: &SessionName,
+        index_map: &BTreeMap<u32, u32>,
+    ) {
+        self.auto_named_windows = self
+            .auto_named_windows
+            .iter()
+            .map(|(name, window_index)| {
+                let next_index = if name == session_name {
+                    index_map
+                        .get(window_index)
+                        .copied()
+                        .unwrap_or(*window_index)
+                } else {
+                    *window_index
+                };
+                (name.clone(), next_index)
+            })
+            .collect();
+
+        let mut remapped_slots = HashMap::with_capacity(self.window_link_slots.len());
+        for (slot, group_id) in &self.window_link_slots {
+            let next_slot = remapped_window_link_slot(slot, session_name, index_map);
+            remapped_slots.insert(next_slot, *group_id);
+        }
+        self.window_link_slots = remapped_slots;
+
+        for group in self.window_link_groups.values_mut() {
+            group.slots = group
+                .slots
+                .iter()
+                .map(|slot| remapped_window_link_slot(slot, session_name, index_map))
+                .collect();
+        }
+    }
+
+    pub(in crate::pane_terminals) fn rename_window_link_session(
+        &mut self,
+        session_name: &SessionName,
+        new_name: &SessionName,
+    ) {
+        let mut renamed_slots = HashMap::with_capacity(self.window_link_slots.len());
+        for (slot, group_id) in &self.window_link_slots {
+            renamed_slots.insert(
+                renamed_window_link_slot(slot, session_name, new_name),
+                *group_id,
+            );
+        }
+        self.window_link_slots = renamed_slots;
+
+        for group in self.window_link_groups.values_mut() {
+            rename_window_link_runtime_session(group, session_name, new_name);
+            group.slots = group
+                .slots
+                .iter()
+                .map(|slot| renamed_window_link_slot(slot, session_name, new_name))
+                .collect();
+        }
+    }
+
+    pub(in crate::pane_terminals) fn rename_window_link_runtime_session(
+        &mut self,
+        session_name: &SessionName,
+        new_name: &SessionName,
+    ) {
+        for group in self.window_link_groups.values_mut() {
+            rename_window_link_runtime_session(group, session_name, new_name);
+        }
+    }
+
+    pub(in crate::pane_terminals) fn linked_runtime_transfer_slots_for_removed_session(
+        &self,
+        session_name: &SessionName,
+    ) -> Vec<WindowLinkSlot> {
+        let mut slots = self
+            .window_link_groups
+            .values()
+            .filter(|group| group.runtime_session_name == *session_name)
+            .filter_map(|group| {
+                group
+                    .slots
+                    .iter()
+                    .filter(|slot| slot.session_name != *session_name)
+                    .filter(|slot| {
+                        self.sessions
+                            .session(&slot.session_name)
+                            .and_then(|session| session.window_at(slot.window_index))
+                            .is_some()
+                    })
+                    .min_by(|left, right| {
+                        left.session_name
+                            .as_str()
+                            .cmp(right.session_name.as_str())
+                            .then_with(|| left.window_index.cmp(&right.window_index))
+                    })
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        slots.sort_by(|left, right| {
+            left.session_name
+                .as_str()
+                .cmp(right.session_name.as_str())
+                .then_with(|| left.window_index.cmp(&right.window_index))
+        });
+        slots
+    }
+
+    pub(in crate::pane_terminals) fn set_window_link_runtime_session_for_slot(
+        &mut self,
+        slot: &WindowLinkSlot,
+        runtime_session_name: SessionName,
+    ) {
+        let Some(group_id) = self.window_link_slots.get(slot).copied() else {
+            return;
+        };
+        if let Some(group) = self.window_link_groups.get_mut(&group_id) {
+            group.runtime_session_name = runtime_session_name;
+        }
+    }
+
+    pub(in crate::pane_terminals) fn remove_window_link_session_slots(
+        &mut self,
+        session_name: &SessionName,
+    ) {
+        let slots = self
+            .window_link_slots
+            .keys()
+            .filter(|slot| slot.session_name == *session_name)
+            .cloned()
+            .collect::<Vec<_>>();
+        for slot in slots {
+            let _ = self.detach_window_link_slot(&slot.session_name, slot.window_index);
+        }
+    }
+
     pub(crate) fn synchronize_linked_window_from_slot(
         &mut self,
         session_name: &SessionName,
@@ -341,5 +493,43 @@ impl HandlerState {
         for slot in slots.into_iter().collect::<HashSet<_>>() {
             self.clear_auto_named_window(&slot.session_name, slot.window_index);
         }
+    }
+}
+
+fn remapped_window_link_slot(
+    slot: &WindowLinkSlot,
+    session_name: &SessionName,
+    index_map: &BTreeMap<u32, u32>,
+) -> WindowLinkSlot {
+    if &slot.session_name != session_name {
+        return slot.clone();
+    }
+    WindowLinkSlot::new(
+        slot.session_name.clone(),
+        index_map
+            .get(&slot.window_index)
+            .copied()
+            .unwrap_or(slot.window_index),
+    )
+}
+
+fn renamed_window_link_slot(
+    slot: &WindowLinkSlot,
+    session_name: &SessionName,
+    new_name: &SessionName,
+) -> WindowLinkSlot {
+    if &slot.session_name != session_name {
+        return slot.clone();
+    }
+    WindowLinkSlot::new(new_name.clone(), slot.window_index)
+}
+
+fn rename_window_link_runtime_session(
+    group: &mut WindowLinkGroup,
+    session_name: &SessionName,
+    new_name: &SessionName,
+) {
+    if group.runtime_session_name == *session_name {
+        group.runtime_session_name = new_name.clone();
     }
 }

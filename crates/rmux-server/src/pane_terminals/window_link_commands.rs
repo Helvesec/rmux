@@ -139,6 +139,10 @@ impl HandlerState {
             &target_session_name,
             target_window_index,
         );
+        self.synchronize_linked_window_options_from_slot(
+            &source_session_name,
+            adjusted_source_window_index,
+        );
         self.synchronize_linked_window_from_slot(
             &source_session_name,
             adjusted_source_window_index,

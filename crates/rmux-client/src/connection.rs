@@ -106,6 +106,8 @@ pub struct Connection {
 }
 
 /// The explicit result of requesting an attach-stream upgrade.
+// Keep the public enum shape stable: callers match `Rejected(Response)` directly.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum AttachTransition {
     /// The server accepted the attach request and switched protocols.
@@ -115,6 +117,8 @@ pub enum AttachTransition {
 }
 
 /// The explicit result of requesting a control-mode upgrade.
+// Keep the public enum shape stable: callers match `Rejected(Response)` directly.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ControlTransition {
     /// The server accepted the control-mode request and switched protocols.

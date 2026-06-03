@@ -12,6 +12,13 @@ impl SessionStore {
         flags: TargetFindFlags,
         context: &TargetFindContext,
     ) -> Result<Target, RmuxError> {
+        if flags.contains(TargetFindFlags::DEFAULT_MARKED) {
+            if let Some(marked_target) = context.marked_target() {
+                let parts = self.parts_for_target(marked_target)?;
+                return Ok(target_for_type(find_type, parts));
+            }
+        }
+
         let current = self.current_parts(context).or_else(|_| {
             self.default_session_name(flags)
                 .and_then(|session_name| self.parts_for_session_current(&session_name))
@@ -30,6 +37,18 @@ impl SessionStore {
             )
         })?;
         let parts = self.parts_for_target(mouse_target)?;
+        Ok(target_for_type(find_type, parts))
+    }
+
+    pub(super) fn marked_target_for_type(
+        &self,
+        find_type: TargetFindType,
+        context: &TargetFindContext,
+    ) -> Result<Target, RmuxError> {
+        let marked_target = context
+            .marked_target()
+            .ok_or_else(|| target_not_found("{marked}", "pane"))?;
+        let parts = self.parts_for_target(marked_target)?;
         Ok(target_for_type(find_type, parts))
     }
 

@@ -42,6 +42,12 @@ impl RequestHandler {
                         .iter()
                         .any(|notification| notification.effects.affects_alerts());
                     state.refresh_transcript_limits_for_scope(&request.scope, request.option);
+                    if let rmux_proto::ScopeSelector::Window(target) = &request.scope {
+                        state.synchronize_linked_window_options_from_slot(
+                            target.session_name(),
+                            target.window_index(),
+                        );
+                    }
                     if request.option == OptionName::MessageLimit {
                         state.trim_message_log();
                     }
@@ -127,6 +133,12 @@ impl RequestHandler {
                         if option == OptionName::MessageLimit {
                             state.trim_message_log();
                         }
+                    }
+                    if let OptionScopeSelector::Window(target) = &request.scope {
+                        state.synchronize_linked_window_options_from_slot(
+                            target.session_name(),
+                            target.window_index(),
+                        );
                     }
                     Response::SetOptionByName(SetOptionByNameResponse {
                         scope: request.scope,

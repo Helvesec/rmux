@@ -310,7 +310,7 @@ async fn allow_passthrough_enables_sixel_for_sixel_terminals() {
 }
 
 #[tokio::test]
-async fn allow_passthrough_all_uses_active_pane_gate_for_now() {
+async fn allow_passthrough_all_shares_the_active_pane_gate() {
     let handler = RequestHandler::new();
     let requester_pid = 43;
     let alpha = session_name("alpha");
@@ -348,7 +348,8 @@ async fn allow_passthrough_all_uses_active_pane_gate_for_now() {
     let target = take_switch_target(control_rx.try_recv().expect("passthrough refresh"));
     assert!(
         target.kitty_graphics_passthrough,
-        "all is accepted and currently shares the active-pane passthrough path"
+        "all is accepted and shares the active-pane passthrough path, since RMUX \
+         renders the attached pane and has no unattached-pane passthrough to gate"
     );
 }
 

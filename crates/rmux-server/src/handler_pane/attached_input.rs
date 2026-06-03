@@ -9,7 +9,7 @@ use super::super::{
     RequestHandler,
 };
 use super::pane_io_encoding::{
-    encode_key_for_target, prepare_pane_input_write, write_bytes_to_target_io,
+    encode_key_for_target, prepare_attached_pane_input_writes, write_bytes_to_target_io,
 };
 use super::pane_prompt_input::{decode_prompt_input_event, is_extended_key_prefix};
 use super::{io_other, resolve_input_target, AttachedKeyDispatch};
@@ -128,12 +128,15 @@ impl RequestHandler {
             else {
                 return Ok(false);
             };
-            let write = prepare_pane_input_write(&state, &target, &encoded).map_err(io_other)?;
-            (write, encoded)
+            let writes =
+                prepare_attached_pane_input_writes(&state, &target, &encoded).map_err(io_other)?;
+            (writes, encoded)
         };
-        write_bytes_to_target_io(prepared.0, prepared.1)
-            .await
-            .map_err(io_other)?;
+        for write in prepared.0 {
+            write_bytes_to_target_io(write, prepared.1.clone())
+                .await
+                .map_err(io_other)?;
+        }
         Ok(false)
     }
 
@@ -364,22 +367,16 @@ impl RequestHandler {
             .attached_input_target(attach_pid)
             .await
             .map_err(io_other)?;
-        let write = {
+        let writes = {
             let state = self.state.lock().await;
-            let pane_id = state
-                .sessions
-                .session(target.session_name())
-                .and_then(|session| session.window_at(target.window_index()))
-                .and_then(|window| window.pane(target.pane_index()))
-                .map(|pane| pane.id());
-            if pane_id.is_some_and(|pane_id| state.pane_is_dead(target.session_name(), pane_id)) {
-                return Ok(());
-            }
-            prepare_pane_input_write(&state, &target, bytes).map_err(io_other)?
+            prepare_attached_pane_input_writes(&state, &target, bytes).map_err(io_other)?
         };
-        write_bytes_to_target_io(write, bytes.to_vec())
-            .await
-            .map_err(io_other)
+        for write in writes {
+            write_bytes_to_target_io(write, bytes.to_vec())
+                .await
+                .map_err(io_other)?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn flush_attached_pending_escape_input(

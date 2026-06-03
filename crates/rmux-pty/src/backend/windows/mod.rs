@@ -1,3 +1,4 @@
+mod application;
 mod command_line;
 mod dsr;
 mod flags;

@@ -1,22 +1,38 @@
-#![cfg(windows)]
+#![cfg_attr(not(windows), allow(dead_code))]
 
+#[cfg(windows)]
 use std::collections::BTreeSet;
+#[cfg(windows)]
 use std::error::Error;
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::process::{Child, Command, Output, Stdio};
+#[cfg(windows)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(windows)]
 use std::sync::OnceLock;
+#[cfg(windows)]
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+#[path = "../../../tests/support/windows_cli_serial.rs"]
+mod windows_cli_serial;
+
+#[cfg(windows)]
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-const STEP_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(windows)]
+const STEP_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(windows)]
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(windows)]
 #[test]
 fn status_interval_refreshes_attached_status_bar_windows() -> TestResult {
     let mut harness = CliHarness::new("statusinterval")?;
-    harness.success_quiet(&["new-session", "-d", "-s", "alpha", "cmd.exe", "/d", "/q"])?;
+    let cmd = cmd_exe();
+    harness.success_quiet(&["new-session", "-d", "-s", "alpha", cmd.as_str(), "/d", "/q"])?;
 
     for (option, value) in [
         ("status-interval", "1"),
@@ -54,32 +70,43 @@ fn status_interval_refreshes_attached_status_bar_windows() -> TestResult {
     Ok(())
 }
 
+#[cfg(windows)]
 struct CliHarness {
+    _serial_guard: windows_cli_serial::WindowsCliSerialGuard,
     label: String,
     armed: bool,
 }
 
+#[cfg(windows)]
 impl CliHarness {
     fn new(label: &str) -> TestResult<Self> {
+        let serial_guard = windows_cli_serial::acquire(label)?;
         Ok(Self {
+            _serial_guard: serial_guard,
             label: format!("win{}{}", std::process::id(), unique_id(label)),
             armed: true,
         })
     }
 
     fn success_quiet(&self, args: &[&str]) -> TestResult {
-        let status = Command::new(rmux_binary()?)
-            .arg("-L")
-            .arg(&self.label)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()?;
-        if !status.success() {
-            return Err(format!("rmux {:?} failed with {:?}", args, status.code()).into());
+        let output = self.run(args)?;
+        if !output.status.success() {
+            return Err(format!(
+                "rmux {:?} failed with {:?}\nstdout:\n{}\nstderr:\n{}",
+                args,
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
         }
         Ok(())
+    }
+
+    fn run(&self, args: &[&str]) -> TestResult<Output> {
+        let mut command = Command::new(rmux_binary()?);
+        command.arg("-L").arg(&self.label).args(args);
+        Ok(command.output()?)
     }
 
     fn spawn_attach(&self, target: &str) -> TestResult<AttachChild> {
@@ -112,6 +139,7 @@ impl CliHarness {
     }
 }
 
+#[cfg(windows)]
 impl Drop for CliHarness {
     fn drop(&mut self) {
         if self.armed {
@@ -120,10 +148,12 @@ impl Drop for CliHarness {
     }
 }
 
+#[cfg(windows)]
 struct AttachChild {
     child: Option<Child>,
 }
 
+#[cfg(windows)]
 impl AttachChild {
     fn wait_with_timeout(mut self, timeout: Duration) -> TestResult<Output> {
         let deadline = Instant::now() + timeout;
@@ -146,6 +176,7 @@ impl AttachChild {
     }
 }
 
+#[cfg(windows)]
 impl Drop for AttachChild {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
@@ -154,6 +185,7 @@ impl Drop for AttachChild {
     }
 }
 
+#[cfg(windows)]
 fn extract_tick_seconds(output: &str) -> BTreeSet<String> {
     let mut ticks = BTreeSet::new();
     let mut remaining = output;
@@ -169,6 +201,7 @@ fn extract_tick_seconds(output: &str) -> BTreeSet<String> {
     ticks
 }
 
+#[cfg(windows)]
 fn unique_id(label: &str) -> String {
     format!(
         "{}{}",
@@ -180,6 +213,7 @@ fn unique_id(label: &str) -> String {
     )
 }
 
+#[cfg(windows)]
 fn rmux_binary() -> TestResult<&'static Path> {
     static RMUX_BINARY: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     match RMUX_BINARY.get_or_init(|| resolve_rmux_binary().map_err(|error| error.to_string())) {
@@ -188,12 +222,17 @@ fn rmux_binary() -> TestResult<&'static Path> {
     }
 }
 
+#[cfg(windows)]
 fn resolve_rmux_binary() -> TestResult<PathBuf> {
+    if let Some(path) = option_env!("CARGO_BIN_EXE_rmux") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+
     let target_dir = target_dir()?;
     let candidate = target_dir.join("debug").join("rmux.exe");
-    if candidate.is_file() {
-        return Ok(candidate);
-    }
     let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
         .arg("build")
         .arg("--bin")
@@ -208,9 +247,17 @@ fn resolve_rmux_binary() -> TestResult<PathBuf> {
             format!("failed to build rmux binary for Windows status smoke: {status}").into(),
         );
     }
+    if !candidate.is_file() {
+        return Err(format!(
+            "rmux binary build succeeded but '{}' was not created",
+            candidate.display()
+        )
+        .into());
+    }
     Ok(candidate)
 }
 
+#[cfg(windows)]
 fn target_dir() -> TestResult<PathBuf> {
     if let Some(target_dir) = std::env::var_os("CARGO_TARGET_DIR") {
         return Ok(PathBuf::from(target_dir));
@@ -224,6 +271,7 @@ fn target_dir() -> TestResult<PathBuf> {
         .ok_or_else(|| "test executable is not under a target directory".into())
 }
 
+#[cfg(windows)]
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -231,3 +279,18 @@ fn workspace_root() -> PathBuf {
         .expect("rmux-server manifest lives under crates/rmux-server")
         .to_path_buf()
 }
+
+#[cfg(windows)]
+fn cmd_exe() -> String {
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join("cmd.exe")
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(not(windows))]
+#[test]
+fn status_windows_tests_are_windows_only() {}

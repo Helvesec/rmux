@@ -59,15 +59,35 @@ pub(crate) fn encode_buffer_sample(input: &[u8]) -> String {
 /// Encodes bytes for tmux-style safe paste-buffer writes.
 #[must_use]
 pub fn encode_paste_bytes(input: &[u8]) -> Vec<u8> {
-    let flags = VisFlags {
-        octal: true,
-        cstyle: true,
-        tab: true,
-        newline: true,
-        safe: true,
-        noslash: true,
-    };
-    encode_bytes(input, flags).into_bytes()
+    let mut encoded = Vec::with_capacity(input.len());
+    for &byte in input {
+        encode_paste_byte(byte, &mut encoded);
+    }
+    encoded
+}
+
+fn encode_paste_byte(byte: u8, output: &mut Vec<u8>) {
+    if (0x20..=0x7e).contains(&byte) || byte >= 0x80 {
+        output.push(byte);
+        return;
+    }
+
+    match byte {
+        b'\0' => output.extend_from_slice(b"\\000"),
+        b'\x07' => output.extend_from_slice(b"\\a"),
+        b'\x08' => output.extend_from_slice(b"\\b"),
+        b'\t' => output.extend_from_slice(b"\\t"),
+        b'\n' => output.extend_from_slice(b"\\n"),
+        b'\x0b' => output.extend_from_slice(b"\\v"),
+        b'\x0c' => output.extend_from_slice(b"\\f"),
+        b'\r' => output.extend_from_slice(b"\\r"),
+        _ => {
+            output.push(b'\\');
+            output.push(b'0' + ((byte >> 6) & 0x7));
+            output.push(b'0' + ((byte >> 3) & 0x7));
+            output.push(b'0' + (byte & 0x7));
+        }
+    }
 }
 
 fn encode_byte(byte: u8, flags: VisFlags, output: &mut String) {
@@ -192,6 +212,18 @@ mod tests {
     fn safe_paste_encoding_escapes_controls_without_backslash_escaping() {
         let encoded = String::from_utf8(encode_paste_bytes(b"\t\\\x1b")).expect("utf8");
         assert_eq!(encoded, "\\t\\\\033");
+    }
+
+    #[test]
+    fn safe_paste_encoding_preserves_utf8_bytes() {
+        let input = "echo PASTED_漢字".as_bytes();
+        assert_eq!(encode_paste_bytes(input), input);
+    }
+
+    #[test]
+    fn safe_paste_encoding_escapes_delete() {
+        let encoded = String::from_utf8(encode_paste_bytes(b"\x7f")).expect("utf8");
+        assert_eq!(encoded, "\\177");
     }
 
     #[test]

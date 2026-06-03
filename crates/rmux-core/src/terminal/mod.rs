@@ -110,6 +110,11 @@ impl TerminalParser {
         self.screen.set_utf8_config(config);
     }
 
+    /// Updates the tmux `input-buffer-size` parser limit.
+    pub(crate) fn set_input_buffer_limit(&mut self, limit: usize) {
+        self.parser.set_input_buffer_limit(limit);
+    }
+
     /// Resizes the screen and resets the scroll region.
     pub(crate) fn resize(&mut self, size: TerminalSize) {
         self.screen.resize(size);
@@ -172,7 +177,9 @@ impl TerminalParser {
     /// state such as pending control bytes, replies, saved cursor state, and
     /// current cell attributes.
     pub(crate) fn reset_parser(&mut self) {
+        let input_buffer_limit = self.parser.configured_input_buffer_limit();
         self.parser = InputParser::new();
+        self.parser.set_input_buffer_limit(input_buffer_limit);
     }
 }
 

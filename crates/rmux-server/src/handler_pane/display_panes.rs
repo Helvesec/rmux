@@ -1,14 +1,15 @@
 use std::{io, time::Duration};
 
-use rmux_core::{command_parser::CommandParser, key_code_lookup_bits, key_code_to_bytes};
+use rmux_core::{key_code_lookup_bits, key_code_to_bytes};
 use rmux_proto::{
-    DisplayPanesResponse, ErrorResponse, OptionName, PaneTarget, Response, RmuxError, Target,
-    WindowTarget,
+    DisplayPanesResponse, ErrorResponse, OptionName, PaneTarget, Request, Response, RmuxError,
+    SelectPaneRequest, Target, WindowTarget,
 };
 
 use super::super::{
     attach_support::{attach_target_for_session, DisplayPanesClientState, DisplayPanesLabel},
     prompt_support::{substitute_prompt_template, PromptInputEvent},
+    scripting_support::command_parser_from_state,
     scripting_support::QueueExecutionContext,
     RequestHandler,
 };
@@ -523,16 +524,39 @@ impl RequestHandler {
                 let overlay = OverlayFrame::new(clear_frame, render_generation, overlay_generation);
                 let _ = control_tx.send(AttachControl::Overlay(overlay));
                 if let Some(template) = template {
+                    if template == DEFAULT_DISPLAY_PANES_TEMPLATE {
+                        let outcome = self
+                            .dispatch_for_connection(
+                                attach_pid,
+                                u64::from(attach_pid),
+                                Request::SelectPane(SelectPaneRequest {
+                                    target,
+                                    title: None,
+                                }),
+                            )
+                            .await;
+                        match outcome.response {
+                            Response::SelectPane(_) => return Ok(()),
+                            Response::Error(ErrorResponse { error }) => return Err(error),
+                            _ => {
+                                return Err(RmuxError::Server(
+                                    "display-panes select-pane returned unexpected response"
+                                        .to_owned(),
+                                ));
+                            }
+                        }
+                    }
                     let substituted = substitute_prompt_template(&template, &[target_string]);
-                    let parsed =
-                        CommandParser::new()
-                            .parse_one_group(&substituted)
-                            .map_err(|error| {
-                                RmuxError::Server(format!(
-                                    "display-panes command parse failed: {}",
-                                    error.message()
-                                ))
-                            })?;
+                    let parser = {
+                        let state = self.state.lock().await;
+                        command_parser_from_state(&state)
+                    };
+                    let parsed = parser.parse_one_group(&substituted).map_err(|error| {
+                        RmuxError::Server(format!(
+                            "display-panes command parse failed: {}",
+                            error.message()
+                        ))
+                    })?;
                     let context = QueueExecutionContext::without_caller_cwd()
                         .with_current_target(Some(Target::Pane(target)));
                     let _ = self

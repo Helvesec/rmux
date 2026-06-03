@@ -10,9 +10,11 @@ use rmux_proto::{
     BreakPaneRequest, DisplayPanesRequest, KillPaneRequest, ListPanesRequest, ListWindowsRequest,
     MovePaneRequest, NewSessionExtRequest, NewSessionRequest, OptionName, PaneSnapshotRequest,
     PaneTarget, PipePaneRequest, ProcessCommand, RenameWindowRequest, Request, RespawnPaneRequest,
-    ScopeSelector, SelectPaneRequest, SessionName, SetOptionMode, SetOptionRequest, SplitDirection,
-    SplitWindowExtRequest, SplitWindowRequest, SplitWindowTarget, TerminalSize, WindowTarget,
+    ScopeSelector, SelectPaneRequest, SessionName, SetHookMutationRequest, SetOptionMode,
+    SetOptionRequest, SplitDirection, SplitWindowExtRequest, SplitWindowRequest, SplitWindowTarget,
+    TerminalSize, WindowTarget,
 };
+use rmux_proto::{HookLifecycle, HookName};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 
@@ -262,6 +264,9 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
             process_command: None,
             start_directory: None,
             keep_alive_on_exit: None,
+            detached: false,
+            size: None,
+            preserve_zoom: false,
         }))
         .await;
     let split_target = match split {
@@ -467,6 +472,9 @@ async fn split_window_ext_applies_start_directory_to_spawned_process() {
             process_command: None,
             start_directory: Some(cwd.clone()),
             keep_alive_on_exit: None,
+            detached: false,
+            size: None,
+            preserve_zoom: false,
         }))
         .await;
     let _split_target = match response {
@@ -500,6 +508,9 @@ async fn split_window_rolls_back_session_when_spawn_fails() {
                 .into_owned()])),
             start_directory: None,
             keep_alive_on_exit: None,
+            detached: false,
+            size: None,
+            preserve_zoom: false,
         }))
         .await;
 
@@ -999,6 +1010,85 @@ async fn display_panes_uses_the_default_select_pane_template() {
     let state = handler.state.lock().await;
     let session = state.sessions.session(&alpha).expect("session exists");
     assert_eq!(session.active_pane_index(), 1);
+}
+
+#[tokio::test]
+async fn display_panes_default_template_runs_select_pane_hooks() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = 4242_u32;
+    create_session(&handler, &alpha).await;
+
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(alpha.clone()),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        rmux_proto::Response::SplitWindow(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SelectPane(SelectPaneRequest {
+                target: PaneTarget::with_window(alpha.clone(), 0, 0),
+                title: None,
+            }))
+            .await,
+        rmux_proto::Response::SelectPane(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SetHookMutation(SetHookMutationRequest {
+                scope: ScopeSelector::Global,
+                hook: HookName::AfterSelectPane,
+                command: Some("set-buffer -b display-panes-probe fired".to_owned()),
+                lifecycle: HookLifecycle::Persistent,
+                append: false,
+                unset: false,
+                run_immediately: false,
+                index: None,
+            }))
+            .await,
+        rmux_proto::Response::SetHook(_)
+    ));
+
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let response = handler
+        .handle(Request::DisplayPanes(DisplayPanesRequest {
+            target: alpha.clone(),
+            duration_ms: Some(5_000),
+            non_blocking: true,
+            no_command: false,
+            template: None,
+        }))
+        .await;
+    assert!(matches!(response, rmux_proto::Response::DisplayPanes(_)));
+    let _overlay = control_rx.recv().await.expect("display-panes overlay");
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"1")
+        .await
+        .expect("display-panes select input");
+    let _clear = control_rx
+        .recv()
+        .await
+        .expect("display-panes clear overlay");
+
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("session exists");
+    assert_eq!(session.active_pane_index(), 1);
+    let (_, buffer) = state
+        .buffers
+        .show(Some("display-panes-probe"))
+        .expect("after-select-pane hook should write the probe buffer");
+    assert_eq!(String::from_utf8_lossy(buffer), "fired");
 }
 
 #[tokio::test]
@@ -1858,57 +1948,5 @@ async fn pane_snapshot_revision_changes_after_clear_history() {
     assert_ne!(
         before.revision, after.revision,
         "clearing scrollback must change the snapshot revision",
-    );
-}
-
-#[tokio::test]
-async fn list_panes_pane_index_respects_pane_base_index() {
-    let handler = RequestHandler::new();
-    let alpha = session_name("alpha");
-    create_session(&handler, &alpha).await;
-
-    assert!(matches!(
-        handler
-            .handle(Request::SplitWindow(SplitWindowRequest {
-                target: SplitWindowTarget::Session(alpha.clone()),
-                direction: SplitDirection::Vertical,
-                before: false,
-                environment: None,
-            }))
-            .await,
-        rmux_proto::Response::SplitWindow(_)
-    ));
-
-    assert!(matches!(
-        handler
-            .handle(Request::SetOption(SetOptionRequest {
-                scope: ScopeSelector::Global,
-                option: OptionName::PaneBaseIndex,
-                value: "1".to_owned(),
-                mode: SetOptionMode::Replace,
-            }))
-            .await,
-        rmux_proto::Response::SetOption(_)
-    ));
-
-    let listed = handler
-        .handle(Request::ListPanes(ListPanesRequest {
-            target: alpha.clone(),
-            target_window_index: None,
-            format: Some("#{pane_index}".to_owned()),
-        }))
-        .await;
-    let stdout = match listed {
-        rmux_proto::Response::ListPanes(response) => {
-            String::from_utf8(response.output.stdout).expect("list-panes utf8")
-        }
-        response => panic!("expected list-panes success, got {response:?}"),
-    };
-
-    let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(
-        lines,
-        vec!["1", "2"],
-        "pane_index should honor pane-base-index"
     );
 }

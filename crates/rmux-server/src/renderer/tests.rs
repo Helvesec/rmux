@@ -2,7 +2,10 @@ use super::{
     border_cells, parse_standalone_style, render, status_bar_runs, style_sgr_bytes, BorderStyle,
 };
 use crate::copy_mode::CopyModeSummary;
-use rmux_core::{input::InputParser, OptionStore, Screen, Session, Style, Utf8Config};
+use rmux_core::{
+    input::{mode, InputParser},
+    OptionStore, Screen, Session, Style, Utf8Config,
+};
 use rmux_proto::{
     OptionName, ResizePaneAdjustment, ScopeSelector, SessionName, SetOptionMode, SplitDirection,
     TerminalSize, WindowTarget,
@@ -549,6 +552,34 @@ fn renderer_uses_session_option_resolution_and_renders_status_when_enabled() {
 }
 
 #[test]
+fn renderer_applies_pane_border_line_style() {
+    let session = session_with_three_panes();
+    let session_name = session.name().clone();
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Session(session_name.clone()),
+            OptionName::Status,
+            "off".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("status option set succeeds");
+    options
+        .set(
+            ScopeSelector::Window(WindowTarget::with_window(session_name.clone(), 0)),
+            OptionName::PaneBorderLines,
+            "heavy".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("pane-border-lines option set succeeds");
+
+    let frame = String::from_utf8(render(&session, &options)).expect("frame is utf8");
+
+    assert!(frame.contains('┃'), "{frame:?}");
+    assert!(!frame.contains('│'), "{frame:?}");
+}
+
+#[test]
 fn top_status_reserves_the_first_row_and_offsets_border_cells() {
     let session = session_with_three_panes();
     let session_name = session.name().clone();
@@ -616,6 +647,28 @@ fn status_window_list_uses_expanded_truncation_justify_and_raw_flags() {
 }
 
 #[test]
+fn status_format_override_replaces_default_status_line() {
+    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 3 });
+    let mut options = OptionStore::new();
+    options
+        .set_by_name(
+            rmux_proto::types::OptionScopeSelector::Session(session.name().clone()),
+            "status-format[0]",
+            Some("custom #{session_name}".to_owned()),
+            SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect("status-format option set succeeds");
+
+    let frame = String::from_utf8(render(&session, &options)).expect("frame is utf-8");
+
+    assert!(frame.contains("custom alpha"), "{frame}");
+    assert!(!frame.contains("0:zsh"), "{frame}");
+}
+
+#[test]
 fn status_fill_applies_background_when_text_background_is_default() {
     let session = Session::new(session_name("alpha"), TerminalSize { cols: 8, rows: 2 });
     let mut options = OptionStore::new();
@@ -671,6 +724,41 @@ fn prompt_status_render_positions_cursor_on_the_input_cell() {
         frame.ends_with("\u{1b}[4;15H"),
         "prompt cursor should land after the prompt label, got {frame:?}"
     );
+}
+
+#[test]
+fn pane_cursor_render_repositions_and_shows_the_terminal_cursor() {
+    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 4 });
+    let pane = session.active_pane().expect("active pane exists");
+    let screen = screen_with(b"abc", TerminalSize { cols: 20, rows: 3 });
+
+    let frame = String::from_utf8(super::render_pane_cursor(
+        &session,
+        &OptionStore::new(),
+        pane,
+        &screen,
+    ))
+    .expect("cursor frame is utf-8");
+
+    assert_eq!(frame, "\u{1b}[1;4H\u{1b}[?25h");
+}
+
+#[test]
+fn pane_cursor_render_hides_terminal_cursor_when_screen_cursor_is_hidden() {
+    let session = Session::new(session_name("alpha"), TerminalSize { cols: 20, rows: 4 });
+    let pane = session.active_pane().expect("active pane exists");
+    let screen = screen_with(b"\x1b[?25l", TerminalSize { cols: 20, rows: 3 });
+    assert_eq!(screen.mode() & mode::MODE_CURSOR, 0);
+
+    let frame = String::from_utf8(super::render_pane_cursor(
+        &session,
+        &OptionStore::new(),
+        pane,
+        &screen,
+    ))
+    .expect("cursor frame is utf-8");
+
+    assert_eq!(frame, "\u{1b}[?25l");
 }
 
 #[test]

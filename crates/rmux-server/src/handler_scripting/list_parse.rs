@@ -101,6 +101,39 @@ pub(super) fn parse_list_panes(
     }))
 }
 
+#[derive(Debug, Clone)]
+pub(in crate::handler) struct ParsedListPanesAllCommand {
+    pub(in crate::handler) format: Option<String>,
+}
+
+pub(super) fn parse_queued_list_panes_all(
+    mut args: CommandTokens,
+) -> Result<Option<ParsedListPanesAllCommand>, RmuxError> {
+    let mut all_sessions = false;
+    let mut format = None;
+
+    while let Some(token) = args.optional() {
+        match token.as_str() {
+            "-a" => all_sessions = true,
+            "-F" => format = Some(args.required("-F format")?),
+            flag if flag.starts_with('-') && compact_list_panes_all_flags(flag) => {
+                all_sessions = true;
+            }
+            flag if flag.starts_with('-') => return Ok(None),
+            _ => return Ok(None),
+        }
+    }
+
+    Ok(all_sessions.then_some(ParsedListPanesAllCommand { format }))
+}
+
+fn compact_list_panes_all_flags(flag: &str) -> bool {
+    let Some(rest) = flag.strip_prefix('-') else {
+        return false;
+    };
+    !rest.is_empty() && rest.chars().all(|ch| matches!(ch, 'a' | 's')) && rest.contains('a')
+}
+
 fn implicit_list_panes_target(
     sessions: &SessionStore,
     find_context: &TargetFindContext,

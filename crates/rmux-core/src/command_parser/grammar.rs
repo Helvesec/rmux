@@ -4,10 +4,20 @@ use super::{
     ParsedCommands,
 };
 
+// Real tmux bounds parser recursion with YYMAXDEPTH; rmux's recursive-descent
+// parser must too. `{ … }` blocks (parse_command) and `%if … %endif` branches
+// (parse_condition) both re-enter parse_until, so without a cap an attacker can
+// nest either one arbitrarily deep and overflow the stack (a SIGABRT DoS reachable
+// from control-mode). Cap the shared recursion node and fail closed with a parse
+// error well before the native stack is exhausted. 256 is far beyond any real
+// config yet leaves ample stack headroom.
+const MAX_NESTING_DEPTH: usize = 256;
+
 pub(super) struct GrammarParser<'a> {
     lexer: Lexer<'a>,
     grouping: CommandGrouping,
     peeked: Option<SpannedToken>,
+    depth: usize,
 }
 
 impl<'a> GrammarParser<'a> {
@@ -16,6 +26,7 @@ impl<'a> GrammarParser<'a> {
             lexer,
             grouping,
             peeked: None,
+            depth: 0,
         }
     }
 
@@ -29,6 +40,17 @@ impl<'a> GrammarParser<'a> {
         stop_on_close_brace: bool,
         active: bool,
     ) -> Result<ParsedCommands, CommandParseError> {
+        // Bound every recursion cycle (braces and %if branches both re-enter here).
+        // On overflow we fail closed; the error aborts the whole parse, so the
+        // matching decrement before the Ok return only needs to keep sibling
+        // blocks at the same nesting level from accumulating depth.
+        self.depth += 1;
+        if self.depth > MAX_NESTING_DEPTH {
+            return Err(CommandParseError::new(
+                self.peek_line().unwrap_or(0),
+                "command nesting too deep",
+            ));
+        }
         let mut commands = ParsedCommands::with_grouping(self.grouping);
 
         loop {
@@ -87,6 +109,7 @@ impl<'a> GrammarParser<'a> {
             }
         }
 
+        self.depth -= 1;
         Ok(commands)
     }
 

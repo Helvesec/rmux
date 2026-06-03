@@ -46,6 +46,11 @@ impl TerminalScreen {
         self.parser.set_utf8_config(config);
     }
 
+    /// Updates the tmux `input-buffer-size` parser limit.
+    pub fn set_input_buffer_limit(&mut self, limit: usize) {
+        self.parser.set_input_buffer_limit(limit);
+    }
+
     /// Resizes the screen and resets the scroll region.
     pub fn resize(&mut self, size: TerminalSize) {
         self.parser.resize(size);

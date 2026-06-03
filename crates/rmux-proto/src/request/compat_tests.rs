@@ -171,6 +171,37 @@ fn split_window_ext_request_deserializes_old_payloads_with_defaulted_fields() {
     assert_eq!(decoded.process_command, None);
     assert_eq!(decoded.start_directory, None);
     assert_eq!(decoded.keep_alive_on_exit, None);
+    assert!(!decoded.detached);
+    assert_eq!(decoded.size, None);
+    assert!(!decoded.preserve_zoom);
+}
+
+#[test]
+fn split_window_ext_request_round_trips_current_payload_fields() {
+    let target = SplitWindowTarget::Pane(PaneTarget::with_window(session_name("alpha"), 0, 1));
+    let request = SplitWindowExtRequest {
+        target: target.clone(),
+        direction: SplitDirection::Vertical,
+        before: false,
+        environment: Some(vec!["FOO=1".to_owned()]),
+        command: Some(vec!["printf ready".to_owned()]),
+        process_command: None,
+        start_directory: Some(PathBuf::from("/tmp/logs")),
+        keep_alive_on_exit: Some(true),
+        detached: true,
+        size: Some("5".to_owned()),
+        preserve_zoom: true,
+    };
+
+    let decoded: SplitWindowExtRequest =
+        bincode::deserialize(&bincode::serialize(&request).expect("request serializes"))
+            .expect("current request decodes");
+
+    assert_eq!(decoded, request);
+    assert_eq!(decoded.target, target);
+    assert!(decoded.detached);
+    assert_eq!(decoded.size.as_deref(), Some("5"));
+    assert!(decoded.preserve_zoom);
 }
 
 #[test]

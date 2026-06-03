@@ -1,12 +1,14 @@
 use rmux_core::{SessionStore, TargetFindContext};
 use rmux_proto::{
     LinkWindowRequest, MoveWindowRequest, MoveWindowTarget, Request, RmuxError, SwapWindowRequest,
-    UnlinkWindowRequest,
+    UnlinkWindowRequest, WindowTarget,
 };
 
 use super::super::tokens::CommandTokens;
 use super::super::values::{missing_argument, unsupported_flag};
-use super::super::{implicit_session_name, parse_move_window_target, parse_window_target};
+use super::super::{
+    implicit_session_name, marked_pane_target, parse_move_window_target, parse_window_target,
+};
 
 pub(in crate::handler::scripting_support) fn parse_move_window(
     mut args: CommandTokens,
@@ -167,6 +169,8 @@ pub(in crate::handler::scripting_support) fn parse_link_window(
 
 pub(in crate::handler::scripting_support) fn parse_swap_window(
     mut args: CommandTokens,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
 ) -> Result<Request, RmuxError> {
     let mut detached = false;
     let mut source = None;
@@ -201,8 +205,16 @@ pub(in crate::handler::scripting_support) fn parse_swap_window(
     }
     args.no_extra("swap-window")?;
 
+    let source = match source {
+        Some(source) => source,
+        None => {
+            let marked = marked_pane_target(sessions, find_context, "swap-window")?;
+            WindowTarget::with_window(marked.session_name().clone(), marked.window_index())
+        }
+    };
+
     Ok(Request::SwapWindow(SwapWindowRequest {
-        source: source.ok_or_else(|| missing_argument("swap-window", "-s target"))?,
+        source,
         target: target.ok_or_else(|| missing_argument("swap-window", "-t target"))?,
         detached,
     }))

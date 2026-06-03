@@ -16,6 +16,8 @@ use crate::{
     EnvironmentStore,
 };
 
+#[path = "command_parser/aliases.rs"]
+mod aliases;
 #[path = "command_parser/grammar.rs"]
 mod grammar;
 #[path = "command_parser/lexer.rs"]
@@ -25,6 +27,7 @@ mod lookup;
 #[path = "command_parser/table.rs"]
 mod table;
 
+use aliases::CommandAlias;
 use grammar::GrammarParser;
 use lexer::Lexer;
 use lookup::lookup_command_at;
@@ -258,16 +261,7 @@ impl CommandParser {
     #[must_use]
     pub fn new() -> Self {
         let mut parser = Self::default();
-        parser
-            .command_aliases
-            .extend(
-                DEFAULT_COMMAND_ALIASES
-                    .iter()
-                    .map(|(name, value)| CommandAlias {
-                        name: (*name).to_owned(),
-                        value: (*value).to_owned(),
-                    }),
-            );
+        parser.command_aliases.extend(CommandAlias::builtin());
         parser
     }
 
@@ -324,17 +318,27 @@ impl CommandParser {
         definition: impl Into<String>,
     ) -> Result<Self, CommandParseError> {
         let definition = definition.into();
-        let Some((name, value)) = definition.split_once('=') else {
+        let Some(alias) = CommandAlias::parse(definition) else {
             return Err(CommandParseError::new(
                 0,
                 "command-alias entry must be name=value",
             ));
         };
-        self.command_aliases.push(CommandAlias {
-            name: name.to_owned(),
-            value: value.to_owned(),
-        });
+        self.command_aliases.push(alias);
         Ok(self)
+    }
+
+    /// Replaces the parser alias table with valid `command-alias` entries.
+    #[must_use]
+    pub fn with_command_aliases<I, S>(mut self, definitions: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.command_aliases.clear();
+        self.command_aliases
+            .extend(definitions.into_iter().filter_map(CommandAlias::parse));
+        self
     }
 
     /// Parses a tmux command string through the tmux-style lexer.
@@ -455,8 +459,9 @@ impl CommandParser {
     fn find_command_alias(&self, name: &str) -> Option<&str> {
         self.command_aliases
             .iter()
-            .find(|alias| alias.name == name)
-            .map(|alias| alias.value.as_str())
+            .rev()
+            .find(|alias| alias.name() == name)
+            .map(CommandAlias::value)
     }
 
     fn lookup_environment(&self, name: &str) -> Option<&str> {
@@ -495,21 +500,6 @@ impl CommandParser {
 
         is_truthy(&expanded)
     }
-}
-
-const DEFAULT_COMMAND_ALIASES: &[(&str, &str)] = &[
-    ("split-pane", "split-window"),
-    ("splitp", "split-window"),
-    ("server-info", "show-messages -JT"),
-    ("info", "show-messages -JT"),
-    ("choose-window", "choose-tree -w"),
-    ("choose-session", "choose-tree -s"),
-];
-
-#[derive(Debug, Clone)]
-struct CommandAlias {
-    name: String,
-    value: String,
 }
 
 struct ParseTimeFormatVariables<'a> {
