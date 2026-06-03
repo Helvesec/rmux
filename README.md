@@ -7,8 +7,7 @@
   </picture>
 </a>
 
-
-**Universal Rust multiplexer for the agentic era: detachable, scriptable, and inspectable, with a tmux-compatible CLI, daemon-backed SDK, and native [Ratatui](https://ratatui.rs) integration.**
+**A modern Rust terminal multiplexer for local shells, long-running agents, typed automation, and browser-shared terminal sessions.**
 
 English · [Français](README.fr.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md)
 
@@ -26,15 +25,9 @@ English · [Français](README.fr.md) · [简体中文](README.zh-CN.md) · [日�
 </div>
 
 > [!IMPORTANT]
-> Current release: **v0.4.0**, published on **25 May 2026**. All 90 tmux-compatible commands are implemented, but bugs are expected — this is a fresh public preview. Please [file issues](https://github.com/helvesec/rmux/issues) if you hit one.
-
-## Why RMUX
-
-RMUX exists because I believe the tmux use case has only been partially explored. My own starting point was simple: I wanted to run long-lived agents over SSH without losing their terminals, while still being able to inspect, script, and orchestrate everything around them.
-
-So I rebuilt that idea from scratch in Rust: a blazing-fast, tmux-compatible multiplexer with a typed SDK, persistent sessions, structured snapshots, and native local transports on Linux, macOS, and Windows, including Windows Named Pipes.
-
-RMUX is usable by agents, headless CLI workflows, and humans alike: you can give terminal apps detachable execution, reconnect later, inspect their state, drive them from code, or simply use it for normal tmux-style terminal work.
+> Current release: **v0.4.0**, published on **3 June 2026**. This release brings **[Web Multiplex (Web Share)](#web-multiplex-web-share)**, RMUX's web multiplexing feature: share a pane or session in a browser with `rmux web-share`, keep the PTY local, and relay only end-to-end encrypted terminal frames.
+>
+> RMUX is still moving fast. If you hit a bug, a platform edge case, or have a feature request, please [file an issue](https://github.com/Helvesec/rmux/issues). Reports are welcome.
 
 ## Demos
 
@@ -42,40 +35,108 @@ Short, real examples of what RMUX can be used for.
 
 <table>
   <tr>
-    <td align="center" width="20%"><a href="https://rmux.io/#demo-orchestration"><img src="https://rmux.io/demos/demo-orchestration.png" width="150" alt="Multi Agents Orchestration demo preview"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/demo-orchestration"><strong>Multi Agents Orchestration</strong></a></sub><br><sub>≃ 514 lines</sub></td>
-    <td align="center" width="20%"><a href="https://rmux.io/#demo-broadcast"><img src="https://rmux.io/demos/demo-broadcast.png" width="150" alt="Agent Broadcast Arena demo preview"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/broadcast-demo"><strong>Agent Broadcast Arena</strong></a></sub><br><sub>≃ 2,171 lines</sub></td>
-    <td align="center" width="20%"><a href="https://rmux.io/#demo-zellij"><img src="https://rmux.io/demos/demo-zellij.png" width="150" alt="Mini-Zellij demo preview"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/mini-zellij"><strong>Mini-Zellij</strong></a></sub><br><sub>≃ 944 lines</sub></td>
-    <td align="center" width="20%"><a href="https://rmux.io/#demo-mirroring"><img src="https://rmux.io/demos/demo-mirroring.png" width="150" alt="Terminal browser mirroring demo preview"></a><br><sub><a href="https://rmux.io/#demo-mirroring"><strong>Terminal &lt;&gt; Browser Mirroring</strong></a></sub><br><sub>≃ 649 lines</sub></td>
-    <td align="center" width="20%"><a href="https://rmux.io/#demo-playwright"><img src="https://rmux.io/demos/demo-playwright.png" width="150" alt="Playwright Testing demo preview"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/terminal-playwright-demo"><strong>Playwright Testing</strong></a></sub><br><sub>≃ 1,495 lines</sub></td>
+    <td align="center" width="25%"><a href="https://rmux.io/#demo-orchestration"><img src="https://rmux.io/demos/demo-orchestration.png" width="150" alt="Multi Agents Orchestration demo preview"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/demo-orchestration"><strong>Multi Agents Orchestration</strong></a></sub><br><sub>≃ 514 lines</sub></td>
+    <td align="center" width="25%"><a href="https://rmux.io/#demo-broadcast"><img src="https://rmux.io/demos/demo-broadcast.png" width="150" alt="Agent Broadcast Arena demo preview"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/broadcast-demo"><strong>Agent Broadcast Arena</strong></a></sub><br><sub>≃ 2,171 lines</sub></td>
+    <td align="center" width="25%"><a href="https://rmux.io/#demo-zellij"><img src="https://rmux.io/demos/demo-zellij.png" width="150" alt="Mini-Zellij demo preview"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/mini-zellij"><strong>Mini-Zellij</strong></a></sub><br><sub>≃ 944 lines</sub></td>
+    <td align="center" width="25%"><a href="https://rmux.io/#demo-playwright"><img src="https://rmux.io/demos/demo-playwright.png" width="150" alt="Terminal automation demo preview"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/terminal-playwright-demo"><strong>Terminal Automation</strong></a></sub><br><sub>≃ 1,495 lines</sub></td>
   </tr>
 </table>
 
+## RMUX
+
+RMUX is a modern Rust multiplexer built on async principles with Tokio. It supports over 90 tmux commands natively across macOS, Linux, and Windows — no WSL required.
+
+Designed for the agentic AI era, it features a public Rust SDK to build and script anything you can imagine. Use it as a normal multiplexer, a daemon-backed terminal runtime, a typed automation layer, or the terminal substrate for your own tools.
+
+RMUX also enables web multiplexing: with one seamless command, `rmux web-share`, you can beam any pane or session directly to the web. Bring your own domain. Host the static frontend anywhere; terminal data stays end-to-end encrypted with a hybrid post-quantum key exchange, even through blind tunnels.
+
+## Web Multiplex (Web Share)
+
+```sh
+# Start a local Web Share over loopback
+rmux web-share
+
+# Share a named session
+rmux new-session -d -s work
+rmux web-share -t work
+
+# Share beyond localhost
+rmux web-share --tunnel-provider localhost-run
+```
+
+Use a tunnel provider, bring your own ingress, or host the static frontend on your own domain.
+
+Useful entry points:
+
+- [Repository Web Share overview](docs/web-share.md)
+- [Web Share docs](https://rmux.io/docs/web-share/)
+- [Security model](https://rmux.io/docs/web-share/#/security)
+- [Tunnel providers](https://rmux.io/docs/web-share/#/tunnels)
+
 ## Install
 
-Prebuilt binary for macOS and Linux:
+Choose your platform:
+
+- [Linux](#linux)
+- [macOS](#macos)
+- [Windows](#windows)
+- [Rust / Cargo](#rust--cargo)
+
+### Linux
+
+Portable installer:
 
 ```sh
 curl -fsSL https://rmux.io/install.sh | sh
 ```
 
-Prebuilt binary for Windows PowerShell:
+Direct downloads are available from the [v0.4.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.4.0):
+
+- `rmux-0.4.0-linux-x86_64.tar.gz`
+- `rmux_0.4.0_amd64.deb`
+- `rmux-0.4.0-1.x86_64.rpm`
+
+### macOS
+
+Portable installer:
+
+```sh
+curl -fsSL https://rmux.io/install.sh | sh
+```
+
+Direct downloads are available from the [v0.4.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.4.0):
+
+- `rmux-0.4.0-macos-aarch64.tar.gz`
+- `rmux-0.4.0-macos-x86_64.tar.gz`
+
+### Windows
+
+PowerShell installer:
 
 ```powershell
 irm https://rmux.io/install.ps1 | iex
 ```
 
-Direct downloads and SHA256 checksums are available from the [v0.4.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.4.0).
+Direct downloads are available from the [v0.4.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.4.0):
 
-From crates.io with Cargo:
+- `rmux-0.4.0-windows-x86_64.zip`
+
+SHA256 checksums are published with every GitHub Release. APT, DNF, Homebrew, WinGet, Scoop, and Chocolatey metadata is prepared for each release and published separately once the corresponding repositories are live.
+
+### Rust / Cargo
+
+This path works on Linux, macOS, and Windows.
+
+Install Rust if you do not already have it:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Then install RMUX from crates.io:
 
 ```sh
 cargo install rmux --locked
-```
-
-From a local checkout:
-
-```sh
-cargo install --path . --locked
 ```
 
 For Rust applications:
@@ -89,7 +150,13 @@ cargo add ratatui-rmux
 
 The full RMUX documentation is available at [rmux.io/docs](https://rmux.io/docs/).
 
-It includes [installation guides](https://rmux.io/docs/get-started/), [CLI references](https://rmux.io/docs/cli/), [SDK examples](https://rmux.io/docs/examples/), [terminal automation examples](https://rmux.io/docs/examples/#/terminal-playwright), and [API documentation](https://rmux.io/docs/api/).
+It includes:
+
+- [Installation guides](https://rmux.io/docs/get-started/)
+- [CLI reference](https://rmux.io/docs/cli/)
+- [Examples](https://rmux.io/docs/examples/)
+- [API reference](https://rmux.io/docs/api/)
+- [Web Share](https://rmux.io/docs/web-share/)
 
 For an ergonomic, human-oriented profile that keeps native terminal selection intuitive while adding easier split bindings and clipboard integration, see [docs/human-friendly-config.md](docs/human-friendly-config.md).
 
@@ -108,10 +175,10 @@ Use command help locally:
 rmux list-commands
 rmux new-session --help
 rmux split-window --help
+rmux web-share --help
 ```
 
-Use `rmux -V` for the RMUX package version. For build and support details,
-use `rmux diagnose --human` or `rmux diagnose --json`.
+Use `rmux -V` for the RMUX package version. For build and support details, use `rmux diagnose --human` or `rmux diagnose --json`.
 
 ## SDK Quickstart
 
@@ -181,7 +248,7 @@ fn render(snapshot: PaneSnapshot, area: Rect, buffer: &mut Buffer) {
 
 </div>
 
-Three public surfaces — a `rmux` CLI, a `rmux-sdk` Rust crate, and a `ratatui-rmux` widget — share a single local protocol to talk to the daemon. Anything one surface can do, the others can do too.
+Three public surfaces — the `rmux` CLI, the `rmux-sdk` Rust crate, and the `ratatui-rmux` widget — share one local protocol to talk to the daemon. Anything one surface can do, the others can do too.
 
 ## Workspace
 
@@ -193,6 +260,7 @@ Three public surfaces — a `rmux` CLI, a `rmux-sdk` Rust crate, and a `ratatui-
 | `rmux-ipc` | Local IPC endpoints and transports | public |
 | `rmux-sdk` | Daemon-backed Rust SDK | public |
 | `ratatui-rmux` | Ratatui integration widget | public |
+| `rmux-web-crypto` | Web Share E2EE core and WASM crypto boundary | public |
 | `rmux-pty` | PTY allocation, resize, child process control | support crate |
 | `rmux-core` | Sessions, panes, layouts, formats, hooks, buffers | support crate |
 | `rmux-server` | Tokio daemon and request dispatch | support crate |
@@ -217,7 +285,7 @@ On Linux and macOS, RMUX reads `.rmux.conf` from the standard system and user lo
 3. `$XDG_CONFIG_HOME/rmux/rmux.conf`
 4. `~/.config/rmux/rmux.conf`
 
-On Windows, RMUX reads `.rmux.conf` as well, from the following locations:
+On Windows, RMUX reads `.rmux.conf` from:
 
 1. `%XDG_CONFIG_HOME%\rmux\rmux.conf`
 2. `%USERPROFILE%\.rmux.conf`
@@ -226,55 +294,35 @@ On Windows, RMUX reads `.rmux.conf` as well, from the following locations:
 
 ### `tmux.conf` migration fallback
 
-When RMUX starts with the default config search and no RMUX config file is
-loaded, it can import a filtered `tmux.conf` as a migration fallback. Explicit
-config loading with `-f` does not use this fallback.
+When RMUX starts with the default config search and no RMUX config file is loaded, it can import a filtered `tmux.conf` as a migration fallback. Explicit config loading with `-f` does not use this fallback.
 
 Fallback paths:
 
 - Linux and macOS: `/etc/tmux.conf`, `~/.tmux.conf`, `$XDG_CONFIG_HOME/tmux/tmux.conf`, `~/.config/tmux/tmux.conf`
 - Windows: `%XDG_CONFIG_HOME%\tmux\tmux.conf`, `%USERPROFILE%\.tmux.conf`, `%APPDATA%\tmux\tmux.conf`
 
-The import is intentionally narrow: RMUX keeps supported static options and
-key unbindings, but skips tmux key bindings, environment or terminal capability
-mutations, plugin user options and hooks, shell commands, command blocks,
-conditionals, format jobs such as `#(cmd)`, recursive `source-file` entries,
-and unsupported options instead of executing them. Set
-`RMUX_DISABLE_TMUX_FALLBACK=1` to disable it entirely. Fallback files are read
-best-effort: non-regular files and files larger than 1 MiB are ignored.
+The import is intentionally narrow: RMUX keeps supported static options and key unbindings, but skips tmux key bindings, environment or terminal capability mutations, plugin user options and hooks, shell commands, command blocks, conditionals, format jobs such as `#(cmd)`, recursive `source-file` entries, and unsupported options instead of executing them. Set `RMUX_DISABLE_TMUX_FALLBACK=1` to disable it entirely.
 
-### Terminal compatibility notes
+## Terminal Compatibility Notes
 
-RMUX works with shells that query terminal capabilities, including fish. It
-answers terminal device-attribute probes and handles Escape-key timing so fish
-prompts and key sequences behave normally inside RMUX panes.
+RMUX works with shells that query terminal capabilities, including fish. It answers terminal device-attribute probes and handles Escape-key timing so fish prompts and key sequences behave normally inside RMUX panes.
 
-Graphics passthrough is available for outer terminals that support Kitty
-graphics or SIXEL. RMUX detects Kitty graphics for Kitty, Ghostty, and WezTerm,
-and detects SIXEL for terminals such as foot, mintty, mlterm, and WezTerm. It
-is opt-in:
+Graphics passthrough is available for outer terminals that support Kitty graphics or SIXEL. RMUX detects Kitty graphics for Kitty, Ghostty, and WezTerm, and detects SIXEL for terminals such as foot, mintty, mlterm, and WezTerm. It is opt-in:
 
 ```tmux
 set -g allow-passthrough on
 ```
 
-RMUX processes passthrough for the attached pane, so `on` enables it. The tmux
-value `all` (which also passes through unattached panes) is accepted for
-configuration compatibility, but because RMUX renders the attached pane it
-currently behaves the same as `on` rather than adding unattached-pane passthrough.
+The tmux value `all` is accepted for configuration compatibility. RMUX renders the attached pane, so `all` currently behaves like `on` rather than adding passthrough for unattached panes.
 
-If your terminal supports either protocol but is not detected automatically,
-add a terminal feature override:
+If your terminal supports either protocol but is not detected automatically, add a terminal feature override:
 
 ```tmux
 set -as terminal-features 'xterm-kitty:kitty-graphics'
 set -as terminal-features 'xterm*:sixel'
 ```
 
-SIXEL passthrough is covered by the automated Unix PTY attach regression suite.
-On Windows, RMUX enables modern ConPTY passthrough when the OS supports it, but
-SIXEL display still depends on the outer terminal. Set
-`RMUX_CONPTY_NO_PASSTHROUGH=1` to disable that backend mode for troubleshooting.
+SIXEL passthrough is covered by the automated Unix PTY attach regression suite. On Windows, RMUX enables modern ConPTY passthrough when the OS supports it, but SIXEL display still depends on the outer terminal. Set `RMUX_CONPTY_NO_PASSTHROUGH=1` to disable that backend mode for troubleshooting.
 
 ## Verification
 
