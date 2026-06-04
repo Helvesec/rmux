@@ -65,13 +65,34 @@ PortableCommandAlias: rmux
 Validate and test on Windows before submission:
 
 ```powershell
+pwsh ./scripts/validate-winget-manifest.ps1 `
+  -Manifest target/package-managers/winget/Helvesec.RMUX.yaml `
+  -Version 0.5.0 `
+  -Checksums dist/SHA256SUMS.txt
 winget validate target/package-managers/winget/Helvesec.RMUX.yaml
 winget install --manifest target/package-managers/winget/Helvesec.RMUX.yaml
 rmux -V
 rmux diagnose --json
 ```
 
-Submit through `wingetcreate submit` or a PR to `microsoft/winget-pkgs`.
+GitHub Actions validates the generated WinGet manifest after the release assets
+are published. The release workflow performs a structural check against
+`SHA256SUMS` and runs `winget validate` when WinGet is available on the Windows
+runner.
+
+WinGet publication is a pull request to `microsoft/winget-pkgs`; there is no
+Chocolatey-style API key. For the first RMUX package, submit manually so the
+publisher, identifier, and CLA are settled:
+
+```powershell
+winget install wingetcreate
+wingetcreate submit target/package-managers/winget/Helvesec.RMUX.yaml
+```
+
+If `wingetcreate` needs a token, use its OAuth/cache flow locally or set
+`WINGET_CREATE_GITHUB_TOKEN` only in a protected release secret for CI. Do not
+commit or print the token. After `Helvesec.RMUX` exists in `microsoft/winget-pkgs`,
+future releases can be automated with `wingetcreate update Helvesec.RMUX ...`.
 
 ## Scoop
 

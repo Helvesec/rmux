@@ -329,6 +329,17 @@ jobs:
             ruby -rjson -e 'JSON.parse(File.read(ARGV.fetch(0)))' target/package-managers/scoop/rmux.json
           fi
 
+      - name: Validate WinGet metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:RELEASE_REF.Substring(1)
+          ./scripts/validate-winget-manifest.ps1 `
+            -Manifest "target/package-managers/winget/Helvesec.RMUX.yaml" `
+            -Version $version `
+            -Checksums "release-assets/SHA256SUMS" `
+            -Repository $env:GITHUB_REPOSITORY
+
       - uses: actions/upload-artifact@v4
         with:
           name: package-manager-metadata-${{ env.RELEASE_REF }}
@@ -482,6 +493,67 @@ jobs:
           git add _headers index.html debian rpm
           git commit -m "packages: publish rmux $RELEASE_REF"
           git push "$package_repo_url" "HEAD:$RMUX_PACKAGE_REPO_BRANCH"
+
+  validate-winget:
+    name: Validate WinGet manifest
+    runs-on: windows-latest
+    needs:
+      - publish
+    env:
+      RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+    steps:
+      - name: Validate release ref
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_REF -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$') {
+            throw "Invalid release ref: $env:RELEASE_REF"
+          }
+          "VERSION=$($env:RELEASE_REF.Substring(1))" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-manager-metadata-${{ env.RELEASE_REF }}
+          path: package-manager-metadata
+
+      - name: Download release checksums
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          gh release download $env:RELEASE_REF `
+            --repo $env:GITHUB_REPOSITORY `
+            --pattern SHA256SUMS `
+            --dir release-assets `
+            --clobber
+
+      - name: Validate generated WinGet manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $manifest = "package-manager-metadata\winget\Helvesec.RMUX.yaml"
+          .\scripts\validate-winget-manifest.ps1 `
+            -Manifest $manifest `
+            -Version $env:VERSION `
+            -Checksums "release-assets\SHA256SUMS" `
+            -Repository $env:GITHUB_REPOSITORY
+
+      - name: Run winget validate when available
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $manifest = "package-manager-metadata\winget\Helvesec.RMUX.yaml"
+          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+            Write-Host "::warning::winget is not available on this runner; structural WinGet manifest validation already passed."
+            exit 0
+          }
+          winget --version
+          winget validate --manifest $manifest --disable-interactivity
 
   publish-chocolatey:
     name: Publish Chocolatey package
