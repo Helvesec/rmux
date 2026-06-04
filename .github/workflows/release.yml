@@ -222,6 +222,7 @@ jobs:
   publish:
     name: Publish GitHub release assets
     runs-on: ubuntu-latest
+    environment: release
     needs:
       - source-gates
       - build
