@@ -391,7 +391,19 @@ jobs:
               --draft \
               --notes "RMUX $version binary release."
           fi
-          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" release-assets/* --clobber
+          shopt -s nullglob
+          assets=(
+            release-assets/*.tar.gz
+            release-assets/*.zip
+            release-assets/*.deb
+            release-assets/*.rpm
+            release-assets/SHA256SUMS
+          )
+          if (( ${#assets[@]} == 0 )); then
+            echo "No release assets found" >&2
+            exit 1
+          fi
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" "${assets[@]}" --clobber
           gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false
 
       - name: Deploy Linux package repositories
