@@ -166,7 +166,7 @@ fn should_capture_terminal_palette(
     terminal_theme: Option<WebTerminalTheme>,
     stdout_is_terminal: bool,
 ) -> bool {
-    matches!(terminal_theme, Some(WebTerminalTheme::User)) && stdout_is_terminal
+    matches!(terminal_theme, None | Some(WebTerminalTheme::User)) && stdout_is_terminal
 }
 
 fn validate_create_web_share_args(
@@ -471,8 +471,8 @@ mod tests {
     }
 
     #[test]
-    fn terminal_palette_capture_requires_explicit_user_theme_and_tty() {
-        assert!(!should_capture_terminal_palette(None, true));
+    fn terminal_palette_capture_follows_default_or_explicit_user_theme_and_tty() {
+        assert!(should_capture_terminal_palette(None, true));
         assert!(!should_capture_terminal_palette(
             Some(WebTerminalTheme::Light),
             true
