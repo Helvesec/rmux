@@ -67,7 +67,7 @@ write_nuspec() {
     <owners>Helvesec</owners>
     <projectUrl>$homepage</projectUrl>
     <packageSourceUrl>https://github.com/$repository</packageSourceUrl>
-    <license type="expression">MIT OR Apache-2.0</license>
+    <licenseUrl>https://github.com/$repository#license</licenseUrl>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
     <description>Terminal multiplexer with a tmux-style CLI, daemon runtime, Rust SDK, and native Windows support.</description>
     <summary>Terminal multiplexer with a tmux-style CLI and native Windows support.</summary>

@@ -482,3 +482,97 @@ jobs:
           git add _headers index.html debian rpm
           git commit -m "packages: publish rmux $RELEASE_REF"
           git push "$package_repo_url" "HEAD:$RMUX_PACKAGE_REPO_BRANCH"
+
+  publish-chocolatey:
+    name: Publish Chocolatey package
+    runs-on: windows-latest
+    needs:
+      - publish
+    env:
+      RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+      CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+    steps:
+      - name: Validate release ref
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_REF -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$') {
+            throw "Invalid release ref: $env:RELEASE_REF"
+          }
+          "VERSION=$($env:RELEASE_REF.Substring(1))" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-manager-metadata-${{ env.RELEASE_REF }}
+          path: package-manager-metadata
+
+      - name: Validate Chocolatey prerequisites
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CHOCOLATEY_API_KEY)) {
+            throw "Missing required GitHub Actions secret: CHOCOLATEY_API_KEY"
+          }
+          choco --version
+
+      - name: Pack and smoke-test Chocolatey package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = $env:VERSION
+          $packageRoot = (Resolve-Path "package-manager-metadata\chocolatey\rmux").Path
+          $nuspecPath = Join-Path $packageRoot "rmux.nuspec"
+          $installScript = Join-Path $packageRoot "tools\chocolateyInstall.ps1"
+          $uninstallScript = Join-Path $packageRoot "tools\chocolateyUninstall.ps1"
+
+          foreach ($required in @($nuspecPath, $installScript, $uninstallScript)) {
+            if (-not (Test-Path $required)) {
+              throw "Missing generated Chocolatey file: $required"
+            }
+          }
+
+          [xml]$nuspec = Get-Content $nuspecPath
+          if ($nuspec.package.metadata.id -ne "rmux") {
+            throw "Unexpected Chocolatey package id: $($nuspec.package.metadata.id)"
+          }
+          if ($nuspec.package.metadata.version -ne $version) {
+            throw "Unexpected Chocolatey package version: $($nuspec.package.metadata.version)"
+          }
+
+          Push-Location $packageRoot
+          try {
+            choco pack .\rmux.nuspec --outputdirectory .
+          } finally {
+            Pop-Location
+          }
+
+          $package = Join-Path $packageRoot "rmux.$version.nupkg"
+          if (-not (Test-Path $package)) {
+            throw "Chocolatey package was not generated: $package"
+          }
+
+          choco install rmux `
+            --source $packageRoot `
+            --version $version `
+            --yes `
+            --no-progress `
+            --force
+
+          $versionOutput = (& rmux -V).Trim()
+          if ($versionOutput -ne "rmux $version") {
+            throw "Unexpected rmux version from Chocolatey install: $versionOutput"
+          }
+
+          choco uninstall rmux --yes --no-progress
+          "CHOCOLATEY_PACKAGE=$package" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Push Chocolatey package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Test-Path $env:CHOCOLATEY_PACKAGE)) {
+            throw "Chocolatey package not found: $env:CHOCOLATEY_PACKAGE"
+          }
+          choco push $env:CHOCOLATEY_PACKAGE `
+            --source "https://push.chocolatey.org/" `
+            --api-key $env:CHOCOLATEY_API_KEY `
+            --yes `
+            --no-progress

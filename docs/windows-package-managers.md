@@ -112,5 +112,11 @@ choco install rmux --source . --version <semver>
 rmux -V
 ```
 
+GitHub Actions publishes Chocolatey after the GitHub Release assets are public.
+The release workflow expects a secret named `CHOCOLATEY_API_KEY`; keep it as a
+GitHub Actions secret and never commit it to the repository. The workflow packs
+the generated package, performs a local Chocolatey install smoke test, then
+pushes the `.nupkg` to `https://push.chocolatey.org/` for moderation.
+
 Never replace a published release zip silently. WinGet, Scoop, and Chocolatey
 all pin SHA256 values; a bad asset requires a new version.
