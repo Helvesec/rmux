@@ -56,7 +56,7 @@ Quelques exemples courts et concrets de ce que l'on peut faire avec RMUX.
 
 <p align="center">
 <a href="https://rmux.io/docs/web-share/">
-  <img src="https://rmux.io/web-share-browser.png" width="500" alt="Partage web RMUX" />
+  <img src="https://rmux.io/web-share-browser.gif" width="500" alt="Partage web RMUX" />
 </a>
 </p>
 

@@ -56,7 +56,7 @@ RMUX を何に使えるかを示す短い実例です。
 
 <p align="center">
 <a href="https://rmux.io/docs/web-share/">
-  <img src="https://rmux.io/web-share-browser.png" width="500" alt="RMUX Web Share" />
+  <img src="https://rmux.io/web-share-browser.gif" width="500" alt="RMUX Web Share" />
 </a>
 </p>
 
