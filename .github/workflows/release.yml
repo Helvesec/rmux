@@ -422,9 +422,8 @@ jobs:
 
           work="$(mktemp -d)"
           trap 'rm -rf "$work"' EXIT
-          git -c "http.extraheader=AUTHORIZATION: bearer $RMUX_PACKAGE_REPO_TOKEN" \
-            clone --depth 1 --branch "$RMUX_PACKAGE_REPO_BRANCH" \
-            "https://github.com/$RMUX_PACKAGE_REPO.git" "$work"
+          package_repo_url="https://x-access-token:${RMUX_PACKAGE_REPO_TOKEN}@github.com/${RMUX_PACKAGE_REPO}.git"
+          git clone --depth 1 --branch "$RMUX_PACKAGE_REPO_BRANCH" "$package_repo_url" "$work"
 
           rm -rf "$work/debian" "$work/rpm"
           cp -a target/package-repositories/debian "$work/debian"
@@ -482,5 +481,4 @@ jobs:
 
           git add _headers index.html debian rpm
           git commit -m "packages: publish rmux $RELEASE_REF"
-          git -c "http.extraheader=AUTHORIZATION: bearer $RMUX_PACKAGE_REPO_TOKEN" \
-            push origin "HEAD:$RMUX_PACKAGE_REPO_BRANCH"
+          git push "$package_repo_url" "HEAD:$RMUX_PACKAGE_REPO_BRANCH"
