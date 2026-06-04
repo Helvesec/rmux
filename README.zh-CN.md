@@ -26,7 +26,7 @@
 </div>
 
 > [!NOTE]
-> RMUX 现在包含无服务器、混合后量子、端到端加密的 Web 复用能力。可在[仓库 Web Share 文档](docs/web-share.md)中了解更多。
+> RMUX 现在包含通过静态前端实现的混合后量子、端到端加密 Web 复用能力。可在[仓库 Web Share 文档](docs/web-share.md)中了解更多。
 >
 > 功能请求或问题反馈可提交到 [issues](https://github.com/Helvesec/rmux/issues)。
 

@@ -26,7 +26,7 @@
 </div>
 
 > [!NOTE]
-> RMUX intègre maintenant un multiplexage web serverless, chiffré de bout en bout, avec échange hybride post-quantique. [Voir la documentation Web Share du dépôt](docs/web-share.md).
+> RMUX intègre maintenant un multiplexage web chiffré de bout en bout, avec échange hybride post-quantique, via un frontend statique. [Voir la documentation Web Share du dépôt](docs/web-share.md).
 >
 > Pour une demande de fonctionnalité ou un signalement, [ouvrir une issue](https://github.com/Helvesec/rmux/issues).
 

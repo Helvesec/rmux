@@ -26,7 +26,7 @@
 </div>
 
 > [!NOTE]
-> RMUX はサーバーレス、ハイブリッド・ポスト量子、エンドツーエンド暗号化の Web 多重化に対応しました。詳しくは[リポジトリの Web Share ドキュメント](docs/web-share.md)を参照してください。
+> RMUX は静的フロントエンドを通じた、ハイブリッド・ポスト量子、エンドツーエンド暗号化の Web 多重化に対応しました。詳しくは[リポジトリの Web Share ドキュメント](docs/web-share.md)を参照してください。
 >
 > 機能要望や問題報告は [issues](https://github.com/Helvesec/rmux/issues) へ送れます。
 
