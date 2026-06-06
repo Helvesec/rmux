@@ -30,6 +30,7 @@ serde_json = { version = "1", optional = true }
 sha1 = { version = "0.10", optional = true }
 sha2 = { version = "0.10", optional = true }
 subtle = { version = "2.6", optional = true }
+tempfile = "3"
 tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 toml = { version = "0.8", optional = true }
 tracing = "0.1"
