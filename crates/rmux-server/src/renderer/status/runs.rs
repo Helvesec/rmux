@@ -12,7 +12,7 @@ pub(in crate::renderer::status) fn render_status_runs(row: u16, runs: &[StatusRu
 
     let mut frame = Vec::new();
     let mut last_style: Option<StatusStyle> = None;
-    frame.extend_from_slice(b"\x1b[s");
+    frame.extend_from_slice(b"\x1b7");
     frame.extend_from_slice(b"\x1b[0m");
     frame.extend_from_slice(cursor_position_bytes(row, 0).as_slice());
 
@@ -30,7 +30,7 @@ pub(in crate::renderer::status) fn render_status_runs(row: u16, runs: &[StatusRu
         frame.extend_from_slice(run.text.as_bytes());
     }
 
-    frame.extend_from_slice(b"\x1b[0m\x1b[u");
+    frame.extend_from_slice(b"\x1b[0m\x1b8");
     frame
 }
 

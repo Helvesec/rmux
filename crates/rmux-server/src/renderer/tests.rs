@@ -699,7 +699,7 @@ fn status_only_render_starts_from_a_reset_sgr_state() {
     let session = Session::new(session_name("alpha"), TerminalSize { cols: 8, rows: 2 });
 
     let frame = String::from_utf8(render(&session, &OptionStore::new())).expect("frame is utf-8");
-    assert!(frame.starts_with("\u{1b}[s\u{1b}[0m"));
+    assert!(frame.starts_with("\u{1b}7\u{1b}[0m"));
 }
 
 #[test]
