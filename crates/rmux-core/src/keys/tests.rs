@@ -47,6 +47,10 @@ fn key_code_to_bytes_encodes_ascii_control_and_utf8() {
         Some(vec![13])
     );
     assert_eq!(
+        key_code_to_bytes(key_string_lookup_string("S-Enter").unwrap()),
+        Some(vec![10])
+    );
+    assert_eq!(
         key_code_to_bytes(key_string_lookup_string("C-c").unwrap()),
         Some(vec![3])
     );

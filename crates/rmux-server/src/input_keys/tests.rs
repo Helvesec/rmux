@@ -68,6 +68,12 @@ fn standard_mode_meta_printable_falls_back_to_escape_prefix() {
 }
 
 #[test]
+fn standard_mode_shift_enter_maps_to_line_feed() {
+    let encoded = encode_key(0, ExtendedKeyFormat::Xterm, parse_key("S-Enter")).expect("encode");
+    assert_eq!(encoded, b"\n");
+}
+
+#[test]
 fn mode1_prefers_vt10x_for_compatible_ctrl_keys() {
     let encoded = encode_key(
         mode::MODE_KEYS_EXTENDED,

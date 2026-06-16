@@ -290,6 +290,10 @@ fn input_key_vt10x(pane_mode: u32, key: KeyCode) -> Option<Vec<u8>> {
         return Some(sequence);
     }
 
+    if is_shift_only_enter(key) {
+        return Some(vec![b'\n']);
+    }
+
     let mut output = Vec::new();
     if (key & KEYC_META) != 0 {
         output.push(0x1b);
@@ -471,6 +475,10 @@ fn should_strip_shift(key: KeyCode) -> bool {
 
 fn is_tab(key: KeyCode) -> bool {
     (key & KEYC_MASK_KEY) == 0x09
+}
+
+fn is_shift_only_enter(key: KeyCode) -> bool {
+    (key & KEYC_MASK_KEY) == b'\r' as u64 && (key & KEYC_MASK_MODIFIERS) == KEYC_SHIFT
 }
 
 #[cfg(test)]

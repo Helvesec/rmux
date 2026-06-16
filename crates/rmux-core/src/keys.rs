@@ -288,6 +288,9 @@ pub fn key_code_to_bytes(key: KeyCode) -> Option<Vec<u8>> {
     }
 
     let base = key & KEYC_MASK_KEY;
+    if base == b'\r' as u64 && (key & KEYC_MASK_MODIFIERS) == KEYC_SHIFT {
+        return Some(vec![b'\n']);
+    }
     if key & KEYC_CTRL != 0 {
         if base == b'?' as u64 {
             return Some(vec![0x7f]);
