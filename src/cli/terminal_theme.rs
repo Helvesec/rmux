@@ -9,7 +9,9 @@ mod imp {
 
     use super::WebTerminalPalette;
 
-    const QUERY_TIMEOUT: Duration = Duration::from_millis(220);
+    const QUERY_TIMEOUT: Duration = Duration::from_millis(800);
+    const READ_POLL_SLICE: Duration = Duration::from_millis(25);
+    const QUIET_DRAIN_TIMEOUT: Duration = Duration::from_millis(80);
     const READ_BUF_SIZE: usize = 4096;
 
     pub(super) fn capture() -> Option<WebTerminalPalette> {
@@ -18,6 +20,10 @@ mod imp {
             .write(true)
             .open("/dev/tty")
             .ok()?;
+        capture_from_tty(&mut tty)
+    }
+
+    fn capture_from_tty(tty: &mut std::fs::File) -> Option<WebTerminalPalette> {
         let fd = tty.as_raw_fd();
         let original = TermiosGuard::new(fd)?;
 
@@ -25,23 +31,27 @@ mod imp {
         tty.flush().ok()?;
 
         let mut bytes = Vec::new();
+        let mut theme = None;
         let deadline = Instant::now() + QUERY_TIMEOUT;
         while Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if !poll_readable(fd, remaining) {
+            if !poll_readable(fd, remaining.min(READ_POLL_SLICE)) {
+                continue;
+            }
+            if !read_available(tty, &mut bytes) {
                 break;
             }
-            let mut buf = [0; READ_BUF_SIZE];
-            match tty.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => bytes.extend_from_slice(&buf[..n]),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(_) => break,
+            theme = parse_theme(&String::from_utf8_lossy(&bytes));
+            if theme.is_some() {
+                break;
             }
         }
 
+        drain_quiet_period(fd, tty, &mut bytes, QUIET_DRAIN_TIMEOUT);
+        let _ = flush_input(fd);
+
         drop(original);
-        parse_theme(&String::from_utf8_lossy(&bytes))
+        theme.or_else(|| parse_theme(&String::from_utf8_lossy(&bytes)))
     }
 
     fn query_bytes() -> String {
@@ -116,6 +126,51 @@ mod imp {
         unsafe { libc::poll(&mut pollfd, 1, timeout_ms) > 0 && pollfd.revents & libc::POLLIN != 0 }
     }
 
+    fn read_available(tty: &mut std::fs::File, bytes: &mut Vec<u8>) -> bool {
+        loop {
+            let mut buf = [0; READ_BUF_SIZE];
+            match tty.read(&mut buf) {
+                Ok(0) => return true,
+                Ok(n) => {
+                    bytes.extend_from_slice(&buf[..n]);
+                    if n < READ_BUF_SIZE {
+                        return true;
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return true,
+                Err(_) => return false,
+            }
+        }
+    }
+
+    fn drain_quiet_period(
+        fd: libc::c_int,
+        tty: &mut std::fs::File,
+        bytes: &mut Vec<u8>,
+        timeout: Duration,
+    ) {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !poll_readable(fd, remaining.min(READ_POLL_SLICE)) {
+                continue;
+            }
+            if !read_available(tty, bytes) {
+                break;
+            }
+        }
+    }
+
+    fn flush_input(fd: libc::c_int) -> std::io::Result<()> {
+        // Best-effort cleanup for terminal emulators that answer OSC palette queries late.
+        // Without this, unread replies can be consumed and echoed by the user's shell.
+        if unsafe { libc::tcflush(fd, libc::TCIFLUSH) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
     struct TermiosGuard {
         fd: libc::c_int,
         original: libc::termios,
@@ -155,9 +210,12 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::fs::File;
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+        use std::thread;
 
-        #[test]
-        fn parses_vte_palette_replies() {
+        fn palette_reply() -> String {
             let mut input = "\x1b]10;rgb:eeee/eeee/eeee\x1b\\\
                          \x1b]11;rgb:3333/4444/5555\x1b\\\
                          \x1b]12;rgb:ffff/0000/0000\x1b\\"
@@ -165,6 +223,12 @@ mod imp {
             for index in 0..16 {
                 input.push_str(&format!("\x1b]4;{index};rgb:{index:04x}/0000/ffff\x1b\\"));
             }
+            input
+        }
+
+        #[test]
+        fn parses_vte_palette_replies() {
+            let input = palette_reply();
 
             let theme = parse_theme(&input).expect("valid theme");
 
@@ -173,6 +237,45 @@ mod imp {
             assert_eq!(theme.cursor, "#ff0000");
             assert_eq!(theme.ansi[0], "#0000ff");
             assert_eq!(theme.ansi[15], "#0000ff");
+        }
+
+        #[test]
+        fn delayed_palette_replies_are_captured() {
+            let (mut master, mut slave) = open_pty_pair();
+            let reply = palette_reply();
+            let responder = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(300));
+                master.write_all(reply.as_bytes()).expect("write reply");
+            });
+
+            let theme = capture_from_tty(&mut slave).expect("delayed theme reply");
+            responder.join().expect("responder thread");
+
+            assert_eq!(theme.foreground, "#eeeeee");
+            assert_eq!(theme.background, "#334455");
+            assert_eq!(theme.cursor, "#ff0000");
+            assert_eq!(theme.ansi[15], "#0000ff");
+        }
+
+        fn open_pty_pair() -> (File, File) {
+            let mut master = -1;
+            let mut slave = -1;
+            let result = unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(
+                result,
+                0,
+                "openpty failed: {}",
+                std::io::Error::last_os_error()
+            );
+            unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) }
         }
     }
 }
