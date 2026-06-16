@@ -14,10 +14,10 @@ use rmux_pty::{
 
 use crate::terminal::{spawn_pane_process, TerminalProfile};
 
-const GRACEFUL_TERMINATION_ATTEMPTS: usize = 10;
-const GRACEFUL_TERMINATION_SLEEP: Duration = Duration::from_millis(10);
-const HARD_TERMINATION_ATTEMPTS: usize = 50;
-const HARD_TERMINATION_SLEEP: Duration = Duration::from_millis(10);
+const GRACEFUL_TERMINATION_ATTEMPTS: usize = 100;
+const GRACEFUL_TERMINATION_SLEEP: Duration = Duration::from_millis(1);
+const HARD_TERMINATION_ATTEMPTS: usize = 500;
+const HARD_TERMINATION_SLEEP: Duration = Duration::from_millis(1);
 
 #[derive(Debug)]
 pub(crate) struct PaneTerminal {

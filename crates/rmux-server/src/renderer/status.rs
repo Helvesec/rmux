@@ -1,3 +1,6 @@
+use std::path::Path;
+use std::time::Duration;
+
 use rmux_core::{
     formats::{FormatContext, FormatVariables},
     style::Style,
@@ -6,7 +9,9 @@ use rmux_core::{
 };
 use rmux_proto::OptionName;
 
-use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
+use crate::format_runtime::{
+    render_runtime_template, render_runtime_template_preserving_jobs, RuntimeFormatContext,
+};
 use crate::pane_terminals::HandlerState;
 
 use super::{
@@ -17,6 +22,8 @@ use super::{
 
 #[path = "status/geometry.rs"]
 mod geometry;
+#[path = "status/jobs.rs"]
+mod jobs;
 #[path = "status/message.rs"]
 mod message;
 #[path = "status/prompt.rs"]
@@ -31,6 +38,7 @@ pub(super) use message::format_status_message_line;
 pub(super) use prompt::prompt_status_runs;
 pub(super) use runs::{sanitize_status_text, status_runs_width, StatusRun};
 
+use jobs::render_template_with_status_jobs;
 use prompt::prompt_status_layout;
 use runs::{push_spaces, push_status_run, render_status_runs, truncate_status_runs, StatusStyle};
 use status_format::render_explicit_status_format_line;
@@ -44,6 +52,7 @@ pub(super) struct StatusBarRenderRequest<'a> {
     pub(super) pane_title: Option<&'a str>,
     pub(super) state: Option<&'a HandlerState>,
     pub(super) key_table: Option<&'a str>,
+    pub(super) socket_path: Option<&'a Path>,
 }
 
 pub(super) fn render_status_bar(request: StatusBarRenderRequest<'_>) -> Vec<u8> {
@@ -56,6 +65,7 @@ pub(super) fn render_status_bar(request: StatusBarRenderRequest<'_>) -> Vec<u8> 
         pane_title,
         state,
         key_table,
+        socket_path,
     } = request;
     let Some(status_y) = geometry.status_y else {
         return Vec::new();
@@ -76,10 +86,13 @@ pub(super) fn render_status_bar(request: StatusBarRenderRequest<'_>) -> Vec<u8> 
         session,
         options,
         geometry.terminal_size.cols,
-        attached_count,
-        pane_title,
-        state,
-        key_table,
+        StatusLineContext {
+            attached_count,
+            pane_title,
+            state,
+            key_table,
+            socket_path,
+        },
     );
     let mut frame = Vec::new();
     render_formatted_line(&mut frame, 0, status_y, &line);
@@ -105,7 +118,7 @@ pub(super) fn status_bar_runs(
         &base_style,
         options.resolve(Some(session_name), OptionName::StatusRightStyle),
     );
-    let context = active_format_context(session, attached_count, None);
+    let context = active_format_context(session, attached_count, None, None);
     let left_template = options
         .resolve(Some(session_name), OptionName::StatusLeft)
         .unwrap_or_default();
@@ -114,6 +127,7 @@ pub(super) fn status_bar_runs(
         .unwrap_or_default();
     let left_limit = option_usize(options, session_name, OptionName::StatusLeftLength);
     let right_limit = option_usize(options, session_name, OptionName::StatusRightLength);
+    let status_job_ttl = status_job_cache_ttl(options, session_name);
     let mut runtime = RuntimeFormatContext::new(context)
         .with_options(options)
         .with_session(session)
@@ -122,14 +136,14 @@ pub(super) fn status_bar_runs(
         runtime = runtime.with_pane(pane);
     }
     let left = tmux_truncate_to_width(
-        &render_runtime_template(left_template, &runtime, true),
+        &render_status_template_jobs(left_template, &runtime, status_job_ttl),
         left_limit.min(width),
         &utf8_config,
     );
     let left_width = tmux_text_width(&left, &utf8_config);
     let right_room = width.saturating_sub(left_width);
     let right = tmux_truncate_to_width(
-        &render_runtime_template(right_template, &runtime, true),
+        &render_status_template_jobs(right_template, &runtime, status_job_ttl),
         right_limit.min(right_room),
         &utf8_config,
     );
@@ -158,6 +172,7 @@ fn active_format_context(
     session: &Session,
     attached_count: usize,
     key_table: Option<&str>,
+    socket_path: Option<&Path>,
 ) -> FormatContext {
     let mut context = FormatContext::from_session(session)
         .with_session_attached(attached_count)
@@ -174,6 +189,10 @@ fn active_format_context(
     context = context
         .with_named_value("client_key_table", key_table.unwrap_or("root"))
         .with_named_value("client_prefix", if prefix_active { "1" } else { "0" });
+    if let Some(socket_path) = socket_path {
+        context =
+            context.with_named_value("socket_path", socket_path.to_string_lossy().into_owned());
+    }
     context
 }
 
@@ -183,36 +202,54 @@ pub(super) fn status_bar_line(
     columns: u16,
     attached_count: usize,
 ) -> FormattedLine {
-    status_bar_line_with_pane_title(session, options, columns, attached_count, None, None, None)
+    status_bar_line_with_pane_title(
+        session,
+        options,
+        columns,
+        StatusLineContext {
+            attached_count,
+            ..StatusLineContext::default()
+        },
+    )
+}
+
+#[derive(Clone, Copy, Default)]
+struct StatusLineContext<'a> {
+    attached_count: usize,
+    pane_title: Option<&'a str>,
+    state: Option<&'a HandlerState>,
+    key_table: Option<&'a str>,
+    socket_path: Option<&'a Path>,
 }
 
 fn status_bar_line_with_pane_title(
     session: &Session,
     options: &OptionStore,
     columns: u16,
-    attached_count: usize,
-    pane_title: Option<&str>,
-    state: Option<&HandlerState>,
-    key_table: Option<&str>,
+    context: StatusLineContext<'_>,
 ) -> FormattedLine {
     let width = usize::from(columns);
     let utf8_config = Utf8Config::from_options(options);
     let session_name = session.name();
     let base_style = resolved_status_style(options, session_name);
-    let mut runtime =
-        RuntimeFormatContext::new(active_format_context(session, attached_count, key_table))
-            .with_options(options)
-            .with_session(session)
-            .with_window(session.active_window_index(), session.window());
+    let mut runtime = RuntimeFormatContext::new(active_format_context(
+        session,
+        context.attached_count,
+        context.key_table,
+        context.socket_path,
+    ))
+    .with_options(options)
+    .with_session(session)
+    .with_window(session.active_window_index(), session.window());
     // Threading the handler state in lets runtime variables such as
     // #{pane_in_mode} (the copy-mode indicator) resolve in the status bar.
-    if let Some(state) = state {
+    if let Some(state) = context.state {
         runtime = runtime.with_state(state);
     }
     if let Some(pane) = session.window().active_pane() {
         runtime = runtime.with_pane(pane);
     }
-    if let Some(pane_title) = pane_title {
+    if let Some(pane_title) = context.pane_title {
         runtime = runtime.with_named_value("pane_title", pane_title);
     }
     if let Some(line) = render_explicit_status_format_line(
@@ -234,15 +271,16 @@ fn status_bar_line_with_pane_title(
         .unwrap_or_default();
     let left_limit = option_usize(options, session_name, OptionName::StatusLeftLength);
     let right_limit = option_usize(options, session_name, OptionName::StatusRightLength);
+    let status_job_ttl = status_job_cache_ttl(options, session_name);
     let left = sanitize_status_text(tmux_truncate_to_width(
-        &render_runtime_template(left_template, &runtime, true),
+        &render_status_template_jobs(left_template, &runtime, status_job_ttl),
         left_limit.min(width),
         &utf8_config,
     ));
     let left_width = tmux_text_width(&left, &utf8_config);
     let right_room = width.saturating_sub(left_width);
     let right = sanitize_status_text(tmux_truncate_to_width(
-        &render_runtime_template(right_template, &runtime, true),
+        &render_status_template_jobs(right_template, &runtime, status_job_ttl),
         right_limit.min(right_room),
         &utf8_config,
     ));
@@ -276,8 +314,10 @@ fn status_bar_line_with_pane_title(
     expanded.push_str(&status_window_format_body(
         session,
         options,
+        context.state,
+        context.socket_path,
         &base_style,
-        attached_count,
+        context.attached_count,
     ));
     expanded.push_str("#[nolist]");
 
@@ -292,15 +332,50 @@ fn status_bar_line_with_pane_title(
     format_draw_line(&expanded, &base_style, width, &utf8_config)
 }
 
+fn render_status_template_jobs(
+    template: &str,
+    runtime: &RuntimeFormatContext<'_>,
+    cache_ttl: Duration,
+) -> String {
+    let profile = runtime.status_job_profile();
+    render_status_template_jobs_with_profile(template, runtime, profile.as_ref(), cache_ttl)
+}
+
+pub(super) fn render_status_template_jobs_with_profile<V>(
+    template: &str,
+    variables: &V,
+    profile: Option<&crate::terminal::TerminalProfile>,
+    cache_ttl: Duration,
+) -> String
+where
+    V: rmux_core::formats::FormatVariables + ?Sized,
+{
+    render_template_with_status_jobs(
+        template,
+        profile,
+        cache_ttl,
+        |command| render_runtime_template(command, variables, true),
+        |prepared| render_runtime_template_preserving_jobs(prepared, variables, true),
+    )
+}
+
+fn status_job_cache_ttl(options: &OptionStore, session_name: &rmux_proto::SessionName) -> Duration {
+    let seconds = option_usize(options, session_name, OptionName::StatusInterval).max(1);
+    Duration::from_secs(u64::try_from(seconds).unwrap_or(u64::MAX))
+}
+
 fn status_window_format_body(
     session: &Session,
     options: &OptionStore,
+    state: Option<&HandlerState>,
+    socket_path: Option<&Path>,
     base_style: &Style,
     attached_count: usize,
 ) -> String {
     let session_name = session.name();
     let active_window = session.active_window_index();
     let last_window = session.last_window_index();
+    let status_job_ttl = status_job_cache_ttl(options, session_name);
     let mut rendered = String::new();
     let windows = session
         .windows()
@@ -323,6 +398,10 @@ fn status_window_format_body(
         let mut context =
             FormatContext::from_session(session).with_window(*window_index, window, active, last);
         context = context.with_session_attached(attached_count);
+        if let Some(socket_path) = socket_path {
+            context =
+                context.with_named_value("socket_path", socket_path.to_string_lossy().into_owned());
+        }
         if let Some(pane) = window.active_pane() {
             context = context.with_window_pane(window, pane);
         }
@@ -330,6 +409,9 @@ fn status_window_format_body(
             .with_options(options)
             .with_session(session)
             .with_window(*window_index, window);
+        if let Some(state) = state {
+            runtime = runtime.with_state(state);
+        }
         if let Some(pane) = window.active_pane() {
             runtime = runtime.with_pane(pane);
         }
@@ -349,8 +431,10 @@ fn status_window_format_body(
             if active { " list=focus" } else { "" },
             rmux_core::style_tostring(&style)
         ));
-        rendered.push_str(&sanitize_status_text(render_runtime_template(
-            format, &runtime, true,
+        rendered.push_str(&sanitize_status_text(render_status_template_jobs(
+            format,
+            &runtime,
+            status_job_ttl,
         )));
         rendered.push_str("#[norange list=on default]");
 
@@ -362,7 +446,8 @@ fn status_window_format_body(
                     OptionName::WindowStatusSeparator,
                 )
                 .unwrap_or(" ");
-            let rendered_separator = render_runtime_template(separator, &runtime, true);
+            let rendered_separator =
+                render_status_template_jobs(separator, &runtime, status_job_ttl);
             if !rendered_separator.is_empty() {
                 rendered.push_str(&sanitize_status_text(rendered_separator));
             }

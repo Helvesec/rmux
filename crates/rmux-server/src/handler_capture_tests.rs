@@ -2,9 +2,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::RequestHandler;
+use rmux_core::{input::InputParser, Screen};
+use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
     CapturePaneRequest, LoadBufferRequest, NewSessionRequest, PaneTarget, Request, Response,
-    SaveBufferRequest, SendKeysRequest, SetBufferRequest, ShowBufferRequest, TerminalSize,
+    SaveBufferRequest, SendKeysRequest, SetBufferRequest, SetOptionByNameRequest, SetOptionMode,
+    ShowBufferRequest, TerminalSize,
 };
 use tokio::time::sleep;
 
@@ -78,16 +81,58 @@ fn save_buffer_request(
 }
 
 async fn create_session(handler: &RequestHandler, name: &str) {
+    create_session_with_size(handler, name, TerminalSize { cols: 80, rows: 24 }).await;
+}
+
+async fn create_session_with_size(handler: &RequestHandler, name: &str, size: TerminalSize) {
     let response = handler
         .handle(Request::NewSession(NewSessionRequest {
             session_name: session_name(name),
             detached: true,
-            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            size: Some(size),
             environment: None,
         }))
         .await;
 
     assert!(matches!(response, Response::NewSession(_)));
+}
+
+async fn replace_transcript_contents(
+    handler: &RequestHandler,
+    target: &PaneTarget,
+    size: TerminalSize,
+    content: &[u8],
+) {
+    let transcript = {
+        let state = handler.state.lock().await;
+        state
+            .transcript_handle(target)
+            .expect("session transcript must exist")
+    };
+    let history_limit = transcript
+        .lock()
+        .expect("pane transcript mutex must not be poisoned")
+        .history_limit();
+    let mut screen = Screen::new(size, history_limit);
+    let mut parser = InputParser::new();
+    parser.parse(content, &mut screen);
+    transcript
+        .lock()
+        .expect("pane transcript mutex must not be poisoned")
+        .set_screen_for_test(screen);
+}
+
+async fn append_to_transcript(handler: &RequestHandler, target: &PaneTarget, bytes: &[u8]) {
+    let transcript = {
+        let state = handler.state.lock().await;
+        state
+            .transcript_handle(target)
+            .expect("session transcript must exist")
+    };
+    transcript
+        .lock()
+        .expect("pane transcript mutex must not be poisoned")
+        .append_bytes(bytes);
 }
 
 async fn send_marker(handler: &RequestHandler, target: PaneTarget, marker: &str) {
@@ -194,6 +239,67 @@ async fn capture_pane_writes_named_buffer() {
         .await;
     let output = show.command_output().expect("show-buffer returns output");
     assert!(String::from_utf8_lossy(output.stdout()).contains(marker));
+}
+
+#[tokio::test]
+async fn capture_pane_do_not_trim_uses_tmux_cell_capacity() {
+    let handler = RequestHandler::new();
+    let target = PaneTarget::with_window(session_name("capacity"), 0, 0);
+    let size = TerminalSize { cols: 20, rows: 6 };
+
+    create_session_with_size(&handler, "capacity", size).await;
+    replace_transcript_contents(&handler, &target, size, b"a\r\nabcde\r\nabcdefghij\r\n").await;
+
+    let mut request = capture_pane_request(target, None, None, true, None);
+    request.do_not_trim_spaces = true;
+    let response = handler.handle(Request::CapturePane(request)).await;
+    let output = response
+        .command_output()
+        .expect("capture-pane -Np returns command output");
+    let output = String::from_utf8(output.stdout().to_vec()).expect("capture output is utf-8");
+
+    assert_eq!(output, "a    \nabcde     \nabcdefghij          \n\n\n\n");
+}
+
+#[tokio::test]
+async fn alternate_screen_off_keeps_program_output_on_main_screen() {
+    let handler = RequestHandler::new();
+    let target = PaneTarget::with_window(session_name("altscreen"), 0, 0);
+    create_session_with_size(&handler, "altscreen", TerminalSize { cols: 20, rows: 5 }).await;
+
+    let response = handler
+        .handle(Request::SetOptionByName(SetOptionByNameRequest {
+            scope: OptionScopeSelector::WindowGlobal,
+            name: "alternate-screen".to_owned(),
+            value: Some("off".to_owned()),
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: false,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOptionByName(_)));
+
+    append_to_transcript(
+        &handler,
+        &target,
+        b"\x1b[?1049hALTLINE\r\n\x1b[?1049lMAINLINE\r\n",
+    )
+    .await;
+
+    let response = handler
+        .handle(Request::CapturePane(capture_pane_request(
+            target, None, None, true, None,
+        )))
+        .await;
+    let output = response
+        .command_output()
+        .expect("capture-pane -p returns command output");
+    let output = String::from_utf8(output.stdout().to_vec()).expect("capture output is utf8");
+    assert!(output.contains("ALTLINE"), "{output:?}");
+    assert!(output.contains("MAINLINE"), "{output:?}");
 }
 
 #[tokio::test]

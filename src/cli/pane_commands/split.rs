@@ -1,7 +1,9 @@
 use std::path::Path;
 
 use rmux_client::connect;
-use rmux_proto::{ErrorResponse, Request, Response, SplitWindowExtRequest, SplitWindowRequest};
+use rmux_proto::{
+    ErrorResponse, ProcessCommand, Request, Response, SplitWindowExtRequest, SplitWindowRequest,
+};
 
 use super::super::format_print::print_target_format;
 use super::super::{
@@ -15,10 +17,6 @@ pub(in crate::cli) fn run_split_window(
     args: SplitWindowArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    if args.stdin {
-        return Err(ExitFailure::new(1, "split-window: unsupported flag -I"));
-    }
-
     let direction = args.direction();
     let print_target = args.print_target;
     let print_format = args
@@ -34,13 +32,28 @@ pub(in crate::cli) fn run_split_window(
             "split-window",
         )?),
     };
+    let size = args.size_spec();
     let environment = (!args.environment.is_empty()).then_some(args.environment);
     let command = (!args.command.is_empty()).then_some(args.command);
+    let stdin_to_empty_pane = args.stdin && command.is_none();
+    let stdin_payload = if stdin_to_empty_pane {
+        Some(read_stdin_payload()?)
+    } else {
+        None
+    };
+    let process_command = if stdin_to_empty_pane {
+        Some(ProcessCommand::Shell(String::new()))
+    } else {
+        None
+    };
     let response = if command.is_some()
+        || process_command.is_some()
         || args.start_directory.is_some()
         || args.detached
-        || args.size.is_some()
+        || size.is_some()
+        || args.full_size
         || args.preserve_zoom
+        || stdin_payload.is_some()
     {
         connection
             .roundtrip(&Request::SplitWindowExt(SplitWindowExtRequest {
@@ -49,12 +62,14 @@ pub(in crate::cli) fn run_split_window(
                 before: args.before,
                 environment,
                 command,
-                process_command: None,
+                process_command,
                 start_directory: args.start_directory,
-                keep_alive_on_exit: None,
+                keep_alive_on_exit: stdin_to_empty_pane.then_some(true),
                 detached: args.detached,
-                size: args.size,
+                size,
                 preserve_zoom: args.preserve_zoom,
+                full_size: args.full_size,
+                stdin_payload,
             }))
             .map_err(ExitFailure::from_client)?
     } else {
@@ -79,10 +94,16 @@ pub(in crate::cli) fn run_split_window(
         print_target_format(
             &mut connection,
             "split-window",
-            rmux_proto::Target::Pane(pane),
+            rmux_proto::Target::Pane(pane.clone()),
             &print_format,
         )?;
     }
-
     Ok(0)
+}
+
+fn read_stdin_payload() -> Result<Vec<u8>, ExitFailure> {
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes)
+        .map_err(|error| ExitFailure::new(1, format!("failed to read stdin: {error}")))?;
+    Ok(bytes)
 }

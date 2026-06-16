@@ -18,6 +18,9 @@ pub struct DaemonStatusResponse {
     pub session_count: usize,
     /// Number of attach/control clients or detached RPC requests currently active.
     pub client_count: usize,
+    /// Whether the daemon is still applying startup configuration.
+    #[serde(default)]
+    pub config_loading: bool,
 }
 
 /// Response payload for internal idle-only daemon shutdown.

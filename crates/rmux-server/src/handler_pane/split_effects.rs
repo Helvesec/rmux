@@ -6,7 +6,6 @@ use crate::pane_terminals::HandlerState;
 pub(super) struct SplitWindowEffects {
     pub(super) detached_anchor: Option<PaneTarget>,
     pub(super) size: Option<u32>,
-    target_was_zoomed: bool,
 }
 
 pub(super) fn split_window_effects(
@@ -41,7 +40,6 @@ pub(super) fn split_window_effects(
         detached_anchor: detached
             .then(|| PaneTarget::with_window(session_name, window_index, pane_index)),
         size: split_size,
-        target_was_zoomed: window.is_zoomed(),
     })
 }
 
@@ -51,7 +49,7 @@ pub(super) fn apply_split_window_effects(
     effects: SplitWindowEffects,
     preserve_zoom: bool,
 ) -> Result<(), RmuxError> {
-    if preserve_zoom && effects.target_was_zoomed {
+    if preserve_zoom {
         let zoom_target = effects.detached_anchor.as_ref().unwrap_or(pane);
         let session_name = zoom_target.session_name().clone();
         state.mutate_session_and_resize_terminals(&session_name, |session| {

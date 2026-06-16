@@ -9,7 +9,7 @@
 
 **Browser sharing for RMUX terminal panes and sessions.**
 
-[![rmux 0.5.0](https://img.shields.io/badge/rmux-0.5.0-informational.svg)](https://github.com/Helvesec/rmux/releases/tag/v0.5.0)
+[![rmux 0.6.0](https://img.shields.io/badge/rmux-0.6.0-informational.svg)](https://github.com/Helvesec/rmux/releases/tag/v0.6.0)
 [![E2EE](https://img.shields.io/badge/E2EE-ChaCha20--Poly1305-success.svg)](#cryptography)
 [![Hybrid Post-Quantum](https://img.shields.io/badge/Hybrid%20Post--Quantum-X25519%20%2B%20ML--KEM--768-blue.svg)](#cryptography)
 [![Frontend](https://img.shields.io/badge/frontend-decoupled-lightgrey.svg)](#architecture)
@@ -19,7 +19,7 @@
 ## Web Multiplex
 
 <p align="center">
-  <img src="https://rmux.io/web-share-browser.png" width="700" alt="RMUX browser terminal">
+  <img src="https://rmux.io/web-share-browser.gif" width="700" alt="RMUX browser terminal">
 </p>
 
 `rmux web-share` opens an existing RMUX pane or session in a browser.
@@ -115,6 +115,19 @@ rmux web-share --pin-operator 123456 --pin-spectator 789012
 rmux web-share --max-spectators 10 --ttl 3600
 ```
 
+Web Share uses these browser-visible close codes:
+
+| Code | Reason | Browser behavior |
+| :--- | :--- | :--- |
+| `1000` | `session_closed` or share shutdown | Ends the view cleanly. |
+| `4000` | `handshake_rejected` | Generic refusal for bad links, expired shares, wrong PINs, origin rejection, and pre-auth capacity. |
+| `4001` | `viewer_backpressure` | Closes slow viewers that cannot keep up with output. |
+| `4002` | `operator_frame_too_large` | Rejects oversized operator input frames. |
+| `4006` | command or role violation | Rejects unsupported actions, spectator writes, pane-only session actions, and malformed control frames. |
+| `4008` | `pin_required` | Prompts for the pairing PIN after token authentication. |
+
+`4008` is only used after the share token is valid. Bad links, expired shares, missing roles, wrong PINs, and authenticated capacity failures stay on the generic `4000` path so the browser does not become a token, PIN, or capacity oracle.
+
 ## Tunnels & Custom Domains
 
 You can share over loopback, a private network, or the public internet:
@@ -132,6 +145,16 @@ rmux web-share --tunnel-url https://my-tunnel.example.com
 # Custom static frontend
 rmux web-share --frontend-url https://share.example.com
 ```
+
+For public demos, keep the public link read-only and put per-IP throttling at the edge:
+
+```sh
+rmux web-share -t demo --spectator-only --max-spectators 150 --tunnel-url https://demo.rmux.io
+```
+
+`rmux web-share` binds the daemon listener to loopback, so it cannot reliably tell public viewers apart by source IP once traffic arrives through a tunnel. Use your tunnel, CDN, or reverse proxy for per-IP limits. For example, a named Cloudflare Tunnel or nginx can cap WebSocket connections by client IP before traffic reaches RMUX.
+
+Account-less Cloudflare Quick Tunnels (`trycloudflare.com`) are intentionally not shipped as a built-in provider. They are useful for casual experiments, but their hostnames can take an unpredictable amount of time to become reachable and Cloudflare does not provide uptime guarantees for them. For a demo or Show HN, use a named tunnel or your own ingress and pass its stable URL with `--tunnel-url`.
 
 ## CLI Commands
 

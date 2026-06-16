@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use rmux_core::{
     command_target_metadata, OptionStore, SessionStore, TargetFindContext, UnresolvedTarget,
@@ -38,18 +39,28 @@ pub(in crate::handler) fn active_session_target(
 impl RequestHandler {
     pub(in crate::handler) async fn handle_resolve_target(
         &self,
+        requester_pid: u32,
         request: rmux_proto::ResolveTargetRequest,
     ) -> Response {
-        let preferred_session = if request
+        let needs_current_target = request
             .target
             .as_deref()
-            .map(unresolved_target_needs_current_session)
-            .unwrap_or(true)
-        {
+            .map(|raw| unresolved_target_needs_current_session(raw, request.target_type))
+            .unwrap_or(true);
+        let attached_session = if needs_current_target {
+            self.current_session_candidate(requester_pid).await
+        } else {
+            None
+        };
+        let preferred_session = if needs_current_target {
             self.preferred_session_name().await.ok()
         } else {
             None
         };
+        let socket_path = self.socket_path();
+        let requester_pane_id = needs_current_target
+            .then(|| requester_environment_pane_id(requester_pid, &socket_path))
+            .flatten();
         let state = self.state.lock().await;
         let unresolved = match request.target {
             Some(target) => UnresolvedTarget::new(target),
@@ -67,9 +78,18 @@ impl RequestHandler {
         if request.prefer_unattached {
             flags = flags.union(rmux_core::TargetFindFlags::PREFER_UNATTACHED);
         }
-        let current_target = preferred_session
-            .as_ref()
-            .and_then(|session_name| active_session_target(&state.sessions, session_name));
+        let current_target = requester_pane_id
+            .and_then(|pane_id| pane_id_target(&state.sessions, pane_id))
+            .or_else(|| {
+                attached_session
+                    .as_ref()
+                    .and_then(|session_name| active_session_target(&state.sessions, session_name))
+            })
+            .or_else(|| {
+                preferred_session
+                    .as_ref()
+                    .and_then(|session_name| active_session_target(&state.sessions, session_name))
+            });
         let marked_target = state.marked_pane_target().map(Target::Pane);
         let context = with_visible_pane_bases(
             TargetFindContext::new(current_target).with_marked_target(marked_target),
@@ -83,6 +103,94 @@ impl RequestHandler {
             Ok(target) => Response::ResolveTarget(ResolveTargetResponse { target }),
             Err(error) => Response::Error(ErrorResponse { error }),
         }
+    }
+}
+
+pub(in crate::handler) fn requester_environment_pane_id(
+    requester_pid: u32,
+    server_socket_path: &Path,
+) -> Option<u32> {
+    if requester_pid == std::process::id() {
+        return None;
+    }
+
+    let environment = rmux_os::process::environment(requester_pid)?;
+    if !environment_rmux_socket_matches(&environment, server_socket_path) {
+        return None;
+    }
+    let pane = environment
+        .get("RMUX_PANE")
+        .or_else(|| environment.get("TMUX_PANE"))?;
+    pane.strip_prefix('%')?.parse::<u32>().ok()
+}
+
+pub(in crate::handler) fn requester_environment_source_depth(
+    requester_pid: u32,
+    server_socket_path: &Path,
+) -> Option<usize> {
+    if requester_pid == std::process::id() {
+        return None;
+    }
+
+    let environment = rmux_os::process::environment(requester_pid)?;
+    if !environment_rmux_socket_matches(&environment, server_socket_path) {
+        return None;
+    }
+    environment.get("RMUX_SOURCE_DEPTH")?.parse::<usize>().ok()
+}
+
+pub(in crate::handler) fn pane_id_target(sessions: &SessionStore, pane_id: u32) -> Option<Target> {
+    sessions
+        .resolve_unresolved_target(
+            &UnresolvedTarget::new(format!("%{pane_id}")),
+            rmux_core::TargetFindType::Pane,
+            rmux_core::TargetFindFlags::CANFAIL,
+            &TargetFindContext::new(None),
+        )
+        .ok()
+}
+
+fn environment_rmux_socket_matches(
+    environment: &HashMap<String, String>,
+    server_socket_path: &Path,
+) -> bool {
+    let Some(value) = environment.get("RMUX") else {
+        return false;
+    };
+    let Some(inherited_socket) = rmux_socket_path_from_env(value) else {
+        return false;
+    };
+    socket_paths_match(&inherited_socket, server_socket_path)
+}
+
+fn rmux_socket_path_from_env(value: &str) -> Option<PathBuf> {
+    let path = value.split_once(',').map_or(value, |(path, _)| path);
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+fn socket_paths_match(left: &Path, right: &Path) -> bool {
+    let left = canonical_socket_path(left);
+    let right = canonical_socket_path(right);
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn canonical_socket_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(file_name)) => std::fs::canonicalize(parent)
+            .map(|canonical_parent| canonical_parent.join(file_name))
+            .unwrap_or_else(|_| path.to_path_buf()),
+        _ => path.to_path_buf(),
     }
 }
 
@@ -106,12 +214,123 @@ pub(in crate::handler) fn with_visible_pane_bases(
     context.with_pane_base_indices(pane_base_indices)
 }
 
-fn unresolved_target_needs_current_session(raw: &str) -> bool {
+fn unresolved_target_needs_current_session(raw: &str, target_type: ResolveTargetType) -> bool {
+    if target_type == ResolveTargetType::Pane {
+        return true;
+    }
+
     raw.is_empty()
         || raw == "."
+        || raw.starts_with('@')
         || raw.starts_with(':')
         || raw.starts_with(['+', '-'])
         || (raw.contains('.') && !raw.contains(':'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmux_proto::{
+        NewSessionRequest, PaneTarget, ResolveTargetRequest, Response, SelectPaneRequest,
+        SplitDirection, SplitWindowRequest, SplitWindowTarget, Target, TerminalSize,
+    };
+
+    fn session_name(value: &str) -> rmux_proto::SessionName {
+        rmux_proto::SessionName::new(value).expect("valid session name")
+    }
+
+    async fn resolve_pane(handler: &RequestHandler, target: &str) -> Target {
+        let response = handler
+            .handle(Request::ResolveTarget(ResolveTargetRequest {
+                target: Some(target.to_owned()),
+                target_type: ResolveTargetType::Pane,
+                window_index: false,
+                prefer_unattached: false,
+            }))
+            .await;
+        let Response::ResolveTarget(response) = response else {
+            panic!("pane target {target:?} should resolve, got {response:?}");
+        };
+        response.target
+    }
+
+    #[tokio::test]
+    async fn resolve_target_uses_current_window_for_relative_pane_forms() {
+        let handler = RequestHandler::new();
+        let alpha = session_name("alpha");
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: alpha.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+        assert!(matches!(
+            handler
+                .handle(Request::SplitWindow(SplitWindowRequest {
+                    target: SplitWindowTarget::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
+                    direction: SplitDirection::Vertical,
+                    before: false,
+                    environment: None,
+                }))
+                .await,
+            Response::SplitWindow(_)
+        ));
+        assert!(matches!(
+            handler
+                .handle(Request::SelectPane(SelectPaneRequest {
+                    target: PaneTarget::with_window(alpha.clone(), 0, 1),
+                    title: None,
+                    style: None,
+                    input_disabled: None,
+                    preserve_zoom: false,
+                }))
+                .await,
+            Response::SelectPane(_)
+        ));
+        {
+            let state = handler.state.lock().await;
+            let session = state.sessions.session(&alpha).expect("alpha exists");
+            let window = session.window_at(0).expect("window 0 exists");
+            assert_eq!(window.active_pane_index(), 1);
+            let top = window.pane(0).expect("pane 0 exists").geometry();
+            let bottom = window.pane(1).expect("pane 1 exists").geometry();
+            assert!(top.y() < bottom.y(), "pane 0 should sit above pane 1");
+        }
+
+        assert_eq!(
+            resolve_pane(&handler, "1").await,
+            Target::Pane(PaneTarget::with_window(alpha.clone(), 0, 1))
+        );
+        assert_eq!(
+            resolve_pane(&handler, "{up-of}").await,
+            Target::Pane(PaneTarget::with_window(alpha.clone(), 0, 0))
+        );
+        assert_eq!(
+            resolve_pane(&handler, "{down-of}").await,
+            Target::Pane(PaneTarget::with_window(alpha.clone(), 0, 0))
+        );
+        assert!(matches!(
+            handler
+                .handle(Request::SelectPane(SelectPaneRequest {
+                    target: PaneTarget::with_window(alpha.clone(), 0, 0),
+                    title: None,
+                    style: None,
+                    input_disabled: None,
+                    preserve_zoom: false,
+                }))
+                .await,
+            Response::SelectPane(_)
+        ));
+        assert_eq!(
+            resolve_pane(&handler, "{down-of}").await,
+            Target::Pane(PaneTarget::with_window(alpha, 0, 1))
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

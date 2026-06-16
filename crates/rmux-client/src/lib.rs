@@ -40,8 +40,8 @@ pub use connection::{
 };
 pub use control::{drive_control_mode, drive_control_mode_with_stdio};
 pub use nested::{
-    detect_context, ensure_nested_context, require_nested_context, ClientContext,
-    NestedContextError,
+    detect_context, detect_parent, ensure_nested_context, require_nested_context, ClientContext,
+    ClientContextParent, NestedContextError,
 };
 
 use rmux_proto::RmuxError;

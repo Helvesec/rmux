@@ -3,14 +3,20 @@
 use std::collections::HashMap;
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
+#[cfg(any(unix, windows))]
+use std::ffi::OsString;
 use std::io;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, BorrowedFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
 #[path = "process_windows.rs"]
 mod windows_process;
+#[cfg(windows)]
+pub use windows_process::ProcessJob;
 
 /// Inspect process metadata for the current platform.
 #[derive(Debug, Default, Clone, Copy)]
@@ -43,6 +49,12 @@ impl ProcessInspector {
     /// Returns a process environment snapshot, when available.
     pub fn environment(&self, pid: u32) -> io::Result<Option<HashMap<String, String>>> {
         environment_impl(pid)
+    }
+
+    /// Returns a process environment snapshot without UTF-8 conversion, when available.
+    #[cfg(any(unix, windows))]
+    pub fn raw_environment(&self, pid: u32) -> io::Result<Option<Vec<(OsString, OsString)>>> {
+        raw_environment_impl(pid)
     }
 }
 
@@ -80,6 +92,13 @@ pub fn environment(pid: u32) -> Option<HashMap<String, String>> {
     ProcessInspector.environment(pid).ok().flatten()
 }
 
+/// Returns a process environment snapshot without UTF-8 conversion, when available.
+#[cfg(any(unix, windows))]
+#[must_use]
+pub fn raw_environment(pid: u32) -> Option<Vec<(OsString, OsString)>> {
+    ProcessInspector.raw_environment(pid).ok().flatten()
+}
+
 /// Unix-only process helpers.
 #[cfg(unix)]
 pub mod unix {
@@ -103,10 +122,21 @@ pub mod unix {
 #[cfg(target_os = "linux")]
 fn current_path_impl(pid: u32) -> io::Result<Option<String>> {
     match std::fs::read_link(format!("/proc/{pid}/cwd")) {
-        Ok(path) => Ok(Some(path.to_string_lossy().into_owned())),
+        Ok(path) => Ok(Some(linux_cwd_path_string(path))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+#[allow(dead_code)]
+fn linux_cwd_path_string(path: PathBuf) -> String {
+    const DELETED_SUFFIX: &str = " (deleted)";
+
+    let value = path.to_string_lossy();
+    value
+        .strip_suffix(DELETED_SUFFIX)
+        .unwrap_or(&value)
+        .to_owned()
 }
 
 #[cfg(target_os = "linux")]
@@ -157,6 +187,16 @@ fn environment_impl(pid: u32) -> io::Result<Option<HashMap<String, String>>> {
         Err(error) => return Err(error),
     };
     Ok(environment_from_nul_entries(&environ))
+}
+
+#[cfg(target_os = "linux")]
+fn raw_environment_impl(pid: u32) -> io::Result<Option<Vec<(OsString, OsString)>>> {
+    let environ = match std::fs::read(format!("/proc/{pid}/environ")) {
+        Ok(environ) => environ,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(Some(raw_environment_from_nul_entries(&environ)))
 }
 
 #[cfg(target_os = "macos")]
@@ -301,6 +341,11 @@ fn environment_impl(pid: u32) -> io::Result<Option<HashMap<String, String>>> {
     Ok(macos_procargs(pid).and_then(|buffer| environment_from_macos_procargs(&buffer)))
 }
 
+#[cfg(target_os = "macos")]
+fn raw_environment_impl(pid: u32) -> io::Result<Option<Vec<(OsString, OsString)>>> {
+    Ok(macos_procargs(pid).and_then(|buffer| raw_environment_from_macos_procargs(&buffer)))
+}
+
 #[cfg(windows)]
 fn current_path_impl(pid: u32) -> io::Result<Option<String>> {
     windows_process::current_path(pid)
@@ -324,6 +369,16 @@ fn is_live_impl(pid: u32) -> io::Result<Option<bool>> {
 #[cfg(windows)]
 fn environment_impl(pid: u32) -> io::Result<Option<HashMap<String, String>>> {
     windows_process::environment(pid)
+}
+
+#[cfg(windows)]
+fn raw_environment_impl(pid: u32) -> io::Result<Option<Vec<(OsString, OsString)>>> {
+    Ok(windows_process::environment(pid)?.map(|environment| {
+        environment
+            .into_iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect()
+    }))
 }
 
 #[cfg(target_os = "macos")]
@@ -399,6 +454,18 @@ fn macos_procargs(pid: u32) -> Option<Vec<u8>> {
 
 #[cfg(target_os = "macos")]
 fn environment_from_macos_procargs(buffer: &[u8]) -> Option<HashMap<String, String>> {
+    let offset = macos_environment_offset(buffer)?;
+    environment_from_nul_entries(&buffer[offset..])
+}
+
+#[cfg(target_os = "macos")]
+fn raw_environment_from_macos_procargs(buffer: &[u8]) -> Option<Vec<(OsString, OsString)>> {
+    let offset = macos_environment_offset(buffer)?;
+    Some(raw_environment_from_nul_entries(&buffer[offset..]))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_environment_offset(buffer: &[u8]) -> Option<usize> {
     let argc_size = std::mem::size_of::<libc::c_int>();
     if buffer.len() < argc_size {
         return None;
@@ -415,8 +482,7 @@ fn environment_from_macos_procargs(buffer: &[u8]) -> Option<HashMap<String, Stri
     for _ in 0..argc {
         offset = skip_nul_terminated(buffer, offset)?;
     }
-    offset = skip_nul_padding(buffer, offset);
-    environment_from_nul_entries(&buffer[offset..])
+    Some(skip_nul_padding(buffer, offset))
 }
 
 #[cfg(target_os = "macos")]
@@ -445,6 +511,28 @@ fn environment_from_nul_entries(environ: &[u8]) -> Option<HashMap<String, String
         values.insert(name.to_owned(), value.to_owned());
     }
     Some(values)
+}
+
+#[cfg(unix)]
+fn raw_environment_from_nul_entries(environ: &[u8]) -> Vec<(OsString, OsString)> {
+    let mut values = Vec::new();
+    for entry in environ.split(|byte| *byte == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let Some(separator) = entry.iter().position(|byte| *byte == b'=') else {
+            continue;
+        };
+        let (name, value) = entry.split_at(separator);
+        if name.is_empty() || name.first().is_some_and(|byte| *byte == b'=') {
+            continue;
+        }
+        values.push((
+            OsString::from_vec(name.to_vec()),
+            OsString::from_vec(value[1..].to_vec()),
+        ));
+    }
+    values
 }
 
 fn executable_name(path: &str) -> Option<String> {

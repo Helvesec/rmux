@@ -400,6 +400,27 @@ pub(crate) fn dispatch_csi(parser: &mut InputParser, writer: &mut dyn ScreenWrit
                 _ => {}
             }
         }
+        CsiCommand::KittyKeyboardSet | CsiCommand::KittyKeyboardPush => {
+            let flags = parser.param_list.get(0, 0, 0);
+            let apply_mode = parser.param_list.get(1, 1, 1);
+            if flags <= 0 || apply_mode == 3 {
+                writer.mode_clear(mode::MODE_KEYS_KITTY | mode::MODE_KEYS_EXTENDED_2);
+            } else {
+                writer.mode_clear(mode::EXTENDED_KEY_MODES);
+                writer.mode_set(mode::MODE_KEYS_EXTENDED_2 | mode::MODE_KEYS_KITTY);
+            }
+        }
+        CsiCommand::KittyKeyboardPop => {
+            writer.mode_clear(mode::MODE_KEYS_KITTY | mode::MODE_KEYS_EXTENDED_2);
+        }
+        CsiCommand::KittyKeyboardQuery => {
+            let flags = if (writer.current_mode() & mode::MODE_KEYS_KITTY) != 0 {
+                1
+            } else {
+                0
+            };
+            parser.reply(&format!("\x1b[?{flags}u"));
+        }
         CsiCommand::Modoff => {
             let n = parser.param_list.get(0, 0, 0);
             if n != 4 {

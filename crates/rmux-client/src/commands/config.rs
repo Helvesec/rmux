@@ -53,6 +53,8 @@ impl Connection {
             only_if_unset,
             unset,
             unset_pane_overrides,
+            format: false,
+            format_target: None,
         };
         rmux_core::validate_option_name_mutation(
             &request.name,
@@ -132,12 +134,14 @@ impl Connection {
         name: Option<String>,
         value_only: bool,
         include_inherited: bool,
+        quiet: bool,
     ) -> Result<Response, ClientError> {
         self.roundtrip(&Request::ShowOptions(ShowOptionsRequest {
             scope,
             name,
             value_only,
             include_inherited,
+            quiet,
         }))
     }
 

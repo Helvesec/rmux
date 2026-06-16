@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use rmux_core::{
     command_parser::CommandParser,
     formats::{
@@ -7,7 +9,7 @@ use rmux_core::{
 };
 use rmux_proto::{RmuxError, Target};
 
-use crate::format_runtime::RuntimeFormatContext;
+use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::pane_terminals::{session_not_found, HandlerState};
 
 pub(super) fn collect_parse_time_values(
@@ -135,4 +137,51 @@ pub(in super::super) fn format_context_for_target<'a>(
                 .with_pane(pane))
         }
     }
+}
+
+pub(in super::super) fn with_server_format_values<'a>(
+    context: RuntimeFormatContext<'a>,
+    socket_path: &Path,
+) -> RuntimeFormatContext<'a> {
+    context.with_named_value("socket_path", socket_path.to_string_lossy().into_owned())
+}
+
+pub(in super::super) fn global_format_context<'a>(
+    state: &'a HandlerState,
+    socket_path: &Path,
+) -> RuntimeFormatContext<'a> {
+    with_server_format_values(
+        RuntimeFormatContext::new(FormatContext::new()).with_state(state),
+        socket_path,
+    )
+}
+
+pub(in super::super) fn format_context_for_target_with_server_values<'a>(
+    state: &'a HandlerState,
+    target: &Target,
+    attached_count: usize,
+    socket_path: &Path,
+) -> Result<RuntimeFormatContext<'a>, RmuxError> {
+    format_context_for_target(state, target, attached_count)
+        .map(|context| with_server_format_values(context, socket_path))
+}
+
+pub(in super::super) fn render_start_directory_template(
+    state: &HandlerState,
+    target: &Target,
+    attached_count: usize,
+    start_directory: Option<PathBuf>,
+) -> Result<Option<PathBuf>, RmuxError> {
+    let Some(start_directory) = start_directory else {
+        return Ok(None);
+    };
+    let template = start_directory.as_os_str().to_string_lossy();
+    if !template.contains("#{") {
+        return Ok(Some(start_directory));
+    }
+
+    let context = format_context_for_target(state, target, attached_count)?;
+    Ok(Some(PathBuf::from(render_runtime_template(
+        &template, &context, false,
+    ))))
 }

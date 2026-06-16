@@ -2,7 +2,7 @@ use rmux_proto::{Request, RmuxError, SendKeysRequest};
 
 use super::parse_pane_target;
 use super::tokens::CommandTokens;
-use super::values::{missing_argument, parse_usize};
+use super::values::{missing_argument, parse_usize, unsupported_flag};
 
 pub(super) fn parse_send_keys(mut args: CommandTokens) -> Result<Request, RmuxError> {
     let mut target = None;
@@ -16,8 +16,23 @@ pub(super) fn parse_send_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
     let mut reset_terminal = false;
     let mut repeat_count = None;
 
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        if let Some(flags) = args.optional_compact_flags("FHlKMRX") {
+            for flag in flags {
+                match flag {
+                    'F' => expand_formats = true,
+                    'H' => hex = true,
+                    'l' => literal = true,
+                    'K' => dispatch_key_table = true,
+                    'M' => forward_mouse_event = true,
+                    'R' => reset_terminal = true,
+                    'X' => copy_mode_command = true,
+                    _ => unreachable!("compact send-keys flags are prevalidated"),
+                }
+            }
+            continue;
+        }
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -44,12 +59,13 @@ pub(super) fn parse_send_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
             }
             "-N" => {
                 let _ = args.optional();
-                repeat_count = Some(parse_usize("send-keys", "-N", &args.required("-N count")?)?);
+                repeat_count = Some(parse_send_keys_repeat_count(&args.required("-N count")?)?);
             }
+            "-p" => return Err(unsupported_flag("send-keys", "-p")),
             value if value.starts_with("-N") && value.len() > 2 => {
                 let count = value[2..].to_owned();
                 let _ = args.optional();
-                repeat_count = Some(parse_usize("send-keys", "-N", &count)?);
+                repeat_count = Some(parse_send_keys_repeat_count(&count)?);
             }
             "-R" => {
                 let _ = args.optional();
@@ -117,6 +133,14 @@ pub(super) fn parse_send_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
         reset_terminal,
         repeat_count,
     }))
+}
+
+fn parse_send_keys_repeat_count(value: &str) -> Result<usize, RmuxError> {
+    let count = parse_usize("send-keys", "-N", value)?;
+    if count == 0 {
+        return Err(RmuxError::Message("repeat count too small".to_owned()));
+    }
+    Ok(count)
 }
 
 pub(super) fn parse_bind_key(mut args: CommandTokens) -> Result<Request, RmuxError> {
@@ -206,9 +230,9 @@ pub(super) fn parse_list_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
     let mut first_only = false;
     let mut include_unnoted = false;
     let mut notes = false;
-    let mut reversed = false;
-    let mut format = None;
-    let mut sort_order = None;
+    let reversed = false;
+    let format = None;
+    let sort_order = None;
     let mut prefix = None;
 
     while let Some(token) = args.peek() {
@@ -230,17 +254,16 @@ pub(super) fn parse_list_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
                 notes = true;
             }
             "-r" => {
-                let _ = args.optional();
-                reversed = true;
+                return Err(unsupported_flag("list-keys", "-r"));
             }
             "-F" => {
-                let _ = args.optional();
-                format = Some(args.required("-F format")?);
+                return Err(unsupported_flag("list-keys", "-F"));
             }
-            "-O" => {
-                let _ = args.optional();
-                sort_order = Some(args.required("-O sort-order")?);
+            flag if flag.starts_with("-F") => return Err(unsupported_flag("list-keys", "-F")),
+            "-O" | "-Oname" => {
+                return Err(unsupported_flag("list-keys", "-O"));
             }
+            flag if flag.starts_with("-O") => return Err(unsupported_flag("list-keys", "-O")),
             "-P" => {
                 let _ = args.optional();
                 prefix = Some(args.required("-P prefix")?);
@@ -322,5 +345,24 @@ mod tests {
         assert_eq!(request.repeat_count, Some(5));
         assert!(request.copy_mode_command);
         assert_eq!(request.keys, vec!["scroll-up"]);
+    }
+
+    #[test]
+    fn parse_send_keys_rejects_zero_repeat_count() {
+        let error = parse_send_keys(CommandTokens::new(vec![token("-N0"), token("A")]))
+            .expect_err("send-keys -N0 must reject zero repeats");
+
+        assert_eq!(error.to_string(), "repeat count too small");
+    }
+
+    #[test]
+    fn parse_send_keys_rejects_unknown_prefix_flag() {
+        let error = parse_send_keys(CommandTokens::new(vec![token("-p"), token("abc")]))
+            .expect_err("send-keys -p should be rejected before keys");
+
+        assert_eq!(
+            error,
+            RmuxError::Server("command send-keys: unknown flag -p".to_owned())
+        );
     }
 }

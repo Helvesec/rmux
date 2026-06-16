@@ -2,6 +2,8 @@ use rmux_proto::RmuxError;
 
 use super::{LayoutCell, LayoutDirection, LayoutGeometry};
 
+const MAX_LAYOUT_PARSE_DEPTH: usize = 128;
+
 pub(super) struct LayoutParser<'a> {
     input: &'a str,
     offset: usize,
@@ -17,6 +19,14 @@ impl<'a> LayoutParser<'a> {
     }
 
     pub(super) fn parse_cell(&mut self) -> Result<LayoutCell, RmuxError> {
+        self.parse_cell_at_depth(0)
+    }
+
+    fn parse_cell_at_depth(&mut self, depth: usize) -> Result<LayoutCell, RmuxError> {
+        if depth > MAX_LAYOUT_PARSE_DEPTH {
+            return Err(RmuxError::Server("layout is too deeply nested".to_owned()));
+        }
+
         let width = self.parse_number()?;
         self.expect('x')?;
         let height = self.parse_number()?;
@@ -39,7 +49,7 @@ impl<'a> LayoutParser<'a> {
                 self.offset += 1;
                 let mut children = Vec::new();
                 loop {
-                    children.push(self.parse_cell()?);
+                    children.push(self.parse_cell_at_depth(depth + 1)?);
                     match self.peek_char() {
                         Some(',') => {
                             self.offset += 1;
@@ -61,7 +71,7 @@ impl<'a> LayoutParser<'a> {
                 self.offset += 1;
                 let mut children = Vec::new();
                 loop {
-                    children.push(self.parse_cell()?);
+                    children.push(self.parse_cell_at_depth(depth + 1)?);
                     match self.peek_char() {
                         Some(',') => {
                             self.offset += 1;

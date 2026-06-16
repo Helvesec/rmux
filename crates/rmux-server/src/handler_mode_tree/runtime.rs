@@ -1,5 +1,7 @@
-use rmux_core::{LifecycleEvent, Window};
-use rmux_proto::{OptionName, PaneTarget, RmuxError, SessionName};
+use rmux_core::{
+    LifecycleEvent, TargetFindContext, TargetFindFlags, TargetFindType, UnresolvedTarget, Window,
+};
+use rmux_proto::{OptionName, PaneTarget, RmuxError, SessionName, Target};
 use std::collections::BTreeSet;
 
 use super::super::scripting_support::{QueueCommandAction, QueueExecutionContext};
@@ -23,17 +25,23 @@ impl RequestHandler {
             .mode_tree_attach_pid(requester_pid, command.kind.command_name())
             .await
         {
-            Ok(attach_pid) => attach_pid,
-            Err(error) if is_missing_attached_client(&error, command.kind.command_name()) => {
-                return Ok(QueueCommandAction::Normal {
-                    output: None,
-                    error: None,
-                });
-            }
+            Ok(attach_pid) => Some(attach_pid),
+            Err(error) if is_missing_attached_client(&error, command.kind.command_name()) => None,
             Err(error) => return Err(error),
         };
 
-        let session_name = self.attached_session_name(attach_pid).await?;
+        let (session_name, host_pane) = match attach_pid {
+            Some(attach_pid) => (
+                self.attached_session_name(attach_pid).await?,
+                self.attached_input_target(attach_pid).await.ok(),
+            ),
+            None => {
+                let target = self
+                    .detached_mode_tree_target(command.target.as_deref())
+                    .await?;
+                (target.session_name().clone(), Some(target))
+            }
+        };
         let order_seq = default_order_seq(command.kind);
         let sort_order = match command.sort_order {
             Some(sort_order) if order_seq.contains(&sort_order) => Some(sort_order),
@@ -46,12 +54,11 @@ impl RequestHandler {
             None => order_seq.first().copied(),
         };
 
-        let zoom_restore = if command.zoom {
+        let zoom_restore = if command.zoom && attach_pid.is_some() {
             self.mode_tree_zoom_target(&session_name).await?
         } else {
             None
         };
-        let host_pane = self.attached_input_target(attach_pid).await.ok();
 
         let mut mode = ModeTreeClientState {
             kind: command.kind,
@@ -83,23 +90,39 @@ impl RequestHandler {
 
         self.seed_mode_tree_defaults(&mut mode).await?;
         if matches!(mode.kind, ModeTreeKind::Buffer) && self.mode_tree_buffer_empty().await {
-            self.dismiss_mode_tree_with_refresh(attach_pid).await?;
+            if let Some(attach_pid) = attach_pid {
+                self.dismiss_mode_tree_with_refresh(attach_pid).await?;
+            }
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                exit_status: None,
             });
         }
         if matches!(mode.kind, ModeTreeKind::Client) && self.mode_tree_client_empty().await {
-            self.dismiss_mode_tree_with_refresh(attach_pid).await?;
+            if let Some(attach_pid) = attach_pid {
+                self.dismiss_mode_tree_with_refresh(attach_pid).await?;
+            }
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                exit_status: None,
             });
         }
 
-        self.activate_mode_tree_for_session(&session_name, &mode)
-            .await?;
-        if let Some(target) = mode.host_pane.as_ref() {
+        if attach_pid.is_some() {
+            self.activate_mode_tree_for_session(&session_name, &mode)
+                .await?;
+            if let Some(target) = mode.host_pane.as_ref() {
+                if self.enter_mode_tree_for_target(target, mode.kind).await? {
+                    self.emit(LifecycleEvent::PaneModeChanged {
+                        target: target.clone(),
+                    })
+                    .await;
+                }
+            }
+            self.refresh_attached_session(&session_name).await;
+        } else if let Some(target) = mode.host_pane.as_ref() {
             if self.enter_mode_tree_for_target(target, mode.kind).await? {
                 self.emit(LifecycleEvent::PaneModeChanged {
                     target: target.clone(),
@@ -107,11 +130,11 @@ impl RequestHandler {
                 .await;
             }
         }
-        self.refresh_attached_session(&session_name).await;
 
         Ok(QueueCommandAction::Normal {
             output: None,
             error: None,
+            exit_status: None,
         })
     }
 
@@ -130,6 +153,28 @@ impl RequestHandler {
             .min_by_key(|(_, active)| active.id)
             .map(|(&pid, _)| pid)
             .ok_or_else(|| attached_client_required(command_name))
+    }
+
+    async fn detached_mode_tree_target(
+        &self,
+        target: Option<&str>,
+    ) -> Result<PaneTarget, RmuxError> {
+        let state = self.state.lock().await;
+        let unresolved = target
+            .map(|target| UnresolvedTarget::new(target.to_owned()))
+            .unwrap_or_else(UnresolvedTarget::none);
+        let resolved = state.sessions.resolve_unresolved_target(
+            &unresolved,
+            TargetFindType::Pane,
+            TargetFindFlags::NONE,
+            &TargetFindContext::new(None),
+        )?;
+        match resolved {
+            Target::Pane(target) => Ok(target),
+            Target::Session(_) | Target::Window(_) => Err(RmuxError::Server(
+                "mode tree target did not resolve to a pane".to_owned(),
+            )),
+        }
     }
 
     async fn activate_mode_tree_for_session(

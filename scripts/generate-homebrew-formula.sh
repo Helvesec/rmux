@@ -8,7 +8,7 @@ Usage: scripts/generate-homebrew-formula.sh --version <semver> --checksums <SHA2
 Generate the RMUX Homebrew tap formula from GitHub Release checksums.
 
 Options:
-  --version <semver|vsemver>   Release version, for example 0.5.0 or v0.5.0
+  --version <semver|vsemver>   Release version, for example 1.2.3 or v1.2.3
   --checksums <path>           SHA256SUMS file from the GitHub Release
   --output <path>              Write formula to path instead of stdout
   --repository <owner/repo>    GitHub repository (default: Helvesec/rmux)
@@ -31,7 +31,7 @@ normalize_version() {
   esac
   case "$version" in
     [0-9]*.[0-9]*.[0-9]*) printf '%s\n' "$version" ;;
-    *) die "version must look like 0.5.0 or v0.5.0, got: $raw" ;;
+    *) die "version must look like 1.2.3 or v1.2.3, got: $raw" ;;
   esac
 }
 
@@ -92,7 +92,11 @@ class Rmux < Formula
 
   def install
     bin.install "bin/rmux"
+    bin.install "bin/rmux-daemon" if File.exist?("bin/rmux-daemon")
     man1.install "share/man/man1/rmux.1"
+    bash_completion.install "share/bash-completion/completions/rmux" if File.exist?("share/bash-completion/completions/rmux")
+    zsh_completion.install "share/zsh/site-functions/_rmux" if File.exist?("share/zsh/site-functions/_rmux")
+    fish_completion.install "share/fish/vendor_completions.d/rmux.fish" if File.exist?("share/fish/vendor_completions.d/rmux.fish")
     pkgshare.install "share/rmux/artifact-metadata.json" if File.exist?("share/rmux/artifact-metadata.json")
 
     license_files = Dir["LICENSE*"]

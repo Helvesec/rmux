@@ -32,6 +32,11 @@ impl RequestHandler {
             .await
         {
             Ok(managed) => managed,
+            Err(RmuxError::Server(message))
+                if message == "command-prompt requires an attached client" =>
+            {
+                return Err(RmuxError::Message("no current client".to_owned()));
+            }
             Err(RmuxError::Server(message)) if message.starts_with("can't find client: ") => {
                 return Err(RmuxError::Message(message));
             }
@@ -80,6 +85,11 @@ impl RequestHandler {
             .await
         {
             Ok(managed) => managed,
+            Err(RmuxError::Server(message))
+                if message == "confirm-before requires an attached client" =>
+            {
+                return Err(RmuxError::Message("no current client".to_owned()));
+            }
             Err(RmuxError::Server(message)) if message.starts_with("can't find client: ") => {
                 return Err(RmuxError::Message(message));
             }
@@ -166,10 +176,11 @@ impl RequestHandler {
             .is_some_and(|active| active.prompt.is_some())
     }
 
-    pub(in crate::handler) async fn handle_prompt_event(
+    pub(in crate::handler) async fn handle_prompt_event_deferred_refresh(
         &self,
         attach_pid: u32,
         event: PromptInputEvent,
+        deferred_refresh: &mut bool,
     ) -> Result<(), RmuxError> {
         let session_name = self.attached_session_name(attach_pid).await?;
         let separators = {
@@ -212,8 +223,7 @@ impl RequestHandler {
         };
 
         if action.refresh && finished.is_none() {
-            self.refresh_attached_client(attach_pid, &session_name)
-                .await;
+            *deferred_refresh = true;
         }
         if let Some(dispatch) = action.dispatch {
             self.dispatch_prompt_commands(dispatch).await;
@@ -222,6 +232,19 @@ impl RequestHandler {
             self.finish_prompt(finished, attach_pid).await;
         }
 
+        Ok(())
+    }
+
+    pub(in crate::handler) async fn flush_attached_prompt_refresh(
+        &self,
+        attach_pid: u32,
+    ) -> Result<(), RmuxError> {
+        if !self.prompt_active(attach_pid).await {
+            return Ok(());
+        }
+        let session_name = self.attached_session_name(attach_pid).await?;
+        self.refresh_attached_client(attach_pid, &session_name)
+            .await;
         Ok(())
     }
 
@@ -287,11 +310,12 @@ impl RequestHandler {
                             let handler = self.clone();
                             let requester_pid = finished.requester_pid;
                             let context = finished.context;
-                            spawn_background_async("rmux-prompt-finish", move || async move {
-                                let _ = handler
-                                    .execute_parsed_commands(requester_pid, parsed, context)
-                                    .await;
-                            });
+                            let _ =
+                                spawn_background_async("rmux-prompt-finish", move || async move {
+                                    let _ = handler
+                                        .execute_parsed_commands(requester_pid, parsed, context)
+                                        .await;
+                                });
                         }
                         Err(error) => {
                             warn!("background prompt command failed to parse: {error}");
@@ -332,6 +356,7 @@ impl RequestHandler {
                 Ok(QueueCommandAction::Normal {
                     output: Some(rmux_proto::CommandOutput::from_stdout(body.into_bytes())),
                     error: None,
+                    exit_status: None,
                 })
             }
             PromptHistoryAction::Clear => {
@@ -339,6 +364,7 @@ impl RequestHandler {
                 Ok(QueueCommandAction::Normal {
                     output: None,
                     error: None,
+                    exit_status: None,
                 })
             }
         }
@@ -355,7 +381,7 @@ impl RequestHandler {
         match parsed {
             Ok(parsed) => {
                 let handler = self.clone();
-                spawn_background_async("rmux-prompt-dispatch", move || async move {
+                let _ = spawn_background_async("rmux-prompt-dispatch", move || async move {
                     let _ = handler
                         .execute_parsed_commands(dispatch.requester_pid, parsed, dispatch.context)
                         .await;

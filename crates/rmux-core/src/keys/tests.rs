@@ -41,10 +41,22 @@ fn key_lookup_accepts_short_ctrl_notation() {
 }
 
 #[test]
+fn key_lookup_canonicalizes_ctrl_bracket_as_escape() {
+    for input in ["C-[", "^["] {
+        let key = key_string_lookup_string(input).expect("ctrl bracket parses");
+        assert_eq!(key_string_lookup_key(key, false), "Escape");
+    }
+}
+
+#[test]
 fn key_code_to_bytes_encodes_ascii_control_and_utf8() {
     assert_eq!(
         key_code_to_bytes(key_string_lookup_string("Enter").unwrap()),
         Some(vec![13])
+    );
+    assert_eq!(
+        key_code_to_bytes(key_string_lookup_string("S-Enter").unwrap()),
+        Some(vec![10])
     );
     assert_eq!(
         key_code_to_bytes(key_string_lookup_string("C-c").unwrap()),
@@ -112,6 +124,29 @@ fn reset_restores_removed_defaults_from_snapshot() {
 }
 
 #[test]
+fn listed_bindings_escape_command_separators_for_resourcing() {
+    let mut store = KeyBindingStore::default();
+    let key = key_string_lookup_string("Y").expect("key parses");
+    let commands =
+        parse_binding_command_tokens(
+            &[r#"run-shell "echo one" ; run-shell "echo two""#.to_owned()],
+        )
+        .expect("binding command parses");
+
+    store.add_binding("prefix", key, None, false, Some(commands));
+    let bindings = store.list_bindings(Some("prefix"), KeyBindingSortOrder::default(), false);
+    let binding = bindings
+        .iter()
+        .find(|binding| binding.key_string() == "Y")
+        .expect("binding is listed");
+
+    assert_eq!(
+        binding.command_string(),
+        r#"run-shell "echo one" \; run-shell "echo two""#
+    );
+}
+
+#[test]
 fn remove_table_clears_active_bindings_but_preserves_default_snapshot() {
     let mut store = KeyBindingStore::default();
     assert!(store.remove_table("prefix"));
@@ -150,6 +185,20 @@ fn list_bindings_sorts_and_widths() {
             false
         )) > 0
     );
+}
+
+#[test]
+fn list_bindings_key_sort_handles_custom_modified_keys() {
+    let mut store = KeyBindingStore::default();
+    let command = parse_binding_command_tokens(&["display-message custom".to_owned()]).unwrap();
+    for key in ["C-/", "M-a"] {
+        let parsed = key_string_lookup_string(key).expect("key parses");
+        assert!(store.add_binding("prefix", parsed, None, false, Some(command.clone())));
+    }
+
+    let bindings = store.list_bindings(None, KeyBindingSortOrder::Key, false);
+    assert!(bindings.iter().any(|binding| binding.key_string() == "C-/"));
+    assert!(bindings.iter().any(|binding| binding.key_string() == "M-a"));
 }
 
 #[test]

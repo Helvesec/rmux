@@ -74,6 +74,7 @@ pub(crate) enum ControlServerEvent {
 pub(crate) struct ControlCommandResult {
     pub(crate) stdout: Vec<u8>,
     pub(crate) error: Option<rmux_proto::RmuxError>,
+    pub(crate) exit_status: Option<i32>,
 }
 
 #[derive(Debug)]

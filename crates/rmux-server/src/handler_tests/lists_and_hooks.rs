@@ -54,6 +54,74 @@ async fn list_sessions_sorts_sessions_by_name() {
 }
 
 #[tokio::test]
+async fn list_sessions_format_uses_each_sessions_active_pane_context() {
+    let handler = RequestHandler::new();
+    let root =
+        std::env::temp_dir().join(format!("rmux-list-sessions-context-{}", std::process::id()));
+    let alpha_dir = root.join("alpha");
+    let beta_dir = root.join("beta");
+    std::fs::create_dir_all(&alpha_dir).expect("create alpha dir");
+    std::fs::create_dir_all(&beta_dir).expect("create beta dir");
+    let alpha_dir = std::fs::canonicalize(&alpha_dir).expect("canonicalize alpha dir");
+    let beta_dir = std::fs::canonicalize(&beta_dir).expect("canonicalize beta dir");
+
+    for (name, path) in [("alpha", &alpha_dir), ("beta", &beta_dir)] {
+        let created = handler
+            .handle(Request::NewSessionExt(NewSessionExtRequest {
+                session_name: Some(session_name(name)),
+                working_directory: Some(path.to_string_lossy().into_owned()),
+                detached: true,
+                size: None,
+                environment: None,
+                group_target: None,
+                attach_if_exists: false,
+                detach_other_clients: false,
+                kill_other_clients: false,
+                flags: None,
+                window_name: None,
+                print_session_info: false,
+                print_format: None,
+                command: None,
+                process_command: None,
+                client_environment: None,
+                skip_environment_update: false,
+            }))
+            .await;
+        assert!(matches!(created, Response::NewSession(_)));
+    }
+
+    let response = handler
+        .handle(Request::ListSessions(ListSessionsRequest {
+            format: Some("#{session_name}|#{session_path}|#{pane_current_path}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        }))
+        .await;
+
+    let output = response
+        .command_output()
+        .expect("list-sessions returns command output");
+    let stdout = std::str::from_utf8(output.stdout()).expect("utf-8");
+    assert_eq!(
+        stdout,
+        format!(
+            "alpha|{}|{}\nbeta|{}|{}\n",
+            rendered_context_path(&alpha_dir),
+            rendered_context_path(&alpha_dir),
+            rendered_context_path(&beta_dir),
+            rendered_context_path(&beta_dir)
+        )
+    );
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn rendered_context_path(path: &std::path::Path) -> String {
+    path.display().to_string()
+}
+
+#[tokio::test]
 async fn list_panes_returns_error_for_missing_session() {
     let handler = RequestHandler::new();
 

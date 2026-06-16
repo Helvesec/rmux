@@ -125,6 +125,10 @@ pub(crate) fn write_all(fd: BorrowedFd<'_>, buffer: &[u8]) -> io::Result<()> {
     unix_io::write_all(fd, buffer)
 }
 
+pub(crate) fn try_write_immediate(fd: BorrowedFd<'_>, buffer: &[u8]) -> io::Result<usize> {
+    unix_io::try_write_immediate(fd, buffer)
+}
+
 pub(crate) fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
     let flags = fcntl_getfl(fd).map_err(io::Error::other)?;
     fcntl_setfl(fd, flags | OFlags::NONBLOCK).map_err(io::Error::other)?;

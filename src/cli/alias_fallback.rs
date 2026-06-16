@@ -19,6 +19,22 @@ pub(super) fn run_unknown_command_through_server_aliases(
         .collect::<Vec<_>>()
         .join(" ");
     run_queued_server_command(socket_path, "source-file", queue_command)
+        .map_err(normalize_alias_fallback_error)
+}
+
+fn normalize_alias_fallback_error(error: ExitFailure) -> ExitFailure {
+    let Some(message) = strip_source_file_stdin_line_prefix(error.message()) else {
+        return error;
+    };
+    ExitFailure::new(error.exit_code(), message.to_owned())
+}
+
+fn strip_source_file_stdin_line_prefix(message: &str) -> Option<&str> {
+    let rest = message.strip_prefix("-:")?;
+    let (line, message) = rest.split_once(": ")?;
+    line.bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then_some(message)
 }
 
 fn command_arguments(args: &[OsString]) -> Option<Vec<String>> {
@@ -91,5 +107,17 @@ mod tests {
         assert_eq!(tmux_quote_argument("display-message"), "display-message");
         assert_eq!(tmux_quote_argument("hello world"), "'hello world'");
         assert_eq!(tmux_quote_argument("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn alias_fallback_errors_strip_synthetic_source_file_prefix() {
+        assert_eq!(
+            strip_source_file_stdin_line_prefix("-:1: unknown command: nope"),
+            Some("unknown command: nope")
+        );
+        assert_eq!(
+            strip_source_file_stdin_line_prefix("unknown command: nope"),
+            None
+        );
     }
 }

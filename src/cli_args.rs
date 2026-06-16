@@ -23,9 +23,11 @@ pub(crate) use client::{
 };
 #[path = "cli_args/config.rs"]
 mod config;
+#[cfg(test)]
+pub(crate) use config::build_scope;
 pub(crate) use config::{
-    build_scope, SetEnvironmentArgs, SetHookArgs, SetOptionArgs, SetOptionCommandKind,
-    ShowEnvironmentArgs, ShowHooksArgs, ShowOptionsArgs, ShowOptionsCommandKind,
+    SetEnvironmentArgs, SetHookArgs, SetOptionArgs, SetOptionCommandKind, ShowEnvironmentArgs,
+    ShowHooksArgs, ShowOptionsArgs, ShowOptionsCommandKind,
 };
 #[path = "cli_args/keys.rs"]
 mod keys;
@@ -50,6 +52,7 @@ mod queue;
 use queue::{command_from_parsed, parse_command_queue};
 #[path = "cli_args/script.rs"]
 mod script;
+use script::parse_source_file_args;
 pub(crate) use script::{IfShellArgs, RunShellArgs, SourceFileArgs, WaitForArgs};
 #[path = "cli_args/overlay.rs"]
 mod overlay;
@@ -60,11 +63,14 @@ use targets::{parse_session_name, parse_target};
 pub(crate) use targets::{parse_target_spec, TargetSpec};
 #[path = "cli_args/pane.rs"]
 mod pane;
-use pane::{parse_resize_pane_args, parse_select_pane_args};
+use pane::{
+    parse_join_pane_args, parse_resize_pane_args, parse_select_layout_args, parse_select_pane_args,
+    parse_split_window_args,
+};
 pub(crate) use pane::{
-    BreakPaneArgs, ClockModeArgs, CopyModeArgs, DisplayPanesArgs, JoinPaneArgs, ListPanesArgs,
-    PaneTargetArgs, PipePaneArgs, ResizePaneArgs, RespawnPaneArgs, SelectLayoutArgs,
-    SelectPaneArgs, SplitWindowArgs, SwapPaneArgs,
+    BreakPaneArgs, ClockModeArgs, CopyModeArgs, DisplayPanesArgs, JoinPaneArgs, LastPaneArgs,
+    ListPanesArgs, PaneTargetArgs, PipePaneArgs, ResizePaneArgs, ResizePaneSize, RespawnPaneArgs,
+    SelectLayoutArgs, SelectPaneArgs, SplitWindowArgs, SwapPaneArgs,
 };
 #[path = "cli_args/session.rs"]
 mod session;
@@ -74,10 +80,11 @@ pub(crate) use session::{
 };
 #[path = "cli_args/window.rs"]
 mod window;
+use window::{parse_rename_window_args, parse_select_window_args, parse_swap_window_args};
 pub(crate) use window::{
     FindWindowArgs, KillWindowArgs, LinkWindowArgs, ListWindowsArgs, MoveWindowArgs, NewWindowArgs,
-    RenameWindowArgs, ResizeWindowArgs, RespawnWindowArgs, RotateWindowArgs, SwapWindowArgs,
-    UnlinkWindowArgs, WindowTargetArgs,
+    RenameWindowArgs, ResizeWindowArgs, RespawnWindowArgs, RotateWindowArgs, SelectWindowArgs,
+    SwapWindowArgs, UnlinkWindowArgs, WindowTargetArgs,
 };
 #[path = "cli_args/web.rs"]
 mod web;
@@ -104,17 +111,75 @@ static IMPLEMENTED_COMMAND_SURFACE: OnceLock<Vec<&'static CommandEntry>> = OnceL
 
 static IMPLEMENTED_COMMAND_HELP: OnceLock<String> = OnceLock::new();
 
+const RMUX_EXTENSION_COMMANDS: &[CommandEntry] = &[CommandEntry {
+    name: "capabilities",
+    alias: None,
+}];
+
 pub(crate) fn parse<I, T>(args: I) -> Result<Cli, clap::Error>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
+    let args = normalize_top_level_attached_short_values(args.into_iter().map(Into::into));
     let mut command = RawCli::command();
     command = command.after_help(implemented_command_help());
     let matches = command.try_get_matches_from(args)?;
     let raw = RawCli::from_arg_matches(&matches)?;
     let parsed_commands = parse_command_queue(&raw.command)?;
     Cli::from_raw(raw, parsed_commands)
+}
+
+fn normalize_top_level_attached_short_values<I>(args: I) -> Vec<OsString>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut normalized = Vec::new();
+    let mut args = args.into_iter();
+    let Some(binary) = args.next() else {
+        return normalized;
+    };
+    normalized.push(binary);
+
+    let mut passthrough = false;
+    for argument in args {
+        if passthrough {
+            normalized.push(argument);
+            continue;
+        }
+        let Some(value) = argument.to_str() else {
+            normalized.push(argument);
+            continue;
+        };
+        if value == "--" {
+            passthrough = true;
+            normalized.push(argument);
+            continue;
+        }
+        if !value.starts_with('-') || value == "-" {
+            passthrough = true;
+            normalized.push(argument);
+            continue;
+        }
+        if let Some((flag, attached)) = top_level_attached_short_value(value) {
+            normalized.push(OsString::from(format!("-{flag}")));
+            normalized.push(OsString::from(attached));
+        } else {
+            normalized.push(argument);
+        }
+    }
+
+    normalized
+}
+
+fn top_level_attached_short_value(argument: &str) -> Option<(char, &str)> {
+    let mut chars = argument.chars();
+    if chars.next()? != '-' || chars.as_str().starts_with('-') {
+        return None;
+    }
+    let flag = chars.next()?;
+    let value = chars.as_str();
+    (!value.is_empty() && matches!(flag, 'c' | 'f' | 'L' | 'S' | 'T')).then_some((flag, value))
 }
 
 fn build_implemented_command_help() -> String {
@@ -144,7 +209,12 @@ fn build_implemented_command_help() -> String {
 
 pub(crate) fn implemented_command_surface() -> &'static [&'static CommandEntry] {
     IMPLEMENTED_COMMAND_SURFACE
-        .get_or_init(|| COMMAND_TABLE.iter().collect())
+        .get_or_init(|| {
+            COMMAND_TABLE
+                .iter()
+                .chain(RMUX_EXTENSION_COMMANDS.iter())
+                .collect()
+        })
         .as_slice()
 }
 
@@ -157,6 +227,12 @@ fn implemented_command_help() -> &'static str {
 pub(crate) fn documented_cli_aliases() -> &'static [DocumentedCliAlias] {
     DOCUMENTED_CLI_ALIASES
 }
+
+#[allow(dead_code)]
+#[path = "cli_args/completion.rs"]
+mod completion;
+#[allow(unused_imports)]
+pub(crate) use completion::completion_command;
 
 #[derive(Debug)]
 pub(crate) struct Cli {
@@ -197,7 +273,7 @@ struct RawCli {
     #[arg(short = 'N', action = ArgAction::SetTrue)]
     no_start_server: bool,
     #[arg(short = 'S', value_name = "socket-path", allow_hyphen_values = true)]
-    socket_path: Option<PathBuf>,
+    socket_path: Option<OsString>,
     #[arg(short = 'T', value_name = "features", allow_hyphen_values = true)]
     terminal_features: Vec<String>,
     #[arg(short = 'u', action = ArgAction::SetTrue)]
@@ -233,7 +309,7 @@ impl Cli {
             login_shell: raw.login_shell,
             socket_name: raw.socket_name,
             no_start_server: raw.no_start_server,
-            socket_path: raw.socket_path,
+            socket_path: raw.socket_path.map(PathBuf::from),
             terminal_features: raw.terminal_features,
             utf8: raw.utf8,
             verbose: raw.verbose,
@@ -296,8 +372,243 @@ where
             .action(ArgAction::Help)
             .help("Print help"),
     );
+    let arguments = normalize_attached_short_values(&command, arguments);
+    validate_options_before_positionals(command_name, &command, &arguments)?;
     let matches = command.try_get_matches_from(arguments)?;
     T::from_arg_matches(&matches)
+}
+
+fn validate_options_before_positionals(
+    command_name: &'static str,
+    command: &clap::Command,
+    arguments: &[String],
+) -> Result<(), clap::Error> {
+    let positionals_allow_hyphen = command
+        .get_positionals()
+        .any(|argument| argument.is_allow_hyphen_values_set());
+
+    let short_flags = command
+        .get_arguments()
+        .filter_map(clap::Arg::get_short)
+        .collect::<std::collections::BTreeSet<_>>();
+    let value_flags = command
+        .get_arguments()
+        .filter(|argument| argument_requires_value(argument))
+        .filter_map(clap::Arg::get_short)
+        .collect::<std::collections::BTreeSet<_>>();
+    let long_flags = command
+        .get_arguments()
+        .filter_map(clap::Arg::get_long)
+        .collect::<std::collections::BTreeSet<_>>();
+    let long_value_flags = command
+        .get_arguments()
+        .filter(|argument| argument_requires_value(argument))
+        .filter_map(clap::Arg::get_long)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    let mut expected_value_flag = None::<String>;
+    for argument in arguments {
+        if expected_value_flag.take().is_some() {
+            continue;
+        }
+        if argument == "--" {
+            break;
+        }
+        if !argument.starts_with('-') || argument == "-" {
+            break;
+        }
+        if let Some(long) = argument.strip_prefix("--") {
+            let name = long.split_once('=').map_or(long, |(name, _)| name);
+            if !long_flags.contains(name) {
+                if positionals_allow_hyphen {
+                    return Err(unknown_flag_error(command_name, format!("--{name}")));
+                }
+                continue;
+            }
+            if long_value_flags.contains(name) && !long.contains('=') {
+                expected_value_flag = Some(format!("--{name}"));
+            }
+            continue;
+        }
+
+        let mut chars = argument[1..].chars().peekable();
+        while let Some(flag) = chars.next() {
+            if !short_flags.contains(&flag) {
+                if positionals_allow_hyphen {
+                    return Err(unknown_flag_error(command_name, format!("-{flag}")));
+                }
+                continue;
+            }
+            if value_flags.contains(&flag) {
+                if chars.peek().is_none() {
+                    expected_value_flag = Some(format!("-{flag}"));
+                }
+                break;
+            }
+        }
+    }
+
+    if let Some(flag) = expected_value_flag {
+        return Err(missing_value_error(command_name, flag));
+    }
+
+    Ok(())
+}
+
+fn argument_requires_value(argument: &clap::Arg) -> bool {
+    matches!(argument.get_action(), ArgAction::Set | ArgAction::Append)
+        && argument
+            .get_num_args()
+            .is_none_or(|range| range.min_values() > 0)
+}
+
+fn unknown_flag_error(command_name: &'static str, flag: String) -> clap::Error {
+    clap::Error::raw(
+        clap::error::ErrorKind::UnknownArgument,
+        format!("command {command_name}: unknown flag {flag}"),
+    )
+}
+
+fn missing_value_error(command_name: &'static str, flag: String) -> clap::Error {
+    clap::Error::raw(
+        clap::error::ErrorKind::ValueValidation,
+        format!("command {command_name}: {flag} expects an argument"),
+    )
+}
+
+fn normalize_attached_short_values(command: &clap::Command, arguments: Vec<String>) -> Vec<String> {
+    let value_flags = command
+        .get_arguments()
+        .filter(|argument| matches!(argument.get_action(), ArgAction::Set | ArgAction::Append))
+        .filter_map(clap::Arg::get_short)
+        .collect::<std::collections::BTreeSet<_>>();
+    let has_trailing_position = command
+        .get_positionals()
+        .any(clap::Arg::is_trailing_var_arg_set);
+    let repeat_last_wins_flags = if command.get_name() == "new-window" {
+        command
+            .get_arguments()
+            .filter(|argument| matches!(argument.get_action(), ArgAction::Set))
+            .filter_map(clap::Arg::get_short)
+            .filter(|flag| *flag == 't')
+            .collect::<std::collections::BTreeSet<_>>()
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    if value_flags.is_empty() {
+        return arguments;
+    }
+
+    let mut normalized_options = Vec::with_capacity(arguments.len());
+    let mut trailing_values = Vec::new();
+    let mut passthrough = false;
+    let mut expect_next_value = false;
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        if passthrough {
+            trailing_values.push(argument);
+            continue;
+        }
+        if expect_next_value {
+            normalized_options.push(argument);
+            expect_next_value = false;
+            continue;
+        }
+        if argument == "--" {
+            passthrough = true;
+            trailing_values.push(argument);
+            continue;
+        }
+
+        if has_trailing_position && is_trailing_position_start(&argument) {
+            trailing_values.push(argument);
+            trailing_values.extend(arguments);
+            break;
+        }
+
+        if let Some((flag, value)) = attached_short_value(&argument, &value_flags) {
+            normalized_options.push(format!("-{flag}"));
+            normalized_options.push(value.to_owned());
+        } else if exact_short_flag(&argument, &value_flags).is_some() {
+            expect_next_value = true;
+            normalized_options.push(argument);
+        } else {
+            normalized_options.push(argument);
+        }
+    }
+
+    let mut normalized =
+        collapse_repeated_short_values(normalized_options, &repeat_last_wins_flags);
+    normalized.extend(trailing_values);
+    normalized
+}
+
+fn is_trailing_position_start(argument: &str) -> bool {
+    !argument.starts_with('-') || argument == "-"
+}
+
+fn attached_short_value<'a>(
+    argument: &'a str,
+    value_flags: &std::collections::BTreeSet<char>,
+) -> Option<(char, &'a str)> {
+    let mut chars = argument.chars();
+    if chars.next()? != '-' || chars.as_str().starts_with('-') {
+        return None;
+    }
+
+    let flag = chars.next()?;
+    let value = chars.as_str();
+    (!value.is_empty() && value_flags.contains(&flag)).then_some((flag, value))
+}
+
+fn collapse_repeated_short_values(
+    arguments: Vec<String>,
+    repeat_last_wins_flags: &std::collections::BTreeSet<char>,
+) -> Vec<String> {
+    if repeat_last_wins_flags.is_empty() {
+        return arguments;
+    }
+
+    let mut occurrences = std::collections::BTreeMap::<char, Vec<(usize, usize)>>::new();
+    let mut index = 0;
+    while index + 1 < arguments.len() {
+        if let Some(flag) = exact_short_flag(&arguments[index], repeat_last_wins_flags) {
+            occurrences
+                .entry(flag)
+                .or_default()
+                .push((index, index + 1));
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+
+    let mut drop_indexes = std::collections::BTreeSet::new();
+    for positions in occurrences.values() {
+        for (flag_index, value_index) in positions
+            .iter()
+            .take(positions.len().saturating_sub(1))
+            .copied()
+        {
+            drop_indexes.insert(flag_index);
+            drop_indexes.insert(value_index);
+        }
+    }
+
+    arguments
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, argument)| (!drop_indexes.contains(&index)).then_some(argument))
+        .collect()
+}
+
+fn exact_short_flag(argument: &str, flags: &std::collections::BTreeSet<char>) -> Option<char> {
+    let mut chars = argument.chars();
+    if chars.next()? != '-' || chars.as_str().starts_with('-') {
+        return None;
+    }
+    let flag = chars.next()?;
+    (chars.next().is_none() && flags.contains(&flag)).then_some(flag)
 }
 
 #[derive(Debug, Clone)]
@@ -314,7 +625,7 @@ pub(crate) enum Command {
     LockClient(ClientTargetArgs),
     NewWindow(NewWindowArgs),
     KillWindow(KillWindowArgs),
-    SelectWindow(WindowTargetArgs),
+    SelectWindow(SelectWindowArgs),
     RenameWindow(RenameWindowArgs),
     NextWindow(AlertSessionTargetArgs),
     PreviousWindow(AlertSessionTargetArgs),
@@ -328,7 +639,7 @@ pub(crate) enum Command {
     RespawnWindow(RespawnWindowArgs),
     SplitWindow(SplitWindowArgs),
     SwapPane(SwapPaneArgs),
-    LastPane(WindowTargetArgs),
+    LastPane(LastPaneArgs),
     JoinPane(JoinPaneArgs),
     MovePane(JoinPaneArgs),
     BreakPane(BreakPaneArgs),

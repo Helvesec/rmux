@@ -131,11 +131,29 @@ fn lookup_raw_key_table_binding(
         .get_binding(table_name, key)
         .cloned()
         .or_else(|| {
+            equivalent_key_table_alias(key)
+                .and_then(|alias| state.key_bindings.get_binding(table_name, alias).cloned())
+        })
+        .or_else(|| {
             state
                 .key_bindings
                 .get_binding(table_name, KEYC_ANY)
                 .cloned()
         })
+}
+
+fn equivalent_key_table_alias(key: KeyCode) -> Option<KeyCode> {
+    let c_space = key_string_lookup_string("C-Space")?;
+    let c_at = key_string_lookup_string("C-@")?;
+    let lookup = key_code_lookup_bits(key);
+
+    if lookup == key_code_lookup_bits(c_space) {
+        Some(c_at)
+    } else if lookup == key_code_lookup_bits(c_at) {
+        Some(c_space)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn step03_prefix_binding(key: KeyCode) -> Option<Step03PrefixBinding> {
@@ -189,6 +207,17 @@ fn decode_escape_key(input: &[u8], backspace: Option<u8>) -> AttachedKeyDecode {
                 size: 2,
                 key: u64::from(byte) | rmux_core::KEYC_META | rmux_core::KEYC_IMPLIED_META,
             };
+        }
+        Some(byte) if byte != b'\x1b' => {
+            if let Some(key) = control_byte_key(byte) {
+                return AttachedKeyDecode::Matched {
+                    size: 2,
+                    key: key | rmux_core::KEYC_META | rmux_core::KEYC_IMPLIED_META,
+                };
+            }
+            if input.len() < 3 {
+                return AttachedKeyDecode::Partial;
+            }
         }
         Some(_) if input.len() < 3 => return AttachedKeyDecode::Partial,
         None => return AttachedKeyDecode::Partial,
@@ -292,22 +321,43 @@ fn decode_ss3_key(input: &[u8]) -> AttachedKeyDecode {
 }
 
 fn control_byte_key(byte: u8) -> Option<KeyCode> {
-    match byte {
-        b'\r' | b'\n' => key_string_lookup_string("Enter"),
-        b'\t' => key_string_lookup_string("Tab"),
-        0x7f | 0x08 => key_string_lookup_string("BSpace"),
-        0x01..=0x1a => {
-            let ch = char::from(b'a' + (byte - 1));
-            key_string_lookup_string(&format!("C-{ch}"))
-        }
-        _ => None,
-    }
+    let name = match byte {
+        0x00 => "C-Space",
+        b'\r' => "Enter",
+        b'\t' => "Tab",
+        0x01..=0x1a => return control_alpha_key(byte),
+        0x1b => return None,
+        0x1c => "C-\\",
+        0x1d => "C-]",
+        0x1e => "C-^",
+        0x1f => "C-_",
+        0x7f => "BSpace",
+        _ => return None,
+    };
+    key_string_lookup_string(name)
+}
+
+fn control_alpha_key(byte: u8) -> Option<KeyCode> {
+    let ch = char::from(b'a' + (byte - 1));
+    key_string_lookup_string(&format!("C-{ch}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{decode_attached_key, AttachedKeyDecode};
     use rmux_core::{key_code_lookup_bits, key_string_lookup_string};
+
+    fn assert_attached_key(sequence: &[u8], expected_name: &str) {
+        let AttachedKeyDecode::Matched { size, key } = decode_attached_key(sequence, None) else {
+            panic!("{expected_name} should decode from {sequence:?}");
+        };
+        assert_eq!(size, sequence.len(), "{expected_name} consumed size");
+        assert_eq!(
+            key_code_lookup_bits(key),
+            key_code_lookup_bits(key_string_lookup_string(expected_name).expect("key parses")),
+            "{expected_name} key bits"
+        );
+    }
 
     #[test]
     fn attached_escape_prefix_decodes_meta_printable_digits() {
@@ -331,6 +381,23 @@ mod tests {
             key_code_lookup_bits(key),
             key_code_lookup_bits(key_string_lookup_string("M-a").expect("M-a parses"))
         );
+    }
+
+    #[test]
+    fn attached_escape_prefix_decodes_meta_control_keys() {
+        for (sequence, name) in [
+            (b"\x1b\x00".as_slice(), "M-C-Space"),
+            (b"\x1b\x01".as_slice(), "M-C-a"),
+            (b"\x1b\x08".as_slice(), "M-C-h"),
+            (b"\x1b\x0a".as_slice(), "M-C-j"),
+            (b"\x1b\x1c".as_slice(), "M-C-\\"),
+            (b"\x1b\x1d".as_slice(), "M-C-]"),
+            (b"\x1b\x1e".as_slice(), "M-C-^"),
+            (b"\x1b\x1f".as_slice(), "M-C-_"),
+            (b"\x1b\x7f".as_slice(), "M-BSpace"),
+        ] {
+            assert_attached_key(sequence, name);
+        }
     }
 
     #[test]
@@ -381,6 +448,26 @@ mod tests {
                 key_code_lookup_bits(key_string_lookup_string(name).expect("key parses")),
                 "{name} key bits"
             );
+        }
+    }
+
+    #[test]
+    fn attached_control_bytes_match_tmux_key_names() {
+        for (sequence, name) in [
+            (b"\x00".as_slice(), "C-Space"),
+            (b"\x01".as_slice(), "C-a"),
+            (b"\x08".as_slice(), "C-h"),
+            (b"\x09".as_slice(), "Tab"),
+            (b"\x0a".as_slice(), "C-j"),
+            (b"\x0d".as_slice(), "Enter"),
+            (b"\x1a".as_slice(), "C-z"),
+            (b"\x1c".as_slice(), "C-\\"),
+            (b"\x1d".as_slice(), "C-]"),
+            (b"\x1e".as_slice(), "C-^"),
+            (b"\x1f".as_slice(), "C-_"),
+            (b"\x7f".as_slice(), "BSpace"),
+        ] {
+            assert_attached_key(sequence, name);
         }
     }
 }

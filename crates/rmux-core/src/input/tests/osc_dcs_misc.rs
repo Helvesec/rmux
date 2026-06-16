@@ -39,6 +39,18 @@ fn dcs_passthrough_tmux_prefix() {
 }
 
 #[test]
+fn dcs_passthrough_tmux_prefix_preserves_inner_escape() {
+    let (_p, w) = parse(b"\x1bPtmux;\x1b]52;c;QQ==\x07\x1b\\");
+    assert!(w.has_call("dcs_passthrough(\"\\u{1b}]52;c;QQ==\\u{7}\")"));
+}
+
+#[test]
+fn dcs_passthrough_tmux_prefix_decodes_doubled_inner_escape() {
+    let (_p, w) = parse(b"\x1bPtmux;\x1b\x1b]52;c;QQ==\x07\x1b\\");
+    assert!(w.has_call("dcs_passthrough(\"\\u{1b}]52;c;QQ==\\u{7}\")"));
+}
+
+#[test]
 fn dcs_sixel_uses_passthrough() {
     let (_p, w) = parse(b"\x1bPq\"1;1;2;2#0!10~\x1b\\");
     assert!(w.has_call("sixel_passthrough(\"q\\\"1;1;2;2#0!10~\")"));

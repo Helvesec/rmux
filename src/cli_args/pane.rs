@@ -5,16 +5,38 @@ use rmux_proto::{SelectPaneDirection, SplitDirection};
 
 use super::{parse_command_args, parse_target_spec, TargetSpec};
 
+pub(super) fn parse_split_window_args(
+    arguments: Vec<String>,
+) -> Result<SplitWindowArgs, clap::Error> {
+    validate_required_size_argument("split-window", &arguments)?;
+    parse_command_args::<SplitWindowArgs>("split-window", arguments)?.validate()
+}
+
+pub(super) fn parse_join_pane_args(
+    command_name: &'static str,
+    arguments: Vec<String>,
+) -> Result<JoinPaneArgs, clap::Error> {
+    parse_command_args::<JoinPaneArgs>(command_name, arguments)?.validate(command_name)
+}
+
 pub(super) fn parse_select_pane_args(
     arguments: Vec<String>,
 ) -> Result<SelectPaneArgs, clap::Error> {
     parse_command_args::<SelectPaneArgs>("select-pane", arguments)?.validate()
 }
 
+pub(super) fn parse_select_layout_args(
+    arguments: Vec<String>,
+) -> Result<SelectLayoutArgs, clap::Error> {
+    parse_command_args::<SelectLayoutArgs>("select-layout", arguments)?.validate()
+}
+
 pub(super) fn parse_resize_pane_args(
     arguments: Vec<String>,
 ) -> Result<ResizePaneArgs, clap::Error> {
+    validate_required_absolute_resize_arguments(&arguments)?;
     validate_resize_pane_tmux_direction_delta_syntax(&arguments)?;
+    validate_resize_pane_absolute_size_values(&arguments)?;
     parse_command_args::<ResizePaneArgs>(
         "resize-pane",
         normalize_resize_pane_optional_delta(arguments),
@@ -22,14 +44,148 @@ pub(super) fn parse_resize_pane_args(
     .and_then(ResizePaneArgs::validate)
 }
 
+fn validate_required_size_argument(
+    command_name: &'static str,
+    arguments: &[String],
+) -> Result<(), clap::Error> {
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument == "--" {
+            break;
+        }
+        if argument == "-l" {
+            if arguments.get(index + 1).is_none() {
+                return Err(clap::Error::raw(
+                    clap::error::ErrorKind::ValueValidation,
+                    format!("command {command_name}: -l expects an argument"),
+                ));
+            }
+            index += 2;
+            continue;
+        }
+        if split_window_option_takes_value(argument) {
+            index += 2;
+            continue;
+        }
+        if !argument.starts_with('-') {
+            break;
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+fn split_window_option_takes_value(argument: &str) -> bool {
+    matches!(argument, "-c" | "-e" | "-F" | "-p" | "-t")
+}
+
+fn validate_required_absolute_resize_arguments(arguments: &[String]) -> Result<(), clap::Error> {
+    for (index, argument) in arguments.iter().enumerate() {
+        let missing =
+            matches!(argument.as_str(), "-x" | "-y") && arguments.get(index + 1).is_none();
+        if missing {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ValueValidation,
+                format!("command resize-pane: {argument} expects an argument"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResizePaneSize {
+    Cells(u16),
+    Percent(u8),
+}
+
+impl ResizePaneSize {
+    pub(crate) fn resolve(self, total: u16) -> Option<u16> {
+        match self {
+            Self::Cells(value) => Some(value),
+            Self::Percent(value) => {
+                let cells = u32::from(total) * u32::from(value) / 100;
+                Some(u16::try_from(cells.max(1)).unwrap_or(u16::MAX))
+            }
+        }
+    }
+}
+
+fn parse_resize_pane_size(value: &str) -> Result<ResizePaneSize, String> {
+    if let Some(percent) = value.strip_suffix('%') {
+        let percent = percent
+            .parse::<u8>()
+            .map_err(|error| format!("invalid percentage: {error}"))?;
+        if percent > 100 {
+            return Err("percentage must be between 0 and 100".to_owned());
+        }
+        return Ok(ResizePaneSize::Percent(percent));
+    }
+
+    let cells = value
+        .parse::<i64>()
+        .map_err(|error| format!("invalid cell count: {error}"))?;
+    if cells < 0 {
+        return Err("cell count too small".to_owned());
+    }
+    if cells > i64::from(i32::MAX) {
+        return Err("cell count too large".to_owned());
+    }
+    Ok(ResizePaneSize::Cells(clamp_resize_pane_cells(cells)))
+}
+
+fn parse_resize_pane_delta(value: &str) -> Result<u16, String> {
+    let cells = value
+        .parse::<i64>()
+        .map_err(|error| format!("adjustment invalid: {error}"))?;
+    if cells <= 0 {
+        return Err("adjustment too small".to_owned());
+    }
+    if cells > i64::from(i32::MAX) {
+        return Err("adjustment too large".to_owned());
+    }
+    Ok(clamp_resize_pane_cells(cells))
+}
+
+fn clamp_resize_pane_cells(cells: i64) -> u16 {
+    u16::try_from(cells).unwrap_or(u16::MAX)
+}
+
 fn validate_resize_pane_tmux_direction_delta_syntax(
     arguments: &[String],
 ) -> Result<(), clap::Error> {
     for (index, argument) in arguments.iter().enumerate() {
         if matches!(argument.as_str(), "-D" | "-U" | "-L" | "-R") {
+            if let Some(next) = arguments
+                .get(index + 1)
+                .filter(|next| !next.starts_with('-'))
+            {
+                match parse_resize_pane_delta(next) {
+                    Ok(_) => {}
+                    Err(message) if message.starts_with("adjustment too large") => {
+                        return Err(clap::Error::raw(
+                            clap::error::ErrorKind::ValueValidation,
+                            "adjustment too large",
+                        ));
+                    }
+                    Err(message) if message.starts_with("adjustment too small") => {
+                        return Err(clap::Error::raw(
+                            clap::error::ErrorKind::ValueValidation,
+                            "adjustment too small",
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(clap::Error::raw(
+                            clap::error::ErrorKind::ValueValidation,
+                            "adjustment invalid",
+                        ));
+                    }
+                }
+            }
             if arguments
                 .get(index + 1)
-                .is_some_and(|next| next.parse::<u16>().is_ok())
+                .is_some_and(|next| parse_resize_pane_delta(next).is_ok())
                 && index + 2 < arguments.len()
             {
                 return Err(clap::Error::raw(
@@ -48,6 +204,85 @@ fn validate_resize_pane_tmux_direction_delta_syntax(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum ResizePaneAxis {
+    Width,
+    Height,
+}
+
+impl ResizePaneAxis {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Width => "width",
+            Self::Height => "height",
+        }
+    }
+}
+
+fn validate_resize_pane_absolute_size_values(arguments: &[String]) -> Result<(), clap::Error> {
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "-x" => {
+                if let Some(value) = arguments.get(index + 1) {
+                    validate_resize_pane_absolute_size_value(ResizePaneAxis::Width, value)?;
+                }
+                index += 2;
+            }
+            "-y" => {
+                if let Some(value) = arguments.get(index + 1) {
+                    validate_resize_pane_absolute_size_value(ResizePaneAxis::Height, value)?;
+                }
+                index += 2;
+            }
+            argument => {
+                if let Some(value) = short_flag_attached_value(argument, "-x") {
+                    validate_resize_pane_absolute_size_value(ResizePaneAxis::Width, value)?;
+                } else if let Some(value) = short_flag_attached_value(argument, "-y") {
+                    validate_resize_pane_absolute_size_value(ResizePaneAxis::Height, value)?;
+                }
+                index += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn short_flag_attached_value<'a>(argument: &'a str, flag: &str) -> Option<&'a str> {
+    let value = argument.strip_prefix(flag)?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.strip_prefix('=').unwrap_or(value))
+}
+
+fn validate_resize_pane_absolute_size_value(
+    axis: ResizePaneAxis,
+    value: &str,
+) -> Result<(), clap::Error> {
+    let value = value.strip_suffix('%').unwrap_or(value);
+    let value = value.strip_prefix('+').unwrap_or(value);
+    let parsed = value.parse::<i64>().map_err(|_| {
+        clap::Error::raw(
+            clap::error::ErrorKind::ValueValidation,
+            format!("{} invalid", axis.label()),
+        )
+    })?;
+    if parsed < 0 {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ValueValidation,
+            format!("{} too small", axis.label()),
+        ));
+    }
+    if parsed > i64::from(i32::MAX) {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ValueValidation,
+            format!("{} too large", axis.label()),
+        ));
+    }
+    Ok(())
+}
+
 fn normalize_resize_pane_optional_delta(arguments: Vec<String>) -> Vec<String> {
     let Some(direction_index) = arguments
         .iter()
@@ -56,7 +291,6 @@ fn normalize_resize_pane_optional_delta(arguments: Vec<String>) -> Vec<String> {
         return arguments;
     };
 
-    let direction = arguments[direction_index].clone();
     if arguments
         .iter()
         .skip(direction_index + 1)
@@ -73,24 +307,54 @@ fn normalize_resize_pane_optional_delta(arguments: Vec<String>) -> Vec<String> {
             .skip(direction_index + 2)
             .any(|argument| argument.starts_with('-'))
     {
-        let mut normalized = arguments;
-        let value = normalized.remove(direction_index + 1);
-        normalized[direction_index] = format!("{direction}={value}");
-        return normalized;
+        return arguments;
     }
 
     if arguments
         .last()
-        .is_some_and(|last| last.parse::<u16>().is_ok())
+        .is_some_and(|last| parse_resize_pane_delta(last).is_ok())
         && arguments.len() > direction_index + 1
+        && resize_pane_has_standalone_trailing_delta(&arguments, direction_index)
     {
         let mut normalized = arguments;
         let value = normalized.pop().expect("last resize-pane delta must exist");
-        normalized[direction_index] = format!("{direction}={value}");
+        normalized.insert(direction_index + 1, value);
         return normalized;
     }
 
     arguments
+}
+
+fn resize_pane_has_standalone_trailing_delta(arguments: &[String], direction_index: usize) -> bool {
+    let last_index = arguments.len().saturating_sub(1);
+    let mut index = direction_index + 1;
+    while index <= last_index {
+        if index == last_index {
+            return true;
+        }
+
+        match arguments[index].as_str() {
+            "-t" | "-x" | "-y" => {
+                if index + 1 == last_index {
+                    return false;
+                }
+                index += 2;
+            }
+            "-M" | "-T" | "-Z" => {
+                index += 1;
+            }
+            "-D" | "-U" | "-L" | "-R" => return false,
+            argument
+                if argument.starts_with("-t")
+                    || argument.starts_with("-x")
+                    || argument.starts_with("-y") =>
+            {
+                index += 1;
+            }
+            _ => return false,
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Args)]
@@ -99,6 +363,11 @@ fn normalize_resize_pane_optional_delta(arguments: Vec<String>) -> Vec<String> {
         .required(false)
         .multiple(false)
         .args(["horizontal", "vertical"])
+), group(
+    ArgGroup::new("size_spec")
+        .required(false)
+        .multiple(false)
+        .args(["size", "percentage"])
 ))]
 pub(crate) struct SplitWindowArgs {
     #[arg(short = 'b', action = ArgAction::SetTrue)]
@@ -107,14 +376,18 @@ pub(crate) struct SplitWindowArgs {
     pub(crate) detached: bool,
     #[arg(short = 'e')]
     pub(crate) environment: Vec<String>,
+    #[arg(short = 'f', action = ArgAction::SetTrue)]
+    pub(crate) full_size: bool,
     #[arg(short = 'h', action = ArgAction::SetTrue, group = "direction")]
     pub(crate) horizontal: bool,
     #[arg(short = 'v', action = ArgAction::SetTrue, group = "direction")]
     pub(crate) vertical: bool,
     #[arg(short = 'c', allow_hyphen_values = true)]
     pub(crate) start_directory: Option<PathBuf>,
-    #[arg(short = 'l', allow_hyphen_values = true)]
+    #[arg(short = 'l', allow_hyphen_values = true, group = "size_spec")]
     pub(crate) size: Option<String>,
+    #[arg(short = 'p', group = "size_spec")]
+    pub(crate) percentage: Option<u8>,
     #[arg(short = 'F', allow_hyphen_values = true)]
     pub(crate) format: Option<String>,
     #[arg(short = 'P', action = ArgAction::SetTrue)]
@@ -123,7 +396,7 @@ pub(crate) struct SplitWindowArgs {
     pub(crate) preserve_zoom: bool,
     #[arg(short = 'I', action = ArgAction::SetTrue)]
     pub(crate) stdin: bool,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     pub(crate) command: Vec<String>,
@@ -143,9 +416,9 @@ pub(crate) struct SwapPaneArgs {
     pub(crate) down: bool,
     #[arg(short = 'U', action = ArgAction::SetTrue, group = "relative")]
     pub(crate) up: bool,
-    #[arg(short = 's', value_parser = parse_target_spec)]
+    #[arg(short = 's', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) source: Option<TargetSpec>,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(short = 'Z', action = ArgAction::SetTrue)]
     pub(crate) preserve_zoom: bool,
@@ -178,9 +451,9 @@ pub(crate) struct JoinPaneArgs {
     pub(crate) percentage: Option<u8>,
     #[arg(short = 'v', action = ArgAction::SetTrue, group = "direction")]
     pub(crate) vertical: bool,
-    #[arg(short = 's', value_parser = parse_target_spec)]
+    #[arg(short = 's', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) source: Option<TargetSpec>,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
 }
 
@@ -202,9 +475,9 @@ pub(crate) struct BreakPaneArgs {
     pub(crate) format: Option<String>,
     #[arg(short = 'P', action = ArgAction::SetTrue)]
     pub(crate) print_target: bool,
-    #[arg(short = 's', value_parser = parse_target_spec)]
+    #[arg(short = 's', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) source: Option<TargetSpec>,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(short = 'n')]
     pub(crate) name: Option<String>,
@@ -218,7 +491,7 @@ pub(crate) struct PipePaneArgs {
     pub(crate) stdout: bool,
     #[arg(short = 'o', action = ArgAction::SetTrue)]
     pub(crate) once: bool,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     pub(crate) command: Vec<String>,
@@ -232,7 +505,7 @@ pub(crate) struct RespawnPaneArgs {
     pub(crate) environment: Vec<String>,
     #[arg(short = 'k', action = ArgAction::SetTrue)]
     pub(crate) kill: bool,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     pub(crate) command: Vec<String>,
@@ -240,29 +513,81 @@ pub(crate) struct RespawnPaneArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct SelectLayoutArgs {
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 'E', action = ArgAction::SetTrue)]
+    pub(crate) spread: bool,
+    #[arg(short = 'n', action = ArgAction::SetTrue)]
+    pub(crate) next: bool,
+    #[arg(short = 'o', action = ArgAction::SetTrue)]
+    pub(crate) old: bool,
+    #[arg(short = 'p', action = ArgAction::SetTrue)]
+    pub(crate) previous: bool,
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     pub(crate) layout: Option<String>,
 }
 
+impl SelectLayoutArgs {
+    fn validate(self) -> Result<Self, clap::Error> {
+        let mode_count = [self.spread, self.next, self.old, self.previous]
+            .into_iter()
+            .filter(|present| *present)
+            .count();
+        if mode_count > 1 {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "select-layout accepts only one mode flag",
+            ));
+        }
+        if mode_count == 1 && self.layout.is_some() {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::TooManyValues,
+                "command select-layout: too many arguments (need at most 0)",
+            ));
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(group(
+    ArgGroup::new("input")
+        .required(false)
+        .multiple(false)
+        .args(["disable_input", "enable_input"])
+))]
+pub(crate) struct LastPaneArgs {
+    #[arg(short = 'd', action = ArgAction::SetTrue, group = "input")]
+    pub(crate) disable_input: bool,
+    #[arg(short = 'e', action = ArgAction::SetTrue, group = "input")]
+    pub(crate) enable_input: bool,
+    #[arg(short = 'Z', action = ArgAction::SetTrue)]
+    pub(crate) keep_zoom: bool,
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
+    pub(crate) target: Option<TargetSpec>,
+}
+
 #[derive(Debug, Clone, Args)]
 pub(crate) struct ResizePaneArgs {
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
-    #[arg(short = 'D', num_args = 0..=1, default_missing_value = "1")]
+    #[arg(short = 'D', num_args = 0..=1, default_missing_value = "1", value_parser = parse_resize_pane_delta)]
     pub(crate) down: Option<u16>,
-    #[arg(short = 'U', num_args = 0..=1, default_missing_value = "1")]
+    #[arg(short = 'U', num_args = 0..=1, default_missing_value = "1", value_parser = parse_resize_pane_delta)]
     pub(crate) up: Option<u16>,
-    #[arg(short = 'L', num_args = 0..=1, default_missing_value = "1")]
+    #[arg(short = 'L', num_args = 0..=1, default_missing_value = "1", value_parser = parse_resize_pane_delta)]
     pub(crate) left: Option<u16>,
-    #[arg(short = 'R', num_args = 0..=1, default_missing_value = "1")]
+    #[arg(short = 'R', num_args = 0..=1, default_missing_value = "1", value_parser = parse_resize_pane_delta)]
     pub(crate) right: Option<u16>,
-    #[arg(short = 'x')]
-    pub(crate) columns: Option<u16>,
-    #[arg(short = 'y')]
-    pub(crate) rows: Option<u16>,
+    #[arg(short = 'x', value_parser = parse_resize_pane_size, allow_hyphen_values = true)]
+    pub(crate) columns: Option<ResizePaneSize>,
+    #[arg(short = 'y', value_parser = parse_resize_pane_size, allow_hyphen_values = true)]
+    pub(crate) rows: Option<ResizePaneSize>,
     #[arg(short = 'Z', action = ArgAction::SetTrue)]
     pub(crate) zoom: bool,
+    #[arg(short = 'M', action = ArgAction::SetTrue)]
+    pub(crate) mouse: bool,
+    #[arg(short = 'T', action = ArgAction::SetTrue)]
+    pub(crate) trim_below: bool,
 }
 
 impl ResizePaneArgs {
@@ -279,11 +604,12 @@ impl ResizePaneArgs {
         let absolute_count = usize::from(self.columns.is_some()) + usize::from(self.rows.is_some());
         let invalid = relative_count > 1
             || (self.zoom && (relative_count > 0 || absolute_count > 0))
+            || (self.trim_below && (relative_count > 0 || absolute_count > 0 || self.zoom))
             || (relative_count > 0 && absolute_count > 0);
         if invalid {
             return Err(clap::Error::raw(
                 clap::error::ErrorKind::ArgumentConflict,
-                "resize-pane accepts only one relative adjustment, zoom, or absolute size",
+                "resize-pane accepts only one relative adjustment, trim, zoom, or absolute size",
             ));
         }
         Ok(self)
@@ -294,7 +620,7 @@ impl ResizePaneArgs {
 pub(crate) struct PaneTargetArgs {
     #[arg(short = 'a', action = ArgAction::SetTrue)]
     pub(crate) kill_all_except: bool,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
 }
 
@@ -309,6 +635,11 @@ pub(crate) struct PaneTargetArgs {
         .required(false)
         .multiple(false)
         .args(["up", "down", "left", "right"])
+), group(
+    ArgGroup::new("input")
+        .required(false)
+        .multiple(false)
+        .args(["disable_input", "enable_input"])
 ))]
 pub(crate) struct SelectPaneArgs {
     #[arg(short = 'm', action = ArgAction::SetTrue, group = "marking")]
@@ -323,16 +654,26 @@ pub(crate) struct SelectPaneArgs {
     pub(crate) left: bool,
     #[arg(short = 'R', action = ArgAction::SetTrue, group = "direction")]
     pub(crate) right: bool,
+    #[arg(short = 'l', action = ArgAction::SetTrue)]
+    pub(crate) last: bool,
+    #[arg(short = 'Z', action = ArgAction::SetTrue)]
+    pub(crate) keep_zoom: bool,
+    #[arg(short = 'd', action = ArgAction::SetTrue, group = "input")]
+    pub(crate) disable_input: bool,
+    #[arg(short = 'e', action = ArgAction::SetTrue, group = "input")]
+    pub(crate) enable_input: bool,
     #[arg(short = 'T')]
     pub(crate) title: Option<String>,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 'P')]
+    pub(crate) style: Option<String>,
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
 }
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct CopyModeArgs {
-    #[arg(short = 'd', action = ArgAction::SetTrue)]
-    pub(crate) page_down: bool,
+    #[arg(short = 'd', action = ArgAction::SetTrue, hide = true)]
+    unsupported_page_down: bool,
     #[arg(short = 'e', action = ArgAction::SetTrue)]
     pub(crate) exit_on_scroll: bool,
     #[arg(short = 'H', action = ArgAction::SetTrue)]
@@ -341,19 +682,38 @@ pub(crate) struct CopyModeArgs {
     pub(crate) mouse_drag_start: bool,
     #[arg(short = 'q', action = ArgAction::SetTrue)]
     pub(crate) cancel_mode: bool,
-    #[arg(short = 'S', action = ArgAction::SetTrue)]
-    pub(crate) scrollbar_scroll: bool,
-    #[arg(short = 's', value_parser = parse_target_spec)]
+    #[arg(short = 'S', action = ArgAction::SetTrue, hide = true)]
+    unsupported_scrollbar_scroll: bool,
+    #[arg(short = 's', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) source: Option<TargetSpec>,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(short = 'u', action = ArgAction::SetTrue)]
     pub(crate) page_up: bool,
 }
 
+impl CopyModeArgs {
+    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
+        if self.unsupported_page_down {
+            return Err(unknown_flag_error("copy-mode", "-d"));
+        }
+        if self.unsupported_scrollbar_scroll {
+            return Err(unknown_flag_error("copy-mode", "-S"));
+        }
+        Ok(self)
+    }
+}
+
+fn unknown_flag_error(command_name: &str, flag: &str) -> clap::Error {
+    clap::Error::raw(
+        clap::error::ErrorKind::UnknownArgument,
+        format!("command {command_name}: unknown flag {flag}"),
+    )
+}
+
 #[derive(Debug, Clone, Args)]
 pub(crate) struct ClockModeArgs {
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
 }
 
@@ -365,7 +725,7 @@ pub(crate) struct DisplayPanesArgs {
     pub(crate) duration_ms: Option<u64>,
     #[arg(short = 'N', action = ArgAction::SetTrue)]
     pub(crate) no_command: bool,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     pub(crate) template: Vec<String>,
@@ -376,20 +736,34 @@ pub(crate) struct ListPanesArgs {
     #[arg(short = 'a', action = ArgAction::SetTrue)]
     pub(crate) all_sessions: bool,
     #[arg(short = 's', action = ArgAction::SetTrue)]
-    pub(crate) short_format: bool,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    pub(crate) session_scope: bool,
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
-    #[arg(short = 'F')]
+    #[arg(short = 'F', conflicts_with = "json")]
     pub(crate) format: Option<String>,
+    #[arg(long = "json", action = ArgAction::SetTrue)]
+    pub(crate) json: bool,
+    #[arg(short = 'f', allow_hyphen_values = true)]
+    pub(crate) filter: Option<String>,
 }
 
 impl SplitWindowArgs {
+    fn validate(self) -> Result<Self, clap::Error> {
+        Ok(self)
+    }
+
     pub(crate) fn direction(&self) -> SplitDirection {
         if self.horizontal {
             SplitDirection::Horizontal
         } else {
             SplitDirection::Vertical
         }
+    }
+
+    pub(crate) fn size_spec(&self) -> Option<String> {
+        self.percentage
+            .map(|value| format!("{value}%"))
+            .or_else(|| self.size.clone())
     }
 }
 
@@ -400,6 +774,10 @@ impl SwapPaneArgs {
 }
 
 impl JoinPaneArgs {
+    fn validate(self, _command_name: &'static str) -> Result<Self, clap::Error> {
+        Ok(self)
+    }
+
     pub(crate) fn direction(&self) -> SplitDirection {
         if self.horizontal {
             SplitDirection::Horizontal
@@ -421,6 +799,20 @@ impl SelectPaneArgs {
             return Err(clap::Error::raw(
                 clap::error::ErrorKind::ArgumentConflict,
                 "select-pane -U/-D/-L/-R cannot be combined with -m, -M, or -T",
+            ));
+        }
+        if self.style.is_some()
+            && (self.direction().is_some() || self.last || self.mark || self.clear_marked)
+        {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "select-pane -P cannot be combined with -U, -D, -L, -R, -l, -m, or -M",
+            ));
+        }
+        if self.last && (self.direction().is_some() || self.mark || self.clear_marked) {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                "select-pane -l cannot be combined with -U, -D, -L, -R, -m, or -M",
             ));
         }
 

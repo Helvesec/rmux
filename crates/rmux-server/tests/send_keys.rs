@@ -44,6 +44,14 @@ async fn read_attach_message(
                 rows: u16::from_le_bytes([size[2], size[3]]),
             })))
         }
+        13 => {
+            let mut length = [0_u8; 4];
+            stream.read_exact(&mut length).await?;
+            let payload_len = u32::from_le_bytes(length) as usize;
+            let mut payload = vec![0_u8; payload_len];
+            stream.read_exact(&mut payload).await?;
+            Ok(Some(AttachMessage::Render(payload)))
+        }
         other => Err(rmux_proto::RmuxError::Decode(format!(
             "unknown attach-stream message tag {other}"
         ))
@@ -69,7 +77,7 @@ async fn read_attach_until_contains(
             break;
         };
 
-        if let AttachMessage::Data(bytes) = message {
+        if let AttachMessage::Data(bytes) | AttachMessage::Render(bytes) = message {
             output.push_str(&String::from_utf8_lossy(&bytes));
             if output.contains(needle) {
                 return Ok(output);
@@ -118,6 +126,7 @@ async fn wait_for_pane_current_command(
                 target: Some(Target::Pane(target.clone())),
                 print: true,
                 message: Some("#{pane_current_command}".to_owned()),
+                empty_target_context: false,
             }))
             .await?;
         let Response::DisplayMessage(response) = response else {
@@ -343,6 +352,9 @@ async fn send_keys_targets_the_correct_pane_in_a_multi_pane_session() -> Result<
         .send_request(&Request::SelectPane(SelectPaneRequest {
             target: PaneTarget::new(session_name("beta"), 1),
             title: None,
+            style: None,
+            input_disabled: None,
+            preserve_zoom: false,
         }))
         .await?;
     assert!(matches!(selected, Response::SelectPane(_)));

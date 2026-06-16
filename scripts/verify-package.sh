@@ -10,6 +10,8 @@ Verify a local-first RMUX Unix package.
 Options:
   --checksums <path>     SHA256SUMS file (default: archive directory)
   --run-binary           Execute rmux -V and rmux diagnose --json
+  --require-release-artifact
+                         Fail unless metadata marks this as a release artifact
   -h, --help             Show this help
 USAGE
 }
@@ -29,6 +31,24 @@ sha256_file() {
   else
     die "no SHA256 tool found"
   fi
+}
+
+run_daemon_smoke() {
+  local binary label sessions
+  binary="$1"
+  label="package-smoke-$$-$(date +%s)"
+  "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
+  if ! "$binary" -L "$label" new-session -d -s package_smoke >/dev/null; then
+    "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
+    die "packaged rmux failed to create a session through its daemon"
+  fi
+  if ! sessions="$("$binary" -L "$label" list-sessions -F '#{session_name}')"; then
+    "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
+    die "packaged rmux failed to list sessions through its daemon"
+  fi
+  "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
+  printf '%s\n' "$sessions" | grep -qx 'package_smoke' ||
+    die "daemon smoke did not list package_smoke session"
 }
 
 verify_checksum_manifest() {
@@ -60,6 +80,7 @@ verify_checksum_manifest() {
 archive=""
 checksums=""
 run_binary=0
+require_release_artifact=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -70,6 +91,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --run-binary)
       run_binary=1
+      shift
+      ;;
+    --require-release-artifact)
+      require_release_artifact=1
       shift
       ;;
     -h|--help)
@@ -114,10 +139,11 @@ tar -xzf "$archive_abs" -C "$tmpdir"
 package_root="$tmpdir/${archive_name%.tar.gz}"
 [ -d "$package_root" ] || die "archive root directory is missing: ${archive_name%.tar.gz}"
 
-for required in bin/rmux LICENSE-APACHE LICENSE-MIT SHA256SUMS.txt share/rmux/artifact-metadata.json share/man/man1/rmux.1; do
+for required in bin/rmux bin/rmux-daemon LICENSE-APACHE LICENSE-MIT SHA256SUMS.txt share/rmux/artifact-metadata.json share/man/man1/rmux.1; do
   [ -e "$package_root/$required" ] || die "missing package file: $required"
 done
 [ -x "$package_root/bin/rmux" ] || die "packaged rmux is not executable"
+[ -x "$package_root/bin/rmux-daemon" ] || die "packaged rmux-daemon is not executable"
 verify_checksum_manifest "$package_root" "$package_root/SHA256SUMS.txt"
 
 metadata="$package_root/share/rmux/artifact-metadata.json"
@@ -125,17 +151,28 @@ metadata_binary_hash="$(sed -n 's/.*"binary_sha256"[[:space:]]*:[[:space:]]*"\([
 [ -n "$metadata_binary_hash" ] || die "metadata binary_sha256 is missing or invalid"
 packaged_binary_hash="$(sha256_file "$package_root/bin/rmux")"
 [ "$metadata_binary_hash" = "$packaged_binary_hash" ] || die "metadata binary_sha256 does not match packaged binary"
+metadata_daemon_hash="$(sed -n 's/.*"daemon_binary_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$metadata" | head -n 1 | tr 'A-F' 'a-f')"
+[ -n "$metadata_daemon_hash" ] || die "metadata daemon_binary_sha256 is missing or invalid"
+packaged_daemon_hash="$(sha256_file "$package_root/bin/rmux-daemon")"
+[ "$metadata_daemon_hash" = "$packaged_daemon_hash" ] || die "metadata daemon_binary_sha256 does not match packaged daemon binary"
 
 grep -q '"artifact_kind"[[:space:]]*:[[:space:]]*"unix-package-binary"' "$metadata" || die "metadata artifact_kind is not unix-package-binary"
 grep -q '"git_commit"[[:space:]]*:' "$metadata" || die "metadata git_commit is missing"
 grep -q '"package_layout"[[:space:]]*:[[:space:]]*"rmux-package-v1"' "$metadata" || die "metadata package_layout is not rmux-package-v1"
+if [ "$require_release_artifact" -eq 1 ]; then
+  grep -q '"release_artifact"[[:space:]]*:[[:space:]]*true' "$metadata" ||
+    die "metadata release_artifact is not true"
+fi
 
 if [ "$run_binary" -eq 1 ]; then
   "$package_root/bin/rmux" -V >/dev/null
   "$package_root/bin/rmux" diagnose --json >/dev/null
+  run_daemon_smoke "$package_root/bin/rmux"
 fi
 
 printf 'archive=%s\n' "$archive_abs"
 printf 'sha256=%s\n' "$actual_hash"
 printf 'binary_sha256=%s\n' "$packaged_binary_hash"
+printf 'daemon_binary_sha256=%s\n' "$packaged_daemon_hash"
 printf 'run_binary=%s\n' "$([ "$run_binary" -eq 1 ] && printf true || printf false)"
+printf 'require_release_artifact=%s\n' "$([ "$require_release_artifact" -eq 1 ] && printf true || printf false)"

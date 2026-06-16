@@ -5,7 +5,7 @@ mod common;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -795,6 +795,7 @@ impl Harness {
             fs::remove_dir_all(&root)?;
         }
         fs::create_dir_all(&root)?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
         let socket_path = root.join("daemon.sock");
         let daemon_binary = rmux_binary()?.to_path_buf();
         let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, daemon_binary.as_os_str());

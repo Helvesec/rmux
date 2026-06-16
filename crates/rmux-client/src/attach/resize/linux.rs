@@ -1,7 +1,6 @@
-use std::io;
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 
 use rmux_proto::TerminalGeometry;
@@ -38,7 +37,7 @@ impl Drop for SignalMaskGuard {
 #[derive(Debug)]
 pub(in crate::attach) struct ResizeWatcher {
     stop: Arc<AtomicBool>,
-    tid: Pid,
+    tid: Arc<(Mutex<Option<Pid>>, Condvar)>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -49,10 +48,17 @@ impl ResizeWatcher {
     ) -> std::result::Result<Self, ClientError> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
-        let (tid_tx, tid_rx) = mpsc::channel();
+        let tid = Arc::new((Mutex::new(None), Condvar::new()));
+        let thread_tid = Arc::clone(&tid);
 
         let thread = thread::spawn(move || {
-            let _ = tid_tx.send(gettid());
+            {
+                let (tid_lock, tid_ready) = &*thread_tid;
+                if let Ok(mut tid) = tid_lock.lock() {
+                    *tid = Some(gettid());
+                    tid_ready.notify_all();
+                }
+            }
             let mut signals = KernelSigSet::empty();
             signals.insert(Signal::WINCH);
 
@@ -81,9 +87,6 @@ impl ResizeWatcher {
             }
         });
 
-        let tid = tid_rx
-            .recv()
-            .map_err(|_| ClientError::Io(io::Error::other("resize watcher failed to start")))?;
         Ok(Self {
             stop,
             tid,
@@ -95,16 +98,32 @@ impl ResizeWatcher {
     pub(in crate::attach) fn notify_for_test(&self) -> rustix::io::Result<()> {
         // SAFETY: `self.tid` identifies the watcher thread created above and
         // SIGWINCH is the signal it waits on.
-        unsafe { tkill(self.tid, Signal::WINCH) }
+        let Some(tid) = self.wait_for_tid() else {
+            return Ok(());
+        };
+        unsafe { tkill(tid, Signal::WINCH) }
+    }
+
+    fn wait_for_tid(&self) -> Option<Pid> {
+        let (tid_lock, tid_ready) = &*self.tid;
+        let Ok(mut tid) = tid_lock.lock() else {
+            return None;
+        };
+        while tid.is_none() {
+            tid = tid_ready.wait(tid).ok()?;
+        }
+        *tid
     }
 }
 
 impl Drop for ResizeWatcher {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        // SAFETY: `self.tid` identifies the watcher thread created above and
-        // SIGWINCH is the signal it waits on.
-        let _ = unsafe { tkill(self.tid, Signal::WINCH) };
+        if let Some(tid) = self.wait_for_tid() {
+            // SAFETY: `tid` identifies the watcher thread created above and
+            // SIGWINCH is the signal it waits on.
+            let _ = unsafe { tkill(tid, Signal::WINCH) };
+        }
 
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

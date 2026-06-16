@@ -1,34 +1,27 @@
 use std::io;
+use std::pin::Pin;
+use std::task::{Context, Poll, Waker};
 
 use rmux_ipc::{is_peer_disconnect, LocalStream};
 use rmux_proto::AttachFrameDecoder;
 #[cfg(feature = "web")]
 use tokio::io::DuplexStream;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
-use tokio::sync::{mpsc, Mutex};
-use tokio::task::JoinHandle;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
+use tokio::sync::Mutex;
 
 const ATTACH_READ_BUFFER_SIZE: usize = 8192;
-const ATTACH_CHANNEL_CAPACITY: usize = 32;
 #[cfg(feature = "web")]
 const IN_PROCESS_ATTACH_BUFFER_SIZE: usize = 64 * 1024;
 
 pub(crate) struct AttachTransport {
-    reader: Mutex<mpsc::Receiver<AttachReadEvent>>,
+    reader: Mutex<Box<dyn AsyncRead + Send + Unpin>>,
     writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
-    read_task: JoinHandle<()>,
 }
 
 pub(super) enum TryAttachRead {
     Read,
     Closed,
     WouldBlock,
-}
-
-enum AttachReadEvent {
-    Bytes(Vec<u8>),
-    Closed,
-    Error(io::Error),
 }
 
 impl AttachTransport {
@@ -41,13 +34,15 @@ impl AttachTransport {
     }
 
     pub(super) async fn read_into(&self, decoder: &mut AttachFrameDecoder) -> io::Result<bool> {
-        match self.next_event().await? {
-            AttachReadEvent::Bytes(bytes) => {
-                decoder.push_bytes(&bytes);
+        let mut buffer = [0_u8; ATTACH_READ_BUFFER_SIZE];
+        let mut reader = self.reader.lock().await;
+        match reader.read(&mut buffer).await {
+            Ok(0) => Ok(false),
+            Ok(bytes_read) => {
+                decoder.push_bytes(&buffer[..bytes_read]);
                 Ok(true)
             }
-            AttachReadEvent::Closed => Ok(false),
-            AttachReadEvent::Error(error) => Err(error),
+            Err(error) => Err(error),
         }
     }
 
@@ -58,15 +53,18 @@ impl AttachTransport {
         let Ok(mut reader) = self.reader.try_lock() else {
             return Ok(TryAttachRead::WouldBlock);
         };
-        match reader.try_recv() {
-            Ok(AttachReadEvent::Bytes(bytes)) => {
-                decoder.push_bytes(&bytes);
+        let mut buffer = [0_u8; ATTACH_READ_BUFFER_SIZE];
+        let mut read_buffer = ReadBuf::new(&mut buffer);
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        match Pin::new(&mut **reader).poll_read(&mut context, &mut read_buffer) {
+            Poll::Ready(Ok(())) if read_buffer.filled().is_empty() => Ok(TryAttachRead::Closed),
+            Poll::Ready(Ok(())) => {
+                decoder.push_bytes(read_buffer.filled());
                 Ok(TryAttachRead::Read)
             }
-            Ok(AttachReadEvent::Closed) => Ok(TryAttachRead::Closed),
-            Ok(AttachReadEvent::Error(error)) => Err(error),
-            Err(mpsc::error::TryRecvError::Empty) => Ok(TryAttachRead::WouldBlock),
-            Err(mpsc::error::TryRecvError::Disconnected) => Ok(TryAttachRead::Closed),
+            Poll::Ready(Err(error)) => Err(error),
+            Poll::Pending => Ok(TryAttachRead::WouldBlock),
         }
     }
 
@@ -76,7 +74,7 @@ impl AttachTransport {
         }
         let mut writer = self.writer.lock().await;
         match writer.write_all(bytes).await {
-            Ok(()) => writer.flush().await,
+            Ok(()) => Ok(()),
             Err(error) if is_peer_disconnect(&error) => Ok(()),
             Err(error) => Err(error),
         }
@@ -86,29 +84,10 @@ impl AttachTransport {
     where
         T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
-        let (tx, rx) = mpsc::channel(ATTACH_CHANNEL_CAPACITY);
-        let read_task = tokio::spawn(read_loop(reader, tx));
         Self {
-            reader: Mutex::new(rx),
+            reader: Mutex::new(Box::new(reader)),
             writer: Mutex::new(Box::new(writer)),
-            read_task,
         }
-    }
-
-    async fn next_event(&self) -> io::Result<AttachReadEvent> {
-        let mut reader = self.reader.lock().await;
-        reader.recv().await.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "attach transport read task stopped",
-            )
-        })
-    }
-}
-
-impl Drop for AttachTransport {
-    fn drop(&mut self) {
-        self.read_task.abort();
     }
 }
 
@@ -122,24 +101,6 @@ impl From<LocalStream> for AttachTransport {
 pub(crate) fn in_process_attach_pair() -> (AttachTransport, DuplexStream) {
     let (client, server) = tokio::io::duplex(IN_PROCESS_ATTACH_BUFFER_SIZE);
     (AttachTransport::from_io(server), client)
-}
-
-async fn read_loop<T>(mut reader: ReadHalf<T>, tx: mpsc::Sender<AttachReadEvent>)
-where
-    T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
-{
-    let mut buffer = [0_u8; ATTACH_READ_BUFFER_SIZE];
-    loop {
-        let event = match reader.read(&mut buffer).await {
-            Ok(0) => AttachReadEvent::Closed,
-            Ok(bytes_read) => AttachReadEvent::Bytes(buffer[..bytes_read].to_vec()),
-            Err(error) => AttachReadEvent::Error(error),
-        };
-        let closed = matches!(event, AttachReadEvent::Closed | AttachReadEvent::Error(_));
-        if tx.send(event).await.is_err() || closed {
-            break;
-        }
-    }
 }
 
 #[cfg(all(test, feature = "web"))]

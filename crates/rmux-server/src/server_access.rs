@@ -208,6 +208,10 @@ pub(crate) fn apply_access_policy(request: Request, can_write: bool) -> Result<R
             request.read_only = true;
             Ok(Request::AttachSessionExt2(request))
         }
+        Request::AttachSessionExt3(mut request) => {
+            request.read_only = true;
+            Ok(Request::AttachSessionExt3(request))
+        }
         request if read_only_request_allowed(&request) => Ok(request),
         _ => Err(RmuxError::Server("client is read-only".to_owned())),
     }
@@ -231,6 +235,7 @@ fn read_only_request_allowed(request: &Request) -> bool {
             | Request::AttachSession(_)
             | Request::AttachSessionExt(_)
             | Request::AttachSessionExt2(_)
+            | Request::AttachSessionExt3(_)
             | Request::SwitchClient(_)
             | Request::SwitchClientExt(_)
             | Request::SwitchClientExt2(_)

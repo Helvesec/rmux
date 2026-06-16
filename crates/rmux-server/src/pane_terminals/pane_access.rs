@@ -16,6 +16,29 @@ use super::{
 };
 
 impl HandlerState {
+    pub(crate) fn set_pane_input_disabled(
+        &mut self,
+        target: &PaneTarget,
+        disabled: bool,
+    ) -> Result<(), RmuxError> {
+        let pane_id = pane_id_for_target(
+            &self.sessions,
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+        )?;
+        if disabled {
+            self.input_disabled_panes.insert(pane_id);
+        } else {
+            self.input_disabled_panes.remove(&pane_id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pane_input_is_disabled(&self, pane_id: PaneId) -> bool {
+        self.input_disabled_panes.contains(&pane_id)
+    }
+
     pub(crate) fn window_index_for_pane_id(
         &self,
         session_name: &SessionName,
@@ -142,6 +165,7 @@ impl HandlerState {
                     geometry: pane_terminal_geometry_for_session(
                         session,
                         &self.options,
+                        *window_index,
                         pane.geometry(),
                     ),
                 }

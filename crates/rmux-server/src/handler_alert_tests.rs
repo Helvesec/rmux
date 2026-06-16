@@ -1,15 +1,23 @@
-use super::{scripting_support::format_context_for_target, QueuedLifecycleEvent, RequestHandler};
+use super::{
+    attach_support::{AttachRegistration, ClientFlags},
+    scripting_support::format_context_for_target,
+    QueuedLifecycleEvent, RequestHandler,
+};
 use crate::format_runtime::render_runtime_template;
+use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::AttachControl;
+use crate::server_access::current_owner_uid;
 use rmux_core::{WINLINK_ACTIVITY, WINLINK_BELL, WINLINK_SILENCE};
 use rmux_proto::{
     DisplayMessageRequest, HookName, KillWindowRequest, NewSessionExtRequest, NewSessionRequest,
     NewWindowRequest, NextWindowRequest, OptionName, PreviousWindowRequest, Request, Response,
-    ScopeSelector, SessionName, SetOptionMode, SetOptionRequest, ShowMessagesRequest, Target,
-    TerminalSize, WindowTarget,
+    ScopeSelector, SessionName, SetOptionMode, SetOptionRequest, ShowMessagesRequest,
+    SplitDirection, SplitWindowExtRequest, SplitWindowTarget, Target, TerminalSize, WindowTarget,
 };
 #[cfg(unix)]
 use rmux_proto::{PaneTarget, SendKeysRequest};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{timeout, Duration};
 
@@ -25,6 +33,33 @@ async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
             detached: true,
             size: Some(TerminalSize { cols: 80, rows: 24 }),
             environment: None,
+        }))
+        .await;
+    assert!(matches!(response, Response::NewSession(_)));
+    session
+}
+
+async fn create_quiet_session(handler: &RequestHandler, name: &str) -> SessionName {
+    let session = session_name(name);
+    let response = handler
+        .handle(Request::NewSessionExt(NewSessionExtRequest {
+            session_name: Some(session.clone()),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(quiet_alert_command()),
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
         }))
         .await;
     assert!(matches!(response, Response::NewSession(_)));
@@ -51,12 +86,58 @@ async fn create_window(handler: &RequestHandler, session: &SessionName) -> Windo
     response.target
 }
 
+async fn split_quiet_window(handler: &RequestHandler, session: &SessionName) {
+    let response = handler
+        .handle(Request::SplitWindowExt(SplitWindowExtRequest {
+            target: SplitWindowTarget::Session(session.clone()),
+            direction: SplitDirection::Vertical,
+            before: false,
+            environment: None,
+            command: Some(quiet_alert_command()),
+            process_command: None,
+            start_directory: None,
+            keep_alive_on_exit: None,
+            detached: false,
+            size: None,
+            preserve_zoom: false,
+            full_size: false,
+            stdin_payload: None,
+        }))
+        .await;
+    assert!(matches!(response, Response::SplitWindow(_)));
+}
+
+#[cfg(unix)]
+fn quiet_alert_command() -> Vec<String> {
+    ["/bin/sh", "-c", "sleep 60"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(windows)]
+fn quiet_alert_command() -> Vec<String> {
+    let system_root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+    let cmd = std::path::PathBuf::from(system_root)
+        .join("System32")
+        .join("cmd.exe");
+    vec![
+        cmd.to_string_lossy().into_owned(),
+        "/d".to_owned(),
+        "/q".to_owned(),
+        "/c".to_owned(),
+        "ping -n 120 127.0.0.1 >NUL".to_owned(),
+    ]
+}
+
 async fn display_message(handler: &RequestHandler, target: Target, message: &str) -> String {
     let response = handler
         .handle(Request::DisplayMessage(DisplayMessageRequest {
             target: Some(target),
             print: true,
             message: Some(message.to_owned()),
+            empty_target_context: false,
         }))
         .await;
     let Response::DisplayMessage(response) = response else {
@@ -263,6 +344,7 @@ async fn pane_alert_event_sets_bell_and_activity_flags_and_emits_alert_hooks() {
         session_name: session.clone(),
         pane_id,
         bell_count: 1,
+        queue_activity_alert: true,
         generation: None,
     });
 
@@ -314,6 +396,7 @@ async fn pane_alert_callback_can_be_invoked_from_reader_thread() {
             session_name: session,
             pane_id,
             bell_count: 0,
+            queue_activity_alert: true,
             generation: None,
         });
     })
@@ -322,6 +405,99 @@ async fn pane_alert_callback_can_be_invoked_from_reader_thread() {
 
     let event = recv_lifecycle(&mut lifecycle).await;
     assert_eq!(event.hook_name, HookName::AlertActivity);
+}
+
+#[tokio::test]
+async fn pane_alert_callback_coalesces_inactive_pane_refreshes_by_session() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "inactive-output-refresh").await;
+    set_option(
+        &handler,
+        ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
+        OptionName::AutomaticRename,
+        "off",
+    )
+    .await;
+    split_quiet_window(&handler, &session).await;
+    split_quiet_window(&handler, &session).await;
+
+    let inactive_panes = {
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&session).expect("session exists");
+        let active_pane_id = session.active_pane_id();
+        session
+            .window_at(0)
+            .expect("window exists")
+            .panes()
+            .iter()
+            .filter_map(|pane| (Some(pane.id()) != active_pane_id).then_some(pane.id()))
+            .take(2)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(inactive_panes.len(), 2);
+
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let control_backlog = Arc::new(AtomicUsize::new(0));
+    let uid = current_owner_uid();
+    handler
+        .register_attach_with_access(
+            77,
+            session.clone(),
+            AttachRegistration {
+                control_tx,
+                control_backlog: Arc::clone(&control_backlog),
+                closing: Arc::new(AtomicBool::new(false)),
+                persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
+                terminal_context: OuterTerminalContext::default(),
+                flags: ClientFlags::default(),
+                render_stream: false,
+                uid,
+                user: rmux_os::identity::UserIdentity::Uid(uid),
+                can_write: true,
+                client_size: Some(TerminalSize { cols: 80, rows: 24 }),
+            },
+        )
+        .await;
+    drain_attach_controls_until_idle(&mut control_rx).await;
+    let baseline_backlog = control_backlog.load(Ordering::Acquire);
+
+    let first_callback = handler.pane_alert_callback();
+    let second_callback = handler.pane_alert_callback();
+    for (callback, pane_id) in [
+        (first_callback.as_ref(), inactive_panes[0]),
+        (second_callback.as_ref(), inactive_panes[1]),
+    ] {
+        callback(crate::pane_io::PaneAlertEvent {
+            session_name: session.clone(),
+            pane_id,
+            bell_count: 0,
+            queue_activity_alert: false,
+            generation: None,
+        });
+    }
+
+    let first = timeout(Duration::from_secs(2), control_rx.recv())
+        .await
+        .expect("inactive pane output should enqueue one refresh")
+        .expect("attach control channel is open");
+    assert!(matches!(first, AttachControl::Switch(_)));
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let mut extra_switches = 0;
+    while let Ok(control) = control_rx.try_recv() {
+        if matches!(control, AttachControl::Switch(_)) {
+            extra_switches += 1;
+        }
+    }
+
+    assert_eq!(
+        extra_switches, 0,
+        "inactive pane output from one coalesced reader batch should repaint each attached session once"
+    );
+    assert_eq!(
+        control_backlog.load(Ordering::Acquire),
+        baseline_backlog + 1
+    );
 }
 
 #[tokio::test]
@@ -371,14 +547,13 @@ async fn pane_alert_event_updates_automatic_window_name_without_disabling_auto_r
             .expect("window pane exists")
     };
 
-    handler
-        .handle_pane_alert_event(crate::pane_io::PaneAlertEvent {
-            session_name: session.clone(),
-            pane_id,
-            bell_count: 0,
-            generation: None,
-        })
-        .await;
+    handler.pane_alert_callback()(crate::pane_io::PaneAlertEvent {
+        session_name: session.clone(),
+        pane_id,
+        bell_count: 0,
+        queue_activity_alert: true,
+        generation: None,
+    });
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -437,6 +612,7 @@ async fn pane_alert_event_respects_automatic_rename_off() {
             session_name: session.clone(),
             pane_id,
             bell_count: 0,
+            queue_activity_alert: true,
             generation: None,
         })
         .await;
@@ -473,6 +649,7 @@ async fn pane_alert_event_updates_grouped_session_window_names() {
             command: None,
             process_command: None,
             client_environment: None,
+            skip_environment_update: false,
         }))
         .await;
     assert!(matches!(response, Response::NewSession(_)));
@@ -499,6 +676,7 @@ async fn pane_alert_event_updates_grouped_session_window_names() {
             session_name: alpha.clone(),
             pane_id,
             bell_count: 0,
+            queue_activity_alert: true,
             generation: None,
         })
         .await;
@@ -756,7 +934,7 @@ async fn show_messages_formats_log_and_terminal_info_and_prunes_to_limit() {
 }
 
 #[tokio::test]
-async fn show_messages_prints_log_without_attached_client() {
+async fn show_messages_log_is_available_without_current_client() {
     let handler = RequestHandler::new();
     let _session = create_session(&handler, "messages-detached").await;
     {
@@ -772,13 +950,24 @@ async fn show_messages_prints_log_without_attached_client() {
         }))
         .await;
     let Response::ShowMessages(response) = response else {
-        panic!("expected show-messages response");
+        panic!("expected detached show-messages log output");
     };
-    let rendered = String::from_utf8_lossy(response.output.stdout()).into_owned();
-    assert!(
-        rendered.contains(": detached log entry"),
-        "detached show-messages should render the message log, got {rendered:?}"
-    );
+    let rendered = String::from_utf8_lossy(response.output.stdout());
+    assert!(rendered.contains("detached log entry"));
+
+    for (jobs, terminals) in [(true, false), (false, true), (true, true)] {
+        let response = handler
+            .handle(Request::ShowMessages(ShowMessagesRequest {
+                jobs,
+                terminals,
+                target_client: None,
+            }))
+            .await;
+        let Response::Error(error) = response else {
+            panic!("expected show-messages -J/-T to require a current client");
+        };
+        assert_eq!(error.error.to_string(), "no current client");
+    }
 }
 
 #[tokio::test]

@@ -2,19 +2,22 @@ use std::path::Path;
 
 #[cfg(unix)]
 use rmux_client::attach_terminal_with_initial_bytes_and_resize_geometry;
+#[cfg(unix)]
+use rmux_client::AttachError;
 use rmux_client::{
-    attach_terminal_with_initial_bytes, connect, connect_or_absent, detect_context,
-    drive_control_mode, AttachTransition, ClientContext, ConnectResult, Connection,
-    ControlTransition,
+    attach_terminal_with_initial_bytes, connect, detect_context, drive_control_mode,
+    AttachTransition, ClientContext, ClientError, Connection, ControlTransition,
 };
 use rmux_proto::request::{
-    AttachSessionExt2Request, DetachClientExtRequest, ListClientsRequest, RefreshClientRequest,
-    SuspendClientRequest, SwitchClientExt3Request,
+    AttachSessionExt2Request, AttachSessionExt3Request, DetachClientExtRequest, ListClientsRequest,
+    RefreshClientRequest, SuspendClientRequest, SwitchClientExt3Request,
 };
 use rmux_proto::{
-    ClientTerminalContext, ControlMode, ErrorResponse, Response, CAPABILITY_ATTACH_RESIZE_GEOMETRY,
+    ClientTerminalContext, ControlMode, ErrorResponse, Response, CAPABILITY_ATTACH_RENDER,
+    CAPABILITY_ATTACH_RESIZE_GEOMETRY,
 };
 
+use super::json_output::{list_clients_json_format, write_list_clients_json};
 use super::{
     connect_with_startserver, current_terminal_size, expect_command_success,
     finish_command_success, list_session_names, resolve_session_target_spec, run_command,
@@ -250,7 +253,7 @@ pub(super) fn run_refresh_client(
             subscriptions: args.subscriptions,
             subscriptions_format: args.subscriptions_format,
             control_size: args.control_size,
-            colour_report: args.colour_report,
+            colour_report: None,
         })
     })
 }
@@ -259,6 +262,36 @@ pub(super) fn run_list_clients(
     args: ListClientsArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
+    if let Some(flag) = args.unsupported_flag() {
+        return Err(ExitFailure::new(
+            1,
+            format!("command list-clients: unknown flag {flag}"),
+        ));
+    }
+    if args.json {
+        let mut connection = connect(socket_path)
+            .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+        let target_session = args
+            .target_session
+            .as_ref()
+            .map(|target| resolve_session_target_spec(&mut connection, target, false))
+            .transpose()?;
+        let response = connection
+            .list_clients(ListClientsRequest {
+                format: Some(list_clients_json_format()),
+                filter: args.filter,
+                sort_order: None,
+                reversed: false,
+                target_session,
+            })
+            .map_err(ExitFailure::from_client)?;
+        return match response {
+            Response::ListClients(response) => write_list_clients_json(&response),
+            Response::Error(ErrorResponse { error }) => Err(ExitFailure::new(1, error.to_string())),
+            other => Err(unexpected_response("list-clients", &other)),
+        };
+    }
+
     run_payload_command_resolved(socket_path, "list-clients", move |connection| {
         let target_session = args
             .target_session
@@ -269,8 +302,8 @@ pub(super) fn run_list_clients(
             .list_clients(ListClientsRequest {
                 format: args.format,
                 filter: args.filter,
-                sort_order: args.sort_order,
-                reversed: args.reversed,
+                sort_order: None,
+                reversed: false,
                 target_session,
             })
             .map_err(ExitFailure::from_client)
@@ -281,21 +314,23 @@ pub(super) fn run_detach_client(
     args: DetachClientArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    match connect_or_absent(socket_path).map_err(ExitFailure::from_client)? {
-        ConnectResult::Absent => Err(ExitFailure::new(1, "rmux server is not running")),
-        ConnectResult::Connected(mut connection) => {
-            let response = connection
-                .detach_client_extended(DetachClientExtRequest {
-                    target_client: args.target_client,
-                    all_other_clients: args.all_other_clients,
-                    target_session: args.target_session,
-                    kill_on_detach: args.kill_on_detach,
-                    exec_command: args.exec_command,
-                })
-                .map_err(ExitFailure::from_client)?;
-            finish_command_success(response, "detach-client")
-        }
-    }
+    let mut connection = connect(socket_path)
+        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let target_session = args
+        .target_session
+        .as_ref()
+        .map(|target| resolve_session_target_spec(&mut connection, target, false))
+        .transpose()?;
+    let response = connection
+        .detach_client_extended(DetachClientExtRequest {
+            target_client: args.target_client,
+            all_other_clients: args.all_other_clients,
+            target_session,
+            kill_on_detach: args.kill_on_detach,
+            exec_command: args.exec_command,
+        })
+        .map_err(ExitFailure::from_client)?;
+    finish_command_success(response, "detach-client")
 }
 
 pub(super) fn run_suspend_client(
@@ -316,27 +351,39 @@ pub(super) fn attach_with_connection(
     let attach_resize_geometry = connection
         .supports_capability(CAPABILITY_ATTACH_RESIZE_GEOMETRY)
         .map_err(ExitFailure::from_client)?;
-    match connection
-        .begin_attach_with_target_spec(request)
-        .map_err(ExitFailure::from_client)?
-    {
+    let attach_render = connection
+        .supports_capability(CAPABILITY_ATTACH_RENDER)
+        .map_err(ExitFailure::from_client)?;
+    let transition = if attach_render {
+        connection
+            .begin_attach_with_capabilities(AttachSessionExt3Request::from_ext2(
+                request,
+                vec![CAPABILITY_ATTACH_RENDER.to_owned()],
+            ))
+            .map_err(ExitFailure::from_client)?
+    } else {
+        connection
+            .begin_attach_with_target_spec(request)
+            .map_err(ExitFailure::from_client)?
+    };
+    match transition {
         AttachTransition::Upgraded(upgrade) => {
             let (stream, initial_bytes) = upgrade.into_parts();
             #[cfg(unix)]
             {
                 if attach_resize_geometry {
                     attach_terminal_with_initial_bytes_and_resize_geometry(stream, initial_bytes)
-                        .map_err(ExitFailure::from_client)?;
+                        .map_err(attach_terminal_exit_failure)?;
                 } else {
                     attach_terminal_with_initial_bytes(stream, initial_bytes)
-                        .map_err(ExitFailure::from_client)?;
+                        .map_err(attach_terminal_exit_failure)?;
                 }
             }
             #[cfg(windows)]
             {
                 let _ = attach_resize_geometry;
                 attach_terminal_with_initial_bytes(stream, initial_bytes)
-                    .map_err(ExitFailure::from_client)?;
+                    .map_err(attach_terminal_exit_failure)?;
             }
             Ok(0)
         }
@@ -345,6 +392,28 @@ pub(super) fn attach_with_connection(
             Ok(0)
         }
     }
+}
+
+fn attach_terminal_exit_failure(error: ClientError) -> ExitFailure {
+    if attach_terminal_failed_because_stdio_is_not_terminal(&error) {
+        ExitFailure::new(1, "open terminal failed: not a terminal")
+    } else {
+        ExitFailure::from_client(error)
+    }
+}
+
+#[cfg(unix)]
+fn attach_terminal_failed_because_stdio_is_not_terminal(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Attach(AttachError::Termios(errno))
+            if matches!(errno.raw_os_error(), libc::ENOTTY | libc::ENODEV)
+    )
+}
+
+#[cfg(windows)]
+fn attach_terminal_failed_because_stdio_is_not_terminal(_error: &ClientError) -> bool {
+    false
 }
 
 pub(super) fn optional_client_flags(flags: Vec<String>) -> Option<Vec<String>> {

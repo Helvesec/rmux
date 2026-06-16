@@ -8,6 +8,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::{AttachSessionSpec, NewSessionSpec, RefreshClientSpec, RmuxEndpoint, SplitSpec};
 
+/// Captured result from the official SDK command escape hatch.
+///
+/// [`crate::Rmux::cmd`] runs the `rmux` binary with an endpoint selector
+/// injected by the SDK. Non-zero process exits are returned here rather than
+/// converted into SDK errors so callers can implement tmux-style command
+/// wrappers with precise stdout, stderr, and status handling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct CommandRun {
+    /// Captured stdout bytes.
+    pub stdout: Vec<u8>,
+    /// Captured stderr bytes.
+    pub stderr: Vec<u8>,
+    /// Process exit code, or `None` when the process terminated without a
+    /// platform exit code.
+    pub exit: Option<i32>,
+}
+
 /// A detached command payload accepted by the SDK.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RmuxCommandKind {

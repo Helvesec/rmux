@@ -60,13 +60,116 @@ pub fn should_retry_hidden_daemon_without_breakaway(error: &io::Error) -> bool {
 #[cfg(unix)]
 fn configure_hidden_daemon_command_impl(command: &mut Command, _allow_job_breakaway: bool) {
     // SAFETY: The closure runs after fork and before exec in the daemon child.
-    // It only calls `setsid`, an async-signal-safe libc/rustix operation, and
-    // does not touch parent-owned Rust state.
+    // It only marks inherited descriptors close-on-exec and calls `setsid`;
+    // both operations stay inside libc/rustix OS boundaries and avoid touching
+    // parent-owned Rust state.
     unsafe {
         command.pre_exec(|| {
+            mark_inherited_fds_close_on_exec()?;
             rustix::process::setsid().map_err(io::Error::from)?;
             Ok(())
         });
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn mark_inherited_fds_close_on_exec() -> io::Result<()> {
+    // SAFETY: `close_range` with `CLOSE_RANGE_CLOEXEC` does not close file
+    // descriptors or dereference Rust memory; it only asks the kernel to mark
+    // inherited descriptors >= 3 close-on-exec in the child process.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3_u32,
+            u32::MAX,
+            libc::CLOSE_RANGE_CLOEXEC,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENOSYS | libc::EINVAL) => mark_inherited_fds_close_on_exec_fallback(),
+        _ => Err(error),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn mark_inherited_fds_close_on_exec() -> io::Result<()> {
+    mark_inherited_fds_close_on_exec_fallback()
+}
+
+#[cfg(unix)]
+const FALLBACK_FD_SCAN_LIMIT: libc::c_int = 16_384;
+
+#[cfg(unix)]
+fn mark_inherited_fds_close_on_exec_fallback() -> io::Result<()> {
+    let max_fd = inherited_fd_scan_limit();
+
+    for fd in 3..max_fd {
+        // SAFETY: `fcntl(F_GETFD)` observes descriptor flags for an integer fd.
+        // Invalid descriptors are reported as EBADF and handled below.
+        let flags = fcntl_getfd_retry(fd)?;
+        if flags == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EBADF) {
+                continue;
+            }
+            return Err(error);
+        }
+
+        // SAFETY: `fd` was accepted by `F_GETFD`; `F_SETFD` only updates that
+        // descriptor's close-on-exec flag and reports races via EBADF.
+        let result = fcntl_setfd_retry(fd, flags | libc::FD_CLOEXEC)?;
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EBADF) {
+                continue;
+            }
+            return Err(error);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn inherited_fd_scan_limit() -> libc::c_int {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: `limit` points to writable storage for `getrlimit`.
+    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
+    if result != 0 {
+        return 1024;
+    }
+    // SAFETY: `getrlimit` succeeded and initialized `limit`.
+    let limit = unsafe { limit.assume_init() };
+    let soft = limit.rlim_cur.min(libc::c_int::MAX as libc::rlim_t);
+    libc::c_int::try_from(soft)
+        .unwrap_or(libc::c_int::MAX)
+        .clamp(3, FALLBACK_FD_SCAN_LIMIT)
+}
+
+#[cfg(unix)]
+fn fcntl_getfd_retry(fd: libc::c_int) -> io::Result<libc::c_int> {
+    loop {
+        // SAFETY: `fcntl(F_GETFD)` observes descriptor flags for an integer fd.
+        let result = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if result != -1 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return Ok(result);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn fcntl_setfd_retry(fd: libc::c_int, flags: libc::c_int) -> io::Result<libc::c_int> {
+    loop {
+        // SAFETY: `fcntl(F_SETFD)` mutates only fd flags for the supplied fd.
+        let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags) };
+        if result != -1 || io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return Ok(result);
+        }
     }
 }
 

@@ -235,22 +235,23 @@ async fn window_mutations_refresh_attached_sessions() {
         .await;
     drain_attach_controls(&mut control_rx).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewWindow(NewWindowRequest {
-                target: alpha.clone(),
-                name: None,
-                detached: true,
-                start_directory: None,
-                environment: None,
-                command: None,
-                process_command: None,
-                target_window_index: None,
-                insert_at_target: false,
-            }))
-            .await,
-        Response::NewWindow(_)
-    ));
+    let new_window = handler
+        .handle(Request::NewWindow(NewWindowRequest {
+            target: alpha.clone(),
+            name: None,
+            detached: true,
+            start_directory: None,
+            environment: None,
+            command: Some(quiet_window_test_command()),
+            process_command: None,
+            target_window_index: None,
+            insert_at_target: false,
+        }))
+        .await;
+    assert!(
+        matches!(new_window, Response::NewWindow(_)),
+        "{new_window:?}"
+    );
     assert_refresh(control_rx.try_recv().expect("new-window refresh"));
 
     assert!(matches!(

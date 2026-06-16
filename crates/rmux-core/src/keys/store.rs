@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use unicode_width::UnicodeWidthStr;
@@ -388,26 +389,7 @@ impl KeyBindingStore {
         };
 
         bindings.sort_by(|left, right| {
-            let ordering = match sort_order {
-                KeyBindingSortOrder::Key => match (left.default_index, right.default_index) {
-                    (Some(left), Some(right)) => left.cmp(&right),
-                    _ => left.binding.key.cmp(&right.binding.key),
-                },
-                KeyBindingSortOrder::Modifier => (left.binding.key & KEYC_MASK_MODIFIERS)
-                    .cmp(&(right.binding.key & KEYC_MASK_MODIFIERS)),
-                KeyBindingSortOrder::Name => left
-                    .table_name
-                    .to_ascii_lowercase()
-                    .cmp(&right.table_name.to_ascii_lowercase()),
-            };
-            let ordering = if ordering.is_eq() {
-                left.table_name
-                    .to_ascii_lowercase()
-                    .cmp(&right.table_name.to_ascii_lowercase())
-                    .then_with(|| left.binding.key.cmp(&right.binding.key))
-            } else {
-                ordering
-            };
+            let ordering = compare_binding_display(left, right, sort_order);
             if reversed {
                 ordering.reverse()
             } else {
@@ -478,6 +460,41 @@ impl KeyBindingStore {
     }
 }
 
+fn compare_binding_display(
+    left: &KeyBindingDisplay,
+    right: &KeyBindingDisplay,
+    sort_order: KeyBindingSortOrder,
+) -> Ordering {
+    let ordering = match sort_order {
+        KeyBindingSortOrder::Key => compare_key_sort(left, right),
+        KeyBindingSortOrder::Modifier => {
+            (left.binding.key & KEYC_MASK_MODIFIERS).cmp(&(right.binding.key & KEYC_MASK_MODIFIERS))
+        }
+        KeyBindingSortOrder::Name => left
+            .table_name
+            .to_ascii_lowercase()
+            .cmp(&right.table_name.to_ascii_lowercase()),
+    };
+    ordering
+        .then_with(|| {
+            left.table_name
+                .to_ascii_lowercase()
+                .cmp(&right.table_name.to_ascii_lowercase())
+        })
+        .then_with(|| left.binding.key.cmp(&right.binding.key))
+        .then_with(|| left.key_string.cmp(&right.key_string))
+        .then_with(|| left.command_string.cmp(&right.command_string))
+}
+
+fn compare_key_sort(left: &KeyBindingDisplay, right: &KeyBindingDisplay) -> Ordering {
+    match (left.default_index, right.default_index) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => left.binding.key.cmp(&right.binding.key),
+    }
+}
+
 fn display_binding(table: &KeyBindingTable, binding: KeyBinding) -> KeyBindingDisplay {
     let default_display = table
         .defaults
@@ -489,7 +506,7 @@ fn display_binding(table: &KeyBindingTable, binding: KeyBinding) -> KeyBindingDi
         |display| display.key_string.to_owned(),
     );
     let command_string = default_display.map_or_else(
-        || binding.commands.to_tmux_string(),
+        || binding.commands.to_tmux_binding_string(),
         |display| display.command_string.to_owned(),
     );
     KeyBindingDisplay {

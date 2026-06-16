@@ -4,6 +4,9 @@ use rmux_proto::OptionName;
 
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::pane_terminals::HandlerState;
+use crate::pane_visible_geometry::{
+    pane_border_status_row as content_pane_border_status_row, PaneBorderStatusPosition,
+};
 
 use super::super::{
     format_draw_content_width, format_draw_line, render_formatted_line, StatusGeometry,
@@ -16,41 +19,28 @@ pub(in crate::renderer) fn render_pane_border_status_lines(
     geometry: StatusGeometry,
     state: Option<&HandlerState>,
 ) -> Vec<u8> {
-    if session.window().is_zoomed() || session.window().pane_count() <= 1 {
+    if session.window().pane_count() == 0 {
         return Vec::new();
     }
 
-    let Some(position) = PaneBorderStatusPosition::from_option(options.resolve_for_window(
+    let Some(position) = PaneBorderStatusPosition::from_options(
+        options,
         session.name(),
         session.active_window_index(),
-        OptionName::PaneBorderStatus,
-    )) else {
+    ) else {
         return Vec::new();
     };
 
     let mut frame = Vec::new();
     for pane in session.window().panes() {
+        if session.window().is_zoomed() && pane.index() != session.active_pane_index() {
+            continue;
+        }
         render_pane_border_status_line(
             &mut frame, session, options, geometry, state, pane, position,
         );
     }
     frame
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PaneBorderStatusPosition {
-    Top,
-    Bottom,
-}
-
-impl PaneBorderStatusPosition {
-    fn from_option(value: Option<&str>) -> Option<Self> {
-        match value {
-            Some("top") => Some(Self::Top),
-            Some("bottom") => Some(Self::Bottom),
-            _ => None,
-        }
-    }
 }
 
 fn render_pane_border_status_line(
@@ -108,22 +98,8 @@ fn pane_border_status_row(
     pane: &Pane,
     geometry: StatusGeometry,
 ) -> Option<u16> {
-    let pane_geometry = pane.geometry();
-    let content_row = match position {
-        PaneBorderStatusPosition::Top => {
-            if pane_geometry.y() == 0 {
-                return None;
-            }
-            pane_geometry.y() - 1
-        }
-        PaneBorderStatusPosition::Bottom => {
-            let row = pane_geometry.y().saturating_add(pane_geometry.rows());
-            if row >= geometry.content_rows {
-                return None;
-            }
-            row
-        }
-    };
+    let content_row =
+        content_pane_border_status_row(position, pane.geometry(), geometry.content_rows)?;
     let row = content_row.saturating_add(geometry.content_y_offset);
     (row < geometry.terminal_size.rows).then_some(row)
 }
@@ -193,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_border_status_top_renders_expanded_format_when_border_row_exists() {
+    fn pane_border_status_top_renders_edge_and_border_lines() {
         let mut session = two_pane_session();
         session.select_pane(1).expect("select bottom pane");
         let mut options = OptionStore::new();
@@ -229,12 +205,12 @@ mod tests {
         .expect("frame is utf8");
 
         assert!(frame.contains("pane=1"), "{frame:?}");
-        assert!(!frame.contains("pane=0"), "{frame:?}");
+        assert!(frame.contains("pane=0"), "{frame:?}");
         assert!(frame.contains("active=1"), "{frame:?}");
     }
 
     #[test]
-    fn pane_border_status_does_not_draw_over_content_without_border_row() {
+    fn pane_border_status_edge_rows_are_reserved_inside_content() {
         let session = two_pane_session();
         let top_pane = session.window().pane(0).expect("top pane exists");
         let bottom_pane = session.window().pane(1).expect("bottom pane exists");
@@ -242,11 +218,11 @@ mod tests {
 
         assert_eq!(
             pane_border_status_row(PaneBorderStatusPosition::Top, top_pane, geometry),
-            None
+            Some(0)
         );
         assert_eq!(
             pane_border_status_row(PaneBorderStatusPosition::Bottom, bottom_pane, geometry),
-            None
+            Some(9)
         );
     }
 

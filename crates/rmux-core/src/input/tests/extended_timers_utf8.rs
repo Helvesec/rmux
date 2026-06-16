@@ -3,14 +3,35 @@ use super::*;
 #[test]
 fn modset_extended_keys_mode_2() {
     let (_p, w) = parse(b"\x1b[>4;2m");
-    assert!(w.has_call("mode_clear(0x48000)")); // EXTENDED_KEY_MODES
+    assert!(w.has_call("mode_clear(0x248000)")); // EXTENDED_KEY_MODES
     assert!(w.has_call("mode_set(0x40000)")); // MODE_KEYS_EXTENDED_2
 }
 
 #[test]
 fn modoff_clears_extended_keys() {
     let (_p, w) = parse(b"\x1b[>4n");
-    assert!(w.has_call("mode_clear(0x48000)")); // EXTENDED_KEY_MODES
+    assert!(w.has_call("mode_clear(0x248000)")); // EXTENDED_KEY_MODES
+}
+
+#[test]
+fn kitty_keyboard_push_enables_csi_u_extended_keys() {
+    let (_p, w) = parse(b"\x1b[>1u");
+    assert!(w.has_call("mode_clear(0x248000)")); // EXTENDED_KEY_MODES
+    assert!(w.has_call("mode_set(0x240000)")); // MODE_KEYS_EXTENDED_2 | MODE_KEYS_KITTY
+}
+
+#[test]
+fn kitty_keyboard_set_and_pop_update_csi_u_extended_keys() {
+    let (_p, w) = parse(b"\x1b[=8u\x1b[<u");
+    assert!(w.has_call("mode_set(0x240000)")); // MODE_KEYS_EXTENDED_2 | MODE_KEYS_KITTY
+    assert!(w.has_call("mode_clear(0x240000)"));
+}
+
+#[test]
+fn kitty_keyboard_query_reports_current_flag_state() {
+    let (p, _w) = parse(b"\x1b[>1u\x1b[?u");
+    let replies = String::from_utf8_lossy(&p.reply_buf);
+    assert_eq!(replies.as_ref(), "\x1b[?1u");
 }
 
 // ─── Hardening: ground timer ───────────────────────────────────────

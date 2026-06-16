@@ -5,15 +5,30 @@ use crate::{Pane, PaneId, Session, Window, WindowId};
 
 /// The default `list-windows` line format.
 pub const DEFAULT_LIST_WINDOWS_FORMAT: &str =
-    "#{window_index}: #{window_name}#{window_raw_flags} (#{window_panes} panes) [#{window_width}x#{window_height}]";
+    "#{window_index}: #{window_name}#{window_raw_flags} (#{window_panes} panes) [#{window_width}x#{window_height}] [layout #{window_layout}] #{window_id}#{?window_active, (active),}";
+
+/// The default `list-windows -a` line format.
+pub const DEFAULT_LIST_WINDOWS_ALL_FORMAT: &str =
+    "#{session_name}:#{window_index}: #{window_name}#{window_raw_flags} (#{window_panes} panes) [#{window_width}x#{window_height}] ";
 
 /// The default `list-sessions` line format.
 pub const DEFAULT_LIST_SESSIONS_FORMAT: &str =
     "#{session_name}: #{session_windows} windows (created #{t:session_created})#{?session_grouped, (group #{session_group}),}#{?session_attached, (attached),}";
 
-/// The default `list-panes` line format.
-pub const DEFAULT_LIST_PANES_FORMAT: &str =
+/// The default `list-panes` line format for a single window.
+pub const DEFAULT_LIST_PANES_WINDOW_FORMAT: &str =
+    "#{pane_index}: [#{pane_width}x#{pane_height}] [history #{history_size}/#{history_limit}, #{history_bytes} bytes] #{pane_id}#{?pane_active, (active),}#{?pane_dead, (dead),}";
+
+/// The default `list-panes -s` line format for a single session.
+pub const DEFAULT_LIST_PANES_SESSION_FORMAT: &str =
+    "#{window_index}.#{pane_index}: [#{pane_width}x#{pane_height}] [history #{history_size}/#{history_limit}, #{history_bytes} bytes] #{pane_id}#{?pane_active, (active),}#{?pane_dead, (dead),}";
+
+/// The default `list-panes -a` line format.
+pub const DEFAULT_LIST_PANES_ALL_FORMAT: &str =
     "#{session_name}:#{window_index}.#{pane_index}: [#{pane_width}x#{pane_height}] [history #{history_size}/#{history_limit}, #{history_bytes} bytes] #{pane_id}#{?pane_active, (active),}#{?pane_dead, (dead),}";
+
+/// Backward-compatible alias for callers that need the fully qualified form.
+pub const DEFAULT_LIST_PANES_FORMAT: &str = DEFAULT_LIST_PANES_ALL_FORMAT;
 
 /// The default `display-message` format.
 pub const DEFAULT_DISPLAY_MESSAGE_FORMAT: &str =
@@ -383,10 +398,23 @@ pub trait FormatVariables {
         None
     }
 
+    /// Searches the current runtime content for the `C:` modifier.
+    ///
+    /// Implementors that do not have a pane screen should return `None`.
+    fn format_search(&self, _options: &str, _pattern: &str) -> Option<String> {
+        None
+    }
+
     /// Expands runtime loop modifiers such as `S`, `W`, and `P`.
     ///
     /// The default implementation leaves these modifiers unsupported.
-    fn format_loop(&self, _scope: char, _body: &str, _count_only: bool) -> Option<String> {
+    fn format_loop(
+        &self,
+        _scope: char,
+        _body: &str,
+        _current_body: Option<&str>,
+        _count_only: bool,
+    ) -> Option<String> {
         None
     }
 }

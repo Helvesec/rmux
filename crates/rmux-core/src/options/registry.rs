@@ -291,9 +291,48 @@ pub fn resolve_option_name(name: &str) -> Result<OptionQuery, RmuxError> {
             metadata: Some(metadata),
             index,
         }),
-        [] => Err(RmuxError::Server(format!("unknown option: {base_name}"))),
+        [] => Err(RmuxError::Server(format!("invalid option: {base_name}"))),
         _ => Err(RmuxError::Server(format!("ambiguous option: {base_name}"))),
     }
+}
+
+/// Resolves a known option name using only exact canonical names and aliases.
+pub(crate) fn resolve_exact_option_name(name: &str) -> Result<OptionQuery, RmuxError> {
+    let (base_name, index) = split_array_index(name)?;
+
+    if base_name.starts_with('@') {
+        if index.is_some() {
+            return Err(RmuxError::Server(format!(
+                "user option does not support array indexes: {name}"
+            )));
+        }
+        return Ok(OptionQuery {
+            name: base_name.to_owned(),
+            metadata: None,
+            index: None,
+        });
+    }
+
+    if let Some(metadata) = OPTIONS.iter().find(|metadata| metadata.name == base_name) {
+        return Ok(OptionQuery {
+            name: metadata.name().to_owned(),
+            metadata: Some(metadata),
+            index,
+        });
+    }
+
+    if let Some(metadata) = OPTIONS
+        .iter()
+        .find(|metadata| metadata.aliases().contains(&base_name))
+    {
+        return Ok(OptionQuery {
+            name: metadata.name().to_owned(),
+            metadata: Some(metadata),
+            index,
+        });
+    }
+
+    Err(RmuxError::Server(format!("invalid option: {base_name}")))
 }
 
 /// Resolves a known option by name when the caller only accepts registered options.

@@ -12,6 +12,7 @@ use crate::daemon::ShutdownHandle;
 use crate::pane_io::pane_output_channel_with_limits;
 
 use super::{lag_dto, OutputSubscriptionState, RequestHandler, MAX_LAG_RECENT_BYTES};
+use crate::handler::PendingShutdownReason;
 
 #[test]
 fn lag_dto_carries_recent_output_without_replaying_missed_bytes() {
@@ -367,6 +368,36 @@ async fn exited_pane_subscription_auto_cleans_after_drain_timeout() {
     })
     .await
     .expect("undrained subscription should auto-clean after the drain timeout");
+}
+
+#[tokio::test]
+async fn exit_empty_shutdown_does_not_wait_for_unsubscribed_retained_output() {
+    let handler = RequestHandler::new();
+    let (shutdown_handle, mut shutdown_rx) = ShutdownHandle::new();
+    handler.install_shutdown_handle(shutdown_handle);
+    let session_name = SessionName::new("gone").expect("valid session name");
+    let target = PaneTarget::with_window(session_name.clone(), 0, 0);
+    let pane = PaneOutputSubscriptionKey::new(session_name, PaneId::new(44));
+    let sender = pane_output_channel_with_limits(8, 1024);
+    sender.send(b"retained".to_vec());
+    sender.send(Vec::new());
+    handler.retain_exited_pane_output(target, pane.clone(), sender);
+
+    handler.queue_shutdown_request(PendingShutdownReason::ExitEmpty);
+    assert!(
+        handler.request_shutdown_if_pending(),
+        "exit-empty shutdown should not wait for retained output with no subscribers"
+    );
+    tokio::time::timeout(Duration::from_millis(50), &mut shutdown_rx)
+        .await
+        .expect("shutdown should be requested immediately")
+        .expect("shutdown receiver should complete cleanly");
+    assert!(
+        handler
+            .retained_exited_pane_output_by_pane(&pane, Instant::now())
+            .is_none(),
+        "retained output should be discarded once exit-empty is committed"
+    );
 }
 
 #[tokio::test]

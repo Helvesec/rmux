@@ -51,18 +51,26 @@ impl SessionName {
 }
 
 fn sanitize_session_name(input: &str) -> String {
+    sanitize_session_name_with_backslash_policy(input, true)
+}
+
+fn sanitize_deserialized_session_name(input: &str) -> String {
+    sanitize_session_name_with_backslash_policy(input, false)
+}
+
+fn sanitize_session_name_with_backslash_policy(input: &str, escape_backslash: bool) -> String {
     let mut sanitized = String::with_capacity(input.len());
     for character in input.chars() {
         let rewritten = match character {
             ':' | '.' => '_',
             other => other,
         };
-        push_session_name_character(rewritten, &mut sanitized);
+        push_session_name_character(rewritten, escape_backslash, &mut sanitized);
     }
     sanitized
 }
 
-fn push_session_name_character(character: char, output: &mut String) {
+fn push_session_name_character(character: char, escape_backslash: bool, output: &mut String) {
     match character {
         '\0' => output.push_str("\\000"),
         '\x07' => output.push_str("\\a"),
@@ -72,6 +80,7 @@ fn push_session_name_character(character: char, output: &mut String) {
         '\x0b' => output.push_str("\\v"),
         '\x0c' => output.push_str("\\f"),
         '\r' => output.push_str("\\r"),
+        '\\' if escape_backslash => output.push_str("\\\\"),
         control if control.is_control() => {
             let value = control as u32;
             output.push('\\');
@@ -83,9 +92,7 @@ fn push_session_name_character(character: char, output: &mut String) {
         // Unicode Cc controls, so `is_control()` misses them, yet they still break
         // the single-line, non-controlling display invariant (and bidi overrides
         // can spoof the rendered name). Escape each UTF-8 byte octally — the same
-        // `\NNN` form as the control arm and tmux's byte-oriented vis. The leading
-        // backslash is never itself escaped, so the output re-sanitizes to itself
-        // and stays idempotent through serde's re-sanitizing Deserialize.
+        // `\NNN` form as the control arm and tmux's byte-oriented vis.
         format_char if is_display_unsafe_format_char(format_char) => {
             let mut buffer = [0_u8; 4];
             for byte in format_char.encode_utf8(&mut buffer).bytes() {
@@ -160,7 +167,10 @@ impl<'de> Deserialize<'de> for SessionName {
         D: Deserializer<'de>,
     {
         let value = String::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
+        if value.is_empty() {
+            return Err(serde::de::Error::custom(RmuxError::EmptySessionName));
+        }
+        Ok(Self(sanitize_deserialized_session_name(&value)))
     }
 }
 
@@ -378,20 +388,23 @@ mod tests {
 
     #[test]
     fn session_name_sanitization_is_idempotent_through_serde() {
-        // Deserialize re-runs sanitize_session_name, so an escaped name must
-        // survive a second pass unchanged (no doubled backslashes).
+        // Deserialize still normalizes raw wire strings, but already-escaped
+        // backslashes must survive unchanged.
         let original =
             SessionName::new("tab\there\u{2028}line\u{202e}rtl\x01ctl").expect("escaped");
         let bytes = bincode::serialize(&original).expect("encodes");
         let restored: SessionName = bincode::deserialize(&bytes).expect("decodes");
-        assert_eq!(restored, original, "re-sanitizing must be a no-op");
-        // And a direct second sanitize pass is also a no-op.
-        assert_eq!(
-            SessionName::new(original.as_str())
-                .expect("re-sanitizes")
-                .as_str(),
-            original.as_str()
-        );
+        assert_eq!(restored, original, "serde must preserve canonical escapes");
+    }
+
+    #[test]
+    fn session_name_escapes_backslashes_to_avoid_control_escape_collisions() {
+        let literal_escape = SessionName::new("test\\nsession").expect("valid");
+        let newline = SessionName::new("test\nsession").expect("valid");
+
+        assert_eq!(literal_escape.as_str(), "test\\\\nsession");
+        assert_eq!(newline.as_str(), "test\\nsession");
+        assert_ne!(literal_escape, newline);
     }
 
     #[test]

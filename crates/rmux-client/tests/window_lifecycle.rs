@@ -395,3 +395,61 @@ fn move_swap_and_rotate_window_commands_round_trip_through_connection_helpers(
     server.shutdown()?;
     Ok(())
 }
+
+#[test]
+fn move_window_with_position_preserves_after_before_flags() -> Result<(), Box<dyn Error>> {
+    let harness = TestHarness::new("window-move-position");
+    let mut server = start_server(&harness)?;
+    let mut connection = connect(harness.socket_path())?;
+    let session = session_name("alpha");
+
+    let created = connection.roundtrip(&Request::NewSession(NewSessionRequest {
+        session_name: session.clone(),
+        detached: true,
+        size: Some(TerminalSize { cols: 80, rows: 24 }),
+        environment: None,
+    }))?;
+    assert!(matches!(created, Response::NewSession(_)));
+    assert!(matches!(
+        connection.new_window(session.clone(), Some("one".to_owned()), true)?,
+        Response::NewWindow(_)
+    ));
+    assert!(matches!(
+        connection.new_window(session.clone(), Some("two".to_owned()), true)?,
+        Response::NewWindow(_)
+    ));
+
+    assert_eq!(
+        connection.move_window_with_position(
+            Some(WindowTarget::with_window(session.clone(), 2)),
+            MoveWindowTarget::Window(WindowTarget::with_window(session.clone(), 0)),
+            false,
+            false,
+            true,
+            true,
+            false,
+        )?,
+        Response::MoveWindow(MoveWindowResponse {
+            session_name: session.clone(),
+            target: Some(WindowTarget::with_window(session.clone(), 1)),
+        })
+    );
+
+    let listed = connection.list_windows(
+        session.clone(),
+        Some("#{window_index}:#{window_name}".to_owned()),
+    )?;
+    let Response::ListWindows(listed) = listed else {
+        panic!("expected list-windows response");
+    };
+    let lines = std::str::from_utf8(listed.output.stdout())?
+        .lines()
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[1], "1:two");
+    assert_eq!(lines[2], "2:one");
+
+    drop(connection);
+    server.shutdown()?;
+    Ok(())
+}

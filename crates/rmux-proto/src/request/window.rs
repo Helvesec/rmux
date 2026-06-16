@@ -127,7 +127,7 @@ pub enum MoveWindowTarget {
 }
 
 /// Request payload for `move-window`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MoveWindowRequest {
     /// The optional source window being moved when not reindexing.
     pub source: Option<WindowTarget>,
@@ -139,6 +139,12 @@ pub struct MoveWindowRequest {
     pub kill_destination: bool,
     /// Whether the destination session should keep its current active window.
     pub detached: bool,
+    /// Whether to insert after the target slot (`-a`).
+    #[serde(default)]
+    pub after: bool,
+    /// Whether to insert before the target slot (`-b`).
+    #[serde(default)]
+    pub before: bool,
 }
 
 /// Request payload for `swap-window`.
@@ -198,6 +204,10 @@ pub enum ResizeWindowAdjustment {
     Left(u16),
     /// Grow width (`-R`).
     Right(u16),
+    /// Resize to the largest attached session containing the window (`-A`).
+    LargestLinkedSession,
+    /// Resize to the smallest attached session containing the window (`-a`).
+    SmallestLinkedSession,
 }
 
 /// Request payload for `respawn-window`.
@@ -261,7 +271,30 @@ impl<'de> Deserialize<'de> for RespawnWindowRequest {
     }
 }
 
+impl<'de> Deserialize<'de> for MoveWindowRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_struct(
+            "MoveWindowRequest",
+            &[
+                "source",
+                "target",
+                "renumber",
+                "kill_destination",
+                "detached",
+                "after",
+                "before",
+            ],
+            MoveWindowRequestVisitor,
+        )
+    }
+}
+
 struct NewWindowRequestVisitor;
+
+struct MoveWindowRequestVisitor;
 
 impl<'de> Visitor<'de> for NewWindowRequestVisitor {
     type Value = NewWindowRequest;
@@ -346,6 +379,86 @@ impl<'de> Visitor<'de> for NewWindowRequestVisitor {
             start_directory: start_directory.unwrap_or_default(),
             target_window_index: target_window_index.unwrap_or_default(),
             insert_at_target: insert_at_target.unwrap_or_default(),
+        })
+    }
+}
+
+impl<'de> Visitor<'de> for MoveWindowRequestVisitor {
+    type Value = MoveWindowRequest;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a move-window request")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let source = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+        let target = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+        let renumber = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(2, &self))?;
+        let kill_destination = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(3, &self))?;
+        let detached = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(4, &self))?;
+        let after = compat_next_element(&mut seq)?;
+        let before = compat_next_element(&mut seq)?;
+
+        Ok(MoveWindowRequest {
+            source,
+            target,
+            renumber,
+            kill_destination,
+            detached,
+            after,
+            before,
+        })
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut source = None;
+        let mut target = None;
+        let mut renumber = None;
+        let mut kill_destination = None;
+        let mut detached = None;
+        let mut after = None;
+        let mut before = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "source" => source = Some(map.next_value()?),
+                "target" => target = Some(map.next_value()?),
+                "renumber" => renumber = Some(map.next_value()?),
+                "kill_destination" => kill_destination = Some(map.next_value()?),
+                "detached" => detached = Some(map.next_value()?),
+                "after" => after = Some(map.next_value()?),
+                "before" => before = Some(map.next_value()?),
+                _ => {
+                    let _: de::IgnoredAny = map.next_value()?;
+                }
+            }
+        }
+
+        Ok(MoveWindowRequest {
+            source: source.ok_or_else(|| de::Error::missing_field("source"))?,
+            target: target.ok_or_else(|| de::Error::missing_field("target"))?,
+            renumber: renumber.ok_or_else(|| de::Error::missing_field("renumber"))?,
+            kill_destination: kill_destination
+                .ok_or_else(|| de::Error::missing_field("kill_destination"))?,
+            detached: detached.ok_or_else(|| de::Error::missing_field("detached"))?,
+            after: after.unwrap_or_default(),
+            before: before.unwrap_or_default(),
         })
     }
 }

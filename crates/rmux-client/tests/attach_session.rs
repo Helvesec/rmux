@@ -18,8 +18,8 @@ use common::{session_name, start_server, TestHarness};
 use rmux_client::{attach_with_terminal, connect, drive_attach_stream, AttachTransition};
 use rmux_proto::{
     encode_attach_message, encode_frame, AttachFrameDecoder, AttachMessage, AttachSessionRequest,
-    AttachSessionResponse, AttachedKeystroke, NewSessionExtRequest, NewSessionRequest, Request,
-    Response, TerminalSize,
+    AttachSessionResponse, NewSessionExtRequest, NewSessionRequest, Request, Response,
+    TerminalSize,
 };
 use rmux_pty::PtyPair;
 use rustix::termios::{
@@ -83,11 +83,7 @@ fn drive_attach_stream_forwards_data_and_resize_messages() -> Result<(), Box<dyn
     let messages = read_attach_messages(&mut server_stream, 2)?;
     assert_eq!(messages.len(), 2);
     assert!(messages.contains(&AttachMessage::Resize(TerminalSize { cols: 80, rows: 24 })));
-    assert!(
-        messages.contains(&AttachMessage::Keystroke(AttachedKeystroke::new(
-            b"typed".to_vec()
-        )))
-    );
+    assert!(messages.contains(&AttachMessage::Data(b"typed".to_vec())));
 
     let frame = encode_attach_message(&AttachMessage::Data(b"screen".to_vec()))?;
     server_stream.write_all(&frame)?;
@@ -106,6 +102,44 @@ fn drive_attach_stream_forwards_data_and_resize_messages() -> Result<(), Box<dyn
             rows: 40,
         })]
     );
+
+    write_attach_stop(&mut server_stream)?;
+    drop(input_writer);
+    drop(server_stream);
+    attach_thread
+        .join()
+        .map_err(|_| std::io::Error::other("attach thread panicked"))??;
+    Ok(())
+}
+
+#[test]
+fn drive_attach_stream_replaces_pending_render_before_strict_data() -> Result<(), Box<dyn Error>> {
+    let _guard = serialize_attach_tests();
+    let (client_stream, mut server_stream) = UnixStream::pair()?;
+    let (input_writer, input_reader) = UnixStream::pair()?;
+    let (mut output_reader, output_writer) = UnixStream::pair()?;
+    let (_resize_tx, resize_rx) = mpsc::channel();
+    output_reader.set_read_timeout(Some(READ_TIMEOUT))?;
+
+    let attach_thread = thread::spawn(move || {
+        drive_attach_stream(client_stream, input_reader, output_writer, resize_rx)
+    });
+
+    let mut frames = Vec::new();
+    frames.extend(encode_attach_message(&AttachMessage::Render(
+        b"old".to_vec(),
+    ))?);
+    frames.extend(encode_attach_message(&AttachMessage::Render(
+        b"new".to_vec(),
+    ))?);
+    frames.extend(encode_attach_message(&AttachMessage::Data(
+        b"strict".to_vec(),
+    ))?);
+    server_stream.write_all(&frames)?;
+
+    let mut stdout = [0_u8; 12];
+    output_reader.read_exact(&mut stdout)?;
+    assert_eq!(&stdout, b"oldnewstrict");
 
     write_attach_stop(&mut server_stream)?;
     drop(input_writer);
@@ -231,6 +265,7 @@ fn attach_with_terminal_restores_termios_after_repeated_detach() -> Result<(), B
         ]),
         process_command: None,
         client_environment: None,
+        skip_environment_update: false,
     }))?;
     assert!(matches!(created, Response::NewSession(_)));
 

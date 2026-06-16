@@ -38,14 +38,13 @@ mod pane_split_effects;
 pub(super) use pane_attached_input::retain_partial_attached_control_input;
 pub(super) use pane_by_id::resolve_pane_target_ref;
 pub(super) use pane_inspection::{
-    attached_status_message_for_error, command_output_from_lines, display_message_context,
-    display_time,
+    attached_status_message_for_error, command_output_from_lines, display_time,
 };
 pub(super) use pane_io_encoding::write_bracketed_pane_payload;
 use pane_io_encoding::{
     encode_key_for_target, encode_mouse_for_target, encode_tokens_for_target,
     expand_send_key_tokens, prepare_pane_input_write, prepare_synchronized_pane_input_writes,
-    write_bytes_to_target, write_bytes_to_target_io, write_bytes_to_targets,
+    write_bytes_to_target, write_bytes_to_target_io, write_bytes_to_targets, PaneInputWrite,
 };
 pub(super) use pane_prompt_input::decode_prompt_input_event;
 pub(in crate::handler) use pane_snapshot::PaneSnapshotRevisionRegistry;

@@ -1,7 +1,7 @@
-use rmux_core::command_parser::lookup_command;
+use std::borrow::Cow;
 
 use super::{write_lines_output, ExitFailure};
-use crate::cli_args::{documented_cli_aliases, implemented_command_surface, ListCommandsArgs};
+use crate::cli_args::{implemented_command_surface, ListCommandsArgs};
 
 const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     (
@@ -142,7 +142,7 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ("previous-window", "(prev) [-a] [-t target-session]"),
     (
         "refresh-client",
-        "(refresh) [-cDlLRSU] [-A pane:state] [-B name:what:format] [-C XxY] [-f flags] [-t target-client] [adjustment]",
+        "(refresh) [-cDlLRSU] [-C XxY] [-f flags] [-t target-client] [adjustment]",
     ),
     ("rename-session", "(rename) [-t target-session] new-name"),
     ("rename-window", "(renamew) [-t target-window] new-name"),
@@ -216,9 +216,9 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ("source-file", "(source) [-Fnqv] [-t target-pane] path ..."),
     (
         "split-window",
-        "(splitw) [-bdefhPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-t target-pane][shell-command]",
+        "(splitw) [-bdefhIPvZ] [-c start-directory] [-e environment] [-F format] [-l size] [-t target-pane][shell-command]",
     ),
-    ("start-server", "(start) [--web-port port] [--frontend-url url]"),
+    ("start-server", "(start) "),
     ("suspend-client", "(suspendc) [-t target-client]"),
     ("swap-pane", "(swapp) [-dDUZ] [-s src-pane] [-t dst-pane]"),
     ("swap-window", "(swapw) [-d] [-s src-window] [-t dst-window]"),
@@ -233,14 +233,16 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
         "web-share",
         "[-lX] [-K share-id] [disconnect share-id] [--config] [--lookup share-id] [--operator-only|--spectator-only] [--ttl seconds|--expires-at RFC3339] [--kill-session-on-expire] [--max-operators count] [--max-spectators count] [--frontend-url url] [--tunnel-url url|--tunnel-provider provider] [--no-navbar] [--no-disclaimer] [--hide-viewers] [--theme user|light|dark] [--no-pin] [-t pane|session]",
     ),
+    ("capabilities", "[--human|--json]"),
 ];
 
 /// Commands that are RMUX extensions rather than part of the tmux command
 /// surface. They stay in `implemented_command_surface()` (so `--help`, the man
-/// page and dispatch keep them) but are hidden from the bare `list-commands`
-/// listing, which is byte-compared against tmux via `#{command_list_name}`. They
-/// remain reachable by explicit name (`list-commands web-share`).
-const RMUX_EXTENSION_COMMANDS: &[&str] = &["web-share"];
+/// page and explicit lookup keep them) but are hidden from the bare
+/// `list-commands` listing, which is byte-compared against tmux via
+/// `#{command_list_name}`. They remain reachable by explicit name
+/// (`list-commands web-share`).
+const RMUX_EXTENSION_COMMANDS: &[&str] = &["capabilities", "web-share"];
 
 fn is_rmux_extension(name: &str) -> bool {
     RMUX_EXTENSION_COMMANDS.contains(&name)
@@ -260,33 +262,52 @@ pub(super) fn run_list_commands(args: ListCommandsArgs) -> Result<i32, ExitFailu
         .filter(|entry| {
             // Explicit lookup shows exactly the requested command (extensions
             // included); the bare listing hides RMUX extensions for tmux parity.
-            requested.map_or_else(|| !is_rmux_extension(entry.name), |name| entry.name == name)
+            match requested {
+                None => !is_rmux_extension(entry.name),
+                Some(name) => entry.name == name,
+            }
         })
-        .map(|entry| render_list_commands_line(format, entry.name, entry.alias))
+        .filter_map(|entry| {
+            let line = render_list_commands_line(format, entry.name, entry.alias);
+            if format.is_some() && line.is_empty() {
+                None
+            } else {
+                Some(line)
+            }
+        })
         .collect::<Vec<_>>();
 
     write_lines_output(&lines)
 }
 
 fn resolve_list_commands_target(name: &str) -> Result<&'static str, ExitFailure> {
-    if let Some(alias) = documented_cli_aliases()
+    let name = list_commands_parser_alias(name);
+    if let Some(entry) = implemented_command_surface()
         .iter()
-        .find(|alias| alias.alias == name)
+        .find(|entry| entry.name == name || entry.alias == Some(name))
     {
-        return Ok(alias.expansion.split(' ').next().unwrap_or("choose-tree"));
+        return Ok(entry.name);
     }
 
-    let resolved = lookup_command(name).map_err(|error| ExitFailure::new(1, error.to_string()))?;
-    if implemented_command_surface()
+    let matches = implemented_command_surface()
         .iter()
-        .any(|entry| entry.name == resolved.name)
-    {
-        Ok(resolved.name)
-    } else {
-        Err(ExitFailure::new(
-            1,
-            format!("command not implemented: {}", resolved.name),
-        ))
+        .filter(|entry| {
+            entry.name.starts_with(name) || entry.alias.is_some_and(|alias| alias.starts_with(name))
+        })
+        .map(|entry| entry.name)
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [command] => Ok(command),
+        [] => Err(ExitFailure::new(1, format!("unknown command: {name}"))),
+        _ => Err(ExitFailure::new(1, format!("ambiguous command: {name}"))),
+    }
+}
+
+fn list_commands_parser_alias(name: &str) -> &str {
+    match name {
+        "choose-session" | "choose-window" => "choose-tree",
+        _ => name,
     }
 }
 
@@ -296,15 +317,62 @@ pub(super) fn render_list_commands_line(
     alias: Option<&str>,
 ) -> String {
     let alias = alias.unwrap_or("");
-    let usage = list_command_usage(name);
     match format {
-        Some(template) => template
-            .replace("#{command_name}", name)
-            .replace("#{command_alias}", alias)
-            .replace("#{command_list_name}", name)
-            .replace("#{command_list_alias}", alias)
-            .replace("#{command_list_usage}", usage),
-        None => format!("{name} {usage}"),
+        Some(template) => {
+            let usage = list_command_usage_without_alias(name);
+            render_list_commands_template(template, name, alias, usage.as_ref())
+        }
+        None => format!("{name} {}", list_command_usage(name)),
+    }
+}
+
+fn render_list_commands_template(template: &str, name: &str, alias: &str, usage: &str) -> String {
+    let mut rendered = String::with_capacity(template.len());
+    let mut index = 0;
+    while index < template.len() {
+        let rest = &template[index..];
+        if rest.starts_with("##") {
+            rendered.push('#');
+            index += 2;
+            continue;
+        }
+        if rest.starts_with("#{") {
+            let value_start = index + 2;
+            let value_rest = &template[value_start..];
+            let Some(value_len) = value_rest.find('}') else {
+                return rendered;
+            };
+            let variable = &template[value_start..value_start + value_len];
+            if variable.contains("#{") && !variable.starts_with("?#{") {
+                return rendered;
+            }
+            rendered.push_str(list_commands_format_value(variable, name, alias, usage));
+            index = value_start + value_len + 1;
+            continue;
+        }
+
+        let next = rest
+            .chars()
+            .next()
+            .expect("index remains inside template while scanning");
+        rendered.push(next);
+        index += next.len_utf8();
+    }
+    rendered
+}
+
+fn list_commands_format_value<'a>(
+    variable: &str,
+    name: &'a str,
+    alias: &'a str,
+    usage: &'a str,
+) -> &'a str {
+    match variable {
+        "command_list_name" => name,
+        "command_list_alias" => alias,
+        "command_list_usage" => usage,
+        "command_name" | "command_alias" | "command_usage" => "",
+        _ => "",
     }
 }
 
@@ -313,6 +381,18 @@ fn list_command_usage(name: &str) -> &'static str {
         .iter()
         .find_map(|(command_name, usage)| (*command_name == name).then_some(*usage))
         .unwrap_or("")
+}
+
+fn list_command_usage_without_alias(name: &str) -> Cow<'static, str> {
+    let usage = list_command_usage(name);
+    if let Some(rest) = usage
+        .strip_prefix('(')
+        .and_then(|rest| rest.split_once(") "))
+    {
+        Cow::Owned(rest.1.to_owned())
+    } else {
+        Cow::Borrowed(usage)
+    }
 }
 
 #[cfg(test)]
@@ -340,6 +420,10 @@ mod tests {
             .map(|entry| entry.name)
             .collect();
         assert!(
+            surface.contains(&"capabilities"),
+            "RMUX extensions stay in the help/dispatch surface"
+        );
+        assert!(
             surface.contains(&"web-share"),
             "RMUX extensions stay in the help/dispatch surface"
         );
@@ -351,6 +435,10 @@ mod tests {
             .map(|entry| entry.name)
             .collect();
         assert!(
+            !listed.contains(&"capabilities"),
+            "bare list-commands must omit RMUX extensions for tmux byte-parity"
+        );
+        assert!(
             !listed.contains(&"web-share"),
             "bare list-commands must omit RMUX extensions for tmux byte-parity"
         );
@@ -358,12 +446,90 @@ mod tests {
     }
 
     #[test]
+    fn formatted_list_commands_uses_command_list_fields_like_tmux() {
+        let rendered = render_list_commands_line(
+            Some(
+                "#{command_name}|#{command_alias}|#{command_list_name}|#{command_list_alias}|#{command_list_usage}",
+            ),
+            "swap-window",
+            Some("swapw"),
+        );
+
+        assert_eq!(
+            rendered,
+            "||swap-window|swapw|[-d] [-s src-window] [-t dst-window]"
+        );
+    }
+
+    #[test]
+    fn formatted_list_commands_expands_unknown_and_non_list_fields_to_empty() {
+        let rendered = render_list_commands_line(
+            Some(
+                "x#{bogus}y|#{command_name}|#{command_alias}|#{command_usage}|#{command_list_name}",
+            ),
+            "link-window",
+            Some("linkw"),
+        );
+
+        assert_eq!(rendered, "xy||||link-window");
+    }
+
+    #[test]
+    fn formatted_list_commands_continues_after_nested_unknown_format() {
+        let rendered = render_list_commands_line(
+            Some("#{?#{unknown},yes,no}|#{command_list_name}"),
+            "link-window",
+            Some("linkw"),
+        );
+
+        assert_eq!(rendered, ",yes,no}|link-window");
+    }
+
+    #[test]
+    fn formatted_list_commands_matches_tmux_escapes_and_incomplete_formats() {
+        assert_eq!(
+            render_list_commands_line(
+                Some("##{command_list_name}|abc#{|#{command_list_name}"),
+                "link-window",
+                Some("linkw"),
+            ),
+            "#{command_list_name}|abc"
+        );
+        assert_eq!(
+            render_list_commands_line(
+                Some("abc#{|#{command_list_name}|tail"),
+                "link-window",
+                Some("linkw"),
+            ),
+            "abc"
+        );
+    }
+
+    #[test]
     fn explicit_list_commands_still_resolves_rmux_extensions() {
         // The explicit-name path stays usable for RMUX users.
+        assert_eq!(
+            resolve_list_commands_target("capabilities").expect("capabilities resolves"),
+            "capabilities"
+        );
         assert_eq!(
             resolve_list_commands_target("web-share").expect("web-share resolves"),
             "web-share"
         );
+    }
+
+    #[test]
+    fn list_commands_target_resolution_errors_for_unknown_and_ambiguous_names() {
+        assert_eq!(
+            resolve_list_commands_target("neww").expect("neww prefix resolves"),
+            "new-window"
+        );
+        assert_eq!(
+            resolve_list_commands_target("choose-session").expect("choose-session alias resolves"),
+            "choose-tree"
+        );
+        assert!(resolve_list_commands_target("nosuch").is_err());
+        assert!(resolve_list_commands_target("list").is_err());
     }
 
     #[test]

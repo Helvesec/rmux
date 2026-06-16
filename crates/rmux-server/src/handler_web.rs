@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,7 +13,9 @@ use rmux_proto::{
 };
 use tokio::sync::{mpsc, watch};
 
-use super::attach_support::{attach_target_for_session, AttachRegistration, ClientFlags};
+use super::attach_support::{
+    attach_render_target_for_session, attach_target_for_session, AttachRegistration, ClientFlags,
+};
 use super::pane_support::resolve_pane_target_ref;
 use super::RequestHandler;
 use crate::outer_terminal::OuterTerminalContext;
@@ -30,8 +32,12 @@ mod snapshot;
 #[path = "handler_web_stream.rs"]
 mod stream;
 
+#[cfg(test)]
+pub(crate) use snapshot::WebSessionView as TestWebSessionView;
 use snapshot::{overlay_pane_lines, session_content_geometry, snapshot_ansi_lines, WebSessionView};
-pub(crate) use snapshot::{WebPaneSnapshot, WebSessionSnapshot};
+pub(crate) use snapshot::{
+    WebPaneSnapshot, WebSessionPaneFrame, WebSessionPaneView, WebSessionSnapshot,
+};
 pub(crate) use stream::{
     WebPaneStream, WebSessionAttachEvent, WebSessionAttachReader, WebSessionStream, WebShareStream,
 };
@@ -182,6 +188,7 @@ impl RequestHandler {
 
         let terminal_context = OuterTerminalContext::default();
         let (control_tx, control_rx) = mpsc::unbounded_channel::<AttachControl>();
+        let control_backlog = Arc::new(AtomicUsize::new(0));
         let closing = Arc::new(AtomicBool::new(false));
         let persistent_overlay_epoch = Arc::new(AtomicU64::new(0));
         let attached_count = self
@@ -201,6 +208,7 @@ impl RequestHandler {
                 current_target.name(),
                 attached_count,
                 &terminal_context,
+                &self.socket_path(),
             )?;
             let snapshot = web_session_snapshot_from_state(
                 &state,
@@ -216,10 +224,12 @@ impl RequestHandler {
                 session_target.name().clone(),
                 AttachRegistration {
                     control_tx,
+                    control_backlog: control_backlog.clone(),
                     closing: closing.clone(),
                     persistent_overlay_epoch: persistent_overlay_epoch.clone(),
                     terminal_context,
                     flags,
+                    render_stream: true,
                     uid: current_owner_uid(),
                     user: UserIdentity::Uid(current_owner_uid()),
                     can_write,
@@ -237,12 +247,14 @@ impl RequestHandler {
                 Vec::new(),
                 shutdown_rx,
                 control_rx,
+                control_backlog,
                 closing,
                 persistent_overlay_epoch,
                 LiveAttachInputContext {
                     handler: Arc::new(task_handler.clone()),
                     attach_pid,
                 },
+                true,
             )
             .await;
             task_handler.finish_attach(attach_pid, attach_id).await;
@@ -281,8 +293,13 @@ impl RequestHandler {
             .sessions
             .session_by_id(session_target.id())
             .ok_or_else(|| session_not_found_web(session_target.name()))?;
-        let target =
-            attach_target_for_session(&state, session.name(), attached_count, &terminal_context)?;
+        let target = attach_render_target_for_session(
+            &state,
+            session.name(),
+            attached_count,
+            &terminal_context,
+            &self.socket_path(),
+        )?;
         web_session_snapshot_from_state(&state, &session_target, target.render_frame, scrolls)
     }
 
@@ -293,6 +310,61 @@ impl RequestHandler {
     ) -> Result<WebSessionSnapshot, RmuxError> {
         self.web_session_snapshot_with_scrolls(session_target, &HashMap::new())
             .await
+    }
+
+    pub(crate) async fn web_session_pane_scroll_frame(
+        &self,
+        session_target: &WebSessionTarget,
+        pane_id: PaneId,
+        scroll_offset: usize,
+    ) -> Result<Option<WebSessionPaneFrame>, RmuxError> {
+        if scroll_offset == 0 {
+            return Ok(None);
+        }
+        let session_target = self.current_web_session_target(session_target).await?;
+        let state = self.state.lock().await;
+        let session = state
+            .sessions
+            .session_by_id(session_target.id())
+            .ok_or_else(|| session_not_found_web(session_target.name()))?;
+        let window = session.window();
+        let active_pane = window.active_pane_index();
+        let panes = if window.is_zoomed() {
+            window.active_pane().into_iter().collect::<Vec<_>>()
+        } else {
+            window.panes().iter().collect::<Vec<_>>()
+        };
+        let Some(pane) = panes.into_iter().find(|pane| pane.id() == pane_id) else {
+            return Ok(None);
+        };
+        let Some(geometry) = session_content_geometry(pane.geometry(), window.size()) else {
+            return Ok(None);
+        };
+        let Some(scrollback) = state.pane_scrollback_view(session.name(), pane.id(), scroll_offset)
+        else {
+            return Err(RmuxError::Server(format!(
+                "missing pane transcript: {}",
+                pane.id()
+            )));
+        };
+        if scrollback.scroll_offset == 0 {
+            return Ok(None);
+        }
+        let mouse_on = state
+            .pane_render_screen(session.name(), pane.id())
+            .is_some_and(|screen| screen.mode() & mode::ALL_MOUSE_MODES != 0);
+        let mut frame = Vec::new();
+        overlay_pane_lines(&mut frame, geometry, &scrollback.ansi_lines);
+        let pane = WebSessionPaneView::new(
+            pane.id(),
+            geometry,
+            pane.index() == active_pane,
+            scrollback.history_size,
+            scrollback.scroll_offset,
+            scrollback.alternate_on,
+            mouse_on,
+        );
+        Ok(Some(WebSessionPaneFrame::new(window.size(), pane, frame)))
     }
 
     pub(crate) async fn web_resnapshot(
@@ -746,12 +818,15 @@ fn web_session_snapshot_from_state(
     let mut active_cursor_style = 0u32;
 
     for pane in panes {
-        if pane.index() == active_pane {
-            if let Some(screen) = state.pane_render_screen(session.name(), pane.id()) {
-                active_mode_bits = screen.mode();
-                active_cursor_style = screen.cursor_style();
-            }
-        }
+        let mode_bits = state
+            .pane_render_screen(session.name(), pane.id())
+            .map(|screen| {
+                if pane.index() == active_pane {
+                    active_mode_bits = screen.mode();
+                    active_cursor_style = screen.cursor_style();
+                }
+                screen.mode()
+            });
         let Some(geometry) = session_content_geometry(pane.geometry(), window.size()) else {
             continue;
         };
@@ -765,14 +840,15 @@ fn web_session_snapshot_from_state(
         if scrollback.scroll_offset > 0 {
             overlay_pane_lines(&mut frame, geometry, &scrollback.ansi_lines);
         }
-        view.add_pane(
+        view.push_pane(WebSessionPaneView::new(
             pane.id(),
             geometry,
             pane.index() == active_pane,
             scrollback.history_size,
             scrollback.scroll_offset,
             scrollback.alternate_on,
-        );
+            mode_bits.is_some_and(|bits| bits & mode::ALL_MOUSE_MODES != 0),
+        ));
     }
 
     Ok(WebSessionSnapshot::new(

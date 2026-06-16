@@ -464,7 +464,7 @@ async fn paste_buffer_empty_store_returns_error() {
 }
 
 #[tokio::test]
-async fn named_buffer_replacement_promotes_to_stack_head() {
+async fn implicit_show_buffer_ignores_newer_named_buffers() {
     let handler = RequestHandler::new();
 
     handler
@@ -473,9 +473,6 @@ async fn named_buffer_replacement_promotes_to_stack_head() {
     handler
         .handle(Request::SetBuffer(set_buffer_request(None, b"unnamed")))
         .await;
-    // unnamed is now stack head
-
-    // Replace alpha - should become stack head again
     handler
         .handle(Request::SetBuffer(set_buffer_request(
             Some("alpha"),
@@ -487,7 +484,36 @@ async fn named_buffer_replacement_promotes_to_stack_head() {
         .handle(Request::ShowBuffer(ShowBufferRequest { name: None }))
         .await;
     let output = show.command_output().expect("show-buffer returns output");
-    assert_eq!(output.stdout(), b"value-two");
+    assert_eq!(output.stdout(), b"unnamed");
+}
+
+#[tokio::test]
+async fn implicit_paste_buffer_ignores_newer_named_buffers() {
+    let handler = RequestHandler::new();
+    create_session(&handler, "alpha").await;
+
+    handler
+        .handle(Request::SetBuffer(set_buffer_request(None, b"unnamed")))
+        .await;
+    handler
+        .handle(Request::SetBuffer(set_buffer_request(
+            Some("named"),
+            b"value-two",
+        )))
+        .await;
+
+    let response = handler
+        .handle(Request::PasteBuffer(paste_buffer_request(
+            None,
+            PaneTarget::new(session_name("alpha"), 0),
+            false,
+        )))
+        .await;
+
+    match response {
+        Response::PasteBuffer(response) => assert_eq!(response.buffer_name, "buffer0"),
+        other => panic!("unexpected response: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -637,6 +663,44 @@ async fn set_buffer_clipboard_write_uses_attached_terminal_features() {
 }
 
 #[tokio::test]
+async fn set_buffer_clipboard_write_flag_overrides_set_clipboard_off() {
+    let handler = RequestHandler::new();
+    let session = session_name("alpha");
+    create_session(&handler, "alpha").await;
+
+    let set_option = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::SetClipboard,
+            value: "off".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(set_option, Response::SetOption(_)));
+
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach_with_terminal_context(
+            41,
+            session,
+            control_tx,
+            OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+        )
+        .await;
+
+    let mut request = set_buffer_request(None, b"forced clipboard");
+    request.set_clipboard = true;
+    let response = handler
+        .dispatch(41, Request::SetBuffer(request))
+        .await
+        .response;
+    assert!(matches!(response, Response::SetBuffer(_)));
+
+    let bytes = take_write(control_rx.try_recv().expect("forced clipboard write"));
+    assert_eq!(bytes, b"\x1b]52;;Zm9yY2VkIGNsaXBib2FyZA==\x07");
+}
+
+#[tokio::test]
 async fn clipboard_writes_require_explicit_buffer_command_flag() {
     let handler = RequestHandler::new();
     let session = session_name("alpha");
@@ -737,7 +801,7 @@ async fn set_buffer_clipboard_write_is_suppressed_without_unique_attached_client
 }
 
 #[tokio::test]
-async fn load_buffer_clipboard_write_honours_set_clipboard_option() {
+async fn load_buffer_clipboard_write_flag_overrides_set_clipboard_off() {
     let handler = RequestHandler::new();
     let session = session_name("alpha");
     create_session(&handler, "alpha").await;
@@ -780,5 +844,6 @@ async fn load_buffer_clipboard_write_honours_set_clipboard_option() {
         .response;
     let _ = fs::remove_file(&temp_path);
     assert!(matches!(response, Response::LoadBuffer(_)));
-    assert!(control_rx.try_recv().is_err());
+    let bytes = take_write(control_rx.try_recv().expect("forced clipboard write"));
+    assert_eq!(bytes, b"\x1b]52;;bG9hZGVkIGNsaXBib2FyZA==\x07");
 }

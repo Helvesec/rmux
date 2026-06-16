@@ -1,4 +1,7 @@
-use rmux_proto::{RmuxError, SessionName};
+use rmux_core::PaneId;
+use rmux_proto::{PaneTarget, RmuxError, SessionName};
+
+use crate::terminal::SessionBaseEnvironment;
 
 use super::{session_not_found, HandlerState};
 
@@ -10,6 +13,89 @@ impl HandlerState {
         self.sessions
             .runtime_owner(session_name)
             .unwrap_or_else(|| session_name.clone())
+    }
+
+    pub(crate) fn session_base_environment_for_window(
+        &self,
+        session_name: &SessionName,
+        window_index: u32,
+    ) -> Option<SessionBaseEnvironment> {
+        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
+        self.first_pane_id_for_window(session_name, window_index)
+            .and_then(|pane_id| {
+                self.terminals
+                    .pane_base_environment(&runtime_session_name, pane_id)
+            })
+            .or_else(|| {
+                self.terminals
+                    .session_base_environment(&runtime_session_name)
+            })
+    }
+
+    pub(crate) fn session_base_environment_for_pane_target(
+        &self,
+        target: &PaneTarget,
+    ) -> Option<SessionBaseEnvironment> {
+        let runtime_session_name =
+            self.runtime_session_name_for_window(target.session_name(), target.window_index());
+        self.pane_id_for_indexed_target(
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+        )
+        .and_then(|pane_id| {
+            self.terminals
+                .pane_base_environment(&runtime_session_name, pane_id)
+        })
+        .or_else(|| {
+            self.terminals
+                .session_base_environment(&runtime_session_name)
+        })
+    }
+
+    pub(crate) fn session_base_environment_for_active_pane(
+        &self,
+        session_name: &SessionName,
+    ) -> Option<SessionBaseEnvironment> {
+        let session = self.sessions.session(session_name)?;
+        let window_index = session.active_window_index();
+        let pane_index = session.active_pane_index();
+        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
+        self.pane_id_for_indexed_target(session_name, window_index, pane_index)
+            .and_then(|pane_id| {
+                self.terminals
+                    .pane_base_environment(&runtime_session_name, pane_id)
+            })
+            .or_else(|| {
+                self.terminals
+                    .session_base_environment(&runtime_session_name)
+            })
+    }
+
+    fn first_pane_id_for_window(
+        &self,
+        session_name: &SessionName,
+        window_index: u32,
+    ) -> Option<PaneId> {
+        self.sessions
+            .session(session_name)?
+            .window_at(window_index)?
+            .panes()
+            .first()
+            .map(|pane| pane.id())
+    }
+
+    fn pane_id_for_indexed_target(
+        &self,
+        session_name: &SessionName,
+        window_index: u32,
+        pane_index: u32,
+    ) -> Option<PaneId> {
+        self.sessions
+            .session(session_name)?
+            .window_at(window_index)?
+            .pane(pane_index)
+            .map(|pane| pane.id())
     }
 
     pub(crate) fn synchronize_session_group_from(
@@ -137,7 +223,8 @@ impl HandlerState {
         for pipe in self.remove_session_pipes(session_name).into_values() {
             pipe.stop();
         }
-        self.remove_session_pane_outputs(session_name);
+        let mut removed_outputs = self.remove_session_pane_outputs(session_name);
+        removed_outputs.abort_output_readers();
         let _ = self.dead_panes.remove(session_name);
         let _ = self.attached_submitted_rows.remove(session_name);
         let _ = self.attached_terminal_pixels.remove(session_name);
@@ -242,12 +329,20 @@ impl HandlerState {
                 "pane output generations already exist for session {new_name}"
             )));
         }
+        #[cfg(unix)]
+        if self.pane_output_readers.contains_key(new_name) {
+            return Err(RmuxError::Server(format!(
+                "pane output readers already exist for session {new_name}"
+            )));
+        }
 
         self.pipes.rename_session(session_name, new_name)?;
 
         let mut transcripts = std::mem::take(&mut self.transcripts);
         let mut pane_outputs = std::mem::take(&mut self.pane_outputs);
         let mut pane_output_generations = std::mem::take(&mut self.pane_output_generations);
+        #[cfg(unix)]
+        let mut pane_output_readers = std::mem::take(&mut self.pane_output_readers);
         let mut dead_panes = std::mem::take(&mut self.dead_panes);
         let mut attached_submitted_rows = std::mem::take(&mut self.attached_submitted_rows);
 
@@ -260,6 +355,8 @@ impl HandlerState {
         let session_output_generations = pane_output_generations
             .remove(session_name)
             .unwrap_or_default();
+        #[cfg(unix)]
+        let session_output_readers = pane_output_readers.remove(session_name).unwrap_or_default();
         let session_dead_panes = dead_panes.remove(session_name).unwrap_or_default();
         let session_attached_rows = attached_submitted_rows
             .remove(session_name)
@@ -275,6 +372,12 @@ impl HandlerState {
             let previous_generations =
                 pane_output_generations.insert(new_name.clone(), session_output_generations);
             debug_assert!(previous_generations.is_none());
+        }
+        #[cfg(unix)]
+        if !session_output_readers.is_empty() {
+            let previous_readers =
+                pane_output_readers.insert(new_name.clone(), session_output_readers);
+            debug_assert!(previous_readers.is_none());
         }
         if !session_dead_panes.is_empty() {
             let previous_dead_panes = dead_panes.insert(new_name.clone(), session_dead_panes);
@@ -299,6 +402,10 @@ impl HandlerState {
         self.transcripts = transcripts;
         self.pane_outputs = pane_outputs;
         self.pane_output_generations = pane_output_generations;
+        #[cfg(unix)]
+        {
+            self.pane_output_readers = pane_output_readers;
+        }
         self.dead_panes = dead_panes;
         self.attached_submitted_rows = attached_submitted_rows;
         self.auto_named_windows = auto_named_windows;

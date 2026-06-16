@@ -5,7 +5,7 @@
 //! fixed locale) so the recorded ANSI is reproducible. Pulling that
 //! plumbing out of the per-scenario file keeps the source code that ships
 //! in the SDK demo UI honest: it shows the SDK call you'd actually write,
-//! not the capture scaffolding.
+//! not the capture support code.
 //!
 //! This file is brought into each example via `#[path]`. `#[allow(dead_code)]`
 //! because individual examples only consume a subset of the helpers.

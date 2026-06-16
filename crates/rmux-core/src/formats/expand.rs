@@ -2,7 +2,7 @@ use super::time::expand_time_tokens;
 use super::{format_replace, format_skip, resolve_variable, ExpandState, FormatVariables};
 
 /// Recursion depth limit matching tmux `FORMAT_LOOP_LIMIT`.
-const FORMAT_LOOP_LIMIT: u32 = 100;
+pub(super) const FORMAT_LOOP_LIMIT: u32 = 100;
 
 /// The main expansion loop, matching tmux `format_expand1`.
 pub(super) fn format_expand1<V>(state: &mut ExpandState, fmt: &str, variables: &V) -> String
@@ -13,7 +13,7 @@ where
         return String::new();
     }
 
-    if state.loop_depth >= FORMAT_LOOP_LIMIT {
+    if state.stop_expansion || state.loop_depth >= FORMAT_LOOP_LIMIT {
         return String::new();
     }
     state.loop_depth += 1;
@@ -31,6 +31,9 @@ where
     let mut i = 0;
 
     while i < bytes.len() {
+        if state.stop_expansion {
+            break;
+        }
         if bytes[i] != b'#' {
             // Copy one UTF-8 character. `#` is ASCII so all multi-byte
             // sequences are guaranteed not to contain it.
@@ -57,7 +60,9 @@ where
         // We have a `#`. Peek at next char.
         i += 1;
         if i >= bytes.len() {
-            // Trailing `#` — tmux drops it (breaks out of the expansion loop).
+            // Keep trailing `#` literal. tmux drops it, but rmux treats a bare
+            // marker as text unless it starts a complete expansion.
+            out.push('#');
             break;
         }
 
@@ -81,8 +86,12 @@ where
                     i += 1;
                 }
                 if i < bytes.len() {
-                    // Found matching `)`. Job expansion is not run in this path.
-                    let _ = &fmt[start..i]; // command text (unused for now)
+                    // Found matching `)`. Job expansion is not run in this
+                    // path, but status rendering can preserve it for a later
+                    // runtime execution pass.
+                    if state.preserve_jobs {
+                        out.push_str(&fmt[start - 2..=i]);
+                    }
                     i += 1; // skip `)`
                 } else {
                     // No matching `)` — break out of loop (tmux behavior).
@@ -100,6 +109,9 @@ where
                         let key_end = skip_start + off;
                         let key = &fmt[key_start..key_end];
                         let result = format_replace(state, key, variables);
+                        if state.stop_expansion {
+                            break;
+                        }
                         out.push_str(&result);
                         i = key_end + 1; // skip past `}`
                     }

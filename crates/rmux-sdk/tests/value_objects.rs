@@ -53,6 +53,7 @@ fn process_subscription_reuse_and_terminal_specs_round_trip() {
         attach_if_exists: true,
         detach_other_clients: false,
         kill_other_clients: true,
+        skip_environment_update: false,
         flags: Some(vec!["active-pane".to_owned()]),
     });
     round_trip(AttachSessionReuse {
@@ -108,6 +109,7 @@ fn new_session_spec_round_trip_and_maps_reuse_flags() {
             attach_if_exists: true,
             detach_other_clients: true,
             kill_other_clients: false,
+            skip_environment_update: false,
             flags: Some(vec!["active-pane".to_owned()]),
         },
         window_name: Some("main".to_owned()),
@@ -435,6 +437,8 @@ fn command_value_object_round_trip_and_materializes_proto_request() {
             detached: false,
             size: None,
             preserve_zoom: false,
+            full_size: false,
+            stdin_payload: None,
         })
     ));
 }

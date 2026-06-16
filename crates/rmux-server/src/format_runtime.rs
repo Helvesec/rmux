@@ -1,13 +1,15 @@
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use crate::pane_terminals::HandlerState;
 use chrono::Local;
 use rmux_core::formats::{
-    expand_time_tokens, render_template, FormatContext, FormatVariable, FormatVariables,
+    expand_time_tokens, render_template, render_template_preserving_jobs, FormatContext,
+    FormatVariable, FormatVariables,
 };
 use rmux_core::{BufferStore, EnvironmentStore, OptionStore, Pane, Session, SessionStore, Window};
 use rmux_proto::OptionName;
-use rmux_proto::{SessionName, TerminalSize};
+use rmux_proto::{PaneTarget, SessionName, TerminalSize};
 
 static SERVER_START_TIME: OnceLock<i64> = OnceLock::new();
 
@@ -113,6 +115,41 @@ impl<'a> RuntimeFormatContext<'a> {
     ) -> Self {
         self.base = self.base.with_named_value(name, value);
         self
+    }
+
+    pub(crate) fn status_job_profile(&self) -> Option<crate::terminal::TerminalProfile> {
+        let state = self.state?;
+        let options = self.options?;
+        let session = self.session?;
+        let socket_path = PathBuf::from(self.base.format_value_by_name("socket_path")?);
+        let session_name = session.name();
+        let target = self
+            .window_index
+            .zip(self.pane)
+            .map(|(window_index, pane)| {
+                PaneTarget::with_window(session_name.clone(), window_index, pane.index())
+            });
+        let base_environment = target
+            .as_ref()
+            .and_then(|target| state.session_base_environment_for_pane_target(target))
+            .or_else(|| state.session_base_environment_for_active_pane(session_name));
+        let cwd = self
+            .pane_screen_path()
+            .or_else(|| self.pane_start_path())
+            .map(PathBuf::from);
+
+        crate::terminal::TerminalProfile::for_run_shell_with_base_environment(
+            &state.environment,
+            options,
+            Some(session_name),
+            Some(session.id().as_u32()),
+            &socket_path,
+            base_environment.as_ref(),
+            false,
+            self.pane.map(Pane::id),
+            cwd.as_deref(),
+        )
+        .ok()
     }
 
     fn option_store(&self) -> Option<&OptionStore> {
@@ -334,7 +371,7 @@ impl<'a> RuntimeFormatContext<'a> {
 
     fn pane_dead_time(&self) -> Option<String> {
         self.pane_exit_metadata()
-            .map(|metadata| metadata.time.to_string())
+            .and_then(|metadata| metadata.time.map(|time| time.to_string()))
             .or_else(|| Some(String::new()))
     }
 
@@ -404,6 +441,18 @@ impl<'a> RuntimeFormatContext<'a> {
             })
     }
 
+    fn resolved_default_shell(&self) -> Option<String> {
+        Some(
+            crate::terminal::TerminalProfile::resolved_default_shell(
+                self.environment_store()?,
+                self.option_store()?,
+                self.session_name(),
+            )
+            .to_string_lossy()
+            .into_owned(),
+        )
+    }
+
     fn option_value_by_name(&self, name: &str) -> Option<String> {
         let store = self.option_store()?;
 
@@ -446,12 +495,23 @@ impl FormatVariables for AutoRenameFormatContext<'_> {
         self.inner.format_value(variable)
     }
 
-    fn format_loop(&self, scope: char, body: &str, count_only: bool) -> Option<String> {
-        self.inner.format_loop(scope, body, count_only)
+    fn format_loop(
+        &self,
+        scope: char,
+        body: &str,
+        current_body: Option<&str>,
+        count_only: bool,
+    ) -> Option<String> {
+        self.inner
+            .format_loop(scope, body, current_body, count_only)
     }
 
     fn format_name_exists(&self, scope: Option<char>, name: &str) -> Option<bool> {
         self.inner.format_name_exists(scope, name)
+    }
+
+    fn format_search(&self, options: &str, pattern: &str) -> Option<String> {
+        self.inner.format_search(options, pattern)
     }
 
     fn format_value_by_name(&self, name: &str) -> Option<String> {
@@ -476,6 +536,22 @@ where
         template.to_owned()
     };
     render_template(&template, variables)
+}
+
+pub(crate) fn render_runtime_template_preserving_jobs<V>(
+    template: &str,
+    variables: &V,
+    expand_time: bool,
+) -> String
+where
+    V: FormatVariables + ?Sized,
+{
+    let template = if expand_time {
+        expand_time_tokens(template)
+    } else {
+        template.to_owned()
+    };
+    render_template_preserving_jobs(&template, variables)
 }
 
 pub(crate) fn render_automatic_window_name(runtime: &RuntimeFormatContext<'_>) -> Option<String> {

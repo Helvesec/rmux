@@ -1,0 +1,10 @@
+session_name
+window_index
+pane_index
+pane_id
+pane_width
+pane_height
+pane_active
+pane_dead
+pane_current_command
+pane_current_path

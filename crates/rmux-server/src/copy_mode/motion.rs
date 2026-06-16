@@ -68,6 +68,7 @@ impl CopyModeState {
     }
 
     pub(super) fn cmd_end_of_line(&mut self) -> Result<(), RmuxError> {
+        self.cursor.y = self.logical_line_end_y(self.cursor.y);
         self.cursor.x = self.line_end_x(self.cursor.y);
         self.sync_selection_with_cursor();
         Ok(())
@@ -89,7 +90,7 @@ impl CopyModeState {
     }
 
     pub(super) fn cmd_middle_line(&mut self) -> Result<(), RmuxError> {
-        self.cursor.y = (self.top_line + usize::from(self.rows() / 2))
+        self.cursor.y = (self.top_line + usize::from(self.rows().saturating_sub(1) / 2))
             .min(self.total_lines().saturating_sub(1));
         self.cursor.x = 0;
         self.sync_selection_with_cursor();
@@ -214,13 +215,23 @@ impl CopyModeState {
     }
 
     pub(super) fn cmd_goto_line(&mut self, line: &str) -> Result<(), RmuxError> {
-        let number = line
-            .parse::<usize>()
-            .map_err(|error| RmuxError::Server(format!("invalid line number '{line}': {error}")))?;
-        let target = number
-            .saturating_sub(1)
+        let Ok(number) = line.parse::<isize>() else {
+            return Ok(());
+        };
+        if number < 0 {
+            return Ok(());
+        }
+        let max_scroll = self.bottom_top_line();
+        let scroll = usize::try_from(number)
+            .unwrap_or(max_scroll)
+            .min(max_scroll);
+        self.top_line = self.bottom_top_line().saturating_sub(scroll);
+        let visible_bottom = self.top_line + usize::from(self.rows().max(1));
+        self.cursor.y = self
+            .cursor
+            .y
+            .clamp(self.top_line, visible_bottom.saturating_sub(1))
             .min(self.total_lines().saturating_sub(1));
-        self.cursor.y = target;
         self.cursor.x = self.owning_or_zero(self.cursor.y, self.cursor.x);
         self.ensure_cursor_visible();
         self.sync_selection_with_cursor();

@@ -1,12 +1,15 @@
 use std::collections::VecDeque;
 use std::future::pending;
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use rmux_core::{events::OutputCursorItem, TerminalPassthrough};
 use rmux_proto::AttachMessage;
 use tokio::sync::mpsc;
 
 use super::attach_transport::AttachTransport;
 use super::exit_log::AttachExitReason;
+use super::passthrough::render_passthroughs;
 use super::persistent_overlay::{
     accept_persistent_overlay_state, advance_persistent_overlay_state, clear_then_base_frame,
     defer_persistent_clear, discard_stale_persistent_overlays, is_stale_persistent_switch,
@@ -16,8 +19,8 @@ use super::persistent_overlay::{
 };
 use super::types::{AttachControl, AttachTarget, OpenAttachTarget, OverlayFrame};
 use super::wire::{
-    emit_attach_bytes, emit_attach_message, emit_attach_stop, emit_detached_message,
-    emit_exited_message, emit_render_frame, open_attach_target,
+    emit_attach_bytes, emit_attach_message, emit_attach_stop, emit_detached_attach_stop,
+    emit_exited_attach_stop, emit_render_frame, open_attach_target,
 };
 
 pub(super) fn should_emit_overlay(
@@ -39,14 +42,79 @@ pub(super) fn should_emit_overlay(
 pub(super) async fn recv_attach_control(
     deferred_controls: &mut VecDeque<AttachControl>,
     control_rx: Option<&mut mpsc::UnboundedReceiver<AttachControl>>,
+    control_backlog: &AtomicUsize,
 ) -> Option<AttachControl> {
     if let Some(control) = deferred_controls.pop_front() {
         return Some(control);
     }
     match control_rx {
-        Some(control_rx) => control_rx.recv().await,
+        Some(control_rx) => {
+            let control = control_rx.recv().await;
+            if control.is_some() {
+                decrement_control_backlog(control_backlog);
+            }
+            control
+        }
         None => pending().await,
     }
+}
+
+pub(super) fn decrement_control_backlog(control_backlog: &AtomicUsize) {
+    let _ = control_backlog.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+        value.checked_sub(1)
+    });
+}
+
+pub(super) fn try_recv_attach_control(
+    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
+    control_backlog: &AtomicUsize,
+) -> Result<AttachControl, mpsc::error::TryRecvError> {
+    let control = control_rx.try_recv()?;
+    decrement_control_backlog(control_backlog);
+    Ok(control)
+}
+
+pub(super) fn coalesce_render_switches(
+    mut target: Box<AttachTarget>,
+    deferred_controls: &mut VecDeque<AttachControl>,
+    mut control_rx: Option<&mut mpsc::UnboundedReceiver<AttachControl>>,
+    control_backlog: &AtomicUsize,
+) -> Box<AttachTarget> {
+    if !target.is_coalescible_render_refresh() {
+        return target;
+    }
+
+    while deferred_controls
+        .front()
+        .is_some_and(AttachControl::is_coalescible_render_switch)
+    {
+        let Some(AttachControl::Switch(next_target)) = deferred_controls.pop_front() else {
+            unreachable!("front was checked as a coalescible switch");
+        };
+        target = next_target;
+    }
+
+    let Some(control_rx) = control_rx.as_mut() else {
+        return target;
+    };
+    loop {
+        match try_recv_attach_control(control_rx, control_backlog) {
+            Ok(AttachControl::Switch(next_target))
+                if next_target.is_coalescible_render_refresh() =>
+            {
+                target = next_target;
+            }
+            Ok(control) => {
+                deferred_controls.push_back(control);
+                break;
+            }
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                break;
+            }
+        }
+    }
+
+    target
 }
 
 pub(super) async fn switch_attach_target(
@@ -58,7 +126,8 @@ pub(super) async fn switch_attach_target(
 ) -> io::Result<()> {
     let previous_terminal = current_target.outer_terminal.clone();
     let previous_cursor_style = current_target.cursor_style;
-    *current_target = open_attach_target(next_target)?;
+    let render_stream = current_target.render_stream;
+    *current_target = open_attach_target(next_target, render_stream)?;
     emit_attach_bytes(
         stream,
         &current_target
@@ -93,6 +162,8 @@ pub(super) async fn switch_attach_target(
 pub(super) enum PendingAttachAction {
     Exit(AttachExitReason),
     Continue { target_changed: bool },
+    InteractiveInput,
+    Refresh { target_changed: bool },
     Write,
 }
 
@@ -100,6 +171,7 @@ pub(super) enum PendingAttachAction {
 pub(super) async fn apply_pending_attach_controls(
     deferred_controls: &mut VecDeque<AttachControl>,
     attach_controls: Option<&mut mpsc::UnboundedReceiver<AttachControl>>,
+    control_backlog: &AtomicUsize,
     current_target: &mut OpenAttachTarget,
     stream: &AttachTransport,
     render_generation: &mut u64,
@@ -119,18 +191,16 @@ pub(super) async fn apply_pending_attach_controls(
         let control = deferred_controls
             .pop_front()
             .map(Ok)
-            .unwrap_or_else(|| control_rx.try_recv());
+            .unwrap_or_else(|| try_recv_attach_control(control_rx, control_backlog));
         match control {
             Ok(AttachControl::Detach) => {
-                emit_attach_stop(stream, current_target).await?;
-                emit_detached_message(stream, current_target).await?;
+                emit_detached_attach_stop(stream, current_target).await?;
                 return Ok(PendingAttachAction::Exit(
                     AttachExitReason::AttachControlDetach,
                 ));
             }
             Ok(AttachControl::Exited) => {
-                emit_attach_stop(stream, current_target).await?;
-                emit_exited_message(stream).await?;
+                emit_exited_attach_stop(stream, current_target).await?;
                 return Ok(PendingAttachAction::Exit(
                     AttachExitReason::AttachControlExited,
                 ));
@@ -150,7 +220,28 @@ pub(super) async fn apply_pending_attach_controls(
                     AttachExitReason::AttachControlDetachExec,
                 ));
             }
+            Ok(AttachControl::InteractiveInput) => {
+                return Ok(PendingAttachAction::InteractiveInput);
+            }
+            Ok(AttachControl::Refresh) => {
+                return Ok(PendingAttachAction::Refresh { target_changed });
+            }
             Ok(AttachControl::Switch(next_target)) => {
+                let next_target = coalesce_render_switches(
+                    next_target,
+                    deferred_controls,
+                    Some(control_rx),
+                    control_backlog,
+                );
+                let drop_live_output = !next_target.is_coalescible_render_refresh();
+                let pending_passthroughs = if drop_live_output {
+                    Vec::new()
+                } else {
+                    take_pending_live_passthroughs(
+                        current_target,
+                        next_target.pane_output_start_sequence,
+                    )
+                };
                 if is_stale_persistent_switch(*persistent_overlay_state_id, next_target.as_ref()) {
                     continue;
                 }
@@ -161,6 +252,7 @@ pub(super) async fn apply_pending_attach_controls(
                     next_target.persistent_overlay_state_id,
                     *render_generation,
                     *overlay_generation,
+                    control_backlog,
                 );
                 let replacement_frame = pending_overlay
                     .as_ref()
@@ -194,6 +286,11 @@ pub(super) async fn apply_pending_attach_controls(
                     replacement_frame.as_deref(),
                 )
                 .await?;
+                if !pending_passthroughs.is_empty() {
+                    let passthrough_frame =
+                        render_passthroughs(current_target, &pending_passthroughs);
+                    emit_attach_bytes(stream, &passthrough_frame).await?;
+                }
                 target_changed = true;
                 if let Some(overlay) = pending_overlay {
                     update_persistent_overlay_cache(
@@ -208,9 +305,10 @@ pub(super) async fn apply_pending_attach_controls(
                         Some(control_rx),
                         deferred_controls,
                         barrier_state_id,
+                        control_backlog,
                     );
                 }
-                should_drop_output = true;
+                should_drop_output |= drop_live_output;
             }
             Ok(AttachControl::AdvancePersistentOverlayState(state_id)) => {
                 let previous_overlay_state_id = *persistent_overlay_state_id;
@@ -219,6 +317,7 @@ pub(super) async fn apply_pending_attach_controls(
                     Some(control_rx),
                     deferred_controls,
                     state_id,
+                    control_backlog,
                 );
                 redraw_after_persistent_overlay_state_advance(
                     stream,
@@ -287,6 +386,26 @@ pub(super) async fn apply_pending_attach_controls(
     } else {
         Ok(PendingAttachAction::Write)
     }
+}
+
+pub(super) fn take_pending_live_passthroughs(
+    current_target: &mut OpenAttachTarget,
+    before_sequence: u64,
+) -> Vec<TerminalPassthrough> {
+    let Some(pane_output) = current_target.pane_output.as_mut() else {
+        return Vec::new();
+    };
+    let mut passthroughs = Vec::new();
+    while let Some(item) = pane_output.try_recv() {
+        let OutputCursorItem::Event(event) = item else {
+            break;
+        };
+        if event.sequence() >= before_sequence {
+            break;
+        }
+        passthroughs.extend(event.into_passthroughs());
+    }
+    passthroughs
 }
 
 pub(super) async fn redraw_after_persistent_overlay_state_advance(

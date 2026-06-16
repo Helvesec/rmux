@@ -1,4 +1,7 @@
-use rmux_proto::{HookLifecycle, HookName, ScopeSelector, SetHookMutationRequest, SetHookRequest};
+use rmux_core::command_parser::{CommandParser, ParsedCommand};
+use rmux_proto::{
+    HookLifecycle, HookName, RmuxError, ScopeSelector, SetHookMutationRequest, SetHookRequest,
+};
 
 pub(crate) fn normalize_set_hook_request(request: SetHookRequest) -> SetHookRequest {
     let Some(shell_command) = extract_self_unsetting_shell_command(
@@ -37,6 +40,125 @@ pub(crate) fn normalize_set_hook_mutation_request(
         lifecycle: HookLifecycle::OneShot,
         command: Some(shell_command),
         ..request
+    }
+}
+
+pub(crate) fn canonicalize_set_hook_mutation_command(
+    mut request: SetHookMutationRequest,
+) -> Result<SetHookMutationRequest, RmuxError> {
+    let Some(command) = request.command.as_deref() else {
+        return Ok(request);
+    };
+
+    match CommandParser::new().parse(command) {
+        Ok(parsed) => {
+            validate_parsed_hook_commands(&parsed)?;
+            request.command = Some(parsed.to_tmux_binding_string());
+            Ok(request)
+        }
+        Err(error) if error.message().starts_with("unknown command: ") => Ok(request),
+        Err(error) => Err(RmuxError::Server(error.to_string())),
+    }
+}
+
+fn validate_parsed_hook_commands(
+    commands: &rmux_core::command_parser::ParsedCommands,
+) -> Result<(), RmuxError> {
+    for command in commands.commands() {
+        validate_no_positional_hook_command(command)?;
+    }
+    Ok(())
+}
+
+fn validate_no_positional_hook_command(command: &ParsedCommand) -> Result<(), RmuxError> {
+    let Some(spec) = NoPositionalCommandSpec::for_command(command.name()) else {
+        return Ok(());
+    };
+
+    let mut index = 0;
+    while index < command.arguments().len() {
+        let argument = &command.arguments()[index];
+        let Some(value) = argument.as_string() else {
+            return Err(too_many_hook_arguments(
+                command.name(),
+                spec.max_positionals,
+            ));
+        };
+
+        if value == "--" {
+            if index + 1 < command.arguments().len() {
+                return Err(too_many_hook_arguments(
+                    command.name(),
+                    spec.max_positionals,
+                ));
+            }
+            return Ok(());
+        }
+
+        if spec.boolean_flags.contains(&value) {
+            index += 1;
+            continue;
+        }
+
+        if spec.value_flags.contains(&value) {
+            index += 2;
+            continue;
+        }
+
+        if spec
+            .value_flags
+            .iter()
+            .any(|flag| value.starts_with(flag) && value.len() > flag.len())
+        {
+            index += 1;
+            continue;
+        }
+
+        if value.starts_with('-') {
+            return Err(RmuxError::Server(format!(
+                "command {}: unknown flag {}",
+                command.name(),
+                value
+            )));
+        }
+
+        return Err(too_many_hook_arguments(
+            command.name(),
+            spec.max_positionals,
+        ));
+    }
+
+    Ok(())
+}
+
+fn too_many_hook_arguments(command: &str, max_positionals: usize) -> RmuxError {
+    RmuxError::Server(format!(
+        "command {command}: too many arguments (need at most {max_positionals})"
+    ))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NoPositionalCommandSpec {
+    max_positionals: usize,
+    boolean_flags: &'static [&'static str],
+    value_flags: &'static [&'static str],
+}
+
+impl NoPositionalCommandSpec {
+    fn for_command(command: &str) -> Option<Self> {
+        match command {
+            "last-window" | "next-layout" | "previous-layout" => Some(Self {
+                max_positionals: 0,
+                boolean_flags: &[],
+                value_flags: &["-t"],
+            }),
+            "next-window" | "previous-window" => Some(Self {
+                max_positionals: 0,
+                boolean_flags: &["-a"],
+                value_flags: &["-t"],
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -187,6 +309,66 @@ mod tests {
         let normalized = super::normalize_set_hook_mutation_request(request);
         assert_eq!(normalized.lifecycle, HookLifecycle::OneShot);
         assert_eq!(normalized.command.as_deref(), Some("printf attached"));
+    }
+
+    #[test]
+    fn canonicalizes_known_hook_commands_before_storage() {
+        let request = SetHookMutationRequest {
+            scope: ScopeSelector::Global,
+            hook: HookName::PaneExited,
+            command: Some("display hi ; selectw -t :0".to_owned()),
+            lifecycle: HookLifecycle::Persistent,
+            append: false,
+            unset: false,
+            run_immediately: false,
+            index: None,
+        };
+
+        let canonical = super::canonicalize_set_hook_mutation_command(request)
+            .expect("known commands should canonicalize");
+        assert_eq!(
+            canonical.command.as_deref(),
+            Some("display-message hi \\; select-window -t :0")
+        );
+    }
+
+    #[test]
+    fn rejects_hook_commands_with_invalid_known_command_arity() {
+        let request = SetHookMutationRequest {
+            scope: ScopeSelector::Global,
+            hook: HookName::PaneExited,
+            command: Some("next \"win\"".to_owned()),
+            lifecycle: HookLifecycle::Persistent,
+            append: false,
+            unset: false,
+            run_immediately: false,
+            index: None,
+        };
+
+        let error = super::canonicalize_set_hook_mutation_command(request)
+            .expect_err("known commands with invalid arity must be rejected");
+        assert!(
+            error.to_string().contains("too many arguments"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn preserves_unknown_hook_commands_for_legacy_shell_fallback() {
+        let request = SetHookMutationRequest {
+            scope: ScopeSelector::Global,
+            hook: HookName::PaneExited,
+            command: Some("printf attached".to_owned()),
+            lifecycle: HookLifecycle::Persistent,
+            append: false,
+            unset: false,
+            run_immediately: false,
+            index: None,
+        };
+
+        let canonical = super::canonicalize_set_hook_mutation_command(request)
+            .expect("unknown command should remain available to shell fallback");
+        assert_eq!(canonical.command.as_deref(), Some("printf attached"));
     }
 
     fn shell_quote_str(value: &str) -> String {

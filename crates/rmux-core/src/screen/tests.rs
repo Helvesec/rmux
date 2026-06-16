@@ -14,6 +14,96 @@ fn new_screen(cols: u16, rows: u16, history: usize) -> Screen {
 }
 
 #[test]
+fn selected_cell_tracking_is_updated_when_selection_is_marked() {
+    let mut screen = new_screen(10, 2, 10);
+    assert!(!screen.has_selected_cells());
+
+    let before = screen
+        .visible_line_revision(0)
+        .expect("visible row revision");
+    screen.mark_selected_row_range(0, 2, 4);
+
+    assert!(screen.has_selected_cells());
+    assert_ne!(
+        screen
+            .visible_line_revision(0)
+            .expect("visible row revision"),
+        before,
+        "selection paint must invalidate delta-render caches"
+    );
+}
+
+#[test]
+fn selected_cell_tracking_is_cleared_when_selection_is_removed() {
+    let mut screen = new_screen(10, 2, 10);
+    screen.mark_selected_row_range(0, 2, 4);
+    let before = screen
+        .visible_line_revision(0)
+        .expect("visible row revision");
+
+    screen.clear_selected_cells();
+
+    assert!(!screen.has_selected_cells());
+    assert_ne!(
+        screen
+            .visible_line_revision(0)
+            .expect("visible row revision"),
+        before,
+        "selection clear must invalidate delta-render caches"
+    );
+}
+
+#[test]
+fn selection_style_overlay_consumes_selected_cell_markers() {
+    let mut screen = new_screen(10, 2, 10);
+    screen.mark_selected_row_range(0, 2, 4);
+
+    screen.overlay_style_on_selected("bg=cyan,fg=black");
+
+    assert!(!screen.has_selected_cells());
+}
+
+#[test]
+fn selected_cell_tracking_is_cleared_when_terminal_writes_text() {
+    let mut screen = new_screen(10, 2, 10);
+    screen.mark_selected_row_range(0, 2, 4);
+
+    parse(&mut screen, b"A");
+
+    assert!(!screen.has_selected_cells());
+}
+
+#[test]
+fn selected_cell_tracking_is_cleared_when_terminal_clears_screen() {
+    let mut screen = new_screen(10, 2, 10);
+    screen.mark_selected_row_range(0, 2, 4);
+
+    parse(&mut screen, b"\x1b[2J");
+
+    assert!(!screen.has_selected_cells());
+}
+
+#[test]
+fn selected_cell_tracking_is_cleared_when_alternate_screen_changes() {
+    let mut screen = new_screen(10, 2, 10);
+    screen.mark_selected_row_range(0, 2, 4);
+
+    parse(&mut screen, b"\x1b[?1049h");
+
+    assert!(!screen.has_selected_cells());
+}
+
+#[test]
+fn selected_cell_tracking_is_cleared_when_screen_resizes() {
+    let mut screen = new_screen(10, 2, 10);
+    screen.mark_selected_row_range(0, 2, 4);
+
+    screen.resize(TerminalSize { cols: 12, rows: 2 });
+
+    assert!(!screen.has_selected_cells());
+}
+
+#[test]
 fn terminal_passthrough_drops_oversized_payloads() {
     let mut screen = new_screen(10, 2, 10);
     let payload = vec![b'A'; MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES + 1];
@@ -83,6 +173,29 @@ fn full_range() -> ScreenCaptureRange {
 }
 
 #[test]
+fn trim_below_cursor_truncates_transcript_and_pulls_history_into_view() {
+    let mut screen = new_screen(10, 5, 20);
+    parse(
+        &mut screen,
+        b"01\r\n02\r\n03\r\n04\r\n05\r\n06\r\n07\r\n08\r\n09\r\n10\x1b[3;1H",
+    );
+
+    assert_eq!(screen.cursor_position(), (0, 2));
+    assert_eq!(screen.history_size(), 5);
+
+    assert!(screen.trim_below_cursor());
+
+    let output = screen.capture_transcript(full_range(), GridRenderOptions::default());
+    let output = String::from_utf8(output).expect("screen text is utf-8");
+    assert_eq!(
+        output.lines().collect::<Vec<_>>(),
+        vec!["01", "02", "03", "04", "05", "06", "07", "08"]
+    );
+    assert_eq!(screen.cursor_position(), (0, 4));
+    assert_eq!(screen.history_size(), 3);
+}
+
+#[test]
 fn wrapped_line_sets_wrapped_flag() {
     let mut screen = new_screen(3, 2, 10);
     parse(&mut screen, b"abcdef");
@@ -94,6 +207,19 @@ fn wrapped_line_sets_wrapped_flag() {
         .flags()
         .contains(crate::grid::GridLineFlags::WRAPPED));
     assert_eq!(screen.capture_grid(false).lines, vec!["abc", "def"]);
+}
+
+#[test]
+fn wrapped_ascii_history_uses_plain_text_storage() {
+    let mut screen = new_screen(4, 2, 10);
+    parse(&mut screen, b"abcdefghijklmnop");
+
+    let history = screen.grid().absolute_line(0).expect("history line exists");
+    assert!(history
+        .flags()
+        .contains(crate::grid::GridLineFlags::WRAPPED));
+    assert_eq!(history.plain_text(), Some("abcd"));
+    assert_eq!(history.cells().len(), 0);
 }
 
 #[test]
@@ -168,6 +294,30 @@ fn scrollback_lines_are_captured_after_crlf_output() {
 }
 
 #[test]
+fn erase_display_moves_used_visible_rows_to_history() {
+    let mut screen = new_screen(12, 4, 10);
+    parse(&mut screen, b"$ printf\r\n$ clear-x\x1b[H\x1b[2J$");
+
+    assert_eq!(screen.history_size(), 2);
+    assert_eq!(
+        screen.capture_transcript(full_range(), GridRenderOptions::default()),
+        b"$ printf\n$ clear-x\n$\n\n\n\n"
+    );
+}
+
+#[test]
+fn erase_to_end_from_home_moves_used_visible_rows_to_history() {
+    let mut screen = new_screen(12, 4, 10);
+    parse(&mut screen, b"$ printf\r\n$ clear-x\x1b[H\x1b[J$");
+
+    assert_eq!(screen.history_size(), 2);
+    assert_eq!(
+        screen.capture_transcript(full_range(), GridRenderOptions::default()),
+        b"$ printf\n$ clear-x\n$\n\n\n\n"
+    );
+}
+
+#[test]
 fn independent_transcript_lines_repeat_carried_sgr_state() {
     let mut screen = new_screen(8, 2, 10);
     parse(&mut screen, b"\x1b[48;2;20;20;20mone\r\n   ");
@@ -187,6 +337,23 @@ fn independent_transcript_lines_repeat_carried_sgr_state() {
 }
 
 #[test]
+fn insert_and_delete_character_materialize_compact_plain_lines() {
+    let mut insert_screen = new_screen(8, 2, 10);
+    parse(&mut insert_screen, b"abcd\x1b[1;3H\x1b[@");
+    assert_eq!(
+        insert_screen.capture_transcript(full_range(), GridRenderOptions::default()),
+        b"ab cd\n\n"
+    );
+
+    let mut delete_screen = new_screen(8, 2, 10);
+    parse(&mut delete_screen, b"abcd\x1b[1;2H\x1b[P");
+    assert_eq!(
+        delete_screen.capture_transcript(full_range(), GridRenderOptions::default()),
+        b"acd\n\n"
+    );
+}
+
+#[test]
 fn alternate_screen_does_not_append_to_history() {
     let mut screen = new_screen(8, 2, 10);
     parse(&mut screen, b"main\n");
@@ -199,6 +366,19 @@ fn alternate_screen_does_not_append_to_history() {
             .expect("utf8");
     assert!(captured.contains("main"));
     assert!(!captured.contains("alt"));
+}
+
+#[test]
+fn alternate_screen_entry_preserves_cursor_position() {
+    let mut screen = new_screen(12, 5, 10);
+    screen.set_preserve_alternate_screen_cursor(true);
+    parse(&mut screen, b"main1\r\nmain2\x1b[?1049halt");
+
+    assert_eq!(screen.cursor_position(), (8, 1));
+    assert_eq!(
+        screen.capture_transcript(full_range(), GridRenderOptions::default()),
+        b"\n     alt\n\n\n\n"
+    );
 }
 
 #[test]

@@ -1,5 +1,7 @@
 use rmux_core::{input::mode, GridRenderOptions, PaneId, ScreenCaptureRange, Utf8Config};
-use rmux_proto::{OptionName, PaneTarget, RmuxError, ScopeSelector, SessionName};
+use rmux_proto::{
+    OptionName, OptionScopeSelector, PaneTarget, RmuxError, ScopeSelector, SessionName,
+};
 
 use crate::pane_screen_state::PaneScreenState;
 use crate::pane_terminal_lookup::{missing_pane_terminal, pane_id_for_target};
@@ -142,6 +144,24 @@ impl HandlerState {
         Ok(())
     }
 
+    pub(crate) fn reset_pane_terminal_state(&self, target: &PaneTarget) -> Result<(), RmuxError> {
+        let transcript = self.transcript_handle(target)?;
+        let mut transcript = transcript
+            .lock()
+            .expect("pane transcript mutex must not be poisoned");
+        transcript.reset_terminal_state();
+        Ok(())
+    }
+
+    pub(crate) fn trim_pane_below_cursor(&self, target: &PaneTarget) -> Result<(), RmuxError> {
+        let transcript = self.transcript_handle(target)?;
+        let mut transcript = transcript
+            .lock()
+            .expect("pane transcript mutex must not be poisoned");
+        let _ = transcript.trim_below_cursor();
+        Ok(())
+    }
+
     pub(crate) fn set_pane_title(
         &mut self,
         target: &PaneTarget,
@@ -182,8 +202,40 @@ impl HandlerState {
                     self.refresh_transcript_input_buffer_limits();
                 }
             }
+            OptionName::AlternateScreen => {
+                self.refresh_transcript_alternate_screen_for_legacy_scope(scope);
+            }
             _ => {}
         }
+    }
+
+    pub(crate) fn refresh_transcript_alternate_screen_for_option_scope(
+        &mut self,
+        scope: &OptionScopeSelector,
+    ) {
+        let targets = match scope {
+            OptionScopeSelector::ServerGlobal
+            | OptionScopeSelector::SessionGlobal
+            | OptionScopeSelector::WindowGlobal => self.all_pane_targets(),
+            OptionScopeSelector::Session(session_name) => self.session_pane_targets(session_name),
+            OptionScopeSelector::Window(target) => {
+                self.window_pane_targets(target.session_name(), target.window_index())
+            }
+            OptionScopeSelector::Pane(target) => vec![target.clone()],
+        };
+        self.refresh_transcript_alternate_screen_for_targets(targets);
+    }
+
+    fn refresh_transcript_alternate_screen_for_legacy_scope(&mut self, scope: &ScopeSelector) {
+        let targets = match scope {
+            ScopeSelector::Global => self.all_pane_targets(),
+            ScopeSelector::Session(session_name) => self.session_pane_targets(session_name),
+            ScopeSelector::Window(target) => {
+                self.window_pane_targets(target.session_name(), target.window_index())
+            }
+            ScopeSelector::Pane(target) => vec![target.clone()],
+        };
+        self.refresh_transcript_alternate_screen_for_targets(targets);
     }
 
     pub(crate) fn pane_history_stats(
@@ -502,6 +554,113 @@ impl HandlerState {
                     .set_input_buffer_limit(limit);
             }
         }
+    }
+
+    fn refresh_transcript_alternate_screen_for_targets(&mut self, targets: Vec<PaneTarget>) {
+        for target in targets {
+            let enabled = self.alternate_screen_enabled_for_pane(
+                target.session_name(),
+                target.window_index(),
+                target.pane_index(),
+            );
+            if let Ok(transcript) = self.transcript_handle(&target) {
+                transcript
+                    .lock()
+                    .expect("pane transcript mutex must not be poisoned")
+                    .set_alternate_screen_enabled(enabled);
+            }
+        }
+    }
+
+    pub(in crate::pane_terminals) fn alternate_screen_enabled_for_pane_id(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> bool {
+        let Some(session) = self.sessions.session(session_name) else {
+            return true;
+        };
+        let Some(window_index) = session.window_index_for_pane_id(pane_id) else {
+            return true;
+        };
+        let Some(pane_index) = session
+            .window_at(window_index)
+            .and_then(|window| window.panes().iter().find(|pane| pane.id() == pane_id))
+            .map(|pane| pane.index())
+        else {
+            return true;
+        };
+        self.alternate_screen_enabled_for_pane(session_name, window_index, pane_index)
+    }
+
+    fn alternate_screen_enabled_for_pane(
+        &self,
+        session_name: &SessionName,
+        window_index: u32,
+        pane_index: u32,
+    ) -> bool {
+        self.options
+            .resolve_for_pane(
+                session_name,
+                window_index,
+                pane_index,
+                OptionName::AlternateScreen,
+            )
+            .is_none_or(|value| value != "off")
+    }
+
+    fn all_pane_targets(&self) -> Vec<PaneTarget> {
+        self.sessions
+            .iter()
+            .flat_map(|(session_name, session)| {
+                session
+                    .windows()
+                    .iter()
+                    .flat_map(move |(window_index, window)| {
+                        window.panes().iter().map(move |pane| {
+                            PaneTarget::with_window(
+                                session_name.clone(),
+                                *window_index,
+                                pane.index(),
+                            )
+                        })
+                    })
+            })
+            .collect()
+    }
+
+    fn session_pane_targets(&self, session_name: &SessionName) -> Vec<PaneTarget> {
+        let Some(session) = self.sessions.session(session_name) else {
+            return Vec::new();
+        };
+        session
+            .windows()
+            .iter()
+            .flat_map(|(window_index, window)| {
+                window.panes().iter().map(move |pane| {
+                    PaneTarget::with_window(session_name.clone(), *window_index, pane.index())
+                })
+            })
+            .collect()
+    }
+
+    fn window_pane_targets(
+        &self,
+        session_name: &SessionName,
+        window_index: u32,
+    ) -> Vec<PaneTarget> {
+        let Some(window) = self
+            .sessions
+            .session(session_name)
+            .and_then(|session| session.window_at(window_index))
+        else {
+            return Vec::new();
+        };
+        window
+            .panes()
+            .iter()
+            .map(|pane| PaneTarget::with_window(session_name.clone(), window_index, pane.index()))
+            .collect()
     }
 
     pub(in crate::pane_terminals) fn input_buffer_limit(&self) -> usize {

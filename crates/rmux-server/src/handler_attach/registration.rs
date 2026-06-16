@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 #[cfg(test)]
 use std::sync::Arc;
 
@@ -70,10 +70,12 @@ impl RequestHandler {
             session_name,
             AttachRegistration {
                 control_tx,
+                control_backlog: Arc::new(AtomicUsize::new(0)),
                 closing,
                 persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
                 terminal_context,
                 flags,
+                render_stream: false,
                 uid: current_owner_uid(),
                 user: UserIdentity::Uid(current_owner_uid()),
                 can_write: true,
@@ -115,6 +117,9 @@ impl RequestHandler {
                 pan_ox: 0,
                 pan_oy: 0,
                 control_tx: registration.control_tx,
+                control_backlog: registration.control_backlog,
+                render_stream: registration.render_stream,
+                render_refresh_pending: false,
                 uid: registration.uid,
                 user: registration.user,
                 can_write: registration.can_write,
@@ -168,7 +173,7 @@ impl RequestHandler {
     }
 
     pub(crate) async fn finish_attach(&self, requester_pid: u32, attach_id: u64) {
-        let (removed_key_table, removed_overlay) = {
+        let (removed_session, removed_key_table, removed_overlay) = {
             let mut active_attach = self.active_attach.lock().await;
             if active_attach
                 .by_pid
@@ -178,16 +183,25 @@ impl RequestHandler {
                 active_attach
                     .by_pid
                     .remove(&requester_pid)
-                    .map(|active| (active.key_table_name, active.overlay))
-                    .unwrap_or((None, None))
+                    .map(|active| {
+                        (
+                            Some(active.session_name),
+                            active.key_table_name,
+                            active.overlay,
+                        )
+                    })
+                    .unwrap_or((None, None, None))
             } else {
-                (None, None)
+                (None, None, None)
             }
         };
         super::terminate_overlay_job(removed_overlay);
         if let Some(table_name) = removed_key_table {
             let mut state = self.state.lock().await;
             state.key_bindings.unref_table(&table_name);
+        }
+        if let Some(session_name) = removed_session {
+            self.destroy_unattached_sessions(vec![session_name]).await;
         }
     }
 }

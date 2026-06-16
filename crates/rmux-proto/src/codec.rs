@@ -9,8 +9,10 @@ use crate::envelope::{
 };
 use crate::RmuxError;
 
-/// Default maximum detached frame payload length in bytes.
+/// Maximum payload for small protocol buffers that must stay bounded.
 pub const DEFAULT_MAX_FRAME_LENGTH: usize = 1024 * 1024;
+/// Maximum detached RPC frame payload length in bytes.
+pub const DEFAULT_MAX_DETACHED_FRAME_LENGTH: usize = 8 * DEFAULT_MAX_FRAME_LENGTH;
 
 /// Encodes a detached message as a versioned length-prefixed bincode frame.
 pub fn encode_frame<T>(value: &T) -> Result<Vec<u8>, RmuxError>
@@ -24,10 +26,10 @@ where
         return Err(RmuxError::EmptyFrame);
     }
 
-    if payload.len() > DEFAULT_MAX_FRAME_LENGTH {
+    if payload.len() > DEFAULT_MAX_DETACHED_FRAME_LENGTH {
         return Err(RmuxError::FrameTooLarge {
             length: payload.len(),
-            maximum: DEFAULT_MAX_FRAME_LENGTH,
+            maximum: DEFAULT_MAX_DETACHED_FRAME_LENGTH,
         });
     }
 
@@ -79,10 +81,10 @@ where
         return Err(RmuxError::EmptyFrame);
     }
 
-    if length > DEFAULT_MAX_FRAME_LENGTH {
+    if length > DEFAULT_MAX_DETACHED_FRAME_LENGTH {
         return Err(RmuxError::FrameTooLarge {
             length,
-            maximum: DEFAULT_MAX_FRAME_LENGTH,
+            maximum: DEFAULT_MAX_DETACHED_FRAME_LENGTH,
         });
     }
 
@@ -114,7 +116,7 @@ impl FrameDecoder {
     /// Creates a decoder with the default maximum frame length.
     #[must_use]
     pub fn new() -> Self {
-        Self::with_max_frame_length(DEFAULT_MAX_FRAME_LENGTH)
+        Self::with_max_frame_length(DEFAULT_MAX_DETACHED_FRAME_LENGTH)
     }
 
     /// Creates a decoder with a custom maximum frame length.
@@ -147,7 +149,10 @@ impl FrameDecoder {
         let Some((version, version_len)) = decode_varint_u32(&self.buffer[1..])? else {
             return Ok(None);
         };
-        ensure_supported_version(version)?;
+        if let Err(error) = ensure_supported_version(version) {
+            self.buffer.clear();
+            return Err(error);
+        }
         let header_start = 1 + version_len;
         if self.buffer.len() < header_start + 4 {
             return Ok(None);

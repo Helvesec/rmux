@@ -10,7 +10,9 @@ use crate::{
     SessionId, SessionInfo, TerminalSizeSpec, WindowId, WindowInfo, WindowRef,
 };
 use rmux_proto::{
-    KillWindowRequest, ListPanesRequest, ListSessionsRequest, ListWindowsRequest, Request, Response,
+    KillWindowRequest, LayoutName, ListPanesRequest, ListSessionsRequest, ListWindowsRequest,
+    RenameWindowRequest, Request, ResizeWindowRequest, Response, SelectLayoutRequest,
+    SelectLayoutTarget, SelectWindowRequest,
 };
 
 #[path = "window/new_builder.rs"]
@@ -125,6 +127,28 @@ impl Window {
         window_info_snapshot(&self.transport, &self.target).await
     }
 
+    /// Selects this window in its session.
+    pub async fn select(&self) -> Result<()> {
+        select_window(&self.transport, &self.target).await
+    }
+
+    /// Renames this window.
+    pub async fn rename(&self, name: impl Into<String>) -> Result<()> {
+        rename_window(&self.transport, &self.target, name.into()).await
+    }
+
+    /// Requests an absolute size for this window.
+    ///
+    /// Passing `None` for one dimension leaves that dimension to the daemon.
+    pub async fn resize(&self, width: Option<u16>, height: Option<u16>) -> Result<()> {
+        resize_window(&self.transport, &self.target, width, height).await
+    }
+
+    /// Applies a named layout to this window.
+    pub async fn select_layout(&self, layout: LayoutName) -> Result<()> {
+        select_window_layout(&self.transport, &self.target, layout).await
+    }
+
     /// Consumes this handle and kills the addressed window through the daemon.
     ///
     /// A stale handle is treated as an idempotent no-op and returns
@@ -143,6 +167,68 @@ impl fmt::Debug for Window {
             .debug_struct("Window")
             .field("target", &self.target)
             .finish_non_exhaustive()
+    }
+}
+
+async fn select_window(client: &TransportClient, target: &WindowRef) -> Result<()> {
+    match client
+        .request(Request::SelectWindow(SelectWindowRequest {
+            target: target.to_proto(),
+        }))
+        .await?
+    {
+        Response::SelectWindow(_) => Ok(()),
+        response => Err(unexpected_response("select-window", response)),
+    }
+}
+
+async fn rename_window(client: &TransportClient, target: &WindowRef, name: String) -> Result<()> {
+    match client
+        .request(Request::RenameWindow(RenameWindowRequest {
+            target: target.to_proto(),
+            name,
+        }))
+        .await?
+    {
+        Response::RenameWindow(_) => Ok(()),
+        response => Err(unexpected_response("rename-window", response)),
+    }
+}
+
+async fn resize_window(
+    client: &TransportClient,
+    target: &WindowRef,
+    width: Option<u16>,
+    height: Option<u16>,
+) -> Result<()> {
+    match client
+        .request(Request::ResizeWindow(ResizeWindowRequest {
+            target: target.to_proto(),
+            width,
+            height,
+            adjustment: None,
+        }))
+        .await?
+    {
+        Response::ResizeWindow(_) => Ok(()),
+        response => Err(unexpected_response("resize-window", response)),
+    }
+}
+
+async fn select_window_layout(
+    client: &TransportClient,
+    target: &WindowRef,
+    layout: LayoutName,
+) -> Result<()> {
+    match client
+        .request(Request::SelectLayout(SelectLayoutRequest {
+            target: SelectLayoutTarget::Window(target.to_proto()),
+            layout,
+        }))
+        .await?
+    {
+        Response::SelectLayout(_) => Ok(()),
+        response => Err(unexpected_response("select-layout", response)),
     }
 }
 
@@ -431,3 +517,7 @@ fn is_already_closed_error(error: &RmuxError, target: &WindowRef) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+#[path = "window/tests.rs"]
+mod tests;

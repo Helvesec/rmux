@@ -214,6 +214,7 @@ async fn display_message_session_target_includes_active_pane_runtime_context(
                 "#{session_name}|#{window_index}|#{pane_index}|#{pane_current_path}|#{pane_pid}|#{pane_tty}|#{socket_path}"
                     .to_owned(),
             ),
+            empty_target_context: false,
             }),
     )
     .await?;

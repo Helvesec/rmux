@@ -76,6 +76,474 @@ async fn swap_window_without_d_preserves_active_slots_across_sessions() {
 }
 
 #[tokio::test]
+async fn swap_window_across_sessions_swaps_linked_slot_metadata() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    let gamma = session_name("gamma");
+    create_session(&handler, "alpha").await;
+    create_session(&handler, "beta").await;
+    create_session(&handler, "gamma").await;
+
+    let link = handler
+        .handle(Request::LinkWindow(LinkWindowRequest {
+            source: WindowTarget::with_window(alpha.clone(), 0),
+            target: WindowTarget::with_window(gamma.clone(), 1),
+            after: false,
+            before: false,
+            kill_destination: false,
+            detached: true,
+        }))
+        .await;
+    assert!(matches!(link, Response::LinkWindow(_)));
+
+    let response = handler
+        .handle(Request::SwapWindow(SwapWindowRequest {
+            source: WindowTarget::with_window(alpha.clone(), 0),
+            target: WindowTarget::with_window(beta.clone(), 0),
+            detached: false,
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::SwapWindow(rmux_proto::SwapWindowResponse {
+            source: WindowTarget::with_window(alpha.clone(), 0),
+            target: WindowTarget::with_window(beta.clone(), 0),
+        })
+    );
+
+    {
+        let state = handler.state.lock().await;
+        assert_eq!(state.window_link_count(&alpha, 0), 1);
+        assert_eq!(state.window_link_count(&beta, 0), 2);
+        assert_eq!(state.window_link_count(&gamma, 1), 2);
+        assert_eq!(
+            state.window_linked_sessions_list(&gamma, 1),
+            vec![beta.clone(), gamma.clone()]
+        );
+    }
+
+    let rename = handler
+        .handle(Request::RenameWindow(RenameWindowRequest {
+            target: WindowTarget::with_window(gamma.clone(), 1),
+            name: "logs".to_owned(),
+        }))
+        .await;
+    assert!(matches!(rename, Response::RenameWindow(_)));
+
+    let state = handler.state.lock().await;
+    assert_ne!(
+        state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.name()),
+        Some("logs")
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&beta)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.name()),
+        Some("logs")
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&gamma)
+            .and_then(|session| session.window_at(1))
+            .and_then(|window| window.name()),
+        Some("logs")
+    );
+}
+
+#[tokio::test]
+async fn swap_window_from_linked_slot_preserves_runtime_owners() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    let gamma = session_name("gamma");
+    create_session(&handler, "alpha").await;
+    create_session(&handler, "beta").await;
+    create_session(&handler, "gamma").await;
+
+    let linked_pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id())
+            .expect("alpha pane should exist")
+    };
+    let gamma_pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&gamma)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id())
+            .expect("gamma pane should exist")
+    };
+
+    let link = handler
+        .handle(Request::LinkWindow(LinkWindowRequest {
+            source: WindowTarget::with_window(alpha.clone(), 0),
+            target: WindowTarget::with_window(beta.clone(), 1),
+            after: false,
+            before: false,
+            kill_destination: false,
+            detached: true,
+        }))
+        .await;
+    assert!(matches!(link, Response::LinkWindow(_)));
+
+    let response = handler
+        .handle(Request::SwapWindow(SwapWindowRequest {
+            source: WindowTarget::with_window(beta.clone(), 1),
+            target: WindowTarget::with_window(gamma.clone(), 0),
+            detached: false,
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::SwapWindow(rmux_proto::SwapWindowResponse {
+            source: WindowTarget::with_window(beta.clone(), 1),
+            target: WindowTarget::with_window(gamma.clone(), 0),
+        })
+    );
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state
+            .sessions
+            .session(&gamma)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id()),
+        Some(linked_pane_id)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&beta)
+            .and_then(|session| session.window_at(1))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id()),
+        Some(gamma_pane_id)
+    );
+    state
+        .pane_profile_in_window(&gamma, 0, 0)
+        .expect("linked window pane should remain reachable after swap");
+    state
+        .pane_profile_in_window(&beta, 1, 0)
+        .expect("unlinked target pane should move to the source slot runtime");
+    assert_eq!(state.window_link_count(&alpha, 0), 2);
+    assert_eq!(state.window_link_count(&gamma, 0), 2);
+    assert_eq!(state.window_link_count(&beta, 1), 1);
+}
+
+#[tokio::test]
+async fn swap_window_from_group_peer_swaps_runtime_state() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    let gamma = session_name("gamma");
+    create_session(&handler, "alpha").await;
+    create_grouped_session(&handler, "beta", &alpha).await;
+    create_session(&handler, "gamma").await;
+
+    let grouped_pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&beta)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id())
+            .expect("grouped pane should exist")
+    };
+    let gamma_pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&gamma)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id())
+            .expect("gamma pane should exist")
+    };
+
+    let response = handler
+        .handle(Request::SwapWindow(SwapWindowRequest {
+            source: WindowTarget::with_window(beta.clone(), 0),
+            target: WindowTarget::with_window(gamma.clone(), 0),
+            detached: false,
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::SwapWindow(rmux_proto::SwapWindowResponse {
+            source: WindowTarget::with_window(beta.clone(), 0),
+            target: WindowTarget::with_window(gamma.clone(), 0),
+        })
+    );
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id()),
+        Some(gamma_pane_id)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&beta)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id()),
+        Some(gamma_pane_id)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&gamma)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id()),
+        Some(grouped_pane_id)
+    );
+    state
+        .pane_profile_in_window(&beta, 0, 0)
+        .expect("swapped grouped pane terminal should live in the group runtime");
+    state
+        .pane_profile_in_window(&gamma, 0, 0)
+        .expect("swapped target pane terminal should live in gamma");
+}
+
+#[tokio::test]
+async fn swap_window_from_group_peer_linked_source_moves_link_metadata_to_target() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    let gamma = session_name("gamma");
+    let delta = session_name("delta");
+    create_session(&handler, "alpha").await;
+    create_grouped_session(&handler, "beta", &alpha).await;
+    create_session(&handler, "gamma").await;
+    create_session(&handler, "delta").await;
+
+    let (linked_pane_id, delta_pane_id) = {
+        let state = handler.state.lock().await;
+        (
+            state
+                .sessions
+                .session(&beta)
+                .and_then(|session| session.window_at(0))
+                .and_then(|window| window.pane(0))
+                .map(|pane| pane.id())
+                .expect("grouped pane should exist"),
+            state
+                .sessions
+                .session(&delta)
+                .and_then(|session| session.window_at(0))
+                .and_then(|window| window.pane(0))
+                .map(|pane| pane.id())
+                .expect("delta pane should exist"),
+        )
+    };
+
+    let link = handler
+        .handle(Request::LinkWindow(LinkWindowRequest {
+            source: WindowTarget::with_window(alpha.clone(), 0),
+            target: WindowTarget::with_window(gamma.clone(), 1),
+            after: false,
+            before: false,
+            kill_destination: false,
+            detached: true,
+        }))
+        .await;
+    assert!(matches!(link, Response::LinkWindow(_)));
+
+    let response = handler
+        .handle(Request::SwapWindow(SwapWindowRequest {
+            source: WindowTarget::with_window(beta.clone(), 0),
+            target: WindowTarget::with_window(delta.clone(), 0),
+            detached: true,
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::SwapWindow(rmux_proto::SwapWindowResponse {
+            source: WindowTarget::with_window(beta.clone(), 0),
+            target: WindowTarget::with_window(delta.clone(), 0),
+        })
+    );
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id()),
+        Some(delta_pane_id)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&beta)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id()),
+        Some(delta_pane_id)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&delta)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id()),
+        Some(linked_pane_id)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&gamma)
+            .and_then(|session| session.window_at(1))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id()),
+        Some(linked_pane_id)
+    );
+    state
+        .pane_profile_in_window(&delta, 0, 0)
+        .expect("linked source pane should move to target runtime");
+    state
+        .pane_profile_in_window(&gamma, 1, 0)
+        .expect("surviving linked peer should keep runtime access");
+    assert_eq!(state.window_link_count(&alpha, 0), 1);
+    assert_eq!(state.window_link_count(&delta, 0), 2);
+    assert_eq!(state.window_link_count(&gamma, 1), 2);
+}
+
+#[tokio::test]
+async fn swap_window_from_group_peer_linked_target_moves_link_metadata_to_source_family() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    let gamma = session_name("gamma");
+    let delta = session_name("delta");
+    create_session(&handler, "alpha").await;
+    create_grouped_session(&handler, "beta", &alpha).await;
+    create_session(&handler, "gamma").await;
+    create_session(&handler, "delta").await;
+
+    let (grouped_pane_id, linked_pane_id) = {
+        let state = handler.state.lock().await;
+        (
+            state
+                .sessions
+                .session(&beta)
+                .and_then(|session| session.window_at(0))
+                .and_then(|window| window.pane(0))
+                .map(|pane| pane.id())
+                .expect("grouped pane should exist"),
+            state
+                .sessions
+                .session(&gamma)
+                .and_then(|session| session.window_at(0))
+                .and_then(|window| window.pane(0))
+                .map(|pane| pane.id())
+                .expect("gamma pane should exist"),
+        )
+    };
+
+    let link = handler
+        .handle(Request::LinkWindow(LinkWindowRequest {
+            source: WindowTarget::with_window(gamma.clone(), 0),
+            target: WindowTarget::with_window(delta.clone(), 1),
+            after: false,
+            before: false,
+            kill_destination: false,
+            detached: true,
+        }))
+        .await;
+    assert!(matches!(link, Response::LinkWindow(_)));
+
+    let response = handler
+        .handle(Request::SwapWindow(SwapWindowRequest {
+            source: WindowTarget::with_window(beta.clone(), 0),
+            target: WindowTarget::with_window(gamma.clone(), 0),
+            detached: true,
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::SwapWindow(rmux_proto::SwapWindowResponse {
+            source: WindowTarget::with_window(beta.clone(), 0),
+            target: WindowTarget::with_window(gamma.clone(), 0),
+        })
+    );
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id()),
+        Some(linked_pane_id)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&beta)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id()),
+        Some(linked_pane_id)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&gamma)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id()),
+        Some(grouped_pane_id)
+    );
+    assert_eq!(
+        state
+            .sessions
+            .session(&delta)
+            .and_then(|session| session.window_at(1))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id()),
+        Some(linked_pane_id)
+    );
+    state
+        .pane_profile_in_window(&alpha, 0, 0)
+        .expect("linked target pane should move to the source family runtime");
+    state
+        .pane_profile_in_window(&delta, 1, 0)
+        .expect("surviving linked peer should keep runtime access");
+    assert_eq!(state.window_link_count(&alpha, 0), 2);
+    assert_eq!(state.window_link_count(&beta, 0), 2);
+    assert_eq!(state.window_link_count(&delta, 1), 2);
+    assert_eq!(state.window_link_count(&gamma, 0), 1);
+}
+
+#[tokio::test]
 async fn rotate_window_updates_the_active_pane_after_reordering_the_window() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -262,6 +730,8 @@ async fn move_window_rejects_nonexistent_source() {
             renumber: false,
             kill_destination: false,
             detached: false,
+            after: false,
+            before: false,
         }))
         .await;
 
@@ -303,7 +773,7 @@ async fn rotate_window_rejects_nonexistent_window() {
 }
 
 #[tokio::test]
-async fn move_window_same_source_and_destination_is_a_noop() {
+async fn move_window_same_source_and_destination_is_noop_without_kill() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     create_session(&handler, "alpha").await;
@@ -315,6 +785,8 @@ async fn move_window_same_source_and_destination_is_a_noop() {
             renumber: false,
             kill_destination: false,
             detached: false,
+            after: false,
+            before: false,
         }))
         .await;
 
@@ -328,7 +800,7 @@ async fn move_window_same_source_and_destination_is_a_noop() {
 }
 
 #[tokio::test]
-async fn move_window_noop_does_not_consume_link_hooks() {
+async fn move_window_same_index_noop_does_not_consume_link_hooks() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     create_session(&handler, "alpha").await;
@@ -362,6 +834,8 @@ async fn move_window_noop_does_not_consume_link_hooks() {
             renumber: false,
             kill_destination: false,
             detached: false,
+            after: false,
+            before: false,
         }))
         .await;
 
@@ -374,5 +848,31 @@ async fn move_window_noop_does_not_consume_link_hooks() {
     assert_eq!(
         state.hooks.global_command(HookName::WindowLinked),
         Some("true")
+    );
+}
+
+#[tokio::test]
+async fn move_window_same_source_and_destination_with_kill_reports_same_index() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    create_session(&handler, "alpha").await;
+
+    let response = handler
+        .handle(Request::MoveWindow(MoveWindowRequest {
+            source: Some(WindowTarget::with_window(alpha.clone(), 0)),
+            target: MoveWindowTarget::Window(WindowTarget::with_window(alpha.clone(), 0)),
+            renumber: false,
+            kill_destination: true,
+            detached: false,
+            after: false,
+            before: false,
+        }))
+        .await;
+
+    assert_eq!(
+        response,
+        Response::Error(rmux_proto::ErrorResponse {
+            error: rmux_proto::RmuxError::Server("same index: 0".to_owned()),
+        })
     );
 }

@@ -38,7 +38,7 @@ pub(crate) struct WebShareArgs {
     pub(crate) lookup: Option<String>,
     #[arg(long = "config", action = ArgAction::SetTrue, group = "mode")]
     pub(crate) config: bool,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(long = "operator-only", action = ArgAction::SetTrue, conflicts_with = "spectator_only")]
     pub(crate) operator_only: bool,

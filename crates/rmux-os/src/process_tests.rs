@@ -23,6 +23,18 @@ fn current_process_path_is_available() {
 }
 
 #[test]
+fn linux_cwd_path_string_strips_deleted_suffix() {
+    assert_eq!(
+        linux_cwd_path_string(PathBuf::from("/tmp/rmux-cwd (deleted)")),
+        "/tmp/rmux-cwd"
+    );
+    assert_eq!(
+        linux_cwd_path_string(PathBuf::from("/tmp/rmux-cwd")),
+        "/tmp/rmux-cwd"
+    );
+}
+
+#[test]
 fn current_process_command_name_is_available() {
     let name = command_name(std::process::id()).expect("current process command should be visible");
     assert!(!name.is_empty());
@@ -148,6 +160,28 @@ fn parses_nul_separated_environment() {
 
     assert_eq!(environment.get("A").map(String::as_str), Some("1"));
     assert_eq!(environment.get("B").map(String::as_str), Some("two"));
+}
+
+#[cfg(unix)]
+#[test]
+fn parses_raw_nul_separated_environment_without_utf8_filtering() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let environment = raw_environment_from_nul_entries(b"A=1\0BAD=foo\xffbar\0\0");
+
+    assert_eq!(
+        environment,
+        vec![
+            (
+                std::ffi::OsString::from_vec(b"A".to_vec()),
+                std::ffi::OsString::from_vec(b"1".to_vec())
+            ),
+            (
+                std::ffi::OsString::from_vec(b"BAD".to_vec()),
+                std::ffi::OsString::from_vec(b"foo\xffbar".to_vec())
+            )
+        ]
+    );
 }
 
 #[cfg(target_os = "macos")]

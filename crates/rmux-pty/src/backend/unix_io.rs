@@ -22,6 +22,26 @@ pub(crate) fn write_all(fd: BorrowedFd<'_>, mut buffer: &[u8]) -> io::Result<()>
     Ok(())
 }
 
+pub(crate) fn try_write_immediate(fd: BorrowedFd<'_>, buffer: &[u8]) -> io::Result<usize> {
+    let mut written = 0;
+    while written < buffer.len() {
+        match rustix::io::write(fd, &buffer[written..]) {
+            Ok(0) => {
+                if written == 0 {
+                    return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0"));
+                }
+                return Ok(written);
+            }
+            Ok(bytes_written) => written += bytes_written,
+            Err(rustix::io::Errno::INTR) => continue,
+            Err(rustix::io::Errno::AGAIN) => return Ok(written),
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Ok(written)
+}
+
 fn wait_until_writable(fd: BorrowedFd<'_>) -> io::Result<()> {
     let deadline = Instant::now() + PTY_WRITE_READY_TIMEOUT;
     loop {

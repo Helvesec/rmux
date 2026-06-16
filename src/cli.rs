@@ -5,12 +5,14 @@ use std::path::{Path, PathBuf};
 
 #[path = "cli/alias_fallback.rs"]
 mod alias_fallback;
+#[path = "cli/buffer_commands.rs"]
+mod buffer_commands;
+#[path = "cli/capabilities.rs"]
+mod capabilities;
 #[path = "cli/capture_pane.rs"]
 mod capture_pane;
 #[path = "cli/client_commands.rs"]
 mod client_commands;
-#[path = "cli/client_environment.rs"]
-mod client_environment;
 #[path = "cli/command_inventory.rs"]
 mod command_inventory;
 #[path = "cli/command_runner.rs"]
@@ -25,10 +27,16 @@ mod dispatch;
 mod error;
 #[path = "cli/format_print.rs"]
 mod format_print;
+#[path = "cli/json_output.rs"]
+mod json_output;
 #[path = "cli/key_commands.rs"]
 mod key_commands;
+#[path = "cli/message_commands.rs"]
+mod message_commands;
 #[path = "cli/pane_commands.rs"]
 mod pane_commands;
+#[path = "cli/scripting_contract.rs"]
+mod scripting_contract;
 #[path = "cli/server_commands.rs"]
 mod server_commands;
 #[path = "cli/session_commands.rs"]
@@ -90,7 +98,7 @@ use target_resolution::{
 use terminal_size::{build_terminal_size, current_terminal_size};
 use top_level::{
     accept_compatibility_options, infer_client_utf8_from_env, top_level_parse_failure,
-    top_level_version_requested, validate_top_level_invocation,
+    top_level_version_output, top_level_version_requested, validate_top_level_invocation,
 };
 pub(crate) fn run<I, T>(args: I) -> Result<i32, ExitFailure>
 where
@@ -104,13 +112,15 @@ where
     if top_level_version_requested(args.get(1..).unwrap_or(&[])) {
         return Err(ExitFailure::new_stdout(
             0,
-            format!("rmux {}", env!("CARGO_PKG_VERSION")),
+            top_level_version_output(invoked_as_tmux(&args)),
         ));
     }
     if let Some(invocation) = diagnose::parse_invocation(args.get(1..).unwrap_or(&[]))? {
         return diagnose::run(invocation);
     }
-
+    if let Some(invocation) = capabilities::parse_invocation(args.get(1..).unwrap_or(&[]))? {
+        return capabilities::run(invocation);
+    }
     let mut cli = match parse(args.clone()) {
         Ok(cli) => cli,
         Err(error) => return parse_failure_or_absent_server(&args, error),
@@ -146,6 +156,13 @@ where
     dispatch_command_queue(commands, &socket_path, startup, client_terminal)
 }
 
+fn invoked_as_tmux(args: &[OsString]) -> bool {
+    args.first()
+        .and_then(|arg| std::path::Path::new(arg).file_stem())
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem == "tmux")
+}
+
 fn parse_failure_or_absent_server(
     args: &[OsString],
     error: clap::Error,
@@ -171,13 +188,36 @@ fn parse_failure_or_absent_server(
 }
 
 fn parse_failure_should_probe_server(args: &[OsString], error: &clap::Error) -> bool {
-    match error.kind() {
-        clap::error::ErrorKind::InvalidSubcommand => true,
-        clap::error::ErrorKind::ValueValidation => {
-            first_command_token(args.get(1..).unwrap_or(&[])).as_deref() == Some("resize-pane")
-        }
-        _ => false,
+    if matches!(
+        error.kind(),
+        clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+    ) {
+        return false;
     }
+
+    if error.kind() == clap::error::ErrorKind::InvalidSubcommand {
+        return first_command_token(args.get(1..).unwrap_or(&[])).is_some();
+    }
+
+    if error.kind() == clap::error::ErrorKind::ValueValidation {
+        let message = error.to_string();
+        if message.contains("command too long") {
+            return first_command_token(args.get(1..).unwrap_or(&[])).is_some();
+        }
+        if message.contains("expects an argument") {
+            return first_command_token(args.get(1..).unwrap_or(&[]))
+                .is_some_and(|command| matches!(command.as_str(), "new-session" | "new"));
+        }
+        return first_command_token(args.get(1..).unwrap_or(&[]))
+            .is_some_and(|command| matches!(command.as_str(), "resize-pane" | "resizep"));
+    }
+
+    first_command_token(args.get(1..).unwrap_or(&[])).is_some_and(|command| {
+        matches!(
+            command.as_str(),
+            "new-session" | "new" | "resize-pane" | "resizep"
+        )
+    })
 }
 
 fn recover_socket_selection(arguments: &[OsString]) -> Option<(Option<OsString>, Option<PathBuf>)> {
@@ -319,7 +359,7 @@ mod tests {
             top_level_parse_failure(&args(&["--help"]))
                 .expect("expected --help to fail before clap")
                 .message(),
-            "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]"
+            "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n\nRMUX extensions:\n  capabilities [--human|--json]\n  diagnose [--human|--json]\n  web-share [flags]\n  web-share list|lookup|stop|disconnect|off|config\n\nUse `rmux list-commands` for the tmux-compatible command surface."
         );
         assert_eq!(
             top_level_parse_failure(&args(&["--not-a-tmux-flag", "-h"]))
@@ -355,6 +395,16 @@ mod tests {
     }
 
     #[test]
+    fn command_too_long_parse_errors_probe_for_absent_server_first() {
+        let error = clap::Error::raw(clap::error::ErrorKind::ValueValidation, "command too long");
+
+        assert!(super::parse_failure_should_probe_server(
+            &args(&["rmux", "-S", "/tmp/missing.sock", "aaaaaaaa"]),
+            &error
+        ));
+    }
+
+    #[test]
     fn start_server_inventory_matches_supported_frozen_commands() {
         assert!(command_has_start_server_flag(&default_client_command()));
         assert!(command_has_start_server_flag(&Command::StartServer(
@@ -376,6 +426,7 @@ mod tests {
             ListSessionsArgs {
                 format: None,
                 filter: None,
+                json: false,
                 sort_order: None,
                 reversed: false,
             }
@@ -389,6 +440,8 @@ mod tests {
                 detached: false,
                 format: None,
                 print_target: false,
+                kill_existing: false,
+                select_existing: false,
                 start_directory: None,
                 environment: Vec::new(),
                 command: Vec::new(),
@@ -487,7 +540,7 @@ mod tests {
                 "attach-session",
                 Some("attach"),
             ),
-            "attach-session|attach|attach-session|attach"
+            "attach-session|attach||"
         );
     }
 
@@ -507,11 +560,11 @@ mod tests {
     fn list_commands_usage_variable_expands_tmux_signature_suffix() {
         assert_eq!(
             render_list_commands_line(
-                Some("#{command_name}|#{command_list_usage}"),
+                Some("#{command_list_name}|#{command_list_usage}"),
                 "attach-session",
                 Some("attach"),
             ),
-            "attach-session|(attach) [-dErx] [-c working-directory] [-f flags] [-t target-session]"
+            "attach-session|[-dErx] [-c working-directory] [-f flags] [-t target-session]"
         );
     }
 }

@@ -7,6 +7,7 @@ yanked = "deny"
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste is a transitive ratatui macro dependency with no runtime exposure; keep tracked until ratatui removes or replaces it." },
     { id = "RUSTSEC-2025-0141", reason = "RMUX detached IPC uses bincode only over local Unix sockets or Windows named pipes; no network or browser runtime is exposed." },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 is pulled only through libcrux/hax verification macro dependencies; no maintained upgrade is available, so keep tracked until libcrux removes it." },
 ]
 
 [licenses]

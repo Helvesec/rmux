@@ -50,7 +50,7 @@ impl RequestHandler {
 
         let attached_session = match request.target_client.as_deref() {
             Some(target_client) => match self
-                .resolve_show_messages_log_session(requester_pid, target_client)
+                .resolve_show_messages_log_session(requester_pid, Some(target_client))
                 .await
             {
                 Ok(session) => session,
@@ -96,31 +96,20 @@ impl RequestHandler {
         requester_pid: u32,
         target_client: Option<&str>,
     ) -> Result<Option<u32>, RmuxError> {
-        let Some(target_client) = target_client else {
-            return Ok(None);
-        };
-        if target_client == "=" {
-            return self
-                .resolve_managed_client(requester_pid, "show-messages")
-                .await
-                .map(|client| match client {
-                    ManagedClient::Attach(pid) | ManagedClient::Control(pid) => Some(pid),
-                });
-        }
-
-        target_client
-            .parse::<u32>()
-            .map(Some)
-            .map_err(|_| RmuxError::invalid_target(target_client, "invalid client identifier"))
+        self.resolve_target_managed_client(requester_pid, target_client, "show-messages")
+            .await
+            .map(|client| match client {
+                ManagedClient::Attach(pid) | ManagedClient::Control(pid) => Some(pid),
+            })
     }
 
     async fn resolve_show_messages_log_session(
         &self,
         requester_pid: u32,
-        target_client: &str,
+        target_client: Option<&str>,
     ) -> Result<Option<rmux_proto::SessionName>, RmuxError> {
         match self
-            .resolve_target_managed_client(requester_pid, Some(target_client), "show-messages")
+            .resolve_target_managed_client(requester_pid, target_client, "show-messages")
             .await?
         {
             ManagedClient::Attach(attach_pid) => {

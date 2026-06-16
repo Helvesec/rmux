@@ -16,9 +16,12 @@ impl RuntimeFormatContext<'_> {
         let Some(session) = self.session else {
             return Vec::new();
         };
+        if self.session_group_name().is_none() {
+            return Vec::new();
+        }
         self.session_store
             .map(|store| store.session_group_members(session.name()))
-            .unwrap_or_else(|| vec![session.name().clone()])
+            .unwrap_or_default()
     }
 
     pub(super) fn session_attached_count(&self) -> usize {

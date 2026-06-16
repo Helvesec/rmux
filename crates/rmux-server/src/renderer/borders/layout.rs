@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use rmux_core::{Pane, PaneGeometry, Window};
 
+use crate::pane_visible_geometry::clip_pane_geometry;
+
 use super::super::StatusGeometry;
 
 pub(super) fn border_layout_cells_with_geometry(
@@ -409,10 +411,7 @@ fn normalize_horizontal_segments(
 }
 
 pub(in crate::renderer) fn content_pane_geometry(pane: &Pane, content_rows: u16) -> PaneGeometry {
-    let geometry = pane.geometry();
-    let y = geometry.y().min(content_rows);
-    let rows = geometry.rows().min(content_rows.saturating_sub(y));
-    PaneGeometry::new(geometry.x(), y, geometry.cols(), rows)
+    clip_pane_geometry(pane.geometry(), content_rows)
 }
 
 fn border_cell_owner_and_activity(

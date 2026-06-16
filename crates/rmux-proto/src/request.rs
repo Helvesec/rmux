@@ -11,6 +11,10 @@ use crate::{
 #[path = "request/compat.rs"]
 mod compat;
 
+#[path = "request/display.rs"]
+mod display;
+pub use display::{DisplayMessageExtRequest, DisplayMessageRequest};
+
 #[path = "request/show.rs"]
 mod show;
 pub use show::ShowHooksRequest;
@@ -68,10 +72,10 @@ pub use server::{
 #[path = "request/client.rs"]
 mod client;
 pub use client::{
-    AttachSessionExt2Request, AttachSessionExtRequest, AttachSessionRequest,
-    DetachClientExtRequest, DetachClientRequest, ListClientsRequest, RefreshClientRequest,
-    SuspendClientRequest, SwitchClientExt2Request, SwitchClientExt3Request, SwitchClientExtRequest,
-    SwitchClientRequest,
+    AttachSessionExt2Request, AttachSessionExt3Request, AttachSessionExtRequest,
+    AttachSessionRequest, DetachClientExtRequest, DetachClientRequest, ListClientsRequest,
+    RefreshClientRequest, SuspendClientRequest, SwitchClientExt2Request, SwitchClientExt3Request,
+    SwitchClientExtRequest, SwitchClientRequest,
 };
 
 #[path = "request/keys.rs"]
@@ -341,6 +345,8 @@ pub enum Request {
     DisplayMessageExt(DisplayMessageExtRequest),
     /// `send-keys` extension with target-client context.
     SendKeysExt2(SendKeysExt2Request),
+    /// Attach-session extension with attach-stream client capabilities.
+    AttachSessionExt3(AttachSessionExt3Request),
 }
 
 impl Request {
@@ -456,7 +462,7 @@ impl Request {
             Self::ListClients(_) => "list-clients",
             Self::SuspendClient(_) => "suspend-client",
             Self::DetachClientExt(_) => "detach-client",
-            Self::AttachSessionExt2(_) => "attach-session",
+            Self::AttachSessionExt2(_) | Self::AttachSessionExt3(_) => "attach-session",
             Self::SwitchClientExt3(_) => "switch-client",
             Self::Handshake(_) => "handshake",
             Self::DaemonStatus(_) => "daemon-status",
@@ -464,33 +470,6 @@ impl Request {
             Self::WebShare(_) => "web-share",
         }
     }
-}
-
-/// Request payload for `display-message`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DisplayMessageRequest {
-    /// The optional exact session, window, or pane target used as format context.
-    pub target: Option<Target>,
-    /// Whether to print the expanded message to stdout instead of displaying it.
-    pub print: bool,
-    /// The optional format string. When omitted, the tmux-compatible default is used.
-    pub message: Option<String>,
-}
-
-/// Extended request payload for `display-message -c`.
-///
-/// This stays separate from [`DisplayMessageRequest`] so the original bincode
-/// field order remains wire-compatible with older clients and daemons.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DisplayMessageExtRequest {
-    /// The optional exact session, window, or pane target used as format context.
-    pub target: Option<Target>,
-    /// Whether to print the expanded message to stdout instead of displaying it.
-    pub print: bool,
-    /// The optional format string. When omitted, the tmux-compatible default is used.
-    pub message: Option<String>,
-    /// Optional target client used for client formats and overlay delivery.
-    pub target_client: Option<String>,
 }
 
 /// Request payload for `show-messages`.
@@ -526,6 +505,9 @@ pub struct RunShellRequest {
     /// Optional explicit target pane used for format and session context.
     #[serde(default)]
     pub target: Option<PaneTarget>,
+    /// Internal source-file recursion depth inherited by queued run-shell.
+    #[serde(default)]
+    pub source_depth: Option<usize>,
 }
 
 /// Losslessly serializable `run-shell -d` seconds value with stable `Eq`.
@@ -717,6 +699,7 @@ mod tests {
                 command: None,
                 process_command: None,
                 client_environment: None,
+                skip_environment_update: false,
             })
             .command_name(),
             "new-session"
@@ -734,6 +717,8 @@ mod tests {
                 detached: false,
                 size: None,
                 preserve_zoom: false,
+                full_size: false,
+                stdin_payload: None,
             })
             .command_name(),
             "split-window"
@@ -742,6 +727,7 @@ mod tests {
             Request::SelectPaneAdjacent(SelectPaneAdjacentRequest {
                 target: pane(),
                 direction: SelectPaneDirection::Right,
+                preserve_zoom: false,
             })
             .command_name(),
             "select-pane"
@@ -764,6 +750,8 @@ mod tests {
                 only_if_unset: false,
                 unset: false,
                 unset_pane_overrides: false,
+                format: false,
+                format_target: None,
             })
             .command_name(),
             "set-option"
@@ -795,6 +783,25 @@ mod tests {
                 client_terminal: crate::ClientTerminalContext::default(),
                 client_size: None,
             })
+            .command_name(),
+            "attach-session"
+        );
+        assert_eq!(
+            Request::AttachSessionExt3(AttachSessionExt3Request::from_ext2(
+                AttachSessionExt2Request {
+                    target: Some(alpha()),
+                    target_spec: None,
+                    detach_other_clients: false,
+                    kill_other_clients: false,
+                    read_only: false,
+                    skip_environment_update: false,
+                    flags: None,
+                    working_directory: None,
+                    client_terminal: crate::ClientTerminalContext::default(),
+                    client_size: None,
+                },
+                vec![crate::CAPABILITY_ATTACH_RENDER.to_owned()],
+            ))
             .command_name(),
             "attach-session"
         );

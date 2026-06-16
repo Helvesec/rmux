@@ -29,12 +29,72 @@ function NormalizeVersion([string]$Raw) {
     $normalized
 }
 
-function UnquoteYamlScalar([string]$Value) {
+function FormatScalarForError([string]$Value) {
+    $Value.Replace("\", "\\").Replace("`r", "\r").Replace("`n", "\n").Replace("`t", "\t")
+}
+
+function DecodeYamlEscape([string]$Escape) {
+    switch ($Escape) {
+        "0" { return "`0" }
+        "a" { return [string][char]0x07 }
+        "b" { return "`b" }
+        "t" { return "`t" }
+        "n" { return "`n" }
+        "v" { return [string][char]0x0B }
+        "f" { return "`f" }
+        "r" { return "`r" }
+        "e" { return [string][char]0x1B }
+        '"' { return '"' }
+        "/" { return "/" }
+        "\" { return "\" }
+        "_" { return [string][char]0xA0 }
+        "N" { return [string][char]0x85 }
+        "L" { return [string][char]0x2028 }
+        "P" { return [string][char]0x2029 }
+    }
+    if ($Escape -match '^x([0-9A-Fa-f]{2})$') {
+        return [string][char]([Convert]::ToInt32($Matches[1], 16))
+    }
+    if ($Escape -match '^u([0-9A-Fa-f]{4})$') {
+        return [string][char]([Convert]::ToInt32($Matches[1], 16))
+    }
+    if ($Escape -match '^U([0-9A-Fa-f]{8})$') {
+        return [char]::ConvertFromUtf32([Convert]::ToInt32($Matches[1], 16))
+    }
+    Fail "unsupported YAML escape sequence: \${Escape}"
+}
+
+function DecodeYamlScalar([string]$Value) {
     $trimmed = $Value.Trim()
-    if ($trimmed.Length -ge 2 -and
-        (($trimmed.StartsWith('"') -and $trimmed.EndsWith('"')) -or
-         ($trimmed.StartsWith("'") -and $trimmed.EndsWith("'")))) {
-        return $trimmed.Substring(1, $trimmed.Length - 2)
+    if ($trimmed.Length -ge 2 -and $trimmed.StartsWith("'") -and $trimmed.EndsWith("'")) {
+        return $trimmed.Substring(1, $trimmed.Length - 2).Replace("''", "'")
+    }
+    if ($trimmed.Length -ge 2 -and $trimmed.StartsWith('"') -and $trimmed.EndsWith('"')) {
+        $body = $trimmed.Substring(1, $trimmed.Length - 2)
+        $builder = [System.Text.StringBuilder]::new()
+        for ($index = 0; $index -lt $body.Length; $index++) {
+            $character = $body[$index]
+            if ($character -ne "\") {
+                [void]$builder.Append($character)
+                continue
+            }
+            $index++
+            if ($index -ge $body.Length) {
+                Fail "unterminated YAML escape sequence"
+            }
+            $escape = [string]$body[$index]
+            if ($escape -in @("x", "u", "U")) {
+                $digits = if ($escape -eq "x") { 2 } elseif ($escape -eq "u") { 4 } else { 8 }
+                if (($index + $digits) -ge $body.Length) {
+                    Fail "truncated YAML escape sequence: \${escape}"
+                }
+                $hex = $body.Substring($index + 1, $digits)
+                $escape = "$escape$hex"
+                $index += $digits
+            }
+            [void]$builder.Append((DecodeYamlEscape $escape))
+        }
+        return $builder.ToString()
     }
     $trimmed
 }
@@ -43,7 +103,7 @@ function ReadManifestValue([string]$Key) {
     $pattern = '^\s*(?:-\s*)?' + [regex]::Escape($Key) + '\s*:\s*(.+?)\s*$'
     foreach ($line in $script:manifestLines) {
         if ($line -match $pattern) {
-            return (UnquoteYamlScalar $Matches[1])
+            return (DecodeYamlScalar $Matches[1])
         }
     }
     Fail "missing WinGet manifest field: $Key"
@@ -52,7 +112,7 @@ function ReadManifestValue([string]$Key) {
 function AssertManifestValue([string]$Key, [string]$Expected) {
     $actual = ReadManifestValue $Key
     if ($actual -ne $Expected) {
-        Fail "unexpected ${Key}: expected '$Expected', got '$actual'"
+        Fail "unexpected ${Key}: expected '$(FormatScalarForError $Expected)', got '$(FormatScalarForError $actual)'"
     }
 }
 

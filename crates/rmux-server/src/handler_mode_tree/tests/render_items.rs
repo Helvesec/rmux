@@ -210,6 +210,33 @@ fn render_visible_item_omits_extra_leaf_padding_for_flat_pane_lists() {
 }
 
 #[test]
+fn default_key_format_renders_meta_shortcuts_without_tail_junk() {
+    let state = HandlerState::default();
+    let utf8 = Utf8Config::default();
+    let mode = test_mode(40);
+    let build = flat_build(&["line10", "line36"]);
+
+    let line10 = build.items.get("line10").expect("line 10 item exists");
+    let rendered = render_visible_item(&state, &mode, &build, line10, 10, 6, &utf8);
+
+    assert!(
+        rendered.starts_with("(M-a) "),
+        "line 10 should render the M-a shortcut, got {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("1,M-a"),
+        "line 10 must not leak the false branch tail, got {rendered:?}"
+    );
+
+    let line36 = build.items.get("line36").expect("line 36 item exists");
+    let rendered = render_visible_item(&state, &mode, &build, line36, 36, 6, &utf8);
+    assert!(
+        !rendered.starts_with('('),
+        "line 36 has no tmux shortcut, got {rendered:?}"
+    );
+}
+
+#[test]
 fn render_mode_tree_overlay_keeps_cursor_hidden_while_active() {
     let mut state = HandlerState::default();
     state

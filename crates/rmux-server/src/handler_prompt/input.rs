@@ -1,4 +1,4 @@
-use rmux_core::{key_string_lookup_key, KeyCode, KEYC_MASK_KEY};
+use rmux_core::{key_code_lookup_bits, key_string_lookup_key, KeyCode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in super::super) enum PromptInputEvent {
@@ -40,7 +40,7 @@ impl PromptInputEvent {
 }
 
 pub(in super::super) fn decode_prompt_key(key: KeyCode) -> PromptInputEvent {
-    let name = key_string_lookup_key(key & KEYC_MASK_KEY, false).to_owned();
+    let name = key_string_lookup_key(key_code_lookup_bits(key), false).to_owned();
     match name.as_str() {
         "Left" => PromptInputEvent::Left,
         "Right" => PromptInputEvent::Right,
@@ -53,5 +53,28 @@ pub(in super::super) fn decode_prompt_key(key: KeyCode) -> PromptInputEvent {
         "BSpace" => PromptInputEvent::Backspace,
         "Escape" => PromptInputEvent::Escape,
         _ => PromptInputEvent::KeyName(name),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rmux_core::{KEYC_CTRL, KEYC_META};
+
+    use super::{decode_prompt_key, PromptInputEvent};
+
+    #[test]
+    fn decode_prompt_key_preserves_meta_shortcuts() {
+        assert_eq!(
+            decode_prompt_key(u64::from(b'a') | KEYC_META),
+            PromptInputEvent::KeyName("M-a".to_owned())
+        );
+    }
+
+    #[test]
+    fn decode_prompt_key_keeps_control_events_canonical() {
+        assert_eq!(
+            decode_prompt_key(u64::from(b't') | KEYC_CTRL),
+            PromptInputEvent::KeyName("C-t".to_owned())
+        );
     }
 }

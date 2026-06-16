@@ -72,6 +72,32 @@ fn modifier_expand() {
         render_template("#{E:session_name}", &StaticWindowValues),
         "alpha"
     );
+
+    struct TimeVars;
+    impl FormatVariables for TimeVars {
+        fn format_value(&self, variable: FormatVariable) -> Option<String> {
+            match variable {
+                FormatVariable::SessionName => Some("alpha".to_owned()),
+                _ => None,
+            }
+        }
+
+        fn format_value_by_name(&self, name: &str) -> Option<String> {
+            match name {
+                "@foo" => Some("time=%H name=#{session_name}".to_owned()),
+                _ => {
+                    FormatVariable::from_name(name).and_then(|variable| self.format_value(variable))
+                }
+            }
+        }
+    }
+    let expanded = render_template("#{E:@foo}", &TimeVars);
+    assert!(expanded.starts_with("time="), "{expanded:?}");
+    assert!(expanded.ends_with(" name=alpha"), "{expanded:?}");
+    assert!(!expanded.contains("%H"), "{expanded:?}");
+    let time_expanded = render_template("#{T:@foo}", &TimeVars);
+    assert!(time_expanded.ends_with(" name=alpha"));
+    assert!(!time_expanded.contains("%H"));
 }
 
 #[test]
@@ -110,6 +136,38 @@ fn modifier_shell_quote_escapes_tmux_specials() {
     assert_eq!(
         render_template("#{q:session_name}", &QuoteVars),
         "a\\ b\\$c\\#d\\%"
+    );
+}
+
+#[test]
+fn modifier_shell_quote_leaves_single_nested_expansion_unescaped() {
+    struct UserOptionVars;
+    impl FormatVariables for UserOptionVars {
+        fn format_value(&self, variable: FormatVariable) -> Option<String> {
+            match variable {
+                FormatVariable::SessionName => Some("alpha beta".to_owned()),
+                _ => None,
+            }
+        }
+
+        fn format_value_by_name(&self, name: &str) -> Option<String> {
+            match name {
+                "@v" => Some("Hello World".to_owned()),
+                _ => {
+                    FormatVariable::from_name(name).and_then(|variable| self.format_value(variable))
+                }
+            }
+        }
+    }
+
+    assert_eq!(
+        render_template("#{q:#{@v}}", &UserOptionVars),
+        "Hello World"
+    );
+    assert_eq!(render_template("#{q:@v}", &UserOptionVars), "Hello\\ World");
+    assert_eq!(
+        render_template("#{q:session_name}", &UserOptionVars),
+        "alpha\\ beta"
     );
 }
 

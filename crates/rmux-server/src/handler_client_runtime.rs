@@ -5,14 +5,14 @@ use std::time::Duration;
 use rmux_os::identity::UserIdentity;
 use rmux_os::process;
 use rmux_proto::request::SwitchClientExt3Request;
-use rmux_proto::{CommandOutput, OptionName, RmuxError, ScopeSelector};
+use rmux_proto::{CommandOutput, OptionName, RmuxError};
 
 use crate::handler_support::attached_client_required;
 use crate::outer_terminal::OuterTerminal;
 use crate::pane_io::AttachControl;
 use crate::pane_terminals::{session_not_found, HandlerState};
 use crate::server_access::current_owner_uid;
-use crate::terminal::base_process_environment;
+use crate::terminal::{base_process_environment, base_process_environment_display_only};
 
 use super::{
     attach_support::{self, ClientFlags},
@@ -172,6 +172,7 @@ impl RequestHandler {
                 active.key_table_name.clone(),
             )
         };
+        let socket_path = self.socket_path();
         let bytes = {
             let state = self.state.lock().await;
             let session = state
@@ -184,9 +185,13 @@ impl RequestHandler {
                 session.as_ref(),
                 &state.options,
                 attached_count,
-                prompt.as_ref(),
-                Some(&state),
-                key_table.as_deref(),
+                crate::renderer::StatusRenderContext {
+                    prompt: prompt.as_ref(),
+                    state: Some(&state),
+                    key_table: key_table.as_deref(),
+                    socket_path: Some(&socket_path),
+                    ..crate::renderer::StatusRenderContext::default()
+                },
             );
             outer_terminal.wrap_render_frame(&frame)
         };
@@ -493,12 +498,26 @@ pub(in crate::handler) fn current_process_environment_snapshot() -> HashMap<Stri
     base_process_environment()
 }
 
+pub(in crate::handler) fn current_process_environment_display_snapshot() -> HashMap<String, String>
+{
+    base_process_environment_display_only()
+}
+
 pub(in crate::handler) fn seed_global_environment(
     state: &mut HandlerState,
     environment: HashMap<String, String>,
 ) {
     for (name, value) in environment {
-        state.environment.set(ScopeSelector::Global, name, value);
+        state.environment.set_implicit_global(name, value);
+    }
+}
+
+pub(in crate::handler) fn seed_global_display_environment(
+    state: &mut HandlerState,
+    environment: HashMap<String, String>,
+) {
+    for (name, value) in environment {
+        state.environment.set_implicit_global_display(name, value);
     }
 }
 

@@ -1,5 +1,9 @@
 #[cfg(unix)]
 use super::environment_from_os_pairs;
+#[cfg(windows)]
+use super::raw_process_environment;
+#[cfg(windows)]
+use super::SessionBaseEnvironment;
 use super::{
     parse_environment_assignments, spawn_hook_command, validate_process_command, TerminalProfile,
 };
@@ -9,7 +13,7 @@ use rmux_proto::{OptionName, ProcessCommand, ScopeSelector, SessionName, SetOpti
 use rmux_pty::TerminalSize as PtyTerminalSize;
 use std::collections::HashMap;
 use std::error::Error;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -45,6 +49,21 @@ fn base_environment_snapshot_skips_non_utf8_pairs() {
 
     assert_eq!(environment.get("VALID").map(String::as_str), Some("value"));
     assert_eq!(environment.len(), 1);
+}
+
+#[cfg(windows)]
+#[test]
+fn raw_environment_suppresses_names_case_insensitively() {
+    let raw = raw_process_environment(
+        Some(&[(
+            std::ffi::OsString::from("Path"),
+            std::ffi::OsString::from("C:\\base"),
+        )]),
+        &HashMap::new(),
+        &["PATH".to_owned()].into_iter().collect(),
+    );
+
+    assert!(raw.is_empty());
 }
 
 #[test]
@@ -121,12 +140,17 @@ fn terminal_profile_sets_rmux_term_shell_and_pane_context() {
         ambient_colorterm.as_deref()
     );
     let socket_path = temp_socket_path();
-    let expected_rmux = format!("{},{},7", socket_path.display(), std::process::id());
+    let expected_rmux = expected_mux_env(&socket_path, 7);
     assert_eq!(
         profile.environment_value("RMUX"),
         Some(expected_rmux.as_str())
     );
+    assert_eq!(
+        profile.environment_value("TMUX"),
+        Some(expected_rmux.as_str())
+    );
     assert_eq!(profile.environment_value("RMUX_PANE"), Some("%3"));
+    assert_eq!(profile.environment_value("TMUX_PANE"), Some("%3"));
     assert_eq!(profile.environment_value("FOO"), Some("bar"));
     let expected_cwd = std::env::temp_dir();
     assert_eq!(
@@ -312,6 +336,167 @@ fn terminal_profile_applies_default_terminal_before_per_command_term_override() 
 }
 
 #[test]
+fn run_shell_profile_exports_tmux_env_for_plugin_children() {
+    let environment = EnvironmentStore::new();
+    let options = OptionStore::new();
+    let socket_path = temp_socket_path();
+
+    let detached_profile = TerminalProfile::for_run_shell(
+        &environment,
+        &options,
+        None,
+        None,
+        socket_path.as_path(),
+        false,
+        Some(std::env::temp_dir().as_path()),
+    )
+    .expect("detached run-shell profile");
+    let expected_detached = expected_mux_env(&socket_path, 0);
+    assert_eq!(
+        detached_profile.environment_value("RMUX"),
+        Some(expected_detached.as_str())
+    );
+    assert_eq!(
+        detached_profile.environment_value("TMUX"),
+        Some(expected_detached.as_str())
+    );
+
+    let session_name = SessionName::new("alpha").expect("valid session name");
+    let targeted_profile = TerminalProfile::for_run_shell(
+        &environment,
+        &options,
+        Some(&session_name),
+        Some(7),
+        socket_path.as_path(),
+        false,
+        Some(std::env::temp_dir().as_path()),
+    )
+    .expect("targeted run-shell profile");
+    let expected_targeted = expected_mux_env(&socket_path, 7);
+    assert_eq!(
+        targeted_profile.environment_value("RMUX"),
+        Some(expected_targeted.as_str())
+    );
+    assert_eq!(
+        targeted_profile.environment_value("TMUX"),
+        Some(expected_targeted.as_str())
+    );
+}
+
+#[test]
+fn run_shell_profile_exports_absolute_mux_env_for_relative_socket() -> Result<(), Box<dyn Error>> {
+    let environment = EnvironmentStore::new();
+    let options = OptionStore::new();
+    let socket_path = PathBuf::from("relative-rmux.sock");
+    let run_cwd = unique_output_path("run-shell-relative-socket-cwd");
+    fs::create_dir_all(&run_cwd)?;
+
+    let profile = TerminalProfile::for_run_shell(
+        &environment,
+        &options,
+        None,
+        None,
+        socket_path.as_path(),
+        false,
+        Some(run_cwd.as_path()),
+    )
+    .expect("run-shell profile");
+    let expected_rmux = expected_mux_env(socket_path.as_path(), 0);
+
+    assert_eq!(
+        profile.environment_value("RMUX"),
+        Some(expected_rmux.as_str())
+    );
+    assert_eq!(
+        profile.environment_value("TMUX"),
+        Some(expected_rmux.as_str())
+    );
+    assert_eq!(profile.cwd(), run_cwd.as_path());
+
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn run_shell_profile_replaces_reserved_names_case_insensitively() {
+    let environment = EnvironmentStore::new();
+    let mut options = OptionStore::new();
+    let session_name = SessionName::new("alpha").expect("valid session name");
+    let socket_path = temp_socket_path();
+    let base_environment = SessionBaseEnvironment {
+        raw_environment: [
+            ("term", "legacy-term"),
+            ("term_program", "legacy-program"),
+            ("term_program_version", "legacy-version"),
+            ("rmux", "legacy-rmux"),
+            ("tmux", "legacy-tmux"),
+            ("rmux_pane", "%old"),
+            ("tmux_pane", "%old"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .collect(),
+    };
+
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::DefaultTerminal,
+            "tmux-256color".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("default-terminal succeeds");
+
+    let profile = TerminalProfile::for_run_shell_with_base_environment(
+        &environment,
+        &options,
+        Some(&session_name),
+        Some(7),
+        socket_path.as_path(),
+        Some(&base_environment),
+        true,
+        None,
+        Some(std::env::temp_dir().as_path()),
+    )
+    .expect("profile");
+    let expected_tmux = expected_mux_env(&socket_path, 7);
+
+    assert_eq!(profile.environment_value("TERM"), Some("tmux-256color"));
+    assert_eq!(profile.environment_value("TERM_PROGRAM"), Some("rmux"));
+    assert_eq!(
+        profile.environment_value("TERM_PROGRAM_VERSION"),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(
+        profile.environment_value("RMUX"),
+        Some(expected_tmux.as_str())
+    );
+    assert_eq!(
+        profile.environment_value("TMUX"),
+        Some(expected_tmux.as_str())
+    );
+    assert_eq!(profile.environment_value("RMUX_PANE"), None);
+    assert_eq!(profile.environment_value("TMUX_PANE"), None);
+
+    for name in [
+        "term",
+        "term_program",
+        "term_program_version",
+        "rmux",
+        "tmux",
+        "rmux_pane",
+        "tmux_pane",
+    ] {
+        assert!(
+            profile
+                .raw_environment()
+                .all(|(candidate, _)| candidate.to_str() != Some(name)),
+            "{name} should have been replaced case-insensitively"
+        );
+    }
+}
+
+#[test]
 fn terminal_profile_prefers_rmux_term_program_for_default_window_name() {
     let environment = EnvironmentStore::new();
     let mut options = OptionStore::new();
@@ -344,7 +529,7 @@ fn terminal_profile_prefers_rmux_term_program_for_default_window_name() {
 }
 
 #[test]
-fn terminal_profile_initial_pane_title_includes_user_host_and_cwd() {
+fn terminal_profile_initial_pane_title_uses_host_short() {
     let environment = EnvironmentStore::new();
     let mut options = OptionStore::new();
     let session_name = SessionName::new("alpha").expect("valid session name");
@@ -379,8 +564,8 @@ fn terminal_profile_initial_pane_title_includes_user_host_and_cwd() {
     .expect("profile");
 
     let title = profile.initial_pane_title().expect("initial title");
-    assert!(title.starts_with("alice@"), "title was {title:?}");
-    assert!(title.ends_with(":~"), "title was {title:?}");
+    let host = crate::host_name::local_hostname().expect("host name");
+    assert_eq!(title, host.split('.').next().unwrap_or(&host));
 }
 
 #[test]
@@ -518,7 +703,6 @@ fn explicit_empty_process_commands_are_rejected() {
     for command in [
         ProcessCommand::Argv(Vec::new()),
         ProcessCommand::Argv(vec![String::new()]),
-        ProcessCommand::Shell(String::new()),
     ] {
         let error = validate_process_command(Some(&command))
             .expect_err("explicit empty process commands must be rejected");
@@ -529,6 +713,12 @@ fn explicit_empty_process_commands_are_rejected() {
             "unexpected validation error: {error}"
         );
     }
+}
+
+#[test]
+fn empty_shell_process_command_is_allowed_for_empty_tmux_panes() {
+    validate_process_command(Some(&ProcessCommand::Shell(String::new())))
+        .expect("empty shell command creates a tmux-style empty pane");
 }
 
 #[cfg(unix)]
@@ -718,9 +908,9 @@ fn windows_interactive_shell_starts_in_profile_cwd_and_accepts_input(
     let output = (|| -> Result<Vec<u8>, Box<dyn Error>> {
         let lower_default_shell = default_shell.to_ascii_lowercase();
         if lower_default_shell.contains("powershell") || lower_default_shell.contains("pwsh") {
-            io.write_all(b"Get-Location\r\necho RMUX_WINDOWS_INTERACTIVE_OK\r\nexit\r\n")?;
+            io.write_all(b"Get-Location; Write-Output RMUX_WINDOWS_INTERACTIVE_OK; exit\r\n")?;
         } else {
-            io.write_all(b"cd\r\necho RMUX_WINDOWS_INTERACTIVE_OK\r\nexit\r\n")?;
+            io.write_all(b"cd && echo RMUX_WINDOWS_INTERACTIVE_OK && exit\r\n")?;
         }
         read_until_io(&io, b"RMUX_WINDOWS_INTERACTIVE_OK", Duration::from_secs(5))
     })();
@@ -799,6 +989,27 @@ fn unique_directory(label: &str) -> io::Result<PathBuf> {
 
 fn temp_socket_path() -> PathBuf {
     std::env::temp_dir().join("rmux.sock")
+}
+
+fn expected_mux_env(socket_path: &Path, index: u32) -> String {
+    let absolute = if socket_path.is_absolute() {
+        socket_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(socket_path))
+            .unwrap_or_else(|_| socket_path.to_path_buf())
+    };
+    let socket_path = if let Ok(canonical) = fs::canonicalize(&absolute) {
+        canonical
+    } else {
+        match (absolute.parent(), absolute.file_name()) {
+            (Some(parent), Some(file_name)) => fs::canonicalize(parent)
+                .map(|canonical_parent| canonical_parent.join(file_name))
+                .unwrap_or(absolute),
+            _ => absolute,
+        }
+    };
+    format!("{},{},{}", socket_path.display(), std::process::id(), index)
 }
 
 fn default_shell_string() -> String {

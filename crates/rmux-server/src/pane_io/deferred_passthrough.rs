@@ -7,7 +7,7 @@ use super::types::OpenAttachTarget;
 #[cfg(any(unix, windows))]
 use super::wire::emit_attach_bytes;
 #[cfg(any(unix, windows))]
-use rmux_core::TerminalPassthrough;
+use rmux_core::{TerminalPassthrough, TerminalPassthroughKind};
 #[cfg(any(unix, windows))]
 use std::io;
 #[cfg(any(unix, windows))]
@@ -56,12 +56,27 @@ pub(super) fn take_passthrough_frame(
 }
 
 #[cfg(any(unix, windows))]
+pub(super) fn take_passthrough_frame_with_live_passthroughs(
+    current_target: &OpenAttachTarget,
+    deferred_passthroughs: &mut Vec<TerminalPassthrough>,
+    live_passthroughs: Vec<TerminalPassthrough>,
+) -> Vec<u8> {
+    if deferred_passthroughs.is_empty() && live_passthroughs.is_empty() {
+        return Vec::new();
+    }
+    let mut passthroughs = std::mem::take(deferred_passthroughs);
+    passthroughs.extend(live_passthroughs);
+    render_passthroughs(current_target, &passthroughs)
+}
+
+#[cfg(any(unix, windows))]
 pub(super) fn clear_deferred_passthroughs_if_target_changed(
     target_changed: bool,
     deferred_passthroughs: &mut Vec<TerminalPassthrough>,
 ) {
     if target_changed {
-        deferred_passthroughs.clear();
+        deferred_passthroughs
+            .retain(|passthrough| passthrough.kind() == TerminalPassthroughKind::Clipboard);
     }
 }
 
@@ -90,16 +105,20 @@ mod tests {
     use super::clear_deferred_passthroughs_if_target_changed;
 
     #[test]
-    fn target_change_discards_deferred_passthroughs() {
-        let mut deferred = vec![TerminalPassthrough::kitty_graphics(
-            0,
-            0,
-            b"Gf=100;AAAA".to_vec(),
-        )];
+    fn target_change_discards_cursor_position_dependent_passthroughs() {
+        let mut deferred = vec![
+            TerminalPassthrough::kitty_graphics(0, 0, b"Gf=100;AAAA".to_vec()),
+            TerminalPassthrough::clipboard(b"\x1b]52;c;QQ==\x07".to_vec()),
+        ];
 
         clear_deferred_passthroughs_if_target_changed(true, &mut deferred);
 
-        assert!(deferred.is_empty());
+        assert_eq!(
+            deferred,
+            vec![TerminalPassthrough::clipboard(
+                b"\x1b]52;c;QQ==\x07".to_vec()
+            )]
+        );
     }
 
     #[test]

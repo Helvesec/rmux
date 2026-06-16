@@ -323,9 +323,9 @@ mod windows {
             .await?;
         assert!(warm.list_sessions().await?.contains(&session_name));
         assert!(warm.session(session_name).await?.exists().await?);
-        drop(warm);
 
-        harness.finish().await
+        warm.shutdown().await?;
+        harness.disarm_after_shutdown().await
     }
 
     fn exit_code(exit: Option<&PaneExitState>) -> Option<i32> {

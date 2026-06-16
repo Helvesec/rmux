@@ -46,6 +46,25 @@ impl CommandTokens {
         self.tokens.front().map(String::as_str)
     }
 
+    pub(super) fn optional_compact_flags(&mut self, allowed: &str) -> Option<Vec<char>> {
+        let token = self.peek()?;
+        if !token.starts_with('-') || token == "-" || token == "--" || token.len() <= 2 {
+            return None;
+        }
+        let flags = token.strip_prefix('-')?;
+        if !flags.chars().all(|flag| allowed.contains(flag)) {
+            return None;
+        }
+        let token = self.optional().expect("peeked flag token must exist");
+        Some(
+            token
+                .strip_prefix('-')
+                .expect("validated compact flag token")
+                .chars()
+                .collect(),
+        )
+    }
+
     pub(super) fn peek_is_flag(&self) -> bool {
         self.tokens
             .front()

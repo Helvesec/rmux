@@ -10,10 +10,18 @@
 //! - `help` &mdash; print top-level help and exit.
 //! - `feature-inventory` &mdash; validate and render the tracked feature
 //!   inventory.
+//! - `generate-completions` &mdash; generate shell completion assets from the
+//!   synthetic RMUX command surface.
 
 use std::env;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
+#[cfg(not(test))]
+#[allow(missing_docs, unused)]
+#[path = "../../src/cli_args.rs"]
+mod cli_args;
+mod completions;
 mod feature_inventory;
 
 const HELP: &str = "\
@@ -29,7 +37,11 @@ Commands:
     feature-inventory --check-file-sizes
                                 Check tracked rmux-sdk source-size exceptions.
     feature-inventory --render-markdown
-                                Render the YAML inventory as a Markdown table.";
+                                Render the YAML inventory as a Markdown table.
+    generate-completions --output-dir <path> [--shell <name>]...
+                                Generate bash, zsh, fish, PowerShell, and
+                                Elvish completion files. Use --shell to limit
+                                the generated set.";
 
 fn main() -> ExitCode {
     match parse_args(env::args().skip(1)) {
@@ -38,11 +50,32 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Command::FeatureInventory { mode }) => run_feature_inventory(mode),
+        Ok(Command::GenerateCompletions { output_dir, shells }) => {
+            run_generate_completions(&output_dir, &shells)
+        }
         Err(message) => {
             eprintln!("{message}");
             eprintln!();
             eprint!("{HELP}");
             ExitCode::from(2)
+        }
+    }
+}
+
+fn run_generate_completions(
+    output_dir: &std::path::Path,
+    shells: &[completions::Shell],
+) -> ExitCode {
+    match completions::generate(output_dir, shells) {
+        Ok(paths) => {
+            for path in paths {
+                println!("{}", path.display());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("xtask generate-completions failed: {error}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -65,7 +98,13 @@ fn run_feature_inventory(mode: feature_inventory::Mode) -> ExitCode {
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Help,
-    FeatureInventory { mode: feature_inventory::Mode },
+    FeatureInventory {
+        mode: feature_inventory::Mode,
+    },
+    GenerateCompletions {
+        output_dir: PathBuf,
+        shells: Vec<completions::Shell>,
+    },
 }
 
 fn repo_root_from_manifest_dir() -> std::path::PathBuf {
@@ -117,13 +156,49 @@ where
                 })?,
             })
         }
+        "generate-completions" => parse_generate_completions_args(args),
         other => Err(format!("unknown xtask command: {other}")),
     }
 }
 
+fn parse_generate_completions_args<I>(args: I) -> Result<Command, String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args = args.into_iter();
+    let mut output_dir = None;
+    let mut shells = Vec::new();
+
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--output-dir" => {
+                let value = args.next().ok_or_else(|| {
+                    "generate-completions --output-dir requires a value".to_owned()
+                })?;
+                output_dir = Some(PathBuf::from(value));
+            }
+            "--shell" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "generate-completions --shell requires a value".to_owned())?;
+                shells.push(completions::Shell::parse(&value)?);
+            }
+            other => return Err(format!("unknown generate-completions argument: {other}")),
+        }
+    }
+
+    Ok(Command::GenerateCompletions {
+        output_dir: output_dir
+            .ok_or_else(|| "generate-completions requires --output-dir <path>".to_owned())?,
+        shells,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{feature_inventory, parse_args, Command};
+    use std::path::PathBuf;
+
+    use super::{completions, feature_inventory, parse_args, Command};
 
     #[test]
     fn no_args_prints_help() {
@@ -197,6 +272,48 @@ mod tests {
             parse_args(["feature-inventory", "--check", "--render-markdown"])
                 .expect_err("duplicate mode errors"),
             "feature-inventory accepts exactly one mode flag"
+        );
+    }
+
+    #[test]
+    fn generate_completions_requires_output_dir() {
+        assert_eq!(
+            parse_args(["generate-completions"]).expect_err("missing output dir errors"),
+            "generate-completions requires --output-dir <path>"
+        );
+    }
+
+    #[test]
+    fn generate_completions_accepts_shell_filters() {
+        assert_eq!(
+            parse_args([
+                "generate-completions",
+                "--output-dir",
+                "target/completions",
+                "--shell",
+                "bash",
+                "--shell",
+                "zsh",
+            ]),
+            Ok(Command::GenerateCompletions {
+                output_dir: PathBuf::from("target/completions"),
+                shells: vec![completions::Shell::Bash, completions::Shell::Zsh],
+            })
+        );
+    }
+
+    #[test]
+    fn generate_completions_rejects_unknown_shell() {
+        assert_eq!(
+            parse_args([
+                "generate-completions",
+                "--output-dir",
+                "target/completions",
+                "--shell",
+                "tcsh",
+            ])
+            .expect_err("unknown shell errors"),
+            "unknown completion shell: tcsh; expected one of bash, zsh, fish, powershell, elvish"
         );
     }
 }

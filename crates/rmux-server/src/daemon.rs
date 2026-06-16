@@ -275,9 +275,7 @@ impl ServerDaemon {
         {
             let bound_listener = bind_unix_listener_at(self.config.socket_path())?;
             let (shutdown_handle, shutdown_receiver) = ShutdownHandle::new();
-            let (server_signal_tx, server_signal_rx) = tokio::sync::mpsc::unbounded_channel();
-            let signal_watcher =
-                crate::signals::SignalWatcher::install(shutdown_handle.clone(), server_signal_tx)?;
+            let signal_watcher = crate::signals::SignalWatcher::install()?;
             let socket_path = self.config.socket_path().to_path_buf();
             let owner_uid = real_user_id()?;
             let serve_options = ServeOptions::new(
@@ -291,7 +289,7 @@ impl ServerDaemon {
                 self.config.web_required(),
             )
             .with_socket_identity(bound_listener.identity)
-            .with_server_signals(server_signal_rx);
+            .with_server_signals(signal_watcher);
 
             let task = tokio::spawn(listener::serve(
                 bound_listener.listener,
@@ -305,7 +303,6 @@ impl ServerDaemon {
                 socket_path,
                 shutdown_handle,
                 task: Some(task),
-                signal_watcher: Some(signal_watcher),
             })
         }
 
@@ -420,8 +417,6 @@ pub struct ServerHandle {
     socket_path: PathBuf,
     shutdown_handle: ShutdownHandle,
     task: Option<JoinHandle<io::Result<()>>>,
-    #[cfg(unix)]
-    signal_watcher: Option<crate::signals::SignalWatcher>,
 }
 
 impl ServerHandle {
@@ -452,10 +447,6 @@ impl ServerHandle {
     }
 
     fn request_shutdown(&mut self) {
-        #[cfg(unix)]
-        {
-            let _ = self.signal_watcher.take();
-        }
         self.shutdown_handle.request_shutdown();
     }
 }

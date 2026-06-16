@@ -68,6 +68,9 @@ pub struct NewSessionExtRequest {
     /// Full invoking client environment in `NAME=VALUE` form.
     #[serde(default)]
     pub client_environment: Option<Vec<String>>,
+    /// Whether session creation should skip updating from the invoking client environment.
+    #[serde(default)]
+    pub skip_environment_update: bool,
 }
 
 impl<'de> Deserialize<'de> for NewSessionExtRequest {
@@ -94,6 +97,7 @@ impl<'de> Deserialize<'de> for NewSessionExtRequest {
                 "command",
                 "process_command",
                 "client_environment",
+                "skip_environment_update",
             ],
             NewSessionExtRequestVisitor,
         )
@@ -129,6 +133,7 @@ impl<'de> Visitor<'de> for NewSessionExtRequestVisitor {
         let command = required_next(&mut seq, 13, &self)?;
         let process_command = compat_next_element(&mut seq)?;
         let client_environment = compat_next_element(&mut seq)?;
+        let skip_environment_update: bool = compat_next_element(&mut seq)?;
 
         Ok(NewSessionExtRequest {
             session_name,
@@ -147,6 +152,7 @@ impl<'de> Visitor<'de> for NewSessionExtRequestVisitor {
             command,
             process_command,
             client_environment,
+            skip_environment_update,
         })
     }
 
@@ -170,6 +176,7 @@ impl<'de> Visitor<'de> for NewSessionExtRequestVisitor {
         let mut command = None;
         let mut process_command = None;
         let mut client_environment = None;
+        let mut skip_environment_update = None;
 
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
@@ -189,6 +196,7 @@ impl<'de> Visitor<'de> for NewSessionExtRequestVisitor {
                 "command" => command = Some(map.next_value()?),
                 "process_command" => process_command = Some(map.next_value()?),
                 "client_environment" => client_environment = Some(map.next_value()?),
+                "skip_environment_update" => skip_environment_update = Some(map.next_value()?),
                 _ => {
                     let _: de::IgnoredAny = map.next_value()?;
                 }
@@ -217,6 +225,7 @@ impl<'de> Visitor<'de> for NewSessionExtRequestVisitor {
             command: command.ok_or_else(|| de::Error::missing_field("command"))?,
             process_command: process_command.unwrap_or_default(),
             client_environment: client_environment.unwrap_or_default(),
+            skip_environment_update: skip_environment_update.unwrap_or_default(),
         })
     }
 }

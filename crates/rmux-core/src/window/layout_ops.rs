@@ -42,6 +42,7 @@ impl Window {
                 self.toggle_zoom(self.active_pane);
                 return;
             }
+            ResizePaneAdjustment::TrimBelow => return,
             ResizePaneAdjustment::Up { cells } => {
                 let rows = self.pane(0).map_or(1, |pane| {
                     pane.geometry().rows().saturating_sub(cells).max(1)
@@ -80,14 +81,7 @@ impl Window {
             return false;
         };
 
-        if self.panes.len() == 1
-            || (!self.custom_layout
-                && position == 0
-                && matches!(
-                    self.layout,
-                    LayoutName::MainVertical | LayoutName::MainVerticalMirrored
-                ))
-        {
+        if self.panes.len() == 1 {
             self.resize_main_pane(ResizePaneAdjustment::AbsoluteWidth { columns });
             return true;
         }
@@ -108,14 +102,7 @@ impl Window {
             return false;
         };
 
-        if self.panes.len() == 1
-            || (!self.custom_layout
-                && position == 0
-                && matches!(
-                    self.layout,
-                    LayoutName::MainHorizontal | LayoutName::MainHorizontalMirrored
-                ))
-        {
+        if self.panes.len() == 1 {
             self.resize_main_pane(ResizePaneAdjustment::AbsoluteHeight { rows });
             return true;
         }
@@ -172,6 +159,7 @@ impl Window {
             ResizePaneAdjustment::AbsoluteWidth { .. }
             | ResizePaneAdjustment::AbsoluteHeight { .. }
             | ResizePaneAdjustment::AbsoluteSize { .. }
+            | ResizePaneAdjustment::TrimBelow
             | ResizePaneAdjustment::Zoom
             | ResizePaneAdjustment::NoOp => return false,
         };

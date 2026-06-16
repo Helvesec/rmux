@@ -58,7 +58,7 @@ impl HandlerState {
         Ok(())
     }
 
-    fn remap_reindexed_window_metadata(
+    pub(in crate::pane_terminals) fn remap_reindexed_window_metadata(
         &mut self,
         session_name: &SessionName,
         index_map: &std::collections::BTreeMap<u32, u32>,

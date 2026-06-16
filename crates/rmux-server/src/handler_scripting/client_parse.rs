@@ -152,7 +152,6 @@ pub(super) fn parse_refresh_client(mut args: CommandTokens) -> Result<Request, R
     let mut pan_down = false;
     let mut flags = None;
     let mut flags_alias = None;
-    let mut colour_report = None;
     let mut clipboard_query = false;
     let mut pan_left = false;
     let mut pan_right = false;
@@ -201,10 +200,6 @@ pub(super) fn parse_refresh_client(mut args: CommandTokens) -> Result<Request, R
                 let _ = args.optional();
                 pan_left = true;
             }
-            "-r" => {
-                let _ = args.optional();
-                colour_report = Some(args.required("-r pane")?);
-            }
             "-R" => {
                 let _ = args.optional();
                 pan_right = true;
@@ -251,15 +246,15 @@ pub(super) fn parse_refresh_client(mut args: CommandTokens) -> Result<Request, R
         subscriptions,
         subscriptions_format,
         control_size,
-        colour_report,
+        colour_report: None,
     }))
 }
 
 pub(super) fn parse_list_clients(mut args: CommandTokens) -> Result<Request, RmuxError> {
     let mut format = None;
     let mut filter = None;
-    let mut sort_order = None;
-    let mut reversed = false;
+    let sort_order = None;
+    let reversed = false;
     let mut target_session = None;
 
     while let Some(token) = args.peek() {
@@ -277,12 +272,10 @@ pub(super) fn parse_list_clients(mut args: CommandTokens) -> Result<Request, Rmu
                 filter = Some(args.required("-f filter")?);
             }
             "-O" => {
-                let _ = args.optional();
-                sort_order = Some(args.required("-O sort-order")?);
+                return Err(unsupported_flag("list-clients", "-O"));
             }
             "-r" => {
-                let _ = args.optional();
-                reversed = true;
+                return Err(unsupported_flag("list-clients", "-r"));
             }
             "-t" => {
                 let _ = args.optional();
@@ -381,6 +374,18 @@ pub(super) fn parse_server_access(mut args: CommandTokens) -> Result<Request, Rm
                 let _ = args.optional();
                 write = true;
             }
+            "--help" => return Err(unsupported_flag("server-access", "--help")),
+            "-" => {
+                return Err(RmuxError::Server(
+                    "command server-access: invalid flag -".to_owned(),
+                ));
+            }
+            flag if flag.starts_with("--") => {
+                return Err(RmuxError::Server(
+                    "command server-access: invalid flag --".to_owned(),
+                ));
+            }
+            flag if flag.starts_with('-') => return Err(unsupported_flag("server-access", flag)),
             _ => break,
         }
     }

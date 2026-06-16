@@ -66,6 +66,84 @@ pub struct AttachSessionExt2Request {
     pub client_size: Option<TerminalSize>,
 }
 
+/// Attach request payload with explicit attach-stream client capabilities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachSessionExt3Request {
+    /// The optional exact target session name.
+    #[serde(default)]
+    pub target: Option<SessionName>,
+    /// The optional raw tmux-style target text, including window/pane selectors.
+    #[serde(default)]
+    pub target_spec: Option<String>,
+    /// Whether other attached clients should be detached first.
+    #[serde(default)]
+    pub detach_other_clients: bool,
+    /// Whether other attached clients should be detached and terminated.
+    #[serde(default)]
+    pub kill_other_clients: bool,
+    /// Whether readonly attach mode should be enabled.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Whether client environment updates should be skipped.
+    #[serde(default)]
+    pub skip_environment_update: bool,
+    /// Optional tmux client-flag names such as `read-only` or `active-pane`.
+    #[serde(default)]
+    pub flags: Option<Vec<String>>,
+    /// Optional tmux format-expanded working directory applied to the target session.
+    #[serde(default)]
+    pub working_directory: Option<String>,
+    /// Terminal/runtime hints captured from the invoking client.
+    #[serde(default)]
+    pub client_terminal: ClientTerminalContext,
+    /// The invoking client terminal size, when known.
+    #[serde(default)]
+    pub client_size: Option<TerminalSize>,
+    /// Attach-stream messages this client can decode.
+    #[serde(default)]
+    pub attach_capabilities: Vec<String>,
+}
+
+impl AttachSessionExt3Request {
+    /// Builds the capability-aware request from the v2 attach request shape.
+    #[must_use]
+    pub fn from_ext2(request: AttachSessionExt2Request, attach_capabilities: Vec<String>) -> Self {
+        Self {
+            target: request.target,
+            target_spec: request.target_spec,
+            detach_other_clients: request.detach_other_clients,
+            kill_other_clients: request.kill_other_clients,
+            read_only: request.read_only,
+            skip_environment_update: request.skip_environment_update,
+            flags: request.flags,
+            working_directory: request.working_directory,
+            client_terminal: request.client_terminal,
+            client_size: request.client_size,
+            attach_capabilities,
+        }
+    }
+
+    /// Splits out the v2 payload fields and the attach-stream capabilities.
+    #[must_use]
+    pub fn into_ext2_and_capabilities(self) -> (AttachSessionExt2Request, Vec<String>) {
+        (
+            AttachSessionExt2Request {
+                target: self.target,
+                target_spec: self.target_spec,
+                detach_other_clients: self.detach_other_clients,
+                kill_other_clients: self.kill_other_clients,
+                read_only: self.read_only,
+                skip_environment_update: self.skip_environment_update,
+                flags: self.flags,
+                working_directory: self.working_directory,
+                client_terminal: self.client_terminal,
+                client_size: self.client_size,
+            },
+            self.attach_capabilities,
+        )
+    }
+}
+
 /// Request payload for `switch-client`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwitchClientRequest {

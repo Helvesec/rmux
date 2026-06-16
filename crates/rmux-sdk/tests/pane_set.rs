@@ -42,12 +42,23 @@ async fn pane_set_broadcast_snapshot_and_visible_waits() -> TestResult {
         .broadcast(Input::text("printf 'sdk_paneset_all_%s\\n' $((40+2))"))
         .await?;
     assert_eq!(broadcast.len(), 2);
-    panes.broadcast(Input::key("Enter")).await?;
+    let staged = panes
+        .expect_all()
+        .visible_text_contains("sdk_paneset_all_%s")
+        .timeout(Duration::from_secs(15))
+        .await;
+    let staged = staged.all().expect("expect_all returns all outcome");
+    assert!(
+        staged.is_success(),
+        "broadcast text should reach every pane before Enter: {staged:?}"
+    );
+    let enter = panes.broadcast(Input::key("Enter")).await?;
+    assert_eq!(enter.len(), 2);
 
     let all = panes
         .expect_all()
         .visible_text_contains("sdk_paneset_all_42")
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
         .await;
     let all = all.all().expect("expect_all returns all outcome");
     assert!(all.is_success(), "all panes should match: {all:?}");

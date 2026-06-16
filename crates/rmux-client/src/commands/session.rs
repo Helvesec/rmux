@@ -1,7 +1,7 @@
 use rmux_proto::request::{
-    AttachSessionExt2Request, AttachSessionExtRequest, DetachClientExtRequest, ListClientsRequest,
-    NewSessionExtRequest, RefreshClientRequest, Request, SuspendClientRequest,
-    SwitchClientExt2Request, SwitchClientExt3Request,
+    AttachSessionExt2Request, AttachSessionExt3Request, AttachSessionExtRequest,
+    DetachClientExtRequest, ListClientsRequest, NewSessionExtRequest, RefreshClientRequest,
+    Request, SuspendClientRequest, SwitchClientExt2Request, SwitchClientExt3Request,
 };
 use rmux_proto::{
     AttachSessionRequest, DetachClientRequest, HasSessionRequest, KillSessionRequest,
@@ -204,6 +204,22 @@ impl Connection {
         request: AttachSessionExt2Request,
     ) -> Result<AttachTransition, ClientError> {
         self.write_request(&Request::AttachSessionExt2(request))?;
+        let response = self.read_response()?;
+
+        match response {
+            Response::AttachSession(response) => Ok(AttachTransition::Upgraded(
+                self.into_attach_upgrade(response)?,
+            )),
+            other => Ok(AttachTransition::Rejected(other)),
+        }
+    }
+
+    /// Sends a capability-aware `attach-session` request over the detached RPC channel.
+    pub fn begin_attach_with_capabilities(
+        mut self,
+        request: AttachSessionExt3Request,
+    ) -> Result<AttachTransition, ClientError> {
+        self.write_request(&Request::AttachSessionExt3(request))?;
         let response = self.read_response()?;
 
         match response {

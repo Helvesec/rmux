@@ -1,28 +1,35 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use std::time::Duration;
 
 use rmux_core::events::OutputCursorItem;
-use rmux_core::{OptionStore, PaneGeometry};
+use rmux_core::{OptionStore, PaneGeometry, TerminalPassthrough};
 use rmux_proto::{
     encode_attach_message, AttachFrameDecoder, AttachMessage, AttachedKeystroke, KeyDispatched,
-    NewSessionRequest, Request, Response, SessionName, TerminalSize,
+    NewSessionRequest, PaneTarget, Request, Response, SessionName, TerminalSize,
 };
 use rmux_pty::PtyPair;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 
 use super::attach_transport::AttachTransport;
-use super::control::{apply_pending_attach_controls, PendingAttachAction};
+use super::control::{
+    apply_pending_attach_controls, coalesce_render_switches, PendingAttachAction,
+};
 use super::wire::open_attach_target;
 use super::wire::recv_pane_output;
 use super::{
-    forward_attach, pane_output_channel, pane_output_channel_with_limits, process_socket_messages,
+    clear_close_pane_output_after_refresh_if_target_changed, consume_predicted_echo,
+    forward_attach, is_predictable_local_echo, pane_output_channel,
+    pane_output_channel_with_limits, predictable_local_echo_prefix_len, process_socket_messages,
     should_emit_overlay, AttachControl, AttachTarget, LiveAttachInputContext, OverlayFrame,
+    PredictedEcho,
 };
 use crate::handler::RequestHandler;
 use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
+use crate::renderer::PaneRenderDeltaFrame;
 
 mod persistent_overlay;
 
@@ -57,6 +64,141 @@ fn overlay_generation_rejects_stale_clears_after_switches_or_newer_overlays() {
         1,
         &mut current_overlay_generation,
         &OverlayFrame::new(Vec::new(), 0, 3)
+    ));
+}
+
+#[test]
+fn target_change_clears_deferred_pane_output_close() {
+    let mut close_after_refresh = true;
+
+    clear_close_pane_output_after_refresh_if_target_changed(true, &mut close_after_refresh);
+
+    assert!(
+        !close_after_refresh,
+        "a deferred close belongs to the old attach target and must not apply after a switch"
+    );
+}
+
+#[test]
+fn same_target_keeps_deferred_pane_output_close() {
+    let mut close_after_refresh = true;
+
+    clear_close_pane_output_after_refresh_if_target_changed(false, &mut close_after_refresh);
+
+    assert!(close_after_refresh);
+}
+
+#[test]
+fn predicted_local_echo_accepts_only_single_printable_bytes() {
+    assert!(is_predictable_local_echo(b"a"));
+    assert!(is_predictable_local_echo(b"abc123"));
+    assert!(is_predictable_local_echo(b" "));
+    assert!(is_predictable_local_echo(b"~"));
+    assert!(!is_predictable_local_echo(b"\n"));
+    assert!(!is_predictable_local_echo(b"\x1b"));
+    assert!(!is_predictable_local_echo(b"0123456789abcdefg"));
+    assert!(!is_predictable_local_echo("é".as_bytes()));
+}
+
+#[test]
+fn predicted_local_echo_accepts_printable_prefix_before_enter() {
+    assert_eq!(predictable_local_echo_prefix_len(b"PING123\r"), 7);
+    assert_eq!(predictable_local_echo_prefix_len(b"PING123\n"), 7);
+    assert_eq!(predictable_local_echo_prefix_len(b"PING123\t"), 0);
+    assert_eq!(predictable_local_echo_prefix_len(b"\r"), 0);
+}
+
+#[test]
+fn predicted_local_echo_consumes_exact_pty_echo_once() {
+    let alpha = SessionName::new("alpha").expect("valid session name");
+    let mut target =
+        open_attach_target(test_attach_target(&alpha, b"", None), false).expect("open target");
+
+    target.predicted_echo.extend(b"xyz");
+    assert_eq!(
+        consume_predicted_echo(&mut target, b"xyz"),
+        PredictedEcho::Consumed
+    );
+    assert!(target.predicted_echo.is_empty());
+
+    target.predicted_echo.extend(b"x");
+    assert_eq!(
+        consume_predicted_echo(&mut target, b"y"),
+        PredictedEcho::Mismatch
+    );
+    assert!(target.predicted_echo.is_empty());
+
+    target.predicted_echo.extend(b"x");
+    assert_eq!(
+        consume_predicted_echo(&mut target, b"xy"),
+        PredictedEcho::Mismatch
+    );
+    assert!(target.predicted_echo.is_empty());
+}
+
+#[test]
+fn stale_predicted_local_echo_expires_without_pty_echo() {
+    let alpha = SessionName::new("alpha").expect("valid session name");
+    let mut target =
+        open_attach_target(test_attach_target(&alpha, b"", None), false).expect("open target");
+
+    target.predicted_echo.extend(b"secret");
+    target.predicted_echo_started_at =
+        Some(Instant::now() - super::PREDICTED_LOCAL_ECHO_TIMEOUT * 2);
+
+    assert_eq!(
+        consume_predicted_echo(&mut target, b"visible"),
+        PredictedEcho::NoPrediction
+    );
+    assert!(target.predicted_echo.is_empty());
+    assert!(target.predicted_echo_started_at.is_none());
+}
+
+#[tokio::test]
+async fn live_render_frame_uses_render_message_for_capable_clients() {
+    let alpha = SessionName::new("alpha").expect("valid session name");
+    let target = test_attach_target(&alpha, b"", None);
+    let mut target = open_attach_target(target, true).expect("open attach target");
+    let frame = PaneRenderDeltaFrame::new(b"live".to_vec(), None);
+    let (stream, mut peer) = tokio::io::duplex(1024);
+    let stream = AttachTransport::from_io(stream);
+
+    super::emit_live_render_frame(&stream, &mut target, &frame, true)
+        .await
+        .expect("emit live render frame");
+
+    let mut bytes = [0_u8; 128];
+    let count = peer.read(&mut bytes).await.expect("read emitted frame");
+    let mut decoder = AttachFrameDecoder::new();
+    decoder.push_bytes(&bytes[..count]);
+
+    assert!(matches!(
+        decoder.next_message().expect("decode emitted frame"),
+        Some(AttachMessage::Render(bytes)) if bytes.ends_with(b"live")
+    ));
+}
+
+#[tokio::test]
+async fn live_render_delta_uses_data_message_for_stateful_frames() {
+    let alpha = SessionName::new("alpha").expect("valid session name");
+    let target = test_attach_target(&alpha, b"", None);
+    let mut target = open_attach_target(target, true).expect("open attach target");
+    let frame = PaneRenderDeltaFrame::new(b"delta".to_vec(), None);
+    let (stream, mut peer) = tokio::io::duplex(1024);
+    let stream = AttachTransport::from_io(stream);
+
+    super::emit_live_render_frame(&stream, &mut target, &frame, false)
+        .await
+        .expect("emit live render frame");
+
+    let mut bytes = [0_u8; 128];
+    let count = peer.read(&mut bytes).await.expect("read emitted frame");
+    let mut decoder = AttachFrameDecoder::new();
+    decoder.push_bytes(&bytes[..count]);
+
+    assert!(matches!(
+        decoder.next_message().expect("decode emitted frame"),
+        Some(AttachMessage::Data(bytes)) if bytes.ends_with(b"delta")
     ));
 }
 
@@ -127,6 +269,7 @@ async fn typed_keystroke_wire_reaches_stub_and_acknowledges() {
         &mut decoder,
         &stream,
         &live_input,
+        None,
         &mut pending_input,
         &mut locked,
     )
@@ -187,6 +330,7 @@ async fn mouse_keystroke_wire_does_not_error_or_drop_the_attach() {
         &mut decoder,
         &stream,
         &live_input,
+        None,
         &mut pending_input,
         &mut locked,
     )
@@ -217,12 +361,19 @@ async fn forward_attach_emits_stop_sequence_when_processing_errors() {
     let expected_stop = outer_terminal.attach_stop_sequence();
     let target = AttachTarget {
         session_name: SessionName::new("alpha").expect("valid session name"),
-        pane_master,
+        input_target: PaneTarget::with_window(
+            SessionName::new("alpha").expect("valid session name"),
+            0,
+            0,
+        ),
+        pane_master: Some(pane_master),
         pane_output: pane_output_channel(),
+        pane_output_start_sequence: 0,
         render_frame: Vec::new(),
         outer_terminal,
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        raw_passthrough: false,
         kitty_graphics_passthrough: false,
         sixel_passthrough: false,
         persistent_overlay_state_id: None,
@@ -245,9 +396,11 @@ async fn forward_attach_emits_stop_sequence_when_processing_errors() {
         invalid_initial_socket_bytes,
         shutdown_rx,
         control_rx,
+        Arc::new(AtomicUsize::new(0)),
         closing,
         Arc::new(AtomicU64::new(0)),
         live_input,
+        false,
     )
     .await;
     assert!(result.is_err(), "invalid attach input should fail");
@@ -265,7 +418,7 @@ async fn forward_attach_emits_stop_sequence_when_processing_errors() {
         let mut decoder = AttachFrameDecoder::new();
         decoder.push_bytes(&frame_bytes[..bytes_read]);
         while let Some(message) = decoder.next_message().expect("decode attach frame") {
-            if let AttachMessage::Data(bytes) = message {
+            if let AttachMessage::Data(bytes) | AttachMessage::Render(bytes) = message {
                 collected.extend_from_slice(&bytes);
             }
         }
@@ -276,6 +429,72 @@ async fn forward_attach_emits_stop_sequence_when_processing_errors() {
             .windows(expected_stop.len())
             .any(|window| window == expected_stop),
         "attach stop sequence should be emitted on attach failure"
+    );
+}
+
+#[tokio::test]
+async fn detach_control_emits_stop_and_banner_in_one_data_frame() {
+    let alpha = SessionName::new("alpha").expect("valid session name");
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let stream = AttachTransport::from(stream);
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let mut current_target = open_attach_target(test_attach_target(&alpha, b"BASE-A", None), false)
+        .expect("open target");
+    let expected_stop = current_target.outer_terminal.attach_stop_sequence();
+    let mut render_generation = 0_u64;
+    let mut overlay_generation = 0_u64;
+    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay_visible = false;
+    let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
+    let mut locked = false;
+    let mut deferred_controls = VecDeque::new();
+
+    control_tx
+        .send(AttachControl::Detach)
+        .expect("send detach control");
+
+    let control_backlog = AtomicUsize::new(0);
+    let action = apply_pending_attach_controls(
+        &mut deferred_controls,
+        Some(&mut control_rx),
+        &control_backlog,
+        &mut current_target,
+        &stream,
+        &mut render_generation,
+        &mut overlay_generation,
+        &mut persistent_overlay,
+        &mut persistent_overlay_visible,
+        &mut persistent_overlay_state_id,
+        &mut locked,
+    )
+    .await
+    .expect("apply pending detach");
+
+    assert!(matches!(action, PendingAttachAction::Exit(_)));
+
+    let mut frame_bytes = [0_u8; 4096];
+    let bytes_read = peer
+        .read(&mut frame_bytes)
+        .await
+        .expect("read detach frame");
+    let mut decoder = AttachFrameDecoder::new();
+    decoder.push_bytes(&frame_bytes[..bytes_read]);
+    let Some(AttachMessage::Data(bytes)) = decoder.next_message().expect("decode detach frame")
+    else {
+        panic!("detach should emit a data frame");
+    };
+
+    assert!(
+        bytes
+            .windows(expected_stop.len())
+            .any(|window| window == expected_stop),
+        "detach data must contain attach-stop before close"
+    );
+    assert!(
+        bytes
+            .windows(b"[detached (from session alpha)]\r\n".len())
+            .any(|window| window == b"[detached (from session alpha)]\r\n"),
+        "detach data must contain detached banner"
     );
 }
 
@@ -322,8 +541,10 @@ fn test_attach_target_with_protocols(
     let pane_master = pty.into_master();
     AttachTarget {
         session_name: session_name.clone(),
-        pane_master,
+        input_target: PaneTarget::with_window(session_name.clone(), 0, 0),
+        pane_master: Some(pane_master),
         pane_output,
+        pane_output_start_sequence: 0,
         render_frame: render_frame.to_vec(),
         outer_terminal: OuterTerminal::resolve(
             &OptionStore::default(),
@@ -331,11 +552,86 @@ fn test_attach_target_with_protocols(
         ),
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        raw_passthrough: kitty_graphics_passthrough || sixel_passthrough,
         kitty_graphics_passthrough,
         sixel_passthrough,
         persistent_overlay_state_id,
         live_pane: None,
     }
+}
+
+fn test_render_only_attach_target(session_name: &SessionName, render_frame: &[u8]) -> AttachTarget {
+    let mut target = test_attach_target(session_name, render_frame, None);
+    target.pane_master = None;
+    target
+}
+
+#[test]
+fn render_only_switches_coalesce_before_reliable_controls() {
+    let alpha = SessionName::new("alpha").expect("valid session name");
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let mut deferred_controls = VecDeque::new();
+
+    let first = test_render_only_attach_target(&alpha, b"first");
+    let second = test_render_only_attach_target(&alpha, b"second");
+    let third = test_render_only_attach_target(&alpha, b"third");
+    control_tx
+        .send(AttachControl::switch(second))
+        .expect("queue second switch");
+    control_tx
+        .send(AttachControl::switch(third))
+        .expect("queue third switch");
+    control_tx
+        .send(AttachControl::Detach)
+        .expect("queue reliable detach");
+
+    let control_backlog = AtomicUsize::new(0);
+    let coalesced = coalesce_render_switches(
+        Box::new(first),
+        &mut deferred_controls,
+        Some(&mut control_rx),
+        &control_backlog,
+    );
+
+    assert_eq!(coalesced.render_frame, b"third");
+    assert!(matches!(
+        deferred_controls.pop_front(),
+        Some(AttachControl::Detach)
+    ));
+}
+
+#[test]
+fn render_only_switch_coalescing_preserves_deferred_control_order() {
+    let alpha = SessionName::new("alpha").expect("valid session name");
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let mut deferred_controls = VecDeque::from([AttachControl::Refresh]);
+
+    let first = test_render_only_attach_target(&alpha, b"first");
+    let second = test_render_only_attach_target(&alpha, b"second");
+    control_tx
+        .send(AttachControl::switch(second))
+        .expect("queue render switch");
+    control_tx
+        .send(AttachControl::Detach)
+        .expect("queue reliable detach");
+
+    let control_backlog = AtomicUsize::new(0);
+    let coalesced = coalesce_render_switches(
+        Box::new(first),
+        &mut deferred_controls,
+        Some(&mut control_rx),
+        &control_backlog,
+    );
+
+    assert_eq!(coalesced.render_frame, b"second");
+    assert!(matches!(
+        deferred_controls.pop_front(),
+        Some(AttachControl::Refresh)
+    ));
+    assert!(matches!(
+        deferred_controls.pop_front(),
+        Some(AttachControl::Detach)
+    ));
 }
 
 #[tokio::test]
@@ -345,8 +641,8 @@ async fn pending_switch_action_reports_target_change_for_status_reschedule() {
     let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
     let stream = AttachTransport::from(stream);
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    let mut current_target =
-        open_attach_target(test_attach_target(&alpha, b"BASE-A", None)).expect("open target");
+    let mut current_target = open_attach_target(test_attach_target(&alpha, b"BASE-A", None), false)
+        .expect("open target");
     let mut render_generation = 0_u64;
     let mut overlay_generation = 0_u64;
     let mut persistent_overlay = None::<Vec<u8>>;
@@ -361,9 +657,11 @@ async fn pending_switch_action_reports_target_change_for_status_reschedule() {
         )))
         .expect("send switch control");
 
+    let control_backlog = AtomicUsize::new(0);
     let action = apply_pending_attach_controls(
         &mut deferred_controls,
         Some(&mut control_rx),
+        &control_backlog,
         &mut current_target,
         &stream,
         &mut render_generation,
@@ -390,6 +688,145 @@ async fn pending_switch_action_reports_target_change_for_status_reschedule() {
     );
 }
 
+#[tokio::test]
+async fn pending_refresh_after_switch_preserves_target_change() {
+    let alpha = SessionName::new("alpha").expect("valid session name");
+    let beta = SessionName::new("beta").expect("valid session name");
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let stream = AttachTransport::from(stream);
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let mut current_target = open_attach_target(test_attach_target(&alpha, b"BASE-A", None), false)
+        .expect("open target");
+    let mut render_generation = 0_u64;
+    let mut overlay_generation = 0_u64;
+    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay_visible = false;
+    let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
+    let mut locked = false;
+    let mut deferred_controls = VecDeque::new();
+
+    control_tx
+        .send(AttachControl::switch(test_attach_target(
+            &beta, b"BASE-B", None,
+        )))
+        .expect("send switch control");
+    control_tx
+        .send(AttachControl::Refresh)
+        .expect("send refresh control");
+
+    let control_backlog = AtomicUsize::new(0);
+    let action = apply_pending_attach_controls(
+        &mut deferred_controls,
+        Some(&mut control_rx),
+        &control_backlog,
+        &mut current_target,
+        &stream,
+        &mut render_generation,
+        &mut overlay_generation,
+        &mut persistent_overlay,
+        &mut persistent_overlay_visible,
+        &mut persistent_overlay_state_id,
+        &mut locked,
+    )
+    .await
+    .expect("apply pending switch and refresh");
+
+    assert!(matches!(
+        action,
+        PendingAttachAction::Refresh {
+            target_changed: true
+        }
+    ));
+    assert_eq!(current_target.session_name, beta);
+    let refresh = read_attach_data_until(&mut peer, b"BASE-B").await;
+    assert!(
+        String::from_utf8_lossy(&refresh).contains("BASE-B"),
+        "switch should render before the refresh is scheduled"
+    );
+}
+
+#[tokio::test]
+async fn render_only_switch_forwards_pending_live_passthroughs() {
+    let alpha = SessionName::new("alpha").expect("valid session name");
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let stream = AttachTransport::from(stream);
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let pane_output = pane_output_channel();
+    let mut initial =
+        test_attach_target_with_output(&alpha, b"BASE-A", None, pane_output.clone(), true);
+    initial.pane_master = None;
+    let mut replacement =
+        test_attach_target_with_output(&alpha, b"BASE-B", None, pane_output.clone(), true);
+    replacement.pane_master = None;
+    let mut current_target = open_attach_target(initial, false).expect("open target");
+    let mut render_generation = 0_u64;
+    let mut overlay_generation = 0_u64;
+    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay_visible = false;
+    let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
+    let mut locked = false;
+    let mut deferred_controls = VecDeque::new();
+
+    pane_output.send_for_generation_with_passthroughs(
+        None,
+        b"image".to_vec(),
+        vec![TerminalPassthrough::kitty_graphics(
+            0,
+            0,
+            b"Gf=100;AAAA".to_vec(),
+        )],
+    );
+    pane_output.send_for_generation_with_passthroughs(
+        None,
+        b"next-image".to_vec(),
+        vec![TerminalPassthrough::kitty_graphics(
+            0,
+            0,
+            b"Gf=100;BBBB".to_vec(),
+        )],
+    );
+    replacement.pane_output_start_sequence = 1;
+    control_tx
+        .send(AttachControl::switch(replacement))
+        .expect("send render-only switch");
+
+    let control_backlog = AtomicUsize::new(0);
+    let action = apply_pending_attach_controls(
+        &mut deferred_controls,
+        Some(&mut control_rx),
+        &control_backlog,
+        &mut current_target,
+        &stream,
+        &mut render_generation,
+        &mut overlay_generation,
+        &mut persistent_overlay,
+        &mut persistent_overlay_visible,
+        &mut persistent_overlay_state_id,
+        &mut locked,
+    )
+    .await
+    .expect("apply pending switch");
+
+    assert!(matches!(action, PendingAttachAction::Write));
+    let refresh = read_attach_data_until(&mut peer, b"Gf=100;AAAA").await;
+    assert!(
+        String::from_utf8_lossy(&refresh).contains("BASE-B"),
+        "render-only switch should still write the replacement frame"
+    );
+    assert!(
+        refresh
+            .windows(b"\x1b_Gf=100;AAAA\x1b\\".len())
+            .any(|window| window == b"\x1b_Gf=100;AAAA\x1b\\"),
+        "render-only switch must not drop pending live passthroughs"
+    );
+    assert!(
+        !refresh
+            .windows(b"\x1b_Gf=100;BBBB\x1b\\".len())
+            .any(|window| window == b"\x1b_Gf=100;BBBB\x1b\\"),
+        "render-only switch must not duplicate passthroughs covered by the replacement receiver"
+    );
+}
+
 async fn read_attach_data_until(peer: &mut tokio::net::UnixStream, needle: &[u8]) -> Vec<u8> {
     tokio::time::timeout(Duration::from_secs(1), async {
         let mut collected = Vec::new();
@@ -400,7 +837,7 @@ async fn read_attach_data_until(peer: &mut tokio::net::UnixStream, needle: &[u8]
             assert!(bytes_read > 0, "attach stream closed before expected data");
             decoder.push_bytes(&frame_bytes[..bytes_read]);
             while let Some(message) = decoder.next_message().expect("decode attach frame") {
-                if let AttachMessage::Data(bytes) = message {
+                if let AttachMessage::Data(bytes) | AttachMessage::Render(bytes) = message {
                     collected.extend_from_slice(&bytes);
                 }
             }
@@ -435,9 +872,11 @@ async fn forward_attach_plain_refresh_does_not_clear_the_screen() {
         Vec::new(),
         shutdown_rx,
         control_rx,
+        Arc::new(AtomicUsize::new(0)),
         closing,
         Arc::new(AtomicU64::new(0)),
         live_input,
+        false,
     ));
 
     let initial = read_attach_data_until(&mut peer, b"BASE-0").await;
@@ -488,9 +927,11 @@ async fn forward_attach_preserves_persistent_overlay_across_stateful_switch_refr
         Vec::new(),
         shutdown_rx,
         control_rx,
+        Arc::new(AtomicUsize::new(0)),
         closing,
         Arc::new(AtomicU64::new(0)),
         live_input,
+        false,
     ));
 
     let initial = read_attach_data_until(&mut peer, b"BASE-0").await;
@@ -544,7 +985,7 @@ async fn forward_attach_preserves_persistent_overlay_across_stateful_switch_refr
 }
 
 #[tokio::test]
-async fn forward_attach_emits_display_panes_overlay_for_prefix_q_keystrokes() {
+async fn forward_attach_emits_overlay_control_frames() {
     let handler = Arc::new(RequestHandler::new());
     let attach_pid = std::process::id();
     let session_name = SessionName::new("alpha").expect("valid session name");
@@ -578,6 +1019,7 @@ async fn forward_attach_emits_display_panes_overlay_for_prefix_q_keystrokes() {
     assert!(matches!(set_option, Response::SetOption(_)));
 
     let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let test_control_tx = control_tx.clone();
     handler
         .register_attach(attach_pid, session_name.clone(), control_tx)
         .await;
@@ -586,8 +1028,10 @@ async fn forward_attach_emits_display_panes_overlay_for_prefix_q_keystrokes() {
     let pane_master = pty.into_master();
     let target = AttachTarget {
         session_name: session_name.clone(),
-        pane_master,
+        input_target: PaneTarget::with_window(session_name.clone(), 0, 0),
+        pane_master: Some(pane_master),
         pane_output: pane_output_channel(),
+        pane_output_start_sequence: 0,
         render_frame: Vec::new(),
         outer_terminal: OuterTerminal::resolve(
             &OptionStore::default(),
@@ -595,6 +1039,7 @@ async fn forward_attach_emits_display_panes_overlay_for_prefix_q_keystrokes() {
         ),
         cursor_style: 0,
         active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+        raw_passthrough: false,
         kitty_graphics_passthrough: false,
         sixel_passthrough: false,
         persistent_overlay_state_id: None,
@@ -616,9 +1061,11 @@ async fn forward_attach_emits_display_panes_overlay_for_prefix_q_keystrokes() {
             Vec::new(),
             shutdown_rx,
             control_rx,
+            Arc::new(AtomicUsize::new(0)),
             closing,
             Arc::new(AtomicU64::new(0)),
             live_input,
+            false,
         )
         .await
     });
@@ -639,49 +1086,49 @@ async fn forward_attach_emits_display_panes_overlay_for_prefix_q_keystrokes() {
         {}
     }
 
-    let encoded = encode_attach_message(&AttachMessage::Keystroke(AttachedKeystroke::new(
-        b"\x02q".to_vec(),
-    )))
-    .expect("encode prefix q");
-    tokio::io::AsyncWriteExt::write_all(&mut peer, &encoded)
-        .await
-        .expect("send prefix q");
-
     let overlay_marker = b"\x1b[s\x1b[?25l";
+    let overlay_frame =
+        OverlayFrame::new(b"\x1b[s\x1b[?25lDISPLAY-PANES\x1b[0m\x1b[u".to_vec(), 0, 1);
+    test_control_tx
+        .send(AttachControl::Overlay(overlay_frame))
+        .expect("send overlay control");
     let mut collected = Vec::new();
-    let mut saw_ack = false;
-    while let Ok(Ok(bytes_read)) =
-        tokio::time::timeout(Duration::from_millis(250), peer.read(&mut frame_bytes)).await
-    {
-        if bytes_read == 0 {
+    let overlay_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let remaining = overlay_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             break;
         }
+        let read_timeout = remaining.min(Duration::from_millis(250));
+        let bytes_read = match tokio::time::timeout(read_timeout, peer.read(&mut frame_bytes)).await
+        {
+            Ok(Ok(0)) => break,
+            Ok(Ok(bytes_read)) => bytes_read,
+            Ok(Err(error)) => panic!("read attach frame: {error}"),
+            Err(_) => continue,
+        };
         decoder.push_bytes(&frame_bytes[..bytes_read]);
         while let Some(message) = decoder.next_message().expect("decode attach frame") {
             match message {
-                AttachMessage::Data(bytes) => collected.extend_from_slice(&bytes),
-                AttachMessage::KeyDispatched(_) => saw_ack = true,
+                AttachMessage::Data(bytes) | AttachMessage::Render(bytes) => {
+                    collected.extend_from_slice(&bytes)
+                }
                 _ => {}
             }
         }
         if collected
             .windows(overlay_marker.len())
             .any(|window| window == overlay_marker)
-            && saw_ack
         {
             break;
         }
     }
 
     assert!(
-        saw_ack,
-        "prefix q should at least be acknowledged by the attach stream"
-    );
-    assert!(
         collected
             .windows(overlay_marker.len())
             .any(|window| window == overlay_marker),
-        "prefix q should emit a display-panes overlay frame, got: {:?}",
+        "overlay control should emit a frame, got: {:?}",
         String::from_utf8_lossy(&collected)
     );
 

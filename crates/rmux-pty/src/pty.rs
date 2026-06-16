@@ -2,7 +2,6 @@ use std::io;
 
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
-#[cfg(windows)]
 use std::sync::Arc;
 
 use crate::backend;
@@ -11,6 +10,8 @@ use crate::unsupported_op;
 #[cfg(all(not(unix), not(windows)))]
 use crate::PtyError;
 use crate::{Result, TerminalGeometry, TerminalSize};
+#[cfg(unix)]
+use rustix::termios::{tcgetattr, LocalModes};
 
 #[cfg(unix)]
 /// The slave endpoint of a Unix pseudoterminal pair.
@@ -53,7 +54,7 @@ impl AsRawFd for PtySlave {
 #[derive(Debug)]
 pub struct PtyIo {
     #[cfg(unix)]
-    fd: OwnedFd,
+    fd: Arc<OwnedFd>,
     #[cfg(windows)]
     pty: Arc<backend::WindowsPty>,
 }
@@ -61,7 +62,7 @@ pub struct PtyIo {
 impl PtyIo {
     #[cfg(unix)]
     pub(crate) fn new(fd: OwnedFd) -> Self {
-        Self { fd }
+        Self { fd: Arc::new(fd) }
     }
 
     #[cfg(windows)]
@@ -73,7 +74,7 @@ impl PtyIo {
     pub fn size(&self) -> Result<TerminalSize> {
         #[cfg(unix)]
         {
-            backend::query_size(self.fd.as_fd())
+            backend::query_size(self.fd.as_ref().as_fd())
         }
 
         #[cfg(not(unix))]
@@ -94,7 +95,7 @@ impl PtyIo {
     pub fn resize(&self, size: TerminalSize) -> Result<()> {
         #[cfg(unix)]
         {
-            backend::apply_size(self.fd.as_fd(), size)
+            backend::apply_size(self.fd.as_ref().as_fd(), size)
         }
 
         #[cfg(not(unix))]
@@ -116,7 +117,7 @@ impl PtyIo {
     pub fn resize_geometry(&self, geometry: TerminalGeometry) -> Result<()> {
         #[cfg(unix)]
         {
-            backend::apply_geometry(self.fd.as_fd(), geometry)
+            backend::apply_geometry(self.fd.as_ref().as_fd(), geometry)
         }
 
         #[cfg(not(unix))]
@@ -134,12 +135,12 @@ impl PtyIo {
         }
     }
 
-    /// Duplicates this PTY I/O endpoint.
+    /// Clones this PTY I/O endpoint.
     pub fn try_clone(&self) -> Result<Self> {
         #[cfg(unix)]
         {
             Ok(Self {
-                fd: self.fd.try_clone()?,
+                fd: Arc::clone(&self.fd),
             })
         }
 
@@ -163,7 +164,7 @@ impl PtyIo {
     pub fn read(&self, buffer: &mut [u8]) -> io::Result<usize> {
         #[cfg(unix)]
         {
-            backend::read(self.fd.as_fd(), buffer)
+            backend::read(self.fd.as_ref().as_fd(), buffer)
         }
 
         #[cfg(not(unix))]
@@ -188,7 +189,7 @@ impl PtyIo {
     pub fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
         #[cfg(unix)]
         {
-            backend::write_all(self.fd.as_fd(), bytes)
+            backend::write_all(self.fd.as_ref().as_fd(), bytes)
         }
 
         #[cfg(not(unix))]
@@ -213,7 +214,7 @@ impl PtyIo {
     pub fn set_nonblocking(&self) -> io::Result<()> {
         #[cfg(unix)]
         {
-            backend::set_nonblocking(self.fd.as_fd())
+            backend::set_nonblocking(self.fd.as_ref().as_fd())
         }
 
         #[cfg(not(unix))]
@@ -242,26 +243,26 @@ impl PtyIo {
     #[cfg(unix)]
     #[must_use]
     pub fn as_fd(&self) -> BorrowedFd<'_> {
-        self.fd.as_fd()
+        self.fd.as_ref().as_fd()
     }
 
     #[cfg(unix)]
     pub(crate) fn raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+        self.fd.as_ref().as_raw_fd()
     }
 }
 
 #[cfg(unix)]
 impl AsFd for PtyIo {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        self.fd.as_fd()
+        self.fd.as_ref().as_fd()
     }
 }
 
 #[cfg(unix)]
 impl AsRawFd for PtyIo {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+        self.fd.as_ref().as_raw_fd()
     }
 }
 
@@ -299,7 +300,7 @@ impl PtyMaster {
         self.io.resize_geometry(geometry)
     }
 
-    /// Duplicates the master handle.
+    /// Clones the master handle.
     pub fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             io: self.io.try_clone()?,
@@ -319,9 +320,11 @@ impl PtyMaster {
 
     /// Consumes this Unix PTY master and returns the owned file descriptor.
     #[cfg(unix)]
-    #[must_use]
-    pub fn into_owned_fd(self) -> OwnedFd {
-        self.io.fd
+    pub fn into_owned_fd(self) -> io::Result<OwnedFd> {
+        match Arc::try_unwrap(self.io.fd) {
+            Ok(fd) => Ok(fd),
+            Err(fd) => fd.as_ref().as_fd().try_clone_to_owned(),
+        }
     }
 
     /// Returns the PTY I/O endpoint.
@@ -333,6 +336,23 @@ impl PtyMaster {
     /// Writes all bytes to the PTY master.
     pub fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
         self.io.write_all(bytes)
+    }
+
+    /// Attempts to write bytes to a nonblocking Unix PTY master without waiting.
+    ///
+    /// Returns the number of bytes accepted immediately. Callers that need to
+    /// preserve the full input stream must write the returned suffix through a
+    /// blocking or readiness-driven path.
+    #[cfg(unix)]
+    pub fn try_write_immediate(&self, bytes: &[u8]) -> io::Result<usize> {
+        backend::try_write_immediate(self.io.fd.as_ref().as_fd(), bytes)
+    }
+
+    /// Returns whether the PTY line discipline currently echoes input bytes.
+    #[cfg(unix)]
+    pub fn local_echo_enabled(&self) -> io::Result<bool> {
+        let termios = tcgetattr(self.io.fd.as_ref().as_fd())?;
+        Ok(termios.local_modes.contains(LocalModes::ECHO))
     }
 
     #[cfg(unix)]

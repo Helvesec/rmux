@@ -49,9 +49,11 @@ pub fn socket_path_for_label(label: impl AsRef<OsStr>) -> Result<PathBuf, Client
         .map_err(ClientError::Io)
 }
 
-/// Resolves the top-level socket path from `-L`, `-S`, `$RMUX`, or defaults.
+/// Resolves the top-level socket path from `-L`, `-S`, inherited multiplexer
+/// environment, or defaults.
 ///
-/// `-S` wins over `-L`; both command-line forms win over `$RMUX`.
+/// `-S` wins over `-L`; both command-line forms win over inherited
+/// multiplexer environment.
 pub fn resolve_socket_path(
     socket_name: Option<&OsStr>,
     socket_path: Option<&Path>,

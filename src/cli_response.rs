@@ -37,6 +37,9 @@ pub(crate) fn expect_command_success(
         Response::NewWindow(_) if command_name == "new-window" => Ok(()),
         Response::KillWindow(_) if command_name == "kill-window" => Ok(()),
         Response::SelectWindow(_) if command_name == "select-window" => Ok(()),
+        Response::NextWindow(_) if command_name == "select-window" => Ok(()),
+        Response::PreviousWindow(_) if command_name == "select-window" => Ok(()),
+        Response::LastWindow(_) if command_name == "select-window" => Ok(()),
         Response::RenameWindow(_) if command_name == "rename-window" => Ok(()),
         Response::NextWindow(_) if command_name == "next-window" => Ok(()),
         Response::PreviousWindow(_) if command_name == "previous-window" => Ok(()),
@@ -57,6 +60,8 @@ pub(crate) fn expect_command_success(
         Response::RespawnPane(_) if command_name == "respawn-pane" => Ok(()),
         Response::KillPane(_) if command_name == "kill-pane" => Ok(()),
         Response::SelectLayout(_) if command_name == "select-layout" => Ok(()),
+        Response::NextLayout(_) if command_name == "select-layout" => Ok(()),
+        Response::PreviousLayout(_) if command_name == "select-layout" => Ok(()),
         Response::NextLayout(_) if command_name == "next-layout" => Ok(()),
         Response::PreviousLayout(_) if command_name == "previous-layout" => Ok(()),
         Response::ResizePane(_) if command_name == "resize-pane" => Ok(()),
@@ -104,9 +109,10 @@ pub(crate) fn expect_command_success(
         Response::WaitFor(_) if command_name == "wait-for" => Ok(()),
         Response::ControlMode(_) if command_name == "control-mode" => Ok(()),
         Response::WebShare(_) if command_name == "web-share" => Ok(()),
-        Response::Error(ErrorResponse { error }) => {
-            Err(ExitFailure::new(1, tmux_cli_error_message(&error)))
-        }
+        Response::Error(ErrorResponse { error }) => Err(ExitFailure::new(
+            1,
+            tmux_cli_error_message(command_name, &error),
+        )),
         other => Err(unexpected_response(command_name, &other)),
     }
 }
@@ -116,9 +122,10 @@ pub(crate) fn expect_command_output<'a>(
     command_name: &'static str,
 ) -> Result<&'a CommandOutput, ExitFailure> {
     match response {
-        Response::Error(ErrorResponse { error }) => {
-            Err(ExitFailure::new(1, tmux_cli_error_message(error)))
-        }
+        Response::Error(ErrorResponse { error }) => Err(ExitFailure::new(
+            1,
+            tmux_cli_error_message(command_name, error),
+        )),
         other
             if matches!(
                 command_name,
@@ -150,11 +157,80 @@ pub(crate) fn expect_command_output<'a>(
     }
 }
 
-fn tmux_cli_error_message(error: &RmuxError) -> String {
+pub(crate) fn tmux_cli_error_message(command_name: &str, error: &RmuxError) -> String {
     match error {
+        RmuxError::InvalidTarget { value, reason }
+            if matches!(command_name, "link-window" | "move-window")
+                && reason == "window index already exists in session" =>
+        {
+            window_index_from_target(value)
+                .map(|index| format!("index in use: {index}"))
+                .unwrap_or_else(|| error.to_string())
+        }
+        RmuxError::InvalidTarget { reason, .. } if reason.starts_with("can't find ") => {
+            reason.clone()
+        }
+        RmuxError::SessionNotFound(session_name) if command_name == "kill-session" => {
+            format!("can't find session: {session_name}")
+        }
+        RmuxError::InvalidSetOption(message)
+            if message.starts_with("unknown value: ") || message.starts_with("bad value: ") =>
+        {
+            message.clone()
+        }
+        RmuxError::InvalidSetOption(message)
+            if message.starts_with("value is ") || message.starts_with("invalid style: ") =>
+        {
+            message.clone()
+        }
+        RmuxError::InvalidSetOption(message)
+            if message
+                .strip_prefix("invalid set-option request: ")
+                .is_some_and(|message| {
+                    message.starts_with("value is ") || message.starts_with("invalid style: ")
+                }) =>
+        {
+            message
+                .strip_prefix("invalid set-option request: ")
+                .unwrap_or(message)
+                .to_owned()
+        }
+        RmuxError::InvalidSetOption(message) if message.ends_with(" is already set") => message
+            .strip_suffix(" is already set")
+            .map(|name| format!("already set: {name}"))
+            .unwrap_or_else(|| message.clone()),
+        RmuxError::Server(message)
+            if command_name == "detach-client"
+                && message == "detach-client requires an attached client" =>
+        {
+            "no current client".to_owned()
+        }
+        RmuxError::Server(message) | RmuxError::Message(message)
+            if message
+                .strip_prefix("invalid set-option request: ")
+                .is_some_and(|message| {
+                    message.starts_with("value is ") || message.starts_with("invalid style: ")
+                }) =>
+        {
+            message
+                .strip_prefix("invalid set-option request: ")
+                .unwrap_or(message)
+                .to_owned()
+        }
+        RmuxError::Server(message) if command_name == "delete-buffer" => {
+            if let Some(name) = message.strip_prefix("no buffer ") {
+                format!("unknown buffer: {name}")
+            } else {
+                message.clone()
+            }
+        }
         RmuxError::Server(message) => message.clone(),
         _ => error.to_string(),
     }
+}
+
+fn window_index_from_target(target: &str) -> Option<&str> {
+    target.rsplit_once(':').map(|(_, index)| index)
 }
 
 fn unexpected_response(command_name: &str, response: &Response) -> ExitFailure {
@@ -254,7 +330,9 @@ pub(crate) fn response_name(response: &Response) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{expect_command_success, queued_source_file_success_command};
+    use super::{
+        expect_command_success, queued_source_file_success_command, tmux_cli_error_message,
+    };
     use rmux_proto::{ErrorResponse, KillSessionResponse, Response, RmuxError, SourceFileResponse};
 
     #[test]
@@ -306,5 +384,58 @@ mod tests {
 
         assert_eq!(error.exit_code(), 1);
         assert_eq!(error.message(), "queued failure");
+    }
+
+    #[test]
+    fn window_index_collision_uses_tmux_cli_error_shape() {
+        for command_name in ["link-window", "move-window"] {
+            let error = expect_command_success(
+                Response::Error(ErrorResponse {
+                    error: RmuxError::InvalidTarget {
+                        value: "s:1".to_owned(),
+                        reason: "window index already exists in session".to_owned(),
+                    },
+                }),
+                command_name,
+            )
+            .expect_err("index collision should remain an error");
+
+            assert_eq!(error.exit_code(), 1);
+            assert_eq!(error.message(), "index in use: 1");
+        }
+    }
+
+    #[test]
+    fn set_option_bad_value_errors_use_tmux_surface() {
+        let message = tmux_cli_error_message(
+            "set-window-option",
+            &RmuxError::InvalidSetOption("bad value: false".to_owned()),
+        );
+
+        assert_eq!(message, "bad value: false");
+    }
+
+    #[test]
+    fn set_option_number_errors_strip_internal_prefix() {
+        for error in [
+            RmuxError::InvalidSetOption(
+                "invalid set-option request: value is too small: -5".to_owned(),
+            ),
+            RmuxError::Server("invalid set-option request: value is invalid: abc".to_owned()),
+        ] {
+            let message = tmux_cli_error_message("set-option", &error);
+            assert!(!message.starts_with("invalid set-option request:"));
+            assert!(message.starts_with("value is "), "{message}");
+        }
+    }
+
+    #[test]
+    fn detach_client_without_attached_client_uses_tmux_error_text() {
+        let message = tmux_cli_error_message(
+            "detach-client",
+            &RmuxError::Server("detach-client requires an attached client".to_owned()),
+        );
+
+        assert_eq!(message, "no current client");
     }
 }

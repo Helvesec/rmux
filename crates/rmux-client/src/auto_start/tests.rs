@@ -1,18 +1,61 @@
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use super::{ensure_server_running_with_probe, AutoStartError};
+use super::{
+    ensure_server_running_with_probe, hidden_daemon_binary_path,
+    hidden_daemon_binary_path_for_config, probe_connected_server, AutoStartConfig, AutoStartError,
+};
 use crate::{ClientError, ConnectResult, Connection};
+use rmux_proto::{
+    encode_frame, DaemonStatusResponse, ErrorResponse, Response, RmuxError, RMUX_WIRE_VERSION,
+};
 
 // Success-path tests exercise retry behavior, not scheduler precision.
 const POLL_SUCCESS_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
+static AUTO_START_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn auto_start_prefers_installed_hidden_daemon_sibling() {
+    let base = std::env::temp_dir().join(format!("rmux-auto-start-sibling-{}", std::process::id()));
+    std::fs::create_dir_all(&base).expect("create temp dir");
+    let current = base.join("rmux");
+    let daemon = base.join("rmux-daemon");
+    std::fs::write(&current, b"cli").expect("write fake cli");
+    std::fs::write(&daemon, b"daemon").expect("write fake daemon");
+
+    assert_eq!(hidden_daemon_binary_path(&current), Some(daemon.clone()));
+    assert_eq!(hidden_daemon_binary_path(&daemon), None);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn auto_start_uses_web_capable_cli_binary_when_web_is_required() {
+    let base = std::env::temp_dir().join(format!(
+        "rmux-auto-start-web-sibling-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&base).expect("create temp dir");
+    let current = base.join("rmux");
+    let daemon = base.join("rmux-daemon");
+    std::fs::write(&current, b"cli").expect("write fake cli");
+    std::fs::write(&daemon, b"daemon").expect("write fake daemon");
+
+    let config = AutoStartConfig::disabled().with_web_required();
+
+    assert_eq!(
+        hidden_daemon_binary_path_for_config(&current, &config),
+        None
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
 
 #[test]
 fn auto_start_returns_existing_connection_without_launching() {
@@ -220,6 +263,136 @@ fn auto_start_waits_for_a_ready_response_after_connecting() {
         probe_call_count.load(Ordering::Relaxed) >= 2,
         "expected an unready probe before the ready probe"
     );
+}
+
+#[test]
+fn probe_connected_server_waits_for_startup_config_to_finish() {
+    let (client, mut server) = UnixStream::pair().expect("create unix stream pair");
+    server
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set probe server read timeout");
+    server
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .expect("set probe server write timeout");
+
+    let server_thread = std::thread::spawn(move || {
+        let mut buffer = [0_u8; 1024];
+        for config_loading in [true, false] {
+            let bytes_read = server
+                .read(&mut buffer)
+                .expect("read daemon-status request");
+            assert!(bytes_read > 0, "daemon-status request should not be empty");
+            let response = Response::DaemonStatus(DaemonStatusResponse {
+                rmux_version: "test".to_owned(),
+                wire_version: RMUX_WIRE_VERSION,
+                session_count: 0,
+                client_count: 0,
+                config_loading,
+            });
+            let frame = encode_frame(&response).expect("encode daemon-status response");
+            server
+                .write_all(&frame)
+                .expect("write daemon-status response");
+        }
+    });
+
+    let connection = Connection::new(client).expect("connection with timeout");
+    let ready = probe_connected_server(
+        connection,
+        &AutoStartConfig::disabled(),
+        Path::new("/tmp/rmux-probe-loading.sock"),
+    )
+    .expect("probe should wait until config_loading is false");
+    drop(ready);
+    server_thread
+        .join()
+        .expect("probe server thread should exit");
+}
+
+#[test]
+fn probe_connected_server_allows_legacy_daemon_status_error() {
+    let (client, mut server) = UnixStream::pair().expect("create unix stream pair");
+    let server_thread = std::thread::spawn(move || {
+        let mut buffer = [0_u8; 1024];
+        let bytes_read = server
+            .read(&mut buffer)
+            .expect("read daemon-status request");
+        assert!(bytes_read > 0, "daemon-status request should not be empty");
+        let response = Response::Error(ErrorResponse {
+            error: RmuxError::UnknownCommand("daemon-status".to_owned()),
+        });
+        let frame = encode_frame(&response).expect("encode daemon-status response");
+        server
+            .write_all(&frame)
+            .expect("write daemon-status response");
+    });
+
+    let connection = Connection::new(client).expect("connection with timeout");
+    let ready = probe_connected_server(
+        connection,
+        &AutoStartConfig::disabled(),
+        Path::new("/tmp/rmux-probe-legacy.sock"),
+    )
+    .expect("legacy daemon status errors should remain upgrade-inspectable");
+    drop(ready);
+    server_thread
+        .join()
+        .expect("probe server thread should exit");
+}
+
+#[test]
+fn probe_connected_server_waits_for_reentrant_startup_source_clients() {
+    let _guard = AUTO_START_ENV_LOCK
+        .lock()
+        .expect("auto-start env lock must not be poisoned");
+    let original_rmux = std::env::var_os("RMUX");
+    let original_depth = std::env::var_os("RMUX_SOURCE_DEPTH");
+    let socket = PathBuf::from(format!(
+        "/tmp/rmux-reentrant-source-{}.sock",
+        std::process::id()
+    ));
+    std::env::set_var("RMUX", format!("{},123,0", socket.display()));
+    std::env::set_var("RMUX_SOURCE_DEPTH", "1");
+
+    let (client, mut server) = UnixStream::pair().expect("create unix stream pair");
+    let server_thread = std::thread::spawn(move || {
+        let mut buffer = [0_u8; 1024];
+        for config_loading in [true, false] {
+            let bytes_read = server
+                .read(&mut buffer)
+                .expect("read daemon-status request");
+            assert!(bytes_read > 0, "daemon-status request should not be empty");
+            let response = Response::DaemonStatus(DaemonStatusResponse {
+                rmux_version: "test".to_owned(),
+                wire_version: RMUX_WIRE_VERSION,
+                session_count: 0,
+                client_count: 0,
+                config_loading,
+            });
+            let frame = encode_frame(&response).expect("encode daemon-status response");
+            server
+                .write_all(&frame)
+                .expect("write daemon-status response");
+        }
+    });
+
+    let connection = Connection::new(client).expect("connection with timeout");
+    let ready = probe_connected_server(connection, &AutoStartConfig::disabled(), &socket)
+        .expect("reentrant source client should still wait for config_loading=false");
+    drop(ready);
+    server_thread
+        .join()
+        .expect("probe server thread should exit");
+
+    restore_env("RMUX", original_rmux);
+    restore_env("RMUX_SOURCE_DEPTH", original_depth);
+}
+
+fn restore_env(name: &str, value: Option<std::ffi::OsString>) {
+    match value {
+        Some(value) => std::env::set_var(name, value),
+        None => std::env::remove_var(name),
+    }
 }
 
 #[test]

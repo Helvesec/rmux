@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmux_proto::{RmuxError, SessionName, SplitDirection, TerminalSize};
 
-use crate::{AlertFlags, Pane, PaneId, SessionId, Window, WindowId};
+use crate::{AlertFlags, Pane, PaneGeometry, PaneId, SessionId, Window, WindowId};
 
 #[path = "session/accessors.rs"]
 mod accessors;
@@ -41,6 +41,7 @@ pub struct Session {
     id: SessionId,
     name: SessionName,
     group_name: Option<SessionName>,
+    terminal_size: TerminalSize,
     windows: BTreeMap<u32, Window>,
     winlink_alert_flags: BTreeMap<u32, AlertFlags>,
     active_window: u32,
@@ -74,6 +75,7 @@ impl Session {
             id: SessionId::new(0),
             name,
             group_name: None,
+            terminal_size: size,
             windows: BTreeMap::from([(
                 window_index,
                 Window::new_with_initial_pane(size, pane_id, window_id),
@@ -207,6 +209,57 @@ impl Session {
             .split_at_position_with_id_and_direction(position, pane_id, direction, before))
     }
 
+    /// Splits the full addressed window root and returns the new pane index.
+    pub fn split_pane_full_size_in_window_with_id_and_direction_before(
+        &mut self,
+        window_index: u32,
+        pane_index: u32,
+        pane_id: PaneId,
+        direction: SplitDirection,
+        before: bool,
+    ) -> Result<u32, RmuxError> {
+        let window = self
+            .window_at(window_index)
+            .ok_or_else(|| invalid_window_target(&self.name, window_index))?;
+        if window.pane(pane_index).is_none() {
+            return Err(invalid_pane_target(
+                &self.name,
+                window_index,
+                pane_index,
+                "pane index does not exist in session",
+            ));
+        }
+
+        let window = self
+            .window_at_mut(window_index)
+            .expect("addressed session window must exist");
+        let previous_active_pane_id = window.active_pane().map(Pane::id);
+        let new_index = window
+            .panes()
+            .iter()
+            .map(Pane::index)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        window.insert_pane_full_size(
+            Pane::new_with_id(pane_id, new_index, PaneGeometry::new(0, 0, 0, 0)),
+            direction,
+            before,
+        )?;
+        window.renumber_panes_by_position(pane_id, previous_active_pane_id);
+        window
+            .panes()
+            .iter()
+            .find(|pane| pane.id() == pane_id)
+            .map(Pane::index)
+            .ok_or_else(|| {
+                RmuxError::Server(format!(
+                    "pane id {} disappeared after full-size split",
+                    pane_id.as_u32()
+                ))
+            })
+    }
+
     /// Removes the addressed pane in the active window.
     pub fn kill_pane(&mut self, pane_index: u32) -> Result<KillPaneOutcome, RmuxError> {
         self.kill_pane_in_window(self.active_window, pane_index)
@@ -284,24 +337,46 @@ impl Session {
         window_index: u32,
         pane_index: u32,
     ) -> Result<(), RmuxError> {
+        self.select_pane_in_window_with_zoom(window_index, pane_index, false)
+    }
+
+    /// Selects the active pane for the addressed window, preserving zoom when requested.
+    pub fn select_pane_in_window_with_zoom(
+        &mut self,
+        window_index: u32,
+        pane_index: u32,
+        preserve_zoom: bool,
+    ) -> Result<(), RmuxError> {
         if self.window_at(window_index).is_none() {
             return Err(invalid_window_target(&self.name, window_index));
         }
 
         if self
-            .window_at_mut(window_index)
+            .window_at(window_index)
             .expect("addressed session window must exist")
-            .select_pane(pane_index)
+            .pane(pane_index)
+            .is_none()
         {
-            Ok(())
-        } else {
-            Err(invalid_pane_target(
+            return Err(invalid_pane_target(
                 &self.name,
                 window_index,
                 pane_index,
                 "pane index does not exist in session",
-            ))
+            ));
         }
+
+        let window = self
+            .window_at_mut(window_index)
+            .expect("addressed session window must exist");
+        if preserve_zoom {
+            let _ = window.push_zoom(true);
+        }
+        let selected = window.select_pane(pane_index);
+        if preserve_zoom {
+            window.pop_zoom();
+        }
+        debug_assert!(selected, "validated pane target must be selectable");
+        Ok(())
     }
 
     /// Selects the pane adjacent to the addressed pane in the requested direction.
@@ -311,25 +386,56 @@ impl Session {
         pane_index: u32,
         direction: rmux_proto::SelectPaneDirection,
     ) -> Result<u32, RmuxError> {
+        self.select_adjacent_pane_in_window_with_zoom(window_index, pane_index, direction, false)
+    }
+
+    /// Selects an adjacent pane, preserving zoom when requested.
+    pub fn select_adjacent_pane_in_window_with_zoom(
+        &mut self,
+        window_index: u32,
+        pane_index: u32,
+        direction: rmux_proto::SelectPaneDirection,
+        preserve_zoom: bool,
+    ) -> Result<u32, RmuxError> {
         if self.window_at(window_index).is_none() {
             return Err(invalid_window_target(&self.name, window_index));
         }
 
-        self.window_at_mut(window_index)
+        if self
+            .window_at(window_index)
             .expect("addressed session window must exist")
+            .pane(pane_index)
+            .is_none()
+        {
+            return Err(invalid_pane_target(
+                &self.name,
+                window_index,
+                pane_index,
+                "pane index does not exist in session",
+            ));
+        }
+
+        let window = self
+            .window_at_mut(window_index)
+            .expect("addressed session window must exist");
+        let was_zoomed = window.is_zoomed();
+        let original_active_pane = window.active_pane_index();
+        if was_zoomed {
+            let _ = window.push_zoom(false);
+        }
+        let selected = window
             .select_adjacent_pane(pane_index, direction)
-            .ok_or_else(|| {
-                invalid_pane_target(
-                    &self.name,
-                    window_index,
-                    pane_index,
-                    "pane index does not exist in session",
-                )
-            })
+            .expect("validated adjacent pane anchor must be selectable");
+        let moved = selected != original_active_pane;
+        if was_zoomed && (preserve_zoom || !moved) {
+            let _ = window.toggle_zoom(window.active_pane_index());
+        }
+        Ok(selected)
     }
 
     /// Updates the backing terminal size and recalculates pane geometry for all windows.
     pub fn resize_terminal(&mut self, size: TerminalSize) {
+        self.terminal_size = size;
         for window in self.windows.values_mut() {
             window.set_size(size);
         }

@@ -83,8 +83,10 @@ pub(super) fn resolve_window_target_spec(
     target: &TargetSpec,
     window_index: bool,
 ) -> Result<rmux_proto::WindowTarget, ExitFailure> {
-    if let Some(rmux_proto::Target::Window(target)) = target.exact() {
-        return Ok(target.clone());
+    if target.raw().starts_with('@') {
+        if let Some(rmux_proto::Target::Window(target)) = target.exact() {
+            return Ok(target.clone());
+        }
     }
 
     match resolve_target_spec(
@@ -246,6 +248,13 @@ fn target_resolution_error_message(
     raw_target: &str,
 ) -> String {
     match error {
+        RmuxError::InvalidTarget { reason, .. }
+            if target_type == ResolveTargetType::Window
+                && raw_target.rsplit_once('.').is_some()
+                && reason.starts_with("can't find window") =>
+        {
+            format!("can't find pane: {}", pane_target_lookup_token(raw_target))
+        }
         RmuxError::InvalidTarget { reason, .. } if reason.starts_with("can't find ") => {
             reason.clone()
         }
@@ -264,6 +273,20 @@ fn target_resolution_error_message(
             if target_type == ResolveTargetType::Window
                 && reason == "window index does not exist in session" =>
         {
+            format!(
+                "can't find window: {}",
+                window_target_lookup_token(raw_target)
+            )
+        }
+        RmuxError::Server(message)
+            if target_type == ResolveTargetType::Window && message == "no current target" =>
+        {
+            format!(
+                "can't find window: {}",
+                window_target_lookup_token(raw_target)
+            )
+        }
+        RmuxError::SessionNotFound(_) if target_type == ResolveTargetType::Window => {
             format!(
                 "can't find window: {}",
                 window_target_lookup_token(raw_target)
@@ -359,5 +382,53 @@ pub(super) fn resolve_current_pane_target(
             target_resolution_error_message(&error, ResolveTargetType::Pane, command_name),
         )),
         other => Err(unexpected_response("resolve-target", &other)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_resolution_no_current_target_reports_missing_window() {
+        let message = target_resolution_error_message(
+            &RmuxError::Server("no current target".to_owned()),
+            ResolveTargetType::Window,
+            "missing",
+        );
+        assert_eq!(message, "can't find window: missing");
+    }
+
+    #[test]
+    fn window_resolution_uses_window_part_for_session_window_targets() {
+        let message = target_resolution_error_message(
+            &RmuxError::Server("no current target".to_owned()),
+            ResolveTargetType::Window,
+            "alpha:missing",
+        );
+        assert_eq!(message, "can't find window: missing");
+    }
+
+    #[test]
+    fn window_resolution_uses_pane_part_for_window_dot_pane_targets() {
+        let message = target_resolution_error_message(
+            &RmuxError::InvalidTarget {
+                value: "0.5".to_owned(),
+                reason: "can't find window: 0.5".to_owned(),
+            },
+            ResolveTargetType::Window,
+            "0.5",
+        );
+        assert_eq!(message, "can't find pane: 5");
+    }
+
+    #[test]
+    fn window_resolution_session_miss_reports_requested_window_index() {
+        let message = target_resolution_error_message(
+            &RmuxError::SessionNotFound("a".to_owned()),
+            ResolveTargetType::Window,
+            "a:99",
+        );
+        assert_eq!(message, "can't find window: 99");
     }
 }

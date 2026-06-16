@@ -13,8 +13,9 @@ use super::command_args::{
 use super::source_files::ParsedSourceFileCommand;
 use super::source_files::SourceSyntax;
 use super::targets::{
-    implicit_session_name, implicit_window_target, parse_new_window_target_argument,
-    parse_pane_target, parse_target_arg, resolve_queue_target_argument,
+    implicit_session_name, implicit_window_target, parse_pane_target,
+    parse_queued_new_window_target_argument, parse_target_arg, resolve_queue_target_argument,
+    NewWindowTargetIndex,
 };
 use super::values::{missing_argument, unsupported_flag};
 use crate::pane_terminals::session_not_found;
@@ -22,7 +23,7 @@ use crate::pane_terminals::session_not_found;
 #[derive(Debug, Clone)]
 pub(super) struct ParsedNewWindowCommand {
     pub(super) target: SessionName,
-    pub(super) target_window_index: Option<u32>,
+    pub(super) target_window_index: Option<NewWindowTargetIndex>,
     pub(super) insert_at_target: bool,
     pub(super) name: Option<String>,
     pub(super) detached: bool,
@@ -55,6 +56,7 @@ pub(super) fn parse_queued_new_window(
     let mut detached = false;
     let mut after = false;
     let mut before = false;
+    let mut target_has_signed_window_part = false;
     let mut start_directory = None;
     let mut command_only = false;
 
@@ -87,8 +89,10 @@ pub(super) fn parse_queued_new_window(
             "-t" => {
                 let _ = args.pop_front();
                 let raw_target = pop_string_argument(&mut args, "-t target")?;
+                target_has_signed_window_part =
+                    signed_window_target_session_part(&raw_target).is_some();
                 let (session_name, window_index) =
-                    parse_new_window_target_argument(raw_target, sessions, find_context)?;
+                    parse_queued_new_window_target_argument(raw_target, sessions, find_context)?;
                 target = Some(session_name);
                 target_window_index = window_index;
             }
@@ -129,7 +133,7 @@ pub(super) fn parse_queued_new_window(
 
     let insert_at_target = after || before;
     if insert_at_target {
-        if target_window_index.is_none() {
+        if target_window_index.is_none() || target_has_signed_window_part {
             let window_target = if let Some(session_name) = target.as_ref() {
                 let window_index = sessions
                     .session(session_name)
@@ -140,16 +144,14 @@ pub(super) fn parse_queued_new_window(
                 implicit_window_target(sessions, find_context, "new-window")?
             };
             target = Some(window_target.session_name().clone());
-            target_window_index = Some(window_target.window_index());
+            target_window_index =
+                Some(NewWindowTargetIndex::Absolute(window_target.window_index()));
         }
         if after {
             target_window_index = Some(
                 target_window_index
                     .expect("placement target index must exist")
-                    .checked_add(1)
-                    .ok_or_else(|| {
-                        RmuxError::Server("window index space exhausted for new-window".to_owned())
-                    })?,
+                    .checked_add_one()?,
             );
         }
     }
@@ -164,6 +166,24 @@ pub(super) fn parse_queued_new_window(
         environment: (!environment.is_empty()).then_some(environment),
         command,
     })
+}
+
+fn signed_window_target_session_part(raw_target: &str) -> Option<Option<&str>> {
+    if signed_window_index_target(raw_target) {
+        return Some(None);
+    }
+    let (session, window) = raw_target.split_once(':')?;
+    if session.is_empty() || !signed_window_index_target(window) {
+        return None;
+    }
+    Some(Some(session))
+}
+
+fn signed_window_index_target(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix(['+', '-']) else {
+        return false;
+    };
+    rest.is_empty() || rest.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 pub(super) fn parse_queued_if_shell(

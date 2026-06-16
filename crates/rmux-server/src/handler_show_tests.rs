@@ -49,6 +49,7 @@ async fn show_options_returns_command_output_for_session_and_server_scopes() {
             name: None,
             value_only: false,
             include_inherited: true,
+            quiet: false,
         }))
         .await;
     let output = response
@@ -64,6 +65,7 @@ async fn show_options_returns_command_output_for_session_and_server_scopes() {
             name: None,
             value_only: true,
             include_inherited: true,
+            quiet: false,
         }))
         .await;
     let output = response
@@ -85,6 +87,7 @@ async fn show_options_without_a_omits_inherited_values() {
             name: Some("status".to_owned()),
             value_only: false,
             include_inherited: false,
+            quiet: false,
         }))
         .await;
     let output = response
@@ -105,6 +108,7 @@ async fn show_options_global_scope_resolves_named_defaults_without_a_marker() {
             name: Some("status".to_owned()),
             value_only: true,
             include_inherited: false,
+            quiet: false,
         }))
         .await;
     let output = response
@@ -125,6 +129,7 @@ async fn show_options_a_marks_inherited_values() {
             name: Some("status".to_owned()),
             value_only: false,
             include_inherited: true,
+            quiet: false,
         }))
         .await;
     let output = response
@@ -245,6 +250,7 @@ async fn show_options_window_global_scope_is_a_valid_explicit_request() {
             name: Some("pane-border-style".to_owned()),
             value_only: false,
             include_inherited: true,
+            quiet: false,
         }))
         .await;
     assert!(matches!(response, Response::ShowOptions(_)));
@@ -367,6 +373,7 @@ async fn show_options_for_nonexistent_session_returns_session_not_found() {
                 name: None,
                 value_only: false,
                 include_inherited: true,
+                quiet: false,
             }))
             .await,
         Response::Error(ErrorResponse {
@@ -401,6 +408,7 @@ async fn show_options_at_window_scope_resolves_window_then_session_then_global()
             name: None,
             value_only: false,
             include_inherited: true,
+            quiet: false,
         }))
         .await;
     let output = response

@@ -4,9 +4,13 @@ mod common;
 
 use std::error::Error;
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use common::acquire_empty_socket_path_lock;
 use common::{assert_success, read_until_contains, stderr, stdout, AttachedSession, CliHarness};
 use rmux_pty::TerminalSize;
 
@@ -50,6 +54,44 @@ fn assert_missing_has_session(output: &std::process::Output, session_name: &str)
     );
 }
 
+#[cfg(target_os = "linux")]
+fn tree_contains_control_empty_socket_label(root: &Path) -> Result<bool, Box<dyn Error>> {
+    const NEEDLE: &[u8] = b"\x1fempty-S";
+
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        if path
+            .as_os_str()
+            .as_bytes()
+            .windows(NEEDLE.len())
+            .any(|window| window == NEEDLE)
+        {
+            return Ok(true);
+        }
+
+        let Ok(entries) = fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries {
+            let entry = entry?;
+            let entry_path = entry.path();
+            if entry_path
+                .as_os_str()
+                .as_bytes()
+                .windows(NEEDLE.len())
+                .any(|window| window == NEEDLE)
+            {
+                return Ok(true);
+            }
+            if entry.file_type()?.is_dir() {
+                stack.push(entry_path);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
 #[test]
 fn list_sessions_prints_sorted_server_rendered_stdout() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("list-sessions-cli")?;
@@ -72,7 +114,298 @@ fn list_sessions_prints_sorted_server_rendered_stdout() -> Result<(), Box<dyn Er
 }
 
 #[test]
-fn list_sessions_supports_filter_sort_order_and_reverse() -> Result<(), Box<dyn Error>> {
+fn new_session_accepts_attached_short_value_flags_at_runtime() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("new-session-attached-short-values")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    let created = harness.run(&["new-session", "-P", "-F#{pane_id}", "-sfoo", "-d"])?;
+
+    assert_eq!(created.status.code(), Some(0));
+    assert_eq!(stdout(&created), "%0\n");
+    assert!(stderr(&created).is_empty());
+    assert_success(&harness.run(&["has-session", "-t", "foo"])?);
+    Ok(())
+}
+
+#[test]
+fn new_session_print_format_uses_spawned_command_metadata() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("new-session-print-command-metadata")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    for index in 0..5 {
+        let session = format!("printed{index}");
+        let created = harness.run(&[
+            "new-session",
+            "-dP",
+            "-F",
+            "#{pane_current_command}:#{pane_start_command}",
+            "-s",
+            &session,
+            "sleep 60",
+        ])?;
+
+        assert_eq!(created.status.code(), Some(0));
+        assert_eq!(stdout(&created), "sleep:\"sleep 60\"\n");
+        assert!(stderr(&created).is_empty());
+        assert_success(&harness.run(&["kill-session", "-t", &session])?);
+    }
+    Ok(())
+}
+
+#[test]
+fn new_session_attach_if_exists_does_not_silently_succeed_when_detached(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("new-session-attach-if-exists-detached")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let existing = harness.run(&["new-session", "-Ad", "-s", "alpha"])?;
+
+    assert_eq!(existing.status.code(), Some(1));
+    assert!(stdout(&existing).is_empty());
+    assert_eq!(stderr(&existing), "open terminal failed: not a terminal\n");
+    Ok(())
+}
+
+#[test]
+fn new_session_rejects_zero_dimensions_before_creating_session() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("new-session-zero-dimensions")?;
+
+    let zero_width = harness.run(&["new-session", "-d", "-s", "zero-width", "-x", "0"])?;
+    assert_eq!(zero_width.status.code(), Some(1));
+    assert!(stdout(&zero_width).is_empty());
+    assert_eq!(stderr(&zero_width), "width too small\n");
+
+    let zero_height = harness.run(&["new-session", "-d", "-s", "zero-height", "-y", "0"])?;
+    assert_eq!(zero_height.status.code(), Some(1));
+    assert!(stdout(&zero_height).is_empty());
+    assert_eq!(stderr(&zero_height), "height too small\n");
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn empty_socket_path_uses_abstract_endpoint_without_sentinel_file() -> Result<(), Box<dyn Error>> {
+    let _empty_socket_lock = acquire_empty_socket_path_lock()?;
+    let harness = CliHarness::new("empty-socket-abstract")?;
+    let _ = harness.run(&["-S", "", "kill-server"])?;
+
+    let created = harness.run(&[
+        "-S",
+        "",
+        "-f",
+        "/dev/null",
+        "new-session",
+        "-d",
+        "-s",
+        "empty",
+    ])?;
+    assert_success(&created);
+
+    let listed = harness.run(&["-S", "", "list-sessions", "-F", "#{session_name}"])?;
+    assert_eq!(listed.status.code(), Some(0));
+    assert_eq!(stdout(&listed), "empty\n");
+    assert!(stderr(&listed).is_empty());
+
+    assert!(
+        !tree_contains_control_empty_socket_label(harness.tmpdir())?,
+        "-S '' must not create the legacy control-character sentinel socket"
+    );
+
+    let killed = harness.run(&["-S", "", "kill-server"])?;
+    assert_success(&killed);
+    Ok(())
+}
+
+#[test]
+fn hidden_environment_without_target_uses_current_session() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("setenv-hidden-default-session")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let set = harness.run(&["set-environment", "-h", "SECRET", "classified"])?;
+    assert_success(&set);
+
+    let normal = harness.run(&["show-environment", "SECRET"])?;
+    assert_eq!(normal.status.code(), Some(0));
+    assert!(stdout(&normal).is_empty());
+    assert!(stderr(&normal).is_empty());
+
+    let hidden = harness.run(&["show-environment", "-h", "SECRET"])?;
+    assert_eq!(hidden.status.code(), Some(0));
+    assert_eq!(stdout(&hidden), "SECRET=classified\n");
+    assert!(stderr(&hidden).is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn set_environment_accepts_hyphen_prefixed_values_at_runtime() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("setenv-hyphen-value")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let set = harness.run(&["set-environment", "TERM", "-screen"])?;
+    assert_success(&set);
+
+    let shown = harness.run(&["show-environment", "TERM"])?;
+    assert_eq!(shown.status.code(), Some(0));
+    assert_eq!(stdout(&shown), "TERM=-screen\n");
+    assert!(stderr(&shown).is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn nested_default_invocation_refuses_without_creating_session() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("nested-default-invocation")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "outer"])?);
+    let nested_env = format!("{},123,0", harness.socket_path().display());
+
+    let refused = harness.run_with(&[], |command| {
+        command.env("TMUX", &nested_env);
+    })?;
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(stdout(&refused).is_empty());
+    assert_eq!(
+        stderr(&refused),
+        "sessions should be nested with care, unset $TMUX to force\n"
+    );
+
+    let sessions = harness.run(&["list-sessions", "-F", "#{session_name}"])?;
+    assert_eq!(sessions.status.code(), Some(0));
+    assert_eq!(stdout(&sessions), "outer\n");
+
+    let detached = harness.run_with(&["new-session", "-d", "-s", "detached"], |command| {
+        command.env("TMUX", &nested_env);
+    })?;
+    assert_success(&detached);
+    let sessions = harness.run(&["list-sessions", "-F", "#{session_name}"])?;
+    assert_eq!(sessions.status.code(), Some(0));
+    assert_eq!(stdout(&sessions), "detached\nouter\n");
+
+    Ok(())
+}
+
+#[test]
+fn session_window_and_pane_id_targets_resolve_through_cli() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("id-targets-cli")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "foo"])?);
+    let ids = harness.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        "foo",
+        "#{session_id} #{window_id} #{pane_id}",
+    ])?;
+    assert_eq!(ids.status.code(), Some(0));
+    assert!(stderr(&ids).is_empty());
+    let ids_stdout = stdout(&ids);
+    let mut parts = ids_stdout.split_whitespace();
+    let session_id = parts.next().expect("session id");
+    let window_id = parts.next().expect("window id");
+    let pane_id = parts.next().expect("pane id");
+
+    assert_success(&harness.run(&[
+        "new-window",
+        "-d",
+        "-t",
+        session_id,
+        "-n",
+        "via-session-id",
+    ])?);
+    assert_success(&harness.run(&["rename-window", "-t", window_id, "via-window-id"])?);
+    assert_success(&harness.run(&["send-keys", "-t", pane_id, "x"])?);
+
+    let windows = harness.run(&["list-windows", "-t", "foo", "-F", "#{window_name}"])?;
+    assert_eq!(windows.status.code(), Some(0));
+    let rendered = stdout(&windows);
+    assert!(rendered.contains("via-session-id\n"), "{rendered:?}");
+    assert!(rendered.contains("via-window-id\n"), "{rendered:?}");
+    assert!(stderr(&windows).is_empty());
+    Ok(())
+}
+
+#[test]
+fn repeated_target_flags_use_the_last_tmux_target() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("repeated-target-last-wins")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "beta"])?);
+    let alpha_id = harness.run(&["display-message", "-p", "-t", "alpha", "#{session_id}"])?;
+    let beta_id = harness.run(&["display-message", "-p", "-t", "beta", "#{session_id}"])?;
+    assert_eq!(alpha_id.status.code(), Some(0));
+    assert!(stderr(&alpha_id).is_empty());
+    assert_eq!(beta_id.status.code(), Some(0));
+    assert!(stderr(&beta_id).is_empty());
+    let alpha_target = format!("{}:", stdout(&alpha_id).trim());
+    let beta_target = format!("{}:", stdout(&beta_id).trim());
+
+    let created = harness.run(&[
+        "new-window",
+        "-d",
+        "-t",
+        &alpha_target,
+        "-P",
+        "-F",
+        "#{session_name}:#{window_name}",
+        "-t",
+        &beta_target,
+        "-n",
+        "chosen",
+    ])?;
+
+    assert_eq!(created.status.code(), Some(0));
+    assert_eq!(stdout(&created), "beta:chosen\n");
+    assert!(stderr(&created).is_empty());
+    Ok(())
+}
+
+#[test]
+fn environment_commands_resolve_session_id_targets() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("environment-session-id-target")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let session_id = harness.run(&["display-message", "-p", "-t", "alpha", "#{session_id}"])?;
+    assert_eq!(session_id.status.code(), Some(0));
+    assert!(stderr(&session_id).is_empty());
+    let session_id = stdout(&session_id).trim().to_owned();
+
+    assert_success(&harness.run(&["set-environment", "-t", &session_id, "FOO", "BAR"])?);
+    let shown = harness.run(&["show-environment", "-t", &session_id, "FOO"])?;
+
+    assert_eq!(shown.status.code(), Some(0));
+    assert_eq!(stdout(&shown), "FOO=BAR\n");
+    assert!(stderr(&shown).is_empty());
+    Ok(())
+}
+
+#[test]
+fn new_session_environment_option_persists_to_session_environment() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("new-session-environment-option")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-e", "FOO_CHILD=bar"])?);
+    let shown = harness.run(&["show-environment", "-t", "alpha", "FOO_CHILD"])?;
+
+    assert_eq!(shown.status.code(), Some(0));
+    assert_eq!(stdout(&shown), "FOO_CHILD=bar\n");
+    assert!(stderr(&shown).is_empty());
+    Ok(())
+}
+
+#[test]
+fn list_sessions_supports_filter_and_rejects_sort_order_extensions() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("list-sessions-filter-sort")?;
     let _daemon = harness.start_hidden_daemon()?;
 
@@ -84,16 +417,25 @@ fn list_sessions_supports_filter_sort_order_and_reverse() -> Result<(), Box<dyn 
         "list-sessions",
         "-f",
         "#{||:#{==:#{session_name},alpha},#{==:#{session_name},gamma}}",
-        "-O",
-        "index",
-        "-r",
         "-F",
         "#{session_name}",
     ])?;
 
     assert_eq!(listed.status.code(), Some(0));
-    assert_eq!(stdout(&listed), "gamma\nalpha\n");
+    assert_eq!(stdout(&listed), "alpha\ngamma\n");
     assert!(stderr(&listed).is_empty());
+
+    let sort = harness.run(&["list-sessions", "-O"])?;
+    assert_eq!(sort.status.code(), Some(1));
+    assert_eq!(stderr(&sort), "command list-sessions: unknown flag -O\n");
+
+    let reversed = harness.run(&["list-sessions", "-r"])?;
+    assert_eq!(reversed.status.code(), Some(1));
+    assert_eq!(
+        stderr(&reversed),
+        "command list-sessions: unknown flag -r\n"
+    );
+
     Ok(())
 }
 
@@ -266,6 +608,27 @@ fn grouped_sessions_share_windows_and_report_group_visibility() -> Result<(), Bo
 }
 
 #[test]
+fn ungrouped_session_group_formats_are_empty() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("ungrouped-session-formats")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let output = harness.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        "alpha",
+        "#{session_grouped}|#{session_group}|#{session_group_list}|#{session_group_size}|#{session_group_attached}|#{session_group_many_attached}",
+    ])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "0|||||\n");
+    assert!(stderr(&output).is_empty());
+
+    Ok(())
+}
+
+#[test]
 fn grouped_sessions_copy_current_and_last_window_state_on_creation() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("grouped-session-current-window")?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -387,6 +750,32 @@ fn wait_for_file_contents(
     }
 
     Err(format!("timed out waiting for '{}'", path.display()).into())
+}
+
+#[test]
+fn destroy_unattached_on_removes_detached_sessions_immediately() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("destroy-unattached-immediate")?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "s", "sleep 30"])?);
+    assert_success(&harness.run(&["set-option", "-g", "destroy-unattached", "on"])?);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let output = harness.run(&["has-session", "-t", "s"])?;
+        if output.status.code() == Some(1) {
+            assert!(stdout(&output).is_empty());
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "session still exists after destroy-unattached; stdout={:?} stderr={:?}",
+                stdout(&output),
+                stderr(&output)
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn shell_quote(path: &Path) -> String {

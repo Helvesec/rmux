@@ -13,15 +13,15 @@ parser_ground_timer_active: false
 mode_bits: 0x00000011
 cursor_style: 0
 cursor: x=2 y=2
-cursor_absolute_y: 3
+cursor_absolute_y: 4
 alternate: false
-history_size: 1
-history_bytes: 4
+history_size: 2
+history_bytes: 10
 bell_count: 0
 title: ""
 path: ""
 size_runtime: cols=6 rows=3
-absolute_line_count: 4
+absolute_line_count: 5
 --- visible_lines ---
 [v=0] flags=- cells=6
   (blank)
@@ -30,22 +30,30 @@ absolute_line_count: 4
 [v=2] flags=- cells=6
   (blank)
 --- history_lines ---
-[h=0] flags=- cells=6
-  c  0 . text="A" w=1 attr=0x0000 fg=default bg=default us=default link=0
-  c  1 . text="A" w=1 attr=0x0000 fg=default bg=default us=default link=0
-  c  2 . text="A" w=1 attr=0x0000 fg=default bg=default us=default link=0
+[h=0] flags=WRAPPED cells=6
+  c  0 . text=" " w=1 attr=0x0000 fg=default bg=default us=default link=0
+  c  1 . text=" " w=1 attr=0x0000 fg=default bg=default us=default link=0
+  c  2 . text=" " w=1 attr=0x0000 fg=default bg=default us=default link=0
+  c  3 . text=" " w=1 attr=0x0000 fg=default bg=default us=default link=0
+  c  4 . text=" " w=1 attr=0x0000 fg=default bg=default us=default link=0
+  c  5 . text="C" w=1 attr=0x0000 fg=default bg=default us=default link=0
+[h=1] flags=- cells=6
+  c  0 . text="C" w=1 attr=0x0000 fg=default bg=default us=default link=0
+  c  1 . text="C" w=1 attr=0x0000 fg=default bg=default us=default link=0
 --- transcript ---
-| AAA
+|      C
+| CC
 |
 |
 |
 --- transcript_joined ---
-| AAA
+|      CCC
 |
 |
 |
 --- transcript_with_sequences ---
-| AAA
+|      C
+| CC
 |
 |
 |

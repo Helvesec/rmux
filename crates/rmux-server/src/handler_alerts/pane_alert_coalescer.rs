@@ -1,0 +1,95 @@
+use std::collections::HashMap;
+use std::time::Duration;
+
+use crate::pane_io::PaneAlertEvent;
+use rmux_core::PaneId;
+
+// Pane readers can emit one alert callback per PTY chunk. Coalescing keeps
+// activity/bell/automatic-rename work from turning high-output panes into a
+// global state-lock storm while staying below a perceptible UI delay.
+pub(super) const PANE_ALERT_COALESCE_DELAY: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PaneAlertKey {
+    pane_id: PaneId,
+    generation: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+pub(in crate::handler) struct PaneAlertCoalescer {
+    pending: HashMap<PaneAlertKey, PaneAlertEvent>,
+    flush_scheduled: bool,
+}
+
+impl PaneAlertKey {
+    fn from_event(event: &PaneAlertEvent) -> Self {
+        Self {
+            pane_id: event.pane_id,
+            generation: event.generation,
+        }
+    }
+}
+
+impl PaneAlertCoalescer {
+    /// Queues an alert event and reports whether a flush task must be armed.
+    pub(super) fn push(&mut self, event: PaneAlertEvent) -> bool {
+        let key = PaneAlertKey::from_event(&event);
+        self.pending
+            .entry(key)
+            .and_modify(|pending| {
+                pending.bell_count = pending.bell_count.saturating_add(event.bell_count);
+                pending.queue_activity_alert |= event.queue_activity_alert;
+            })
+            .or_insert(event);
+
+        if self.flush_scheduled {
+            return false;
+        }
+        self.flush_scheduled = true;
+        true
+    }
+
+    pub(super) fn take_pending(&mut self) -> Vec<PaneAlertEvent> {
+        self.flush_scheduled = false;
+        self.pending.drain().map(|(_, event)| event).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alert_event(pane_id: u32, generation: Option<u64>, bell_count: u64) -> PaneAlertEvent {
+        PaneAlertEvent {
+            session_name: rmux_proto::SessionName::new("alpha").expect("valid session name"),
+            pane_id: PaneId::new(pane_id),
+            bell_count,
+            queue_activity_alert: true,
+            generation,
+        }
+    }
+
+    #[test]
+    fn pane_alert_callback_state_coalesces_by_pane_generation() {
+        let mut state = PaneAlertCoalescer::default();
+
+        assert!(state.push(alert_event(1, Some(7), 1)));
+        assert!(!state.push(alert_event(1, Some(7), 2)));
+        assert!(!state.push(alert_event(2, Some(7), 4)));
+
+        let events = state.take_pending();
+        let first = events
+            .iter()
+            .find(|event| event.pane_id == PaneId::new(1))
+            .expect("first pane event");
+        let second = events
+            .iter()
+            .find(|event| event.pane_id == PaneId::new(2))
+            .expect("second pane event");
+
+        assert_eq!(events.len(), 2);
+        assert_eq!(first.bell_count, 3);
+        assert_eq!(second.bell_count, 4);
+        assert!(state.push(alert_event(1, Some(8), 0)));
+    }
+}

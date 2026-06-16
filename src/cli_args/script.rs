@@ -3,7 +3,57 @@ use std::path::PathBuf;
 use clap::{ArgAction, ArgGroup, Args};
 use rmux_proto::{Target, WaitForMode};
 
-use super::{parse_target, parse_target_spec, TargetSpec};
+use super::{parse_command_args, parse_target, parse_target_spec, TargetSpec};
+
+pub(super) fn parse_source_file_args(
+    arguments: Vec<String>,
+) -> Result<SourceFileArgs, clap::Error> {
+    validate_source_file_options(&arguments)?;
+    parse_command_args("source-file", arguments)
+}
+
+fn validate_source_file_options(arguments: &[String]) -> Result<(), clap::Error> {
+    let mut expect_target = false;
+    for argument in arguments {
+        if expect_target {
+            expect_target = false;
+            continue;
+        }
+        if argument == "--" {
+            break;
+        }
+        if argument == "-" || !argument.starts_with('-') {
+            break;
+        }
+        if let Some(long) = argument.strip_prefix("--") {
+            let name = long.split_once('=').map_or(long, |(name, _)| name);
+            if name != "help" {
+                return Err(source_file_unknown_flag(format!("--{name}")));
+            }
+            continue;
+        }
+
+        let mut chars = argument[1..].chars().peekable();
+        while let Some(flag) = chars.next() {
+            match flag {
+                'F' | 'n' | 'q' | 'v' => {}
+                't' => {
+                    expect_target = chars.peek().is_none();
+                    break;
+                }
+                _ => return Err(source_file_unknown_flag(format!("-{flag}"))),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn source_file_unknown_flag(flag: String) -> clap::Error {
+    clap::Error::raw(
+        clap::error::ErrorKind::UnknownArgument,
+        format!("command source-file: unknown flag {flag}"),
+    )
+}
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct RunShellArgs {
@@ -11,16 +61,28 @@ pub(crate) struct RunShellArgs {
     pub(crate) background: bool,
     #[arg(short = 'C', action = ArgAction::SetTrue)]
     pub(crate) as_commands: bool,
-    #[arg(short = 'E', action = ArgAction::SetTrue)]
+    #[arg(short = 'E', action = ArgAction::SetTrue, hide = true)]
     pub(crate) show_stderr: bool,
     #[arg(short = 'd')]
     pub(crate) delay_seconds: Option<f64>,
     #[arg(short = 'c')]
     pub(crate) start_directory: Option<PathBuf>,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     pub(crate) command: Vec<String>,
+}
+
+impl RunShellArgs {
+    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
+        if self.show_stderr {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::UnknownArgument,
+                "command run-shell: unknown flag -E",
+            ));
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -33,7 +95,7 @@ pub(crate) struct SourceFileArgs {
     pub(crate) quiet: bool,
     #[arg(short = 'v', action = ArgAction::SetTrue)]
     pub(crate) verbose: bool,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(required = true, allow_hyphen_values = true)]
     pub(crate) paths: Vec<String>,
@@ -45,7 +107,7 @@ pub(crate) struct IfShellArgs {
     pub(crate) background: bool,
     #[arg(short = 'F', action = ArgAction::SetTrue)]
     pub(crate) format_mode: bool,
-    #[arg(short = 't', value_parser = parse_target)]
+    #[arg(short = 't', value_parser = parse_target, allow_hyphen_values = true)]
     pub(crate) target: Option<Target>,
     #[arg(allow_hyphen_values = true)]
     pub(crate) condition: String,

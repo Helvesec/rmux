@@ -17,11 +17,10 @@ mod text;
 mod transfer;
 #[path = "copy_mode/types.rs"]
 mod types;
+#[path = "copy_mode/word.rs"]
+mod word;
 
-use text::{
-    classify_word_char, line_char, owner_positions, pattern_looks_like_regex, WordBoundary,
-    WordClass,
-};
+use text::{classify_word_char, line_char, owner_positions, pattern_looks_like_regex, WordClass};
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use transfer::run_pipe_command;
 #[cfg_attr(windows, allow(unused_imports))]
@@ -209,7 +208,7 @@ impl CopyModeState {
             scroll_position: self.bottom_top_line().saturating_sub(self.top_line),
             rectangle_toggle: self.rectangle,
             cursor_x: self.cursor.x,
-            cursor_y: self.cursor.y,
+            cursor_y: self.cursor.y.saturating_sub(self.top_line),
             selection_start,
             selection_end,
             selection_active,
@@ -238,6 +237,12 @@ impl CopyModeState {
     fn current_word(&self) -> Option<String> {
         let range = self.word_selection_range(self.cursor);
         let line = self.line(range.start.y);
+        let class = line_char(&line, range.start.x)
+            .map(|ch| classify_word_char(ch, &self.word_separators, false))
+            .unwrap_or(WordClass::Space);
+        if class != WordClass::Word {
+            return None;
+        }
         Some(self.extract_line_range(&line, range.start.x, range.end.x, false))
     }
 
@@ -305,98 +310,6 @@ impl CopyModeState {
         None
     }
 
-    fn flatten_owner_positions(&self) -> Vec<CopyPosition> {
-        let mut positions = Vec::new();
-        for y in 0..self.total_lines() {
-            let line = self.line(y);
-            for x in owner_positions(&line) {
-                positions.push(CopyPosition { x, y });
-            }
-        }
-        positions
-    }
-
-    fn find_word_boundary(
-        &self,
-        position: CopyPosition,
-        boundary: WordBoundary,
-    ) -> Option<CopyPosition> {
-        self.find_boundary(position, boundary, false)
-    }
-
-    fn find_space_boundary(
-        &self,
-        position: CopyPosition,
-        boundary: WordBoundary,
-    ) -> Option<CopyPosition> {
-        self.find_boundary(position, boundary, true)
-    }
-
-    fn find_boundary(
-        &self,
-        position: CopyPosition,
-        boundary: WordBoundary,
-        spaces_only: bool,
-    ) -> Option<CopyPosition> {
-        let positions = self.flatten_owner_positions();
-        let index = positions
-            .iter()
-            .position(|candidate| *candidate == position)?;
-        let class_at = |candidate: CopyPosition| -> WordClass {
-            let line = self.line(candidate.y);
-            let ch = line_char(&line, candidate.x).unwrap_or(' ');
-            classify_word_char(ch, &self.word_separators, spaces_only)
-        };
-        match boundary {
-            WordBoundary::NextStart => {
-                let mut saw_gap = false;
-                for candidate in positions.into_iter().skip(index.saturating_add(1)) {
-                    let class = class_at(candidate);
-                    if class != WordClass::Word {
-                        saw_gap = true;
-                        continue;
-                    }
-                    if saw_gap || class_at(position) != WordClass::Word {
-                        return Some(candidate);
-                    }
-                }
-                None
-            }
-            WordBoundary::NextEnd => {
-                let mut in_word = false;
-                let mut last_word = None;
-                for candidate in positions.into_iter().skip(index.saturating_add(1)) {
-                    let class = class_at(candidate);
-                    if class == WordClass::Word {
-                        in_word = true;
-                        last_word = Some(candidate);
-                        continue;
-                    }
-                    if in_word {
-                        return last_word;
-                    }
-                }
-                last_word
-            }
-            WordBoundary::PreviousStart => {
-                let mut found_word = false;
-                let mut start = None;
-                for candidate in positions.into_iter().take(index).rev() {
-                    let class = class_at(candidate);
-                    if class == WordClass::Word {
-                        found_word = true;
-                        start = Some(candidate);
-                        continue;
-                    }
-                    if found_word {
-                        return start;
-                    }
-                }
-                start
-            }
-        }
-    }
-
     fn line_blank(&self, y: usize) -> bool {
         self.full_line_text(y, true).trim().is_empty()
     }
@@ -404,6 +317,35 @@ impl CopyModeState {
     fn full_line_text(&self, y: usize, trim_spaces: bool) -> String {
         let line = self.line(y);
         self.extract_line_range(&line, 0, self.cols().saturating_sub(1), trim_spaces)
+    }
+
+    fn logical_line_text(&self, y: usize, trim_spaces: bool) -> String {
+        let start = self.logical_line_start_y(y);
+        let end = self.logical_line_end_y(y);
+        self.logical_line_text_range(start, end, trim_spaces)
+    }
+
+    fn logical_line_text_range(&self, start_y: usize, end_y: usize, trim_spaces: bool) -> String {
+        let mut text = String::new();
+        for y in start_y..=end_y {
+            text.push_str(&self.full_line_text(y, trim_spaces && y == end_y));
+        }
+        text
+    }
+
+    fn logical_line_start_y(&self, mut y: usize) -> usize {
+        while y > 0 && self.line(y - 1).wrapped() {
+            y -= 1;
+        }
+        y
+    }
+
+    fn logical_line_end_y(&self, mut y: usize) -> usize {
+        let total_lines = self.total_lines();
+        while y + 1 < total_lines && self.line(y).wrapped() {
+            y += 1;
+        }
+        y
     }
 
     fn extract_line_range(
@@ -419,14 +361,19 @@ impl CopyModeState {
         let mut x = start;
         let last = end.min(self.cols().saturating_sub(1));
         while x <= last {
-            let Some(cell) = line.cell(x) else {
-                break;
-            };
-            if !cell.is_padding() {
-                output.push_str(cell.text());
-                x = x.saturating_add(u32::from(cell.width().max(1)));
-            } else {
-                x = x.saturating_add(1);
+            match line.cell(x) {
+                Some(cell) if !cell.is_padding() => {
+                    output.push_str(cell.text());
+                    x = x.saturating_add(u32::from(cell.width().max(1)));
+                }
+                Some(_) => {
+                    x = x.saturating_add(1);
+                }
+                None if x < line.width() => {
+                    output.push(' ');
+                    x = x.saturating_add(1);
+                }
+                None => break,
             }
         }
         if trim_spaces && !line.wrapped() {
@@ -458,11 +405,17 @@ impl CopyModeState {
     fn next_cell_position(&self, position: CopyPosition) -> Option<CopyPosition> {
         let line = self.line(position.y);
         let owner = line.owning_cell_x(position.x).unwrap_or(position.x);
-        if let Some(next) = self.next_owner_in_line(&line, owner) {
-            return Some(CopyPosition {
-                x: next,
-                y: position.y,
-            });
+        let end = self.line_end_x(position.y);
+        if owner < end {
+            if let Some(next) = self
+                .next_owner_in_line(&line, owner)
+                .filter(|next| *next <= end)
+            {
+                return Some(CopyPosition {
+                    x: next,
+                    y: position.y,
+                });
+            }
         }
         if position.y + 1 >= self.total_lines() {
             return None;
@@ -491,10 +444,18 @@ impl CopyModeState {
     }
 
     fn line_end_x(&self, y: usize) -> u32 {
-        owner_positions(&self.line(y))
+        let line = self.line(y);
+        let positions = owner_positions(&line);
+        let Some(last_content) = positions.iter().copied().rev().find(|x| {
+            line.cell(*x)
+                .is_some_and(|cell| !cell.text().chars().all(char::is_whitespace))
+        }) else {
+            return 0;
+        };
+        positions
             .into_iter()
-            .last()
-            .unwrap_or(0)
+            .find(|x| *x > last_content)
+            .unwrap_or(last_content)
     }
 
     fn line(&self, y: usize) -> ScreenLineView {

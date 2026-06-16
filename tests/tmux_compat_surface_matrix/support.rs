@@ -269,7 +269,7 @@ pub(super) struct PtyAttachedClient {
 impl PtyAttachedClient {
     pub(super) fn spawn(mut command: Command) -> Result<Self, Box<dyn Error>> {
         let pty = PtyPair::open_with_size(PtyTerminalSize { cols: 80, rows: 24 })?;
-        let master = File::from(pty.master().try_clone()?.into_owned_fd());
+        let master = File::from(pty.master().try_clone()?.into_owned_fd()?);
         let _terminal = File::from(pty.slave().try_clone()?.into_owned_fd());
         // SAFETY: fcntl is called on a valid file descriptor obtained from the PTY master.
         unsafe {

@@ -39,6 +39,24 @@ async fn parsed_queue_display_message_consumes_neutral_compat_flags_before_messa
         .await
         .expect("display-message compat flags execute");
 
+    assert_eq!(
+        output.stdout(),
+        b"# expanding format: hello\n# result is: hello\nhello\n"
+    );
+}
+
+#[tokio::test]
+async fn parsed_queue_display_message_consumes_compact_delay_before_message() {
+    let handler = RequestHandler::new();
+
+    let parsed = CommandParser::new()
+        .parse("display-message -d0 -p hello")
+        .expect("display-message compact delay flag parses");
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("display-message compact delay flag executes");
+
     assert_eq!(output.stdout(), b"hello\n");
 }
 
@@ -170,6 +188,36 @@ async fn parsed_queue_set_environment_requires_a_value() {
         error,
         rmux_proto::RmuxError::Server("no value specified".to_owned())
     );
+}
+
+#[tokio::test]
+async fn parsed_queue_set_environment_uses_current_session_by_default() {
+    let handler = RequestHandler::new();
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session_name("alpha"),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let parsed = CommandParser::new()
+        .parse(
+            "set-environment -h SECRET classified; \
+             show-environment SECRET; \
+             show-environment -h SECRET",
+        )
+        .expect("commands parse");
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("environment commands execute");
+
+    assert_eq!(output.stdout(), b"SECRET=classified\n");
 }
 
 #[tokio::test]

@@ -1,5 +1,9 @@
-use rmux_proto::request::{AttachSessionExt2Request, AttachSessionExtRequest};
-use rmux_proto::{AttachSessionResponse, ErrorResponse, Response, RmuxError};
+use rmux_proto::request::{
+    AttachSessionExt2Request, AttachSessionExt3Request, AttachSessionExtRequest,
+};
+use rmux_proto::{
+    AttachSessionResponse, ErrorResponse, Response, RmuxError, CAPABILITY_ATTACH_RENDER,
+};
 use tokio::sync::mpsc;
 
 use super::super::{
@@ -58,6 +62,29 @@ impl RequestHandler {
         &self,
         requester_pid: u32,
         request: AttachSessionExt2Request,
+    ) -> HandleOutcome {
+        self.handle_attach_session_ext2_inner(requester_pid, request, false)
+            .await
+    }
+
+    pub(in crate::handler) async fn handle_attach_session_ext3(
+        &self,
+        requester_pid: u32,
+        request: AttachSessionExt3Request,
+    ) -> HandleOutcome {
+        let (request, attach_capabilities) = request.into_ext2_and_capabilities();
+        let render_stream = attach_capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_ATTACH_RENDER);
+        self.handle_attach_session_ext2_inner(requester_pid, request, render_stream)
+            .await
+    }
+
+    async fn handle_attach_session_ext2_inner(
+        &self,
+        requester_pid: u32,
+        request: AttachSessionExt2Request,
+        render_stream: bool,
     ) -> HandleOutcome {
         let mut session_name = match request.target {
             Some(session_name) => session_name,
@@ -147,6 +174,7 @@ impl RequestHandler {
                 &session_name,
                 attached_count,
                 &terminal_context,
+                &self.socket_path(),
             ) {
                 Ok(target) => target,
                 Err(error) => {
@@ -164,6 +192,7 @@ impl RequestHandler {
             control_rx,
             flags,
             request.client_size,
+            render_stream,
         )
     }
 }

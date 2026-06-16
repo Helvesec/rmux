@@ -22,23 +22,48 @@ fn list_panes_accepts_session_target_and_optional_format() {
         super::super::Command::ListPanes(args) => {
             assert_eq!(args.target.expect("session target").to_string(), "alpha");
             assert_eq!(args.format.as_deref(), Some("#{pane_id}"));
+            assert!(args.filter.is_none());
             assert!(!args.all_sessions);
-            assert!(!args.short_format);
+            assert!(!args.session_scope);
         }
         _ => panic!("expected ListPanes command"),
     }
 }
 
 #[test]
-fn list_panes_accepts_all_sessions_and_short_output_without_a_target() {
+fn list_panes_accepts_tmux_filter_flag() {
+    let cli = parse_args(&[
+        "list-panes",
+        "-t",
+        "$1",
+        "-f",
+        "#{m:%0,#{pane_id}}",
+        "-F",
+        "#{pane_id}",
+    ])
+    .unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::ListPanes(args) => {
+            assert_eq!(args.target.expect("session target").to_string(), "$1");
+            assert_eq!(args.filter.as_deref(), Some("#{m:%0,#{pane_id}}"));
+            assert_eq!(args.format.as_deref(), Some("#{pane_id}"));
+        }
+        _ => panic!("expected ListPanes command"),
+    }
+}
+
+#[test]
+fn list_panes_accepts_all_sessions_and_session_scope_without_a_target() {
     let cli = parse_args(&["list-panes", "-a", "-s"]).unwrap();
 
     match cli.command.expect("parsed command") {
         super::super::Command::ListPanes(args) => {
             assert!(args.all_sessions);
-            assert!(args.short_format);
+            assert!(args.session_scope);
             assert!(args.target.is_none());
             assert!(args.format.is_none());
+            assert!(args.filter.is_none());
         }
         _ => panic!("expected ListPanes command"),
     }
@@ -80,6 +105,47 @@ fn split_window_accepts_trailing_command_argv() {
             );
         }
         _ => panic!("expected SplitWindow command"),
+    }
+}
+
+#[test]
+fn split_window_preserves_glued_flags_after_trailing_command_starts() {
+    let cli = parse_args(&[
+        "split-window",
+        "-t",
+        "alpha",
+        "bash",
+        "-lc",
+        "printf split-command",
+    ])
+    .unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::SplitWindow(args) => {
+            assert_eq!(
+                args.command,
+                ["bash", "-lc", "printf split-command"].map(str::to_owned)
+            );
+        }
+        _ => panic!("expected SplitWindow command"),
+    }
+}
+
+#[test]
+fn split_window_allows_trailing_command_l_flag() {
+    for argv in [
+        &["split-window", "-d", "ls", "-l"][..],
+        &["split-window", "-d", "--", "ls", "-l"][..],
+    ] {
+        let cli = parse_args(argv).unwrap();
+
+        match cli.command.expect("parsed command") {
+            super::super::Command::SplitWindow(args) => {
+                assert!(args.detached);
+                assert_eq!(args.command, ["ls", "-l"].map(str::to_owned));
+            }
+            _ => panic!("expected SplitWindow command"),
+        }
     }
 }
 
@@ -133,6 +199,82 @@ fn split_window_accepts_tmux_compat_flags_before_command() {
             assert!(args.preserve_zoom);
             assert_eq!(args.size.as_deref(), Some("12"));
             assert_eq!(args.command, vec!["sh".to_owned()]);
+        }
+        _ => panic!("expected SplitWindow command"),
+    }
+}
+
+#[test]
+fn split_window_accepts_percentage_size() {
+    let cli = parse_args(&["split-window", "-p25", "-f", "-t", "alpha:0.0"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::SplitWindow(args) => {
+            assert!(args.full_size);
+            assert_eq!(args.percentage, Some(25));
+            assert_eq!(args.size_spec().as_deref(), Some("25%"));
+        }
+        _ => panic!("expected SplitWindow command"),
+    }
+}
+
+#[test]
+fn join_pane_accepts_percentage_size() {
+    let cli = parse_args(&[
+        "join-pane",
+        "-p",
+        "50",
+        "-s",
+        "alpha:0.1",
+        "-t",
+        "alpha:0.0",
+    ])
+    .unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::JoinPane(args) => {
+            assert_eq!(args.percentage, Some(50));
+            assert_eq!(args.size_spec().as_deref(), Some("50%"));
+        }
+        _ => panic!("expected JoinPane command"),
+    }
+}
+
+#[test]
+fn split_window_accepts_full_size_flag() {
+    let cli = parse_args(&["split-window", "-f", "-t", "alpha:0.0"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::SplitWindow(args) => {
+            assert_eq!(args.percentage, None);
+            assert_eq!(args.size_spec(), None);
+            assert!(args.full_size);
+            assert_eq!(
+                args.target.as_ref().expect("target").to_string(),
+                "alpha:0.0"
+            );
+        }
+        _ => panic!("expected SplitWindow command"),
+    }
+}
+
+#[test]
+fn split_window_rejects_unknown_flag_before_trailing_command() {
+    let error = parse_args(&["split-window", "-Q", "printf ok"]).unwrap_err();
+
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    assert!(error
+        .to_string()
+        .contains("command split-window: unknown flag -Q"));
+}
+
+#[test]
+fn split_window_preserves_hyphenated_values_after_trailing_command_starts() {
+    let cli = parse_args(&["split-window", "env", "-Q", "value"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::SplitWindow(args) => {
+            assert_eq!(args.command, ["env", "-Q", "value"].map(str::to_owned));
         }
         _ => panic!("expected SplitWindow command"),
     }
@@ -242,13 +384,13 @@ fn join_pane_accepts_implicit_marked_source() {
 }
 
 #[test]
-fn join_pane_accepts_before_full_size_and_percentage_size_flags() {
+fn join_pane_accepts_before_full_size_and_percentage_length_flags() {
     let cli = parse_args(&[
         "join-pane",
         "-b",
         "-f",
-        "-p",
-        "30",
+        "-l",
+        "30%",
         "-s",
         "alpha:0.1",
         "-t",
@@ -295,6 +437,19 @@ fn move_pane_parses_the_full_join_pane_flag_surface() {
                 "alpha:0.1"
             );
             assert_eq!(target_text(&args.target), "beta:1.2");
+        }
+        _ => panic!("expected MovePane command"),
+    }
+}
+
+#[test]
+fn move_pane_accepts_percentage_size() {
+    let cli = parse_args(&["move-pane", "-p", "35", "-s", "alpha:0.1", "-t", "beta:1.2"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::MovePane(args) => {
+            assert_eq!(args.percentage, Some(35));
+            assert_eq!(args.size_spec().as_deref(), Some("35%"));
         }
         _ => panic!("expected MovePane command"),
     }

@@ -144,6 +144,9 @@ async fn pane_management_requests_round_trip_through_the_socket() -> Result<(), 
         .send_request(&Request::SelectPane(SelectPaneRequest {
             target: PaneTarget::new(session, 2),
             title: None,
+            style: None,
+            input_disabled: None,
+            preserve_zoom: false,
         }))
         .await?;
     assert_eq!(

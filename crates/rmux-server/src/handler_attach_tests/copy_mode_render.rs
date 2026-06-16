@@ -210,6 +210,9 @@ async fn attached_copy_mode_unhandled_key_falls_back_to_prefix_table() {
             .handle(Request::SelectPane(SelectPaneRequest {
                 target: PaneTarget::new(alpha.clone(), 0),
                 title: None,
+                style: None,
+                input_disabled: None,
+                preserve_zoom: false,
             }))
             .await,
         Response::SelectPane(_)

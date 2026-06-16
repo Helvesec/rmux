@@ -1,7 +1,9 @@
 use clap::{ArgAction, ArgGroup, Args};
-use rmux_proto::{HookName, ScopeSelector, SessionName};
+use rmux_proto::HookName;
+#[cfg(test)]
+use rmux_proto::{ScopeSelector, SessionName};
 
-use super::{parse_session_name, parse_target_spec, TargetSpec};
+use super::{parse_target_spec, TargetSpec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SetOptionCommandKind {
@@ -30,6 +32,8 @@ pub(crate) struct SetOptionArgs {
     pub(crate) pane: bool,
     #[arg(short = 'a', action = ArgAction::SetTrue)]
     pub(crate) append: bool,
+    #[arg(short = 'F', action = ArgAction::SetTrue)]
+    pub(crate) format: bool,
     #[arg(short = 'o', action = ArgAction::SetTrue)]
     pub(crate) only_if_unset: bool,
     #[arg(short = 'q', action = ArgAction::SetTrue)]
@@ -38,7 +42,7 @@ pub(crate) struct SetOptionArgs {
     pub(crate) unset: bool,
     #[arg(short = 'U', action = ArgAction::SetTrue)]
     pub(crate) unset_pane_overrides: bool,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     pub(crate) option: String,
     #[arg(allow_hyphen_values = true)]
@@ -101,7 +105,7 @@ impl ShowOptionsCommandKind {
     disable_help_flag = true,
     group(
         ArgGroup::new("scope")
-            .required(true)
+            .required(false)
             .multiple(false)
             .args(["global", "target"])
     )
@@ -109,8 +113,8 @@ impl ShowOptionsCommandKind {
 pub(crate) struct SetEnvironmentArgs {
     #[arg(short = 'g', action = ArgAction::SetTrue, group = "scope")]
     pub(crate) global: bool,
-    #[arg(short = 't', value_parser = parse_session_name, group = "scope")]
-    pub(crate) target: Option<SessionName>,
+    #[arg(short = 't', value_parser = parse_target_spec, group = "scope")]
+    pub(crate) target: Option<TargetSpec>,
     #[arg(short = 'F', action = ArgAction::SetTrue)]
     pub(crate) format: bool,
     #[arg(short = 'h', action = ArgAction::SetTrue)]
@@ -120,6 +124,7 @@ pub(crate) struct SetEnvironmentArgs {
     #[arg(short = 'u', action = ArgAction::SetTrue, conflicts_with = "clear")]
     pub(crate) unset: bool,
     pub(crate) name: String,
+    #[arg(allow_hyphen_values = true)]
     pub(crate) value: Option<String>,
 }
 
@@ -145,7 +150,7 @@ pub(crate) struct ShowOptionsArgs {
     pub(crate) quiet: bool,
     #[arg(short = 'v', action = ArgAction::SetTrue)]
     pub(crate) value_only: bool,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(allow_hyphen_values = true)]
     pub(crate) name: Option<String>,
@@ -162,6 +167,9 @@ impl ShowOptionsArgs {
         if matches!(kind, ShowOptionsCommandKind::ShowWindowOptions) {
             if self.quiet {
                 return Err(unknown_flag_error(kind.command_name(), "-q"));
+            }
+            if self.include_inherited {
+                return Err(unknown_flag_error(kind.command_name(), "-A"));
             }
             if self.server {
                 return Err(unknown_flag_error(kind.command_name(), "-s"));
@@ -191,8 +199,8 @@ impl ShowOptionsArgs {
 pub(crate) struct ShowEnvironmentArgs {
     #[arg(short = 'g', action = ArgAction::SetTrue, group = "scope")]
     pub(crate) global: bool,
-    #[arg(short = 't', value_parser = parse_session_name, group = "scope")]
-    pub(crate) target: Option<SessionName>,
+    #[arg(short = 't', value_parser = parse_target_spec, group = "scope")]
+    pub(crate) target: Option<TargetSpec>,
     #[arg(short = 'h', action = ArgAction::SetTrue)]
     pub(crate) hidden: bool,
     #[arg(short = 's', action = ArgAction::SetTrue)]
@@ -203,7 +211,7 @@ pub(crate) struct ShowEnvironmentArgs {
 #[derive(Debug, Clone, Args)]
 #[command(group(
     ArgGroup::new("scope")
-        .required(true)
+        .required(false)
         .multiple(true)
         .args(["global", "target"])
 ))]
@@ -253,6 +261,7 @@ pub(crate) struct ParsedHookSpec {
     pub(crate) index: Option<u32>,
 }
 
+#[cfg(test)]
 pub(crate) fn build_scope(global: bool, target: Option<SessionName>) -> ScopeSelector {
     match (global, target) {
         (true, None) => ScopeSelector::Global,
@@ -281,7 +290,7 @@ fn parse_hook_spec(value: &str) -> Result<ParsedHookSpec, String> {
 }
 
 fn parse_hook_name(value: &str) -> Result<HookName, String> {
-    HookName::from_str(value).ok_or_else(|| format!("unknown hook: {value}"))
+    HookName::from_str(value).ok_or_else(|| format!("invalid option: {value}"))
 }
 
 fn unknown_flag_error(command_name: &str, flag: &str) -> clap::Error {

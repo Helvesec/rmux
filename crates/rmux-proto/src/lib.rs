@@ -16,19 +16,23 @@ pub mod response;
 pub mod types;
 
 pub use attach::{
-    encode_attach_message, AttachFrameDecoder, AttachMessage, AttachShellCommand,
-    AttachedKeystroke, KeyDispatched,
+    decode_attach_data_frame, decode_attach_data_frame_with_limit, encode_attach_data,
+    encode_attach_data_into_slice, encode_attach_message, AttachDataFrame, AttachFrameDecoder,
+    AttachMessage, AttachShellCommand, AttachedKeystroke, KeyDispatched, ATTACH_DATA_HEADER_LEN,
 };
 pub use capabilities::{
-    HandshakeRequest, HandshakeResponse, CAPABILITY_ATTACH_RESIZE_GEOMETRY,
-    CAPABILITY_ATTACH_STREAM, CAPABILITY_CONTROL_STREAM, CAPABILITY_DAEMON_SHUTDOWN,
-    CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE, CAPABILITY_DAEMON_STATUS, CAPABILITY_DETACHED_RPC,
-    CAPABILITY_FRAMED_ERRORS, CAPABILITY_HANDSHAKE, CAPABILITY_SDK_PANE_BROADCAST,
-    CAPABILITY_SDK_PANE_BY_ID, CAPABILITY_SDK_PROCESS_COMMAND, CAPABILITY_SDK_SESSION_LEASE,
-    CAPABILITY_SDK_WAITS, CAPABILITY_TARGET_CLIENT_COMMANDS, CAPABILITY_WEB_SHARE,
-    SUPPORTED_CAPABILITIES,
+    HandshakeRequest, HandshakeResponse, CAPABILITY_ATTACH_RENDER,
+    CAPABILITY_ATTACH_RESIZE_GEOMETRY, CAPABILITY_ATTACH_STREAM, CAPABILITY_CONTROL_STREAM,
+    CAPABILITY_DAEMON_SHUTDOWN, CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE, CAPABILITY_DAEMON_STATUS,
+    CAPABILITY_DETACHED_RPC, CAPABILITY_FRAMED_ERRORS, CAPABILITY_HANDSHAKE,
+    CAPABILITY_SDK_PANE_BROADCAST, CAPABILITY_SDK_PANE_BY_ID, CAPABILITY_SDK_PROCESS_COMMAND,
+    CAPABILITY_SDK_SESSION_LEASE, CAPABILITY_SDK_WAITS, CAPABILITY_TARGET_CLIENT_COMMANDS,
+    CAPABILITY_WEB_SHARE, SUPPORTED_CAPABILITIES,
 };
-pub use codec::{decode_frame, encode_frame, FrameDecoder, DEFAULT_MAX_FRAME_LENGTH};
+pub use codec::{
+    decode_frame, encode_frame, FrameDecoder, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
+    DEFAULT_MAX_FRAME_LENGTH,
+};
 pub use control::{
     format_continue_line, format_exit_line, format_extended_output_line, format_guard_line,
     format_output_line, format_pause_line, octal_escape, ClientTerminalContext, ControlGuardKind,

@@ -1,13 +1,17 @@
 use std::collections::VecDeque;
-use std::io;
-use std::process::Stdio;
-use std::time::Duration;
+use std::io::{self, BufRead, Read};
+use std::net::SocketAddr;
+use std::process::{Child, Command, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use regex::Regex;
 use rmux_proto::RmuxError;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{lookup_host, TcpStream};
-use tokio::process::{ChildStderr, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
@@ -21,17 +25,24 @@ use crate::web::tunnel::TunnelInfo;
 const LINE_CHANNEL_CAPACITY: usize = 64;
 const ERROR_LINE_LIMIT: usize = 8;
 const STOP_GRACE_PERIOD: Duration = Duration::from_secs(5);
+const TUNNEL_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const PUBLIC_ENDPOINT_INITIAL_PROBE_DELAY: Duration = Duration::from_secs(1);
+const PUBLIC_ENDPOINT_RETRY_DELAY: Duration = Duration::from_secs(1);
+const PUBLIC_ENDPOINT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub(crate) struct TunnelHandle {
     provider: String,
+    stop_flag: Arc<AtomicBool>,
     stop_tx: Option<oneshot::Sender<()>>,
+    _output_task: Option<JoinHandle<()>>,
     _task: JoinHandle<()>,
 }
 
 impl Drop for TunnelHandle {
     fn drop(&mut self) {
         debug!(provider = %self.provider, "stopping web-share tunnel provider");
+        self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.send(());
         }
@@ -70,39 +81,49 @@ pub(super) async fn start(
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|error| spawn_error(&preset, &program, error))?;
     let stdout = child.stdout.take().expect("stdout is piped");
     let stderr = child.stderr.take().expect("stderr is piped");
     let (line_tx, line_rx) = mpsc::channel(LINE_CHANNEL_CAPACITY);
-    tokio::spawn(read_stdout(stdout, line_tx.clone()));
-    tokio::spawn(read_stderr(stderr, line_tx));
+    spawn_line_reader(
+        "rmux-tunnel-stdout",
+        stdout,
+        line_tx.clone(),
+        ProcessOutput::Stdout,
+    );
+    spawn_line_reader("rmux-tunnel-stderr", stderr, line_tx, ProcessOutput::Stderr);
 
     let (stop_tx, stop_rx) = oneshot::channel();
     let (exit_tx, exit_rx) = oneshot::channel();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let handle_stop_flag = Arc::clone(&stop_flag);
     let task = tokio::spawn(async move {
-        tokio::select! {
+        let mut child_wait = tokio::task::spawn_blocking({
+            let stop_flag = stop_flag.clone();
+            move || wait_for_tunnel_child(child, stop_flag)
+        });
+        let status = tokio::select! {
             _ = stop_rx => {
-                terminate_child(&mut child);
-                if timeout(STOP_GRACE_PERIOD, child.wait()).await.is_err() {
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
-                }
+                stop_flag.store(true, Ordering::SeqCst);
+                child_wait.await.map_err(|error| io::Error::other(format!("tunnel wait task failed: {error}")))
             }
-            status = child.wait() => {
-                let _ = exit_tx.send(status);
+            status = &mut child_wait => {
+                status.map_err(|error| io::Error::other(format!("tunnel wait task failed: {error}")))
             }
-        }
+        };
+        let _ = exit_tx.send(status.and_then(|status| status));
     });
     let mut handle = Some(TunnelHandle {
         provider: preset.name.clone(),
+        stop_flag: handle_stop_flag,
         stop_tx: Some(stop_tx),
+        _output_task: None,
         _task: task,
     });
-    let public_url =
+    let (public_url, line_rx) =
         match wait_for_url(&preset, &regex, ready_regex.as_ref(), line_rx, exit_rx).await {
             Ok(url) => url,
             Err(error) => {
@@ -110,6 +131,10 @@ pub(super) async fn start(
                 return Err(error);
             }
         };
+    let output_task = spawn_output_drain(preset.name.clone(), line_rx);
+    if let Some(handle) = &mut handle {
+        handle._output_task = Some(output_task);
+    }
     if let Err(error) = wait_for_public_endpoint(&preset, &public_url).await {
         drop(handle.take());
         return Err(error);
@@ -134,11 +159,12 @@ async fn wait_for_public_endpoint(preset: &TunnelPreset, url: &str) -> Result<()
         ))
     })?;
     let wait = async {
+        sleep(PUBLIC_ENDPOINT_INITIAL_PROBE_DELAY).await;
         loop {
             if endpoint_accepts_connections(&host, port).await.is_ok() {
                 return Ok::<(), ()>(());
             }
-            sleep(Duration::from_secs(1)).await;
+            sleep(PUBLIC_ENDPOINT_RETRY_DELAY).await;
         }
     };
     match timeout(Duration::from_secs(preset.ready_timeout_secs), wait)
@@ -155,10 +181,10 @@ async fn wait_for_public_endpoint(preset: &TunnelPreset, url: &str) -> Result<()
 }
 
 async fn endpoint_accepts_connections(host: &str, port: u16) -> io::Result<()> {
-    let mut addrs = lookup_host((host, port)).await?;
+    let addrs = ordered_endpoint_addrs(lookup_host((host, port)).await?);
     let mut last_error = None;
-    for addr in addrs.by_ref() {
-        match timeout(Duration::from_secs(2), TcpStream::connect(addr)).await {
+    for addr in addrs {
+        match timeout(PUBLIC_ENDPOINT_CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
             Ok(Ok(_stream)) => return Ok(()),
             Ok(Err(error)) => last_error = Some(error),
             Err(_) => {
@@ -175,6 +201,20 @@ async fn endpoint_accepts_connections(host: &str, port: u16) -> io::Result<()> {
             "public endpoint did not resolve to any address",
         )
     }))
+}
+
+fn ordered_endpoint_addrs(addrs: impl IntoIterator<Item = SocketAddr>) -> Vec<SocketAddr> {
+    let mut ipv4 = Vec::new();
+    let mut ipv6 = Vec::new();
+    for addr in addrs {
+        if addr.is_ipv4() {
+            ipv4.push(addr);
+        } else {
+            ipv6.push(addr);
+        }
+    }
+    ipv4.extend(ipv6);
+    ipv4
 }
 
 fn public_endpoint(url: &str) -> io::Result<(String, u16)> {
@@ -219,11 +259,39 @@ fn default_port(scheme: &str) -> io::Result<u16> {
     }
 }
 
+fn wait_for_tunnel_child(
+    mut child: Child,
+    stop_flag: Arc<AtomicBool>,
+) -> io::Result<std::process::ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if stop_flag.load(Ordering::SeqCst) {
+            terminate_child(&mut child);
+            let deadline = Instant::now() + STOP_GRACE_PERIOD;
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+                if Instant::now() >= deadline {
+                    child.kill()?;
+                    return child.wait();
+                }
+                thread::sleep(TUNNEL_CHILD_POLL_INTERVAL);
+            }
+        }
+        thread::sleep(TUNNEL_CHILD_POLL_INTERVAL);
+    }
+}
+
 #[cfg(unix)]
-fn terminate_child(child: &mut tokio::process::Child) {
+fn terminate_child(child: &mut Child) {
     let Some(pid) = child
         .id()
-        .and_then(|pid| rustix::process::Pid::from_raw(pid as i32))
+        .try_into()
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
     else {
         return;
     };
@@ -231,7 +299,7 @@ fn terminate_child(child: &mut tokio::process::Child) {
 }
 
 #[cfg(not(unix))]
-fn terminate_child(_child: &mut tokio::process::Child) {}
+fn terminate_child(_child: &mut Child) {}
 
 async fn wait_for_url(
     preset: &TunnelPreset,
@@ -239,7 +307,7 @@ async fn wait_for_url(
     ready_regex: Option<&Regex>,
     mut lines: mpsc::Receiver<(ProcessOutput, String)>,
     mut exit_rx: oneshot::Receiver<io::Result<std::process::ExitStatus>>,
-) -> Result<String, RmuxError> {
+) -> Result<(String, mpsc::Receiver<(ProcessOutput, String)>), RmuxError> {
     let mut last_lines = VecDeque::new();
     let ready = async {
         let mut found_url = None;
@@ -262,7 +330,7 @@ async fn wait_for_url(
                     }
                     if provider_ready {
                         if let Some(url) = found_url.take() {
-                            return Ok(url);
+                            return Ok((url, lines));
                         }
                     }
                 }
@@ -282,27 +350,46 @@ async fn wait_for_url(
         .map_err(|_| tunnel_error(preset, "timed out waiting for a public URL", &last_lines))?
 }
 
-async fn read_stdout(stdout: ChildStdout, tx: mpsc::Sender<(ProcessOutput, String)>) {
-    read_lines(ProcessOutput::Stdout, stdout, tx).await;
-}
-
-async fn read_stderr(stderr: ChildStderr, tx: mpsc::Sender<(ProcessOutput, String)>) {
-    read_lines(ProcessOutput::Stderr, stderr, tx).await;
-}
-
-async fn read_lines<R>(source: ProcessOutput, reader: R, tx: mpsc::Sender<(ProcessOutput, String)>)
-where
-    R: tokio::io::AsyncRead + Unpin,
+fn spawn_line_reader<R>(
+    name: &'static str,
+    reader: R,
+    tx: mpsc::Sender<(ProcessOutput, String)>,
+    source: ProcessOutput,
+) where
+    R: Read + Send + 'static,
 {
-    let mut lines = BufReader::new(reader).lines();
-    loop {
-        match lines.next_line().await {
-            Ok(Some(line)) => {
-                if tx.send((source, line)).await.is_err() {
+    let _ = thread::Builder::new().name(name.to_owned()).spawn(move || {
+        read_lines(source, reader, tx);
+    });
+}
+
+fn spawn_output_drain(
+    provider: String,
+    mut lines: mpsc::Receiver<(ProcessOutput, String)>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some((source, line)) = lines.recv().await {
+            debug!(
+                provider,
+                source = ?source,
+                line,
+                "web-share tunnel provider output"
+            );
+        }
+    })
+}
+
+fn read_lines<R>(source: ProcessOutput, reader: R, tx: mpsc::Sender<(ProcessOutput, String)>)
+where
+    R: Read,
+{
+    for line in io::BufReader::new(reader).lines() {
+        match line {
+            Ok(line) => {
+                if tx.blocking_send((source, line)).is_err() {
                     return;
                 }
             }
-            Ok(None) => return,
             Err(error) => {
                 debug!("web-share tunnel output read failed: {error}");
                 return;
@@ -361,15 +448,28 @@ fn expand(value: &str, settings: &WebShareSettings) -> Result<String, RmuxError>
     Ok(expanded)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
-    use super::start;
-    use crate::web::settings::WebShareSettings;
-    use crate::web::tunnel::preset::{TunnelPreset, UrlSource};
-    use tokio::net::TcpListener;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
+    #[test]
+    fn endpoint_probe_prefers_ipv4_before_ipv6() {
+        let ipv6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 443);
+        let ipv4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443);
+
+        let ordered = super::ordered_endpoint_addrs([ipv6, ipv4]);
+
+        assert_eq!(ordered, vec![ipv4, ipv6]);
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn runner_extracts_public_url_and_stops_on_drop() {
+        use super::start;
+        use crate::web::settings::WebShareSettings;
+        use crate::web::tunnel::preset::{TunnelPreset, UrlSource};
+        use tokio::net::TcpListener;
+
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind readiness probe listener");

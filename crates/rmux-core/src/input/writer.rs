@@ -18,6 +18,13 @@ pub trait ScreenWriter {
         self.collect_add(ch, cell);
     }
 
+    /// Add a run of printable ASCII bytes with the current cell attributes.
+    fn collect_add_ascii_run(&mut self, bytes: &[u8], cell: &CellState, acs: bool) {
+        for &byte in bytes {
+            self.collect_add_with_charset(char::from(byte), cell, acs);
+        }
+    }
+
     /// End character collection (flush). Called before non-print transitions.
     fn collect_end(&mut self) {}
 

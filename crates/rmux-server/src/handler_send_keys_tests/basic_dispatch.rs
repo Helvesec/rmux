@@ -28,6 +28,81 @@ async fn send_keys_writes_resolved_bytes_to_the_correct_pane() {
 }
 
 #[tokio::test]
+async fn send_keys_marks_attached_session_input_as_interactive() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    handler.register_attach(77, alpha.clone(), control_tx).await;
+
+    let response = handler
+        .handle(Request::SendKeys(SendKeysRequest {
+            target: PaneTarget::new(alpha, 0),
+            keys: vec!["hello".to_owned()],
+        }))
+        .await;
+
+    assert_eq!(
+        response,
+        Response::SendKeys(SendKeysResponse { key_count: 1 })
+    );
+    assert!(matches!(
+        control_rx.try_recv(),
+        Ok(crate::pane_io::AttachControl::InteractiveInput)
+    ));
+}
+
+#[tokio::test]
+async fn send_keys_plain_input_uses_copy_mode_until_copy_mode_exits() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let target = PaneTarget::new(alpha.clone(), 0);
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "send-keys-copy-mode", 1).await;
+
+    let entered = handler
+        .handle(Request::CopyMode(CopyModeRequest {
+            target: Some(target.clone()),
+            page_down: false,
+            exit_on_scroll: false,
+            hide_position: false,
+            mouse_drag_start: false,
+            cancel_mode: false,
+            scrollbar_scroll: false,
+            source: None,
+            page_up: false,
+        }))
+        .await;
+    assert!(matches!(entered, Response::CopyMode(_)));
+
+    let response = handler
+        .handle(Request::SendKeys(SendKeysRequest {
+            target: target.clone(),
+            keys: vec!["q".to_owned(), "X".to_owned()],
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::SendKeys(SendKeysResponse { key_count: 2 })
+    );
+
+    let listed = handler
+        .handle(Request::ListPanes(ListPanesRequest {
+            target: alpha,
+            format: Some("#{pane_in_mode}".to_owned()),
+            target_window_index: None,
+        }))
+        .await;
+    let Response::ListPanes(response) = listed else {
+        panic!("expected list-panes response");
+    };
+    assert_eq!(response.command_output().stdout(), b"0\n");
+    capture.assert_contents(&handler, b"X").await;
+}
+
+#[tokio::test]
 async fn send_keys_with_empty_keys_returns_zero_count() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -51,6 +126,103 @@ async fn send_keys_with_empty_keys_returns_zero_count() {
     assert_eq!(
         response,
         Response::SendKeys(SendKeysResponse { key_count: 0 })
+    );
+}
+
+#[tokio::test]
+async fn send_keys_control_question_and_noop_digits_match_tmux_bytes() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "send-keys-control-bytes", 1).await;
+    let response = handler
+        .handle(Request::SendKeys(SendKeysRequest {
+            target: PaneTarget::new(alpha.clone(), 0),
+            keys: vec![
+                "C-?".to_owned(),
+                "C-3".to_owned(),
+                "C-4".to_owned(),
+                "C-5".to_owned(),
+                "C-7".to_owned(),
+                "C-8".to_owned(),
+            ],
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::SendKeys(SendKeysResponse { key_count: 6 })
+    );
+    capture.assert_contents(&handler, &[0x7f]).await;
+}
+
+#[tokio::test]
+async fn send_keys_reset_terminal_updates_transcript_without_writing_to_child() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let target = PaneTarget::new(alpha.clone(), 0);
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+
+    {
+        let state = handler.state.lock().await;
+        state.start_pane_input_capture_for_test(&target);
+        let transcript = state
+            .transcript_handle(&target)
+            .expect("test pane transcript must exist");
+        let mut transcript = transcript
+            .lock()
+            .expect("pane transcript mutex must not be poisoned");
+        transcript.append_bytes(b"reset-marker");
+    }
+
+    let response = handler
+        .handle(Request::SendKeysExt(SendKeysExtRequest {
+            target: Some(target.clone()),
+            keys: vec![],
+            expand_formats: false,
+            hex: false,
+            literal: false,
+            dispatch_key_table: false,
+            copy_mode_command: false,
+            forward_mouse_event: false,
+            reset_terminal: true,
+            repeat_count: None,
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::SendKeys(SendKeysResponse { key_count: 0 })
+    );
+
+    let state = handler.state.lock().await;
+    assert_eq!(state.pane_input_capture_for_test(&target), Some(Vec::new()));
+    let captured = state
+        .capture_transcript(
+            &target,
+            crate::pane_terminals::PaneCaptureRequest {
+                range: Default::default(),
+                options: Default::default(),
+                alternate: false,
+                use_mode_screen: false,
+                pending_input: false,
+                quiet: false,
+                escape_pending: false,
+            },
+        )
+        .expect("capture after reset must succeed");
+    assert!(
+        !String::from_utf8_lossy(&captured).contains("reset-marker"),
+        "terminal reset should clear visible transcript contents"
     );
 }
 

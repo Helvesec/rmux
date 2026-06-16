@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::net::UnixStream;
+use tokio::task;
 use tokio::time::sleep;
 
 use crate::bootstrap::deadline::StartupDeadline;
@@ -36,9 +37,7 @@ mod filesystem;
 #[path = "startup_unix/lock.rs"]
 mod lock;
 
-use filesystem::{
-    ensure_owner_only_directory, prepare_socket_path_safe, reject_socket_symlink, startup_lock_path,
-};
+use filesystem::{prepare_socket_parent, prepare_socket_path_safe, reject_socket_symlink};
 use lock::StartupLock;
 
 /// Permission bits enforced for the per-endpoint startup lock file.
@@ -55,6 +54,7 @@ pub const UNSAFE_PERMISSION_MASK: u32 = 0o077;
 pub const DEFAULT_STARTUP_DEADLINE: Duration = Duration::from_secs(20);
 /// Default poll interval used while waiting for the daemon to become ready.
 pub const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const CONNECT_PROBE_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Outcome of [`connect_or_start`].
 #[derive(Debug)]
@@ -331,6 +331,51 @@ where
     let deadline = StartupDeadline::from_timeout(deadline);
     let owner_uid = real_user_id();
 
+    let empty_socket_path = socket_path.as_os_str().is_empty();
+    if can_probe_existing_socket_before_startup_validation(socket_path) {
+        if let Some(stream) = try_connect_validated(socket_path, owner_uid).await? {
+            return Ok(StartupOutcome::JoinedExisting(stream));
+        }
+    }
+
+    let lock_path = if empty_socket_path {
+        None
+    } else {
+        Some(startup_lock_path_for_filesystem_socket(
+            socket_path,
+            owner_uid,
+        )?)
+    };
+
+    let lock_guard = match lock_path.as_deref() {
+        Some(lock_path) => {
+            Some(StartupLock::acquire(lock_path, owner_uid, deadline, poll_interval).await?)
+        }
+        None => None,
+    };
+
+    if let Some(stream) = try_connect_validated(socket_path, owner_uid).await? {
+        drop(lock_guard);
+        return Ok(StartupOutcome::JoinedExisting(stream));
+    }
+
+    if !empty_socket_path {
+        prepare_socket_path_safe(socket_path, owner_uid)?;
+    }
+
+    launcher()
+        .await
+        .map_err(|error| StartupError::Launcher { source: error })?;
+
+    let stream = wait_for_daemon(socket_path, owner_uid, deadline, poll_interval).await?;
+    drop(lock_guard);
+    Ok(StartupOutcome::Started(stream))
+}
+
+fn startup_lock_path_for_filesystem_socket(
+    socket_path: &Path,
+    owner_uid: u32,
+) -> Result<PathBuf, StartupError> {
     let parent = socket_path
         .parent()
         .ok_or_else(|| StartupError::InvalidPath {
@@ -350,39 +395,31 @@ where
         });
     }
 
-    if let Some(stream) = try_connect_validated(socket_path, owner_uid).await? {
-        return Ok(StartupOutcome::JoinedExisting(stream));
+    prepare_socket_parent(socket_path, parent, owner_uid).map(|prepared| prepared.lock_path)
+}
+
+fn can_probe_existing_socket_before_startup_validation(socket_path: &Path) -> bool {
+    if socket_path.as_os_str().is_empty() {
+        return true;
     }
-
-    ensure_owner_only_directory(parent, owner_uid)?;
-
-    let lock_path = startup_lock_path(socket_path);
-    let lock_guard = StartupLock::acquire(&lock_path, owner_uid, deadline, poll_interval).await?;
-
-    if let Some(stream) = try_connect_validated(socket_path, owner_uid).await? {
-        drop(lock_guard);
-        return Ok(StartupOutcome::JoinedExisting(stream));
-    }
-
-    prepare_socket_path_safe(socket_path, owner_uid)?;
-
-    launcher()
-        .await
-        .map_err(|error| StartupError::Launcher { source: error })?;
-
-    let stream = wait_for_daemon(socket_path, owner_uid, deadline, poll_interval).await?;
-    drop(lock_guard);
-    Ok(StartupOutcome::Started(stream))
+    let Some(parent) = socket_path.parent() else {
+        return false;
+    };
+    !parent.as_os_str().is_empty() && socket_path.file_name().is_some()
 }
 
 async fn try_connect_validated(
     socket_path: &Path,
     owner_uid: u32,
 ) -> Result<Option<UnixStream>, StartupError> {
-    reject_socket_symlink(socket_path)?;
-    match UnixStream::connect(socket_path).await {
+    if !socket_path.as_os_str().is_empty() {
+        reject_socket_symlink(socket_path)?;
+    }
+    match connect_socket_path(socket_path).await {
         Ok(stream) => {
-            reject_socket_symlink(socket_path)?;
+            if !socket_path.as_os_str().is_empty() {
+                reject_socket_symlink(socket_path)?;
+            }
             match validate_peer_credentials(&stream, owner_uid, socket_path) {
                 Ok(()) => Ok(Some(stream)),
                 Err(error) => Err(error),
@@ -391,7 +428,9 @@ async fn try_connect_validated(
         Err(error)
             if matches!(
                 error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                io::ErrorKind::NotFound
+                    | io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::TimedOut
             ) =>
         {
             Ok(None)
@@ -402,6 +441,18 @@ async fn try_connect_validated(
             source: error,
         }),
     }
+}
+
+async fn connect_socket_path(socket_path: &Path) -> io::Result<UnixStream> {
+    let socket_path = socket_path.to_path_buf();
+    let stream = task::spawn_blocking(move || {
+        let endpoint = rmux_ipc::resolve_endpoint(None, Some(socket_path.as_path()))?;
+        rmux_ipc::connect_blocking(&endpoint, CONNECT_PROBE_TIMEOUT)
+    })
+    .await
+    .map_err(io::Error::other)??;
+    stream.set_nonblocking(true)?;
+    UnixStream::from_std(stream)
 }
 
 fn validate_peer_credentials(
@@ -438,7 +489,8 @@ async fn wait_for_daemon(
     // from spinning on the connect probe; anything below this is rounded up.
     const MIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
-    let effective_poll = poll_interval.max(MIN_POLL_INTERVAL);
+    let max_poll = poll_interval.max(MIN_POLL_INTERVAL);
+    let mut next_poll = MIN_POLL_INTERVAL.min(max_poll);
     loop {
         match try_connect_validated(socket_path, owner_uid).await {
             Ok(Some(stream)) => return Ok(stream),
@@ -451,7 +503,8 @@ async fn wait_for_daemon(
                 waited: deadline.elapsed(),
             });
         }
-        sleep(deadline.sleep_for(effective_poll)).await;
+        sleep(deadline.sleep_for(next_poll)).await;
+        next_poll = (next_poll + next_poll).min(max_poll);
     }
 }
 

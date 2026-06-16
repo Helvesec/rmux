@@ -87,6 +87,7 @@ pub(in crate::handler) struct ModeTreeClientState {
 #[derive(Debug, Clone)]
 pub(in crate::handler) struct ParsedModeTreeCommand {
     pub(super) kind: ModeTreeKind,
+    pub(super) target: Option<String>,
     pub(super) preview_mode: PreviewMode,
     pub(super) row_format: Option<String>,
     pub(super) filter_format: Option<String>,
@@ -164,7 +165,7 @@ impl ModeTreeKind {
             Self::Tree => "tree-mode",
             Self::Buffer => "buffer-mode",
             Self::Client => "client-mode",
-            Self::Customize => "customize-mode",
+            Self::Customize => "options-mode",
         }
     }
 }

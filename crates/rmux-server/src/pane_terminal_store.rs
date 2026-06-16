@@ -13,11 +13,12 @@ use tracing::{debug, warn};
 
 use crate::pane_terminal_lookup::{missing_pane_terminal, SessionPane};
 use crate::pane_terminal_process::{pty_geometry_from_layout, PaneTerminal};
-use crate::terminal::TerminalProfile;
+use crate::terminal::{SessionBaseEnvironment, TerminalProfile};
 
 #[derive(Debug, Default)]
 pub(super) struct PaneTerminalStore {
     sessions: HashMap<SessionName, HashMap<PaneId, PaneTerminal>>,
+    session_environments: HashMap<SessionName, SessionBaseEnvironment>,
     #[cfg(test)]
     fail_next_resize: bool,
 }
@@ -33,16 +34,19 @@ impl PaneTerminalStore {
         pane_id: PaneId,
         terminal: PaneTerminal,
     ) -> Result<(), RmuxError> {
-        let previous = self
-            .sessions
-            .insert(session_name.clone(), HashMap::from([(pane_id, terminal)]));
-
-        if previous.is_some() {
+        if self.sessions.contains_key(&session_name) {
             return Err(RmuxError::Server(format!(
                 "pane terminals already exist for session {session_name}"
             )));
         }
 
+        let environment = SessionBaseEnvironment::from_profile(terminal.profile());
+        let previous = self
+            .sessions
+            .insert(session_name.clone(), HashMap::from([(pane_id, terminal)]));
+        debug_assert!(previous.is_none());
+        let previous_environment = self.session_environments.insert(session_name, environment);
+        debug_assert!(previous_environment.is_none());
         Ok(())
     }
 
@@ -89,6 +93,12 @@ impl PaneTerminalStore {
         let replaced = sessions.insert(new_name.clone(), panes);
         debug_assert!(replaced.is_none());
         self.sessions = sessions;
+        if let Some(environment) = self.session_environments.remove(session_name) {
+            let previous = self
+                .session_environments
+                .insert(new_name.clone(), environment);
+            debug_assert!(previous.is_none());
+        }
         Ok(())
     }
 
@@ -310,6 +320,7 @@ impl PaneTerminalStore {
         &mut self,
         session_name: &SessionName,
     ) -> Option<HashMap<PaneId, PaneTerminal>> {
+        let _ = self.session_environments.remove(session_name);
         self.sessions.remove(session_name)
     }
 
@@ -496,6 +507,24 @@ impl PaneTerminalStore {
             .ok_or_else(|| missing_pane_terminal(session_name, window_index, pane_index))?;
 
         Ok(pane.profile())
+    }
+
+    pub(super) fn session_base_environment(
+        &self,
+        session_name: &SessionName,
+    ) -> Option<SessionBaseEnvironment> {
+        self.session_environments.get(session_name).cloned()
+    }
+
+    pub(super) fn pane_base_environment(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> Option<SessionBaseEnvironment> {
+        self.sessions
+            .get(session_name)?
+            .get(&pane_id)
+            .map(|pane| SessionBaseEnvironment::from_profile(pane.profile()))
     }
 
     pub(super) fn pane_runtime_window_name(

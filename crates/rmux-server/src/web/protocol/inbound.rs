@@ -7,9 +7,9 @@ use rmux_core::PaneId;
 
 use super::{
     encode_session_key, parse_pane_resize_body, parse_resize_body, session_logout_allowed,
-    valid_window_name, ClientMessage, SessionOperatorBinaryOutcome, SessionScrollRequest,
-    OPERATOR_INPUT_FRAME_MAX, WS_ATTACH_INPUT, WS_INPUT_KEY, WS_INPUT_TEXT, WS_RESIZE_REQUEST,
-    WS_SESSION_RESIZE_PANE,
+    valid_window_name, ClientMessage, SessionClientTextOutcome, SessionOperatorBinaryOutcome,
+    SessionScrollRequest, OPERATOR_INPUT_FRAME_MAX, WS_ATTACH_INPUT, WS_INPUT_KEY, WS_INPUT_TEXT,
+    WS_RESIZE_REQUEST, WS_SESSION_RESIZE_PANE,
 };
 use crate::handler::{RequestHandler, WebPaneStream, WebSessionStream};
 use crate::web::outbound::WebSocketOutbound;
@@ -59,35 +59,32 @@ pub(crate) async fn handle_session_client_text(
     socket: &WebSocketOutbound,
     session: &mut WebSessionStream,
     text: &str,
-) -> io::Result<Option<SessionScrollRequest>> {
+) -> io::Result<SessionClientTextOutcome> {
     let message = serde_json::from_str::<ClientMessage>(text)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     match message {
         ClientMessage::PaneScroll { pane_id, delta } => {
-            if !session.is_operator() {
-                let _ = socket
-                    .write_close_code(4006, "pane_scroll_requires_operator")
-                    .await;
-                return Ok(None);
-            }
             if delta == 0 || delta.unsigned_abs() > 10_000 {
                 let _ = socket.write_close_code(4006, "invalid_scroll_delta").await;
-                return Ok(None);
+                return Ok(SessionClientTextOutcome::None);
             }
-            Ok(Some(SessionScrollRequest { pane_id, delta }))
+            Ok(SessionClientTextOutcome::Scroll(SessionScrollRequest {
+                pane_id,
+                delta,
+            }))
         }
         ClientMessage::SelectPane { pane_id } if session.is_operator() => {
             handler
                 .web_session_select_pane(session.target(), PaneId::new(pane_id))
                 .await
                 .map_err(|error| io::Error::other(error.to_string()))?;
-            Ok(None)
+            Ok(SessionClientTextOutcome::Snapshot)
         }
         ClientMessage::SelectPane { .. } => {
             let _ = socket
                 .write_close_code(4006, "select_pane_requires_operator")
                 .await;
-            Ok(None)
+            Ok(SessionClientTextOutcome::None)
         }
         ClientMessage::SplitPane { direction } if session.is_operator() => {
             if let Err(error) = handler
@@ -96,7 +93,7 @@ pub(crate) async fn handle_session_client_text(
             {
                 tracing::debug!(?error, "web session split pane ignored");
             }
-            Ok(None)
+            Ok(SessionClientTextOutcome::Snapshot)
         }
         ClientMessage::NewWindow if session.is_operator() => {
             if let Err(error) = handler
@@ -105,13 +102,13 @@ pub(crate) async fn handle_session_client_text(
             {
                 tracing::debug!(?error, "web session new window ignored");
             }
-            Ok(None)
+            Ok(SessionClientTextOutcome::Snapshot)
         }
         ClientMessage::KillPane if session.is_operator() => {
             if let Err(error) = handler.web_session_kill_active_pane(session.target()).await {
                 tracing::debug!(?error, "web session kill pane ignored");
             }
-            Ok(None)
+            Ok(SessionClientTextOutcome::Snapshot)
         }
         ClientMessage::SelectWindow { window_index } if session.is_operator() => {
             if let Err(error) = handler
@@ -120,12 +117,12 @@ pub(crate) async fn handle_session_client_text(
             {
                 tracing::debug!(?error, "web session select window ignored");
             }
-            Ok(None)
+            Ok(SessionClientTextOutcome::Snapshot)
         }
         ClientMessage::RenameWindow { window_index, name } if session.is_operator() => {
             if !valid_window_name(&name) {
                 let _ = socket.write_close_code(4006, "invalid_window_name").await;
-                return Ok(None);
+                return Ok(SessionClientTextOutcome::None);
             }
             if let Err(error) = handler
                 .web_session_rename_window(session.target(), window_index, name)
@@ -133,7 +130,7 @@ pub(crate) async fn handle_session_client_text(
             {
                 tracing::debug!(?error, "web session rename window ignored");
             }
-            Ok(None)
+            Ok(SessionClientTextOutcome::Snapshot)
         }
         ClientMessage::KillWindow { window_index } if session.is_operator() => {
             if let Err(error) = handler
@@ -142,7 +139,7 @@ pub(crate) async fn handle_session_client_text(
             {
                 tracing::debug!(?error, "web session kill window ignored");
             }
-            Ok(None)
+            Ok(SessionClientTextOutcome::Snapshot)
         }
         ClientMessage::SplitPane { .. }
         | ClientMessage::NewWindow
@@ -153,7 +150,7 @@ pub(crate) async fn handle_session_client_text(
             let _ = socket
                 .write_close_code(4006, "session_action_requires_operator")
                 .await;
-            Ok(None)
+            Ok(SessionClientTextOutcome::None)
         }
         ClientMessage::Logout
             if session_logout_allowed(session.is_operator(), session.controls()) =>
@@ -163,19 +160,19 @@ pub(crate) async fn handle_session_client_text(
                 .await
                 .map_err(|error| io::Error::other(error.to_string()))?;
             socket.write_close_code(1000, "session_closed").await?;
-            Ok(None)
+            Ok(SessionClientTextOutcome::None)
         }
         ClientMessage::Logout if session.is_operator() => {
             let _ = socket
                 .write_close_code(4006, "logout_requires_controls")
                 .await;
-            Ok(None)
+            Ok(SessionClientTextOutcome::None)
         }
         ClientMessage::Logout => {
             let _ = socket
                 .write_close_code(4006, "logout_requires_operator")
                 .await;
-            Ok(None)
+            Ok(SessionClientTextOutcome::None)
         }
     }
 }
@@ -363,7 +360,7 @@ async fn resize_session(
         return Ok(SessionOperatorBinaryOutcome::None);
     };
     session.send_attach_resize(size).await?;
-    Ok(SessionOperatorBinaryOutcome::Snapshot)
+    Ok(SessionOperatorBinaryOutcome::Resize)
 }
 
 async fn resize_session_pane(

@@ -1,4 +1,4 @@
-//! v1 wire compatibility ledger.
+//! v1 frame-kind compatibility ledger.
 //!
 //! `FrameKind(u16)` is the v1 compatibility ledger entry identifier. It is
 //! deliberately decoupled from the Rust source order of [`crate::Request`] and
@@ -6,11 +6,11 @@
 //! DTO type and direction so that future re-orderings of the Rust enums do
 //! not silently change wire identity.
 //!
-//! The current v1 wire format still encodes DTOs through `bincode_v1`. The
+//! The current wire format still encodes DTOs through `bincode_v1`. The
 //! ledger therefore additionally pins each variant's bincode tag, and a
-//! companion test in `tests/wire_v1.rs` enforces that every active ledger
-//! entry's `FrameKind` low bits match the bincode tag observed for a sample
-//! value of the corresponding variant.
+//! companion test in `tests/wire_ledger_v1.rs` enforces that every active
+//! ledger entry's `FrameKind` low bits match the bincode tag observed for a
+//! sample value of the corresponding variant.
 //!
 //! Numeric layout:
 //! - `0x0000..=0x7FFF` is reserved for client→server frames.
@@ -130,7 +130,8 @@ pub struct FrameLedgerEntry {
     pub dto_type: &'static str,
     /// Owning feature area.
     pub feature: FrameFeature,
-    /// Optional fixture file name (no extension) under `tests/wire-fixtures/v1/`.
+    /// Optional fixture file name (no extension) under
+    /// `tests/wire-fixtures/ledger-v1-current-wire/`.
     pub fixture: Option<&'static str>,
     /// Compatibility note for the entry.
     pub compatibility_note: &'static str,
@@ -1227,6 +1228,15 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         None,
         "Target-client aware send-keys extension; pinned bincode tag 116.",
     ),
+    entry(
+        c2s(117),
+        FrameDirection::ClientToServer,
+        ACTIVE,
+        "AttachSessionExt3Request",
+        FrameFeature::Clients,
+        None,
+        "Attach-session request carrying attach-stream client capabilities; pinned bincode tag 117.",
+    ),
     // Reserved client→server slot. Removed values must be listed and never reused.
     entry(
         c2s(0x7FFE),
@@ -2239,6 +2249,7 @@ pub const fn frame_kind_for_request(request: &Request) -> FrameKind {
         Request::WebShare(_) => c2s(114),
         Request::DisplayMessageExt(_) => c2s(115),
         Request::SendKeysExt2(_) => c2s(116),
+        Request::AttachSessionExt3(_) => c2s(117),
     }
 }
 

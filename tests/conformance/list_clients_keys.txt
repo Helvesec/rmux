@@ -1,0 +1,9 @@
+client_name
+client_session
+client_tty
+client_width
+client_height
+client_pid
+client_readonly
+client_control_mode
+client_utf8

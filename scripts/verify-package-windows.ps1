@@ -3,7 +3,8 @@ param(
     [string]$Archive,
     [string]$Checksums = "",
     [switch]$RunBinary,
-    [switch]$RunDaemonSmoke
+    [switch]$RunDaemonSmoke,
+    [switch]$RequireReleaseArtifact
 )
 
 Set-StrictMode -Version Latest
@@ -15,7 +16,23 @@ function Fail([string]$Message) {
 }
 
 function Sha256File([string]$Path) {
-    (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+    $getFileHash = Get-Command Get-FileHash -ErrorAction SilentlyContinue
+    if ($getFileHash) {
+        return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+    }
+
+    $stream = [System.IO.File]::OpenRead([System.IO.Path]::GetFullPath($Path))
+    try {
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $hashBytes = $sha256.ComputeHash($stream)
+            return ([System.BitConverter]::ToString($hashBytes) -replace "-", "").ToLowerInvariant()
+        } finally {
+            $sha256.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
 }
 
 function AssertSuccess([string]$Binary, [string[]]$Arguments) {
@@ -94,7 +111,7 @@ try {
         Fail "archive root directory is missing: $([System.IO.Path]::GetFileNameWithoutExtension($archiveName))"
     }
 
-    foreach ($required in @("rmux.exe", "SHA256SUMS.txt", "share/rmux/artifact-metadata.json", "README.md", "LICENSE-APACHE", "LICENSE-MIT", "rmux.1")) {
+    foreach ($required in @("rmux.exe", "rmux-daemon.exe", "SHA256SUMS.txt", "share/rmux/artifact-metadata.json", "README.md", "LICENSE-APACHE", "LICENSE-MIT", "rmux.1")) {
         if (-not (Test-Path -LiteralPath (Join-Path $packageRoot $required))) {
             Fail "missing package file: $required"
         }
@@ -111,9 +128,20 @@ try {
     if ($metadata.package_layout -ne "rmux-windows-package-v1") {
         Fail "metadata package_layout is not rmux-windows-package-v1"
     }
+    if ($RequireReleaseArtifact) {
+        if (-not ($metadata.PSObject.Properties.Name -contains "release_artifact") -or
+            $metadata.release_artifact -ne $true) {
+            Fail "metadata release_artifact is not true"
+        }
+    }
     $packagedBinaryHash = Sha256File $binary
     if ($metadata.binary_sha256.ToLowerInvariant() -ne $packagedBinaryHash) {
         Fail "metadata binary_sha256 does not match packaged binary"
+    }
+    $daemonBinary = Join-Path $packageRoot "rmux-daemon.exe"
+    $packagedDaemonHash = Sha256File $daemonBinary
+    if ($metadata.daemon_binary_sha256.ToLowerInvariant() -ne $packagedDaemonHash) {
+        Fail "metadata daemon_binary_sha256 does not match packaged daemon binary"
     }
 
     if ($RunBinary) {
@@ -137,8 +165,10 @@ try {
     Write-Output "archive=$archiveFull"
     Write-Output "sha256=$actualHash"
     Write-Output "binary_sha256=$packagedBinaryHash"
+    Write-Output "daemon_binary_sha256=$packagedDaemonHash"
     Write-Output "run_binary=$($RunBinary.ToString().ToLowerInvariant())"
     Write-Output "run_daemon_smoke=$($RunDaemonSmoke.ToString().ToLowerInvariant())"
+    Write-Output "require_release_artifact=$($RequireReleaseArtifact.ToString().ToLowerInvariant())"
 } finally {
     Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

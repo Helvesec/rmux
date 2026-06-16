@@ -236,7 +236,13 @@ impl FormatVariables for StaticWindowValues {
 fn default_list_windows_format_matches_existing_shape() {
     let rendered = render_template(DEFAULT_LIST_WINDOWS_FORMAT, &StaticWindowValues);
 
-    assert_eq!(rendered, "5: logs* (3 panes) [120x40]");
+    assert_eq!(
+        rendered,
+        format!(
+            "5: logs* (3 panes) [120x40] [layout {}] @9 (active)",
+            sample_window_layout()
+        )
+    );
 }
 
 #[test]
@@ -446,7 +452,7 @@ fn format_consuming_option_defaults_use_only_the_closed_surface() {
     assert_eq!(status_left, "[#{session_name}] ");
     assert_eq!(
         status_right,
-        r##"#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}"#{=21:host_short}" %H:%M %d-%b-%y"##
+        r##"#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}"#{=21:pane_title}" %H:%M %d-%b-%y"##
     );
     assert_eq!(
         window_status_current,

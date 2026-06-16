@@ -89,6 +89,10 @@ impl WebPaneStream {
     pub(crate) fn show_viewers(&self) -> bool {
         self.access.show_viewers()
     }
+
+    pub(crate) fn operator_visible_spectator_pairing_code(&self) -> Option<&str> {
+        self.access.operator_visible_spectator_pairing_code()
+    }
 }
 
 impl WebShareStream {
@@ -169,6 +173,13 @@ impl WebShareStream {
         }
     }
 
+    pub(crate) fn operator_visible_spectator_pairing_code(&self) -> Option<&str> {
+        match self {
+            Self::Pane(stream) => stream.operator_visible_spectator_pairing_code(),
+            Self::Session(stream) => stream.operator_visible_spectator_pairing_code(),
+        }
+    }
+
     pub(crate) fn role(&self) -> &'static str {
         if self.is_operator() {
             "operator"
@@ -235,6 +246,10 @@ impl WebSessionStream {
         self.access.show_viewers()
     }
 
+    pub(crate) fn operator_visible_spectator_pairing_code(&self) -> Option<&str> {
+        self.access.operator_visible_spectator_pairing_code()
+    }
+
     pub(crate) fn take_attach_reader(&mut self) -> WebSessionAttachReader {
         self.reader
             .take()
@@ -274,7 +289,7 @@ impl WebSessionAttachReader {
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?
             {
                 match message {
-                    AttachMessage::Data(bytes) => {
+                    AttachMessage::Data(bytes) | AttachMessage::Render(bytes) => {
                         if !bytes.is_empty() {
                             return Ok(Some(WebSessionAttachEvent::Data(bytes)));
                         }

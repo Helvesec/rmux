@@ -13,15 +13,32 @@ mod break_window;
 impl Session {
     /// Selects the previously active pane in the addressed window.
     pub fn last_pane_in_window(&mut self, window_index: u32) -> Result<u32, RmuxError> {
+        self.last_pane_in_window_with_zoom(window_index, false)
+    }
+
+    /// Selects the previously active pane in the addressed window, preserving zoom when requested.
+    pub fn last_pane_in_window_with_zoom(
+        &mut self,
+        window_index: u32,
+        preserve_zoom: bool,
+    ) -> Result<u32, RmuxError> {
         let last_pane = self
             .window_at(window_index)
             .ok_or_else(|| invalid_window_target(&self.name, window_index))?
             .last_pane_index()
             .ok_or_else(|| RmuxError::Server("no last pane".to_owned()))?;
 
-        self.window_at_mut(window_index)
-            .expect("addressed session window must exist")
-            .select_pane(last_pane);
+        let window = self
+            .window_at_mut(window_index)
+            .expect("addressed session window must exist");
+        if preserve_zoom {
+            let _ = window.push_zoom(true);
+        }
+        let selected = window.select_pane(last_pane);
+        if preserve_zoom {
+            window.pop_zoom();
+        }
+        debug_assert!(selected, "validated last pane must be selectable");
 
         Ok(last_pane)
     }

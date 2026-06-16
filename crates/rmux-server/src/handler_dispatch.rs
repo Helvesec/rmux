@@ -116,10 +116,6 @@ impl RequestHandler {
             return HandleOutcome::response(self.handle_daemon_status(connection_id).await);
         }
 
-        if let Some(error) = self.take_startup_config_error().await {
-            return HandleOutcome::response(Response::Error(ErrorResponse { error }));
-        }
-
         let command_name = request.command_name().to_owned();
         #[allow(unreachable_patterns)]
         match request {
@@ -403,7 +399,7 @@ impl RequestHandler {
                     .await,
             ),
             Request::ResolveTarget(request) => {
-                HandleOutcome::response(self.handle_resolve_target(request).await)
+                HandleOutcome::response(self.handle_resolve_target(requester_pid, request).await)
             }
             Request::ShowMessages(request) => {
                 HandleOutcome::response(self.handle_show_messages(requester_pid, request).await)
@@ -416,6 +412,10 @@ impl RequestHandler {
             }
             Request::AttachSessionExt2(request) => {
                 self.handle_attach_session_ext2(requester_pid, request)
+                    .await
+            }
+            Request::AttachSessionExt3(request) => {
+                self.handle_attach_session_ext3(requester_pid, request)
                     .await
             }
             Request::RefreshClient(request) => {
@@ -437,7 +437,7 @@ impl RequestHandler {
                 self.handle_switch_client_ext3(requester_pid, request).await,
             ),
             Request::RunShell(request) => {
-                HandleOutcome::response(self.handle_run_shell(request).await)
+                HandleOutcome::response(self.handle_run_shell(requester_pid, request).await)
             }
             Request::IfShell(request) => {
                 HandleOutcome::response(self.handle_if_shell(requester_pid, request).await)

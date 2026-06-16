@@ -9,6 +9,7 @@ use common::{
     assert_success, stderr, stdout, terminate_child, CliHarness, FrozenTmuxBinary,
     TmuxCompatHarness, TmuxCompatRun, TmuxCompatRunConfig, FROZEN_TMUX_ENV,
 };
+use rmux_proto::DEFAULT_MAX_FRAME_LENGTH;
 
 #[test]
 fn capture_pane_prints_unattached_transcript() -> Result<(), Box<dyn Error>> {
@@ -28,6 +29,41 @@ fn capture_pane_prints_unattached_transcript() -> Result<(), Box<dyn Error>> {
     let output = wait_for_capture(&harness, marker)?;
     assert!(stdout(&output).contains(marker));
     assert!(stderr(&output).is_empty());
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn capture_pane_non_numeric_bounds_are_rejected() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("capture-nonnumeric-bounds")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        "alpha",
+        "printf 'line1\\nline2\\n'; sleep 60",
+    ])?);
+    let _ = wait_for_capture(&harness, "line2")?;
+
+    let direct = harness.run(&["capture-pane", "-p", "-t", "alpha:0.0", "-S", "abc"])?;
+    assert_eq!(direct.status.code(), Some(1));
+    assert!(stdout(&direct).is_empty());
+    assert_eq!(
+        stderr(&direct),
+        "command capture-pane: -S expects a number\n"
+    );
+
+    let queued = harness.run(&["run-shell", "-C", "capture-pane -p -t alpha:0.0 -S abc"])?;
+    assert_eq!(queued.status.code(), Some(1));
+    assert!(stdout(&queued).is_empty());
+    assert!(
+        stderr(&queued).contains("command capture-pane: -S expects a number"),
+        "stderr={}",
+        stderr(&queued)
+    );
 
     terminate_child(daemon.child_mut())?;
     Ok(())
@@ -80,6 +116,58 @@ fn capture_pane_print_does_not_reorder_buffers() -> Result<(), Box<dyn Error>> {
     let show = harness.run(&["show-buffer"])?;
     assert_eq!(show.status.code(), Some(0));
     assert_eq!(stdout(&show), "stable-head");
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn capture_pane_can_print_large_scrollback() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("capture-large-scrollback")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        "alpha",
+        "-x",
+        "80",
+        "-y",
+        "24",
+        "sleep 60",
+    ])?);
+    assert_success(&harness.run(&["set-option", "-g", "history-limit", "40000"])?);
+    assert_success(&harness.run(&[
+        "respawn-pane",
+        "-k",
+        "-t",
+        "alpha:0.0",
+        "printf 'rmux-large-capture-start\\n'; dd if=/dev/zero bs=2097152 count=1 2>/dev/null | tr '\\000' A; printf '\\nrmux-large-capture-end\\n'; sleep 60",
+    ])?);
+    let _ = wait_for_capture(&harness, "rmux-large-capture-end")?;
+
+    let output = harness.run(&[
+        "capture-pane",
+        "-p",
+        "-S",
+        "-",
+        "-E",
+        "-",
+        "-t",
+        "alpha:0.0",
+    ])?;
+    let rendered = stdout(&output);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty());
+    assert!(rendered.contains("rmux-large-capture-start"));
+    assert!(rendered.contains("rmux-large-capture-end"));
+    assert!(
+        rendered.len() > DEFAULT_MAX_FRAME_LENGTH,
+        "large capture stayed below old frame cap: {} bytes",
+        rendered.len()
+    );
 
     terminate_child(daemon.child_mut())?;
     Ok(())

@@ -1,6 +1,6 @@
-//! v1 wire ledger and binary fixture regression tests.
+//! V1 frame ledger and current-envelope binary fixture regression tests.
 //!
-//! These tests assert the v1 ledger and fixture contracts:
+//! These tests assert the stable frame ledger and fixture contracts:
 //!
 //! 1. The `FrameKind(u16)` ledger in `rmux_proto::frame_kind` is the
 //!    authoritative compatibility ledger. Each fixture's ledger entry pins its
@@ -8,34 +8,36 @@
 //!    are inspected and compared against `FrameKind::bincode_tag` for both
 //!    `Request` and `Response` fixtures. A representative cross-section of
 //!    other variants exercises the same invariant.
-//! 2. The seven checked-in v1 fixtures under `tests/wire-fixtures/v1/` decode
-//!    through both `decode_frame` and `FrameDecoder`, asserting stable
-//!    semantic fields rather than enum source order. Encoding canonical
-//!    inputs reproduces each fixture byte-for-byte to guard against silent
-//!    codec drift.
+//! 2. The seven checked-in ledger fixtures under
+//!    `tests/wire-fixtures/ledger-v1-current-wire/`
+//!    decode through both `decode_frame` and `FrameDecoder` using the current
+//!    wire envelope (currently `RMUX_WIRE_VERSION = 2`), asserting stable
+//!    semantic fields rather than enum source order. Encoding canonical inputs
+//!    reproduces each fixture byte-for-byte to guard against silent codec drift.
 
 use std::path::{Path, PathBuf};
 
 use rmux_proto::{
     decode_frame, encode_frame, frame_kind_for_request, frame_kind_for_response, ledger_entry_for,
-    BindKeyRequest, CancelSdkWaitRequest, CancelSdkWaitResponse, CapturePaneRequest,
-    ClientTerminalContext, ClockModeRequest, ControlMode, ControlModeRequest, ControlModeResponse,
-    DetachClientRequest, DisplayMessageExtRequest, ErrorResponse, FrameDecoder, FrameDirection,
-    FrameFeature, FrameKind, FrameStatus, HandshakeRequest, HandshakeResponse, HasSessionRequest,
-    HasSessionResponse, HookLifecycle, HookName, KillServerResponse, KillSessionRequest,
-    ListBuffersRequest, NewSessionResponse, OptionName, PaneId, PaneInputRequest, PaneKillRequest,
-    PaneOutputCursor, PaneOutputCursorRequest, PaneOutputCursorResponse, PaneOutputEvent,
-    PaneOutputLagNotice, PaneOutputLagResponse, PaneOutputSubscriptionId,
-    PaneOutputSubscriptionStart, PaneRecentOutput, PaneResizeRequest, PaneRespawnRequest,
-    PaneSelectRequest, PaneSnapshotCursor, PaneSnapshotRefRequest, PaneSnapshotResponse,
-    PaneTarget, PaneTargetRef, Request, ResizePaneAdjustment, ResolveTargetRequest,
-    ResolveTargetType, Response, RmuxError, ScopeSelector, SdkWaitForOutputRefRequest,
-    SdkWaitForOutputRequest, SdkWaitForOutputResponse, SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId,
-    SendKeysExt2Request, SendKeysRequest, SendKeysResponse, SessionName, SetHookRequest,
-    SetOptionMode, SetOptionRequest, SubscribePaneOutputRefRequest, SubscribePaneOutputRequest,
-    SubscribePaneOutputResponse, TerminalSize, UnsubscribePaneOutputRequest,
-    UnsubscribePaneOutputResponse, WebShareConfigRequest, WebShareListener, WebShareRequest,
-    WebShareResponse, WindowTarget, RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION, V1_FRAME_LEDGER,
+    AttachSessionExt2Request, AttachSessionExt3Request, BindKeyRequest, CancelSdkWaitRequest,
+    CancelSdkWaitResponse, CapturePaneRequest, ClientTerminalContext, ClockModeRequest,
+    ControlMode, ControlModeRequest, ControlModeResponse, DetachClientRequest,
+    DisplayMessageExtRequest, ErrorResponse, FrameDecoder, FrameDirection, FrameFeature, FrameKind,
+    FrameStatus, HandshakeRequest, HandshakeResponse, HasSessionRequest, HasSessionResponse,
+    HookLifecycle, HookName, KillServerResponse, KillSessionRequest, ListBuffersRequest,
+    NewSessionResponse, OptionName, PaneId, PaneInputRequest, PaneKillRequest, PaneOutputCursor,
+    PaneOutputCursorRequest, PaneOutputCursorResponse, PaneOutputEvent, PaneOutputLagNotice,
+    PaneOutputLagResponse, PaneOutputSubscriptionId, PaneOutputSubscriptionStart, PaneRecentOutput,
+    PaneResizeRequest, PaneRespawnRequest, PaneSelectRequest, PaneSnapshotCursor,
+    PaneSnapshotRefRequest, PaneSnapshotResponse, PaneTarget, PaneTargetRef, Request,
+    ResizePaneAdjustment, ResolveTargetRequest, ResolveTargetType, Response, RmuxError,
+    ScopeSelector, SdkWaitForOutputRefRequest, SdkWaitForOutputRequest, SdkWaitForOutputResponse,
+    SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId, SendKeysExt2Request, SendKeysRequest,
+    SendKeysResponse, SessionName, SetHookRequest, SetOptionMode, SetOptionRequest,
+    SubscribePaneOutputRefRequest, SubscribePaneOutputRequest, SubscribePaneOutputResponse,
+    TerminalSize, UnsubscribePaneOutputRequest, UnsubscribePaneOutputResponse,
+    WebShareConfigRequest, WebShareListener, WebShareRequest, WebShareResponse, WindowTarget,
+    RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION, V1_FRAME_LEDGER,
 };
 
 fn fixture_root() -> PathBuf {
@@ -44,7 +46,7 @@ fn fixture_root() -> PathBuf {
         .join("..")
         .join("tests")
         .join("wire-fixtures")
-        .join("v1")
+        .join("ledger-v1-current-wire")
 }
 
 fn read_fixture(name: &str) -> Vec<u8> {
@@ -183,7 +185,7 @@ fn fixture_count_is_seven() {
     assert_eq!(
         fixtures().len(),
         7,
-        "Milestone 3 mandates seven v1 fixtures"
+        "Milestone 3 mandates seven ledger fixtures"
     );
 }
 
@@ -224,7 +226,7 @@ fn fixture_bytes_match_canonical_encoding() {
         assert_eq!(
             stored, encoded,
             "fixture {} drifted from canonical encoding; \
-             regenerate via `cargo test -p rmux-proto --test wire_v1 \
+             regenerate via `cargo test -p rmux-proto --test wire_ledger_v1 \
              -- --ignored regenerate_v1_fixtures`",
             fixture.name
         );
@@ -232,7 +234,7 @@ fn fixture_bytes_match_canonical_encoding() {
 }
 
 #[test]
-fn fixture_envelope_uses_v1_baseline() {
+fn fixture_envelope_uses_current_wire_version() {
     for fixture in fixtures() {
         let bytes = read_fixture(fixture.name);
         assert_eq!(
@@ -241,11 +243,11 @@ fn fixture_envelope_uses_v1_baseline() {
             "fixture {} missing magic byte",
             fixture.name
         );
-        // Pin the canonical single-byte varint encoding for v1: a multi-byte
-        // varint such as `[0x81, 0x00]` would also decode to 1 but would drift
-        // the envelope layout silently. Every fixture must use exactly one
-        // byte for the wire-version varint while v1 is the only supported
-        // version.
+        // Pin the canonical single-byte varint encoding for the current wire
+        // version: a multi-byte varint such as `[0x82, 0x00]` would also
+        // decode to 2 but would drift the envelope layout silently. Every
+        // fixture must use exactly one byte for the wire-version varint while
+        // this build supports a single version.
         assert_eq!(
             bytes.get(1).copied(),
             Some(RMUX_WIRE_VERSION as u8),
@@ -566,6 +568,7 @@ fn cross_section_requests() -> Vec<Request> {
             print: true,
             message: Some("#{client_name}".to_owned()),
             target_client: Some("=".to_owned()),
+            empty_target_context: false,
         }),
         Request::SendKeysExt2(SendKeysExt2Request {
             target: Some(pane.clone()),
@@ -580,6 +583,21 @@ fn cross_section_requests() -> Vec<Request> {
             repeat_count: None,
             target_client: Some("=".to_owned()),
         }),
+        Request::AttachSessionExt3(AttachSessionExt3Request::from_ext2(
+            AttachSessionExt2Request {
+                target: Some(alpha.clone()),
+                target_spec: Some("alpha:0.0".to_owned()),
+                detach_other_clients: false,
+                kill_other_clients: false,
+                read_only: false,
+                skip_environment_update: false,
+                flags: None,
+                working_directory: None,
+                client_terminal: ClientTerminalContext::default(),
+                client_size: Some(TerminalSize { cols: 80, rows: 24 }),
+            },
+            vec![rmux_proto::CAPABILITY_ATTACH_RENDER.to_owned()],
+        )),
     ]
 }
 
@@ -783,8 +801,8 @@ fn ledger_active_size_matches_request_and_response_variant_count() {
         .iter()
         .filter(|entry| matches!(entry.status, FrameStatus::Active))
         .count();
-    // Active entries = 117 Request variants + 94 Response variants.
-    assert_eq!(active_count, 117 + 94, "active ledger size mismatch");
+    // Active entries = 118 Request variants + 94 Response variants.
+    assert_eq!(active_count, 118 + 94, "active ledger size mismatch");
 }
 
 #[test]
@@ -856,8 +874,8 @@ fn frame_decoder_rejects_unsupported_wire_version() {
         err,
         RmuxError::UnsupportedWireVersion {
             got: 7,
-            minimum: 1,
-            maximum: 1,
+            minimum: RMUX_WIRE_VERSION,
+            maximum: RMUX_WIRE_VERSION,
         }
     ));
 }
@@ -1245,9 +1263,9 @@ fn every_ledger_some_fixture_has_corresponding_file_on_disk() {
 #[test]
 fn every_v1_fixture_file_on_disk_has_a_ledger_entry() {
     // Edge case: the inverse of the previous test. If a contributor adds a
-    // new `.bin` file under `tests/wire-fixtures/v1/` without registering a
-    // ledger entry, fail loudly so the wire ledger remains the single source
-    // of truth.
+    // new `.bin` file under `tests/wire-fixtures/ledger-v1-current-wire/`
+    // without registering a ledger entry, fail loudly so the wire ledger
+    // remains the single source of truth.
     let root = fixture_root();
     let entries = std::fs::read_dir(&root)
         .unwrap_or_else(|err| panic!("read fixture root {}: {err}", root.display()));
@@ -1448,9 +1466,9 @@ fn frame_decoder_rejects_payload_exactly_one_byte_over_max() {
     }
 }
 
-/// Regenerates the seven checked-in v1 fixtures.
+/// Regenerates the seven checked-in ledger fixtures.
 ///
-/// Run via `cargo test -p rmux-proto --test wire_v1 --
+/// Run via `cargo test -p rmux-proto --test wire_ledger_v1 --
 /// --ignored regenerate_v1_fixtures`. The result must be reviewed and
 /// committed; downstream readers consume the bytes through `decode_frame`
 /// and `FrameDecoder`.

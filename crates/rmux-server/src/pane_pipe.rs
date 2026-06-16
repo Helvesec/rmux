@@ -1,13 +1,21 @@
 use std::collections::HashMap;
-use std::io;
+use std::io::{Read, Write};
+use std::process::Child;
 use std::process::Stdio;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use rmux_core::events::OutputCursorItem;
 use rmux_core::PaneId;
 use rmux_proto::{RmuxError, SessionName};
 use rmux_pty::PtyMaster;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
+
+const PIPE_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 use crate::pane_io::{PaneOutputReceiver, PaneOutputSender};
 use crate::terminal::TerminalProfile;
@@ -203,6 +211,7 @@ impl PanePipeStore {
 
 pub(crate) struct ActivePanePipe {
     stop_tx: watch::Sender<bool>,
+    stop_flag: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for ActivePanePipe {
@@ -220,10 +229,9 @@ impl ActivePanePipe {
         read_from_pipe: bool,
         write_to_pipe: bool,
     ) -> Result<Self, RmuxError> {
-        let mut child = profile.shell_command(command);
+        let mut child = profile.shell_std_command(command);
         child.current_dir(profile.cwd());
         child.env_clear();
-        child.kill_on_drop(true);
         child.stdin(if write_to_pipe {
             Stdio::piped()
         } else {
@@ -250,52 +258,81 @@ impl ActivePanePipe {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let (stop_tx, stop_rx) = watch::channel(false);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let pipe_stop_flag = stop_flag.clone();
         let stderr_master = stderr.as_ref().and_then(|_| pane_master.try_clone().ok());
+        let pane_output_rx = stdin.as_ref().map(|_| pane_output.subscribe());
 
         tokio::spawn(async move {
-            let pane_output_task = stdin.map(|stdin| {
-                tokio::spawn(forward_pane_output_to_pipe(
+            let mut async_tasks = Vec::new();
+            let mut blocking_tasks = Vec::new();
+            if let Some(stdin) = stdin {
+                let (pipe_tx, pipe_rx) = mpsc::channel(64);
+                spawn_pipe_thread(
+                    &mut blocking_tasks,
+                    "rmux-pipe-pane-stdin",
+                    stop_flag.clone(),
+                    move |stop_flag| forward_pane_bytes_to_pipe(pipe_rx, stdin, stop_flag),
+                );
+                async_tasks.push(tokio::spawn(forward_pane_output_to_pipe(
                     stop_rx.clone(),
-                    pane_output.subscribe(),
-                    stdin,
-                ))
-            });
-            let pipe_stdout_task = stdout.map(|stdout| {
-                tokio::spawn(forward_pipe_output_to_pane(
-                    stop_rx.clone(),
-                    stdout,
-                    pane_master,
-                ))
-            });
-            let pipe_stderr_task = stderr.zip(stderr_master).map(|(stderr, pane_master)| {
-                tokio::spawn(forward_pipe_output_to_pane(
-                    stop_rx.clone(),
-                    stderr,
-                    pane_master,
-                ))
-            });
+                    stop_flag.clone(),
+                    pane_output_rx.expect("stdin pipe must have a pane output subscriber"),
+                    pipe_tx,
+                )));
+            }
+            if let Some(stdout) = stdout {
+                spawn_pipe_thread(
+                    &mut blocking_tasks,
+                    "rmux-pipe-pane-stdout",
+                    stop_flag.clone(),
+                    move |stop_flag| forward_pipe_output_to_pane(stdout, pane_master, stop_flag),
+                );
+            }
+            if let Some((stderr, pane_master)) = stderr.zip(stderr_master) {
+                spawn_pipe_thread(
+                    &mut blocking_tasks,
+                    "rmux-pipe-pane-stderr",
+                    stop_flag.clone(),
+                    move |stop_flag| forward_pipe_output_to_pane(stderr, pane_master, stop_flag),
+                );
+            }
+
+            let child_stop = stop_flag.clone();
+            let mut child_wait =
+                tokio::task::spawn_blocking(move || wait_for_pipe_child(child, child_stop));
             let mut stop_wait = stop_rx.clone();
             tokio::select! {
                 _ = wait_for_pipe_stop(&mut stop_wait) => {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
+                    stop_flag.store(true, Ordering::SeqCst);
+                    let _ = child_wait.await;
                 }
-                _ = child.wait() => {}
+                _ = &mut child_wait => {
+                    // The child exited normally. Keep output forwarders alive
+                    // until stdout/stderr reach EOF so short pipe-pane
+                    // commands cannot lose their last bytes under load.
+                }
             }
-
-            for task in [pane_output_task, pipe_stdout_task, pipe_stderr_task]
-                .into_iter()
-                .flatten()
-            {
+            for task in async_tasks {
                 task.abort();
                 let _ = task.await;
             }
+            let _ = tokio::task::spawn_blocking(move || {
+                for task in blocking_tasks {
+                    let _ = task.join();
+                }
+            })
+            .await;
         });
 
-        Ok(Self { stop_tx })
+        Ok(Self {
+            stop_tx,
+            stop_flag: pipe_stop_flag,
+        })
     }
 
     pub(crate) fn stop(self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
         let _ = self.stop_tx.send(true);
     }
 }
@@ -310,24 +347,28 @@ async fn wait_for_pipe_stop(stop_rx: &mut watch::Receiver<bool>) {
 
 async fn forward_pane_output_to_pipe(
     mut stop_rx: watch::Receiver<bool>,
+    stop_flag: Arc<AtomicBool>,
     mut pane_output: PaneOutputReceiver,
-    mut stdin: tokio::process::ChildStdin,
+    pipe_tx: mpsc::Sender<Vec<u8>>,
 ) {
     loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            break;
+        }
         tokio::select! {
             biased;
             _ = wait_for_pipe_stop(&mut stop_rx) => break,
             next = pane_output.recv() => {
                 match next {
                     OutputCursorItem::Event(event) => {
-                        if *stop_rx.borrow() {
+                        if stop_flag.load(Ordering::Relaxed) || *stop_rx.borrow() {
                             break;
                         }
                         let bytes = event.into_bytes();
                         if bytes.is_empty() {
                             break;
                         }
-                        if stdin.write_all(&bytes).await.is_err() {
+                        if pipe_tx.send(bytes).await.is_err() {
                             break;
                         }
                     }
@@ -336,50 +377,70 @@ async fn forward_pane_output_to_pipe(
             }
         }
     }
-    let _ = stdin.shutdown().await;
 }
 
-async fn forward_pipe_output_to_pane<R>(
-    mut stop_rx: watch::Receiver<bool>,
-    mut reader: R,
-    pane_master: PtyMaster,
-) where
-    R: AsyncRead + Unpin,
+fn forward_pane_bytes_to_pipe(
+    mut pipe_rx: mpsc::Receiver<Vec<u8>>,
+    mut stdin: std::process::ChildStdin,
+    stop_flag: Arc<AtomicBool>,
+) {
+    while !stop_flag.load(Ordering::Relaxed) {
+        let Some(bytes) = pipe_rx.blocking_recv() else {
+            break;
+        };
+        if bytes.is_empty() || stdin.write_all(&bytes).is_err() {
+            break;
+        }
+    }
+    let _ = stdin.flush();
+}
+
+fn forward_pipe_output_to_pane<R>(mut reader: R, pane_master: PtyMaster, stop_flag: Arc<AtomicBool>)
+where
+    R: Read,
 {
     let mut buffer = [0_u8; 8192];
-    loop {
-        tokio::select! {
-            biased;
-            _ = wait_for_pipe_stop(&mut stop_rx) => break,
-            read = reader.read(&mut buffer) => {
-                match read {
-                    Ok(0) | Err(_) => break,
-                    Ok(size) => {
-                        if *stop_rx.borrow() {
-                            break;
-                        }
-                        if write_pipe_output_to_pane(&pane_master, buffer[..size].to_vec())
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
+    while !stop_flag.load(Ordering::Relaxed) {
+        match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(size) => {
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                if pane_master.write_all(&buffer[..size]).is_err() {
+                    break;
                 }
             }
         }
     }
 }
 
-#[cfg(windows)]
-async fn write_pipe_output_to_pane(pane_master: &PtyMaster, bytes: Vec<u8>) -> io::Result<()> {
-    let pane_master = pane_master.try_clone().map_err(io::Error::other)?;
-    tokio::task::spawn_blocking(move || pane_master.write_all(&bytes))
-        .await
-        .map_err(|error| io::Error::other(format!("pipe-pane write task failed: {error}")))?
+fn wait_for_pipe_child(mut child: Child, stop_flag: Arc<AtomicBool>) {
+    loop {
+        if stop_flag.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => thread::sleep(PIPE_CHILD_POLL_INTERVAL),
+        }
+    }
 }
 
-#[cfg(not(windows))]
-async fn write_pipe_output_to_pane(pane_master: &PtyMaster, bytes: Vec<u8>) -> io::Result<()> {
-    pane_master.write_all(&bytes)
+fn spawn_pipe_thread<F>(
+    tasks: &mut Vec<JoinHandle<()>>,
+    name: &'static str,
+    stop_flag: Arc<AtomicBool>,
+    task: F,
+) where
+    F: FnOnce(Arc<AtomicBool>) + Send + 'static,
+{
+    if let Ok(handle) = thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || task(stop_flag))
+    {
+        tasks.push(handle);
+    }
 }

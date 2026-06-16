@@ -33,6 +33,22 @@ fn screen_with(bytes: &[u8], size: TerminalSize) -> Screen {
     screen
 }
 
+fn render_until_contains(session: &Session, options: &OptionStore, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let frame = String::from_utf8(render(session, options)).expect("frame is utf-8");
+        assert!(!frame.contains("#("), "{frame}");
+        if frame.contains(needle) {
+            return frame;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "render never contained {needle:?}; last frame was {frame:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 fn copy_mode_summary_with_time(top_line_time: i64) -> CopyModeSummary {
     CopyModeSummary {
         view_mode: false,
@@ -302,6 +318,46 @@ fn pane_render_leaves_default_cells_at_terminal_default_without_user_style() {
 }
 
 #[test]
+fn pane_render_uses_line_clear_for_unstyled_full_width_panes() {
+    let size = TerminalSize { cols: 12, rows: 3 };
+    let session = Session::new(session_name("alpha"), size);
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let screen = screen_with(b"short", size);
+    let options = OptionStore::new();
+
+    let frame = String::from_utf8(super::render_pane_screen(&session, &options, pane, &screen))
+        .expect("pane frame is utf-8");
+
+    assert!(
+        frame.contains("\u{1b}[1;1Hshort\u{1b}[0m\u{1b}[K"),
+        "{frame:?}"
+    );
+    assert!(frame.contains("\u{1b}[2;1H\u{1b}[0m\u{1b}[K"), "{frame:?}");
+    assert!(
+        !frame.contains("short       "),
+        "full-width unstyled panes should clear trailing cells instead of padding: {frame:?}"
+    );
+}
+
+#[test]
+fn pane_render_keeps_padding_for_split_panes_to_avoid_clearing_neighbors() {
+    let size = TerminalSize { cols: 20, rows: 4 };
+    let mut session = Session::new(session_name("alpha"), size);
+    session.split_active_pane().expect("split succeeds");
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let screen = screen_with(b"left", size);
+    let options = OptionStore::new();
+
+    let frame = String::from_utf8(super::render_pane_screen(&session, &options, pane, &screen))
+        .expect("pane frame is utf-8");
+
+    assert!(
+        !frame.contains("\u{1b}[K"),
+        "split-pane repaint must not clear to terminal EOL: {frame:?}"
+    );
+}
+
+#[test]
 fn pane_render_applies_window_style_to_default_cells() {
     let size = TerminalSize { cols: 6, rows: 2 };
     let session = Session::new(session_name("alpha"), size);
@@ -323,6 +379,10 @@ fn pane_render_applies_window_style_to_default_cells() {
 
     assert!(frame.contains("\u{1b}[44mB"), "{frame:?}");
     assert!(frame.contains("\u{1b}[40mD"), "{frame:?}");
+    assert!(
+        frame.contains("\u{1b}[40mD    "),
+        "styled default cells must still fill the pane background: {frame:?}"
+    );
 }
 
 #[test]
@@ -669,6 +729,78 @@ fn status_format_override_replaces_default_status_line() {
 }
 
 #[test]
+fn status_left_expands_shell_job() {
+    let session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 3 });
+    let mut options = OptionStore::new();
+    let marker = format!("statusjob{}", std::process::id());
+    let command = format!("#(echo {marker})");
+    for (option, value) in [
+        (OptionName::StatusLeft, command.as_str()),
+        (OptionName::StatusLeftLength, "32"),
+        (OptionName::StatusRight, ""),
+        (OptionName::WindowStatusFormat, ""),
+        (OptionName::WindowStatusCurrentFormat, ""),
+    ] {
+        options
+            .set(
+                ScopeSelector::Global,
+                option,
+                value.to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("status option set succeeds");
+    }
+
+    let frame = render_until_contains(&session, &options, &marker);
+    assert!(frame.contains(&marker), "{frame}");
+}
+
+#[test]
+fn status_format_expands_shell_job() {
+    let session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 3 });
+    let mut options = OptionStore::new();
+    let marker = format!("statusformatjob{}", std::process::id());
+    options
+        .set_by_name(
+            rmux_proto::types::OptionScopeSelector::Session(session.name().clone()),
+            "status-format[0]",
+            Some(format!("#(echo {marker})")),
+            SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect("status-format option set succeeds");
+
+    let frame = render_until_contains(&session, &options, &marker);
+    assert!(frame.contains(&marker), "{frame}");
+}
+
+#[test]
+fn status_format_expands_shell_job_introduced_by_status_left() {
+    let session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 3 });
+    let mut options = OptionStore::new();
+    let marker = format!("statusleftjob{}", std::process::id());
+    let status_left = format!("X#(echo {marker})Y");
+    for (option, value) in [
+        (OptionName::StatusFormat, "#{T:status-left}"),
+        (OptionName::StatusLeft, status_left.as_str()),
+    ] {
+        options
+            .set(
+                ScopeSelector::Global,
+                option,
+                value.to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("status option set succeeds");
+    }
+
+    let frame = render_until_contains(&session, &options, &marker);
+    assert!(frame.contains(&format!("X{marker}Y")), "{frame}");
+}
+
+#[test]
 fn status_fill_applies_background_when_text_background_is_default() {
     let session = Session::new(session_name("alpha"), TerminalSize { cols: 8, rows: 2 });
     let mut options = OptionStore::new();
@@ -699,7 +831,7 @@ fn status_only_render_starts_from_a_reset_sgr_state() {
     let session = Session::new(session_name("alpha"), TerminalSize { cols: 8, rows: 2 });
 
     let frame = String::from_utf8(render(&session, &OptionStore::new())).expect("frame is utf-8");
-    assert!(frame.starts_with("\u{1b}[s\u{1b}[0m"));
+    assert!(frame.starts_with("\u{1b}7\u{1b}[0m"));
 }
 
 #[test]

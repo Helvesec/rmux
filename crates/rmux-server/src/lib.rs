@@ -54,6 +54,9 @@ mod key_table;
 mod keys;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
+mod legacy_command;
+#[cfg(any(unix, windows))]
+#[cfg_attr(windows, allow(dead_code))]
 mod listener;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
@@ -91,6 +94,9 @@ mod pane_terminals;
 mod pane_transcript;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
+mod pane_visible_geometry;
+#[cfg(any(unix, windows))]
+#[cfg_attr(windows, allow(dead_code))]
 mod renderer;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
@@ -109,6 +115,8 @@ mod terminal;
 mod test_env;
 #[cfg(test)]
 mod test_shell;
+#[cfg(any(unix, windows))]
+mod tmux_shim;
 #[cfg(unix)]
 mod unix_socket;
 #[cfg(any(unix, windows))]

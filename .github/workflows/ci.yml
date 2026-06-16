@@ -162,7 +162,7 @@ jobs:
           {
             echo "### Browser WASM crypto blob (production)"
             echo ""
-            echo "rustc 1.94.1 · wasm-bindgen 0.2.118 · wasm-opt off"
+            echo "rustc 1.94.1 · wasm-bindgen 0.2.123 · wasm-opt off"
             echo ""
             echo '```'
             ( cd "$RUNNER_TEMP/wasm-pkg" && sha256sum rmux_web_crypto_wasm_bg.wasm rmux_web_crypto_wasm.js )
@@ -357,12 +357,16 @@ jobs:
         if: runner.os != 'Windows'
         run: cargo test --locked --no-fail-fast -p rmux-types -p rmux-os -p rmux-proto -p rmux-ipc -p rmux-core -p rmux-client
 
+      - name: cargo test macOS direct /tmp socket path
+        if: runner.os == 'macOS'
+        run: cargo test --locked -p rmux --test cli_surface socket_path_flag_can_start_directly_under_tmp -- --exact --test-threads=1
+
       - name: cargo test workspace on Windows
         if: runner.os == 'Windows'
         run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
 
       - name: rmux binary smoke
-        run: cargo run --package rmux --locked -- -V
+        run: cargo run --package rmux --bin rmux --locked -- -V
 
   windows-cross:
     name: Cross-target Windows build check

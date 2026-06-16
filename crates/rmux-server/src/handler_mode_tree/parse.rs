@@ -31,8 +31,9 @@ pub(super) fn parse_mode_tree_queue_command(
     let mut reversed = false;
     let mut tree_depth = TreeDepth::Pane;
     let mut show_all_group_members = false;
-    let mut auto_accept = false;
+    let auto_accept = false;
     let mut zoom = false;
+    let mut target = None;
 
     while let Some(token) = args.front().and_then(CommandArgument::as_string) {
         if token == "--" {
@@ -82,10 +83,20 @@ pub(super) fn parse_mode_tree_queue_command(
                 'r' => reversed = true,
                 's' => tree_depth = TreeDepth::Session,
                 'w' => tree_depth = TreeDepth::Window,
-                'y' => auto_accept = true,
+                'y' => {
+                    return Err(RmuxError::Server(format!(
+                        "unsupported flag '-y' for {}",
+                        command.name()
+                    )));
+                }
                 'Z' => zoom = true,
                 't' => {
-                    let _ = inline_flag_value(&chars, &mut index, &mut args, "-t target")?;
+                    target = Some(inline_flag_value(
+                        &chars,
+                        &mut index,
+                        &mut args,
+                        "-t target",
+                    )?);
                     break;
                 }
                 other => {
@@ -115,6 +126,7 @@ pub(super) fn parse_mode_tree_queue_command(
 
     Ok(Some(ParsedModeTreeCommand {
         kind,
+        target,
         preview_mode: preview_state,
         row_format,
         filter_format,
@@ -140,6 +152,7 @@ fn parse_find_window_as_tree(command: ParsedCommand) -> Result<ParsedModeTreeCom
     let mut case_insensitive = false;
     let mut regex = false;
     let mut zoom = false;
+    let mut target = None;
 
     while let Some(token) = args.front().and_then(CommandArgument::as_string) {
         if token == "--" {
@@ -151,7 +164,11 @@ fn parse_find_window_as_tree(command: ParsedCommand) -> Result<ParsedModeTreeCom
         }
 
         let flag_token = pop_string_argument(&mut args, "find-window flag")?;
-        for ch in flag_token.chars().skip(1) {
+        let flag_iter = flag_token
+            .strip_prefix('-')
+            .unwrap_or_default()
+            .char_indices();
+        for (offset, ch) in flag_iter {
             match ch {
                 'C' => search_content = true,
                 'i' => case_insensitive = true,
@@ -160,8 +177,13 @@ fn parse_find_window_as_tree(command: ParsedCommand) -> Result<ParsedModeTreeCom
                 'T' => search_title = true,
                 'Z' => zoom = true,
                 't' => {
-                    // Consume target value but ignore (tmux does the same in tree mode).
-                    let _ = pop_string_argument(&mut args, "-t target")?;
+                    let attached_start = 1 + offset + ch.len_utf8();
+                    target = Some(if attached_start < flag_token.len() {
+                        flag_token[attached_start..].to_owned()
+                    } else {
+                        pop_string_argument(&mut args, "-t target")?
+                    });
+                    break;
                 }
                 other => {
                     return Err(RmuxError::Server(format!(
@@ -220,6 +242,7 @@ fn parse_find_window_as_tree(command: ParsedCommand) -> Result<ParsedModeTreeCom
 
     Ok(ParsedModeTreeCommand {
         kind: ModeTreeKind::Tree,
+        target,
         preview_mode: PreviewMode::Normal,
         row_format: None,
         filter_format: Some(filter),

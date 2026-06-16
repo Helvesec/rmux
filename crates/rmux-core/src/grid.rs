@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 
 use crate::hyperlinks::Hyperlinks;
 use crate::input::{Colour, COLOUR_DEFAULT};
+use crate::style::Style;
 
 #[path = "grid/cell.rs"]
 mod cell;
@@ -15,6 +16,8 @@ mod render;
 
 pub(crate) use cell::{GridCell, GridCellFlags, GridLine, GridLineFlags};
 use render::{append_cell_text, append_grid_string_code, append_hyperlink};
+
+const HISTORY_STAMP_REFRESH_LINES: u16 = 256;
 
 /// Captured grid content rendered as logical lines.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -35,6 +38,8 @@ pub struct GridRenderOptions {
     pub escape_sequences: bool,
     /// Whether trailing empty cells should be included.
     pub include_empty_cells: bool,
+    /// Whether included empty cells should stop at tmux's allocation bucket.
+    pub use_tmux_cell_capacity: bool,
     /// Whether trailing spaces should be trimmed from the rendered line.
     pub trim_spaces: bool,
 }
@@ -46,6 +51,7 @@ impl Default for GridRenderOptions {
             with_sequences: false,
             escape_sequences: false,
             include_empty_cells: true,
+            use_tmux_cell_capacity: false,
             trim_spaces: true,
         }
     }
@@ -65,6 +71,36 @@ impl Default for GridStringState {
     }
 }
 
+impl GridStringState {
+    pub(crate) fn reset_to_default_line_style(
+        &mut self,
+        options: GridRenderOptions,
+        hyperlinks: Option<&Hyperlinks>,
+        output: &mut Vec<u8>,
+    ) {
+        if !options.with_sequences {
+            return;
+        }
+
+        let default_cell = GridCell::blank_with_bg(COLOUR_DEFAULT);
+        let mut rendered = String::new();
+        let mut has_link = false;
+        append_grid_string_code(
+            &self.last_cell,
+            &default_cell,
+            &mut rendered,
+            options.escape_sequences,
+            hyperlinks,
+            &mut has_link,
+        );
+        if has_link {
+            append_hyperlink(&mut rendered, "", "", options.escape_sequences);
+        }
+        output.extend_from_slice(rendered.as_bytes());
+        self.last_cell = default_cell;
+    }
+}
+
 /// Absolute grid storage split into history and visible rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Grid {
@@ -73,8 +109,10 @@ pub(crate) struct Grid {
     hlimit: usize,
     hscrolled: usize,
     history_enabled: bool,
+    history_stamp: i64,
+    history_stamp_remaining: u16,
     history: VecDeque<GridLine>,
-    visible: Vec<GridLine>,
+    visible: VecDeque<GridLine>,
 }
 
 impl Grid {
@@ -89,6 +127,8 @@ impl Grid {
             hlimit,
             hscrolled: 0,
             history_enabled: true,
+            history_stamp: 0,
+            history_stamp_remaining: 0,
             history: VecDeque::new(),
             visible: (0..sy).map(|_| GridLine::new(sx)).collect(),
         }
@@ -193,7 +233,41 @@ impl Grid {
         }
 
         let _ = self.visible.remove(visible_index);
-        self.visible.push(GridLine::new(self.sx));
+        self.visible.push_back(GridLine::new(self.sx));
+        true
+    }
+
+    /// Drops all lines after the addressed absolute row and recomposes the viewport.
+    pub(crate) fn truncate_after_absolute_line(&mut self, absolute_y: usize) -> bool {
+        let total = self.history.len() + self.visible.len();
+        if absolute_y >= total {
+            return false;
+        }
+
+        let keep = absolute_y.saturating_add(1);
+        let mut lines = self
+            .history
+            .iter()
+            .chain(self.visible.iter())
+            .take(keep)
+            .cloned()
+            .collect::<Vec<_>>();
+        let visible_rows = self.sy as usize;
+        while lines.len() < visible_rows {
+            lines.push(GridLine::new(self.sx));
+        }
+
+        let visible_start = lines.len().saturating_sub(visible_rows);
+        let mut visible = lines.split_off(visible_start);
+        for line in &mut visible {
+            line.resize_width_preserving_wrap(self.sx, COLOUR_DEFAULT);
+        }
+        self.history = compacted_history(lines);
+        while self.history.len() > self.hlimit {
+            let _ = self.history.pop_front();
+        }
+        self.visible = visible.into();
+        self.hscrolled = self.history.len();
         true
     }
 
@@ -217,10 +291,24 @@ impl Grid {
         }
     }
 
+    /// Moves used visible rows to scrollback before clearing the viewport.
+    pub fn clear_visible_to_history(&mut self, bg: Colour) {
+        if self.history_enabled {
+            let last_used = self.visible.iter().rposition(|line| line.used_end() > 0);
+            if let Some(last_used) = last_used {
+                for index in 0..=last_used {
+                    let line = self.visible[index].clone();
+                    self.push_history(line);
+                }
+            }
+        }
+        self.clear_visible(bg);
+    }
+
     /// Replaces the visible rows with a saved copy.
     pub fn replace_visible(&mut self, lines: Vec<GridLine>) {
         self.sy = lines.len() as u32;
-        self.visible = lines;
+        self.visible = lines.into();
         for line in &mut self.visible {
             line.resize_width_preserving_wrap(self.sx, COLOUR_DEFAULT);
         }
@@ -263,7 +351,41 @@ impl Grid {
         hyperlinks: Option<&Hyperlinks>,
     ) -> Option<String> {
         self.absolute_line(absolute_y)
-            .map(|line| line.render_with_options(options, state, hyperlinks))
+            .map(|line| line.render_with_options(self.sx as usize, options, state, hyperlinks))
+    }
+
+    pub fn append_rendered_absolute_line(
+        &self,
+        absolute_y: usize,
+        options: GridRenderOptions,
+        state: &mut GridStringState,
+        hyperlinks: Option<&Hyperlinks>,
+        output: &mut Vec<u8>,
+    ) -> Option<()> {
+        let line = self.absolute_line(absolute_y)?;
+        if line.render_bytes_with_options(self.sx as usize, options, output) {
+            return Some(());
+        }
+        let rendered = line.render_with_options(self.sx as usize, options, state, hyperlinks);
+        output.extend_from_slice(rendered.as_bytes());
+        Some(())
+    }
+
+    /// Renders one visible line after applying a pane default-style overlay to
+    /// default cells only. This is used by live renderers to avoid cloning the
+    /// full screen and scrollback when only the viewport is needed.
+    #[must_use]
+    pub fn render_visible_line_with_default_style(
+        &self,
+        row: usize,
+        options: GridRenderOptions,
+        state: &mut GridStringState,
+        hyperlinks: Option<&Hyperlinks>,
+        style: &Style,
+    ) -> Option<String> {
+        self.visible_line(u32::try_from(row).ok()?).map(|line| {
+            line.render_with_default_style(self.sx as usize, options, state, hyperlinks, style)
+        })
     }
 
     /// Returns the retained history size in bytes including newlines.
@@ -278,7 +400,7 @@ impl Grid {
     /// Captures only the visible rows.
     #[must_use]
     pub fn visible_lines(&self) -> Vec<GridLine> {
-        self.visible.clone()
+        self.visible.iter().cloned().collect()
     }
 
     pub(crate) fn scroll_region_up(
@@ -292,12 +414,37 @@ impl Grid {
             return;
         }
 
-        let removed = self.visible.remove(upper as usize);
-        if to_history && self.history_enabled {
+        let upper = upper as usize;
+        let lower = lower as usize;
+        if upper == 0 && lower + 1 == self.visible.len() {
+            let Some(mut removed) = self.visible.pop_front() else {
+                return;
+            };
+            if to_history && self.history_enabled {
+                self.push_history(removed);
+                self.visible.push_back(GridLine::blank_with_bg(self.sx, bg));
+            } else {
+                removed.clear(bg);
+                self.visible.push_back(removed);
+            }
+            return;
+        }
+
+        let removed_for_history = if to_history && self.history_enabled {
+            let blank = GridLine::blank_with_bg(self.sx, bg);
+            let visible = self.visible.make_contiguous();
+            let removed = std::mem::replace(&mut visible[upper], blank);
+            Some(removed)
+        } else {
+            None
+        };
+        if let Some(removed) = removed_for_history {
             self.push_history(removed);
         }
-        self.visible
-            .insert(lower as usize, GridLine::blank_with_bg(self.sx, bg));
+        let visible = self.visible.make_contiguous();
+        visible[upper..=lower].rotate_left(1);
+        let removed = &mut visible[lower];
+        removed.clear(bg);
     }
 
     pub(crate) fn scroll_region_down(&mut self, upper: u32, lower: u32, bg: Colour) {
@@ -305,9 +452,20 @@ impl Grid {
             return;
         }
 
-        let _ = self.visible.remove(lower as usize);
-        self.visible
-            .insert(upper as usize, GridLine::blank_with_bg(self.sx, bg));
+        let upper = upper as usize;
+        let lower = lower as usize;
+        if upper == 0 && lower + 1 == self.visible.len() {
+            let Some(mut removed) = self.visible.pop_back() else {
+                return;
+            };
+            removed.clear(bg);
+            self.visible.push_front(removed);
+            return;
+        }
+
+        let visible = self.visible.make_contiguous();
+        visible[upper..=lower].rotate_right(1);
+        visible[upper].clear(bg);
     }
 
     pub(crate) fn resize_width(&mut self, sx: u32, bg: Colour) {
@@ -329,12 +487,15 @@ impl Grid {
         }
 
         let history_rows = reflowed.len().saturating_sub(visible_rows);
-        let visible = reflowed.split_off(history_rows);
-        self.history = reflowed.into();
+        let mut visible = reflowed.split_off(history_rows);
+        for line in &mut visible {
+            line.resize_width_preserving_wrap(sx, bg);
+        }
+        self.history = compacted_history(reflowed);
         while self.history.len() > self.hlimit {
             let _ = self.history.pop_front();
         }
-        self.visible = visible;
+        self.visible = visible.into();
         self.hscrolled = self.history.len();
         self.sx = sx;
     }
@@ -349,24 +510,21 @@ impl Grid {
             let available_bottom = oldy.saturating_sub(1).saturating_sub(*cursor_y);
             let remove_bottom = available_bottom.min(needed);
             for _ in 0..remove_bottom {
-                let _ = self.visible.pop();
+                let _ = self.visible.pop_back();
             }
             needed -= remove_bottom;
 
             if self.history_enabled {
                 for _ in 0..needed {
-                    let Some(line) = self.visible.first().cloned() else {
+                    let Some(line) = self.visible.pop_front() else {
                         break;
                     };
-                    let _ = self.visible.remove(0);
                     self.push_history(line);
                 }
             } else {
                 let remove_top = (*cursor_y).min(needed);
                 for _ in 0..remove_top {
-                    if !self.visible.is_empty() {
-                        let _ = self.visible.remove(0);
-                    }
+                    let _ = self.visible.pop_front();
                 }
                 *cursor_y = cursor_y.saturating_sub(remove_top);
             }
@@ -381,8 +539,9 @@ impl Grid {
                     }
                 }
                 restored.reverse();
-                for line in restored.into_iter().rev() {
-                    self.visible.insert(0, line);
+                for mut line in restored.into_iter().rev() {
+                    line.resize_width_preserving_wrap(self.sx, bg);
+                    self.visible.push_front(line);
                 }
                 *cursor_y = cursor_y.saturating_add(pull).min(sy.saturating_sub(1));
                 self.hscrolled -= pull as usize;
@@ -390,13 +549,20 @@ impl Grid {
             }
 
             for _ in 0..needed {
-                self.visible.push(GridLine::blank_with_bg(self.sx, bg));
+                self.visible.push_back(GridLine::blank_with_bg(self.sx, bg));
             }
         }
 
         self.sy = sy;
-        self.visible
-            .resize_with(self.sy as usize, || GridLine::blank_with_bg(self.sx, bg));
+        while self.visible.len() > self.sy as usize {
+            let _ = self.visible.pop_back();
+        }
+        while self.visible.len() < self.sy as usize {
+            self.visible.push_back(GridLine::blank_with_bg(self.sx, bg));
+        }
+        for line in &mut self.visible {
+            line.resize_width_preserving_wrap(self.sx, bg);
+        }
         *cursor_y = (*cursor_y).min(self.sy.saturating_sub(1));
     }
 
@@ -409,13 +575,33 @@ impl Grid {
             return;
         }
 
-        line.touch();
+        line.stamp_for_history_at(self.next_history_stamp());
+        line.compact_for_history();
         if self.history.len() == self.hlimit {
             let _ = self.history.pop_front();
         }
         self.history.push_back(line);
         self.hscrolled = (self.hscrolled + 1).min(self.history.len());
     }
+
+    fn next_history_stamp(&mut self) -> i64 {
+        if self.history_stamp_remaining == 0 {
+            self.history_stamp = cell::current_unix_timestamp();
+            self.history_stamp_remaining = HISTORY_STAMP_REFRESH_LINES;
+        }
+        self.history_stamp_remaining = self.history_stamp_remaining.saturating_sub(1);
+        self.history_stamp
+    }
+}
+
+fn compacted_history(lines: Vec<GridLine>) -> VecDeque<GridLine> {
+    lines
+        .into_iter()
+        .map(|mut line| {
+            line.compact_for_history();
+            line
+        })
+        .collect()
 }
 
 fn reflow_wrapped_lines(lines: Vec<GridLine>, width: u32, bg: Colour) -> Vec<GridLine> {
@@ -432,17 +618,26 @@ fn reflow_wrapped_lines(lines: Vec<GridLine>, width: u32, bg: Colour) -> Vec<Gri
         }
 
         let end = if wrapped {
-            line.cells.len()
+            self::line_width(&line)
         } else {
             line.used_end()
         };
-        logical_cells.extend(
-            line.cells
-                .iter()
-                .take(end)
-                .filter(|cell| !cell.is_padding())
-                .cloned(),
-        );
+        if let Some(text) = line.plain_text() {
+            logical_cells.extend(
+                text.bytes()
+                    .chain(std::iter::repeat(b' '))
+                    .take(end)
+                    .map(GridCell::from_plain_ascii),
+            );
+        } else {
+            logical_cells.extend(
+                line.cells
+                    .iter()
+                    .take(end)
+                    .filter(|cell| !cell.is_padding())
+                    .cloned(),
+            );
+        }
 
         if !wrapped {
             output.extend(reflow_logical_line(
@@ -498,11 +693,11 @@ fn reflow_logical_line(
             x = 0;
         }
 
-        if let Some(target) = current.cells.get_mut(x as usize) {
+        if let Some(target) = current.cell_mut(x) {
             *target = cell.clone();
         }
         for offset in 1..cell_width {
-            if let Some(padding_cell) = current.cells.get_mut((x + offset) as usize) {
+            if let Some(padding_cell) = current.cell_mut(x + offset) {
                 let mut padding = cell.clone();
                 padding.set_text(" ".to_owned());
                 padding.set_width(0);
@@ -518,83 +713,10 @@ fn reflow_logical_line(
     output
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::input::CellState;
-
-    #[test]
-    fn render_without_trimming_preserves_explicit_trailing_spaces_but_not_cleared_cells() {
-        let mut line = GridLine::new(6);
-        let state = CellState::default();
-        for (x, ch) in "A  ".chars().enumerate() {
-            *line.cell_mut(x as u32).expect("cell exists") =
-                GridCell::from_state(ch, 1, &state, GridCellFlags::default());
-        }
-
-        let mut render_state = GridStringState::default();
-        let rendered = line.render_with_options(
-            GridRenderOptions {
-                trim_spaces: false,
-                include_empty_cells: false,
-                ..GridRenderOptions::default()
-            },
-            &mut render_state,
-            None,
-        );
-        assert_eq!(rendered, "A  ");
-
-        let mut render_state = GridStringState::default();
-        let trimmed = line.render_with_options(
-            GridRenderOptions {
-                trim_spaces: true,
-                include_empty_cells: false,
-                ..GridRenderOptions::default()
-            },
-            &mut render_state,
-            None,
-        );
-        assert_eq!(trimmed, "A");
-    }
-
-    #[test]
-    fn capture_join_wrapped_keeps_spaces_at_wrapped_boundaries() {
-        let mut grid = Grid::new(TerminalSize { cols: 6, rows: 2 }, 0);
-        let state = CellState::default();
-        let first = grid.visible_line_mut(0).expect("line exists");
-        for (x, ch) in "user ".chars().enumerate() {
-            *first.cell_mut(x as u32).expect("cell exists") =
-                GridCell::from_state(ch, 1, &state, GridCellFlags::default());
-        }
-        first.set_wrapped(true);
-        let second = grid.visible_line_mut(1).expect("line exists");
-        for (x, ch) in "root".chars().enumerate() {
-            *second.cell_mut(x as u32).expect("cell exists") =
-                GridCell::from_state(ch, 1, &state, GridCellFlags::default());
-        }
-
-        let mut render_state = GridStringState::default();
-        let mut output = Vec::new();
-        for absolute_y in 0..2 {
-            let line = grid
-                .render_absolute_line(
-                    absolute_y,
-                    GridRenderOptions {
-                        join_wrapped: true,
-                        trim_spaces: false,
-                        include_empty_cells: false,
-                        ..GridRenderOptions::default()
-                    },
-                    &mut render_state,
-                    None,
-                )
-                .expect("line renders");
-            output.extend_from_slice(line.as_bytes());
-            if !grid.absolute_line_wrapped(absolute_y).unwrap_or(false) {
-                output.push(b'\n');
-            }
-        }
-
-        assert_eq!(String::from_utf8(output).expect("utf8"), "user root\n");
-    }
+fn line_width(line: &GridLine) -> usize {
+    line.width() as usize
 }
+
+#[cfg(test)]
+#[path = "grid/tests.rs"]
+mod tests;

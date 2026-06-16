@@ -1,4 +1,6 @@
-use rmux_proto::{ResizePaneAdjustment, SessionName, TerminalSize};
+use rmux_proto::{
+    ResizePaneAdjustment, SelectPaneDirection, SessionName, SplitDirection, TerminalSize,
+};
 
 use super::{PaneSwapOptions, Session, SessionPaneTarget};
 use crate::PaneGeometry;
@@ -60,6 +62,113 @@ fn zoom_toggle_targets_a_non_active_window_explicitly() {
             .geometry(),
         PaneGeometry::new(0, 0, 80, 24)
     );
+}
+
+#[test]
+fn select_pane_preserves_zoom_when_requested() {
+    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
+    session.split_active_pane().expect("split succeeds");
+    session
+        .resize_pane_in_window(0, 0, ResizePaneAdjustment::Zoom)
+        .expect("zoom succeeds");
+
+    session
+        .select_pane_in_window_with_zoom(0, 1, true)
+        .expect("pane select succeeds");
+
+    let window = session.window_at(0).expect("window exists");
+    assert!(window.is_zoomed());
+    assert_eq!(window.active_pane_index(), 1);
+    assert_eq!(
+        window.pane(1).expect("pane 1 exists").geometry(),
+        PaneGeometry::new(0, 0, 80, 24)
+    );
+}
+
+#[test]
+fn last_pane_preserves_zoom_when_requested() {
+    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
+    session.split_active_pane().expect("split succeeds");
+    session
+        .resize_pane_in_window(0, 1, ResizePaneAdjustment::Zoom)
+        .expect("zoom succeeds");
+
+    let selected = session
+        .last_pane_in_window_with_zoom(0, true)
+        .expect("last pane succeeds");
+
+    let window = session.window_at(0).expect("window exists");
+    assert_eq!(selected, 0);
+    assert!(window.is_zoomed());
+    assert_eq!(window.active_pane_index(), 0);
+    assert_eq!(
+        window.pane(0).expect("pane 0 exists").geometry(),
+        PaneGeometry::new(0, 0, 80, 24)
+    );
+}
+
+#[test]
+fn adjacent_select_preserves_zoom_when_requested() {
+    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
+    session
+        .split_pane_with_direction(0, SplitDirection::Vertical)
+        .expect("split succeeds");
+    session
+        .resize_pane_in_window(0, 1, ResizePaneAdjustment::Zoom)
+        .expect("zoom succeeds");
+
+    let selected = session
+        .select_adjacent_pane_in_window_with_zoom(0, 1, SelectPaneDirection::Left, true)
+        .expect("adjacent select succeeds");
+
+    let window = session.window_at(0).expect("window exists");
+    assert_eq!(selected, 0);
+    assert!(window.is_zoomed());
+    assert_eq!(window.active_pane_index(), 0);
+    assert_eq!(
+        window.pane(0).expect("pane 0 exists").geometry(),
+        PaneGeometry::new(0, 0, 80, 24)
+    );
+}
+
+#[test]
+fn adjacent_select_unzooms_when_zoomed_neighbor_exists() {
+    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
+    session
+        .split_pane_with_direction(0, SplitDirection::Vertical)
+        .expect("split succeeds");
+    session
+        .resize_pane_in_window(0, 1, ResizePaneAdjustment::Zoom)
+        .expect("zoom succeeds");
+
+    let selected = session
+        .select_adjacent_pane_in_window(0, 1, SelectPaneDirection::Left)
+        .expect("adjacent select succeeds");
+
+    let window = session.window_at(0).expect("window exists");
+    assert_eq!(selected, 0);
+    assert!(!window.is_zoomed());
+    assert_eq!(window.active_pane_index(), 0);
+}
+
+#[test]
+fn adjacent_select_keeps_zoom_when_zoomed_no_neighbor_exists() {
+    let mut session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
+    session
+        .split_pane_with_direction(0, SplitDirection::Vertical)
+        .expect("split succeeds");
+    session
+        .resize_pane_in_window(0, 1, ResizePaneAdjustment::Zoom)
+        .expect("zoom succeeds");
+
+    let selected = session
+        .select_adjacent_pane_in_window(0, 1, SelectPaneDirection::Up)
+        .expect("adjacent select succeeds");
+
+    let window = session.window_at(0).expect("window exists");
+    assert_eq!(selected, 1);
+    assert!(window.is_zoomed());
+    assert_eq!(window.active_pane_index(), 1);
 }
 
 #[test]

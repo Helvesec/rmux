@@ -333,6 +333,7 @@ mod tests {
                     wire_version: RMUX_WIRE_VERSION,
                     session_count: 0,
                     client_count: 0,
+                    config_loading: false,
                 }),
             ),
         ]);
@@ -395,6 +396,7 @@ mod tests {
                     target: None,
                     print: true,
                     message: Some("#{server_sessions}".to_owned()),
+                    empty_target_context: false,
                 }),
                 Response::DisplayMessage(DisplayMessageResponse::from_output(
                     CommandOutput::from_stdout(b"0\n".to_vec()),
@@ -434,6 +436,7 @@ mod tests {
                     wire_version,
                     session_count,
                     client_count,
+                    config_loading: false,
                 }),
             ),
         ])

@@ -175,6 +175,11 @@ pub(super) fn parse_display_menu(
             command,
         });
     }
+    if items.is_empty() {
+        return Err(RmuxError::Message(
+            "command display-menu: too few arguments (need at least 1)".to_owned(),
+        ));
+    }
 
     Ok(ParsedDisplayMenuCommand {
         target_client,
@@ -238,7 +243,17 @@ pub(super) fn parse_display_popup(
             "-c" => target_client = Some(args.pop("-c target-client")?),
             "-d" => start_directory = Some(PathBuf::from(args.pop("-d start-directory")?)),
             "-e" => environment.push(args.pop("-e name=value")?),
-            "-E" => close_on_exit = true,
+            flag if flag.starts_with("-e") && flag.len() > 2 => {
+                environment.push(flag[2..].to_owned());
+            }
+            "-E" => {
+                if args.peek() == Some("-E") {
+                    let _ = args.optional();
+                    close_on_zero_exit = true;
+                } else {
+                    close_on_exit = true;
+                }
+            }
             "-h" => height = Some(parse_popup_size_spec(&args.pop("-h height")?)?),
             "-k" => {
                 close_any_key = true;
@@ -348,4 +363,22 @@ fn rebuild_shell_command(command_parts: Vec<String>) -> String {
         .map(|token| format!("'{}'", token.replace('\'', "'\\''")))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_display_menu;
+    use rmux_proto::RmuxError;
+
+    #[test]
+    fn display_menu_requires_at_least_one_item_argument() {
+        let error = parse_display_menu(vec!["-T".to_owned(), "Menu".to_owned()])
+            .expect_err("empty display-menu should be rejected before client lookup");
+        assert_eq!(
+            error,
+            RmuxError::Message(
+                "command display-menu: too few arguments (need at least 1)".to_owned()
+            )
+        );
+    }
 }

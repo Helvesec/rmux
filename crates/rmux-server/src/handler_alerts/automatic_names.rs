@@ -4,6 +4,7 @@ use rmux_proto::{PaneTarget, SessionName, Target, WindowTarget};
 
 use super::super::{scripting_support::format_context_for_target, RequestHandler};
 use crate::format_runtime::render_automatic_window_name;
+use crate::pane_terminals::HandlerState;
 
 impl RequestHandler {
     pub(in crate::handler) async fn refresh_automatic_window_name_for_pane_target(
@@ -54,7 +55,16 @@ impl RequestHandler {
                 .ok()
                 .and_then(|runtime| render_automatic_window_name(&runtime))
         };
-        let Some(window_name) = rendered_window_name.as_deref() else {
+        let fallback_window_name = if rendered_window_name.is_none() {
+            let state = self.state.lock().await;
+            mode_marker_fallback_window_name(&state, target)
+        } else {
+            None
+        };
+        let Some(window_name) = rendered_window_name
+            .as_deref()
+            .or(fallback_window_name.as_deref())
+        else {
             return Vec::new();
         };
 
@@ -103,4 +113,37 @@ impl RequestHandler {
         };
         sessions_to_refresh
     }
+}
+
+fn mode_marker_fallback_window_name(state: &HandlerState, target: &WindowTarget) -> Option<String> {
+    let session = state.sessions.session(target.session_name())?;
+    let window = session.window_at(target.window_index())?;
+    if window.name() != Some("[tmux]")
+        || !state.tracks_auto_named_window(target.session_name(), target.window_index())
+    {
+        return None;
+    }
+
+    let pane = window.active_pane()?;
+    state
+        .pane_runtime_window_name_in_window(
+            target.session_name(),
+            target.window_index(),
+            pane.index(),
+        )
+        .ok()
+        .flatten()
+        .or_else(|| {
+            state
+                .pane_profile_in_window(target.session_name(), target.window_index(), pane.index())
+                .ok()
+                .and_then(|profile| {
+                    profile
+                        .shell()
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(str::to_owned)
+                })
+        })
+        .filter(|name| !name.is_empty() && name != "[tmux]")
 }

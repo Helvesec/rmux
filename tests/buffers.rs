@@ -3,6 +3,7 @@
 mod common;
 
 use std::error::Error;
+use std::time::{Duration, Instant};
 
 use common::{assert_success, stderr, stdout, terminate_child, CliHarness};
 
@@ -38,6 +39,23 @@ fn set_buffer_named_and_show_by_name() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn set_buffer_accepts_ignored_target() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("buf-set-target")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["set-buffer", "-t", "alpha", "target-tolerated"])?);
+
+    let show = harness.run(&["show-buffer"])?;
+    assert_eq!(show.status.code(), Some(0));
+    assert_eq!(stdout(&show), "target-tolerated");
+    assert!(stderr(&show).is_empty());
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
 fn list_buffers_shows_entries() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("buf-list")?;
     let mut daemon = harness.start_hidden_daemon()?;
@@ -50,6 +68,37 @@ fn list_buffers_shows_entries() -> Result<(), Box<dyn Error>> {
     let out = stdout(&list);
     assert!(out.contains("named:"), "should contain named buffer");
     assert!(out.contains("buffer0:"), "should contain unnamed buffer");
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn show_buffer_without_name_uses_latest_automatic_buffer() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("buf-show-top-auto")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["set-buffer", "auto"])?);
+    assert_success(&harness.run(&["set-buffer", "-b", "named", "manual"])?);
+
+    let show = harness.run(&["show-buffer"])?;
+    assert_eq!(show.status.code(), Some(0));
+    assert_eq!(stdout(&show), "auto");
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn show_buffer_without_name_rejects_named_only_store() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("buf-show-named-only")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["set-buffer", "-b", "named", "manual"])?);
+
+    let show = harness.run(&["show-buffer"])?;
+    assert_eq!(show.status.code(), Some(1));
+    assert!(stderr(&show).contains("no buffers"));
 
     terminate_child(daemon.child_mut())?;
     Ok(())
@@ -87,13 +136,34 @@ fn delete_buffer_removes_stack_head() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn delete_buffer_without_name_uses_latest_automatic_buffer() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("buf-delete-top-auto")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["set-buffer", "auto"])?);
+    assert_success(&harness.run(&["set-buffer", "-b", "named", "manual"])?);
+    assert_success(&harness.run(&["delete-buffer"])?);
+
+    let auto = harness.run(&["show-buffer", "-b", "buffer0"])?;
+    assert_eq!(auto.status.code(), Some(1));
+    assert!(stderr(&auto).contains("no buffer buffer0"));
+
+    let named = harness.run(&["show-buffer", "-b", "named"])?;
+    assert_eq!(named.status.code(), Some(0));
+    assert_eq!(stdout(&named), "manual");
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
 fn delete_buffer_nonexistent_returns_error() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("buf-del-miss")?;
     let mut daemon = harness.start_hidden_daemon()?;
 
     let output = harness.run(&["delete-buffer", "-b", "missing"])?;
     assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).contains("no buffer missing"));
+    assert_eq!(stderr(&output), "unknown buffer: missing\n");
 
     terminate_child(daemon.child_mut())?;
     Ok(())
@@ -125,6 +195,30 @@ fn paste_buffer_to_pane() -> Result<(), Box<dyn Error>> {
     let show = harness.run(&["show-buffer"])?;
     assert_eq!(show.status.code(), Some(0));
     assert_eq!(stdout(&show), "paste-me");
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn paste_buffer_without_name_uses_latest_automatic_buffer() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("buf-paste-top-auto")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["set-buffer", "auto-paste"])?);
+    assert_success(&harness.run(&["set-buffer", "-b", "named", "manual-paste"])?);
+    assert_success(&harness.run(&["paste-buffer", "-t", "alpha:0.0"])?);
+
+    let capture = wait_for_capture_contains(&harness, "alpha:0.0", "auto-paste")?;
+    assert!(
+        stdout(&capture).contains("auto-paste"),
+        "paste-buffer should use the automatic buffer by default"
+    );
+    assert!(
+        !stdout(&capture).contains("manual-paste"),
+        "named buffer must not be pasted without -b"
+    );
 
     terminate_child(daemon.child_mut())?;
     Ok(())
@@ -192,6 +286,27 @@ fn set_buffer_rename_without_buffer_name_prefers_latest_unnamed_buffer(
 }
 
 #[test]
+fn set_buffer_rename_ignores_trailing_content() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("buf-rename-ignore-trailing")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["set-buffer", "-b", "src", "original"])?);
+    assert_success(&harness.run(&["set-buffer", "-b", "src", "-n", "dst", "ignored"])?);
+
+    let renamed = harness.run(&["show-buffer", "-b", "dst"])?;
+    assert_eq!(renamed.status.code(), Some(0));
+    assert_eq!(stdout(&renamed), "original");
+    assert!(stderr(&renamed).is_empty());
+
+    let old = harness.run(&["show-buffer", "-b", "src"])?;
+    assert_eq!(old.status.code(), Some(1));
+    assert!(stderr(&old).contains("no buffer src"));
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
 fn set_buffer_rename_without_buffer_name_rejects_named_only_store() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("buf-rename-named-only")?;
     let mut daemon = harness.start_hidden_daemon()?;
@@ -244,4 +359,21 @@ fn buffer_commands_report_absent_server_on_stderr() -> Result<(), Box<dyn Error>
     }
 
     Ok(())
+}
+
+fn wait_for_capture_contains(
+    harness: &CliHarness,
+    target: &str,
+    marker: &str,
+) -> Result<std::process::Output, Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut last = harness.run(&["capture-pane", "-p", "-t", target])?;
+    while Instant::now() < deadline {
+        if last.status.code() == Some(0) && stdout(&last).contains(marker) {
+            return Ok(last);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+        last = harness.run(&["capture-pane", "-p", "-t", target])?;
+    }
+    Ok(last)
 }

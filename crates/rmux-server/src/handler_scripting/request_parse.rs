@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use rmux_core::{command_parser::ParsedCommand, SessionStore, TargetFindContext};
+use rmux_core::{command_parser::ParsedCommand, OptionStore, SessionStore, TargetFindContext};
 use rmux_proto::{Request, RmuxError};
 
 use super::super::RequestHandler;
@@ -19,7 +19,8 @@ use super::config_parse::{
     ParsedSetOptionCommand,
 };
 use super::display_parse::{
-    parse_capture_pane, parse_clear_history, parse_display_message, parse_show_messages,
+    parse_capture_pane, parse_clear_history, parse_display_message, parse_queued_display_message,
+    parse_show_messages,
 };
 use super::key_parse::{
     parse_bind_key, parse_list_keys, parse_send_keys, parse_send_prefix, parse_unbind_key,
@@ -53,12 +54,15 @@ use super::window_parse::{
     parse_resize_window, parse_respawn_window, parse_rotate_window, parse_swap_window,
     parse_unlink_window, parse_window_request,
 };
+use rmux_proto::Target;
 
 pub(super) fn parse_queue_invocation(
     command: ParsedCommand,
     caller_cwd: Option<&Path>,
     sessions: &SessionStore,
+    options: &OptionStore,
     find_context: &TargetFindContext,
+    queue_current_target: Option<&Target>,
 ) -> Result<QueueInvocation, RmuxError> {
     if command.name() == "new-window" {
         return parse_queued_new_window(command, sessions, find_context)
@@ -84,6 +88,16 @@ pub(super) fn parse_queue_invocation(
     if matches!(command.name(), "confirm-before" | "confirm") {
         return parse_queued_confirm_before(command).map(QueueInvocation::ConfirmBefore);
     }
+    if command.name() == "display-message" {
+        let arguments = command_arguments_as_strings(command.name(), command.arguments())?;
+        return parse_queued_display_message(
+            CommandTokens::new(arguments),
+            sessions,
+            find_context,
+            queue_current_target,
+        )
+        .map(QueueInvocation::Request);
+    }
     if let Some(command) = RequestHandler::parse_mode_tree_queue_command(command.clone())? {
         return Ok(QueueInvocation::ModeTree(command));
     }
@@ -101,6 +115,7 @@ pub(super) fn parse_queue_invocation(
             arguments,
             caller_cwd,
             sessions,
+            options,
             find_context,
         )
         .map(QueueInvocation::Request);
@@ -139,8 +154,15 @@ pub(super) fn parse_queue_invocation(
         parse_no_argument_request(args, "start-server")?;
         return Ok(QueueInvocation::StartServer);
     }
-    parse_request_from_parts(command_name, arguments, caller_cwd, sessions, find_context)
-        .map(QueueInvocation::Request)
+    parse_request_from_parts(
+        command_name,
+        arguments,
+        caller_cwd,
+        sessions,
+        options,
+        find_context,
+    )
+    .map(QueueInvocation::Request)
 }
 
 pub(crate) fn parse_request_from_parts(
@@ -148,6 +170,7 @@ pub(crate) fn parse_request_from_parts(
     arguments: Vec<String>,
     caller_cwd: Option<&Path>,
     sessions: &SessionStore,
+    options: &OptionStore,
     find_context: &TargetFindContext,
 ) -> Result<Request, RmuxError> {
     let args = CommandTokens::new(arguments);
@@ -165,11 +188,11 @@ pub(crate) fn parse_request_from_parts(
             true,
             default_set_option_target(sessions, find_context),
         ),
-        "set-environment" => parse_set_environment(args),
+        "set-environment" => parse_set_environment(args, sessions, find_context),
         "set-hook" => parse_set_hook(args),
-        "show-options" => parse_show_options(args, false),
-        "show-window-options" => parse_show_options(args, true),
-        "show-environment" => parse_show_environment(args),
+        "show-options" => parse_show_options(args, false, sessions, find_context),
+        "show-window-options" => parse_show_options(args, true, sessions, find_context),
+        "show-environment" => parse_show_environment(args, sessions, find_context),
         "show-hooks" => parse_show_hooks(args),
         "set-buffer" => parse_set_buffer(args),
         "show-buffer" => parse_show_buffer(args),
@@ -200,8 +223,8 @@ pub(crate) fn parse_request_from_parts(
         "next-window" => parse_session_request(args, "next-window", sessions, find_context),
         "previous-window" => parse_session_request(args, "previous-window", sessions, find_context),
         "last-window" => parse_session_request(args, "last-window", sessions, find_context),
-        "link-window" => parse_link_window(args),
-        "move-window" => parse_move_window(args, sessions, find_context),
+        "link-window" => parse_link_window(args, sessions, options, find_context),
+        "move-window" => parse_move_window(args, sessions, options, find_context),
         "swap-window" => parse_swap_window(args, sessions, find_context),
         "rotate-window" => parse_rotate_window(args, sessions, find_context),
         "resize-window" => parse_resize_window(args),
@@ -235,7 +258,7 @@ pub(crate) fn parse_request_from_parts(
         "switch-client" => parse_switch_client(args),
         "detach-client" => parse_detach_client(args),
         "suspend-client" => parse_suspend_client(args),
-        "unlink-window" => parse_unlink_window(args),
+        "unlink-window" => parse_unlink_window(args, sessions, find_context),
         other => Err(RmuxError::Server(format!(
             "unsupported command in queue: {other}"
         ))),

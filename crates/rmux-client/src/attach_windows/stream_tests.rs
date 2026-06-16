@@ -216,6 +216,55 @@ async fn input_eof_keeps_attach_stream_until_server_detach(
 }
 
 #[tokio::test]
+async fn render_frames_are_flushed_in_stream_order_before_strict_data(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut scenario = AttachScenario::new(RecordingActions::default());
+    let mut server = scenario.take_server();
+
+    write_server_message(&mut server, AttachMessage::Render(b"old".to_vec())).await?;
+    write_server_message(&mut server, AttachMessage::Render(b"new".to_vec())).await?;
+    write_server_message(&mut server, AttachMessage::Data(b"strict".to_vec())).await?;
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+
+    let output = scenario.join().await?;
+    assert_eq!(output, b"oldnewstrict");
+    Ok(())
+}
+
+#[tokio::test]
+async fn render_frames_flush_while_stream_stays_busy() -> Result<(), Box<dyn std::error::Error>> {
+    let mut scenario = AttachScenario::new(RecordingActions::default());
+    let output = scenario.output.clone();
+    let mut server = scenario.take_server();
+
+    for index in 0..8 {
+        write_server_message(
+            &mut server,
+            AttachMessage::Render(format!("render-{index}\n").into_bytes()),
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while output.bytes().is_empty() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("render frame stayed pending while stream remained busy".into());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    let final_output = scenario.join().await?;
+    let final_output = String::from_utf8_lossy(&final_output);
+    assert!(
+        final_output.contains("render-"),
+        "expected at least one flushed render frame, got {final_output:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn split_detached_banner_marks_stream_stopped_before_eof(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut scenario = AttachScenario::new(RecordingActions::default());

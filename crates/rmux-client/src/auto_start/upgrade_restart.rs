@@ -2,6 +2,8 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use rmux_proto::{Response, CAPABILITY_WEB_SHARE};
+
 use crate::{connect_or_absent, upgrade, ConnectResult, Connection};
 use tracing::debug;
 
@@ -31,7 +33,9 @@ pub(super) fn ensure_daemon_fresh_or_restart(
     };
 
     match freshness {
-        upgrade::DaemonFreshness::Current => Ok(connection),
+        upgrade::DaemonFreshness::Current => {
+            ensure_required_web_capability_or_restart(connection, socket_path, binary_path, config)
+        }
         upgrade::DaemonFreshness::StaleActive(stale) => {
             upgrade::warn_stale_active_daemon(&stale, socket_path);
             Ok(connection)
@@ -63,6 +67,69 @@ pub(super) fn ensure_daemon_fresh_or_restart(
             wait_for_connected_server(socket_path, config)
         }
     }
+}
+
+fn ensure_required_web_capability_or_restart(
+    mut connection: Connection,
+    socket_path: &Path,
+    binary_path: &Path,
+    config: &AutoStartConfig,
+) -> Result<Connection, AutoStartError> {
+    if !config.web_required || connection.supports_capability(CAPABILITY_WEB_SHARE)? {
+        return Ok(connection);
+    }
+
+    let Response::DaemonStatus(status) =
+        connection.daemon_status().map_err(AutoStartError::Client)?
+    else {
+        return Err(AutoStartError::IncompatibleDaemon {
+            socket_path: socket_path.to_path_buf(),
+            message: "running daemon did not report status for web-share upgrade".to_owned(),
+        });
+    };
+
+    if status.session_count > 0 || status.client_count > 0 {
+        return Err(AutoStartError::IncompatibleDaemon {
+            socket_path: socket_path.to_path_buf(),
+            message: "running daemon was built without web-share support and still owns sessions or clients".to_owned(),
+        });
+    }
+
+    let Response::ShutdownIfIdle(shutdown) = connection
+        .shutdown_if_idle()
+        .map_err(AutoStartError::Client)?
+    else {
+        return Err(AutoStartError::IncompatibleDaemon {
+            socket_path: socket_path.to_path_buf(),
+            message: "running daemon cannot be restarted for web-share support".to_owned(),
+        });
+    };
+
+    if !shutdown.shutdown {
+        return Err(AutoStartError::IncompatibleDaemon {
+            socket_path: socket_path.to_path_buf(),
+            message: "running daemon became active before web-share upgrade".to_owned(),
+        });
+    }
+
+    drop(connection);
+    if wait_for_server_absent(socket_path)?.is_some() {
+        return Err(AutoStartError::IncompatibleDaemon {
+            socket_path: socket_path.to_path_buf(),
+            message: format!(
+                "running daemon was built without web-share support and is still active with {} sessions and {} clients",
+                status.session_count, status.client_count
+            ),
+        });
+    }
+
+    spawn_hidden_daemon_for(binary_path, socket_path, config).map_err(|error| {
+        AutoStartError::Launch {
+            path: binary_path.to_path_buf(),
+            error,
+        }
+    })?;
+    wait_for_connected_server(socket_path, config)
 }
 
 fn wait_for_server_absent(socket_path: &Path) -> Result<Option<Connection>, AutoStartError> {
@@ -120,7 +187,7 @@ fn wait_for_connected_server(
     loop {
         match connect_or_absent(socket_path) {
             Ok(ConnectResult::Connected(connection)) => {
-                return probe_connected_server(connection, config);
+                return probe_connected_server(connection, config, socket_path);
             }
             Ok(ConnectResult::Absent) => {}
             Err(error) if is_transient_connect_error(&error) => {}
@@ -140,13 +207,22 @@ fn wait_for_connected_server(
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::Path;
+    use std::thread;
     use std::time::Duration;
+
+    use rmux_proto::{
+        encode_frame, DaemonStatusRequest, DaemonStatusResponse, FrameDecoder, HandshakeRequest,
+        HandshakeResponse, Request, Response, CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE,
+        CAPABILITY_DAEMON_STATUS, RMUX_WIRE_VERSION,
+    };
 
     use crate::{ClientError, ConnectResult, Connection};
 
-    use super::wait_for_server_absent_with;
+    use super::{ensure_required_web_capability_or_restart, wait_for_server_absent_with};
+    use crate::auto_start::{AutoStartConfig, AutoStartError};
 
     #[test]
     fn wait_for_server_absent_returns_existing_connection_after_timeout() {
@@ -193,5 +269,75 @@ mod tests {
         .expect_err("transient-only state should still time out");
 
         assert!(matches!(error, super::AutoStartError::TimedOut { .. }));
+    }
+
+    #[test]
+    fn web_required_does_not_replace_active_no_web_daemon() {
+        let (connection, server_thread) = connection_with_script(vec![
+            (
+                Request::Handshake(HandshakeRequest::current()),
+                Response::Handshake(HandshakeResponse {
+                    wire_version: RMUX_WIRE_VERSION,
+                    capabilities: vec![
+                        CAPABILITY_DAEMON_STATUS.to_owned(),
+                        CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE.to_owned(),
+                    ],
+                }),
+            ),
+            (
+                Request::DaemonStatus(DaemonStatusRequest),
+                Response::DaemonStatus(DaemonStatusResponse {
+                    rmux_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    wire_version: RMUX_WIRE_VERSION,
+                    session_count: 1,
+                    client_count: 0,
+                    config_loading: false,
+                }),
+            ),
+        ]);
+        let config = AutoStartConfig::disabled().with_web_required();
+
+        let error = ensure_required_web_capability_or_restart(
+            connection,
+            Path::new("/tmp/rmux-web-active.sock"),
+            Path::new("/bin/rmux"),
+            &config,
+        )
+        .expect_err("active no-web daemon must not be replaced");
+
+        assert!(matches!(error, AutoStartError::IncompatibleDaemon { .. }));
+        assert!(error.to_string().contains("without web-share support"));
+        server_thread.join().expect("scripted server should finish");
+    }
+
+    fn connection_with_script(
+        script: Vec<(Request, Response)>,
+    ) -> (Connection, thread::JoinHandle<()>) {
+        let (client, mut server) = UnixStream::pair().expect("create stream pair");
+        let server_thread = thread::spawn(move || {
+            let mut decoder = FrameDecoder::new();
+            let mut buffer = [0_u8; 1024];
+            for (expected_request, response) in script {
+                loop {
+                    let bytes_read = server.read(&mut buffer).expect("read request");
+                    assert_ne!(bytes_read, 0, "client closed before sending request");
+                    decoder.push_bytes(&buffer[..bytes_read]);
+                    if let Some(request) = decoder
+                        .next_frame::<Request>()
+                        .expect("decode request frame")
+                    {
+                        assert_eq!(request, expected_request);
+                        let frame = encode_frame(&response).expect("encode response frame");
+                        server.write_all(&frame).expect("write response frame");
+                        break;
+                    }
+                }
+            }
+        });
+
+        (
+            Connection::new(client).expect("scripted connection"),
+            server_thread,
+        )
     }
 }

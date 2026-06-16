@@ -1,12 +1,22 @@
 use rmux_core::command_parser::{CommandArgument, ParsedCommands};
+use rmux_core::key_code_lookup_bits;
+use rmux_proto::{PaneTarget, RmuxError, Target};
 
-pub(super) struct DirectCopyModeCommand {
-    pub(super) command: String,
-    pub(super) args: Vec<String>,
-    pub(super) repeat_count: usize,
+use super::super::{scripting_support::QueueExecutionContext, RequestHandler};
+use super::target_is_in_copy_mode;
+use crate::key_table::{
+    default_key_table_name, lookup_key_table_binding, COPY_MODE_TABLE, COPY_MODE_VI_TABLE,
+};
+
+pub(in crate::handler) struct DirectCopyModeCommand {
+    pub(in crate::handler) command: String,
+    pub(in crate::handler) args: Vec<String>,
+    pub(in crate::handler) repeat_count: usize,
 }
 
-pub(super) fn direct_copy_mode_command(commands: &ParsedCommands) -> Option<DirectCopyModeCommand> {
+pub(in crate::handler) fn direct_copy_mode_command(
+    commands: &ParsedCommands,
+) -> Option<DirectCopyModeCommand> {
     if !commands.assignments().is_empty() {
         return None;
     }
@@ -60,6 +70,49 @@ fn copy_mode_argument_strings<'a>(
 ) -> Option<Vec<String>> {
     args.map(|argument| argument.as_string().map(str::to_owned))
         .collect()
+}
+
+impl RequestHandler {
+    pub(in crate::handler) async fn handle_detached_copy_mode_key_code(
+        &self,
+        requester_pid: u32,
+        target: PaneTarget,
+        key: rmux_core::KeyCode,
+    ) -> Result<bool, RmuxError> {
+        let binding = {
+            let state = self.state.lock().await;
+            if !target_is_in_copy_mode(&state, &target) {
+                return Ok(false);
+            }
+            let table_name = default_key_table_name(&state, &target);
+            if !matches!(table_name.as_str(), COPY_MODE_TABLE | COPY_MODE_VI_TABLE) {
+                return Ok(false);
+            }
+            lookup_key_table_binding(&state, &table_name, key_code_lookup_bits(key))
+        };
+
+        let Some(binding) = binding else {
+            return Ok(true);
+        };
+
+        if let Some(command) = direct_copy_mode_command(binding.commands()) {
+            Box::pin(self.execute_copy_mode_command(
+                requester_pid,
+                target,
+                &command.command,
+                &command.args,
+                command.repeat_count,
+            ))
+            .await?;
+            return Ok(true);
+        }
+
+        let context = QueueExecutionContext::without_caller_cwd()
+            .with_current_target(Some(Target::Pane(target)));
+        self.execute_parsed_commands(requester_pid, binding.commands().clone(), context)
+            .await?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]

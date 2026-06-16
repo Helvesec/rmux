@@ -189,6 +189,9 @@ async fn switch_client_to_multi_pane_session_emits_border_frame_before_forwardin
         &Request::SelectPane(SelectPaneRequest {
             target: PaneTarget::new(beta.clone(), 2),
             title: None,
+            style: None,
+            input_disabled: None,
+            preserve_zoom: false,
         }),
     )
     .await?;

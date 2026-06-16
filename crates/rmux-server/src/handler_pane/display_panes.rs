@@ -312,9 +312,14 @@ impl RequestHandler {
         let attached_count = self.attached_count(&session_name).await;
         let state = self.state.lock().await;
         let session = state.sessions.session(&session_name)?;
-        let target =
-            attach_target_for_session(&state, &session_name, attached_count, &terminal_context)
-                .ok()?;
+        let target = attach_target_for_session(
+            &state,
+            &session_name,
+            attached_count,
+            &terminal_context,
+            &self.socket_path(),
+        )
+        .ok()?;
         Some(renderer::render_display_panes_clear_with_base(
             session,
             &state.options,
@@ -538,6 +543,9 @@ impl RequestHandler {
                                 Request::SelectPane(SelectPaneRequest {
                                     target,
                                     title: None,
+                                    style: None,
+                                    input_disabled: None,
+                                    preserve_zoom: false,
                                 }),
                             )
                             .await;

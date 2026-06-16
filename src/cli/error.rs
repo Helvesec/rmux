@@ -93,10 +93,61 @@ impl ExitFailure {
 
 fn tmux_compat_clap_message(error: &clap::Error) -> String {
     let message = error.to_string().trim_end().to_owned();
+    let first_line = message.lines().next().unwrap_or(message.as_str());
+    if message == "error: size missing" || message == "error: command join-pane: size missing" {
+        return "size missing".to_owned();
+    }
+    if first_line.contains("invalid session name: session names must be non-empty") {
+        return "invalid session: ".to_owned();
+    }
+    if let Some((_, detail)) = first_line.rsplit_once(": ") {
+        if let Some(normalized) = normalized_invalid_value_detail(detail) {
+            return normalized;
+        }
+    }
+    if let Some(stripped) = message.strip_prefix("error: ") {
+        if matches!(
+            stripped,
+            "width too small"
+                | "width invalid"
+                | "width too large"
+                | "height too small"
+                | "height invalid"
+                | "height too large"
+                | "adjustment invalid"
+                | "adjustment too small"
+                | "adjustment too large"
+        ) {
+            return stripped.to_owned();
+        }
+    }
     if let Some(stripped) = message.strip_prefix("error: command ") {
         return format!("command {stripped}");
     }
+    if let Some((_, option)) = message.rsplit_once(": invalid option: ") {
+        let option = option.lines().next().unwrap_or(option);
+        return format!("invalid option: {option}");
+    }
     message
+}
+
+fn normalized_invalid_value_detail(detail: &str) -> Option<String> {
+    if matches!(
+        detail,
+        "width too small"
+            | "width invalid"
+            | "width too large"
+            | "height too small"
+            | "height invalid"
+            | "height too large"
+            | "adjustment invalid"
+            | "adjustment too small"
+            | "adjustment too large"
+    ) {
+        return Some(detail.to_owned());
+    }
+
+    None
 }
 
 fn server_is_absent(error: &ClientError) -> bool {
@@ -131,5 +182,63 @@ fn io_error_message_without_code(error: &std::io::Error) -> String {
 impl From<NestedContextError> for ExitFailure {
     fn from(error: NestedContextError) -> Self {
         Self::new(1, error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tmux_compat_clap_message;
+
+    #[test]
+    fn clap_invalid_option_value_errors_keep_single_tmx_line() {
+        let error = clap::Error::raw(
+            clap::error::ErrorKind::ValueValidation,
+            "error: invalid value 'no-such-hook' for '<HOOK>': invalid option: no-such-hook\n\nFor more information, try '--help'.",
+        );
+
+        assert_eq!(
+            tmux_compat_clap_message(&error),
+            "invalid option: no-such-hook"
+        );
+    }
+
+    #[test]
+    fn resize_pane_dimension_errors_keep_single_tmux_line() {
+        let error = clap::Error::raw(clap::error::ErrorKind::ValueValidation, "width too small");
+
+        assert_eq!(tmux_compat_clap_message(&error), "width too small");
+    }
+
+    #[test]
+    fn resize_pane_adjustment_errors_keep_single_tmux_line() {
+        for message in [
+            "adjustment invalid",
+            "adjustment too small",
+            "adjustment too large",
+        ] {
+            let error = clap::Error::raw(clap::error::ErrorKind::ValueValidation, message);
+
+            assert_eq!(tmux_compat_clap_message(&error), message);
+        }
+    }
+
+    #[test]
+    fn invalid_value_dimension_errors_keep_single_tmux_line() {
+        let error = clap::Error::raw(
+            clap::error::ErrorKind::ValueValidation,
+            "error: invalid value '70000' for '-x <COLS>': width too large\n\nFor more information, try '--help'.",
+        );
+
+        assert_eq!(tmux_compat_clap_message(&error), "width too large");
+    }
+
+    #[test]
+    fn empty_session_name_errors_keep_tmux_line() {
+        let error = clap::Error::raw(
+            clap::error::ErrorKind::ValueValidation,
+            "error: invalid value '' for '<NEW_NAME>': invalid session name: session names must be non-empty\n\nFor more information, try '--help'.",
+        );
+
+        assert_eq!(tmux_compat_clap_message(&error), "invalid session: ");
     }
 }

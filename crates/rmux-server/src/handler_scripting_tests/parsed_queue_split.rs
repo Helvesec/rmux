@@ -96,7 +96,55 @@ async fn parsed_queue_split_window_applies_stateful_compat_flags() {
 
     assert_eq!(
         error,
-        rmux_proto::RmuxError::Server("unsupported split-window flag: -I".to_owned())
+        rmux_proto::RmuxError::Server("command split-window: unknown flag -I".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn parsed_queue_split_window_full_size_splits_the_window_root() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("split-full");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let parsed = CommandParser::new()
+        .parse("split-window -v -l 5 -t split-full:0.0 ; split-window -f -v -t split-full:0.1")
+        .expect("split-window commands parse");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("split-window -f should execute");
+
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("session exists");
+    let window = session.window_at(0).expect("window exists");
+    let target_rows = window
+        .pane(1)
+        .expect("nested target pane exists")
+        .geometry()
+        .rows();
+    let full_size_rows = window
+        .pane(2)
+        .expect("full-size split pane exists")
+        .geometry()
+        .rows();
+
+    assert!(
+        target_rows <= 5,
+        "setup split should keep pane 1 in the small nested region, got {target_rows}"
+    );
+    assert!(
+        full_size_rows > 5,
+        "split-window -f must split the window root, got {full_size_rows} rows"
     );
 }
 

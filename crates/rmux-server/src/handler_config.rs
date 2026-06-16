@@ -1,6 +1,6 @@
 use rmux_core::{
-    validate_hook_registration, HookBindingView, HookGlobalRoot, HookSetOptions, HookStore,
-    ENVIRON_HIDDEN,
+    hook_global_root, validate_hook_registration, HookBindingView, HookGlobalRoot, HookSetOptions,
+    HookStore, ENVIRON_HIDDEN,
 };
 use rmux_proto::{
     CommandOutput, ErrorResponse, OptionScopeSelector, Response, RmuxError, ScopeSelector,
@@ -9,9 +9,13 @@ use rmux_proto::{
 };
 
 use super::RequestHandler;
-use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
+use crate::format_runtime::render_runtime_template;
 use crate::handler_support::{ensure_option_scope_exists, ensure_scope_session_exists};
-use crate::hook_compat::{normalize_set_hook_mutation_request, normalize_set_hook_request};
+use crate::hook_compat::{
+    canonicalize_set_hook_mutation_command, normalize_set_hook_mutation_request,
+    normalize_set_hook_request,
+};
+use crate::terminal::TerminalProfile;
 
 impl RequestHandler {
     pub(super) async fn handle_set_environment(
@@ -42,15 +46,20 @@ impl RequestHandler {
         let mode = request.mode.unwrap_or(SetEnvironmentMode::Set);
         let value = if request.format && matches!(mode, SetEnvironmentMode::Set) {
             let current_target = super::target_for_scope_selector(&state, &request.scope);
+            let socket_path = self.socket_path();
             let context = match current_target.as_ref() {
                 Some(target) => {
-                    match super::scripting_support::format_context_for_target(&state, target, 0) {
+                    match super::scripting_support::format_context_for_target_with_server_values(
+                        &state,
+                        target,
+                        0,
+                        &socket_path,
+                    ) {
                         Ok(context) => context,
                         Err(error) => return Response::Error(ErrorResponse { error }),
                     }
                 }
-                None => RuntimeFormatContext::new(rmux_core::formats::FormatContext::new())
-                    .with_state(&state),
+                None => super::scripting_support::global_format_context(&state, &socket_path),
             };
             render_runtime_template(&request.value, &context, false)
         } else {
@@ -82,7 +91,7 @@ impl RequestHandler {
 
     pub(super) async fn handle_set_hook(&self, request: rmux_proto::SetHookRequest) -> Response {
         let request = normalize_set_hook_request(request);
-        self.handle_set_hook_mutation_inner(SetHookMutationRequest {
+        let request = SetHookMutationRequest {
             scope: request.scope,
             hook: request.hook,
             command: Some(request.command),
@@ -91,16 +100,24 @@ impl RequestHandler {
             unset: false,
             run_immediately: false,
             index: None,
-        })
-        .await
+        };
+        let request = match canonicalize_set_hook_mutation_command(request) {
+            Ok(request) => request,
+            Err(error) => return Response::Error(ErrorResponse { error }),
+        };
+        self.handle_set_hook_mutation_inner(request).await
     }
 
     pub(super) async fn handle_set_hook_mutation(
         &self,
         request: SetHookMutationRequest,
     ) -> Response {
-        self.handle_set_hook_mutation_inner(normalize_set_hook_mutation_request(request))
-            .await
+        let request = normalize_set_hook_mutation_request(request);
+        let request = match canonicalize_set_hook_mutation_command(request) {
+            Ok(request) => request,
+            Err(error) => return Response::Error(ErrorResponse { error }),
+        };
+        self.handle_set_hook_mutation_inner(request).await
     }
 
     async fn handle_set_hook_mutation_inner(&self, request: SetHookMutationRequest) -> Response {
@@ -203,11 +220,47 @@ impl RequestHandler {
             request.value_only,
             mode,
         ) {
-            Ok(lines) => Response::ShowOptions(ShowOptionsResponse {
-                scope: request.scope,
-                output: command_output_from_lines(&lines),
-            }),
+            Ok(lines) => {
+                let lines = self.render_runtime_show_options_lines(&state, &request, lines);
+                Response::ShowOptions(ShowOptionsResponse {
+                    scope: request.scope,
+                    output: command_output_from_lines(&lines),
+                })
+            }
+            Err(error) if request.quiet && show_options_quiet_suppresses(&error) => {
+                Response::ShowOptions(ShowOptionsResponse {
+                    scope: request.scope,
+                    output: command_output_from_lines(&[]),
+                })
+            }
             Err(error) => Response::Error(ErrorResponse { error }),
+        }
+    }
+
+    fn render_runtime_show_options_lines(
+        &self,
+        state: &super::HandlerState,
+        request: &rmux_proto::ShowOptionsRequest,
+        lines: Vec<String>,
+    ) -> Vec<String> {
+        if !matches!(request.name.as_deref(), Some("default-shell")) {
+            return lines;
+        }
+        if !matches!(request.scope, OptionScopeSelector::SessionGlobal) {
+            return lines;
+        }
+        let session_name = show_options_session_name(&request.scope);
+        let shell = TerminalProfile::resolved_default_shell(
+            &state.environment,
+            &state.options,
+            session_name,
+        )
+        .to_string_lossy()
+        .into_owned();
+        if request.value_only {
+            vec![shell]
+        } else {
+            vec![format!("default-shell {shell}")]
         }
     }
 
@@ -306,6 +359,27 @@ impl RequestHandler {
     }
 }
 
+fn show_options_quiet_suppresses(error: &RmuxError) -> bool {
+    let message = match error {
+        RmuxError::Server(message) | RmuxError::Message(message) => message.as_str(),
+        _ => return false,
+    };
+    message.starts_with("unknown option: ")
+        || message.starts_with("invalid option: ")
+        || message.starts_with("ambiguous option: ")
+}
+
+fn show_options_session_name(scope: &OptionScopeSelector) -> Option<&rmux_proto::SessionName> {
+    match scope {
+        OptionScopeSelector::Session(session_name) => Some(session_name),
+        OptionScopeSelector::Window(target) => Some(target.session_name()),
+        OptionScopeSelector::Pane(target) => Some(target.session_name()),
+        OptionScopeSelector::ServerGlobal
+        | OptionScopeSelector::SessionGlobal
+        | OptionScopeSelector::WindowGlobal => None,
+    }
+}
+
 fn validate_set_environment_request(
     request: &rmux_proto::SetEnvironmentRequest,
 ) -> Result<(), RmuxError> {
@@ -342,17 +416,22 @@ fn render_show_environment_entry(
 
     Some(match &entry.value {
         Some(value) => {
-            let escaped = value
-                .chars()
-                .flat_map(|character| match character {
-                    '$' | '`' | '"' | '\\' => ['\\', character].into_iter().collect::<Vec<_>>(),
-                    other => [other].into_iter().collect::<Vec<_>>(),
-                })
-                .collect::<String>();
+            let escaped = shell_escape_environment_value(value, !entry.value_is_display_escape);
             format!("{name}=\"{escaped}\"; export {name};", name = entry.name)
         }
         None => format!("unset {};", entry.name),
     })
+}
+
+fn shell_escape_environment_value(value: &str, escape_backslash: bool) -> String {
+    value
+        .chars()
+        .flat_map(|character| match character {
+            '$' | '`' | '"' => ['\\', character].into_iter().collect::<Vec<_>>(),
+            '\\' if escape_backslash => ['\\', character].into_iter().collect::<Vec<_>>(),
+            other => [other].into_iter().collect::<Vec<_>>(),
+        })
+        .collect()
 }
 
 fn validate_hook_mutation_request(request: &SetHookMutationRequest) -> Result<(), RmuxError> {
@@ -400,6 +479,13 @@ fn resolve_show_hooks_selection(
     }
 
     match (&request.scope, request.window, request.pane) {
+        (ScopeSelector::Global, false, false)
+            if request
+                .hook
+                .is_some_and(|hook| hook_global_root(hook) == HookGlobalRoot::Window) =>
+        {
+            Ok(ShowHooksSelection::GlobalWindow)
+        }
         (ScopeSelector::Global, false, false) => Ok(ShowHooksSelection::GlobalSession),
         (ScopeSelector::Global, true, false) | (ScopeSelector::Global, false, true) => {
             Ok(ShowHooksSelection::GlobalWindow)

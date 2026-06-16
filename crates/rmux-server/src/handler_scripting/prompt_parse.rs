@@ -54,12 +54,12 @@ pub(super) fn parse_queued_command_prompt(
     let mut args = VecDeque::from(command.arguments().to_vec());
     let mut background = false;
     let mut format_template = false;
-    let mut literal = false;
+    let literal = false;
     let mut single = false;
     let mut numeric = false;
     let mut incremental = false;
     let mut key = false;
-    let mut backspace_exit = false;
+    let backspace_exit = false;
     let mut prompts = None;
     let mut inputs = None;
     let mut prompt_type = PromptType::Command;
@@ -81,11 +81,11 @@ pub(super) fn parse_queued_command_prompt(
             match chars[index] {
                 '1' => single = true,
                 'b' => background = true,
-                'e' => backspace_exit = true,
+                'e' => return Err(unsupported_flag("command-prompt", "-e")),
                 'F' => format_template = true,
                 'i' => incremental = true,
                 'k' => key = true,
-                'l' => literal = true,
+                'l' => return Err(unsupported_flag("command-prompt", "-l")),
                 'N' => numeric = true,
                 'I' => {
                     inputs = Some(inline_flag_value(

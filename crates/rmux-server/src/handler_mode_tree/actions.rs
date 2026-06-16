@@ -122,7 +122,13 @@ impl RequestHandler {
         };
         let target = {
             let state = self.state.lock().await;
-            attach_target_for_session(&state, &session_name, attached_count, &terminal_context)?
+            attach_target_for_session(
+                &state,
+                &session_name,
+                attached_count,
+                &terminal_context,
+                &self.socket_path(),
+            )?
         };
         let _ = self
             .send_attach_control(
@@ -495,6 +501,8 @@ impl RequestHandler {
                         only_if_unset: false,
                         unset: true,
                         unset_pane_overrides: false,
+                        format: false,
+                        format_target: None,
                     })
                     .await;
                 if let Response::Error(error) = response {
@@ -551,6 +559,8 @@ impl RequestHandler {
                         only_if_unset: false,
                         unset: true,
                         unset_pane_overrides: false,
+                        format: false,
+                        format_target: None,
                     })
                     .await;
                 if let Response::Error(error) = response {

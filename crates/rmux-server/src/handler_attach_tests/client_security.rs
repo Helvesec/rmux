@@ -412,3 +412,60 @@ async fn refresh_client_flags_merge_incrementally() {
         );
     }
 }
+
+#[tokio::test]
+async fn refresh_client_unimplemented_control_mode_flags_are_rejected() {
+    use rmux_proto::request::RefreshClientRequest;
+
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(std::process::id(), alpha, control_tx)
+        .await;
+
+    let response = handler
+        .dispatch(
+            std::process::id(),
+            Request::RefreshClient(RefreshClientRequest {
+                target_client: None,
+                adjustment: None,
+                clear_pan: false,
+                pan_left: false,
+                pan_right: false,
+                pan_up: false,
+                pan_down: false,
+                status_only: false,
+                clipboard_query: false,
+                flags: None,
+                flags_alias: None,
+                subscriptions: vec!["%0:on".to_owned()],
+                subscriptions_format: vec!["name:%0:#{pane_id}".to_owned()],
+                control_size: Some("80x24".to_owned()),
+                colour_report: Some("%0".to_owned()),
+            }),
+        )
+        .await
+        .response;
+
+    assert!(
+        matches!(
+            response,
+            Response::Error(rmux_proto::ErrorResponse {
+                error: RmuxError::Server(ref message)
+            }) if message.contains("-A/-B/-r")
+        ),
+        "unimplemented control-mode refresh-client flags should fail explicitly, got {response:?}"
+    );
+}

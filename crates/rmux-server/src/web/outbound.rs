@@ -1,11 +1,12 @@
 use std::io;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
+use tracing::warn;
 
 use super::crypto::{EncryptedWebSocketWriter, FrameSealer};
 use super::websocket::WebSocketWriter;
@@ -23,35 +24,67 @@ pub(crate) enum OutboundQueueResult {
 }
 
 pub(crate) struct WebSocketOutbound {
-    tx: mpsc::Sender<ViewerCmd>,
-    writer: Arc<Mutex<EncryptedWebSocketWriter>>,
+    tx: mpsc::Sender<DataCmd>,
+    control_tx: mpsc::UnboundedSender<ControlCmd>,
     backlog_bytes: Arc<AtomicUsize>,
     latest_epoch: Arc<AtomicU64>,
+    latest_keyframe: Arc<Mutex<Option<KeyframeCmd>>>,
+    keyframe_wakeup_pending: Arc<AtomicBool>,
     writer_task: JoinHandle<()>,
 }
 
-enum ViewerCmd {
+enum DataCmd {
     Frame { bytes: Vec<u8>, epoch: u64 },
     Snapshot { bytes: Vec<u8>, epoch: u64 },
+}
+
+enum ControlCmd {
+    Keyframe,
+    Text {
+        text: String,
+        done: oneshot::Sender<io::Result<()>>,
+    },
+    Close {
+        code: Option<u16>,
+        reason: String,
+        done: oneshot::Sender<io::Result<()>>,
+    },
+    Pong {
+        payload: Vec<u8>,
+        done: oneshot::Sender<io::Result<()>>,
+    },
+}
+
+struct KeyframeCmd {
+    frames: Vec<Vec<u8>>,
+    epoch: u64,
 }
 
 impl WebSocketOutbound {
     pub(crate) fn spawn(writer: WebSocketWriter, sealer: FrameSealer) -> Self {
         let (tx, rx) = mpsc::channel(VIEWER_CHANNEL_CAP);
-        let writer = Arc::new(Mutex::new(EncryptedWebSocketWriter::new(writer, sealer)));
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let writer = EncryptedWebSocketWriter::new(writer, sealer);
         let backlog_bytes = Arc::new(AtomicUsize::new(0));
         let latest_epoch = Arc::new(AtomicU64::new(0));
+        let latest_keyframe = Arc::new(Mutex::new(None));
+        let keyframe_wakeup_pending = Arc::new(AtomicBool::new(false));
         let writer_task = tokio::spawn(writer_task(
-            writer.clone(),
+            writer,
             rx,
+            control_rx,
             backlog_bytes.clone(),
             latest_epoch.clone(),
+            latest_keyframe.clone(),
+            keyframe_wakeup_pending.clone(),
         ));
         Self {
             tx,
-            writer,
+            control_tx,
             backlog_bytes,
             latest_epoch,
+            latest_keyframe,
+            keyframe_wakeup_pending,
             writer_task,
         }
     }
@@ -62,7 +95,7 @@ impl WebSocketOutbound {
         }
         let len = bytes.len();
         let epoch = self.latest_epoch.load(Ordering::Acquire);
-        match self.tx.try_send(ViewerCmd::Frame { bytes, epoch }) {
+        match self.tx.try_send(DataCmd::Frame { bytes, epoch }) {
             Ok(()) => {
                 self.backlog_bytes.fetch_add(len, Ordering::Relaxed);
                 OutboundQueueResult::Queued
@@ -73,6 +106,9 @@ impl WebSocketOutbound {
     }
 
     pub(crate) fn queue_snapshot(&self, bytes: Vec<u8>) -> OutboundQueueResult {
+        if self.backlog_exceeds(bytes.len()) {
+            return OutboundQueueResult::Backpressure;
+        }
         let len = bytes.len();
         let permit = match self.tx.try_reserve() {
             Ok(permit) => permit,
@@ -81,28 +117,62 @@ impl WebSocketOutbound {
         };
         let epoch = self.latest_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         self.backlog_bytes.fetch_add(len, Ordering::Relaxed);
-        permit.send(ViewerCmd::Snapshot { bytes, epoch });
+        permit.send(DataCmd::Snapshot { bytes, epoch });
         OutboundQueueResult::Queued
     }
 
+    pub(crate) fn queue_keyframe(&self, frames: Vec<Vec<u8>>) -> OutboundQueueResult {
+        let epoch = self.latest_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        match self.latest_keyframe.lock() {
+            Ok(mut latest) => {
+                *latest = Some(KeyframeCmd { frames, epoch });
+            }
+            Err(_) => return OutboundQueueResult::Closed,
+        }
+        if self.keyframe_wakeup_pending.swap(true, Ordering::AcqRel) {
+            return OutboundQueueResult::Queued;
+        }
+        match self.control_tx.send(ControlCmd::Keyframe) {
+            Ok(()) => OutboundQueueResult::Queued,
+            Err(_) => {
+                self.keyframe_wakeup_pending.store(false, Ordering::Release);
+                OutboundQueueResult::Closed
+            }
+        }
+    }
+
     pub(crate) async fn write_text(&self, text: &str) -> io::Result<()> {
-        let mut writer = self.writer.lock().await;
-        write_with_timeout(writer.write_text(text)).await
+        self.enqueue_control(|done| ControlCmd::Text {
+            text: text.to_owned(),
+            done,
+        })
+        .await
     }
 
     pub(crate) async fn write_close(&self) -> io::Result<()> {
-        let mut writer = self.writer.lock().await;
-        write_with_timeout(writer.write_close()).await
+        self.enqueue_control(|done| ControlCmd::Close {
+            code: None,
+            reason: String::new(),
+            done,
+        })
+        .await
     }
 
     pub(crate) async fn write_close_code(&self, code: u16, reason: &str) -> io::Result<()> {
-        let mut writer = self.writer.lock().await;
-        write_with_timeout(writer.write_close_code(code, reason)).await
+        self.enqueue_control(|done| ControlCmd::Close {
+            code: Some(code),
+            reason: reason.to_owned(),
+            done,
+        })
+        .await
     }
 
     pub(crate) async fn write_pong(&self, payload: &[u8]) -> io::Result<()> {
-        let mut writer = self.writer.lock().await;
-        write_with_timeout(writer.write_pong(payload)).await
+        self.enqueue_control(|done| ControlCmd::Pong {
+            payload: payload.to_vec(),
+            done,
+        })
+        .await
     }
 
     fn backlog_exceeds(&self, next_len: usize) -> bool {
@@ -110,6 +180,47 @@ impl WebSocketOutbound {
             .load(Ordering::Relaxed)
             .saturating_add(next_len)
             > BACKLOG_BYTES_MAX
+    }
+
+    async fn enqueue_control(
+        &self,
+        build: impl FnOnce(oneshot::Sender<io::Result<()>>) -> ControlCmd,
+    ) -> io::Result<()> {
+        let (done, result) = oneshot::channel();
+        self.control_tx
+            .send(build(done))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "web-share writer closed"))?;
+        result
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "web-share writer closed"))?
+    }
+
+    #[cfg(test)]
+    fn test_channels() -> (
+        Self,
+        mpsc::Receiver<DataCmd>,
+        mpsc::UnboundedReceiver<ControlCmd>,
+    ) {
+        let (tx, rx) = mpsc::channel(VIEWER_CHANNEL_CAP);
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        let backlog_bytes = Arc::new(AtomicUsize::new(0));
+        let latest_epoch = Arc::new(AtomicU64::new(0));
+        let latest_keyframe = Arc::new(Mutex::new(None));
+        let keyframe_wakeup_pending = Arc::new(AtomicBool::new(false));
+        let writer_task = tokio::spawn(async { std::future::pending::<()>().await });
+        (
+            Self {
+                tx,
+                control_tx,
+                backlog_bytes,
+                latest_epoch,
+                latest_keyframe,
+                keyframe_wakeup_pending,
+                writer_task,
+            },
+            rx,
+            control_rx,
+        )
     }
 }
 
@@ -120,38 +231,161 @@ impl Drop for WebSocketOutbound {
 }
 
 async fn writer_task(
-    writer: Arc<Mutex<EncryptedWebSocketWriter>>,
-    mut rx: mpsc::Receiver<ViewerCmd>,
+    mut writer: EncryptedWebSocketWriter,
+    mut rx: mpsc::Receiver<DataCmd>,
+    mut control_rx: mpsc::UnboundedReceiver<ControlCmd>,
     backlog_bytes: Arc<AtomicUsize>,
     latest_epoch: Arc<AtomicU64>,
+    latest_keyframe: Arc<Mutex<Option<KeyframeCmd>>>,
+    keyframe_wakeup_pending: Arc<AtomicBool>,
 ) {
-    while let Some(cmd) = rx.recv().await {
-        match cmd {
-            ViewerCmd::Frame { bytes, epoch } => {
-                subtract_backlog(&backlog_bytes, bytes.len());
-                if epoch < latest_epoch.load(Ordering::Acquire) {
-                    continue;
-                }
-                let mut writer = writer.lock().await;
-                if write_with_timeout(writer.write_binary(&bytes))
-                    .await
-                    .is_err()
-                {
+    loop {
+        tokio::select! {
+            biased;
+            Some(cmd) = control_rx.recv() => {
+                if !handle_control_cmd(
+                    &mut writer,
+                    cmd,
+                    latest_epoch.as_ref(),
+                    latest_keyframe.as_ref(),
+                    keyframe_wakeup_pending.as_ref(),
+                ).await {
                     break;
                 }
             }
-            ViewerCmd::Snapshot { bytes, epoch } => {
-                subtract_backlog(&backlog_bytes, bytes.len());
-                let mut writer = writer.lock().await;
-                if write_with_timeout(writer.write_binary(&bytes))
-                    .await
-                    .is_err()
-                {
+            Some(cmd) = rx.recv() => {
+                if !handle_data_cmd(
+                    &mut writer,
+                    cmd,
+                    backlog_bytes.as_ref(),
+                    latest_epoch.as_ref(),
+                ).await {
                     break;
                 }
-                latest_epoch.fetch_max(epoch, Ordering::Release);
+            }
+            else => break,
+        }
+    }
+}
+
+async fn handle_data_cmd(
+    writer: &mut EncryptedWebSocketWriter,
+    cmd: DataCmd,
+    backlog_bytes: &AtomicUsize,
+    latest_epoch: &AtomicU64,
+) -> bool {
+    match cmd {
+        DataCmd::Frame { bytes, epoch } => {
+            subtract_backlog(backlog_bytes, bytes.len());
+            if epoch < latest_epoch.load(Ordering::Acquire) {
+                return true;
+            }
+            if let Err(error) = write_with_timeout(writer.write_binary(&bytes)).await {
+                warn!(
+                    frame = "output",
+                    epoch,
+                    error = %error,
+                    "web-share writer task stopped"
+                );
+                return false;
             }
         }
+        DataCmd::Snapshot { bytes, epoch } => {
+            subtract_backlog(backlog_bytes, bytes.len());
+            if epoch < latest_epoch.load(Ordering::Acquire) {
+                return true;
+            }
+            if let Err(error) = write_with_timeout(writer.write_binary(&bytes)).await {
+                warn!(
+                    frame = "snapshot",
+                    epoch,
+                    error = %error,
+                    "web-share writer task stopped"
+                );
+                return false;
+            }
+            latest_epoch.fetch_max(epoch, Ordering::Release);
+        }
+    }
+    true
+}
+
+async fn handle_control_cmd(
+    writer: &mut EncryptedWebSocketWriter,
+    cmd: ControlCmd,
+    latest_epoch: &AtomicU64,
+    latest_keyframe: &Mutex<Option<KeyframeCmd>>,
+    keyframe_wakeup_pending: &AtomicBool,
+) -> bool {
+    match cmd {
+        ControlCmd::Keyframe => {
+            keyframe_wakeup_pending.store(false, Ordering::Release);
+            let keyframe = match latest_keyframe.lock() {
+                Ok(mut latest) => latest.take(),
+                Err(_) => None,
+            };
+            let Some(KeyframeCmd { frames, epoch }) = keyframe else {
+                return true;
+            };
+            if epoch < latest_epoch.load(Ordering::Acquire) {
+                return true;
+            }
+            for (index, frame) in frames.iter().enumerate() {
+                if let Err(error) = write_with_timeout(writer.write_binary(frame)).await {
+                    warn!(
+                        frame = "keyframe",
+                        epoch,
+                        frame_index = index,
+                        frame_count = frames.len(),
+                        error = %error,
+                        "web-share writer task stopped"
+                    );
+                    return false;
+                }
+            }
+            latest_epoch.fetch_max(epoch, Ordering::Release);
+        }
+        ControlCmd::Text { text, done } => {
+            let result = write_with_timeout(writer.write_text(&text)).await;
+            let failed = log_writer_failure("text", &result);
+            let _ = done.send(result);
+            if failed {
+                return false;
+            }
+        }
+        ControlCmd::Close { code, reason, done } => {
+            let result = match code {
+                Some(code) => write_with_timeout(writer.write_close_code(code, &reason)).await,
+                None => write_with_timeout(writer.write_close()).await,
+            };
+            let failed = log_writer_failure("close", &result);
+            let _ = done.send(result);
+            if failed {
+                return false;
+            }
+        }
+        ControlCmd::Pong { payload, done } => {
+            let result = write_with_timeout(writer.write_pong(&payload)).await;
+            let failed = log_writer_failure("pong", &result);
+            let _ = done.send(result);
+            if failed {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn log_writer_failure(frame: &'static str, result: &io::Result<()>) -> bool {
+    if let Err(error) = result {
+        warn!(
+            frame,
+            error = %error,
+            "web-share writer task stopped"
+        );
+        true
+    } else {
+        false
     }
 }
 
@@ -171,5 +405,65 @@ where
             io::ErrorKind::TimedOut,
             "web-share client write timed out",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use super::{
+        ControlCmd, OutboundQueueResult, WebSocketOutbound, BACKLOG_BYTES_MAX, VIEWER_CHANNEL_CAP,
+    };
+
+    #[tokio::test]
+    async fn keyframe_replaces_latest_even_when_data_queue_is_full() {
+        let (outbound, _data_rx, mut control_rx) = WebSocketOutbound::test_channels();
+
+        for _ in 0..VIEWER_CHANNEL_CAP {
+            assert_eq!(
+                outbound.queue_frame(vec![b'x']),
+                OutboundQueueResult::Queued
+            );
+        }
+        assert_eq!(outbound.queue_frame(vec![b'y']), OutboundQueueResult::Full);
+
+        assert_eq!(
+            outbound.queue_keyframe(vec![vec![b'o', b'l', b'd']]),
+            OutboundQueueResult::Queued
+        );
+        assert_eq!(
+            outbound.queue_keyframe(vec![vec![b'n', b'e', b'w']]),
+            OutboundQueueResult::Queued
+        );
+
+        assert!(matches!(control_rx.try_recv(), Ok(ControlCmd::Keyframe)));
+        assert!(control_rx.try_recv().is_err());
+        let latest = outbound.latest_keyframe.lock().expect("keyframe lock");
+        let latest = latest.as_ref().expect("latest keyframe retained");
+        assert_eq!(latest.frames, vec![vec![b'n', b'e', b'w']]);
+        assert_eq!(latest.epoch, outbound.latest_epoch.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn snapshots_respect_backlog_byte_limit() {
+        let (outbound, _data_rx, _control_rx) = WebSocketOutbound::test_channels();
+
+        assert_eq!(
+            outbound.queue_frame(vec![0; BACKLOG_BYTES_MAX]),
+            OutboundQueueResult::Queued
+        );
+        assert_eq!(
+            outbound.queue_frame(vec![0]),
+            OutboundQueueResult::Backpressure
+        );
+        assert_eq!(
+            outbound.queue_snapshot(vec![0]),
+            OutboundQueueResult::Backpressure
+        );
+        assert_eq!(
+            outbound.backlog_bytes.load(Ordering::Acquire),
+            BACKLOG_BYTES_MAX
+        );
     }
 }

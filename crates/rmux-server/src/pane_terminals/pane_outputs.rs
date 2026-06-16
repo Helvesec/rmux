@@ -4,7 +4,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 
 use rmux_core::{events::PaneOutputSubscriptionKey, PaneId};
-use rmux_proto::{RmuxError, SessionName};
+use rmux_proto::{PaneTarget, RmuxError, SessionName};
 
 use crate::pane_io::PaneOutputSender;
 use crate::pane_terminal_lookup::{missing_pane_terminal, pane_id_for_target};
@@ -27,7 +27,7 @@ pub(super) use self::submitted::AttachedSubmittedLine;
 pub(crate) struct PaneExitMetadata {
     pub(crate) status: Option<i32>,
     pub(crate) signal: Option<i32>,
-    pub(crate) time: i64,
+    pub(crate) time: Option<i64>,
 }
 
 impl PaneExitMetadata {
@@ -35,7 +35,15 @@ impl PaneExitMetadata {
         Self {
             status: status.code(),
             signal: exit_signal(status),
-            time: chrono::Local::now().timestamp(),
+            time: Some(chrono::Local::now().timestamp()),
+        }
+    }
+
+    pub(crate) const fn without_exit_details() -> Self {
+        Self {
+            status: None,
+            signal: None,
+            time: None,
         }
     }
 }
@@ -54,8 +62,19 @@ fn exit_signal(_status: ExitStatus) -> Option<i32> {
 pub(super) struct RemovedPaneOutputs {
     transcripts: HashMap<PaneId, SharedPaneTranscript>,
     pane_outputs: HashMap<PaneId, PaneOutputSender>,
+    #[cfg(unix)]
+    pane_output_readers: HashMap<PaneId, crate::pane_io::PaneOutputReaderTask>,
     pane_output_generations: HashMap<PaneId, u64>,
     attached_submitted_rows: HashMap<PaneId, AttachedSubmittedLine>,
+}
+
+impl RemovedPaneOutputs {
+    pub(in crate::pane_terminals) fn abort_output_readers(&mut self) {
+        #[cfg(unix)]
+        for (_, reader) in self.pane_output_readers.drain() {
+            reader.abort();
+        }
+    }
 }
 
 impl HandlerState {
@@ -95,6 +114,27 @@ impl HandlerState {
             .insert(pane_id, metadata);
         self.mark_pane_lifecycle_exited(pane_id, metadata);
         Ok(Some(metadata))
+    }
+
+    pub(crate) fn mark_pane_dead_without_exit_details(
+        &mut self,
+        target: &PaneTarget,
+    ) -> Result<(), RmuxError> {
+        let pane_id = pane_id_for_target(
+            &self.sessions,
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+        )?;
+        let runtime_session_name =
+            self.runtime_session_name_for_window(target.session_name(), target.window_index());
+        let metadata = PaneExitMetadata::without_exit_details();
+        self.dead_panes
+            .entry(runtime_session_name)
+            .or_default()
+            .insert(pane_id, metadata);
+        self.mark_pane_lifecycle_exited(pane_id, metadata);
+        Ok(())
     }
 
     pub(crate) fn append_bytes_to_runtime_pane_transcript(
@@ -291,6 +331,11 @@ impl HandlerState {
         RemovedPaneOutputs {
             transcripts: self.transcripts.remove(session_name).unwrap_or_default(),
             pane_outputs: self.pane_outputs.remove(session_name).unwrap_or_default(),
+            #[cfg(unix)]
+            pane_output_readers: self
+                .pane_output_readers
+                .remove(session_name)
+                .unwrap_or_default(),
             pane_output_generations: self
                 .pane_output_generations
                 .remove(session_name)
@@ -319,6 +364,14 @@ impl HandlerState {
             .pane_outputs
             .get_mut(session_name)
             .and_then(|panes| panes.remove(&pane_id));
+        #[cfg(unix)]
+        if let Some(reader) = self
+            .pane_output_readers
+            .get_mut(session_name)
+            .and_then(|panes| panes.remove(&pane_id))
+        {
+            reader.abort();
+        }
 
         match (transcript, pane_output) {
             (Some(transcript), Some(pane_output)) => Some((transcript, pane_output)),
@@ -353,6 +406,14 @@ impl HandlerState {
             {
                 removed.pane_outputs.insert(*pane_id, pane_output);
             }
+            #[cfg(unix)]
+            if let Some(reader) = self
+                .pane_output_readers
+                .get_mut(session_name)
+                .and_then(|panes| panes.remove(pane_id))
+            {
+                removed.pane_output_readers.insert(*pane_id, reader);
+            }
             if let Some(generation) = self
                 .pane_output_generations
                 .get_mut(session_name)
@@ -381,6 +442,11 @@ impl HandlerState {
             .entry(session_name.clone())
             .or_default()
             .extend(removed_outputs.pane_outputs);
+        #[cfg(unix)]
+        self.pane_output_readers
+            .entry(session_name.clone())
+            .or_default()
+            .extend(removed_outputs.pane_output_readers);
         self.pane_output_generations
             .entry(session_name.clone())
             .or_default()

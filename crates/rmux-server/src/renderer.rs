@@ -12,6 +12,7 @@ use rmux_proto::OptionName;
 use crate::copy_mode::CopyModeSummary;
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::pane_terminals::HandlerState;
+use crate::pane_visible_geometry::visible_pane_content_geometry;
 #[path = "renderer/borders.rs"]
 mod borders;
 #[path = "renderer/clock_mode.rs"]
@@ -31,8 +32,7 @@ mod status;
 #[cfg(test)]
 use borders::{border_cells, BorderCell, BorderStyle};
 use borders::{
-    content_pane_geometry, render_cells, render_pane_border_status_lines as render_border_status,
-    runtime_border_cells,
+    render_cells, render_pane_border_status_lines as render_border_status, runtime_border_cells,
 };
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use clock_mode::{
@@ -52,7 +52,7 @@ pub(crate) use overlay::{
     MenuRenderItem, MenuRenderSpec, OverlayMousePosition, OverlayPositionContext, OverlayRect,
     PopupRenderSpec,
 };
-pub(crate) use pane_delta::{PaneRenderDelta, PaneRenderSnapshot};
+pub(crate) use pane_delta::{PaneRenderDelta, PaneRenderDeltaFrame, PaneRenderSnapshot};
 pub(crate) use pane_screen::{render_pane_screen, styled_pane_screen, truncate_rendered_pane_line};
 #[cfg(test)]
 use status::status_bar_runs;
@@ -92,21 +92,27 @@ pub(crate) fn render_with_attached_count_and_prompt(
         session,
         options,
         attached_count,
-        prompt,
-        None,
-        None,
-        None,
+        StatusRenderContext {
+            prompt,
+            ..StatusRenderContext::default()
+        },
     )
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct StatusRenderContext<'a> {
+    pub(crate) prompt: Option<&'a RenderedPrompt>,
+    pub(crate) pane_title: Option<&'a str>,
+    pub(crate) state: Option<&'a HandlerState>,
+    pub(crate) key_table: Option<&'a str>,
+    pub(crate) socket_path: Option<&'a std::path::Path>,
 }
 
 pub(crate) fn render_with_attached_count_prompt_and_pane_title(
     session: &Session,
     options: &OptionStore,
     attached_count: usize,
-    prompt: Option<&RenderedPrompt>,
-    pane_title: Option<&str>,
-    state: Option<&HandlerState>,
-    key_table: Option<&str>,
+    context: StatusRenderContext<'_>,
 ) -> Vec<u8> {
     let geometry = StatusGeometry::for_session(session, options);
     let mut frame = Vec::new();
@@ -119,7 +125,9 @@ pub(crate) fn render_with_attached_count_prompt_and_pane_title(
         frame.extend_from_slice(
             render_cells(runtime_border_cells(session, options, geometry).as_slice()).as_slice(),
         );
-        frame.extend_from_slice(render_border_status(session, options, geometry, state).as_slice());
+        frame.extend_from_slice(
+            render_border_status(session, options, geometry, context.state).as_slice(),
+        );
     }
 
     frame.extend_from_slice(
@@ -128,10 +136,11 @@ pub(crate) fn render_with_attached_count_prompt_and_pane_title(
             options,
             geometry,
             attached_count,
-            prompt,
-            pane_title,
-            state,
-            key_table,
+            prompt: context.prompt,
+            pane_title: context.pane_title,
+            state: context.state,
+            key_table: context.key_table,
+            socket_path: context.socket_path,
         })
         .as_slice(),
     );
@@ -154,7 +163,8 @@ pub(crate) fn render_pane_cursor(
     screen: &Screen,
 ) -> Vec<u8> {
     let geometry = StatusGeometry::for_session(session, options);
-    let Some(pane_geometry) = visible_pane_geometry(session, pane, geometry.content_rows) else {
+    let Some(pane_geometry) = visible_pane_geometry(session, options, pane, geometry.content_rows)
+    else {
         return Vec::new();
     };
     if pane_geometry.cols() == 0 || pane_geometry.rows() == 0 {
@@ -183,7 +193,7 @@ pub(crate) fn visible_pane_terminal_geometry(
     pane: &Pane,
 ) -> Option<PaneGeometry> {
     let geometry = StatusGeometry::for_session(session, options);
-    visible_pane_geometry(session, pane, geometry.content_rows).map(|pane_geometry| {
+    visible_pane_geometry(session, options, pane, geometry.content_rows).map(|pane_geometry| {
         PaneGeometry::new(
             pane_geometry.x(),
             pane_geometry.y().saturating_add(geometry.content_y_offset),
@@ -202,7 +212,8 @@ pub(crate) fn render_copy_mode_position(
     history_size: usize,
 ) -> Vec<u8> {
     let geometry = StatusGeometry::for_session(session, options);
-    let Some(pane_geometry) = visible_pane_geometry(session, pane, geometry.content_rows) else {
+    let Some(pane_geometry) = visible_pane_geometry(session, options, pane, geometry.content_rows)
+    else {
         return Vec::new();
     };
     if pane_geometry.cols() == 0 || pane_geometry.rows() == 0 {
@@ -270,6 +281,7 @@ pub(crate) fn render_copy_mode_position(
 
 fn visible_pane_geometry(
     session: &Session,
+    options: &OptionStore,
     pane: &Pane,
     content_rows: u16,
 ) -> Option<PaneGeometry> {
@@ -277,7 +289,19 @@ fn visible_pane_geometry(
         return None;
     }
 
-    Some(content_pane_geometry(pane, content_rows))
+    let geometry = if session.window().is_zoomed() {
+        let size = session.window().size();
+        PaneGeometry::new(0, 0, size.cols, content_rows)
+    } else {
+        pane.geometry()
+    };
+    Some(visible_pane_content_geometry(
+        options,
+        session.name(),
+        session.active_window_index(),
+        geometry,
+        content_rows,
+    ))
 }
 
 fn bool_text(value: bool) -> &'static str {
@@ -292,9 +316,7 @@ pub(crate) fn render_status_only_with_attached_count_and_prompt(
     session: &Session,
     options: &OptionStore,
     attached_count: usize,
-    prompt: Option<&RenderedPrompt>,
-    state: Option<&HandlerState>,
-    key_table: Option<&str>,
+    context: StatusRenderContext<'_>,
 ) -> Vec<u8> {
     let geometry = StatusGeometry::for_session(session, options);
     render_status_bar(StatusBarRenderRequest {
@@ -302,10 +324,11 @@ pub(crate) fn render_status_only_with_attached_count_and_prompt(
         options,
         geometry,
         attached_count,
-        prompt,
-        pane_title: None,
-        state,
-        key_table,
+        prompt: context.prompt,
+        pane_title: context.pane_title,
+        state: context.state,
+        key_table: context.key_table,
+        socket_path: context.socket_path,
     })
 }
 
@@ -330,7 +353,37 @@ pub(crate) fn render_status_message(
 }
 
 fn cursor_position_bytes(y: u16, x: u16) -> Vec<u8> {
-    format!("\x1b[{};{}H", y.saturating_add(1), x.saturating_add(1)).into_bytes()
+    let mut bytes = Vec::with_capacity(16);
+    push_cursor_position_bytes(&mut bytes, y, x);
+    bytes
+}
+
+fn replace_cursor_position_bytes(bytes: &mut Vec<u8>, y: u16, x: u16) {
+    bytes.clear();
+    push_cursor_position_bytes(bytes, y, x);
+}
+
+fn push_cursor_position_bytes(bytes: &mut Vec<u8>, y: u16, x: u16) {
+    bytes.extend_from_slice(b"\x1b[");
+    push_u16_decimal(bytes, y.saturating_add(1));
+    bytes.push(b';');
+    push_u16_decimal(bytes, x.saturating_add(1));
+    bytes.push(b'H');
+}
+
+fn push_u16_decimal(bytes: &mut Vec<u8>, value: u16) {
+    let mut scratch = [0_u8; 5];
+    let mut remaining = value;
+    let mut index = scratch.len();
+    loop {
+        index -= 1;
+        scratch[index] = b'0' + u8::try_from(remaining % 10).expect("digit fits in u8");
+        remaining /= 10;
+        if remaining == 0 {
+            break;
+        }
+    }
+    bytes.extend_from_slice(&scratch[index..]);
 }
 
 fn parse_standalone_style(value: Option<&str>) -> Style {

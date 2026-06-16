@@ -93,16 +93,14 @@ async fn server_reset_during_sdk_wait_returns_typed_disconnect_error() -> TestRe
         .ensure(&rmux)
         .await?;
     let pane = session.pane(0, 0);
-    let wait_task = tokio::spawn(async move { pane.wait_for(b"never-observed").await });
+    let armed_wait = pane.wait_for_next(b"never-observed").await?;
 
-    tokio::time::sleep(WAIT_SETTLE).await;
     let handle = harness.handle.take().expect("daemon handle present");
     handle.shutdown().await?;
 
-    let result = tokio::time::timeout(SDK_WAIT_BOUNDARY_TIMEOUT, wait_task)
+    let result = tokio::time::timeout(SDK_WAIT_BOUNDARY_TIMEOUT, armed_wait)
         .await
-        .expect("wait future must resolve after daemon reset")
-        .expect("wait task must not panic");
+        .expect("wait future must resolve after daemon reset");
 
     match result {
         Err(RmuxError::Transport {

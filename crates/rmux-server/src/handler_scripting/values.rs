@@ -8,12 +8,6 @@ pub(super) fn parse_usize(command: &str, flag: &str, value: &str) -> Result<usiz
     })
 }
 
-pub(super) fn parse_i64(command: &str, flag: &str, value: &str) -> Result<i64, RmuxError> {
-    value
-        .parse()
-        .map_err(|error| RmuxError::Server(format!("{command} {flag} expects an integer: {error}")))
-}
-
 pub(super) fn parse_u16(command: &str, flag: &str, value: &str) -> Result<u16, RmuxError> {
     value.parse().map_err(|error| {
         RmuxError::Server(format!(
@@ -58,10 +52,24 @@ pub(super) fn parse_f64(command: &str, flag: &str, value: &str) -> Result<f64, R
     })
 }
 
+pub(super) fn parse_non_negative_f64(
+    command: &str,
+    flag: &str,
+    value: &str,
+) -> Result<f64, RmuxError> {
+    let parsed = parse_f64(command, flag, value)?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err(RmuxError::Server(format!(
+            "{command} {flag} expects a non-negative finite delay"
+        )));
+    }
+    Ok(parsed)
+}
+
 pub(super) fn missing_argument(command: &str, argument: &str) -> RmuxError {
     RmuxError::Server(format!("{command} requires {argument}"))
 }
 
 pub(super) fn unsupported_flag(command: &str, flag: &str) -> RmuxError {
-    RmuxError::Server(format!("unsupported {command} flag: {flag}"))
+    RmuxError::Server(format!("command {command}: unknown flag {flag}"))
 }

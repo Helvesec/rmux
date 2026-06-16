@@ -300,6 +300,7 @@ impl EnsureSession {
                 .clone()
                 .map(rmux_proto::ProcessCommand::from),
             client_environment: None,
+            skip_environment_update: false,
         }
     }
 }

@@ -43,6 +43,7 @@ impl RequestHandler {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                exit_status: None,
             });
         }
 
@@ -81,6 +82,7 @@ impl RequestHandler {
                         return Ok(QueueCommandAction::Normal {
                             output: None,
                             error: None,
+                            exit_status: None,
                         });
                     }
                     popup.nested_menu = Some(built);
@@ -90,6 +92,7 @@ impl RequestHandler {
                     return Ok(QueueCommandAction::Normal {
                         output: None,
                         error: None,
+                        exit_status: None,
                     });
                 }
                 None => {
@@ -103,6 +106,7 @@ impl RequestHandler {
         Ok(QueueCommandAction::Normal {
             output: None,
             error: None,
+            exit_status: None,
         })
     }
 
@@ -112,24 +116,40 @@ impl RequestHandler {
         command: ParsedDisplayPopupCommand,
         context: &QueueExecutionContext,
     ) -> Result<QueueCommandAction, RmuxError> {
-        let attach_pid = self
+        if command.close_existing {
+            if let Ok(attach_pid) = self
+                .resolve_overlay_client(
+                    requester_pid,
+                    command.target_client.as_deref(),
+                    "display-popup",
+                )
+                .await
+            {
+                let _ = self.clear_interactive_overlay(attach_pid, true).await;
+            }
+            return Ok(QueueCommandAction::Normal {
+                output: None,
+                error: None,
+                exit_status: None,
+            });
+        }
+
+        let attach_pid = match self
             .resolve_overlay_client(
                 requester_pid,
                 command.target_client.as_deref(),
                 "display-popup",
             )
-            .await?;
-        if command.close_existing {
-            let _ = self.clear_interactive_overlay(attach_pid, true).await;
-            return Ok(QueueCommandAction::Normal {
-                output: None,
-                error: None,
-            });
-        }
+            .await
+        {
+            Ok(attach_pid) => attach_pid,
+            Err(error) => return Err(error),
+        };
         if self.mode_tree_active(attach_pid).await {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                exit_status: None,
             });
         }
 
@@ -152,6 +172,7 @@ impl RequestHandler {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                exit_status: None,
             });
         }
 
@@ -180,6 +201,7 @@ impl RequestHandler {
         Ok(QueueCommandAction::Normal {
             output: None,
             error: None,
+            exit_status: None,
         })
     }
 

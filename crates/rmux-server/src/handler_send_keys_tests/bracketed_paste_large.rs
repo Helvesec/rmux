@@ -16,9 +16,10 @@ async fn live_attach_large_bracketed_paste_survives_irregular_chunks() {
         .register_attach(requester_pid, alpha.clone(), control_tx)
         .await;
 
-    let expected = large_bracketed_paste_bytes();
-    assert!(expected.len() >= LARGE_PASTE_TARGET_BYTES);
-    assert!(expected.len() < DEFAULT_MAX_FRAME_LENGTH);
+    let input = large_bracketed_paste_bytes();
+    let expected = bracketed_paste_body(&input);
+    assert!(input.len() >= LARGE_PASTE_TARGET_BYTES);
+    assert!(input.len() < DEFAULT_MAX_FRAME_LENGTH);
 
     let capture = RawPaneInputProbe::start(
         &handler,
@@ -31,13 +32,13 @@ async fn live_attach_large_bracketed_paste_survives_irregular_chunks() {
     let mut pending_input = Vec::new();
     let mut offset = 0;
     for width in CHUNK_PATTERN.iter().copied().cycle() {
-        if offset == expected.len() {
+        if offset == input.len() {
             break;
         }
 
-        let end = expected.len().min(offset + width);
+        let end = input.len().min(offset + width);
         handler
-            .handle_attached_live_input(requester_pid, &mut pending_input, &expected[offset..end])
+            .handle_attached_live_input(requester_pid, &mut pending_input, &input[offset..end])
             .await
             .expect("large bracketed paste chunk");
         offset = end;
@@ -45,7 +46,11 @@ async fn live_attach_large_bracketed_paste_survives_irregular_chunks() {
     assert!(pending_input.is_empty());
 
     capture.finish(&handler, &alpha).await;
-    capture.assert_contents(&handler, &expected).await;
+    capture.assert_contents(&handler, expected).await;
+}
+
+fn bracketed_paste_body(bytes: &[u8]) -> &[u8] {
+    &bytes[b"\x1b[200~".len()..bytes.len() - b"\x1b[201~".len()]
 }
 
 fn large_bracketed_paste_bytes() -> Vec<u8> {

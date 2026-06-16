@@ -1,5 +1,7 @@
-use rmux_core::{OptionStore, Pane, Session, Window};
+use rmux_core::{OptionStore, Pane, PaneGeometry, Session, Window};
 use rmux_proto::{OptionName, ResizePaneAdjustment, TerminalSize};
+
+use crate::pane_visible_geometry::{clip_pane_geometry, visible_pane_content_geometry};
 
 use super::RuntimeFormatContext;
 
@@ -64,6 +66,46 @@ impl RuntimeFormatContext<'_> {
             .map(Pane::index)
             .unwrap_or_else(|| window.active_pane_index());
         window.pane(pane_index).cloned()
+    }
+
+    pub(super) fn visible_pane_geometry(&self) -> Option<PaneGeometry> {
+        let session = self.session?;
+        let window = self.visible_window_snapshot()?;
+        let window_index = self
+            .window_index
+            .unwrap_or_else(|| session.active_window_index());
+        let content_rows = window.size().rows;
+        let pane_index = self
+            .pane
+            .map(Pane::index)
+            .unwrap_or_else(|| window.active_pane_index());
+        if window.is_zoomed() && pane_index == window.active_pane_index() {
+            let size = window.size();
+            let geometry = PaneGeometry::new(0, 0, size.cols, size.rows);
+            return Some(match self.option_store() {
+                Some(options) => visible_pane_content_geometry(
+                    options,
+                    session.name(),
+                    window_index,
+                    geometry,
+                    content_rows,
+                ),
+                None => clip_pane_geometry(geometry, content_rows),
+            });
+        }
+        self.visible_pane_snapshot().map(|pane| {
+            let geometry = pane.geometry();
+            match self.option_store() {
+                Some(options) => visible_pane_content_geometry(
+                    options,
+                    session.name(),
+                    window_index,
+                    geometry,
+                    content_rows,
+                ),
+                None => clip_pane_geometry(geometry, content_rows),
+            }
+        })
     }
 }
 

@@ -8,10 +8,11 @@ use serde::Serialize;
 use tokio::time::timeout;
 
 use super::{
-    AuthMessage, AuthWireMessage, AUTH_FRAME_TIMEOUT, CAPACITY_REACHED, HANDSHAKE_REJECTED,
+    AuthMessage, AuthWireMessage, AUTH_FRAME_TIMEOUT, HANDSHAKE_REJECTED, PANE_FRAME_CAPABILITY,
     PRE_AUTH_TIMEOUT, SERVER_CAPABILITIES, WEB_SHARE_PROTOCOL_VERSION,
 };
 use crate::web::crypto::{parse_client_hello, ClientHello, FrameOpener, E2EE_CAPABILITY};
+use crate::web::record::{OPERATOR_LIMIT_ERROR, SPECTATOR_LIMIT_ERROR};
 use crate::web::websocket::{WebSocket, WebSocketMessage};
 
 #[derive(Debug, Serialize)]
@@ -26,7 +27,7 @@ enum ServerHandshakeMessage<'a> {
     },
 }
 
-/// Reads and parses the v4 client hello.
+/// Reads and parses the v1 client hello.
 ///
 /// On failure the `Err` carries the PRECISE internal reason for server-side
 /// logging only; the caller collapses every pre-ready failure to
@@ -42,7 +43,7 @@ pub(crate) async fn read_client_hello(socket: &mut WebSocket) -> Result<ClientHe
     parse_client_hello(&text, WEB_SHARE_PROTOCOL_VERSION).map_err(|_| "invalid_hello")
 }
 
-/// Serializes the v4 challenge to its EXACT wire text.
+/// Serializes the v1 challenge to its EXACT wire text.
 ///
 /// Split from sending so the caller can bind the same bytes it transmits into
 /// the session key schedule (handshake transcript binding).
@@ -101,7 +102,14 @@ pub(crate) async fn read_auth_message(
     {
         return Err("missing_e2ee_capability");
     }
-    Ok(AuthMessage { pin: wire.pin })
+    let supports_session_pane_frame = wire
+        .capabilities
+        .iter()
+        .any(|capability| capability == PANE_FRAME_CAPABILITY);
+    Ok(AuthMessage {
+        pin: wire.pin,
+        supports_session_pane_frame,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -112,20 +120,20 @@ pub(crate) struct AuthClose {
 
 /// Maps an open-token error to a precise internal reason and safe wire close.
 ///
-/// Role capacity is only reached after the token-authenticated channel and PIN
-/// check succeed, so it can use a distinct close code without becoming a
-/// token/PIN oracle. All other auth errors stay collapsed.
+/// Capacity errors are logged precisely but collapse on the wire with other auth
+/// failures. Otherwise a full PIN-protected share can confirm whether a guessed
+/// PIN was valid by returning a distinct capacity close code.
 pub(crate) fn close_for_auth_error(error: &str) -> AuthClose {
-    if error.contains("spectator limit") {
+    if is_server_error(error, SPECTATOR_LIMIT_ERROR) {
         return AuthClose {
             reason: "spectator_cap_reached",
-            wire_close: CAPACITY_REACHED,
+            wire_close: HANDSHAKE_REJECTED,
         };
     }
-    if error.contains("operator limit") {
+    if is_server_error(error, OPERATOR_LIMIT_ERROR) {
         return AuthClose {
             reason: "operator_cap_reached",
-            wire_close: CAPACITY_REACHED,
+            wire_close: HANDSHAKE_REJECTED,
         };
     }
     if error.contains("missing web-share pairing code") {
@@ -146,6 +154,10 @@ pub(crate) fn close_for_auth_error(error: &str) -> AuthClose {
     }
 }
 
+fn is_server_error(error: &str, message: &str) -> bool {
+    error == message || error.strip_prefix("server error: ") == Some(message)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -155,18 +167,20 @@ mod tests {
 
         assert_eq!(
             challenge,
-            r#"{"type":"challenge","protocol_version":1,"capabilities":["e2ee-token-auth","terminal-palette-v1"],"server_nonce":"nonce","server_public":"server-public","server_ml_kem_ct":"ml-kem-ct"}"#
+            r#"{"type":"challenge","protocol_version":1,"capabilities":["e2ee-token-auth","terminal-palette-v1","pane-frame-v1"],"server_nonce":"nonce","server_public":"server-public","server_ml_kem_ct":"ml-kem-ct"}"#
         );
     }
 
     #[test]
-    fn role_capacity_auth_errors_use_capacity_close_code() {
+    fn role_capacity_auth_errors_are_collapsed_on_the_wire() {
         for error in [
-            "web-share spectator limit reached",
-            "web-share operator limit reached",
+            super::SPECTATOR_LIMIT_ERROR.to_owned(),
+            super::OPERATOR_LIMIT_ERROR.to_owned(),
+            format!("server error: {}", super::SPECTATOR_LIMIT_ERROR),
+            format!("server error: {}", super::OPERATOR_LIMIT_ERROR),
         ] {
-            let close = super::close_for_auth_error(error);
-            assert_eq!(close.wire_close, super::CAPACITY_REACHED);
+            let close = super::close_for_auth_error(&error);
+            assert_eq!(close.wire_close, super::HANDSHAKE_REJECTED);
         }
     }
 

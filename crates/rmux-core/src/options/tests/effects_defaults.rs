@@ -113,7 +113,7 @@ fn default_size_rejects_empty_width_or_height() {
 }
 
 #[test]
-fn append_on_choice_type_rejects_with_non_array_error() {
+fn append_on_choice_type_is_rejected() {
     let mut store = OptionStore::new();
 
     let error = store
@@ -123,16 +123,58 @@ fn append_on_choice_type_rejects_with_non_array_error() {
             "centre".to_owned(),
             SetOptionMode::Append,
         )
-        .expect_err("choice append must fail");
+        .expect_err("choice append is not a real append");
 
     assert_eq!(
         error,
         RmuxError::InvalidSetOption("status-justify is not an array option".to_owned())
     );
+    assert_eq!(store.global_value(OptionName::StatusJustify), None);
 }
 
 #[test]
-fn append_on_number_type_rejects_with_non_array_error() {
+fn invalid_choice_value_uses_tmux_error_text() {
+    let mut store = OptionStore::new();
+
+    let error = store
+        .set(
+            ScopeSelector::Global,
+            OptionName::Status,
+            "maybe".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect_err("invalid choice must fail");
+
+    assert_eq!(
+        error,
+        RmuxError::InvalidSetOption("unknown value: maybe".to_owned())
+    );
+}
+
+#[test]
+fn invalid_flag_value_uses_tmux_error_text() {
+    let mut store = OptionStore::new();
+
+    let error = store
+        .set_by_name(
+            OptionScopeSelector::WindowGlobal,
+            "automatic-rename",
+            Some("false".to_owned()),
+            SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect_err("invalid flag value must fail");
+
+    assert_eq!(
+        error,
+        RmuxError::InvalidSetOption("bad value: false".to_owned())
+    );
+}
+
+#[test]
+fn append_on_number_type_is_rejected() {
     let mut store = OptionStore::new();
 
     let error = store
@@ -142,11 +184,43 @@ fn append_on_number_type_rejects_with_non_array_error() {
             "100".to_owned(),
             SetOptionMode::Append,
         )
-        .expect_err("number append must fail");
+        .expect_err("number append is not a real append");
 
     assert_eq!(
         error,
         RmuxError::InvalidSetOption("history-limit is not an array option".to_owned())
+    );
+    assert_eq!(store.global_value(OptionName::HistoryLimit), None);
+}
+
+#[test]
+fn invalid_number_values_use_tmux_error_text() {
+    let mut store = OptionStore::new();
+
+    let too_small = store
+        .set(
+            ScopeSelector::Global,
+            OptionName::HistoryLimit,
+            "-5".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect_err("negative history-limit must fail");
+    assert_eq!(
+        too_small,
+        RmuxError::InvalidSetOption("value is too small: -5".to_owned())
+    );
+
+    let invalid = store
+        .set(
+            ScopeSelector::Global,
+            OptionName::DisplayTime,
+            "abc".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect_err("non-numeric display-time must fail");
+    assert_eq!(
+        invalid,
+        RmuxError::InvalidSetOption("value is invalid: abc".to_owned())
     );
 }
 
@@ -191,7 +265,7 @@ fn status_format_array_default_resolves_tmux_entries_in_snapshot() {
 }
 
 #[test]
-fn status_right_default_uses_machine_name() {
+fn status_right_default_uses_pane_title() {
     let store = OptionStore::new();
     let alpha = session_name("alpha");
     let value = store
@@ -199,8 +273,8 @@ fn status_right_default_uses_machine_name() {
         .expect("status-right default resolves");
 
     assert!(
-        value.contains("#{=21:host_short}"),
-        "status-right should show the machine name, got {value:?}"
+        value.contains("#{=21:pane_title}"),
+        "status-right should show the pane title, got {value:?}"
     );
 }
 

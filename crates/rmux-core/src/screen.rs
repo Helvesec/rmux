@@ -61,7 +61,10 @@ pub struct Screen {
     bell_count: u64,
     terminal_passthrough: Vec<TerminalPassthrough>,
     dropped_terminal_passthrough_count: u64,
+    has_selected_cells: bool,
     utf8_config: Utf8Config,
+    alternate_screen_enabled: bool,
+    preserve_alternate_screen_cursor: bool,
 }
 
 impl Screen {
@@ -93,7 +96,10 @@ impl Screen {
             bell_count: 0,
             terminal_passthrough: Vec::new(),
             dropped_terminal_passthrough_count: 0,
+            has_selected_cells: false,
             utf8_config: Utf8Config::default(),
+            alternate_screen_enabled: true,
+            preserve_alternate_screen_cursor: false,
         };
         screen.reset_tabs();
         screen
@@ -139,6 +145,18 @@ impl Screen {
     /// Sets the current screen title.
     pub fn set_title(&mut self, title: impl Into<String>) {
         self.title = title.into();
+    }
+
+    /// Enables or disables DEC alternate-screen entry for this screen.
+    ///
+    /// Exit sequences are still honored by the writer so disabling the option
+    /// while a pane is already in alternate screen does not trap it there.
+    pub fn set_alternate_screen_enabled(&mut self, enabled: bool) {
+        self.alternate_screen_enabled = enabled;
+    }
+
+    pub(crate) fn set_preserve_alternate_screen_cursor(&mut self, enabled: bool) {
+        self.preserve_alternate_screen_cursor = enabled;
     }
 
     /// Returns the most recent OSC 7 path.
@@ -236,6 +254,22 @@ impl Screen {
         true
     }
 
+    /// Trims all lines below the cursor and pulls history into the viewport.
+    pub fn trim_below_cursor(&mut self) -> bool {
+        let cursor_absolute_y = self.cursor_absolute_y();
+        if !self.grid.truncate_after_absolute_line(cursor_absolute_y) {
+            return false;
+        }
+
+        let history_size = self.grid.hsize();
+        self.cursor_y = cursor_absolute_y
+            .saturating_sub(history_size)
+            .min(self.grid.sy().saturating_sub(1) as usize) as u32;
+        self.cursor_x = self.cursor_x.min(self.max_cursor_x());
+        self.pending_wrap = false;
+        true
+    }
+
     /// Returns the current retained history size in bytes.
     #[must_use]
     pub fn history_bytes(&self) -> usize {
@@ -303,6 +337,7 @@ impl Screen {
 
     /// Resizes the screen and resets the scroll region.
     pub fn resize(&mut self, size: TerminalSize) {
+        self.clear_selected_cells();
         let cols = u32::from(size.cols.max(1));
         let rows = u32::from(size.rows.max(1));
         if cols != self.grid.sx() {
@@ -321,6 +356,7 @@ impl Screen {
 
     /// Clears history and optionally resets stored hyperlinks.
     pub fn clear_history_and_hyperlinks(&mut self, reset_hyperlinks: bool) {
+        self.clear_selected_cells();
         self.grid.clear_history();
         if reset_hyperlinks {
             self.hyperlinks.reset();
@@ -410,6 +446,7 @@ impl Screen {
     }
 
     fn clear_line_range(&mut self, y: u32, start: u32, end_inclusive: u32, bg: i32) {
+        self.clear_selected_cells();
         let sx = self.grid.sx();
         let end = end_inclusive.min(sx.saturating_sub(1));
         let Some(line) = self.grid.visible_line_mut(y) else {
@@ -425,6 +462,7 @@ impl Screen {
     }
 
     fn clear_screen_region(&mut self, start_y: u32, end_y_inclusive: u32, bg: i32) {
+        self.clear_selected_cells();
         for y in start_y..=end_y_inclusive.min(self.grid.sy().saturating_sub(1)) {
             if let Some(line) = self.grid.visible_line_mut(y) {
                 line.clear(bg);
@@ -436,6 +474,7 @@ impl Screen {
         if self.grid.sx() == 0 || self.grid.sy() == 0 {
             return;
         }
+        self.clear_selected_cells();
 
         let ch = if acs { acs::translate_acs(ch) } else { ch };
         let width = u32::from(self.utf8_config.width(ch));
@@ -498,6 +537,69 @@ impl Screen {
             self.cursor_x = x.saturating_add(width).min(self.max_cursor_x());
             self.pending_wrap = false;
         }
+    }
+
+    fn write_plain_ascii_run(&mut self, mut bytes: &[u8], cell: &CellState, acs: bool) -> bool {
+        if bytes.is_empty() {
+            return true;
+        }
+        if acs
+            || cell.attr() != 0
+            || cell.fg() != COLOUR_DEFAULT
+            || cell.bg() != COLOUR_DEFAULT
+            || cell.us() != COLOUR_DEFAULT
+            || cell.link() != 0
+            || self.grid.sx() == 0
+            || self.grid.sy() == 0
+        {
+            return false;
+        }
+        self.clear_selected_cells();
+
+        while !bytes.is_empty() {
+            let automatic_wrap_continuation =
+                self.pending_wrap && (self.mode & mode::MODE_WRAP) != 0;
+            self.apply_pending_wrap();
+            if self.cursor_y >= self.grid.sy() {
+                return false;
+            }
+
+            let sx = self.grid.sx();
+            let x = self.cursor_column();
+            if x == 0 && !automatic_wrap_continuation {
+                self.break_previous_wrapped_line();
+            }
+
+            if (self.mode & mode::MODE_WRAP) == 0 {
+                let available = sx.saturating_sub(x) as usize;
+                if bytes.len() > available {
+                    return false;
+                }
+            }
+
+            let writable = sx.saturating_sub(x) as usize;
+            if writable == 0 {
+                return false;
+            }
+            let chunk_len = bytes.len().min(writable);
+            let (chunk, rest) = bytes.split_at(chunk_len);
+            let Some(line) = self.current_line_mut() else {
+                return false;
+            };
+            if !line.write_plain_ascii_run(x, chunk) {
+                return false;
+            }
+
+            if (self.mode & mode::MODE_WRAP) != 0 && x + chunk_len as u32 >= sx {
+                self.cursor_x = self.max_cursor_x();
+                self.pending_wrap = true;
+            } else {
+                self.cursor_x = x.saturating_add(chunk_len as u32).min(self.max_cursor_x());
+                self.pending_wrap = false;
+            }
+            bytes = rest;
+        }
+        true
     }
 
     fn break_previous_wrapped_line(&mut self) {

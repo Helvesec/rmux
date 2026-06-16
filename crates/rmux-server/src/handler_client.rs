@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
 use rmux_core::formats::{is_truthy, FormatContext};
-use rmux_proto::request::{ListClientsRequest, RefreshClientRequest, SuspendClientRequest};
+use rmux_proto::request::{ListClientsRequest, SuspendClientRequest};
 use rmux_proto::{
-    ErrorResponse, ListClientsResponse, RefreshClientResponse, Response, RmuxError,
-    SuspendClientResponse, TerminalGeometry, TerminalSize,
+    ErrorResponse, ListClientsResponse, Response, RmuxError, SuspendClientResponse,
+    TerminalGeometry, TerminalSize,
 };
 
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
@@ -13,17 +13,18 @@ use crate::pane_io::AttachControl;
 use crate::pane_terminals::session_not_found;
 
 use super::{
-    attach_support::ClientFlags, attached_client_matches_target, clipboard_query_sequence,
-    command_output_from_lines, control_support::ManagedClient, format_client_uid,
-    format_client_user, format_requester_uid, normalize_target_client,
-    session_selection_prefers_live_process, sort_list_clients, RequestHandler,
-    LIST_CLIENTS_TEMPLATE,
+    attach_support::ClientFlags, attached_client_matches_target, command_output_from_lines,
+    control_support::ManagedClient, format_client_uid, format_client_user, format_requester_uid,
+    normalize_target_client, session_selection_prefers_live_process, sort_list_clients,
+    RequestHandler, LIST_CLIENTS_TEMPLATE,
 };
 
 #[path = "handler_client/attach.rs"]
 mod attach;
 #[path = "handler_client/detach.rs"]
 mod detach;
+#[path = "handler_client/refresh.rs"]
+mod refresh;
 #[path = "handler_client/switching.rs"]
 mod switching;
 
@@ -303,131 +304,6 @@ impl RequestHandler {
             session.touch_attached();
             session.resize_terminal(client_size);
             Ok(())
-        })
-    }
-
-    pub(in crate::handler) async fn handle_refresh_client(
-        &self,
-        requester_pid: u32,
-        request: RefreshClientRequest,
-    ) -> Response {
-        let control_only_requested = !request.subscriptions.is_empty()
-            || !request.subscriptions_format.is_empty()
-            || request.control_size.is_some()
-            || request.colour_report.is_some();
-        if control_only_requested {
-            return Response::Error(ErrorResponse {
-                error: RmuxError::Server(
-                    "refresh-client control-mode flags are not yet available".to_owned(),
-                ),
-            });
-        }
-
-        let attach_pid = match self
-            .resolve_target_attach_client_pid(
-                requester_pid,
-                request.target_client.as_deref(),
-                "refresh-client",
-            )
-            .await
-        {
-            Ok(attach_pid) => attach_pid,
-            Err(error) => return Response::Error(ErrorResponse { error }),
-        };
-
-        let pan_actions = usize::from(request.clear_pan)
-            + usize::from(request.pan_left)
-            + usize::from(request.pan_right)
-            + usize::from(request.pan_up)
-            + usize::from(request.pan_down);
-        if pan_actions > 1 {
-            return Response::Error(ErrorResponse {
-                error: RmuxError::Server(
-                    "refresh-client accepts only one of -c, -L, -R, -U, or -D".to_owned(),
-                ),
-            });
-        }
-        if request.adjustment.is_some() && pan_actions == 0 {
-            return Response::Error(ErrorResponse {
-                error: RmuxError::Server(
-                    "refresh-client adjustment requires a pan direction".to_owned(),
-                ),
-            });
-        }
-
-        let mut needs_full_refresh = !request.status_only;
-        let clipboard_query = request.clipboard_query;
-        let session_name = {
-            let mut active_attach = self.active_attach.lock().await;
-            let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
-                return Response::Error(ErrorResponse {
-                    error: attached_client_required("refresh-client"),
-                });
-            };
-
-            let raw_flag = request.flags.as_deref().or(request.flags_alias.as_deref());
-            if let Some(raw) = raw_flag {
-                let mut merged_flags = active.flags;
-                for token in raw.split(',').filter(|t| !t.is_empty()) {
-                    if let Err(error) = merged_flags.apply_named(token) {
-                        return Response::Error(ErrorResponse { error });
-                    }
-                }
-                if !active.can_write {
-                    merged_flags = merged_flags.with_read_only();
-                }
-                active.flags = merged_flags;
-            }
-
-            let adjustment = request.adjustment.unwrap_or(1);
-            if request.clear_pan {
-                active.pan_window = None;
-                active.pan_ox = 0;
-                active.pan_oy = 0;
-            } else if request.pan_left || request.pan_right || request.pan_up || request.pan_down {
-                active.pan_window = Some(active.pan_window.unwrap_or(0));
-                if request.pan_left {
-                    active.pan_ox = active.pan_ox.saturating_sub(adjustment);
-                }
-                if request.pan_right {
-                    active.pan_ox = active.pan_ox.saturating_add(adjustment);
-                }
-                if request.pan_up {
-                    active.pan_oy = active.pan_oy.saturating_sub(adjustment);
-                }
-                if request.pan_down {
-                    active.pan_oy = active.pan_oy.saturating_add(adjustment);
-                }
-            }
-            active.session_name.clone()
-        };
-
-        if request.status_only {
-            if let Err(error) = self
-                .refresh_attached_client_status(attach_pid, &session_name)
-                .await
-            {
-                return Response::Error(ErrorResponse { error });
-            }
-            needs_full_refresh = false;
-        }
-        if clipboard_query {
-            let _ = self
-                .send_attach_control(
-                    attach_pid,
-                    AttachControl::Write(clipboard_query_sequence()),
-                    "refresh-client",
-                    None,
-                )
-                .await;
-        }
-        if needs_full_refresh {
-            self.refresh_attached_client(attach_pid, &session_name)
-                .await;
-        }
-
-        Response::RefreshClient(RefreshClientResponse {
-            target_client: attach_pid.to_string(),
         })
     }
 

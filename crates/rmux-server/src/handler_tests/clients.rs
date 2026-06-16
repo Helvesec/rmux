@@ -1,4 +1,5 @@
 use super::*;
+use crate::control::ControlServerEvent;
 
 #[tokio::test]
 async fn attached_client_flags_keep_tmux_order_for_extended_flag_sets() {
@@ -117,6 +118,115 @@ async fn control_client_flags_keep_tmux_order_for_extended_flag_sets() {
 }
 
 #[tokio::test]
+async fn refresh_client_control_size_resizes_real_control_session() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let alpha = session_name("alpha");
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let _control_id = handler
+        .register_control_with_closing(
+            requester_pid,
+            ControlModeUpgrade {
+                mode: ControlMode::Plain,
+                terminal_context: crate::outer_terminal::OuterTerminalContext::default(),
+            },
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+    handler
+        .set_control_session(requester_pid, Some(alpha.clone()))
+        .await
+        .expect("set control session");
+    while event_rx.try_recv().is_ok() {}
+
+    let mut lifecycle_events = handler.subscribe_lifecycle_events();
+    let response = handler
+        .dispatch(
+            requester_pid,
+            Request::RefreshClient(rmux_proto::request::RefreshClientRequest {
+                target_client: None,
+                adjustment: None,
+                clear_pan: false,
+                pan_left: false,
+                pan_right: false,
+                pan_up: false,
+                pan_down: false,
+                status_only: false,
+                clipboard_query: false,
+                flags: None,
+                flags_alias: None,
+                subscriptions: Vec::new(),
+                subscriptions_format: Vec::new(),
+                control_size: Some("100x30".to_owned()),
+                colour_report: None,
+            }),
+        )
+        .await
+        .response;
+    loop {
+        match lifecycle_events.try_recv() {
+            Ok(event) => handler.dispatch_lifecycle_hook(event).await,
+            Err(
+                tokio::sync::broadcast::error::TryRecvError::Empty
+                | tokio::sync::broadcast::error::TryRecvError::Closed,
+            ) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                panic!("lifecycle events lagged during test: {skipped}");
+            }
+        }
+    }
+
+    assert!(matches!(response, Response::RefreshClient(_)));
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state
+            .sessions
+            .session(&alpha)
+            .expect("session exists")
+            .window()
+            .size(),
+        TerminalSize {
+            cols: 100,
+            rows: 30
+        }
+    );
+    drop(state);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut saw_layout_change = false;
+    while tokio::time::Instant::now() < deadline {
+        let Some(event) = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
+            .await
+            .ok()
+            .flatten()
+        else {
+            continue;
+        };
+        if matches!(event, ControlServerEvent::Notification(ref line) if line.starts_with("%layout-change "))
+        {
+            saw_layout_change = true;
+            break;
+        }
+    }
+    assert!(
+        saw_layout_change,
+        "control client should receive a layout-change notification"
+    );
+}
+
+#[tokio::test]
 async fn control_client_flags_without_session_emit_only_control_mode() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
@@ -146,6 +256,118 @@ async fn control_client_flags_without_session_emit_only_control_mode() {
         super::super::format_control_client_flags(active),
         "control-mode"
     );
+}
+
+#[tokio::test]
+async fn detach_client_target_session_detaches_control_clients() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+
+    for session_name in [&alpha, &beta] {
+        let response = handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session_name.clone(),
+                detached: true,
+                size: None,
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(response, Response::NewSession(_)));
+    }
+
+    let mut event_receivers = Vec::new();
+    for (pid, session_name) in [(101, &alpha), (102, &alpha), (201, &beta)] {
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let _control_id = handler
+            .register_control_with_closing(
+                pid,
+                ControlModeUpgrade {
+                    mode: ControlMode::Plain,
+                    terminal_context: crate::outer_terminal::OuterTerminalContext::default()
+                        .with_client_terminal(&rmux_proto::ClientTerminalContext {
+                            terminal_features: Vec::new(),
+                            utf8: true,
+                        }),
+                },
+                event_tx,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+        handler
+            .set_control_session(pid, Some(session_name.clone()))
+            .await
+            .expect("control session set");
+        event_receivers.push(event_rx);
+    }
+
+    let response = handler
+        .handle(Request::DetachClientExt(
+            rmux_proto::DetachClientExtRequest {
+                target_client: None,
+                all_other_clients: false,
+                target_session: Some(alpha),
+                kill_on_detach: false,
+                exec_command: None,
+            },
+        ))
+        .await;
+    assert_eq!(
+        response,
+        Response::DetachClient(rmux_proto::DetachClientResponse)
+    );
+
+    let active_control = handler.active_control.lock().await;
+    assert!(!active_control.by_pid.contains_key(&101));
+    assert!(!active_control.by_pid.contains_key(&102));
+    assert!(active_control.by_pid.contains_key(&201));
+}
+
+#[tokio::test]
+async fn control_mode_attach_session_tracks_the_control_clients_session() {
+    let handler = RequestHandler::new();
+    let requester_pid = 301;
+    let alpha = session_name("alpha");
+
+    let response = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(response, Response::NewSession(_)));
+
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let _control_id = handler
+        .register_control_with_closing(
+            requester_pid,
+            ControlModeUpgrade {
+                mode: ControlMode::Plain,
+                terminal_context: crate::outer_terminal::OuterTerminalContext::default()
+                    .with_client_terminal(&rmux_proto::ClientTerminalContext {
+                        terminal_features: Vec::new(),
+                        utf8: true,
+                    }),
+            },
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+
+    let commands = parse_command_string("attach-session -t $0").expect("command parses");
+    let result = handler
+        .execute_control_commands(requester_pid, commands)
+        .await;
+    assert_eq!(result.error, None);
+
+    let active_control = handler.active_control.lock().await;
+    let active = active_control
+        .by_pid
+        .get(&requester_pid)
+        .expect("control client remains registered");
+    assert_eq!(active.session_name.as_ref(), Some(&alpha));
 }
 
 #[tokio::test]

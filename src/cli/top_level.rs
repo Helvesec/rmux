@@ -7,6 +7,7 @@ use super::ExitFailure;
 
 const RMUX_USAGE: &str = "usage: rmux [-2CDhlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]";
 const RMUX_LONG_OPTION_USAGE: &str = "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]";
+const RMUX_LONG_HELP: &str = "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n\nRMUX extensions:\n  capabilities [--human|--json]\n  diagnose [--human|--json]\n  web-share [flags]\n  web-share list|lookup|stop|disconnect|off|config\n\nUse `rmux list-commands` for the tmux-compatible command surface.";
 
 pub(super) fn top_level_parse_failure(args: &[OsString]) -> Option<ExitFailure> {
     let mut index = 0;
@@ -18,6 +19,9 @@ pub(super) fn top_level_parse_failure(args: &[OsString]) -> Option<ExitFailure> 
         }
         if !bytes.starts_with(b"-") || bytes == b"-" {
             return None;
+        }
+        if bytes == b"--help" {
+            return Some(ExitFailure::new(1, RMUX_LONG_HELP));
         }
         if bytes.starts_with(b"--") {
             return Some(ExitFailure::new(1, RMUX_LONG_OPTION_USAGE));
@@ -61,6 +65,19 @@ pub(super) fn top_level_version_requested(args: &[OsString]) -> bool {
     }
 
     false
+}
+
+pub(super) fn top_level_version_output(invoked_as_tmux: bool) -> String {
+    if invoked_as_tmux {
+        // TPM and most tmux plugin managers parse only the leading product token
+        // and version. The shim keeps the rest of the CLI on the normal rmux path.
+        return format!("tmux {}", tmux_compatible_version());
+    }
+    format!("rmux {}", env!("CARGO_PKG_VERSION"))
+}
+
+fn tmux_compatible_version() -> &'static str {
+    "3.4"
 }
 
 fn invalid_short_option_in_cluster(bytes: &[u8]) -> Option<u8> {

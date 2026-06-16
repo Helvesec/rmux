@@ -1,4 +1,6 @@
 use std::path::Path;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 use rmux_client::{connect, ClientError, Connection, StartServerError};
 use rmux_proto::ListSessionsRequest;
@@ -8,6 +10,13 @@ use super::{
     run_command_resolved, run_payload_command, write_command_output, ExitFailure, StartupOptions,
 };
 use crate::cli_args::{ClientTargetArgs, ServerAccessArgs, SessionTargetArgs};
+
+#[cfg(unix)]
+const KILL_SERVER_SOCKET_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(unix)]
+const KILL_SERVER_SOCKET_CLEANUP_MIN_POLL: Duration = Duration::from_millis(1);
+#[cfg(unix)]
+const KILL_SERVER_SOCKET_CLEANUP_MAX_POLL: Duration = Duration::from_millis(10);
 
 pub(super) fn run_start_server(
     socket_path: &Path,
@@ -44,12 +53,29 @@ pub(super) fn run_kill_server(socket_path: &Path) -> Result<i32, ExitFailure> {
             if let Some(output) = output {
                 write_command_output(&output)?;
             }
+            wait_for_killed_server_socket_cleanup(socket_path);
             Ok(0)
         }
-        Err(error) if kill_server_connection_closed(&error) => Ok(0),
+        Err(error) if kill_server_connection_closed(&error) => {
+            wait_for_killed_server_socket_cleanup(socket_path);
+            Ok(0)
+        }
         Err(error) => Err(ExitFailure::from_client(error)),
     }
 }
+
+#[cfg(unix)]
+fn wait_for_killed_server_socket_cleanup(socket_path: &Path) {
+    let deadline = Instant::now() + KILL_SERVER_SOCKET_CLEANUP_TIMEOUT;
+    let mut next_poll = KILL_SERVER_SOCKET_CLEANUP_MIN_POLL;
+    while socket_path.exists() && Instant::now() < deadline {
+        std::thread::sleep(next_poll);
+        next_poll = (next_poll + next_poll).min(KILL_SERVER_SOCKET_CLEANUP_MAX_POLL);
+    }
+}
+
+#[cfg(not(unix))]
+fn wait_for_killed_server_socket_cleanup(_socket_path: &Path) {}
 
 pub(super) fn run_server_access(
     args: ServerAccessArgs,

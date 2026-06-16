@@ -16,6 +16,8 @@ use super::secrets::SecretHash;
 use super::tunnel::TunnelHandle;
 
 const DEFAULT_LOCAL_WEBSOCKET_ENDPOINT: &str = "ws://127.0.0.1:9777/share";
+pub(crate) const OPERATOR_LIMIT_ERROR: &str = "web-share operator limit reached";
+pub(crate) const SPECTATOR_LIMIT_ERROR: &str = "web-share spectator limit reached";
 
 #[derive(Debug)]
 pub(super) struct WebShareRecord {
@@ -98,9 +100,10 @@ impl WebShareRecord {
                     ));
                 }
                 self.pairing_codes.check(pin, role)?;
-                let lease = self.lease_book.try_spectator().ok_or_else(|| {
-                    RmuxError::Server("web-share spectator limit reached".to_owned())
-                })?;
+                let lease = self
+                    .lease_book
+                    .try_spectator()
+                    .ok_or_else(|| RmuxError::Server(SPECTATOR_LIMIT_ERROR.to_owned()))?;
                 Ok(self.access(
                     Some(lease),
                     None,
@@ -115,9 +118,10 @@ impl WebShareRecord {
                     ));
                 };
                 self.pairing_codes.check(pin, role)?;
-                let lease = self.lease_book.try_operator().ok_or_else(|| {
-                    RmuxError::Server("web-share operator limit reached".to_owned())
-                })?;
+                let lease = self
+                    .lease_book
+                    .try_operator()
+                    .ok_or_else(|| RmuxError::Server(OPERATOR_LIMIT_ERROR.to_owned()))?;
                 Ok(self.access(None, Some(lease), connection_permit, WebShareRole::Operator))
             }
         }
@@ -146,6 +150,7 @@ impl WebShareRecord {
             max_spectators: self.max_spectators,
             operator: self.operator,
             spectator: self.spectator,
+            spectator_pairing_code: self.pairing_codes.spectator().map(str::to_owned),
             role,
             share_id: self.share_id.clone(),
             revoke_rx: self.revoke_tx.subscribe(),
@@ -247,6 +252,7 @@ pub(crate) struct WebShareAccess {
     max_spectators: Option<u16>,
     operator: bool,
     spectator: bool,
+    spectator_pairing_code: Option<String>,
     revoke_rx: watch::Receiver<Option<WebShareRevokeReason>>,
     role: WebShareRole,
     share_id: String,
@@ -275,6 +281,12 @@ impl WebShareAccess {
 
     pub(crate) const fn has_spectator_access(&self) -> bool {
         self.spectator
+    }
+
+    pub(crate) fn operator_visible_spectator_pairing_code(&self) -> Option<&str> {
+        self.is_operator()
+            .then_some(self.spectator_pairing_code.as_deref())
+            .flatten()
     }
 
     pub(crate) fn connect_role(&self) -> WebShareConnectRole {

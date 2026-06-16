@@ -22,6 +22,7 @@ pub(super) fn parse_new_session(mut args: CommandTokens) -> Result<Request, Rmux
     let mut print_format = None;
     let mut print_session_info = false;
     let mut session_name = None;
+    let mut skip_environment_update = false;
     let mut working_directory = None;
     let mut window_name = None;
     let mut cols = None;
@@ -34,6 +35,7 @@ pub(super) fn parse_new_session(mut args: CommandTokens) -> Result<Request, Rmux
             "-c" => working_directory = Some(args.required("-c start-directory")?),
             "-D" => detach_other_clients = true,
             "-d" => detached = true,
+            "-E" => skip_environment_update = true,
             "-e" => environment.push(args.required("-e name=value")?),
             "-f" => flags.push(args.required("-f flags")?),
             "-F" => print_format = Some(args.required("-F format")?),
@@ -88,6 +90,7 @@ pub(super) fn parse_new_session(mut args: CommandTokens) -> Result<Request, Rmux
         command: (!command.is_empty()).then_some(command),
         process_command: None,
         client_environment: None,
+        skip_environment_update,
     }))
 }
 

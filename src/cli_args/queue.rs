@@ -84,20 +84,30 @@ fn command_argument_to_string(argument: &OsStr) -> Result<String, clap::Error> {
 }
 
 fn command_parse_error_to_clap(error: CommandParseError) -> clap::Error {
-    let message = error.message();
-    if let Some(command) = message.strip_prefix("unknown command: ") {
-        return clap::Error::raw(
-            clap::error::ErrorKind::InvalidSubcommand,
-            format!("unrecognized subcommand '{command}'"),
-        );
-    }
+    let message = cli_command_error_message(error.message());
 
-    let kind = if message.starts_with("ambiguous command: ") {
-        clap::error::ErrorKind::InvalidSubcommand
-    } else {
-        clap::error::ErrorKind::ValueValidation
-    };
+    let kind =
+        if message.starts_with("unknown command: ") || message.starts_with("ambiguous command: ") {
+            clap::error::ErrorKind::InvalidSubcommand
+        } else {
+            clap::error::ErrorKind::ValueValidation
+        };
     clap::Error::raw(kind, message.to_owned())
+}
+
+fn cli_command_error_message(message: &str) -> &str {
+    let original = message;
+    let Some(rest) = original.strip_prefix("-:") else {
+        return message;
+    };
+    let Some((line, stripped)) = rest.split_once(": ") else {
+        return original;
+    };
+    if line.bytes().all(|byte| byte.is_ascii_digit()) {
+        stripped
+    } else {
+        original
+    }
 }
 
 pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, clap::Error> {
@@ -133,23 +143,19 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
         "lock-client" => parse_command_args("lock-client", arguments).map(Command::LockClient),
         "new-window" => parse_command_args("new-window", arguments).map(Command::NewWindow),
         "kill-window" => parse_command_args("kill-window", arguments).map(Command::KillWindow),
-        "select-window" => {
-            parse_command_args("select-window", arguments).map(Command::SelectWindow)
-        }
-        "rename-window" => {
-            parse_command_args("rename-window", arguments).map(Command::RenameWindow)
-        }
+        "select-window" => parse_select_window_args(arguments).map(Command::SelectWindow),
+        "rename-window" => parse_rename_window_args(arguments).map(Command::RenameWindow),
         "next-window" => parse_command_args("next-window", arguments).map(Command::NextWindow),
         "previous-window" => {
             parse_command_args("previous-window", arguments).map(Command::PreviousWindow)
         }
         "last-window" => parse_command_args("last-window", arguments).map(Command::LastWindow),
-        "list-sessions" => {
-            parse_command_args("list-sessions", arguments).map(Command::ListSessions)
-        }
+        "list-sessions" => parse_command_args::<ListSessionsArgs>("list-sessions", arguments)
+            .and_then(ListSessionsArgs::validate)
+            .map(Command::ListSessions),
         "list-windows" => parse_command_args("list-windows", arguments).map(Command::ListWindows),
         "move-window" => parse_command_args("move-window", arguments).map(Command::MoveWindow),
-        "swap-window" => parse_command_args("swap-window", arguments).map(Command::SwapWindow),
+        "swap-window" => parse_swap_window_args(arguments).map(Command::SwapWindow),
         "rotate-window" => {
             parse_command_args("rotate-window", arguments).map(Command::RotateWindow)
         }
@@ -159,18 +165,16 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
         "respawn-window" => {
             parse_command_args("respawn-window", arguments).map(Command::RespawnWindow)
         }
-        "split-window" => parse_command_args("split-window", arguments).map(Command::SplitWindow),
+        "split-window" => parse_split_window_args(arguments).map(Command::SplitWindow),
         "swap-pane" => parse_command_args("swap-pane", arguments).map(Command::SwapPane),
         "last-pane" => parse_command_args("last-pane", arguments).map(Command::LastPane),
-        "join-pane" => parse_command_args("join-pane", arguments).map(Command::JoinPane),
-        "move-pane" => parse_command_args("move-pane", arguments).map(Command::MovePane),
+        "join-pane" => parse_join_pane_args("join-pane", arguments).map(Command::JoinPane),
+        "move-pane" => parse_join_pane_args("move-pane", arguments).map(Command::MovePane),
         "break-pane" => parse_command_args("break-pane", arguments).map(Command::BreakPane),
         "pipe-pane" => parse_command_args("pipe-pane", arguments).map(Command::PipePane),
         "respawn-pane" => parse_command_args("respawn-pane", arguments).map(Command::RespawnPane),
         "kill-pane" => parse_command_args("kill-pane", arguments).map(Command::KillPane),
-        "select-layout" => {
-            parse_command_args("select-layout", arguments).map(Command::SelectLayout)
-        }
+        "select-layout" => parse_select_layout_args(arguments).map(Command::SelectLayout),
         "next-layout" => parse_command_args("next-layout", arguments).map(Command::NextLayout),
         "previous-layout" => {
             parse_command_args("previous-layout", arguments).map(Command::PreviousLayout)
@@ -181,7 +185,9 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
         }
         "list-panes" => parse_command_args("list-panes", arguments).map(Command::ListPanes),
         "select-pane" => parse_select_pane_args(arguments).map(Command::SelectPane),
-        "copy-mode" => parse_command_args("copy-mode", arguments).map(Command::CopyMode),
+        "copy-mode" => parse_command_args::<CopyModeArgs>("copy-mode", arguments)
+            .and_then(CopyModeArgs::validate)
+            .map(Command::CopyMode),
         "clock-mode" => parse_command_args("clock-mode", arguments).map(Command::ClockMode),
         "send-keys" => parse_command_args("send-keys", arguments).map(Command::SendKeys),
         "bind-key" => parse_command_args("bind-key", arguments).map(Command::BindKey),
@@ -189,7 +195,9 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
         "list-commands" => {
             parse_command_args("list-commands", arguments).map(Command::ListCommands)
         }
-        "list-keys" => parse_command_args("list-keys", arguments).map(Command::ListKeys),
+        "list-keys" => parse_command_args::<ListKeysArgs>("list-keys", arguments)
+            .and_then(ListKeysArgs::validate)
+            .map(Command::ListKeys),
         "send-prefix" => parse_command_args("send-prefix", arguments).map(Command::SendPrefix),
         "attach-session" => {
             parse_command_args("attach-session", arguments).map(Command::AttachSession)
@@ -224,7 +232,7 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
         }
         "set-hook" => parse_command_args("set-hook", arguments).map(Command::SetHook),
         "show-hooks" => parse_command_args("show-hooks", arguments).map(Command::ShowHooks),
-        "set-buffer" => parse_command_args("set-buffer", arguments).map(Command::SetBuffer),
+        "set-buffer" => parse_set_buffer_args(arguments).map(Command::SetBuffer),
         "show-buffer" => parse_command_args("show-buffer", arguments).map(Command::ShowBuffer),
         "paste-buffer" => parse_command_args("paste-buffer", arguments).map(Command::PasteBuffer),
         "list-buffers" => parse_command_args("list-buffers", arguments).map(Command::ListBuffers),
@@ -233,7 +241,9 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
         }
         "load-buffer" => parse_command_args("load-buffer", arguments).map(Command::LoadBuffer),
         "save-buffer" => parse_command_args("save-buffer", arguments).map(Command::SaveBuffer),
-        "capture-pane" => parse_command_args("capture-pane", arguments).map(Command::CapturePane),
+        "capture-pane" => parse_command_args::<CapturePaneArgs>("capture-pane", arguments)
+            .and_then(CapturePaneArgs::validate)
+            .map(Command::CapturePane),
         "clear-history" => {
             parse_command_args("clear-history", arguments).map(Command::ClearHistory)
         }
@@ -244,12 +254,15 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
         "show-messages" => {
             parse_command_args("show-messages", arguments).map(Command::ShowMessages)
         }
-        "run-shell" => parse_command_args("run-shell", arguments).map(Command::RunShell),
-        "source-file" => parse_command_args("source-file", arguments).map(Command::SourceFile),
+        "run-shell" => parse_command_args::<RunShellArgs>("run-shell", arguments)
+            .and_then(RunShellArgs::validate)
+            .map(Command::RunShell),
+        "source-file" => parse_source_file_args(arguments).map(Command::SourceFile),
         "if-shell" => parse_command_args("if-shell", arguments).map(Command::IfShell),
         "wait-for" => parse_command_args("wait-for", arguments).map(Command::WaitFor),
         "web-share" => super::web::parse_web_share_args(arguments).map(Command::WebShare),
         "command-prompt" => parse_queue_command_args::<PromptArgs>("command-prompt", arguments)
+            .and_then(PromptArgs::validate)
             .map(|args| Command::Prompt(with_queue_command(args, queue_command))),
         "confirm-before" => {
             parse_queue_command_args::<ConfirmBeforeArgs>("confirm-before", arguments)
@@ -262,10 +275,13 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
             parse_command_args("unlink-window", arguments).map(Command::UnlinkWindow)
         }
         "choose-tree" => parse_queue_command_args::<ChooseTreeArgs>("choose-tree", arguments)
+            .and_then(ChooseTreeArgs::validate)
             .map(|args| Command::ChooseTree(with_queue_command(args, queue_command))),
         "choose-buffer" => parse_queue_command_args::<ChooseBufferArgs>("choose-buffer", arguments)
+            .and_then(ChooseBufferArgs::validate)
             .map(|args| Command::ChooseBuffer(with_queue_command(args, queue_command))),
         "choose-client" => parse_queue_command_args::<ChooseClientArgs>("choose-client", arguments)
+            .and_then(ChooseClientArgs::validate)
             .map(|args| Command::ChooseClient(with_queue_command(args, queue_command))),
         "customize-mode" => {
             parse_queue_command_args::<CustomizeModeArgs>("customize-mode", arguments)
@@ -286,6 +302,20 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
         "show-prompt-history" | "showphist" => {
             parse_queue_command_args::<PromptHistoryArgs>("show-prompt-history", arguments)
                 .map(|args| Command::ShowPromptHistory(with_queue_command(args, queue_command)))
+        }
+        "capabilities" => {
+            let is_help = arguments.iter().any(|arg| arg == "--help");
+            if is_help {
+                Err(clap::Error::raw(
+                    clap::error::ErrorKind::DisplayHelp,
+                    "usage: rmux capabilities [--human|--json]\n",
+                ))
+            } else {
+                Ok(Command::Unsupported(UnsupportedCommandArgs {
+                    name,
+                    arguments,
+                }))
+            }
         }
         _ => Ok(Command::Unsupported(UnsupportedCommandArgs {
             name,
@@ -319,21 +349,111 @@ fn parse_no_args(command_name: &'static str, arguments: Vec<String>) -> Result<(
 }
 
 fn parse_server_access_args(arguments: Vec<String>) -> Result<ServerAccessArgs, clap::Error> {
+    for argument in &arguments {
+        if argument == "--" {
+            break;
+        }
+        if argument == "--help" {
+            continue;
+        }
+        if argument.starts_with("--") {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::UnknownArgument,
+                "command server-access: invalid flag --",
+            ));
+        }
+        if argument == "-" {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::UnknownArgument,
+                "command server-access: invalid flag -",
+            ));
+        }
+        let Some(flags) = argument.strip_prefix('-') else {
+            continue;
+        };
+        if flags.is_empty() {
+            continue;
+        }
+        for flag in flags.chars() {
+            if !matches!(flag, 'a' | 'd' | 'l' | 'r' | 'w') {
+                return Err(clap::Error::raw(
+                    clap::error::ErrorKind::UnknownArgument,
+                    format!("command server-access: unknown flag -{flag}"),
+                ));
+            }
+        }
+    }
+
     let args = parse_command_args::<ServerAccessArgs>("server-access", arguments)?;
     args.validate()
 }
 
 fn parse_set_option_args(
     command_name: &'static str,
-    arguments: Vec<String>,
+    mut arguments: Vec<String>,
 ) -> Result<SetOptionArgs, clap::Error> {
+    let trailing_literal_separator = normalize_set_option_separator(command_name, &mut arguments)?;
     let kind = match command_name {
         "set-option" => SetOptionCommandKind::SetOption,
         "set-window-option" => SetOptionCommandKind::SetWindowOption,
         _ => unreachable!("unexpected set-option command name"),
     };
-    let args = parse_command_args::<SetOptionArgs>(command_name, arguments)?;
+    let mut args = parse_command_args::<SetOptionArgs>(command_name, arguments)?;
+    if trailing_literal_separator {
+        if args.value.is_some() {
+            return Err(set_option_too_many_arguments(command_name));
+        }
+        args.value = Some("--".to_owned());
+    }
     args.validate(kind)
+}
+
+fn normalize_set_option_separator(
+    command_name: &'static str,
+    arguments: &mut Vec<String>,
+) -> Result<bool, clap::Error> {
+    let Some(index) = arguments.iter().position(|argument| argument == "--") else {
+        return Ok(false);
+    };
+    if index + 1 == arguments.len() {
+        let _ = arguments.pop();
+        return Ok(true);
+    }
+    if set_option_positionals_before_separator(&arguments[..index]) > 0 {
+        return Err(set_option_too_many_arguments(command_name));
+    }
+    let _ = arguments.remove(index);
+    Ok(false)
+}
+
+fn set_option_positionals_before_separator(arguments: &[String]) -> usize {
+    let mut positionals = 0;
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument == "-t" {
+            index += 2;
+            continue;
+        }
+        if argument.starts_with("-t") && argument.len() > 2 {
+            index += 1;
+            continue;
+        }
+        if argument.starts_with('-') && argument.len() > 1 {
+            index += 1;
+            continue;
+        }
+        positionals += 1;
+        index += 1;
+    }
+    positionals
+}
+
+fn set_option_too_many_arguments(command_name: &'static str) -> clap::Error {
+    clap::Error::raw(
+        clap::error::ErrorKind::TooManyValues,
+        format!("command {command_name}: too many arguments (need at most 2)"),
+    )
 }
 
 fn parse_show_options_args(
@@ -347,6 +467,11 @@ fn parse_show_options_args(
     };
     let args = parse_command_args::<ShowOptionsArgs>(command_name, arguments)?;
     args.validate(kind)
+}
+
+fn parse_set_buffer_args(arguments: Vec<String>) -> Result<SetBufferArgs, clap::Error> {
+    let args = parse_command_args::<SetBufferArgs>("set-buffer", arguments)?;
+    args.validate()
 }
 
 fn parse_queue_command_args<T>(

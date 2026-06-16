@@ -1,9 +1,16 @@
 use super::FormatModifier;
+use regex::RegexBuilder;
 
-/// Simple fnmatch-style glob matching (no regex support yet).
 pub(super) fn format_fnmatch(pattern: &str, text: &str, fm: &FormatModifier) -> bool {
-    let case_insensitive = fm.argv.first().is_some_and(|s| s.contains('i'));
+    let flags = fm.argv.first().map(String::as_str).unwrap_or_default();
+    let case_insensitive = flags.contains('i');
 
+    if flags.contains('r') {
+        return RegexBuilder::new(pattern)
+            .case_insensitive(case_insensitive)
+            .build()
+            .is_ok_and(|regex| regex.is_match(text));
+    }
     if case_insensitive {
         glob_match(&pattern.to_lowercase(), &text.to_lowercase())
     } else {

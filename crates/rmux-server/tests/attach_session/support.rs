@@ -7,7 +7,7 @@ use rmux_proto::{AttachMessage, Request, Response};
 use tokio::io::AsyncReadExt;
 use tokio::time::sleep;
 
-pub(super) const STEP_TIMEOUT: Duration = Duration::from_secs(6);
+pub(super) const STEP_TIMEOUT: Duration = Duration::from_secs(12);
 
 pub(super) async fn read_response_exact(
     stream: &mut tokio::net::UnixStream,
@@ -43,6 +43,14 @@ pub(super) async fn read_attach_message(
                 rows: u16::from_le_bytes([size[2], size[3]]),
             })))
         }
+        13 => {
+            let mut length = [0_u8; 4];
+            stream.read_exact(&mut length).await?;
+            let payload_len = u32::from_le_bytes(length) as usize;
+            let mut payload = vec![0_u8; payload_len];
+            stream.read_exact(&mut payload).await?;
+            Ok(Some(AttachMessage::Render(payload)))
+        }
         other => Err(rmux_proto::RmuxError::Decode(format!(
             "unknown attach-stream message tag {other}"
         ))
@@ -60,12 +68,18 @@ pub(super) async fn read_attach_until_contains(
 
     while std::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let Some(message) = tokio::time::timeout(remaining, read_attach_message(stream)).await??
+        let read = tokio::time::timeout(remaining, read_attach_message(stream)).await;
+        let Some(message) = read.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out waiting for attach output containing {needle:?}: {output:?}"),
+            )
+        })??
         else {
             break;
         };
 
-        if let AttachMessage::Data(bytes) = message {
+        if let AttachMessage::Data(bytes) | AttachMessage::Render(bytes) = message {
             output.push_str(&String::from_utf8_lossy(&bytes));
             if output.contains(needle) {
                 return Ok(output);

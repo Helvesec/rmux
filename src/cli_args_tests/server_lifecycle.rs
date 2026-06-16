@@ -356,6 +356,33 @@ fn server_access_rejects_unknown_target_flag() {
     assert!(error
         .to_string()
         .contains("command server-access: unknown flag -t"));
+
+    let error = parse_args(&["server-access", "-t", "%0", "root"]).unwrap_err();
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    assert!(error
+        .to_string()
+        .contains("command server-access: unknown flag -t"));
+
+    let error = parse_args(&["server-access", "-xt", "root"]).unwrap_err();
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    assert!(error
+        .to_string()
+        .contains("command server-access: unknown flag -x"));
+
+    let error = parse_args(&["server-access", "--target", "%0", "root"]).unwrap_err();
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    assert!(error
+        .to_string()
+        .contains("command server-access: invalid flag --"));
+}
+
+#[test]
+fn server_access_rejects_bare_dash() {
+    let error = parse_args(&["server-access", "-"]).unwrap_err();
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    assert!(error
+        .to_string()
+        .contains("command server-access: invalid flag -"));
 }
 
 #[test]

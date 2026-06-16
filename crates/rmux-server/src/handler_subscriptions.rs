@@ -10,7 +10,7 @@ use rmux_proto::{
     PaneOutputEvent, PaneOutputLagNotice, PaneOutputLagResponse, PaneOutputSubscriptionId,
     PaneOutputSubscriptionStart, PaneRecentOutput, PaneTarget, PaneTargetRef, Response, RmuxError,
     SubscribePaneOutputRefRequest, SubscribePaneOutputRequest, SubscribePaneOutputResponse,
-    UnsubscribePaneOutputRequest, UnsubscribePaneOutputResponse, DEFAULT_MAX_FRAME_LENGTH,
+    UnsubscribePaneOutputRequest, UnsubscribePaneOutputResponse,
 };
 
 use crate::pane_io::{PaneOutputReceiver, PaneOutputSender};
@@ -20,7 +20,7 @@ use super::RequestHandler;
 
 // Keep lag diagnostics well below the detached RPC frame cap after bincode
 // overhead and the rest of the response envelope are added.
-const MAX_LAG_RECENT_BYTES: usize = DEFAULT_MAX_FRAME_LENGTH / 16;
+const MAX_LAG_RECENT_BYTES: usize = 64 * 1024;
 const EXITED_PANE_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const EXITED_PANE_DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 

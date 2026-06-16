@@ -102,19 +102,17 @@ impl CopyModeState {
     }
 
     pub(super) fn select_line(&mut self) {
-        let x = self.line_end_x(self.cursor.y);
+        let start_y = self.logical_line_start_y(self.cursor.y);
+        let end_y = self.logical_line_end_y(self.cursor.y);
+        let x = self.line_end_x(end_y);
+        self.cursor = CopyPosition { x, y: end_y };
         self.selection = Some(SelectionState {
-            anchor: CopyPosition {
-                x: 0,
-                y: self.cursor.y,
-            },
-            end: CopyPosition {
-                x,
-                y: self.cursor.y,
-            },
+            anchor: CopyPosition { x: 0, y: start_y },
+            end: CopyPosition { x, y: end_y },
             mode: SelectionMode::Line,
             active: true,
         });
+        self.ensure_cursor_visible();
     }
 
     pub(super) fn select_word(&mut self) {
@@ -154,10 +152,19 @@ impl CopyModeState {
                 end: position,
             };
         }
-        let owner = line.owning_cell_x(position.x).unwrap_or(position.x);
-        let class = line_char(&line, owner)
+        let mut owner = line.owning_cell_x(position.x).unwrap_or(position.x);
+        let mut class = line_char(&line, owner)
             .map(|ch| classify_word_char(ch, &self.word_separators, false))
             .unwrap_or(WordClass::Space);
+        if class != WordClass::Word {
+            if let Some(next_word) = positions.iter().copied().filter(|x| *x > owner).find(|x| {
+                line_char(&line, *x).map(|ch| classify_word_char(ch, &self.word_separators, false))
+                    == Some(WordClass::Word)
+            }) {
+                owner = next_word;
+                class = WordClass::Word;
+            }
+        }
         let mut start = owner;
         let mut end = owner;
         for candidate in positions.iter().copied().rev().filter(|x| *x < owner) {

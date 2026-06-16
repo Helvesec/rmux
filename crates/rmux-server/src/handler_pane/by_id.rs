@@ -1,7 +1,8 @@
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
-    ErrorResponse, HookName, OptionName, PaneTarget, PaneTargetRef, ResizePaneResponse, Response,
-    RmuxError, ScopeSelector, SelectPaneResponse, SessionId, SetOptionMode, Target, WindowTarget,
+    ErrorResponse, HookName, OptionName, PaneTarget, PaneTargetRef, ResizePaneAdjustment,
+    ResizePaneResponse, Response, RmuxError, ScopeSelector, SelectPaneResponse, SessionId,
+    SetOptionMode, Target, WindowTarget,
 };
 
 use super::super::{prepare_lifecycle_event, RequestHandler};
@@ -58,8 +59,17 @@ impl RequestHandler {
             let window_index = target.window_index();
             let pane_index = target.pane_index();
             let response_target = target.clone();
-            let response =
-                match state.mutate_session_and_resize_terminals(&session_name, |session| {
+            let response = match adjustment {
+                ResizePaneAdjustment::TrimBelow => {
+                    match state.trim_pane_below_cursor(&response_target) {
+                        Ok(()) => Response::ResizePane(ResizePaneResponse {
+                            target: response_target,
+                            adjustment,
+                        }),
+                        Err(error) => Response::Error(ErrorResponse { error }),
+                    }
+                }
+                _ => match state.mutate_session_and_resize_terminals(&session_name, |session| {
                     session.resize_pane_in_window(window_index, pane_index, adjustment)?;
                     Ok(ResizePaneResponse {
                         target: response_target,
@@ -68,7 +78,8 @@ impl RequestHandler {
                 }) {
                     Ok(response) => Response::ResizePane(response),
                     Err(error) => Response::Error(ErrorResponse { error }),
-                };
+                },
+            };
             (response, window_index)
         };
 

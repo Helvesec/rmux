@@ -40,6 +40,28 @@ pub(super) fn record_attach_exit(
     session_name: &SessionName,
     reason: AttachExitReason,
 ) {
+    record_attach_exit_line(attach_pid, session_name, reason, None);
+}
+
+pub(super) fn record_attach_error(
+    attach_pid: u32,
+    session_name: &SessionName,
+    error: &dyn std::fmt::Display,
+) {
+    record_attach_exit_line(
+        attach_pid,
+        session_name,
+        AttachExitReason::AttachError,
+        Some(&error.to_string()),
+    );
+}
+
+fn record_attach_exit_line(
+    attach_pid: u32,
+    session_name: &SessionName,
+    reason: AttachExitReason,
+    detail: Option<&str>,
+) {
     let Some(path) = std::env::var_os(ATTACH_EXIT_LOG_ENV) else {
         return;
     };
@@ -54,10 +76,23 @@ pub(super) fn record_attach_exit(
     else {
         return;
     };
-    let _ = writeln!(
-        file,
-        "time_ms={timestamp_ms} process_pid={} attach_pid={attach_pid} session={} reason={reason}",
-        std::process::id(),
-        session_name
-    );
+    match detail {
+        Some(detail) => {
+            let escaped = detail.replace('\n', "\\n");
+            let _ = writeln!(
+                file,
+                "time_ms={timestamp_ms} process_pid={} attach_pid={attach_pid} session={} reason={reason} detail={escaped:?}",
+                std::process::id(),
+                session_name
+            );
+        }
+        None => {
+            let _ = writeln!(
+                file,
+                "time_ms={timestamp_ms} process_pid={} attach_pid={attach_pid} session={} reason={reason}",
+                std::process::id(),
+                session_name
+            );
+        }
+    }
 }

@@ -18,6 +18,8 @@ use crate::{
     VisibleTextExpectation,
 };
 
+#[path = "pane/capture_pane.rs"]
+mod capture_pane;
 #[path = "pane/info.rs"]
 mod info;
 #[path = "pane/input.rs"]
@@ -37,6 +39,7 @@ mod target;
 #[path = "pane/title.rs"]
 mod title;
 
+pub use capture_pane::{PaneCapture, PaneCaptureBuilder};
 use info::{current_pane_entry, current_pane_ref_for_id, pane_info_snapshot};
 use input::{resize_to_size, send_key, send_text};
 use lifecycle::{close_pane, respawn_pane};
@@ -395,6 +398,11 @@ impl Pane {
     /// revision.
     pub async fn snapshot(&self) -> Result<PaneSnapshot> {
         pane_snapshot(self).await
+    }
+
+    /// Starts a daemon `capture-pane` request builder.
+    pub fn capture_pane(&self) -> PaneCaptureBuilder<'_> {
+        PaneCaptureBuilder::new(self)
     }
 
     /// Captures a fresh snapshot and searches its rendered visible text for

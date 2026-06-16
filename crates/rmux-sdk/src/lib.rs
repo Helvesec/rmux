@@ -3,11 +3,10 @@
 #![deny(rustdoc::invalid_codeblock_attributes)]
 #![forbid(unsafe_code)]
 
-//! Public daemon-backed RMUX SDK scaffolding.
+//! Public daemon-backed RMUX SDK.
 //!
-//! v1 introduces a fully daemon-backed public SDK. This crate exposes the
-//! compile-time vocabulary, facade handles, session ensure builders, and
-//! facade-error skeletons that pin the public SDK boundary.
+//! v1 exposes live facade handles, session builders, waits, pane streams,
+//! snapshots, and command escape hatches over the rmux daemon.
 //!
 //! `rmux-sdk` is a public integration peer of `rmux-client` and must not
 //! depend on `rmux-client`, `rmux-core`, `rmux-server`, or `rmux-pty` as
@@ -86,7 +85,7 @@ pub use broadcast::{
     BroadcastPaneFailure, BroadcastPaneSuccess, BroadcastResult, Input, PartialBroadcastFailure,
 };
 pub use capture::{CaptureBuilder, CapturedRegion, Rect};
-pub use command::{RmuxCommand, RmuxCommandKind};
+pub use command::{CommandRun, RmuxCommand, RmuxCommandKind};
 pub use diagnostics::{
     command_feature_id, protocol_diagnostic, unsupported_feature_id, Diagnostic,
     DiagnosticSeverity, FEATURE_DAEMON_SHUTDOWN, FEATURE_PROTOCOL_CAPABILITIES,
@@ -104,9 +103,9 @@ pub use events::{
 pub use extract::{CollectedPaneOutput, PaneTextMatch};
 pub use handles::{
     CleanupPolicy, LeaseState, NewWindowBuilder, OwnedSession, OwnedSessionBuilder,
-    OwnedSessionSignalHandlers, Pane, PaneCloseOutcome, PaneRespawnOptions, PaneSpawnBuilder,
-    PaneSplitBuilder, Rmux, RmuxBuilder, Session, SplitDirection, Window, WindowCloseOutcome,
-    WindowPane,
+    OwnedSessionSignalHandlers, Pane, PaneCapture, PaneCaptureBuilder, PaneCloseOutcome,
+    PaneRespawnOptions, PaneSpawnBuilder, PaneSplitBuilder, Rmux, RmuxBuilder, Session,
+    SplitDirection, Window, WindowCloseOutcome, WindowPane,
 };
 pub use info::{InfoSnapshot, PaneExitState, PaneInfo, PaneProcessState, SessionInfo, WindowInfo};
 pub use input::{
@@ -122,6 +121,7 @@ pub use pane_set::{
     PaneSet, PaneSetAny, PaneSetBatch, PaneSetExpectation, PaneSetFailure, PaneSetSuccess,
     PaneSetVisibleTextOutcome, PaneSetVisibleTextWait,
 };
+pub use rmux_proto::LayoutName;
 #[cfg(feature = "web")]
 pub use rmux_proto::{WebTerminalPalette, WebTerminalTheme};
 pub use snapshot::{

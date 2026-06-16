@@ -239,10 +239,16 @@ fn buffer_capture_and_scripting_commands_round_trip_end_to_end() -> Result<(), B
     assert_eq!(stdout(&display), "alpha:0:\n");
     assert!(stderr(&display).is_empty());
 
-    let shell = harness.run(&["run-shell", "printf cli-run-shell-output"])?;
+    let shell_output = harness.tmpdir().join("run-shell-output.txt");
+    let shell_command = format!(
+        "printf cli-run-shell-output > {}",
+        shell_quote_path(&shell_output)
+    );
+    let shell = harness.run(&["run-shell", &shell_command])?;
     assert_eq!(shell.status.code(), Some(0));
-    assert_eq!(stdout(&shell), "cli-run-shell-output");
+    assert!(stdout(&shell).is_empty());
     assert!(stderr(&shell).is_empty());
+    assert_eq!(fs::read_to_string(shell_output)?, "cli-run-shell-output");
 
     assert_success(&harness.run(&[
         "if-shell",
@@ -545,6 +551,10 @@ fn wait_for_capture_target(
 
 fn nonempty_lines(output: &str) -> Vec<&str> {
     output.lines().filter(|line| !line.is_empty()).collect()
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
 fn spawn_cli_process(harness: &CliHarness, args: &[&str]) -> Result<ChildGuard, Box<dyn Error>> {

@@ -78,6 +78,8 @@ impl RequestHandler {
         if let Some(frame) = self.clock_mode_restore_frame(target).await? {
             self.send_session_overlay(&session_name, frame, false).await;
         }
+        self.sync_automatic_window_name_for_pane_target(target)
+            .await;
         self.emit(LifecycleEvent::PaneModeChanged {
             target: target.clone(),
         })

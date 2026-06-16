@@ -15,6 +15,10 @@ pub struct TerminalPassthrough {
 /// Supported terminal passthrough protocol families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalPassthroughKind {
+    /// Opaque tmux DCS passthrough payload, already framed for the outer terminal.
+    Raw,
+    /// OSC 52 clipboard payload emitted by a pane program.
+    Clipboard,
     /// Kitty terminal graphics protocol, encoded as an APC payload.
     KittyGraphics,
     /// SIXEL graphics protocol, encoded as a DCS payload.
@@ -22,6 +26,28 @@ pub enum TerminalPassthroughKind {
 }
 
 impl TerminalPassthrough {
+    /// Creates an opaque passthrough event at a pane-local cursor position.
+    #[must_use]
+    pub fn raw(cursor_x: u32, cursor_y: u32, payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            kind: TerminalPassthroughKind::Raw,
+            cursor_x,
+            cursor_y,
+            payload: Arc::from(payload.into()),
+        }
+    }
+
+    /// Creates an OSC 52 clipboard passthrough event.
+    #[must_use]
+    pub fn clipboard(payload: impl Into<Vec<u8>>) -> Self {
+        Self {
+            kind: TerminalPassthroughKind::Clipboard,
+            cursor_x: 0,
+            cursor_y: 0,
+            payload: Arc::from(payload.into()),
+        }
+    }
+
     /// Creates a Kitty graphics passthrough event at a pane-local cursor position.
     #[must_use]
     pub fn kitty_graphics(cursor_x: u32, cursor_y: u32, payload: impl Into<Vec<u8>>) -> Self {
@@ -72,6 +98,8 @@ impl TerminalPassthrough {
     #[must_use]
     pub fn render_sequence(&self) -> Vec<u8> {
         match self.kind {
+            TerminalPassthroughKind::Raw => self.payload.to_vec(),
+            TerminalPassthroughKind::Clipboard => self.payload.to_vec(),
             TerminalPassthroughKind::KittyGraphics => {
                 let mut sequence = Vec::with_capacity(self.payload.len() + 4);
                 sequence.extend_from_slice(b"\x1b_");
@@ -99,6 +127,20 @@ mod tests {
         let passthrough = TerminalPassthrough::kitty_graphics(0, 0, b"Gf=100;AAAA".to_vec());
 
         assert_eq!(passthrough.render_sequence(), b"\x1b_Gf=100;AAAA\x1b\\");
+    }
+
+    #[test]
+    fn renders_raw_sequence_verbatim() {
+        let passthrough = TerminalPassthrough::raw(0, 0, b"\x1b]52;c;QQ==\x1b\\".to_vec());
+
+        assert_eq!(passthrough.render_sequence(), b"\x1b]52;c;QQ==\x1b\\");
+    }
+
+    #[test]
+    fn renders_clipboard_sequence_verbatim() {
+        let passthrough = TerminalPassthrough::clipboard(b"\x1b]52;c;QQ==\x07".to_vec());
+
+        assert_eq!(passthrough.render_sequence(), b"\x1b]52;c;QQ==\x07");
     }
 
     #[test]

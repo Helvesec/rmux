@@ -45,6 +45,24 @@ fn padding_left_align() {
     assert_eq!(result, "alpha     ");
 }
 
+#[test]
+fn truncation_uses_display_width_for_wide_characters() {
+    let context = FormatContext::new()
+        .with_named_value("left", "表A")
+        .with_named_value("right", "A表");
+
+    assert_eq!(render_template("#{=2:left}", &context), "表");
+    assert_eq!(render_template("#{=-2:right}", &context), "表");
+}
+
+#[test]
+fn padding_uses_display_width_for_wide_characters() {
+    let context = FormatContext::new().with_named_value("wide", "表A");
+
+    assert_eq!(render_template("#{p5:wide}", &context), "表A  ");
+    assert_eq!(render_template("#{p-5:wide}", &context), "  表A");
+}
+
 // -----------------------------------------------------------------------
 // Hardening tests — substitution edge cases
 // -----------------------------------------------------------------------
@@ -69,8 +87,27 @@ fn substitution_invalid_regex_falls_back_to_literal() {
 #[test]
 fn substitution_with_regex_groups() {
     assert_eq!(
-        render_template("#{s/(al)(pha)/$2$1/:session_name}", &StaticWindowValues),
+        render_template(r"#{s/(al)(pha)/\2\1/:session_name}", &StaticWindowValues),
         "phaal"
+    );
+}
+
+#[test]
+fn substitution_backreference_before_word_character_is_unambiguous() {
+    assert_eq!(
+        render_template(
+            r"#{s/(al)(pha)/\2_word_\1/:session_name}",
+            &StaticWindowValues
+        ),
+        "pha_word_al"
+    );
+}
+
+#[test]
+fn substitution_keeps_dollar_references_literal() {
+    assert_eq!(
+        render_template("#{s/(al)(pha)/$2$1/:session_name}", &StaticWindowValues),
+        "$2$1"
     );
 }
 

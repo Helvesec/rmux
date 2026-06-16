@@ -16,13 +16,15 @@ pub(crate) struct SendKeysArgs {
     pub(crate) mouse: bool,
     #[arg(short = 'N')]
     pub(crate) repeat_count: Option<usize>,
+    #[arg(short = 'p', action = ArgAction::SetTrue, hide = true)]
+    pub(crate) unsupported_prefix: bool,
     #[arg(short = 'R', action = ArgAction::SetTrue)]
     pub(crate) reset_terminal: bool,
     #[arg(short = 'X', action = ArgAction::SetTrue)]
     pub(crate) copy_mode: bool,
     #[arg(short = 'c', allow_hyphen_values = true)]
     pub(crate) client_target: Option<String>,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     pub(crate) keys: Vec<String>,
@@ -66,11 +68,11 @@ pub(crate) struct ListKeysArgs {
     pub(crate) include_unnoted: bool,
     #[arg(short = 'N', action = ArgAction::SetTrue)]
     pub(crate) notes: bool,
-    #[arg(short = 'r', action = ArgAction::SetTrue)]
+    #[arg(short = 'r', action = ArgAction::SetTrue, hide = true)]
     pub(crate) reversed: bool,
-    #[arg(short = 'F')]
+    #[arg(short = 'F', hide = true)]
     pub(crate) format: Option<String>,
-    #[arg(short = 'O')]
+    #[arg(short = 'O', hide = true)]
     pub(crate) sort_order: Option<String>,
     #[arg(short = 'P')]
     pub(crate) prefix: Option<String>,
@@ -80,11 +82,26 @@ pub(crate) struct ListKeysArgs {
     pub(crate) key: Option<String>,
 }
 
+impl ListKeysArgs {
+    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
+        if self.reversed {
+            return Err(unknown_flag_error("list-keys", "-r"));
+        }
+        if self.sort_order.is_some() {
+            return Err(unknown_flag_error("list-keys", "-O"));
+        }
+        if self.format.is_some() {
+            return Err(unknown_flag_error("list-keys", "-F"));
+        }
+        Ok(self)
+    }
+}
+
 #[derive(Debug, Clone, Args)]
 pub(crate) struct SendPrefixArgs {
     #[arg(short = '2', action = ArgAction::SetTrue)]
     pub(crate) secondary: bool,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
 }
 
@@ -110,4 +127,11 @@ impl UnbindKeyArgs {
             "prefix".to_owned()
         }
     }
+}
+
+fn unknown_flag_error(command_name: &str, flag: &str) -> clap::Error {
+    clap::Error::raw(
+        clap::error::ErrorKind::UnknownArgument,
+        format!("command {command_name}: unknown flag {flag}"),
+    )
 }

@@ -5,12 +5,9 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
-#[cfg(any(all(test, unix), not(any(unix, windows))))]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-#[cfg(not(windows))]
-use rmux_proto::{ListSessionsRequest, Response};
+use rmux_proto::Response;
 #[cfg(unix)]
 use rmux_sdk::bootstrap::startup_unix::{
     connect_or_start_with, StartupError, StartupOutcome, DEFAULT_STARTUP_DEADLINE,
@@ -42,7 +39,6 @@ pub const INTERNAL_DAEMON_FLAG: &str = "--__internal-daemon";
 
 const BINARY_OVERRIDE_ENV: &str = "RMUX_INTERNAL_BINARY_PATH";
 const BINARY_OVERRIDE_TEST_OPT_IN_ENV: &str = "RMUX_ALLOW_INTERNAL_BINARY_OVERRIDE";
-
 /// Config loading policy to pass to a newly auto-started hidden daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoStartConfig {
@@ -51,6 +47,7 @@ pub struct AutoStartConfig {
     cwd: Option<PathBuf>,
     web_frontend: Option<String>,
     web_port: Option<u16>,
+    web_required: bool,
 }
 
 impl AutoStartConfig {
@@ -63,6 +60,7 @@ impl AutoStartConfig {
             cwd: None,
             web_frontend: None,
             web_port: None,
+            web_required: false,
         }
     }
 
@@ -75,6 +73,7 @@ impl AutoStartConfig {
             cwd,
             web_frontend: None,
             web_port: None,
+            web_required: false,
         }
     }
 
@@ -87,6 +86,7 @@ impl AutoStartConfig {
             cwd,
             web_frontend: None,
             web_port: None,
+            web_required: false,
         }
     }
 
@@ -94,6 +94,7 @@ impl AutoStartConfig {
     #[must_use]
     pub const fn with_web_port(mut self, port: u16) -> Self {
         self.web_port = Some(port);
+        self.web_required = true;
         self
     }
 
@@ -101,10 +102,19 @@ impl AutoStartConfig {
     #[must_use]
     pub fn with_web_frontend(mut self, frontend: String) -> Self {
         self.web_frontend = Some(frontend);
+        self.web_required = true;
+        self
+    }
+
+    /// Requires a daemon compiled with web-share support for this autostart.
+    #[must_use]
+    pub const fn with_web_required(mut self) -> Self {
+        self.web_required = true;
         self
     }
 
     #[cfg(not(windows))]
+    #[cfg(not(any(unix, windows)))]
     fn loads_startup_config(&self) -> bool {
         !matches!(self.selection, AutoStartConfigSelection::Disabled)
     }
@@ -190,7 +200,7 @@ fn ensure_server_running_unix(
     socket_path: &Path,
     config: AutoStartConfig,
 ) -> Result<Connection, AutoStartError> {
-    let binary_path = rmux_binary_path().map_err(AutoStartError::BinaryPath)?;
+    let binary_path = rmux_binary_path(&config).map_err(AutoStartError::BinaryPath)?;
     let launcher_binary_path = binary_path.clone();
     let launcher_socket_path = socket_path.to_path_buf();
     let launcher_config = config.clone();
@@ -216,7 +226,7 @@ fn ensure_server_running_unix(
         outcome.map_err(|error| auto_start_error_from_startup(error, &binary_path, socket_path))?,
     )?;
 
-    let connection = probe_connected_server(connection, &config)?;
+    let connection = probe_connected_server(connection, &config, socket_path)?;
     upgrade_restart::ensure_daemon_fresh_or_restart(connection, socket_path, &binary_path, &config)
 }
 
@@ -237,7 +247,7 @@ fn ensure_server_running_windows(
     socket_path: &Path,
     config: AutoStartConfig,
 ) -> Result<Connection, AutoStartError> {
-    let binary_path = rmux_binary_path().map_err(AutoStartError::BinaryPath)?;
+    let binary_path = rmux_binary_path(&config).map_err(AutoStartError::BinaryPath)?;
     let launcher_binary_path = binary_path.clone();
     let launcher_socket_path = socket_path.to_path_buf();
     let launcher_config = config.clone();
@@ -262,6 +272,7 @@ fn ensure_server_running_windows(
     let connection = startup_outcome_into_connection(
         outcome.map_err(|error| auto_start_error_from_startup(error, &binary_path, socket_path))?,
     )?;
+    let connection = probe_connected_server(connection, &config, socket_path)?;
     upgrade_restart::ensure_daemon_fresh_or_restart(connection, socket_path, &binary_path, &config)
 }
 
@@ -270,23 +281,22 @@ fn startup_outcome_into_connection(outcome: StartupOutcome) -> Result<Connection
     Connection::new(outcome.into_stream()).map_err(AutoStartError::Client)
 }
 
-#[cfg(not(windows))]
 fn probe_connected_server(
     mut connection: Connection,
-    config: &AutoStartConfig,
-) -> Result<Connection, AutoStartError> {
-    if !config.loads_startup_config() {
-        probe_server_readiness(&mut connection).map_err(AutoStartError::Client)?;
-    }
-    Ok(connection)
-}
-
-#[cfg(windows)]
-fn probe_connected_server(
-    connection: Connection,
     _config: &AutoStartConfig,
+    _socket_path: &Path,
 ) -> Result<Connection, AutoStartError> {
-    Ok(connection)
+    let deadline = Instant::now() + DEFAULT_STARTUP_DEADLINE;
+    loop {
+        match probe_server_readiness(&mut connection) {
+            Ok(()) => return Ok(connection),
+            Err(error) if is_transient_connect_error(&error) && Instant::now() < deadline => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(STARTUP_POLL_INTERVAL.min(remaining));
+            }
+            Err(error) => return Err(AutoStartError::Client(error)),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -585,16 +595,17 @@ fn is_transient_connect_error(error: &ClientError) -> bool {
     )
 }
 
-#[cfg(not(windows))]
 fn probe_server_readiness(connection: &mut Connection) -> Result<(), ClientError> {
-    let response = connection.list_sessions(ListSessionsRequest {
-        format: None,
-        filter: None,
-        sort_order: None,
-        reversed: false,
-    })?;
+    let response = connection.daemon_status()?;
     match response {
-        Response::ListSessions(_) => Ok(()),
+        Response::DaemonStatus(status) if status.config_loading => {
+            Err(ClientError::Io(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "daemon is still loading startup config",
+            )))
+        }
+        Response::DaemonStatus(_) => Ok(()),
+        Response::Error(_) => Ok(()),
         other => Err(ClientError::Protocol(rmux_proto::RmuxError::Server(
             format!("unexpected readiness response: {other:?}"),
         ))),
@@ -606,7 +617,7 @@ fn launch_hidden_daemon(
     socket_path: &Path,
     config: &AutoStartConfig,
 ) -> Result<(), AutoStartError> {
-    let binary_path = rmux_binary_path().map_err(AutoStartError::BinaryPath)?;
+    let binary_path = rmux_binary_path(config).map_err(AutoStartError::BinaryPath)?;
     spawn_hidden_daemon_for(&binary_path, socket_path, config).map_err(|error| {
         AutoStartError::Launch {
             path: binary_path,
@@ -657,17 +668,48 @@ fn spawn_hidden_daemon(mut command: Command) -> io::Result<()> {
     Ok(())
 }
 
-fn rmux_binary_path() -> io::Result<PathBuf> {
+fn rmux_binary_path(config: &AutoStartConfig) -> io::Result<PathBuf> {
     let current_exe = env::current_exe()?;
     match env::var_os(BINARY_OVERRIDE_ENV).filter(|_| binary_override_enabled_for_tests()) {
         Some(path) => Ok(PathBuf::from(path)),
-        None => Ok(current_exe),
+        None => {
+            Ok(hidden_daemon_binary_path_for_config(&current_exe, config).unwrap_or(current_exe))
+        }
     }
 }
 
 fn binary_override_enabled_for_tests() -> bool {
     cfg!(debug_assertions)
         && env::var_os(BINARY_OVERRIDE_TEST_OPT_IN_ENV).is_some_and(|value| value == "1")
+}
+
+#[cfg(all(test, unix))]
+fn hidden_daemon_binary_path(current_exe: &Path) -> Option<PathBuf> {
+    hidden_daemon_binary_path_for_config(current_exe, &AutoStartConfig::disabled())
+}
+
+fn hidden_daemon_binary_path_for_config(
+    current_exe: &Path,
+    config: &AutoStartConfig,
+) -> Option<PathBuf> {
+    if config.web_required {
+        return None;
+    }
+    let file_stem = current_exe.file_stem()?.to_str()?;
+    if file_stem == "rmux-daemon" {
+        return None;
+    }
+
+    let mut candidate = current_exe.to_path_buf();
+    let daemon_file_name = match current_exe
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
+        Some(extension) if !extension.is_empty() => format!("rmux-daemon.{extension}"),
+        _ => "rmux-daemon".to_owned(),
+    };
+    candidate.set_file_name(daemon_file_name);
+    candidate.is_file().then_some(candidate)
 }
 
 #[cfg(all(test, unix))]

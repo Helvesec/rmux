@@ -5,14 +5,16 @@ use rmux_core::{
     LifecycleEvent, PaneId, WINDOW_ALERTFLAGS,
 };
 use rmux_proto::request::NewSessionExtRequest;
+use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
-    ErrorResponse, KillSessionResponse, ListSessionsResponse, NewSessionResponse, OptionName,
-    Response, RmuxError, SessionId, SessionName,
+    ErrorResponse, KillSessionRequest, KillSessionResponse, ListSessionsResponse,
+    NewSessionResponse, OptionName, Response, RmuxError, ScopeSelector, SessionId, SessionName,
+    WindowTarget,
 };
 
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::pane_terminals::InitialPaneSpawnOptions;
-use crate::terminal::validate_process_command;
+use crate::terminal::{parse_environment_assignments, validate_process_command};
 
 #[path = "handler_session/client_environment.rs"]
 mod client_environment;
@@ -27,17 +29,70 @@ mod options;
 #[path = "handler_session/output.rs"]
 mod output;
 
-use client_environment::new_session_client_environment;
+use client_environment::{
+    new_session_client_environment, new_session_raw_client_environment,
+    raw_environment_from_assignments,
+};
 use list::{sort_list_sessions, ListSessionSnapshot};
 use options::resolve_session_creation_options;
 
+use super::scripting_support::format_context_for_target;
+use super::target_support::{pane_id_target, requester_environment_pane_id};
 use super::{
-    client_spawn_environment, command_output_from_lines, parse_session_sort_order,
+    command_output_from_lines, initial_session_spawn_environment, parse_session_sort_order,
     prepare_lifecycle_event, resolve_existing_session_target, update_environment_from_client,
     PendingShutdownReason, RequestHandler, SessionSortOrder,
 };
 
 impl RequestHandler {
+    pub(in crate::handler) async fn destroy_unattached_sessions_for_option_scope(
+        &self,
+        scope: &OptionScopeSelector,
+    ) {
+        let mut candidates = {
+            let state = self.state.lock().await;
+            destroy_unattached_candidate_sessions(&state, scope)
+        };
+        self.destroy_unattached_sessions(std::mem::take(&mut candidates))
+            .await;
+    }
+
+    pub(in crate::handler) async fn destroy_unattached_sessions(
+        &self,
+        mut candidates: Vec<SessionName>,
+    ) {
+        candidates.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        candidates.dedup();
+
+        for session_name in candidates {
+            if !self
+                .session_should_destroy_when_unattached(&session_name)
+                .await
+            {
+                continue;
+            }
+            if self.attached_count(&session_name).await != 0 {
+                continue;
+            }
+            let _ = self
+                .handle_kill_session(KillSessionRequest {
+                    target: session_name,
+                    kill_all_except_target: false,
+                    clear_alerts: false,
+                })
+                .await;
+        }
+    }
+
+    async fn session_should_destroy_when_unattached(&self, session_name: &SessionName) -> bool {
+        let state = self.state.lock().await;
+        state.sessions.contains_session(session_name)
+            && state
+                .options
+                .resolve(Some(session_name), OptionName::DestroyUnattached)
+                == Some("on")
+    }
+
     pub(in crate::handler) async fn handle_new_session(
         &self,
         requester_pid: u32,
@@ -62,6 +117,7 @@ impl RequestHandler {
                 command: None,
                 process_command: None,
                 client_environment: None,
+                skip_environment_update: false,
             },
         )
         .await
@@ -86,7 +142,14 @@ impl RequestHandler {
             Ok(environment) => environment,
             Err(error) => return Response::Error(ErrorResponse { error }),
         };
-        let spawn_environment = client_spawn_environment(client_environment.as_ref());
+        let spawn_environment = initial_session_spawn_environment(client_environment.as_ref());
+        let raw_spawn_environment = if request.client_environment.is_some() {
+            client_environment
+                .as_ref()
+                .map(raw_environment_from_assignments)
+        } else {
+            new_session_raw_client_environment(requester_pid)
+        };
 
         if request.attach_if_exists && request.group_target.is_none() {
             if let Some(existing) = request.session_name.as_ref() {
@@ -96,13 +159,15 @@ impl RequestHandler {
                 };
                 if session_exists {
                     let session_name = existing.clone();
-                    if let Some(client_environment) = client_environment.as_ref() {
+                    if !request.skip_environment_update {
                         let mut state = self.state.lock().await;
-                        update_environment_from_client(
-                            &mut state,
-                            &session_name,
-                            client_environment,
-                        );
+                        if let Some(client_environment) = client_environment.as_ref() {
+                            update_environment_from_client(
+                                &mut state,
+                                &session_name,
+                                client_environment,
+                            );
+                        }
                     }
                     if !request.detached
                         && (request.detach_other_clients || request.kill_other_clients)
@@ -116,7 +181,7 @@ impl RequestHandler {
                     }
                     return Response::NewSession(NewSessionResponse {
                         session_name,
-                        detached: request.detached,
+                        detached: false,
                         output: None,
                     });
                 }
@@ -126,12 +191,40 @@ impl RequestHandler {
         let requested_size = request.size;
         let detached = request.detached;
         let environment_overrides = request.environment;
+        let environment_assignments = match environment_overrides.as_deref() {
+            Some(overrides) => match parse_environment_assignments(overrides) {
+                Ok(assignments) => Some(assignments),
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            },
+            None => None,
+        };
         let group_target = request.group_target;
         let working_directory = request.working_directory;
+        let requester_cwd_pane_id = if working_directory
+            .as_ref()
+            .is_some_and(|path| path.contains("#{"))
+        {
+            let socket_path = self.socket_path();
+            requester_environment_pane_id(requester_pid, &socket_path)
+        } else {
+            None
+        };
+        let requester_cwd_target = match requester_cwd_pane_id {
+            Some(pane_id) => {
+                let state = self.state.lock().await;
+                pane_id_target(&state.sessions, pane_id)
+            }
+            None => None,
+        };
+        let requester_cwd_attached_count = match requester_cwd_target.as_ref() {
+            Some(target) => self.attached_count(target.session_name()).await,
+            None => 0,
+        };
+        let working_directory_uses_requester_context = requester_cwd_target.is_some();
         let command = request.command;
         let requested_process_command = request
             .process_command
-            .or_else(|| rmux_proto::ProcessCommand::from_legacy_command(command.as_deref()));
+            .or_else(|| crate::legacy_command::from_legacy_command(command.as_deref()));
         let requested_name = request.session_name;
         let socket_path = self.socket_path();
         let response = {
@@ -148,6 +241,20 @@ impl RequestHandler {
             let size = creation_options.size;
             let base_index = creation_options.base_index;
             let process_command = creation_options.process_command;
+            let working_directory = match (requester_cwd_target.as_ref(), working_directory) {
+                (Some(target), Some(template)) => {
+                    let context = match format_context_for_target(
+                        &state,
+                        target,
+                        requester_cwd_attached_count,
+                    ) {
+                        Ok(context) => context,
+                        Err(error) => return Response::Error(ErrorResponse { error }),
+                    };
+                    Some(render_runtime_template(&template, &context, false))
+                }
+                (_, working_directory) => working_directory,
+            };
             let (session_name, created_group) = match (requested_name.clone(), group_target.clone())
             {
                 (Some(session_name), Some(group_target)) => {
@@ -207,12 +314,25 @@ impl RequestHandler {
                 }
             }
 
-            if let Some(client_environment) = client_environment.as_ref() {
-                update_environment_from_client(&mut state, &session_name, client_environment);
+            if !request.skip_environment_update {
+                if let Some(client_environment) = client_environment.as_ref() {
+                    update_environment_from_client(&mut state, &session_name, client_environment);
+                }
+            }
+            if let Some(environment_assignments) = environment_assignments.as_ref() {
+                for (name, value) in environment_assignments {
+                    state.environment.set(
+                        ScopeSelector::Session(session_name.clone()),
+                        name.clone(),
+                        value.clone(),
+                    );
+                }
             }
 
             if let Some(template) = working_directory.as_deref() {
-                let rendered = {
+                let rendered = if working_directory_uses_requester_context {
+                    template.to_owned()
+                } else {
                     let session = state
                         .sessions
                         .session(&session_name)
@@ -239,6 +359,7 @@ impl RequestHandler {
                     InitialPaneSpawnOptions {
                         socket_path: &socket_path,
                         spawn_environment: spawn_environment.as_ref(),
+                        raw_spawn_environment: raw_spawn_environment.as_deref(),
                         environment_overrides: environment_overrides.as_deref(),
                         command: process_command.as_ref(),
                         pane_alert_callback: Some(self.pane_alert_callback()),
@@ -250,6 +371,17 @@ impl RequestHandler {
                         let _removed = state.sessions.remove_session(&session_name);
                         return Response::Error(ErrorResponse { error });
                     }
+                }
+            }
+            if request.window_name.is_some() {
+                let active_window = state
+                    .sessions
+                    .session(&session_name)
+                    .map(|session| session.active_window_index())
+                    .expect("newly created session must still exist");
+                let target = WindowTarget::with_window(session_name.clone(), active_window);
+                if let Err(error) = state.disable_automatic_rename_for_window(&target) {
+                    return Response::Error(ErrorResponse { error });
                 }
             }
 
@@ -529,11 +661,21 @@ impl RequestHandler {
             .filter_map(|session| {
                 let attached_count = active_attach.attached_count(session.name())
                     + active_control.attached_count(session.name());
-                let context =
-                    FormatContext::from_session(session).with_session_attached(attached_count);
+                let active_window_index = session.active_window_index();
+                let active_window = session.window();
+                let mut context = FormatContext::from_session(session)
+                    .with_session_attached(attached_count)
+                    .with_window(active_window_index, active_window, true, false);
+                if let Some(pane) = active_window.active_pane() {
+                    context = context.with_window_pane(active_window, pane);
+                }
                 let mut runtime = RuntimeFormatContext::new(context)
                     .with_state(&state)
-                    .with_session(session);
+                    .with_session(session)
+                    .with_window(active_window_index, active_window);
+                if let Some(pane) = active_window.active_pane() {
+                    runtime = runtime.with_pane(pane);
+                }
                 if attached_count == 0 {
                     runtime = runtime.with_unclipped_geometry();
                 }
@@ -577,6 +719,24 @@ impl RequestHandler {
             self.queue_shutdown_request(PendingShutdownReason::ExitEmpty);
         }
         should_shutdown
+    }
+}
+
+fn destroy_unattached_candidate_sessions(
+    state: &crate::pane_terminals::HandlerState,
+    scope: &OptionScopeSelector,
+) -> Vec<SessionName> {
+    match scope {
+        OptionScopeSelector::ServerGlobal
+        | OptionScopeSelector::SessionGlobal
+        | OptionScopeSelector::WindowGlobal => state
+            .sessions
+            .iter()
+            .map(|(session_name, _)| session_name.clone())
+            .collect(),
+        OptionScopeSelector::Session(session_name) => vec![session_name.clone()],
+        OptionScopeSelector::Window(target) => vec![target.session_name().clone()],
+        OptionScopeSelector::Pane(target) => vec![target.session_name().clone()],
     }
 }
 

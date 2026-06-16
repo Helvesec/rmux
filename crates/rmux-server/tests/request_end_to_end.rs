@@ -20,9 +20,10 @@ use rmux_proto::{
 use tokio::time::sleep;
 
 const COMMAND_SURFACE_COUNT: usize = 79;
-const INTERNAL_REQUEST_COMMANDS: [&str; 39] = [
+const INTERNAL_REQUEST_COMMANDS: [&str; 40] = [
     "attach-session-ext",
     "attach-session-ext2",
+    "attach-session-ext3",
     "cancel-sdk-wait",
     "control-mode",
     "daemon-status",
@@ -413,6 +414,7 @@ async fn buffer_capture_and_scripting_requests_round_trip_over_real_socket(
             target: Some(Target::Pane(pane.clone())),
             print: true,
             message: Some("#{session_name}:#{pane_index}:#{missing}".to_owned()),
+            empty_target_context: false,
         }),
     )
     .await?;
@@ -430,20 +432,25 @@ async fn buffer_capture_and_scripting_requests_round_trip_over_real_socket(
             command: "printf server-run-shell-output".to_owned(),
             background: false,
             as_commands: false,
-            show_stderr: false,
+            show_stderr: true,
             delay_seconds: None,
             start_directory: None,
             target: None,
+            source_depth: None,
         }),
     )
     .await?;
-    assert_eq!(
-        shell
-            .command_output()
-            .expect("run-shell returns command output")
-            .stdout(),
-        b"server-run-shell-output"
-    );
+    match shell {
+        Response::RunShell(response) => {
+            assert_eq!(response.exit_status(), Some(0));
+            assert_eq!(
+                response.command_output(),
+                None,
+                "foreground run-shell should drain stdout without returning it"
+            );
+        }
+        other => panic!("expected run-shell response, got {other:?}"),
+    }
 
     let if_shell = send_request(
         harness.socket_path(),

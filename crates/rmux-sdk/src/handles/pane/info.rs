@@ -337,6 +337,7 @@ async fn fetch_live_details(client: &TransportClient, target: &PaneRef) -> Resul
             target: Some(Target::Pane(target.into())),
             print: true,
             message: Some(PANE_INFO_FORMAT.to_owned()),
+            empty_target_context: false,
         }))
         .await?;
 
@@ -516,11 +517,39 @@ fn decode_command_field(value: &str) -> Result<Option<Vec<String>>> {
     if value.is_empty() {
         return Ok(None);
     }
-    value
+    let mut command = value
         .split('\x1f')
         .map(percent_decode_string)
-        .collect::<Result<Vec<_>>>()
-        .map(Some)
+        .collect::<Result<Vec<_>>>()?;
+    if command.len() == 1 {
+        command[0] = unquote_tmux_shell_command(&command[0]);
+    }
+    Ok(Some(command))
+}
+
+fn unquote_tmux_shell_command(value: &str) -> String {
+    let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    else {
+        return value.to_owned();
+    };
+    let mut unquoted = String::with_capacity(inner.len());
+    let mut escaped = false;
+    for character in inner.chars() {
+        if escaped {
+            unquoted.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else {
+            unquoted.push(character);
+        }
+    }
+    if escaped {
+        unquoted.push('\\');
+    }
+    unquoted
 }
 
 fn percent_decode_string(value: &str) -> Result<String> {

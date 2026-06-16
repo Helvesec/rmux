@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -14,6 +15,8 @@ use crate::pane_io::{AttachControl, AttachTarget, LivePaneRender, OverlayFrame};
 use crate::pane_terminals::{session_not_found, HandlerState};
 use crate::renderer;
 use crate::terminal::TerminalProfile;
+
+pub(super) const ATTACH_CONTROL_BACKLOG_LIMIT: usize = 64;
 
 #[path = "handler_attach/key_table.rs"]
 mod key_table;
@@ -80,6 +83,7 @@ impl RequestHandler {
         OuterTerminalContext,
         TerminalSize,
         Option<rmux_proto::TerminalPixels>,
+        bool,
     )> {
         let active_attach = self.active_attach.lock().await;
         active_attach.by_pid.get(&attach_pid).map(|active| {
@@ -87,6 +91,7 @@ impl RequestHandler {
                 active.terminal_context.clone(),
                 active.client_size,
                 active.client_pixels,
+                active.render_stream,
             )
         })
     }
@@ -172,7 +177,53 @@ impl RequestHandler {
         ) {
             active.closing.store(true, Ordering::SeqCst);
         }
+        let render_stream_switch_refresh = active.render_stream
+            && matches!(
+                &command,
+                AttachControl::Switch(target) if target.is_coalescible_render_refresh()
+            );
+        if render_stream_switch_refresh {
+            if let Some(session_name) = next_session_name {
+                if session_name != active.session_name {
+                    active.last_session = Some(active.session_name.clone());
+                }
+                active.session_name = session_name;
+            }
+            if !active.render_refresh_pending {
+                active.render_refresh_pending = true;
+                if active.control_tx.send(AttachControl::Refresh).is_err() {
+                    active_attach.by_pid.remove(&attach_pid);
+                    return Err(attached_client_required(command_name));
+                }
+            }
+            drop(active_attach);
+            if clear_prompt {
+                self.clear_prompt_for_attach(attach_pid).await;
+            }
+            return Ok(previous_session_name);
+        }
+        let tracked_control = matches!(command, AttachControl::Switch(_) | AttachControl::Refresh);
+        if tracked_control
+            && active.control_backlog.load(Ordering::Acquire) >= ATTACH_CONTROL_BACKLOG_LIMIT
+        {
+            active.closing.store(true, Ordering::SeqCst);
+            let _ = active.control_tx.send(AttachControl::Detach);
+            active_attach.by_pid.remove(&attach_pid);
+            return Err(rmux_proto::RmuxError::Server(
+                "attached client is not draining updates".to_owned(),
+            ));
+        }
+        if tracked_control {
+            active.control_backlog.fetch_add(1, Ordering::AcqRel);
+        }
         if active.control_tx.send(command).is_err() {
+            if tracked_control {
+                let _ = active.control_backlog.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |value| value.checked_sub(1),
+                );
+            }
             active_attach.by_pid.remove(&attach_pid);
             return Err(attached_client_required(command_name));
         }
@@ -342,43 +393,114 @@ pub(super) fn attach_target_for_session(
     session_name: &rmux_proto::SessionName,
     attached_count: usize,
     terminal_context: &OuterTerminalContext,
+    socket_path: &Path,
 ) -> Result<AttachTarget, rmux_proto::RmuxError> {
     attach_target_for_session_with_prompt(
         state,
         session_name,
         attached_count,
-        None,
-        None,
-        terminal_context,
-        None,
+        AttachTargetRenderOptions {
+            prompt: None,
+            key_table: None,
+            terminal_context,
+            render_size: None,
+            master: AttachTargetMaster::Clone,
+            socket_path,
+        },
     )
+}
+
+#[cfg(feature = "web")]
+pub(super) fn attach_render_target_for_session(
+    state: &HandlerState,
+    session_name: &rmux_proto::SessionName,
+    attached_count: usize,
+    terminal_context: &OuterTerminalContext,
+    socket_path: &Path,
+) -> Result<AttachTarget, rmux_proto::RmuxError> {
+    attach_target_for_session_with_prompt(
+        state,
+        session_name,
+        attached_count,
+        AttachTargetRenderOptions {
+            prompt: None,
+            key_table: None,
+            terminal_context,
+            render_size: None,
+            master: AttachTargetMaster::Omit,
+            socket_path,
+        },
+    )
+}
+
+pub(super) fn attach_render_target_for_session_with_prompt(
+    state: &HandlerState,
+    session_name: &rmux_proto::SessionName,
+    attached_count: usize,
+    request: AttachRenderTargetRequest<'_>,
+) -> Result<AttachTarget, rmux_proto::RmuxError> {
+    attach_target_for_session_with_prompt(
+        state,
+        session_name,
+        attached_count,
+        AttachTargetRenderOptions {
+            prompt: request.prompt,
+            key_table: request.key_table,
+            terminal_context: request.terminal_context,
+            render_size: request.render_size,
+            master: AttachTargetMaster::Omit,
+            socket_path: request.socket_path,
+        },
+    )
+}
+
+pub(super) struct AttachRenderTargetRequest<'a> {
+    pub(super) prompt: Option<&'a renderer::RenderedPrompt>,
+    pub(super) key_table: Option<&'a str>,
+    pub(super) terminal_context: &'a OuterTerminalContext,
+    pub(super) render_size: Option<TerminalSize>,
+    pub(super) socket_path: &'a Path,
+}
+
+#[derive(Clone, Copy)]
+enum AttachTargetMaster {
+    Clone,
+    Omit,
+}
+
+struct AttachTargetRenderOptions<'a> {
+    prompt: Option<&'a renderer::RenderedPrompt>,
+    key_table: Option<&'a str>,
+    terminal_context: &'a OuterTerminalContext,
+    render_size: Option<TerminalSize>,
+    master: AttachTargetMaster,
+    socket_path: &'a Path,
 }
 
 fn attach_target_for_session_with_prompt(
     state: &HandlerState,
     session_name: &rmux_proto::SessionName,
     attached_count: usize,
-    prompt: Option<&renderer::RenderedPrompt>,
-    key_table: Option<&str>,
-    terminal_context: &OuterTerminalContext,
-    render_size: Option<TerminalSize>,
+    options: AttachTargetRenderOptions<'_>,
 ) -> Result<AttachTarget, rmux_proto::RmuxError> {
     let canonical_session = state
         .sessions
         .session(session_name)
         .ok_or_else(|| session_not_found(session_name))?;
-    let session = sized_session(canonical_session, render_size);
+    let session = sized_session(canonical_session, options.render_size);
     let session = session.as_ref();
     let outer_terminal = OuterTerminal::resolve_for_session(
         &state.options,
         Some(session_name),
-        terminal_context.clone(),
+        options.terminal_context.clone(),
     );
+    let pane_output = state.active_pane_output(session_name)?;
+    let (pane_output_start_sequence, ()) = pane_output.capture_with_next_sequence(|| ());
     let active_pane = session.window().active_pane().cloned();
     let pane_state = session
         .active_pane_id()
         .and_then(|pane_id| state.pane_screen_state(session_name, pane_id));
-    let cursor_scope = match prompt {
+    let cursor_scope = match options.prompt {
         Some(prompt) if prompt.command_prompt => CursorScope::CommandPrompt,
         Some(_) => CursorScope::Prompt,
         None => CursorScope::Pane,
@@ -396,13 +518,16 @@ fn attach_target_for_session_with_prompt(
             session,
             &state.options,
             attached_count,
-            prompt,
-            pane_state
-                .as_ref()
-                .map(|pane_state| pane_state.title.as_str())
-                .filter(|title| !title.is_empty()),
-            Some(state),
-            key_table,
+            renderer::StatusRenderContext {
+                prompt: options.prompt,
+                pane_title: pane_state
+                    .as_ref()
+                    .map(|pane_state| pane_state.title.as_str())
+                    .filter(|title| !title.is_empty()),
+                state: Some(state),
+                key_table: options.key_table,
+                socket_path: Some(options.socket_path),
+            },
         )
         .as_slice(),
     );
@@ -439,8 +564,8 @@ fn attach_target_for_session_with_prompt(
         renderer::render_pane_border_status_lines(session, &state.options, Some(state)).as_slice(),
     );
     let live_pane =
-        live_pane_render_for_target(state, session, &state.options, session_name, prompt);
-    if prompt.is_none() {
+        live_pane_render_for_target(state, session, &state.options, session_name, options.prompt);
+    if options.prompt.is_none() {
         if let Some(active_pane) = active_pane.clone() {
             let active_screen = state
                 .pane_copy_mode_render_screen(session_name, active_pane.id())
@@ -469,14 +594,26 @@ fn attach_target_for_session_with_prompt(
         terminal_passthrough_allowed && outer_terminal.supports_kitty_graphics();
     let sixel_passthrough = terminal_passthrough_allowed && outer_terminal.supports_sixel();
 
+    let input_target = PaneTarget::with_window(
+        session_name.clone(),
+        session.active_window_index(),
+        active_pane.as_ref().map_or(0, rmux_core::Pane::index),
+    );
+
     Ok(AttachTarget {
         session_name: session_name.clone(),
-        pane_master: state.active_pane_master(session_name)?,
-        pane_output: state.active_pane_output(session_name)?,
+        input_target,
+        pane_master: match options.master {
+            AttachTargetMaster::Clone => Some(state.active_pane_master(session_name)?),
+            AttachTargetMaster::Omit => None,
+        },
+        pane_output,
+        pane_output_start_sequence,
         render_frame,
         outer_terminal,
         cursor_style,
         active_pane_geometry,
+        raw_passthrough: terminal_passthrough_allowed,
         kitty_graphics_passthrough,
         sixel_passthrough,
         persistent_overlay_state_id: None,
@@ -550,4 +687,61 @@ pub(super) fn option_affects_attached_rendering(option: rmux_proto::OptionName) 
             | rmux_proto::OptionName::TerminalFeatures
             | rmux_proto::OptionName::TerminalOverrides
     ) || rmux_core::option_affects_rendering(option)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use rmux_os::identity::UserIdentity;
+    use rmux_proto::{SessionName, TerminalSize};
+    use tokio::sync::mpsc;
+
+    use super::{AttachRegistration, RequestHandler, ATTACH_CONTROL_BACKLOG_LIMIT};
+    use crate::client_flags::ClientFlags;
+    use crate::outer_terminal::OuterTerminalContext;
+    use crate::pane_io::AttachControl;
+    use crate::server_access::current_owner_uid;
+
+    #[tokio::test]
+    async fn attach_control_backlog_limit_removes_slow_client() {
+        let handler = RequestHandler::new();
+        let session_name = SessionName::new("alpha").expect("valid session name");
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let control_backlog = Arc::new(AtomicUsize::new(ATTACH_CONTROL_BACKLOG_LIMIT));
+        let uid = current_owner_uid();
+
+        handler
+            .register_attach_with_access(
+                77,
+                session_name.clone(),
+                AttachRegistration {
+                    control_tx,
+                    control_backlog: control_backlog.clone(),
+                    closing: Arc::new(AtomicBool::new(false)),
+                    persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
+                    terminal_context: OuterTerminalContext::default(),
+                    flags: ClientFlags::default(),
+                    render_stream: true,
+                    uid,
+                    user: UserIdentity::Uid(uid),
+                    can_write: true,
+                    client_size: Some(TerminalSize { cols: 80, rows: 24 }),
+                },
+            )
+            .await;
+
+        let error = handler
+            .send_attach_control(77, AttachControl::Refresh, "refresh-client", None)
+            .await
+            .expect_err("overloaded attach client should reject refresh");
+
+        assert!(error.to_string().contains("not draining updates"));
+        assert_eq!(
+            control_backlog.load(Ordering::Acquire),
+            ATTACH_CONTROL_BACKLOG_LIMIT
+        );
+        assert!(!handler.active_attach.lock().await.by_pid.contains_key(&77));
+    }
 }

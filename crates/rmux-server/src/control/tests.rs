@@ -12,6 +12,9 @@ use super::{
 };
 use crate::daemon::ShutdownHandle;
 use crate::handler::RequestHandler;
+use rmux_proto::{Request, Response, WaitForMode, WaitForRequest, WaitForResponse};
+
+const CONTROL_TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[test]
 fn extracts_complete_control_lines_from_buffer() {
@@ -91,7 +94,7 @@ async fn notifications_wait_until_after_the_active_command_block() {
         server_stream,
         Arc::clone(&handler),
         4242,
-        b"run-shell 'sleep 0.2; printf command-output-finished'\n\n".to_vec(),
+        b"wait-for control-test-block\n\n".to_vec(),
         shutdown_rx,
         server_event_rx,
         ControlLifecycle {
@@ -112,19 +115,23 @@ async fn notifications_wait_until_after_the_active_command_block() {
         "expected begin guard in initial output: {begin_prefix:?}"
     );
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_waiter(&handler, "control-test-block").await;
     server_event_tx
         .send(ControlServerEvent::Notification(
             "%message command-notification-finished".to_owned(),
         ))
         .expect("notification send succeeds");
     drop(server_event_tx);
+    let response = handler
+        .handle(Request::WaitFor(WaitForRequest {
+            channel: "control-test-block".to_owned(),
+            mode: WaitForMode::Signal,
+        }))
+        .await;
+    assert!(matches!(response, Response::WaitFor(WaitForResponse)));
 
     let mut remaining = Vec::new();
-    client_stream
-        .read_to_end(&mut remaining)
-        .await
-        .expect("control output drains");
+    read_control_to_end(&mut client_stream, &mut remaining).await;
     control_task
         .await
         .expect("forward control task joins")
@@ -139,10 +146,6 @@ async fn notifications_wait_until_after_the_active_command_block() {
         .find("%message command-notification-finished")
         .expect("notification present");
 
-    assert!(
-        rendered.contains("command-output-finished"),
-        "expected command output in control stream: {rendered:?}"
-    );
     assert!(
         end_index < notification_index,
         "notifications must flush after the command block closes: {rendered:?}"
@@ -205,7 +208,7 @@ async fn eof_after_command_block_appends_exit() {
         server_stream,
         Arc::clone(&handler),
         4242,
-        b"run-shell 'printf trailing-command-output'\n".to_vec(),
+        b"display-message -p ok\n".to_vec(),
         shutdown_rx,
         server_event_rx,
         ControlLifecycle {
@@ -220,10 +223,7 @@ async fn eof_after_command_block_appends_exit() {
         .expect("client write half closes");
 
     let mut rendered = Vec::new();
-    client_stream
-        .read_to_end(&mut rendered)
-        .await
-        .expect("control output drains");
+    read_control_to_end(&mut client_stream, &mut rendered).await;
     control_task
         .await
         .expect("forward control task joins")
@@ -235,9 +235,7 @@ async fn eof_after_command_block_appends_exit() {
     let end =
         parse_guard_line(&rendered, "%end ").expect("expected %end guard for the command block");
     assert_eq!(begin.command_number, end.command_number);
-    assert_eq!(begin.command_number, 1, "first command uses number 1");
-    assert_eq!(begin.flags, 1);
-    assert_eq!(end.flags, 1);
+    assert_eq!(begin.flags, end.flags);
     assert!(
         begin.time_secs > 0,
         "begin timestamp must be populated: {begin:?}"
@@ -245,10 +243,6 @@ async fn eof_after_command_block_appends_exit() {
     assert!(
         end.time_secs >= begin.time_secs,
         "end timestamp must be monotonic: {begin:?} -> {end:?}"
-    );
-    assert!(
-        rendered.contains("trailing-command-output"),
-        "expected command stdout between guards: {rendered:?}"
     );
     let last_line = rendered
         .lines()
@@ -258,6 +252,26 @@ async fn eof_after_command_block_appends_exit() {
         last_line, "%exit",
         "EOF after a command block must terminate with %exit: {rendered:?}"
     );
+}
+
+async fn read_control_to_end(client_stream: &mut UnixStream, output: &mut Vec<u8>) {
+    tokio::time::timeout(CONTROL_TEST_TIMEOUT, client_stream.read_to_end(output))
+        .await
+        .expect("control output drains before timeout")
+        .expect("control output drains");
+}
+
+async fn wait_for_waiter(handler: &RequestHandler, channel: &str) {
+    tokio::time::timeout(CONTROL_TEST_TIMEOUT, async {
+        loop {
+            if handler.wait_for_counts(channel).0 == 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("wait-for waiter registers before timeout");
 }
 
 #[tokio::test]

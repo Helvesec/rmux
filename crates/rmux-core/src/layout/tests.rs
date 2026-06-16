@@ -1,4 +1,4 @@
-use super::apply_layout;
+use super::{apply_layout, layout_checksum, LayoutTree};
 use crate::{Pane, PaneGeometry};
 use rmux_proto::{LayoutName, TerminalSize};
 
@@ -19,6 +19,22 @@ fn assert_layout(
     assert_eq!(
         panes.iter().map(|pane| pane.geometry()).collect::<Vec<_>>(),
         expected
+    );
+}
+
+#[test]
+fn custom_layout_rejects_excessive_nesting_before_stack_growth() {
+    let mut body = "1x1,0,0".to_owned();
+    for _ in 0..150 {
+        body = format!("1x1,0,0{{{body}}}");
+    }
+    let layout = format!("{:04x},{body}", layout_checksum(&body));
+
+    let error = LayoutTree::parse(&layout, 1).expect_err("deep layout must be rejected");
+
+    assert!(
+        error.to_string().contains("too deeply nested"),
+        "unexpected error: {error}"
     );
 }
 

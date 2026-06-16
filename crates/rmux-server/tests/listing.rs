@@ -295,6 +295,7 @@ async fn rename_session_round_trips_and_migrates_session_scoped_state() -> Resul
             name: None,
             value_only: false,
             include_inherited: true,
+            quiet: false,
         }),
     )
     .await?;

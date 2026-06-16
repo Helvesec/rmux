@@ -3,13 +3,40 @@ use super::{
     ScopeSelector, SessionName, Target, WindowTarget,
 };
 use crate::{
-    decode_frame, encode_frame, Request, RmuxError, SelectLayoutRequest, SelectLayoutTarget,
+    decode_frame, encode_frame, ProcessCommand, Request, RmuxError, SelectLayoutRequest,
+    SelectLayoutTarget,
 };
 
 #[test]
 fn session_name_preserves_case_without_rewriting() {
     let session_name = SessionName::new("MiXeD-Case_01").expect("valid session name");
     assert_eq!(session_name.as_str(), "MiXeD-Case_01");
+}
+
+#[test]
+fn legacy_command_vectors_preserve_argv_without_runtime_context() {
+    let command = vec![
+        "bash".to_owned(),
+        "-lc".to_owned(),
+        "printf '%s\\n' hello world".to_owned(),
+    ];
+
+    assert_eq!(
+        ProcessCommand::from_legacy_command(Some(&command)),
+        Some(ProcessCommand::Argv(command))
+    );
+}
+
+#[test]
+fn legacy_single_string_still_uses_shell_mode() {
+    let command = vec!["printf '%s\\n' hello world".to_owned()];
+
+    assert_eq!(
+        ProcessCommand::from_legacy_command(Some(&command)),
+        Some(ProcessCommand::Shell(
+            "printf '%s\\n' hello world".to_owned()
+        ))
+    );
 }
 
 #[test]

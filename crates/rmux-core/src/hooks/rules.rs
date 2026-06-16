@@ -202,6 +202,12 @@ pub(super) const fn root_for_hook(hook: HookName) -> HookGlobalRoot {
     }
 }
 
+/// Returns the global hook root where tmux stores a hook.
+#[must_use]
+pub const fn hook_global_root(hook: HookName) -> HookGlobalRoot {
+    root_for_hook(hook)
+}
+
 pub(super) const fn hook_is_visible_in_show_hooks(hook: HookName) -> bool {
     !matches!(
         hook,
@@ -220,7 +226,6 @@ const fn hook_is_supported_for_registration(hook: HookName) -> bool {
             | HookName::ClientDarkTheme
             | HookName::CommandError
             | HookName::PaneTitleChanged
-            | HookName::WindowResized
             | HookName::PasteBufferChanged
             | HookName::PasteBufferDeleted
     )

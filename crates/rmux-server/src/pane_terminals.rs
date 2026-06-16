@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ffi::OsString;
 use std::path::Path;
 #[cfg(test)]
 use std::sync::Mutex as StdMutex;
@@ -12,10 +13,13 @@ use rmux_proto::{
     SessionName, TerminalPixels, WindowTarget,
 };
 
+#[cfg(unix)]
+use crate::pane_io::PaneOutputReaderTask;
 use crate::pane_io::{PaneAlertCallback, PaneExitCallback, PaneOutputSender};
 #[cfg(unix)]
 use crate::pane_reader_runtime::PaneReaderRuntime;
 use crate::pane_transcript::SharedPaneTranscript;
+use crate::pane_visible_geometry::visible_pane_content_geometry;
 
 #[path = "pane_terminals/lifecycle_state.rs"]
 mod lifecycle_state;
@@ -80,6 +84,7 @@ pub(crate) struct WindowSpawnOptions<'a> {
 pub(crate) struct InitialPaneSpawnOptions<'a> {
     pub(crate) socket_path: &'a Path,
     pub(crate) spawn_environment: Option<&'a HashMap<String, String>>,
+    pub(crate) raw_spawn_environment: Option<&'a [(OsString, OsString)]>,
     pub(crate) environment_overrides: Option<&'a [String]>,
     pub(crate) command: Option<&'a ProcessCommand>,
     pub(crate) pane_alert_callback: Option<PaneAlertCallback>,
@@ -110,10 +115,13 @@ pub(crate) struct HandlerState {
     terminals: PaneTerminalStore,
     transcripts: HashMap<SessionName, HashMap<PaneId, SharedPaneTranscript>>,
     pane_outputs: HashMap<SessionName, HashMap<PaneId, PaneOutputSender>>,
+    #[cfg(unix)]
+    pane_output_readers: HashMap<SessionName, HashMap<PaneId, PaneOutputReaderTask>>,
     pane_output_generations: HashMap<SessionName, HashMap<PaneId, u64>>,
     pane_lifecycle: HashMap<PaneId, PaneLifecycleState>,
     attached_submitted_rows: HashMap<SessionName, HashMap<PaneId, AttachedSubmittedLine>>,
     attached_terminal_pixels: HashMap<SessionName, TerminalPixels>,
+    input_disabled_panes: HashSet<PaneId>,
     #[cfg(test)]
     pane_input_captures: StdMutex<HashMap<String, Vec<u8>>>,
     dead_panes: HashMap<SessionName, HashMap<PaneId, PaneExitMetadata>>,
@@ -306,12 +314,17 @@ impl HandlerState {
 fn pane_terminal_geometry_for_session(
     session: &Session,
     options: &OptionStore,
+    window_index: u32,
     geometry: PaneGeometry,
 ) -> PaneGeometry {
     let content_rows = session_content_rows(session, options);
-    let y = geometry.y().min(content_rows);
-    let rows = geometry.rows().min(content_rows.saturating_sub(y));
-    PaneGeometry::new(geometry.x(), y, geometry.cols(), rows)
+    visible_pane_content_geometry(
+        options,
+        session.name(),
+        window_index,
+        geometry,
+        content_rows,
+    )
 }
 
 fn session_content_rows(session: &Session, options: &OptionStore) -> u16 {
@@ -368,6 +381,7 @@ mod tests {
                 InitialPaneSpawnOptions {
                     socket_path: std::path::Path::new("/tmp/rmux-test.sock"),
                     spawn_environment: None,
+                    raw_spawn_environment: None,
                     environment_overrides: None,
                     command: None,
                     pane_alert_callback: None,
@@ -482,6 +496,7 @@ mod tests {
                 InitialPaneSpawnOptions {
                     socket_path: std::path::Path::new("/tmp/rmux-test.sock"),
                     spawn_environment: None,
+                    raw_spawn_environment: None,
                     environment_overrides: None,
                     command: None,
                     pane_alert_callback: None,
@@ -498,12 +513,31 @@ mod tests {
             .expect("initial pane exists");
         let generation = state.pane_output_generation(&alpha, pane_id);
         assert!(generation > 0);
+        #[cfg(unix)]
+        assert!(
+            state
+                .pane_output_readers
+                .get(&alpha)
+                .is_some_and(|readers| readers.contains_key(&pane_id)),
+            "initial pane reader task must be owned by the runtime session"
+        );
 
         state
             .rename_session(&alpha, &beta)
             .expect("rename succeeds");
 
         assert!(!state.pane_output_generations.contains_key(&alpha));
+        #[cfg(unix)]
+        {
+            assert!(!state.pane_output_readers.contains_key(&alpha));
+            assert!(
+                state
+                    .pane_output_readers
+                    .get(&beta)
+                    .is_some_and(|readers| readers.contains_key(&pane_id)),
+                "rename must re-key pane reader ownership for cleanup"
+            );
+        }
         assert_eq!(
             state.pane_output_generation(&beta, pane_id),
             generation,

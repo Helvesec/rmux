@@ -182,15 +182,25 @@ impl OptionStore {
         mode: ShowOptionsMode,
     ) -> Result<Vec<String>, RmuxError> {
         let query = resolve_option_name(name)?;
-        let scope = self.show_scope_for_named_query(scope, &query);
-        let lines = self.render_show_lines_for_query(&scope, &query, value_only, mode);
+        let resolved_scope = self.show_scope_for_named_query(scope, &query);
+        let mode = if mode == ShowOptionsMode::Explicit && resolved_scope.mask() != scope.mask() {
+            ShowOptionsMode::Resolved
+        } else {
+            mode
+        };
+        let lines = self.render_show_lines_for_query(&resolved_scope, &query, value_only, mode);
         if query.is_user() && lines.is_empty() {
             return Err(RmuxError::Message(format!(
                 "invalid option: {}",
                 query.canonical_name()
             )));
         }
-        if query.is_array() && query.index().is_none() && lines.is_empty() && !value_only {
+        if query.is_array()
+            && query.index().is_none()
+            && lines.is_empty()
+            && !value_only
+            && empty_array_shows_name(&resolved_scope, mode, &query)
+        {
             return Ok(vec![query.canonical_name().to_owned()]);
         }
         Ok(lines)
@@ -238,7 +248,7 @@ impl OptionStore {
                     .map(OptionEntry::array_entries)
                     .unwrap_or_default(),
             };
-            if values.is_empty() && !value_only {
+            if values.is_empty() && !value_only && empty_array_shows_name(scope, mode, query) {
                 return vec![query.canonical_name().to_owned()];
             }
             return values
@@ -426,4 +436,22 @@ impl OptionStore {
             }
         }
     }
+}
+
+fn empty_array_shows_name(
+    scope: &ShowScope<'_>,
+    mode: ShowOptionsMode,
+    query: &OptionQuery,
+) -> bool {
+    query.is_array()
+        && matches!(
+            (scope, mode),
+            (
+                ShowScope::Server | ShowScope::SessionGlobal | ShowScope::WindowGlobal,
+                ShowOptionsMode::Resolved | ShowOptionsMode::ResolvedWithInheritanceMarkers
+            ) | (
+                ShowScope::Window(_) | ShowScope::Pane(_),
+                ShowOptionsMode::ResolvedWithInheritanceMarkers
+            )
+        )
 }

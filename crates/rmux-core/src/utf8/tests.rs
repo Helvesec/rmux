@@ -1,4 +1,6 @@
-use super::{combine_char, text_width, truncate_to_width, CombineResult, Utf8Config};
+use super::{
+    combine_char, text_width, truncate_right_to_width, truncate_to_width, CombineResult, Utf8Config,
+};
 use crate::OptionStore;
 use rmux_proto::{OptionName, ScopeSelector, SetOptionMode};
 
@@ -159,4 +161,16 @@ fn text_width_and_truncation_follow_display_width() {
     assert_eq!(truncate_to_width("表A", 2, &config), "表");
     assert_eq!(text_width("🇨🇭A", &config), 3);
     assert_eq!(truncate_to_width("🇨🇭A", 2, &config), "🇨🇭");
+}
+
+#[test]
+fn right_truncation_keeps_display_cells_from_the_end() {
+    let config = Utf8Config::default();
+
+    assert_eq!(truncate_right_to_width("A表B", 3, &config), "表B");
+    assert_eq!(
+        truncate_right_to_width("A👨\u{200D}👩B", 3, &config),
+        "👨\u{200D}👩B"
+    );
+    assert_eq!(truncate_right_to_width("AB", 0, &config), "");
 }

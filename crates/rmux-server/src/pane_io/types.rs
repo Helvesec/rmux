@@ -1,14 +1,16 @@
 use rmux_core::events::{
-    OutputCursor, OutputCursorItem, OutputRing, DEFAULT_OUTPUT_RING_CAPACITY,
+    OutputCursor, OutputCursorItem, OutputEvent, OutputRing, DEFAULT_OUTPUT_RING_CAPACITY,
     DEFAULT_RECENT_LIVE_BUFFER_CAPACITY,
 };
 use rmux_core::{PaneGeometry, PaneId, TerminalPassthrough};
-use rmux_proto::{AttachShellCommand, TerminalSize};
+use rmux_proto::{AttachShellCommand, PaneTarget, TerminalSize};
 use rmux_pty::PtyMaster;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::{mpsc, Notify};
+use tokio::time::Instant;
 
 use crate::client_flags::ClientFlags;
 use crate::control_mode::ControlModeUpgrade;
@@ -24,6 +26,8 @@ pub(crate) enum AttachControl {
     Exited,
     DetachKill,
     DetachExecShellCommand(AttachShellCommand),
+    InteractiveInput,
+    Refresh,
     Switch(Box<AttachTarget>),
     AdvancePersistentOverlayState(u64),
     Overlay(OverlayFrame),
@@ -35,6 +39,10 @@ pub(crate) enum AttachControl {
 impl AttachControl {
     pub(crate) fn switch(target: AttachTarget) -> Self {
         Self::Switch(Box::new(target))
+    }
+
+    pub(crate) fn is_coalescible_render_switch(&self) -> bool {
+        matches!(self, Self::Switch(target) if target.is_coalescible_render_refresh())
     }
 }
 
@@ -93,6 +101,7 @@ pub(crate) struct PaneAlertEvent {
     pub(crate) session_name: rmux_proto::SessionName,
     pub(crate) pane_id: PaneId,
     pub(crate) bell_count: u64,
+    pub(crate) queue_activity_alert: bool,
     pub(crate) generation: Option<u64>,
 }
 
@@ -110,16 +119,25 @@ pub(crate) type PaneExitCallback = Arc<dyn Fn(PaneExitEvent) + Send + Sync>;
 #[derive(Debug)]
 pub(crate) struct AttachTarget {
     pub(crate) session_name: rmux_proto::SessionName,
-    pub(crate) pane_master: PtyMaster,
+    pub(crate) input_target: PaneTarget,
+    pub(crate) pane_master: Option<PtyMaster>,
     pub(crate) pane_output: PaneOutputSender,
+    pub(crate) pane_output_start_sequence: u64,
     pub(crate) render_frame: Vec<u8>,
     pub(crate) outer_terminal: OuterTerminal,
     pub(crate) cursor_style: u32,
     pub(crate) active_pane_geometry: PaneGeometry,
+    pub(crate) raw_passthrough: bool,
     pub(crate) kitty_graphics_passthrough: bool,
     pub(crate) sixel_passthrough: bool,
     pub(crate) persistent_overlay_state_id: Option<u64>,
     pub(crate) live_pane: Option<Box<LivePaneRender>>,
+}
+
+impl AttachTarget {
+    pub(crate) fn is_coalescible_render_refresh(&self) -> bool {
+        self.pane_master.is_none() && self.persistent_overlay_state_id.is_none()
+    }
 }
 
 #[cfg(any(unix, windows))]
@@ -150,17 +168,21 @@ impl HandleOutcome {
         control_rx: mpsc::UnboundedReceiver<AttachControl>,
         flags: ClientFlags,
         client_size: Option<TerminalSize>,
+        render_stream: bool,
     ) -> Self {
+        let control_backlog = Arc::new(AtomicUsize::new(0));
         Self {
             response,
             attach: Some(AttachSessionUpgrade {
                 target,
                 control_tx,
                 control_rx,
+                control_backlog,
                 closing: Arc::new(AtomicBool::new(false)),
                 persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
                 flags,
                 client_size,
+                render_stream,
             }),
             control: None,
         }
@@ -179,24 +201,31 @@ pub(crate) struct AttachSessionUpgrade {
     pub(crate) target: AttachTarget,
     pub(crate) control_tx: mpsc::UnboundedSender<AttachControl>,
     pub(crate) control_rx: mpsc::UnboundedReceiver<AttachControl>,
+    pub(crate) control_backlog: Arc<AtomicUsize>,
     pub(crate) closing: Arc<AtomicBool>,
     pub(crate) persistent_overlay_epoch: Arc<AtomicU64>,
     pub(crate) flags: ClientFlags,
     pub(crate) client_size: Option<TerminalSize>,
+    pub(crate) render_stream: bool,
 }
 
 pub(super) struct OpenAttachTarget {
     pub(super) session_name: rmux_proto::SessionName,
-    pub(super) _pane_master: PtyMaster,
+    pub(super) input_target: PaneTarget,
+    pub(super) pane_master: Option<PtyMaster>,
+    pub(super) predicted_echo: VecDeque<u8>,
+    pub(super) predicted_echo_started_at: Option<Instant>,
     pub(super) pane_output: Option<PaneOutputReceiver>,
     pub(super) render_frame: Vec<u8>,
     pub(super) outer_terminal: OuterTerminal,
     pub(super) cursor_style: u32,
     pub(super) active_pane_geometry: PaneGeometry,
+    pub(super) raw_passthrough: bool,
     pub(super) kitty_graphics_passthrough: bool,
     pub(super) sixel_passthrough: bool,
     pub(super) persistent_overlay_state_id: Option<u64>,
     pub(super) live_pane: Option<Box<LivePaneRender>>,
+    pub(super) render_stream: bool,
 }
 
 #[derive(Clone)]
@@ -207,6 +236,10 @@ pub(crate) struct PaneOutputSender {
 struct PaneOutputInner {
     state: Mutex<PaneOutputState>,
     generation: AtomicU64,
+    fast_epoch: AtomicU64,
+    receiver_count: AtomicUsize,
+    fast_receiver_count: AtomicUsize,
+    fast_receivers: Mutex<Vec<mpsc::Sender<FastPaneOutput>>>,
     notify: Notify,
 }
 
@@ -214,6 +247,14 @@ pub(crate) struct PaneOutputReceiver {
     inner: Arc<PaneOutputInner>,
     cursor: OutputCursor,
     passthrough_floor_sequence: u64,
+    fast_rx: Option<mpsc::Receiver<FastPaneOutput>>,
+}
+
+#[derive(Debug, Clone)]
+struct FastPaneOutput {
+    epoch: u64,
+    sequence: u64,
+    bytes: Arc<[u8]>,
 }
 
 struct PaneOutputState {
@@ -227,6 +268,8 @@ struct PaneOutputPassthroughs {
 }
 
 const PANE_OUTPUT_PASSTHROUGH_CAPACITY: usize = 16;
+const FAST_PANE_OUTPUT_MAX_BYTES: usize = 16 * 1024;
+const FAST_PANE_OUTPUT_CHANNEL_CAPACITY: usize = 64;
 
 impl PaneOutputState {
     fn new(event_capacity: usize, recent_byte_capacity: usize) -> Self {
@@ -236,8 +279,15 @@ impl PaneOutputState {
         }
     }
 
-    fn push(&mut self, bytes: Vec<u8>, passthroughs: Vec<TerminalPassthrough>) -> u64 {
-        let sequence = self.ring.push(bytes).sequence();
+    fn push(
+        &mut self,
+        bytes: Arc<[u8]>,
+        passthroughs: Vec<TerminalPassthrough>,
+        retain_recent: bool,
+    ) -> u64 {
+        let sequence = self
+            .ring
+            .push_shared_with_recent_retention(bytes, retain_recent);
         if !passthroughs.is_empty() {
             self.passthroughs.push_back(PaneOutputPassthroughs {
                 sequence,
@@ -350,7 +400,8 @@ impl PaneOutputSender {
         bytes: Vec<u8>,
         build_side_effects: impl FnOnce(&[u8]) -> (R, Vec<TerminalPassthrough>),
     ) -> Option<(u64, R)> {
-        let (sequence, result) = {
+        let fast_receiver_count = self.inner.fast_receiver_count.load(Ordering::Acquire);
+        let (sequence, result, fast_bytes) = {
             let mut state = self
                 .inner
                 .state
@@ -360,10 +411,15 @@ impl PaneOutputSender {
                 return None;
             }
             let (result, passthroughs) = build_side_effects(&bytes);
-            let sequence = state.push(bytes, passthroughs);
-            (sequence, result)
+            let bytes: Arc<[u8]> = bytes.into();
+            let fast_bytes = fast_output_candidate(fast_receiver_count, &bytes, &passthroughs);
+            let sequence = state.push(bytes, passthroughs, true);
+            (sequence, result, fast_bytes)
         };
-        self.inner.notify.notify_waiters();
+        let fast_delivered = fast_bytes
+            .map(|bytes| self.try_send_fast_output(sequence, bytes))
+            .unwrap_or(false);
+        self.notify_receivers_after_fast(fast_delivered);
         Some((sequence, result))
     }
 
@@ -381,6 +437,7 @@ impl PaneOutputSender {
             .lock()
             .expect("pane output state mutex must not be poisoned");
         self.inner.generation.store(generation, Ordering::SeqCst);
+        self.inner.fast_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     pub(crate) fn current_generation(&self) -> u64 {
@@ -398,11 +455,7 @@ impl PaneOutputSender {
             let passthrough_floor_sequence = cursor.next_sequence();
             (cursor, passthrough_floor_sequence)
         };
-        PaneOutputReceiver {
-            inner: Arc::clone(&self.inner),
-            cursor,
-            passthrough_floor_sequence,
-        }
+        self.receiver(cursor, passthrough_floor_sequence, None)
     }
 
     pub(crate) fn subscribe_from_oldest(&self) -> PaneOutputReceiver {
@@ -414,11 +467,7 @@ impl PaneOutputSender {
                 .expect("pane output state mutex must not be poisoned");
             (state.cursor_from_oldest(), state.next_sequence())
         };
-        PaneOutputReceiver {
-            inner: Arc::clone(&self.inner),
-            cursor,
-            passthrough_floor_sequence,
-        }
+        self.receiver(cursor, passthrough_floor_sequence, None)
     }
 
     #[allow(dead_code)]
@@ -431,11 +480,28 @@ impl PaneOutputSender {
                 .expect("pane output state mutex must not be poisoned");
             state.next_sequence()
         };
-        PaneOutputReceiver {
-            inner: Arc::clone(&self.inner),
-            cursor: OutputRing::cursor_from_sequence(sequence),
+        self.receiver(
+            OutputRing::cursor_from_sequence(sequence),
             passthrough_floor_sequence,
-        }
+            None,
+        )
+    }
+
+    pub(crate) fn subscribe_live_from_sequence(&self, sequence: u64) -> PaneOutputReceiver {
+        let (fast_tx, fast_rx) = mpsc::channel(FAST_PANE_OUTPUT_CHANNEL_CAPACITY);
+        self.inner
+            .fast_receivers
+            .lock()
+            .expect("pane output fast receiver list must not be poisoned")
+            .push(fast_tx);
+        self.inner
+            .fast_receiver_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.receiver(
+            OutputRing::cursor_from_sequence(sequence),
+            sequence,
+            Some(fast_rx),
+        )
     }
 
     #[cfg_attr(not(all(any(unix, windows), feature = "web")), allow(dead_code))]
@@ -455,7 +521,8 @@ impl PaneOutputSender {
             .lock()
             .expect("pane output state mutex must not be poisoned")
             .clear_retained();
-        self.inner.notify.notify_waiters();
+        self.inner.fast_epoch.fetch_add(1, Ordering::AcqRel);
+        self.notify_receivers();
     }
 
     fn push_for_generation(
@@ -464,7 +531,8 @@ impl PaneOutputSender {
         bytes: Vec<u8>,
         passthroughs: Vec<TerminalPassthrough>,
     ) -> Option<u64> {
-        let sequence = {
+        let fast_receiver_count = self.inner.fast_receiver_count.load(Ordering::Acquire);
+        let (sequence, fast_bytes) = {
             let mut state = self
                 .inner
                 .state
@@ -473,10 +541,99 @@ impl PaneOutputSender {
             if !generation_matches(self.current_generation(), generation) {
                 return None;
             }
-            state.push(bytes, passthroughs)
+            let bytes: Arc<[u8]> = bytes.into();
+            let fast_bytes = fast_output_candidate(fast_receiver_count, &bytes, &passthroughs);
+            let sequence = state.push(bytes, passthroughs, true);
+            (sequence, fast_bytes)
         };
-        self.inner.notify.notify_waiters();
+        let fast_delivered = fast_bytes
+            .map(|bytes| self.try_send_fast_output(sequence, bytes))
+            .unwrap_or(false);
+        self.notify_receivers_after_fast(fast_delivered);
         Some(sequence)
+    }
+
+    fn receiver(
+        &self,
+        cursor: OutputCursor,
+        passthrough_floor_sequence: u64,
+        fast_rx: Option<mpsc::Receiver<FastPaneOutput>>,
+    ) -> PaneOutputReceiver {
+        self.inner.receiver_count.fetch_add(1, Ordering::Relaxed);
+        PaneOutputReceiver {
+            inner: Arc::clone(&self.inner),
+            cursor,
+            passthrough_floor_sequence,
+            fast_rx,
+        }
+    }
+
+    fn notify_receivers(&self) {
+        match self.inner.receiver_count.load(Ordering::Acquire) {
+            0 => {}
+            1 => self.inner.notify.notify_one(),
+            _ => self.inner.notify.notify_waiters(),
+        }
+    }
+
+    fn notify_receivers_after_fast(&self, fast_delivered: bool) {
+        let receiver_count = self.inner.receiver_count.load(Ordering::Acquire);
+        if receiver_count == 0 {
+            return;
+        }
+        if fast_delivered
+            && receiver_count == self.inner.fast_receiver_count.load(Ordering::Acquire)
+        {
+            return;
+        }
+        match receiver_count {
+            1 => self.inner.notify.notify_one(),
+            _ => self.inner.notify.notify_waiters(),
+        }
+    }
+
+    fn try_send_fast_output(&self, sequence: u64, bytes: Arc<[u8]>) -> bool {
+        let epoch = self.inner.fast_epoch.load(Ordering::Acquire);
+        let mut receivers = self
+            .inner
+            .fast_receivers
+            .lock()
+            .expect("pane output fast receiver list must not be poisoned");
+        if receivers.len() == 1 {
+            return match receivers[0].try_send(FastPaneOutput {
+                epoch,
+                sequence,
+                bytes,
+            }) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => false,
+                Err(TrySendError::Closed(_)) => {
+                    receivers.clear();
+                    false
+                }
+            };
+        }
+
+        let mut delivered = 0_usize;
+        let mut missed = false;
+        receivers.retain(|receiver| {
+            match receiver.try_send(FastPaneOutput {
+                epoch,
+                sequence,
+                bytes: Arc::clone(&bytes),
+            }) {
+                Ok(()) => {
+                    delivered = delivered.saturating_add(1);
+                    true
+                }
+                Err(TrySendError::Full(_)) => {
+                    missed = true;
+                    true
+                }
+                Err(TrySendError::Closed(_)) => false,
+            }
+        });
+        delivered > 0 && !missed
     }
 }
 
@@ -487,17 +644,95 @@ fn generation_matches(current: u64, generation: Option<u64>) -> bool {
     }
 }
 
+fn fast_output_candidate(
+    fast_receiver_count: usize,
+    bytes: &Arc<[u8]>,
+    passthroughs: &[TerminalPassthrough],
+) -> Option<Arc<[u8]>> {
+    if fast_receiver_count == 0
+        || !passthroughs.is_empty()
+        || bytes.len() > FAST_PANE_OUTPUT_MAX_BYTES
+    {
+        return None;
+    }
+    Some(Arc::clone(bytes))
+}
+
 impl PaneOutputReceiver {
     pub(crate) async fn recv(&mut self) -> OutputCursorItem {
         loop {
+            if let Some(item) = self.try_recv_fast() {
+                return item;
+            }
             let inner = Arc::clone(&self.inner);
             let notified = inner.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
+            if let Some(item) = self.try_recv_fast() {
+                return item;
+            }
             if let Some(item) = self.try_recv() {
                 return item;
             }
-            notified.await;
+            if self.fast_rx.is_some() {
+                let fast = {
+                    let fast_rx = self.fast_rx.as_mut().expect("fast receiver checked");
+                    tokio::select! {
+                        fast = fast_rx.recv() => fast,
+                        _ = notified => None,
+                    }
+                };
+                if let Some(fast) = fast {
+                    if let Some(item) = self.accept_fast_item(fast) {
+                        return item;
+                    }
+                }
+            } else {
+                notified.await;
+            }
+        }
+    }
+
+    fn try_recv_fast(&mut self) -> Option<OutputCursorItem> {
+        loop {
+            let fast = match self.fast_rx.as_mut()?.try_recv() {
+                Ok(fast) => fast,
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => {
+                    self.disable_fast_rx();
+                    return None;
+                }
+            };
+            if let Some(item) = self.accept_fast_item(fast) {
+                return Some(item);
+            }
+        }
+    }
+
+    fn accept_fast_item(&mut self, fast: FastPaneOutput) -> Option<OutputCursorItem> {
+        if fast.epoch != self.inner.fast_epoch.load(Ordering::Acquire) {
+            return None;
+        }
+        if !self.cursor.advance_past_sequence(fast.sequence) {
+            return None;
+        }
+        Some(OutputCursorItem::Event(OutputEvent::from_shared(
+            fast.sequence,
+            fast.bytes,
+            Vec::new(),
+        )))
+    }
+
+    fn disable_fast_rx(&mut self) {
+        if self.fast_rx.take().is_some() {
+            self.inner
+                .fast_receiver_count
+                .fetch_sub(1, Ordering::Relaxed);
+            self.inner
+                .fast_receivers
+                .lock()
+                .expect("pane output fast receiver list must not be poisoned")
+                .retain(|receiver| !receiver.is_closed());
         }
     }
 
@@ -510,15 +745,37 @@ impl PaneOutputReceiver {
     }
 
     pub(crate) fn try_recv_batch(&mut self, limit: usize) -> Vec<OutputCursorItem> {
-        self.inner
+        let mut items = Vec::new();
+        for _ in 0..limit {
+            let Some(item) = self.try_recv_fast() else {
+                break;
+            };
+            items.push(item);
+        }
+
+        let remaining = limit.saturating_sub(items.len());
+        if remaining == 0 {
+            return items;
+        }
+        let mut retained = self
+            .inner
             .state
             .lock()
             .expect("pane output state mutex must not be poisoned")
-            .poll_cursor_batch(&mut self.cursor, self.passthrough_floor_sequence, limit)
+            .poll_cursor_batch(&mut self.cursor, self.passthrough_floor_sequence, remaining);
+        items.append(&mut retained);
+        items
     }
 
     pub(crate) const fn cursor(&self) -> &OutputCursor {
         &self.cursor
+    }
+}
+
+impl Drop for PaneOutputReceiver {
+    fn drop(&mut self) {
+        self.disable_fast_rx();
+        self.inner.receiver_count.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -537,6 +794,10 @@ pub(crate) fn pane_output_channel_with_limits(
         inner: Arc::new(PaneOutputInner {
             state: Mutex::new(PaneOutputState::new(event_capacity, recent_byte_capacity)),
             generation: AtomicU64::new(0),
+            fast_epoch: AtomicU64::new(0),
+            receiver_count: AtomicUsize::new(0),
+            fast_receiver_count: AtomicUsize::new(0),
+            fast_receivers: Mutex::new(Vec::new()),
             notify: Notify::new(),
         }),
     }
@@ -602,6 +863,50 @@ mod tests {
     }
 
     #[test]
+    fn detached_output_keeps_recent_recovery_buffer_for_late_waiters() {
+        let sender = pane_output_channel_with_limits(4, 64);
+
+        sender.send(b"detached".to_vec());
+
+        {
+            let state = sender
+                .inner
+                .state
+                .lock()
+                .expect("pane output state mutex must not be poisoned");
+            assert_eq!(state.ring.retained_len(), 1);
+            assert_eq!(
+                state.ring.recent_len(),
+                b"detached".len(),
+                "late waiters and lag reports need recent output even when no receiver was live"
+            );
+        }
+
+        let mut receiver = sender.subscribe_from_oldest();
+        let Some(OutputCursorItem::Event(event)) = receiver.try_recv() else {
+            panic!("oldest subscriptions should still replay retained detached events");
+        };
+        assert_eq!(event.sequence(), 0);
+        assert_eq!(event.bytes(), b"detached");
+    }
+
+    #[test]
+    fn live_output_keeps_recent_recovery_buffer_for_slow_receivers() {
+        let sender = pane_output_channel_with_limits(4, 64);
+        let _receiver = sender.subscribe();
+
+        sender.send(b"live".to_vec());
+
+        let state = sender
+            .inner
+            .state
+            .lock()
+            .expect("pane output state mutex must not be poisoned");
+        assert_eq!(state.ring.retained_len(), 1);
+        assert_eq!(state.ring.recent_len(), b"live".len());
+    }
+
+    #[test]
     fn passthroughs_are_not_replayed_to_oldest_subscribers() {
         let sender = pane_output_channel_with_limits(4, 64);
 
@@ -654,5 +959,170 @@ mod tests {
         }
         assert_eq!(latest.sequence(), PANE_OUTPUT_PASSTHROUGH_CAPACITY as u64);
         assert_eq!(latest.passthroughs().len(), 1);
+    }
+
+    #[test]
+    fn receiver_count_tracks_live_subscribers() {
+        let sender = pane_output_channel_with_limits(4, 64);
+        assert_eq!(sender.inner.receiver_count.load(Ordering::Relaxed), 0);
+        assert_eq!(sender.inner.fast_receiver_count.load(Ordering::Relaxed), 0);
+
+        let first = sender.subscribe();
+        assert_eq!(sender.inner.receiver_count.load(Ordering::Relaxed), 1);
+        assert_eq!(sender.inner.fast_receiver_count.load(Ordering::Relaxed), 0);
+        {
+            let _second = sender.subscribe_from_oldest();
+            assert_eq!(sender.inner.receiver_count.load(Ordering::Relaxed), 2);
+            assert_eq!(sender.inner.fast_receiver_count.load(Ordering::Relaxed), 0);
+            let _live = sender.subscribe_live_from_sequence(0);
+            assert_eq!(sender.inner.receiver_count.load(Ordering::Relaxed), 3);
+            assert_eq!(sender.inner.fast_receiver_count.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(sender.inner.receiver_count.load(Ordering::Relaxed), 1);
+        assert_eq!(sender.inner.fast_receiver_count.load(Ordering::Relaxed), 0);
+
+        drop(first);
+        assert_eq!(sender.inner.receiver_count.load(Ordering::Relaxed), 0);
+        assert_eq!(sender.inner.fast_receiver_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn dropped_live_receivers_are_pruned_without_new_output() {
+        let sender = pane_output_channel_with_limits(4, 64);
+
+        for _ in 0..32 {
+            drop(sender.subscribe_live_from_sequence(0));
+        }
+
+        assert_eq!(sender.inner.receiver_count.load(Ordering::Relaxed), 0);
+        assert_eq!(sender.inner.fast_receiver_count.load(Ordering::Relaxed), 0);
+        assert!(
+            sender
+                .inner
+                .fast_receivers
+                .lock()
+                .expect("pane output fast receiver list must not be poisoned")
+                .is_empty(),
+            "closed fast senders must not accumulate while panes are quiet"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_receiver_consumes_fast_output() {
+        let sender = pane_output_channel_with_limits(4, 64);
+        let mut receiver = sender.subscribe_live_from_sequence(0);
+
+        assert_eq!(sender.send(b"fast".to_vec()), 0);
+
+        let item = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("live receiver should not block on fast output");
+        let OutputCursorItem::Event(event) = item else {
+            panic!("live receiver should see the fast output event");
+        };
+        assert_eq!(event.sequence(), 0);
+        assert_eq!(event.bytes(), b"fast");
+        assert_eq!(receiver.cursor().next_sequence(), 1);
+    }
+
+    #[tokio::test]
+    async fn live_receiver_uses_bounded_ring_for_large_output() {
+        let sender = pane_output_channel_with_limits(4, 64);
+        let mut receiver = sender.subscribe_live_from_sequence(0);
+        let large = vec![b'x'; FAST_PANE_OUTPUT_MAX_BYTES + 1];
+
+        assert_eq!(sender.send(large.clone()), 0);
+        assert!(
+            receiver
+                .fast_rx
+                .as_mut()
+                .expect("live receiver should have fast channel")
+                .try_recv()
+                .is_err(),
+            "large output must not be duplicated into the fast receiver queue"
+        );
+
+        let item = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("live receiver should fall back to retained output");
+        let OutputCursorItem::Event(event) = item else {
+            panic!("large retained event should be delivered from the bounded ring");
+        };
+        assert_eq!(event.sequence(), 0);
+        assert_eq!(event.bytes(), large.as_slice());
+        assert_eq!(receiver.cursor().next_sequence(), 1);
+    }
+
+    #[test]
+    fn live_fast_output_queue_capacity_is_bounded() {
+        let sender = pane_output_channel_with_limits(256, 64);
+        let receiver = sender.subscribe_live_from_sequence(0);
+
+        for _ in 0..(FAST_PANE_OUTPUT_CHANNEL_CAPACITY + 8) {
+            sender.send(b"x".to_vec());
+        }
+
+        let fast_rx = receiver.fast_rx.as_ref().expect("live receiver");
+        assert_eq!(fast_rx.len(), FAST_PANE_OUTPUT_CHANNEL_CAPACITY);
+        assert_eq!(fast_rx.max_capacity(), FAST_PANE_OUTPUT_CHANNEL_CAPACITY);
+    }
+
+    #[test]
+    fn live_receiver_batches_fast_output_before_retained_fallback() {
+        let sender = pane_output_channel_with_limits(256, 64);
+        let mut receiver = sender.subscribe_live_from_sequence(0);
+
+        for byte in [b'a', b'b', b'c'] {
+            assert_eq!(sender.send(vec![byte]), u64::from(byte - b'a'));
+        }
+
+        let batch = receiver.try_recv_batch(8);
+        let events = batch
+            .into_iter()
+            .map(|item| {
+                let OutputCursorItem::Event(event) = item else {
+                    panic!("fast output should not report a gap");
+                };
+                (event.sequence(), event.bytes().to_vec())
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            events,
+            vec![(0, b"a".to_vec()), (1, b"b".to_vec()), (2, b"c".to_vec())]
+        );
+        assert_eq!(receiver.cursor().next_sequence(), 3);
+        assert!(
+            receiver.try_recv().is_none(),
+            "batching fast output must not replay the same retained events"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_fast_output_is_invalidated_when_retained_output_is_cleared() {
+        let sender = pane_output_channel_with_limits(4, 64);
+        let mut receiver = sender.subscribe_live_from_sequence(0);
+
+        assert_eq!(sender.send(b"stale".to_vec()), 0);
+        sender.clear_retained();
+        assert_eq!(sender.send(b"fresh".to_vec()), 1);
+
+        let item = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("live receiver should report the retained-output gap");
+        let OutputCursorItem::Gap(gap) = item else {
+            panic!("stale fast output must not be delivered after clear_retained");
+        };
+        assert_eq!(gap.expected_sequence(), 0);
+        assert_eq!(gap.resume_sequence(), 1);
+
+        let item = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("live receiver should resume with fresh output");
+        let OutputCursorItem::Event(event) = item else {
+            panic!("live receiver should resume with fresh output");
+        };
+        assert_eq!(event.sequence(), 1);
+        assert_eq!(event.bytes(), b"fresh");
     }
 }

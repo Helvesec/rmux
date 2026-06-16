@@ -32,15 +32,20 @@ impl RequestHandler {
         let state = self.state.lock().await;
         let active_attach = self.active_attach.lock().await;
         let active_control = self.active_control.lock().await;
+        let current_attach_session = active_attach
+            .by_pid
+            .get(&attach_pid)
+            .map(|active| active.session_name.clone());
         let attached_counts = state
             .sessions
             .iter()
             .map(|(session_name, _)| {
-                (
-                    session_name.clone(),
-                    active_attach.attached_count(session_name)
-                        + active_control.attached_count(session_name),
-                )
+                let mut count = active_attach.attached_count(session_name)
+                    + active_control.attached_count(session_name);
+                if count == 0 && current_attach_session.as_ref() == Some(session_name) {
+                    count = 1;
+                }
+                (session_name.clone(), count)
             })
             .collect::<Vec<_>>();
         let build = match mode.kind {

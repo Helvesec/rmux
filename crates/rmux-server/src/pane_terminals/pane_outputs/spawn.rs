@@ -42,6 +42,9 @@ impl HandlerState {
                 .expect("pane transcript mutex must not be poisoned");
             transcript.set_utf8_config(Utf8Config::from_options(&self.options));
             transcript.set_input_buffer_limit(self.input_buffer_limit());
+            transcript.set_alternate_screen_enabled(
+                self.alternate_screen_enabled_for_pane_id(session_name, pane_id),
+            );
         }
         seed_initial_pane_title(&transcript, spawn.initial_title.as_deref());
         let pane_output = pane_output_channel();
@@ -97,6 +100,19 @@ impl HandlerState {
             );
         }
         self.clear_attached_submitted_line(session_name, pane_id);
+        #[cfg(unix)]
+        let output_reader_task = spawn_pane_output_reader(
+            session_name.clone(),
+            pane_id,
+            spawn.output_reader,
+            transcript,
+            pane_output,
+            Some(generation),
+            spawn.pane_alert_callback,
+            spawn.pane_exit_callback,
+            reader_runtime,
+        );
+        #[cfg(windows)]
         spawn_pane_output_reader(
             session_name.clone(),
             pane_id,
@@ -106,9 +122,12 @@ impl HandlerState {
             Some(generation),
             spawn.pane_alert_callback,
             spawn.pane_exit_callback,
-            #[cfg(unix)]
-            reader_runtime,
         );
+        #[cfg(unix)]
+        self.pane_output_readers
+            .entry(session_name.clone())
+            .or_default()
+            .insert(pane_id, output_reader_task);
         Ok(())
     }
 
@@ -131,6 +150,9 @@ impl HandlerState {
                 .expect("pane transcript mutex must not be poisoned");
             transcript.set_utf8_config(Utf8Config::from_options(&self.options));
             transcript.set_input_buffer_limit(self.input_buffer_limit());
+            transcript.set_alternate_screen_enabled(
+                self.alternate_screen_enabled_for_pane_id(session_name, pane_id),
+            );
         }
         transcript
             .lock()
@@ -139,6 +161,14 @@ impl HandlerState {
         seed_initial_pane_title(&transcript, spawn.initial_title.as_deref());
         #[cfg(unix)]
         let reader_runtime = self.pane_reader_runtime()?;
+        #[cfg(unix)]
+        if let Some(reader) = self
+            .pane_output_readers
+            .get_mut(session_name)
+            .and_then(|panes| panes.remove(&pane_id))
+        {
+            reader.abort();
+        }
         self.transcripts
             .entry(session_name.clone())
             .or_default()
@@ -168,6 +198,19 @@ impl HandlerState {
             );
         }
         self.clear_attached_submitted_line(session_name, pane_id);
+        #[cfg(unix)]
+        let output_reader_task = spawn_pane_output_reader(
+            session_name.clone(),
+            pane_id,
+            spawn.output_reader,
+            transcript,
+            pane_output,
+            Some(generation),
+            spawn.pane_alert_callback,
+            spawn.pane_exit_callback,
+            reader_runtime,
+        );
+        #[cfg(windows)]
         spawn_pane_output_reader(
             session_name.clone(),
             pane_id,
@@ -177,9 +220,12 @@ impl HandlerState {
             Some(generation),
             spawn.pane_alert_callback,
             spawn.pane_exit_callback,
-            #[cfg(unix)]
-            reader_runtime,
         );
+        #[cfg(unix)]
+        self.pane_output_readers
+            .entry(session_name.clone())
+            .or_default()
+            .insert(pane_id, output_reader_task);
         Ok(())
     }
 }

@@ -1,7 +1,6 @@
 use super::cell::LayoutKind;
 use super::{
-    split_axis, LayoutCell, LayoutDirection, LayoutGeometry, LayoutTree, PANE_BORDER_CELLS,
-    PANE_MINIMUM,
+    LayoutCell, LayoutDirection, LayoutGeometry, LayoutTree, PANE_BORDER_CELLS, PANE_MINIMUM,
 };
 
 impl LayoutTree {
@@ -84,25 +83,30 @@ impl LayoutTree {
         insert_before_target: bool,
     ) -> bool {
         let geometry = self.root.geometry;
-        let sizes = match direction {
-            LayoutDirection::LeftRight => split_axis(geometry.width, 2),
-            LayoutDirection::TopBottom => split_axis(geometry.height, 2),
+        let saved = match direction {
+            LayoutDirection::LeftRight => geometry.width,
+            LayoutDirection::TopBottom => geometry.height,
         };
-        let [first_size, second_size] = sizes.as_slice() else {
+        if saved < (PANE_MINIMUM * 2) + PANE_BORDER_CELLS {
             return false;
         };
-        if *first_size == 0 || *second_size == 0 {
-            return false;
-        }
+        let mut second_size = ((saved + PANE_BORDER_CELLS) / 2).saturating_sub(PANE_BORDER_CELLS);
+        second_size = second_size.clamp(
+            PANE_MINIMUM,
+            saved.saturating_sub(PANE_MINIMUM + PANE_BORDER_CELLS),
+        );
+        let first_size = saved
+            .saturating_sub(PANE_BORDER_CELLS)
+            .saturating_sub(second_size);
 
         let mut existing = std::mem::replace(
             &mut self.root,
             LayoutCell::pane(LayoutGeometry::new(0, 0, 0, 0)),
         );
         let existing_size = if insert_before_target {
-            *second_size
+            second_size
         } else {
-            *first_size
+            first_size
         };
         let current_size = axis_size(&existing, direction);
         existing.resize_adjust(direction, existing_size as i32 - current_size as i32);
@@ -111,15 +115,15 @@ impl LayoutTree {
             LayoutDirection::LeftRight => {
                 if insert_before_target {
                     (
-                        LayoutGeometry::new(*first_size, geometry.height, 0, 0),
-                        (*first_size + PANE_BORDER_CELLS, 0),
+                        LayoutGeometry::new(first_size, geometry.height, 0, 0),
+                        (first_size + PANE_BORDER_CELLS, 0),
                     )
                 } else {
                     (
                         LayoutGeometry::new(
-                            *second_size,
+                            second_size,
                             geometry.height,
-                            *first_size + PANE_BORDER_CELLS,
+                            first_size + PANE_BORDER_CELLS,
                             0,
                         ),
                         (0, 0),
@@ -129,16 +133,16 @@ impl LayoutTree {
             LayoutDirection::TopBottom => {
                 if insert_before_target {
                     (
-                        LayoutGeometry::new(geometry.width, *first_size, 0, 0),
-                        (0, *first_size + PANE_BORDER_CELLS),
+                        LayoutGeometry::new(geometry.width, first_size, 0, 0),
+                        (0, first_size + PANE_BORDER_CELLS),
                     )
                 } else {
                     (
                         LayoutGeometry::new(
                             geometry.width,
-                            *second_size,
+                            second_size,
                             0,
-                            *first_size + PANE_BORDER_CELLS,
+                            first_size + PANE_BORDER_CELLS,
                         ),
                         (0, 0),
                     )

@@ -298,6 +298,26 @@ pub(crate) static CSI_TABLE: &[TableEntry<CsiCommand>] = &[
     },
     TableEntry {
         ch: b'u',
+        interm: b"<",
+        cmd: CsiCommand::KittyKeyboardPop,
+    },
+    TableEntry {
+        ch: b'u',
+        interm: b"=",
+        cmd: CsiCommand::KittyKeyboardSet,
+    },
+    TableEntry {
+        ch: b'u',
+        interm: b">",
+        cmd: CsiCommand::KittyKeyboardPush,
+    },
+    TableEntry {
+        ch: b'u',
+        interm: b"?",
+        cmd: CsiCommand::KittyKeyboardQuery,
+    },
+    TableEntry {
+        ch: b'u',
         interm: b"",
         cmd: CsiCommand::Rcp,
     },

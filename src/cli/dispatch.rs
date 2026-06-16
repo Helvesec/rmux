@@ -4,12 +4,14 @@ use std::path::Path;
 use rmux_client::connect;
 use rmux_proto::{ClientTerminalContext, CopyModeRequest, ErrorResponse, LayoutName, Response};
 
+use super::buffer_commands::{run_load_buffer, run_save_buffer};
 use super::capture_pane::{build_capture_pane_request, capture_pane_request};
 use super::client_commands::run_attach_session;
 use super::command_inventory::run_list_commands;
 use super::command_runner::{
-    finish_command_success, run_command, run_command_resolved, run_payload_command,
-    run_payload_command_resolved, run_queued_server_command,
+    finish_command_success, inherited_pane_target, run_command, run_command_resolved,
+    run_payload_command, run_payload_command_resolved, run_queued_server_command,
+    write_command_output,
 };
 use super::config_commands::{
     run_set_environment, run_set_hook, run_set_option, run_show_environment, run_show_hooks,
@@ -18,6 +20,7 @@ use super::config_commands::{
 use super::key_commands::{
     run_bind_key, run_list_keys, run_send_keys, run_send_prefix, run_unbind_key,
 };
+use super::message_commands::run_display_message;
 use super::pane_commands::{
     run_break_pane, run_join_pane, run_last_pane, run_list_panes, run_move_pane, run_pipe_pane,
     run_resize_pane, run_respawn_pane, run_select_pane, run_split_window, run_swap_pane,
@@ -42,12 +45,14 @@ use super::window_commands::{
 };
 use super::{connect_with_startserver, shell_command_text, ExitFailure, StartupOptions};
 use crate::cli_args::{Command, NewSessionArgs, SetOptionCommandKind, ShowOptionsCommandKind};
+use crate::cli_response::tmux_cli_error_message;
 
 pub(super) fn default_client_command() -> Command {
     Command::NewSession(NewSessionArgs {
         attach_if_exists: false,
         working_directory: None,
         detach_other_clients: false,
+        skip_environment_update: false,
         detached: false,
         session_name: None,
         environment: Vec::new(),
@@ -93,7 +98,10 @@ fn dispatch(
     startup: StartupOptions,
     client_terminal: ClientTerminalContext,
 ) -> Result<i32, ExitFailure> {
-    let command_startup = startup.for_command(command_has_start_server_flag(&command));
+    let command_startup = startup.for_command(
+        command_has_start_server_flag(&command),
+        command_requires_web_daemon(&command),
+    );
 
     match command {
         Command::NewSession(args) => {
@@ -143,6 +151,56 @@ fn dispatch(
             })
         }
         Command::SelectLayout(args) => {
+            if args.spread {
+                return run_command_resolved(socket_path, "select-layout", move |connection| {
+                    let target = match args.target.as_ref() {
+                        Some(target) => resolve_select_layout_target_spec(connection, target)?,
+                        None => rmux_proto::SelectLayoutTarget::Window(
+                            resolve_window_target_or_current(connection, None, "select-layout")?,
+                        ),
+                    };
+                    connection
+                        .spread_layout(target)
+                        .map_err(ExitFailure::from_client)
+                });
+            }
+            if args.next {
+                return run_command_resolved(socket_path, "select-layout", move |connection| {
+                    let target = resolve_window_target_or_current(
+                        connection,
+                        args.target.as_ref(),
+                        "select-layout",
+                    )?;
+                    connection
+                        .next_layout(target)
+                        .map_err(ExitFailure::from_client)
+                });
+            }
+            if args.previous {
+                return run_command_resolved(socket_path, "select-layout", move |connection| {
+                    let target = resolve_window_target_or_current(
+                        connection,
+                        args.target.as_ref(),
+                        "select-layout",
+                    )?;
+                    connection
+                        .previous_layout(target)
+                        .map_err(ExitFailure::from_client)
+                });
+            }
+            if args.old {
+                return run_command_resolved(socket_path, "select-layout", move |connection| {
+                    let target = match args.target.as_ref() {
+                        Some(target) => resolve_select_layout_target_spec(connection, target)?,
+                        None => rmux_proto::SelectLayoutTarget::Window(
+                            resolve_window_target_or_current(connection, None, "select-layout")?,
+                        ),
+                    };
+                    connection
+                        .select_old_layout(target)
+                        .map_err(ExitFailure::from_client)
+                });
+            }
             if args.layout.is_none() {
                 return run_select_layout_noop(args.target.as_ref(), socket_path);
             }
@@ -250,12 +308,12 @@ fn dispatch(
                 connection
                     .copy_mode(CopyModeRequest {
                         target,
-                        page_down: args.page_down,
+                        page_down: false,
                         exit_on_scroll: args.exit_on_scroll,
                         hide_position: args.hide_position,
                         mouse_drag_start: args.mouse_drag_start,
                         cancel_mode: args.cancel_mode,
-                        scrollbar_scroll: args.scrollbar_scroll,
+                        scrollbar_scroll: false,
                         source,
                         page_up: args.page_up,
                     })
@@ -361,8 +419,14 @@ fn dispatch(
             })
         }
         Command::ListBuffers(args) => {
+            if let Some(flag) = args.unsupported_flag() {
+                return Err(ExitFailure::new(
+                    1,
+                    format!("command list-buffers: unknown flag {flag}"),
+                ));
+            }
             run_payload_command(socket_path, "list-buffers", move |connection| {
-                connection.list_buffers(args.format, args.filter, args.sort_order, args.reversed)
+                connection.list_buffers(args.format, args.filter, None, false)
             })
         }
         Command::DeleteBuffer(args) => {
@@ -370,12 +434,8 @@ fn dispatch(
                 connection.delete_buffer(args.name)
             })
         }
-        Command::LoadBuffer(args) => run_command(socket_path, "load-buffer", move |connection| {
-            connection.load_buffer(args.path, args.name, args.set_clipboard)
-        }),
-        Command::SaveBuffer(args) => run_command(socket_path, "save-buffer", move |connection| {
-            connection.save_buffer(args.path, args.name, args.append)
-        }),
+        Command::LoadBuffer(args) => run_load_buffer(args, socket_path),
+        Command::SaveBuffer(args) => run_save_buffer(args, socket_path),
         Command::CapturePane(args) if args.print => {
             let args = capture_pane_request(args)?;
             run_payload_command_resolved(socket_path, "capture-pane", move |connection| {
@@ -406,9 +466,7 @@ fn dispatch(
                     .map_err(ExitFailure::from_client)
             })
         }
-        Command::DisplayMessage(args) => {
-            run_queued_server_command(socket_path, "display-message", args.queue_command)
-        }
+        Command::DisplayMessage(args) => run_display_message(args, socket_path),
         Command::ShowMessages(args) => {
             run_payload_command(socket_path, "show-messages", move |connection| {
                 connection.show_messages(args.jobs, args.terminals, args.target_client)
@@ -417,11 +475,10 @@ fn dispatch(
         Command::RunShell(args) if args.background => {
             let command = shell_command_text(args.command);
             run_command_resolved(socket_path, "run-shell", move |connection| {
-                let target = args
-                    .target
-                    .as_ref()
-                    .map(|target| resolve_pane_target_spec(connection, target))
-                    .transpose()?;
+                let target = match args.target.as_ref() {
+                    Some(target) => Some(resolve_pane_target_spec(connection, target)?),
+                    None => inherited_pane_target(connection, socket_path)?,
+                };
                 connection
                     .run_shell(
                         command,
@@ -435,27 +492,7 @@ fn dispatch(
                     .map_err(ExitFailure::from_client)
             })
         }
-        Command::RunShell(args) => {
-            let command = shell_command_text(args.command);
-            run_command_resolved(socket_path, "run-shell", move |connection| {
-                let target = args
-                    .target
-                    .as_ref()
-                    .map(|target| resolve_pane_target_spec(connection, target))
-                    .transpose()?;
-                connection
-                    .run_shell(
-                        command,
-                        false,
-                        args.as_commands,
-                        args.show_stderr,
-                        args.delay_seconds,
-                        args.start_directory,
-                        target,
-                    )
-                    .map_err(ExitFailure::from_client)
-            })
-        }
+        Command::RunShell(args) => run_shell_foreground(socket_path, args),
         Command::SourceFile(args) => run_source_file(args, socket_path, command_startup),
         Command::IfShell(args) => run_command(socket_path, "if-shell", move |connection| {
             connection.if_shell(
@@ -497,6 +534,40 @@ fn dispatch(
     }
 }
 
+fn run_shell_foreground(
+    socket_path: &Path,
+    args: crate::cli_args::RunShellArgs,
+) -> Result<i32, ExitFailure> {
+    let command = shell_command_text(args.command);
+    let mut connection = connect(socket_path)
+        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let target = match args.target.as_ref() {
+        Some(target) => Some(resolve_pane_target_spec(&mut connection, target)?),
+        None => inherited_pane_target(&mut connection, socket_path)?,
+    };
+    let response = connection
+        .run_shell(
+            command,
+            false,
+            args.as_commands,
+            args.show_stderr,
+            args.delay_seconds,
+            args.start_directory,
+            target,
+        )
+        .map_err(ExitFailure::from_client)?;
+
+    match response {
+        Response::RunShell(response) => {
+            if let Some(output) = response.command_output() {
+                write_command_output(output)?;
+            }
+            Ok(response.exit_status().unwrap_or(0))
+        }
+        other => finish_command_success(other, "run-shell"),
+    }
+}
+
 fn run_select_layout_noop(
     target: Option<&crate::cli_args::TargetSpec>,
     socket_path: &Path,
@@ -531,10 +602,7 @@ fn invalid_layout_failure(layout: &str) -> ExitFailure {
 
 pub(super) fn command_has_start_server_flag(command: &Command) -> bool {
     match command {
-        Command::NewSession(_)
-        | Command::StartServer(_)
-        | Command::AttachSession(_)
-        | Command::SourceFile(_) => true,
+        Command::NewSession(_) | Command::StartServer(_) | Command::AttachSession(_) => true,
         Command::WebShare(args) => web_share_creates_share(args),
         _ => false,
     }
@@ -547,6 +615,10 @@ fn web_share_creates_share(args: &crate::cli_args::WebShareArgs) -> bool {
         && !args.stop_all
         && args.lookup.is_none()
         && !args.config
+}
+
+fn command_requires_web_daemon(command: &Command) -> bool {
+    matches!(command, Command::WebShare(args) if web_share_creates_share(args))
 }
 
 fn unsupported_argument_suffix(arguments: &[String]) -> String {
@@ -573,11 +645,10 @@ fn run_source_file(
     };
 
     let mut connection = connect_with_startserver(socket_path, startup)?;
-    let target = args
-        .target
-        .as_ref()
-        .map(|target| resolve_pane_target_spec(&mut connection, target))
-        .transpose()?;
+    let target = match args.target.as_ref() {
+        Some(target) => Some(resolve_pane_target_spec(&mut connection, target)?),
+        None => inherited_pane_target(&mut connection, socket_path)?,
+    };
     let response = connection
         .source_file(
             args.paths,
@@ -589,5 +660,62 @@ fn run_source_file(
             stdin,
         )
         .map_err(ExitFailure::from_client)?;
+    if let Response::Error(ErrorResponse { error }) = &response {
+        if source_file_error_uses_stdout(error) {
+            return Err(ExitFailure::new_stdout(
+                1,
+                tmux_cli_error_message("source-file", error),
+            ));
+        }
+    }
+    if let Response::SourceFile(response) = &response {
+        if let Some(output) = response.command_output() {
+            write_command_output(output)?;
+        }
+        return Ok(response.exit_status().unwrap_or(0));
+    }
     finish_command_success(response, "source-file")
+}
+
+fn source_file_error_uses_stdout(error: &rmux_proto::RmuxError) -> bool {
+    match error {
+        rmux_proto::RmuxError::Server(message) => has_source_file_line_prefix(message),
+        _ => false,
+    }
+}
+
+fn has_source_file_line_prefix(message: &str) -> bool {
+    let mut parts = message.split(':');
+    let Some(mut previous) = parts.next() else {
+        return false;
+    };
+    for current in parts {
+        if !previous.is_empty() && previous.bytes().all(|byte| byte.is_ascii_digit()) {
+            return true;
+        }
+        previous = current;
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_file_line_prefix_accepts_windows_drive_paths() {
+        assert!(has_source_file_line_prefix(
+            r"C:\Users\RMUXUser\.tmux.conf:12: unknown command"
+        ));
+    }
+
+    #[test]
+    fn source_file_line_prefix_rejects_plain_messages() {
+        assert!(!has_source_file_line_prefix(
+            "source-file failed: missing file"
+        ));
+        assert!(!has_source_file_line_prefix(
+            "C:\\Users\\RMUXUser\\.tmux.conf"
+        ));
+    }
 }

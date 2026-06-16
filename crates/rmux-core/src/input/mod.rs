@@ -218,11 +218,63 @@ impl InputParser {
 
     /// Parse a buffer of bytes, dispatching actions to the screen writer.
     pub fn parse(&mut self, buf: &[u8], writer: &mut dyn ScreenWriter) {
-        for &byte in buf {
-            self.ch = byte;
+        let mut index = 0;
+        while index < buf.len() {
+            if self.state == InputState::Ground && !self.utf8_started {
+                let printable_end = buf[index..]
+                    .iter()
+                    .position(|byte| !byte.is_ascii_graphic() && *byte != b' ')
+                    .map_or(buf.len(), |offset| index + offset);
+                if printable_end > index {
+                    self.handle_printable_ascii_run(&buf[index..printable_end], writer);
+                    index = printable_end;
+                    continue;
+                }
+                if self.handle_ground_c0_fast_path(buf[index], writer) {
+                    index += 1;
+                    continue;
+                }
+            }
+
+            self.ch = buf[index];
             let transition = self.find_transition();
             self.execute_transition(transition, writer);
+            index += 1;
         }
+    }
+
+    fn handle_printable_ascii_run(&mut self, bytes: &[u8], writer: &mut dyn ScreenWriter) {
+        debug_assert_eq!(self.state, InputState::Ground);
+        let set = if self.cell.set == 0 {
+            self.cell.g0set
+        } else {
+            self.cell.g1set
+        };
+        let acs = set != 0;
+        writer.collect_add_ascii_run(bytes, &self.cell, acs);
+        if let Some(&last) = bytes.last() {
+            self.last_char = Some(char::from(last));
+        }
+        self.flags |= INPUT_LAST;
+    }
+
+    fn handle_ground_c0_fast_path(&mut self, byte: u8, writer: &mut dyn ScreenWriter) -> bool {
+        match byte {
+            0x0a..=0x0c => {
+                writer.collect_end();
+                writer.linefeed(false, self.cell.bg());
+                if writer.current_mode() & mode::MODE_CRLF != 0 {
+                    writer.carriage_return();
+                }
+            }
+            0x0d => {
+                writer.collect_end();
+                writer.carriage_return();
+            }
+            _ => return false,
+        }
+        self.flags &= !INPUT_LAST;
+        true
     }
 
     fn find_transition(&self) -> Transition {
@@ -432,13 +484,24 @@ impl InputParser {
     }
 
     fn handle_input(&mut self) -> bool {
+        let escaped_dcs_byte = self.state == InputState::DcsEscape;
+        let bytes_to_push = if escaped_dcs_byte && self.ch != 0x1b {
+            2
+        } else {
+            1
+        };
         let input_limit = self.input_buffer_limit();
-        if self.input_buf.len() + 1 >= input_limit {
+        if self.input_buf.len() + bytes_to_push >= input_limit {
             if self.flags & INPUT_DISCARD == 0 && self.is_terminal_passthrough_string() {
                 self.terminal_passthrough_dropped_count =
                     self.terminal_passthrough_dropped_count.saturating_add(1);
             }
             self.flags |= INPUT_DISCARD;
+        } else if escaped_dcs_byte && self.ch == 0x1b {
+            self.input_buf.push(0x1b);
+        } else if escaped_dcs_byte {
+            self.input_buf.push(0x1b);
+            self.input_buf.push(self.ch);
         } else {
             self.input_buf.push(self.ch);
         }
@@ -454,9 +517,9 @@ impl InputParser {
 
     fn is_terminal_passthrough_string(&self) -> bool {
         (self.state == InputState::ApcString && passthrough::is_kitty_graphics_apc(&self.input_buf))
-            || (self.state == InputState::DcsHandler
+            || (matches!(self.state, InputState::DcsHandler | InputState::DcsEscape)
                 && self.interm_len == 0
-                && self.input_buf.first() == Some(&b'q'))
+                && (self.input_buf.first() == Some(&b'q') || self.input_buf.starts_with(b"tmux;")))
     }
 
     fn handle_end_bel(&mut self) -> bool {

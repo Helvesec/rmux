@@ -98,6 +98,14 @@ pub enum CsiCommand {
     Sgr,
     /// MODSET — Set modifier key mode (>m).
     Modset,
+    /// KITTY_KEYBOARD_SET — Set Kitty keyboard enhancement flags (=u).
+    KittyKeyboardSet,
+    /// KITTY_KEYBOARD_PUSH — Push Kitty keyboard enhancement flags (>u).
+    KittyKeyboardPush,
+    /// KITTY_KEYBOARD_POP — Pop Kitty keyboard enhancement flags (<u).
+    KittyKeyboardPop,
+    /// KITTY_KEYBOARD_QUERY — Query Kitty keyboard enhancement flags (?u).
+    KittyKeyboardQuery,
     /// DSR — Device Status Report (n).
     Dsr,
     /// MODOFF — Reset modifier key mode (>n).

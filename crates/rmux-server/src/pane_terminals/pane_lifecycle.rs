@@ -10,7 +10,7 @@ use rmux_pty::PtyMaster;
 use crate::pane_io::{PaneAlertCallback, PaneExitCallback};
 use crate::pane_terminal_lookup::initial_pane;
 use crate::pane_terminal_process::{open_pane_terminal, PaneTerminal};
-use crate::terminal::{validate_process_command, TerminalProfile};
+use crate::terminal::{validate_process_command, SessionBaseEnvironment, TerminalProfile};
 
 use super::lifecycle_state::terminal_size_from_geometry;
 use super::{
@@ -57,7 +57,12 @@ impl HandlerState {
                 session.id(),
                 window.id(),
                 session.cwd(),
-                pane_terminal_geometry_for_session(session, &self.options, pane.geometry),
+                pane_terminal_geometry_for_session(
+                    session,
+                    &self.options,
+                    pane.window_index,
+                    pane.geometry,
+                ),
             )
         };
         let profile = TerminalProfile::for_initial_session_pane(
@@ -67,6 +72,7 @@ impl HandlerState {
             session_id.as_u32(),
             spawn.socket_path,
             spawn.spawn_environment,
+            spawn.raw_spawn_environment,
             true,
             spawn.environment_overrides,
             Some(pane.id),
@@ -152,16 +158,29 @@ impl HandlerState {
         window_index: u32,
         spawn: WindowSpawnOptions<'_>,
     ) -> Result<(), RmuxError> {
-        self.spawn_window_terminal(session_name, window_index, spawn, PaneOutputMode::Insert)
+        self.spawn_window_terminal(
+            session_name,
+            window_index,
+            spawn,
+            PaneOutputMode::Insert,
+            None,
+        )
     }
 
-    pub(in crate::pane_terminals) fn reset_window_terminal(
+    pub(in crate::pane_terminals) fn reset_window_terminal_with_base_environment(
         &mut self,
         session_name: &SessionName,
         window_index: u32,
         spawn: WindowSpawnOptions<'_>,
+        base_environment: Option<&SessionBaseEnvironment>,
     ) -> Result<(), RmuxError> {
-        self.spawn_window_terminal(session_name, window_index, spawn, PaneOutputMode::Reset)
+        self.spawn_window_terminal(
+            session_name,
+            window_index,
+            spawn,
+            PaneOutputMode::Reset,
+            base_environment,
+        )
     }
 
     fn spawn_window_terminal(
@@ -170,6 +189,7 @@ impl HandlerState {
         window_index: u32,
         spawn: WindowSpawnOptions<'_>,
         output_mode: PaneOutputMode,
+        base_environment_override: Option<&SessionBaseEnvironment>,
     ) -> Result<(), RmuxError> {
         let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
         let (session_id, window_id, pane_id, pane_index, pane_geometry, requested_cwd) = {
@@ -193,16 +213,25 @@ impl HandlerState {
                 window.id(),
                 pane.id(),
                 pane.index(),
-                pane_terminal_geometry_for_session(session, &self.options, pane.geometry()),
+                pane_terminal_geometry_for_session(
+                    session,
+                    &self.options,
+                    window_index,
+                    pane.geometry(),
+                ),
                 session.cwd(),
             )
         };
-        let profile = TerminalProfile::for_session(
+        let captured_base_environment =
+            self.session_base_environment_for_window(session_name, window_index);
+        let base_environment = base_environment_override.or(captured_base_environment.as_ref());
+        let profile = TerminalProfile::for_session_with_base_environment(
             &self.environment,
             &self.options,
             session_name,
             session_id.as_u32(),
             spawn.socket_path,
+            base_environment,
             spawn.spawn_environment,
             true,
             spawn.environment_overrides,
@@ -392,7 +421,7 @@ impl HandlerState {
                 return Err(error);
             }
         };
-        let removed_outputs =
+        let mut removed_outputs =
             self.remove_pane_outputs(&runtime_session_name, committed_outcome.removed_pane_ids());
 
         if let Err(error) = self.resize_terminals(&session_name) {
@@ -405,6 +434,7 @@ impl HandlerState {
             )?;
             return Err(error);
         }
+        removed_outputs.abort_output_readers();
         terminate_removed_terminals(&mut removed_terminals);
         self.remove_pane_lifecycles(committed_outcome.removed_pane_ids());
 
@@ -453,8 +483,8 @@ impl HandlerState {
             command,
             process_command,
         } = request;
-        let process_command =
-            process_command.or_else(|| ProcessCommand::from_legacy_command(command.as_deref()));
+        let process_command = process_command
+            .or_else(|| crate::legacy_command::from_legacy_command(command.as_deref()));
         validate_process_command(process_command.as_ref())?;
         let session_name = target.session_name().clone();
         let window_index = target.window_index();
@@ -483,7 +513,12 @@ impl HandlerState {
                 window.id(),
                 window.name().unwrap_or_default().to_owned(),
                 pane.id(),
-                pane_terminal_geometry_for_session(session, &self.options, pane.geometry()),
+                pane_terminal_geometry_for_session(
+                    session,
+                    &self.options,
+                    window_index,
+                    pane.geometry(),
+                ),
                 session.cwd(),
             )
         };
@@ -498,12 +533,14 @@ impl HandlerState {
             return Err(RmuxError::ProcessStillRunning);
         }
 
-        let profile = TerminalProfile::for_session(
+        let base_environment = self.session_base_environment_for_pane_target(&target);
+        let profile = TerminalProfile::for_session_with_base_environment(
             &self.environment,
             &self.options,
             &session_name,
             session_id.as_u32(),
             socket_path,
+            base_environment.as_ref(),
             spawn_environment,
             true,
             environment.as_deref(),

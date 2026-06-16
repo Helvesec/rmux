@@ -96,6 +96,9 @@ async fn attached_prefix_x_during_display_panes_opens_kill_pane_prompt() {
             .handle(Request::SelectPane(SelectPaneRequest {
                 target: PaneTarget::new(alpha.clone(), 1),
                 title: None,
+                style: None,
+                input_disabled: None,
+                preserve_zoom: false,
             }))
             .await,
         Response::SelectPane(_)
@@ -201,6 +204,9 @@ async fn display_panes_input_uses_visible_pane_base_index_labels() {
             .handle(Request::SelectPane(SelectPaneRequest {
                 target: PaneTarget::with_window(alpha.clone(), 0, 0),
                 title: None,
+                style: None,
+                input_disabled: None,
+                preserve_zoom: false,
             }))
             .await,
         Response::SelectPane(_)
@@ -457,6 +463,8 @@ async fn attached_prefix_q_inside_choose_tree_restores_the_tree_overlay_without_
                 }
                 AttachControl::AdvancePersistentOverlayState(_) => {}
                 AttachControl::Switch(_) => {}
+                AttachControl::Refresh => {}
+                AttachControl::InteractiveInput => {}
                 AttachControl::Write(_) => {}
                 AttachControl::LockShellCommand(_) => {}
                 AttachControl::Detach => panic!("unexpected detach"),

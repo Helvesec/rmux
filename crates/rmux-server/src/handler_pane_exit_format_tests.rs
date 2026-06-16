@@ -77,6 +77,7 @@ async fn display_pane_dead(handler: &RequestHandler, target: PaneTarget) -> Stri
             target: Some(Target::Pane(target)),
             print: true,
             message: Some("#{pane_dead}".to_owned()),
+            empty_target_context: false,
         }))
         .await;
     let Response::DisplayMessage(response) = response else {

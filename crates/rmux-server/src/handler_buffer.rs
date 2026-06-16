@@ -232,6 +232,11 @@ impl RequestHandler {
                 });
             }
         };
+        if content.is_empty() {
+            return Response::LoadBuffer(LoadBufferResponse {
+                buffer_name: String::new(),
+            });
+        }
 
         let clipboard_bytes = request.set_clipboard.then_some(content.clone());
         match self.store_buffer(request.name, content).await {
@@ -280,7 +285,7 @@ impl RequestHandler {
         request: rmux_proto::CapturePaneRequest,
     ) -> Response {
         let content = {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             let range = ScreenCaptureRange {
                 start: request.start,
                 end: request.end,
@@ -288,7 +293,7 @@ impl RequestHandler {
                 end_is_absolute: request.end_is_absolute,
             };
             let options = capture_render_options(&request);
-            match state.capture_transcript(
+            match state.capture_transcript_for_command(
                 &request.target,
                 PaneCaptureRequest {
                     range,
@@ -419,7 +424,8 @@ impl RequestHandler {
         };
         let payload = {
             let state = self.state.lock().await;
-            OuterTerminal::resolve(&state.options, terminal_context).encode_clipboard_set(bytes)
+            OuterTerminal::resolve(&state.options, terminal_context)
+                .encode_forced_clipboard_set(bytes)
         };
         let Some(payload) = payload else {
             return;
@@ -442,6 +448,7 @@ fn capture_render_options(request: &rmux_proto::CapturePaneRequest) -> GridRende
         with_sequences: request.escape_ansi,
         escape_sequences: request.escape_sequences,
         include_empty_cells: !join_wrapped && !request.preserve_trailing_spaces,
+        use_tmux_cell_capacity: request.do_not_trim_spaces,
         trim_spaces: !join_wrapped && !request.do_not_trim_spaces,
     }
 }

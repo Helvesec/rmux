@@ -123,6 +123,9 @@ pub struct NewSessionReuse {
     /// Detach and terminate other attached clients before attaching.
     #[serde(default)]
     pub kill_other_clients: bool,
+    /// Skip client environment updates.
+    #[serde(default)]
+    pub skip_environment_update: bool,
     /// Optional tmux client-flag names such as `read-only` or `active-pane`.
     #[serde(default)]
     pub flags: Option<Vec<String>>,
@@ -232,6 +235,7 @@ impl From<NewSessionSpec> for rmux_proto::NewSessionExtRequest {
             command,
             process_command,
             client_environment: None,
+            skip_environment_update: value.reuse.skip_environment_update,
         }
     }
 }
@@ -459,6 +463,8 @@ impl From<SplitSpec> for rmux_proto::SplitWindowExtRequest {
             detached: false,
             size: None,
             preserve_zoom: false,
+            full_size: false,
+            stdin_payload: None,
         }
     }
 }

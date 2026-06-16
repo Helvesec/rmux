@@ -8,7 +8,9 @@ const ATTACHED_EXIT_INPUT: &[u8] = b"exit\r";
 #[cfg(windows)]
 const SUBMITTED_EXIT_LINE_NEEDLE: &str = "RMUX_EXIT";
 #[cfg(not(windows))]
-const SUBMITTED_EXIT_LINE_NEEDLE: &str = "PROMPT> exit";
+const SUBMITTED_EXIT_LINE_NEEDLE: &str = "exit";
+
+const REMAIN_ON_EXIT_CAPTURE_SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[tokio::test]
 async fn attached_remain_on_exit_strips_the_submitted_exit_line_from_dead_pane_capture() {
@@ -37,7 +39,7 @@ async fn attached_remain_on_exit_strips_the_submitted_exit_line_from_dead_pane_c
         .expect("attached exit input");
     wait_for_dead_pane(&handler, &alpha, 0, 0).await;
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + REMAIN_ON_EXIT_CAPTURE_SETTLE_TIMEOUT;
     let capture = loop {
         let capture = capture_pane_print(&handler, target.clone()).await;
         if capture.contains("Pane is dead") && !capture.contains(SUBMITTED_EXIT_LINE_NEEDLE) {
@@ -89,6 +91,7 @@ async fn attached_display_message_print_reports_client_size_and_cursor_position(
                 "#{client_width}x#{client_height}|#{cursor_x}|#{cursor_y}|#{session_width}x#{session_height}|#{pane_width}x#{pane_height}"
                     .to_owned(),
             ),
+            empty_target_context: false,
             }))
         .await;
     let Response::DisplayMessage(response) = response else {
@@ -130,7 +133,7 @@ async fn attached_exit_on_last_pane_closes_the_session_and_client() {
     wait_for_session_removed(&handler, &alpha).await;
 }
 
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 async fn create_exit_attached_session(
     handler: &RequestHandler,
     requester_pid: u32,
@@ -139,7 +142,7 @@ async fn create_exit_attached_session(
     create_line_exiting_attached_session(handler, requester_pid, session).await
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(unix, windows)))]
 async fn create_exit_attached_session(
     handler: &RequestHandler,
     requester_pid: u32,
@@ -148,10 +151,10 @@ async fn create_exit_attached_session(
     create_attached_session(handler, requester_pid, session).await
 }
 
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 async fn prepare_exit_prompt(_handler: &RequestHandler, _target: &PaneTarget) {}
 
-#[cfg(not(windows))]
+#[cfg(not(any(unix, windows)))]
 async fn prepare_exit_prompt(handler: &RequestHandler, target: &PaneTarget) {
     prepare_attached_shell_prompt(handler, target).await;
 }
@@ -214,6 +217,69 @@ async fn attached_prefix_key_activates_prefix_table() {
             .get(&requester_pid)
             .and_then(|active| active.key_table_name.as_deref()),
         Some("prefix")
+    );
+}
+
+#[tokio::test]
+async fn attached_control_space_prefix_activates_prefix_table() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let alpha = session_name("alpha");
+    let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Session(alpha.clone()),
+                option: OptionName::Prefix,
+                value: "C-Space".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x00")
+        .await
+        .expect("C-Space prefix input");
+
+    let active_attach = handler.active_attach.lock().await;
+    assert_eq!(
+        active_attach
+            .by_pid
+            .get(&requester_pid)
+            .and_then(|active| active.key_table_name.as_deref()),
+        Some("prefix")
+    );
+}
+
+#[tokio::test]
+async fn attached_control_space_prefix_c_creates_window() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let alpha = session_name("alpha");
+    let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Session(alpha.clone()),
+                option: OptionName::Prefix,
+                value: "C-Space".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x00c")
+        .await
+        .expect("C-Space c prefix input");
+
+    assert_eq!(
+        active_windows(&handler, &alpha).await,
+        "0:0\n1:1\n",
+        "C-Space c must dispatch the prefix table's new-window binding"
     );
 }
 

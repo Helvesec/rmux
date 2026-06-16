@@ -7,7 +7,7 @@ use rmux_proto::{PaneTarget, RmuxError, SourceFileRequest};
 
 use super::aggregate_rmux_errors;
 
-const MAX_TMUX_COMPAT_CONFIG_BYTES: u64 = 1024 * 1024;
+const MAX_SOURCE_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
 const DISABLE_TMUX_FALLBACK_ENV: &str = "RMUX_DISABLE_TMUX_FALLBACK";
 
 #[derive(Debug, Default)]
@@ -15,14 +15,11 @@ pub(super) struct LoadedSourceFile {
     pub(super) commands: Vec<SourcedParsedCommands>,
     pub(super) stdout: Vec<u8>,
     errors: Vec<RmuxError>,
+    parse_errors: bool,
     loaded_file_count: usize,
 }
 
 impl LoadedSourceFile {
-    pub(super) fn is_empty(&self) -> bool {
-        self.commands.is_empty()
-    }
-
     pub(super) fn loaded_any_file(&self) -> bool {
         self.loaded_file_count != 0
     }
@@ -37,6 +34,11 @@ impl LoadedSourceFile {
 
     pub(super) fn push_error(&mut self, error: RmuxError) {
         self.errors.push(error);
+    }
+
+    pub(super) fn push_parse_error(&mut self, error: RmuxError) {
+        self.parse_errors = true;
+        self.push_error(error);
     }
 
     pub(super) fn take_error(&mut self) -> Option<RmuxError> {
@@ -307,8 +309,9 @@ pub(super) fn source_inputs_for_path(
             Err(_) if read_policy == SourceReadPolicy::BestEffort => {}
             Err(error) => {
                 return Err(RmuxError::Server(format!(
-                    "{}: {error}",
-                    source_entry_display_path(&entry)
+                    "{}: {}",
+                    source_entry_display_path(&entry),
+                    source_io_error_message(&error)
                 )));
             }
         }
@@ -317,11 +320,73 @@ pub(super) fn source_inputs_for_path(
     Ok(inputs)
 }
 
+fn source_io_error_message(error: &io::Error) -> String {
+    match error.kind() {
+        io::ErrorKind::NotFound => "No such file or directory".to_owned(),
+        io::ErrorKind::PermissionDenied => "Permission denied".to_owned(),
+        io::ErrorKind::IsADirectory => "Is a directory".to_owned(),
+        _ => error.to_string(),
+    }
+}
+
 fn read_source_entry(entry: &Path, read_policy: SourceReadPolicy) -> io::Result<String> {
     match read_policy {
-        SourceReadPolicy::Strict => std::fs::read_to_string(entry),
+        SourceReadPolicy::Strict => read_limited_source_entry(entry),
         SourceReadPolicy::BestEffort => read_tmux_compat_source_entry(entry),
     }
+}
+
+fn read_limited_source_entry(entry: &Path) -> io::Result<String> {
+    let metadata = fs::metadata(entry)?;
+    validate_strict_source_metadata(&metadata)?;
+
+    let file = open_strict_source_entry(entry)?;
+    let metadata = file.metadata()?;
+    validate_strict_source_metadata(&metadata)?;
+    let mut contents = String::new();
+    let mut reader = file.take(MAX_SOURCE_CONFIG_BYTES + 1);
+    reader.read_to_string(&mut contents)?;
+    if contents.len() as u64 > MAX_SOURCE_CONFIG_BYTES {
+        return Err(oversized_source_config_error());
+    }
+    Ok(contents)
+}
+
+fn validate_strict_source_metadata(metadata: &fs::Metadata) -> io::Result<()> {
+    if metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::IsADirectory,
+            "Is a directory",
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source file is not a regular file",
+        ));
+    }
+    if metadata.len() > MAX_SOURCE_CONFIG_BYTES {
+        return Err(oversized_source_config_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_strict_source_entry(entry: &Path) -> io::Result<File> {
+    use rustix::fs::{open, Mode, OFlags};
+
+    let fd = open(
+        entry,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    Ok(File::from(fd))
+}
+
+#[cfg(not(unix))]
+fn open_strict_source_entry(entry: &Path) -> io::Result<File> {
+    File::open(entry)
 }
 
 fn read_tmux_compat_source_entry(entry: &Path) -> io::Result<String> {
@@ -333,10 +398,10 @@ fn read_tmux_compat_source_entry(entry: &Path) -> io::Result<String> {
     validate_tmux_compat_regular_metadata(&metadata)?;
 
     let mut contents = String::new();
-    let mut reader = file.take(MAX_TMUX_COMPAT_CONFIG_BYTES + 1);
+    let mut reader = file.take(MAX_SOURCE_CONFIG_BYTES + 1);
     reader.read_to_string(&mut contents)?;
-    if contents.len() as u64 > MAX_TMUX_COMPAT_CONFIG_BYTES {
-        return Err(oversized_tmux_compat_config_error());
+    if contents.len() as u64 > MAX_SOURCE_CONFIG_BYTES {
+        return Err(oversized_source_config_error());
     }
     Ok(contents)
 }
@@ -358,8 +423,8 @@ fn validate_tmux_compat_regular_metadata(metadata: &fs::Metadata) -> io::Result<
             "tmux fallback config is not a regular file",
         ));
     }
-    if metadata.len() > MAX_TMUX_COMPAT_CONFIG_BYTES {
-        return Err(oversized_tmux_compat_config_error());
+    if metadata.len() > MAX_SOURCE_CONFIG_BYTES {
+        return Err(oversized_source_config_error());
     }
     Ok(())
 }
@@ -382,11 +447,8 @@ fn open_tmux_compat_regular_file(entry: &Path) -> io::Result<File> {
     File::open(entry)
 }
 
-fn oversized_tmux_compat_config_error() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        "tmux fallback config exceeds 1 MiB",
-    )
+fn oversized_source_config_error() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "source file exceeds 16 MiB")
 }
 
 fn strip_utf8_bom(mut contents: String) -> String {
@@ -453,8 +515,21 @@ fn no_such_source_file(path: &str) -> RmuxError {
     RmuxError::Message(format!("{path}: No such file or directory"))
 }
 
-pub(super) fn source_parse_error(input: &SourceInput, error: CommandParseError) -> RmuxError {
-    RmuxError::Server(format!("{}: {}", input.current_file, error.message()))
+pub(super) fn source_parse_error_with_line_offset(
+    input: &SourceInput,
+    error: CommandParseError,
+    line_offset: usize,
+) -> RmuxError {
+    if error.line() == 0 {
+        return RmuxError::Server(format!("{}: {}", input.current_file, error.message()));
+    }
+    let line = error.line().saturating_add(line_offset);
+    RmuxError::Server(format!(
+        "{}:{}: {}",
+        input.current_file,
+        line,
+        error.message()
+    ))
 }
 
 #[cfg(test)]
@@ -521,7 +596,7 @@ mod tests {
     #[test]
     fn tmux_best_effort_source_skips_oversized_files() {
         let path = temp_source_path("oversized-tmux-fallback");
-        let contents = "x".repeat((super::MAX_TMUX_COMPAT_CONFIG_BYTES + 1) as usize);
+        let contents = "x".repeat((super::MAX_SOURCE_CONFIG_BYTES + 1) as usize);
         std::fs::write(&path, contents).expect("write oversized source file");
 
         let inputs = source_inputs_for_path(
@@ -535,6 +610,104 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(inputs.is_empty());
+    }
+
+    #[test]
+    fn strict_source_rejects_oversized_files() {
+        let path = temp_source_path("oversized-strict-source");
+        let contents = "x".repeat((super::MAX_SOURCE_CONFIG_BYTES + 1) as usize);
+        std::fs::write(&path, contents).expect("write oversized source file");
+
+        let error = source_inputs_for_path(
+            &path.to_string_lossy(),
+            None,
+            false,
+            None,
+            SourceReadPolicy::Strict,
+        )
+        .expect_err("strict source should reject oversized files");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            error.to_string().contains("source file exceeds 16 MiB"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn strict_source_accepts_multi_megabyte_configs_below_limit() {
+        let path = temp_source_path("large-strict-source");
+        let contents = format!(
+            "{}set -g status off\n",
+            "# large config padding\n".repeat(80_000)
+        );
+        assert!(
+            contents.len() as u64 > 1024 * 1024,
+            "test fixture should exceed the old 1 MiB limit"
+        );
+        assert!(
+            contents.len() as u64 <= super::MAX_SOURCE_CONFIG_BYTES,
+            "test fixture should stay below the current source-file limit"
+        );
+        std::fs::write(&path, contents.clone()).expect("write large source file");
+
+        let inputs = source_inputs_for_path(
+            &path.to_string_lossy(),
+            None,
+            false,
+            None,
+            SourceReadPolicy::Strict,
+        )
+        .expect("strict source should accept multi-megabyte configs below the hard limit");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].contents, contents);
+    }
+
+    #[test]
+    fn strict_source_rejects_directories_with_directory_error() {
+        let path = temp_source_path("directory-strict-source");
+        std::fs::create_dir(&path).expect("create directory source entry");
+
+        let error = source_inputs_for_path(
+            &path.to_string_lossy(),
+            None,
+            false,
+            None,
+            SourceReadPolicy::Strict,
+        )
+        .expect_err("strict source should reject directories");
+        let _ = std::fs::remove_dir(&path);
+
+        assert!(
+            error.to_string().contains("Is a directory"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_source_rejects_fifo_without_blocking() {
+        let path = temp_source_path("fifo-strict-source");
+        create_test_fifo(&path);
+
+        let error = source_inputs_for_path(
+            &path.to_string_lossy(),
+            None,
+            false,
+            None,
+            SourceReadPolicy::Strict,
+        )
+        .expect_err("strict source should reject fifo");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            error
+                .to_string()
+                .contains("source file is not a regular file"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

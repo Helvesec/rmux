@@ -324,6 +324,92 @@ fn removing_and_renaming_sessions_updates_window_and_pane_scopes() {
 }
 
 #[test]
+fn swapping_windows_rekeys_window_and_pane_hooks() {
+    let mut store = HookStore::new();
+    let alpha = session_name("alpha");
+    let source = WindowTarget::with_window(alpha.clone(), 1);
+    let target = WindowTarget::with_window(alpha.clone(), 3);
+    let source_pane = rmux_proto::PaneTarget::with_window(alpha.clone(), 1, 0);
+    let target_pane = rmux_proto::PaneTarget::with_window(alpha, 3, 0);
+
+    store
+        .set(
+            ScopeSelector::Window(source.clone()),
+            HookName::WindowLayoutChanged,
+            "printf window".to_owned(),
+            HookLifecycle::Persistent,
+        )
+        .expect("window hook set succeeds");
+    store
+        .set(
+            ScopeSelector::Pane(source_pane.clone()),
+            HookName::PaneExited,
+            "printf pane".to_owned(),
+            HookLifecycle::Persistent,
+        )
+        .expect("pane hook set succeeds");
+
+    store.swap_window_hooks(&source, &target);
+
+    assert_eq!(
+        store.window_command(&source, HookName::WindowLayoutChanged),
+        None
+    );
+    assert_eq!(store.pane_command(&source_pane, HookName::PaneExited), None);
+    assert_eq!(
+        store.window_command(&target, HookName::WindowLayoutChanged),
+        Some("printf window")
+    );
+    assert_eq!(
+        store.pane_command(&target_pane, HookName::PaneExited),
+        Some("printf pane")
+    );
+}
+
+#[test]
+fn moving_windows_rekeys_window_and_pane_hooks() {
+    let mut store = HookStore::new();
+    let alpha = session_name("alpha");
+    let source = WindowTarget::with_window(alpha.clone(), 2);
+    let target = WindowTarget::with_window(alpha.clone(), 4);
+    let source_pane = rmux_proto::PaneTarget::with_window(alpha.clone(), 2, 0);
+    let target_pane = rmux_proto::PaneTarget::with_window(alpha, 4, 0);
+
+    store
+        .set(
+            ScopeSelector::Window(source.clone()),
+            HookName::WindowLayoutChanged,
+            "printf window".to_owned(),
+            HookLifecycle::Persistent,
+        )
+        .expect("window hook set succeeds");
+    store
+        .set(
+            ScopeSelector::Pane(source_pane.clone()),
+            HookName::PaneExited,
+            "printf pane".to_owned(),
+            HookLifecycle::Persistent,
+        )
+        .expect("pane hook set succeeds");
+
+    store.move_window_hooks(&source, &target);
+
+    assert_eq!(
+        store.window_command(&source, HookName::WindowLayoutChanged),
+        None
+    );
+    assert_eq!(store.pane_command(&source_pane, HookName::PaneExited), None);
+    assert_eq!(
+        store.window_command(&target, HookName::WindowLayoutChanged),
+        Some("printf window")
+    );
+    assert_eq!(
+        store.pane_command(&target_pane, HookName::PaneExited),
+        Some("printf pane")
+    );
+}
+
+#[test]
 fn incompatible_hook_scope_pairs_are_rejected() {
     let alpha = session_name("alpha");
 
@@ -573,9 +659,12 @@ fn shipped_hooks_accept_registration_at_supported_scopes() {
     assert!(validate_hook_registration(HookName::ClientAttached, &ScopeSelector::Global).is_ok());
     assert!(validate_hook_registration(
         HookName::WindowLayoutChanged,
-        &ScopeSelector::Window(window)
+        &ScopeSelector::Window(window.clone())
     )
     .is_ok());
+    assert!(
+        validate_hook_registration(HookName::WindowResized, &ScopeSelector::Window(window)).is_ok()
+    );
     assert!(validate_hook_registration(HookName::PaneExited, &ScopeSelector::Pane(pane)).is_ok());
     assert!(validate_hook_registration(HookName::AfterShowOptions, &ScopeSelector::Global).is_ok());
 }

@@ -34,6 +34,18 @@ impl OutputCursor {
         self.next_sequence = next_sequence;
     }
 
+    /// Advances past `sequence` only when it is exactly the next retained event.
+    ///
+    /// This lets live-output fast paths consume an already identified event
+    /// without exposing arbitrary cursor rewinds to callers.
+    pub fn advance_past_sequence(&mut self, sequence: u64) -> bool {
+        if self.next_sequence != sequence {
+            return false;
+        }
+        self.next_sequence = sequence.wrapping_add(1);
+        true
+    }
+
     pub(super) fn record_gap(&mut self, missed: u64, resume_sequence: u64) {
         self.missed_events = self.missed_events.saturating_add(missed);
         self.next_sequence = resume_sequence;

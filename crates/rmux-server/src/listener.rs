@@ -14,7 +14,9 @@ use crate::control::{self, ControlLifecycle, ControlServerEvent};
 use crate::daemon::ShutdownHandle;
 use crate::handler::{attach_support::AttachRegistration, ControlRegistration, RequestHandler};
 use crate::listener_options::ServeOptions;
-use crate::listener_signals::{handle_server_signal, receive_server_signal};
+use crate::listener_signals::handle_server_signal;
+use crate::listener_signals::poll_server_signal;
+use crate::listener_signals::wait_server_signal;
 use crate::pane_io;
 use crate::server_access::apply_access_policy;
 use crate::socket_cleanup::SocketCleanup;
@@ -31,7 +33,7 @@ pub(crate) async fn serve(
     let mut cleanup_on_drop = SocketCleanup::new(socket_path.clone(), options.socket_identity);
     #[cfg(windows)]
     let mut cleanup_on_drop = SocketCleanup::new(socket_path.clone());
-    let mut server_signals = options.server_signals;
+    let server_signals = options.server_signals;
     #[cfg(all(any(unix, windows), feature = "web"))]
     let web_required = options.web_required;
     #[cfg(all(any(unix, windows), feature = "web"))]
@@ -50,7 +52,6 @@ pub(crate) async fn serve(
     ));
     handler.install_shutdown_handle(shutdown_handle.clone());
     handler.set_socket_path(&socket_path);
-    handler.load_startup_config(options.config_load).await;
     #[cfg(all(any(unix, windows), feature = "web"))]
     if web_required {
         handler
@@ -58,6 +59,14 @@ pub(crate) async fn serve(
             .await
             .map_err(|error| io::Error::new(io::ErrorKind::AddrNotAvailable, error.to_string()))?;
     }
+    let startup_guard = handler.start_config_loading();
+    let startup_handler = Arc::clone(&handler);
+    let startup_config = options.config_load;
+    let startup_task = tokio::spawn(async move {
+        startup_handler
+            .load_startup_config_with_guard(startup_config, startup_guard)
+            .await;
+    });
     let (connection_shutdown, connection_shutdown_rx) = watch::channel(());
     let mut connection_tasks = JoinSet::new();
     let hook_handler = Arc::clone(&handler);
@@ -98,20 +107,31 @@ pub(crate) async fn serve(
                 debug!("shutdown requested");
                 break;
             }
-            signal = receive_server_signal(&mut server_signals), if server_signals.is_some() => {
-                handle_server_signal(
-                    signal,
-                    &mut server_signals,
-                    &handler,
-                    &socket_path,
-                    &mut listener,
-                    &mut cleanup_on_drop,
-                ).await;
+            result = wait_server_signal(&server_signals), if server_signals.is_some() => {
+                if let Err(error) = result {
+                    warn!("server signal wake failed; keeping server accept loop alive: {error}");
+                }
+                while let Some(signal) = poll_server_signal(&server_signals) {
+                    handle_server_signal(
+                        Some(signal),
+                        &shutdown_handle,
+                        &handler,
+                        &socket_path,
+                        &mut listener,
+                        &mut cleanup_on_drop,
+                    ).await;
+                }
             }
         }
     }
 
     drop(connection_shutdown);
+    startup_task.abort();
+    match startup_task.await {
+        Ok(()) => {}
+        Err(error) if error.is_cancelled() => {}
+        Err(error) => warn!("startup config task failed: {error}"),
+    }
 
     while let Some(result) = connection_tasks.join_next().await {
         log_connection_task_result(result);
@@ -191,10 +211,12 @@ async fn serve_connection(
                             session_name.clone(),
                             AttachRegistration {
                                 control_tx: attach.control_tx,
+                                control_backlog: attach.control_backlog.clone(),
                                 closing: attach.closing.clone(),
                                 persistent_overlay_epoch: attach.persistent_overlay_epoch.clone(),
                                 terminal_context,
                                 flags: attach.flags,
+                                render_stream: attach.render_stream,
                                 uid: requester.uid,
                                 user: requester.user.clone(),
                                 can_write: access_mode.can_write(),
@@ -218,12 +240,14 @@ async fn serve_connection(
                         buffered_bytes,
                         shutdown,
                         attach.control_rx,
+                        attach.control_backlog,
                         attach.closing,
                         attach.persistent_overlay_epoch,
                         pane_io::LiveAttachInputContext {
                             handler: Arc::clone(&handler),
                             attach_pid: requester.pid,
                         },
+                        attach.render_stream,
                     )
                     .await;
                     handler.finish_attach(requester.pid, attach_id).await;

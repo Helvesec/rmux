@@ -1,4 +1,6 @@
-use rmux_core::{SessionStore, TargetFindContext};
+use rmux_core::{
+    SessionStore, TargetFindContext, TargetFindFlags, TargetFindType, UnresolvedTarget,
+};
 use rmux_proto::{
     ListPanesRequest, ListSessionsRequest, ListWindowsRequest, Request, RmuxError, SessionName,
     Target,
@@ -13,15 +15,15 @@ use super::values::{missing_argument, unsupported_flag};
 pub(super) fn parse_list_sessions(mut args: CommandTokens) -> Result<Request, RmuxError> {
     let mut format = None;
     let mut filter = None;
-    let mut sort_order = None;
-    let mut reversed = false;
+    let sort_order = None;
+    let reversed = false;
 
     while let Some(token) = args.optional() {
         match token.as_str() {
             "-F" => format = Some(args.required("-F format")?),
             "-f" => filter = Some(args.required("-f filter")?),
-            "-O" => sort_order = Some(args.required("-O sort-order")?),
-            "-r" => reversed = true,
+            "-O" => return Err(unsupported_flag("list-sessions", "-O")),
+            "-r" => return Err(unsupported_flag("list-sessions", "-r")),
             flag if flag.starts_with('-') => return Err(unsupported_flag("list-sessions", flag)),
             _ => {
                 return Err(RmuxError::Server(format!(
@@ -70,16 +72,18 @@ pub(super) fn parse_list_panes(
     let mut target = None;
     let mut target_window_index = None;
     let mut format = None;
+    let mut session_scope = false;
 
     while let Some(token) = args.optional() {
         match token.as_str() {
             "-t" => {
                 let (session_name, window_index) =
-                    parse_list_panes_target(args.required("-t target")?, sessions)?;
+                    parse_list_panes_target(args.required("-t target")?, sessions, find_context)?;
                 target = Some(session_name);
                 target_window_index = window_index;
             }
             "-F" => format = Some(args.required("-F format")?),
+            "-s" => session_scope = true,
             flag if flag.starts_with('-') => return Err(unsupported_flag("list-panes", flag)),
             _ => {
                 return Err(RmuxError::Server(format!(
@@ -92,6 +96,11 @@ pub(super) fn parse_list_panes(
     let (target, target_window_index) = match target {
         Some(target) => (target, target_window_index),
         None => implicit_list_panes_target(sessions, find_context)?,
+    };
+    let target_window_index = if session_scope {
+        None
+    } else {
+        target_window_index
     };
 
     Ok(Request::ListPanes(ListPanesRequest {
@@ -159,21 +168,22 @@ fn implicit_list_panes_target(
 fn parse_list_panes_target(
     value: String,
     sessions: &SessionStore,
+    find_context: &TargetFindContext,
 ) -> Result<(SessionName, Option<u32>), RmuxError> {
-    match Target::parse(&value) {
-        Ok(Target::Session(session_name)) => {
+    match sessions.resolve_unresolved_target(
+        &UnresolvedTarget::new(value),
+        TargetFindType::Window,
+        TargetFindFlags::NONE,
+        find_context,
+    )? {
+        Target::Session(session_name) => {
             let active_window = sessions
                 .session(&session_name)
                 .ok_or_else(|| session_not_found(&session_name))?
                 .active_window_index();
             Ok((session_name, Some(active_window)))
         }
-        Ok(Target::Window(target)) => {
-            Ok((target.session_name().clone(), Some(target.window_index())))
-        }
-        Ok(Target::Pane(target)) => {
-            Ok((target.session_name().clone(), Some(target.window_index())))
-        }
-        Err(error) => Err(error),
+        Target::Window(target) => Ok((target.session_name().clone(), Some(target.window_index()))),
+        Target::Pane(target) => Ok((target.session_name().clone(), Some(target.window_index()))),
     }
 }

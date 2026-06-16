@@ -96,23 +96,20 @@ fn tmux_compat_hook_allow_list_show_hooks_and_prefix_binding_surface_on_rmux_rel
     assert!(allowed.stdout.is_empty());
     assert!(allowed.stderr.is_empty());
 
-    let rejected = harness.run_rmux_with(
+    let window_resized = harness.run_rmux_with(
         &["set-hook", "-g", "window-resized", "display-message hi"],
         &config,
     )?;
     assert_rmux_metadata(
-        &rejected,
+        &window_resized,
         &harness,
         &["set-hook", "-g", "window-resized", "display-message hi"],
         &expected_overrides,
     );
-    assert_eq!(rejected.status_code, Some(1));
-    assert!(!rejected.timed_out);
-    assert!(rejected.stdout.is_empty());
-    assert_eq!(
-        rejected.stderr_string(),
-        "window-resized is not supported: rmux does not dispatch this hook\n"
-    );
+    assert_eq!(window_resized.status_code, Some(0));
+    assert!(!window_resized.timed_out);
+    assert!(window_resized.stdout.is_empty());
+    assert!(window_resized.stderr.is_empty());
 
     let show_hooks =
         harness.run_rmux_with(&["show-hooks", "-t", "alpha", "client-attached"], &config)?;

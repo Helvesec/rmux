@@ -9,7 +9,7 @@ use super::websocket::{WebSocketMessage, WebSocketReader, WebSocketWriter};
 
 pub(super) const E2EE_CAPABILITY: &str = "e2ee-token-auth";
 
-/// A parsed v4 client hello.
+/// A parsed web-share client hello.
 ///
 /// `raw` is the EXACT hello text received on the wire. It is bound into the
 /// session key schedule as part of the handshake transcript, so it must be the
@@ -60,7 +60,7 @@ pub(super) fn random_handshake_nonce() -> io::Result<String> {
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce))
 }
 
-/// Derives the server side of a v4 session from the token-derived PSK, the
+/// Derives the server side of a web-share session from the token-derived PSK, the
 /// X25519 DH shared secret, the ML-KEM shared secret, and the exact handshake
 /// transcript bytes.
 ///

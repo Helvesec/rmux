@@ -2,13 +2,14 @@ use std::path::PathBuf;
 
 use rmux_core::{SessionStore, TargetFindContext};
 use rmux_proto::{
-    BreakPaneRequest, KillPaneRequest, PipePaneRequest, Request, RespawnPaneRequest, RmuxError,
-    SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneMarkRequest, SelectPaneRequest,
-    SplitDirection, SplitWindowExtRequest, SplitWindowRequest, SwapPaneDirection, SwapPaneRequest,
+    BreakPaneRequest, KillPaneRequest, LastPaneRequest, PipePaneRequest, Request,
+    RespawnPaneRequest, RmuxError, SelectPaneAdjacentRequest, SelectPaneDirection,
+    SelectPaneMarkRequest, SelectPaneRequest, SplitDirection, SplitWindowExtRequest,
+    SplitWindowRequest, SwapPaneDirection, SwapPaneRequest, WindowTarget,
 };
 
 use super::tokens::{rebuild_shell_command, CommandTokens};
-use super::values::{missing_argument, unsupported_flag};
+use super::values::{missing_argument, parse_percentage, unsupported_flag};
 use super::{
     implicit_pane_target, implicit_split_target, marked_pane_target, parse_pane_target,
     parse_split_window_target, parse_window_target,
@@ -77,7 +78,11 @@ pub(super) fn parse_select_pane(
     let mut mark = false;
     let mut clear_marked = false;
     let mut title = None;
+    let mut style = None;
     let mut direction = None;
+    let mut last = false;
+    let mut input_disabled = None;
+    let mut preserve_zoom = false;
 
     while let Some(token) = args.peek() {
         match token {
@@ -100,9 +105,29 @@ pub(super) fn parse_select_pane(
                 let _ = args.optional();
                 clear_marked = true;
             }
+            "-l" => {
+                let _ = args.optional();
+                last = true;
+            }
+            "-Z" => {
+                let _ = args.optional();
+                preserve_zoom = true;
+            }
+            "-d" => {
+                let _ = args.optional();
+                input_disabled = Some(true);
+            }
+            "-e" => {
+                let _ = args.optional();
+                input_disabled = Some(false);
+            }
             "-T" => {
                 let _ = args.optional();
                 title = Some(args.required("-T title")?.to_owned());
+            }
+            "-P" => {
+                let _ = args.optional();
+                style = Some(args.required("-P style")?.to_owned());
             }
             "-U" => {
                 let _ = args.optional();
@@ -135,16 +160,33 @@ pub(super) fn parse_select_pane(
             "select-pane -U/-D/-L/-R cannot be combined with -m, -M, or -T".to_owned(),
         ));
     }
+    if style.is_some() && (direction.is_some() || last || mark || clear_marked) {
+        return Err(RmuxError::Server(
+            "select-pane -P cannot be combined with -U, -D, -L, -R, -l, -m, or -M".to_owned(),
+        ));
+    }
+    if last && (direction.is_some() || mark || clear_marked) {
+        return Err(RmuxError::Server(
+            "select-pane -l cannot be combined with -U, -D, -L, -R, -m, or -M".to_owned(),
+        ));
+    }
 
     let target = match target {
         Some(target) => target,
         None => implicit_pane_target(sessions, find_context, "select-pane")?,
     };
 
-    if let Some(direction) = direction {
+    if last {
+        Ok(Request::LastPane(LastPaneRequest {
+            target: WindowTarget::with_window(target.session_name().clone(), target.window_index()),
+            preserve_zoom,
+            input_disabled,
+        }))
+    } else if let Some(direction) = direction {
         Ok(Request::SelectPaneAdjacent(SelectPaneAdjacentRequest {
             target,
             direction,
+            preserve_zoom,
         }))
     } else if mark || clear_marked {
         Ok(Request::SelectPaneMark(SelectPaneMarkRequest {
@@ -153,7 +195,13 @@ pub(super) fn parse_select_pane(
             title,
         }))
     } else {
-        Ok(Request::SelectPane(SelectPaneRequest { target, title }))
+        Ok(Request::SelectPane(SelectPaneRequest {
+            target,
+            title,
+            style,
+            input_disabled,
+            preserve_zoom,
+        }))
     }
 }
 
@@ -187,6 +235,7 @@ fn parse_split_window_command(
     let mut start_directory: Option<std::path::PathBuf> = None;
     let mut detached = false;
     let mut size = None;
+    let mut full_size = false;
     let mut preserve_zoom = false;
     let mut print_target = false;
     let mut format = None;
@@ -225,6 +274,10 @@ fn parse_split_window_command(
                 let _ = args.optional();
                 detached = true;
             }
+            "-f" => {
+                let _ = args.optional();
+                full_size = true;
+            }
             "-Z" => {
                 let _ = args.optional();
                 preserve_zoom = true;
@@ -232,6 +285,12 @@ fn parse_split_window_command(
             "-l" => {
                 let _ = args.optional();
                 size = Some(args.required("-l size")?);
+            }
+            "-p" => {
+                let _ = args.optional();
+                let percentage =
+                    parse_percentage("split-window", "-p", &args.required("-p size")?)?;
+                size = Some(format!("{percentage}%"));
             }
             "-P" if allow_print_flags => {
                 let _ = args.optional();
@@ -272,6 +331,7 @@ fn parse_split_window_command(
         || start_directory.is_some()
         || detached
         || size.is_some()
+        || full_size
         || preserve_zoom
     {
         Request::SplitWindowExt(SplitWindowExtRequest {
@@ -286,6 +346,8 @@ fn parse_split_window_command(
             detached,
             size,
             preserve_zoom,
+            full_size,
+            stdin_payload: None,
         })
     } else {
         Request::SplitWindow(SplitWindowRequest {

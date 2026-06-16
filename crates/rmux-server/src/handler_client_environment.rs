@@ -20,6 +20,12 @@ pub(in crate::handler) fn client_spawn_environment(
     (!spawn_environment.is_empty()).then_some(spawn_environment)
 }
 
+pub(in crate::handler) fn initial_session_spawn_environment(
+    client_environment: Option<&HashMap<String, String>>,
+) -> Option<HashMap<String, String>> {
+    client_environment.cloned()
+}
+
 #[cfg(not(windows))]
 fn client_environment_entry<'a>(
     client_environment: &'a HashMap<String, String>,
@@ -45,7 +51,7 @@ fn client_environment_entry<'a>(
 mod tests {
     use std::collections::HashMap;
 
-    use super::client_spawn_environment;
+    use super::{client_spawn_environment, initial_session_spawn_environment};
 
     #[test]
     fn client_spawn_environment_keeps_path_without_leaking_arbitrary_variables() {
@@ -93,5 +99,31 @@ mod tests {
 
         assert_eq!(client_spawn_environment(Some(&client_environment)), None);
         assert_eq!(client_spawn_environment(None), None);
+    }
+
+    #[test]
+    fn initial_session_spawn_environment_keeps_full_invoking_client_environment() {
+        let client_environment = HashMap::from([
+            ("PATH".to_owned(), "/tmp/client-bin:/usr/bin".to_owned()),
+            (
+                "RMUX_CLIENT_ENV_SENTINEL".to_owned(),
+                "from-client".to_owned(),
+            ),
+        ]);
+
+        let spawn_environment = initial_session_spawn_environment(Some(&client_environment))
+            .expect("initial session spawn env is retained");
+
+        assert_eq!(spawn_environment, client_environment);
+    }
+
+    #[test]
+    fn initial_session_spawn_environment_preserves_explicit_empty_environment() {
+        let client_environment = HashMap::new();
+
+        let spawn_environment = initial_session_spawn_environment(Some(&client_environment))
+            .expect("explicit empty client env remains an explicit base");
+
+        assert!(spawn_environment.is_empty());
     }
 }

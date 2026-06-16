@@ -178,6 +178,52 @@ async fn duplicate_new_session_returns_the_duplicate_session_error() {
 }
 
 #[tokio::test]
+async fn attach_if_exists_existing_session_reports_attach_semantics() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+
+    let reused = handler
+        .handle(Request::NewSessionExt(NewSessionExtRequest {
+            session_name: Some(alpha.clone()),
+            working_directory: None,
+            detached: true,
+            size: None,
+            environment: None,
+            group_target: None,
+            attach_if_exists: true,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: None,
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        }))
+        .await;
+
+    assert_eq!(
+        reused,
+        Response::NewSession(rmux_proto::NewSessionResponse {
+            session_name: alpha,
+            detached: false,
+            output: None,
+        })
+    );
+}
+
+#[tokio::test]
 async fn grouped_new_session_without_explicit_name_uses_tmux_suffix_shape() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -210,6 +256,7 @@ async fn grouped_new_session_without_explicit_name_uses_tmux_suffix_shape() {
             command: None,
             process_command: None,
             client_environment: None,
+            skip_environment_update: false,
         }))
         .await;
 
@@ -272,6 +319,7 @@ async fn auto_named_session_uses_next_global_session_id_after_named_sessions() {
             command: None,
             process_command: None,
             client_environment: None,
+            skip_environment_update: false,
         }))
         .await;
 
@@ -318,6 +366,7 @@ async fn grouped_new_session_rejects_shell_command_like_tmux() {
             command: Some(vec!["cat".to_owned()]),
             process_command: None,
             client_environment: None,
+            skip_environment_update: false,
         }))
         .await;
 
@@ -360,6 +409,7 @@ async fn grouped_new_session_uses_next_global_session_id_suffix_when_group_is_ne
             command: None,
             process_command: None,
             client_environment: None,
+            skip_environment_update: false,
         }))
         .await;
 

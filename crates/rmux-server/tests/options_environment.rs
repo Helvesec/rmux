@@ -66,7 +66,7 @@ async fn set_option_round_trips_and_invalid_variants_fail_cleanly() -> Result<()
         })
     );
 
-    let invalid_append = send_request(
+    let scalar_append = send_request(
         &socket_path,
         &Request::SetOption(SetOptionRequest {
             scope: ScopeSelector::Global,
@@ -77,7 +77,7 @@ async fn set_option_round_trips_and_invalid_variants_fail_cleanly() -> Result<()
     )
     .await?;
     assert_eq!(
-        invalid_append,
+        scalar_append,
         Response::Error(rmux_proto::ErrorResponse {
             error: RmuxError::InvalidSetOption("status is not an array option".to_owned()),
         })

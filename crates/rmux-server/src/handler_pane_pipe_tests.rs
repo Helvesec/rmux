@@ -73,6 +73,7 @@ async fn display_pane_format(
             target: Some(Target::Pane(target)),
             print: true,
             message: Some(message.to_owned()),
+            empty_target_context: false,
         }))
         .await;
     let Response::DisplayMessage(response) = response else {
@@ -84,6 +85,21 @@ async fn display_pane_format(
     String::from_utf8_lossy(output.stdout())
         .trim_end()
         .to_owned()
+}
+
+async fn wait_for_pane_process(handler: &RequestHandler, target: PaneTarget) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let last = display_pane_format(handler, target.clone(), "#{pane_current_command}").await;
+        if !last.is_empty() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for pane process; last command={last:?}"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
 }
 
 async fn pipe_pane(
@@ -135,6 +151,7 @@ async fn pipe_pane_once_closes_existing_pipe_without_reopening() {
     let first_output = unique_temp_path("once-first");
     let second_output = unique_temp_path("once-second");
     create_session(&handler, "alpha").await;
+    wait_for_pane_process(&handler, target.clone()).await;
 
     pipe_pane(
         &handler,

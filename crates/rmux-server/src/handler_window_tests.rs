@@ -21,17 +21,84 @@ fn session_name(value: &str) -> SessionName {
 
 async fn create_session(handler: &RequestHandler, name: &str) {
     let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name(name),
+        .handle(Request::NewSessionExt(NewSessionExtRequest {
+            session_name: Some(session_name(name)),
+            working_directory: None,
             detached: true,
             size: Some(TerminalSize {
                 cols: 120,
                 rows: 40,
             }),
             environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(quiet_window_test_command()),
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
         }))
         .await;
     assert!(matches!(created, Response::NewSession(_)));
+}
+
+async fn create_grouped_session(handler: &RequestHandler, name: &str, group_target: &SessionName) {
+    let created = handler
+        .handle(Request::NewSessionExt(NewSessionExtRequest {
+            session_name: Some(session_name(name)),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize {
+                cols: 120,
+                rows: 40,
+            }),
+            environment: None,
+            group_target: Some(group_target.clone()),
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: None,
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+}
+
+#[cfg(unix)]
+fn quiet_window_test_command() -> Vec<String> {
+    ["/bin/sh", "-c", "sleep 60"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(windows)]
+fn quiet_window_test_command() -> Vec<String> {
+    let system_root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+    let cmd = std::path::PathBuf::from(system_root)
+        .join("System32")
+        .join("cmd.exe");
+    [
+        cmd.to_string_lossy().into_owned(),
+        "/d".to_owned(),
+        "/q".to_owned(),
+        "/c".to_owned(),
+        "ping -n 60 127.0.0.1 >NUL".to_owned(),
+    ]
+    .into_iter()
+    .collect()
 }
 
 async fn insert_window(handler: &RequestHandler, session_name: &SessionName, window_index: u32) {

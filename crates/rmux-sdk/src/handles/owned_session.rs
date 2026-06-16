@@ -245,9 +245,7 @@ impl OwnedSession {
         let transport = session.transport().clone();
         let target = session.name().clone();
         let installed = Arc::clone(&self.signal_handlers_installed);
-        Ok(signals::install_default_signal_handlers(
-            transport, target, installed,
-        ))
+        signals::install_default_signal_handlers(transport, target, installed)
     }
 
     /// Switches this owner to preserve mode after confirming lease release.

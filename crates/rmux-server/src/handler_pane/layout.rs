@@ -250,16 +250,27 @@ impl RequestHandler {
             PaneTarget::with_window(session_name.clone(), window_index, pane_index);
         let response = {
             let mut state = self.state.lock().await;
-            match state.mutate_session_and_resize_terminals(&session_name, |session| {
-                session.resize_pane_in_window(window_index, pane_index, adjustment)?;
+            match adjustment {
+                ResizePaneAdjustment::TrimBelow => {
+                    match state.trim_pane_below_cursor(&response_target) {
+                        Ok(()) => Response::ResizePane(ResizePaneResponse {
+                            target: response_target,
+                            adjustment,
+                        }),
+                        Err(error) => Response::Error(ErrorResponse { error }),
+                    }
+                }
+                _ => match state.mutate_session_and_resize_terminals(&session_name, |session| {
+                    session.resize_pane_in_window(window_index, pane_index, adjustment)?;
 
-                Ok(ResizePaneResponse {
-                    target: response_target,
-                    adjustment,
-                })
-            }) {
-                Ok(response) => Response::ResizePane(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+                    Ok(ResizePaneResponse {
+                        target: response_target,
+                        adjustment,
+                    })
+                }) {
+                    Ok(response) => Response::ResizePane(response),
+                    Err(error) => Response::Error(ErrorResponse { error }),
+                },
             }
         };
 

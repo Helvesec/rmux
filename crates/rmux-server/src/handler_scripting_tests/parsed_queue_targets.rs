@@ -78,6 +78,170 @@ async fn parsed_queue_uses_current_target_for_rename_window_session_and_last_win
 }
 
 #[tokio::test]
+async fn parsed_queue_select_window_navigation_flags_use_window_session() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha-select-flags");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::NewWindow(NewWindowRequest {
+                target: alpha.clone(),
+                name: Some("w1".to_owned()),
+                detached: true,
+                start_directory: None,
+                environment: None,
+                command: None,
+                process_command: None,
+                target_window_index: Some(1),
+                insert_at_target: false,
+            }))
+            .await,
+        Response::NewWindow(_)
+    ));
+
+    let current_pane = PaneTarget::with_window(alpha.clone(), 0, 0);
+    let context = TargetFindContext::from_target(Target::Pane(current_pane));
+    let state = handler.state.lock().await;
+    let cases = [
+        (
+            vec![
+                "-n".to_owned(),
+                "-t".to_owned(),
+                "alpha-select-flags:1".to_owned(),
+            ],
+            Request::NextWindow(NextWindowRequest {
+                target: alpha.clone(),
+                alerts_only: false,
+            }),
+        ),
+        (
+            vec![
+                "-p".to_owned(),
+                "-t".to_owned(),
+                "alpha-select-flags:1".to_owned(),
+            ],
+            Request::PreviousWindow(PreviousWindowRequest {
+                target: alpha.clone(),
+                alerts_only: false,
+            }),
+        ),
+        (
+            vec![
+                "-l".to_owned(),
+                "-t".to_owned(),
+                "alpha-select-flags:1".to_owned(),
+            ],
+            Request::LastWindow(LastWindowRequest {
+                target: alpha.clone(),
+            }),
+        ),
+        (
+            vec![
+                "-T".to_owned(),
+                "-t".to_owned(),
+                "alpha-select-flags:0".to_owned(),
+            ],
+            Request::LastWindow(LastWindowRequest {
+                target: alpha.clone(),
+            }),
+        ),
+        (
+            vec![
+                "-T".to_owned(),
+                "-t".to_owned(),
+                "alpha-select-flags:1".to_owned(),
+            ],
+            Request::SelectWindow(rmux_proto::SelectWindowRequest {
+                target: WindowTarget::with_window(alpha.clone(), 1),
+            }),
+        ),
+    ];
+
+    for (arguments, expected) in cases {
+        let parsed = crate::handler::scripting_support::parse_request_from_parts(
+            "select-window".to_owned(),
+            arguments,
+            None,
+            &state.sessions,
+            &state.options,
+            &context,
+        )
+        .expect("select-window navigation flag should parse");
+        assert_eq!(parsed, expected);
+    }
+}
+
+#[tokio::test]
+async fn parsed_queue_list_panes_resolves_bare_window_name_in_current_session() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::NewWindow(NewWindowRequest {
+                target: alpha.clone(),
+                name: Some("editor".to_owned()),
+                detached: true,
+                start_directory: None,
+                environment: None,
+                command: None,
+                process_command: None,
+                target_window_index: Some(1),
+                insert_at_target: false,
+            }))
+            .await,
+        Response::NewWindow(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(PaneTarget::with_window(alpha.clone(), 1, 0)),
+                direction: SplitDirection::Vertical,
+                environment: None,
+                before: false,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+
+    let command = CommandParser::new()
+        .parse("list-panes -t editor -F '#{pane_index}'")
+        .expect("list-panes command parses");
+    let output = handler
+        .execute_parsed_commands(
+            std::process::id(),
+            command,
+            QueueExecutionContext::without_caller_cwd().with_current_target(Some(Target::Pane(
+                PaneTarget::with_window(alpha.clone(), 1, 0),
+            ))),
+        )
+        .await
+        .expect("list-panes should resolve editor as a window name");
+
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "0\n1\n");
+}
+
+#[tokio::test]
 async fn parsed_queue_uses_current_target_for_more_default_targeted_commands() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -182,6 +346,7 @@ async fn parsed_queue_uses_current_target_for_more_default_targeted_commands() {
             arguments,
             None,
             &state.sessions,
+            &state.options,
             &context,
         )
         .unwrap_or_else(|error| panic!("{command} should use the current target: {error}"));
@@ -547,4 +712,63 @@ async fn marked_pane_prefers_original_linked_window_slot() {
         .expect("marked pane should resolve through the marked slot");
 
     assert_eq!(String::from_utf8_lossy(&output.stdout), "alpha:0.0\n");
+}
+
+#[tokio::test]
+async fn parsed_queue_display_message_canfail_target_uses_empty_context_without_current_target() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha,
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let command = CommandParser::new()
+        .parse("display-message -p -t nosuch '#{session_name}:#{window_index}.#{pane_index}'")
+        .expect("display-message command parses");
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), command)
+        .await
+        .expect("display-message should tolerate a missing canfail target");
+
+    assert_eq!(output.stdout(), b":.\n");
+}
+
+#[tokio::test]
+async fn parsed_queue_display_message_canfail_target_falls_back_to_queue_current_target() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let command = CommandParser::new()
+        .parse("display-message -p -t '{up-of}' '#{session_name}:#{window_index}.#{pane_index}'")
+        .expect("display-message command parses");
+    let output = handler
+        .execute_parsed_commands(
+            std::process::id(),
+            command,
+            QueueExecutionContext::without_caller_cwd()
+                .with_current_target(Some(Target::Pane(PaneTarget::with_window(alpha, 0, 0)))),
+        )
+        .await
+        .expect("display-message should fall back to queue current target");
+
+    assert_eq!(output.stdout(), b"alpha:0.0\n");
 }

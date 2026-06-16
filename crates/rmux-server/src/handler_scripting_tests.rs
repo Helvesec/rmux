@@ -11,14 +11,15 @@ use crate::hook_runtime::with_hook_execution;
 use rmux_core::command_parser::CommandParser;
 use rmux_core::TargetFindContext;
 use rmux_proto::{
-    BreakPaneRequest, CommandOutput, DisplayMessageRequest, IfShellRequest, KillWindowRequest,
-    LinkWindowRequest, NewSessionExtRequest, NewSessionRequest, NewWindowRequest, OptionName,
-    OptionScopeSelector, PaneTarget, Request, RespawnPaneRequest, RespawnWindowRequest, Response,
-    RotateWindowDirection, RotateWindowRequest, RunShellRequest, RunShellResponse, ScopeSelector,
-    SelectPaneRequest, SessionName, SetEnvironmentRequest, SetOptionMode, SetOptionRequest,
-    ShowBufferRequest, ShowOptionsRequest, SourceFileRequest, SplitDirection, SplitWindowRequest,
-    SplitWindowTarget, SwapPaneDirection, SwapPaneRequest, Target, TerminalSize, WaitForMode,
-    WaitForRequest, WaitForResponse, WindowTarget,
+    BreakPaneRequest, DisplayMessageRequest, IfShellRequest, KillWindowRequest, LastWindowRequest,
+    LinkWindowRequest, NewSessionExtRequest, NewSessionRequest, NewWindowRequest,
+    NextWindowRequest, OptionName, OptionScopeSelector, PaneTarget, PreviousWindowRequest, Request,
+    RespawnPaneRequest, RespawnWindowRequest, Response, RotateWindowDirection, RotateWindowRequest,
+    RunShellDelaySeconds, RunShellRequest, RunShellResponse, ScopeSelector, SelectPaneRequest,
+    SessionName, SetEnvironmentRequest, SetOptionMode, SetOptionRequest, ShowBufferRequest,
+    ShowOptionsRequest, SourceFileRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget,
+    SwapPaneDirection, SwapPaneRequest, Target, TerminalSize, WaitForMode, WaitForRequest,
+    WaitForResponse, WindowTarget,
 };
 
 fn session_name(value: &str) -> SessionName {
@@ -42,6 +43,7 @@ fn run_shell(command: &str, background: bool) -> Request {
         delay_seconds: None,
         start_directory: None,
         target: None,
+        source_depth: None,
     })
 }
 
@@ -94,6 +96,36 @@ fn command_quote(command: &str) -> String {
     crate::test_shell::command_quote(command)
 }
 
+async fn use_platform_test_shell(handler: &RequestHandler) {
+    #[cfg(not(windows))]
+    let _ = handler;
+
+    #[cfg(windows)]
+    {
+        let powershell = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .map(|root| {
+                root.join("System32")
+                    .join("WindowsPowerShell")
+                    .join("v1.0")
+                    .join("powershell.exe")
+            })
+            .unwrap_or_else(|| PathBuf::from("powershell.exe"));
+
+        assert!(matches!(
+            handler
+                .handle(Request::SetOption(SetOptionRequest {
+                    scope: ScopeSelector::Global,
+                    option: OptionName::DefaultShell,
+                    value: powershell.to_string_lossy().into_owned(),
+                    mode: SetOptionMode::Replace,
+                }))
+                .await,
+            Response::SetOption(_)
+        ));
+    }
+}
+
 #[cfg(unix)]
 fn shell_print_command(text: &str) -> String {
     format!("printf {}", command_quote(text))
@@ -101,10 +133,10 @@ fn shell_print_command(text: &str) -> String {
 
 #[cfg(windows)]
 fn shell_print_command(text: &str) -> String {
-    crate::test_shell::powershell_encoded_command(&format!(
+    format!(
         "[Console]::Out.Write({})",
         crate::test_shell::powershell_quote(text)
-    ))
+    )
 }
 
 #[cfg(unix)]
@@ -114,10 +146,10 @@ fn shell_print_then_exit_command(text: &str, code: u8) -> String {
 
 #[cfg(windows)]
 fn shell_print_then_exit_command(text: &str, code: u8) -> String {
-    crate::test_shell::powershell_encoded_command(&format!(
+    format!(
         "[Console]::Out.Write({}); exit {code}",
         crate::test_shell::powershell_quote(text)
-    ))
+    )
 }
 
 #[cfg(unix)]
@@ -128,20 +160,6 @@ fn shell_success_command() -> String {
 #[cfg(windows)]
 fn shell_success_command() -> String {
     crate::test_shell::powershell_encoded_command("exit 0")
-}
-
-#[cfg(unix)]
-fn shell_env_or_default_command(name: &str, default: &str) -> String {
-    format!("printf %s \"${{{name}-{default}}}\"")
-}
-
-#[cfg(windows)]
-fn shell_env_or_default_command(name: &str, default: &str) -> String {
-    crate::test_shell::powershell_encoded_command(&format!(
-        "$value=[Environment]::GetEnvironmentVariable({}); if ([string]::IsNullOrEmpty($value)) {{ $value={} }}; [Console]::Out.Write($value)",
-        crate::test_shell::powershell_quote(name),
-        crate::test_shell::powershell_quote(default)
-    ))
 }
 
 #[path = "handler_scripting_tests/run_shell.rs"]
@@ -167,6 +185,15 @@ mod parsed_queue_targets;
 
 #[path = "handler_scripting_tests/parsed_queue_windows_mouse.rs"]
 mod parsed_queue_windows_mouse;
+
+#[path = "handler_scripting_tests/parsed_queue_move_window_current.rs"]
+mod parsed_queue_move_window_current;
+
+#[path = "handler_scripting_tests/parsed_queue_select_zoom.rs"]
+mod parsed_queue_select_zoom;
+
+#[path = "handler_scripting_tests/parsed_queue_resize_trim.rs"]
+mod parsed_queue_resize_trim;
 
 #[path = "handler_scripting_tests/control_hooks_wait.rs"]
 mod control_hooks_wait;

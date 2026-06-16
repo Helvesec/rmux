@@ -16,19 +16,26 @@ impl HandlerState {
     pub(crate) fn last_pane(
         &mut self,
         target: WindowTarget,
+        preserve_zoom: bool,
+        input_disabled: Option<bool>,
     ) -> Result<LastPaneResponse, RmuxError> {
         let session = self
             .sessions
             .session_mut(target.session_name())
             .ok_or_else(|| session_not_found(target.session_name()))?;
-        let pane_index = session.last_pane_in_window(target.window_index())?;
+        let pane_index =
+            session.last_pane_in_window_with_zoom(target.window_index(), preserve_zoom)?;
+        let response_target = PaneTarget::with_window(
+            target.session_name().clone(),
+            target.window_index(),
+            pane_index,
+        );
+        if let Some(disabled) = input_disabled {
+            self.set_pane_input_disabled(&response_target, disabled)?;
+        }
 
         Ok(LastPaneResponse {
-            target: PaneTarget::with_window(
-                target.session_name().clone(),
-                target.window_index(),
-                pane_index,
-            ),
+            target: response_target,
         })
     }
 

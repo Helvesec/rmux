@@ -1,9 +1,12 @@
+use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use rmux_client::INTERNAL_DAEMON_FLAG;
@@ -23,6 +26,62 @@ pub(crate) struct CliHarness {
     socket_path: PathBuf,
     launcher_path: PathBuf,
     pid_path: PathBuf,
+}
+
+pub(crate) struct EmptySocketPathLock {
+    path: PathBuf,
+}
+
+impl Drop for EmptySocketPathLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(cli_command_lock_owner_path(&self.path));
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+pub(crate) fn acquire_empty_socket_path_lock() -> Result<EmptySocketPathLock, Box<dyn Error>> {
+    let path = empty_socket_path_lock_path();
+    let deadline = Instant::now() + Duration::from_secs(120);
+
+    loop {
+        match fs::create_dir(&path) {
+            Ok(()) => {
+                if let Err(error) = record_cli_command_lock_owner(&path) {
+                    if error.kind() == io::ErrorKind::NotFound {
+                        let _ = fs::remove_dir(&path);
+                        continue;
+                    }
+                    let _ = fs::remove_dir(&path);
+                    return Err(format!(
+                        "failed to record empty -S lock owner '{}': {error}",
+                        path.display()
+                    )
+                    .into());
+                }
+                return Ok(EmptySocketPathLock { path });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if clear_stale_cli_command_lock(&path)? {
+                    continue;
+                }
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "timed out waiting for empty -S lock '{}'",
+                        path.display()
+                    )
+                    .into());
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to acquire empty -S lock '{}': {error}",
+                    path.display()
+                )
+                .into());
+            }
+        }
+    }
 }
 
 impl CliHarness {
@@ -87,9 +146,11 @@ impl CliHarness {
         command.env("RMUX_TMPDIR", &self.tmpdir);
         command.env("HOME", self.tmpdir.join("home"));
         command.env("XDG_CONFIG_HOME", self.tmpdir.join("xdg"));
+        command.env("RMUX_DISABLE_TMUX_FALLBACK", "1");
         command.env(BINARY_OVERRIDE_TEST_OPT_IN_ENV, "1");
         command.env_remove(BINARY_OVERRIDE_ENV);
         command.env_remove("RMUX");
+        command.env_remove("TMUX");
         command
     }
 
@@ -173,16 +234,13 @@ impl Drop for CliCommandLock {
 }
 
 fn acquire_cli_command_lock() -> Result<CliCommandLock, Box<dyn Error>> {
-    let path = std::env::temp_dir().join("rmux-cli-command.lock");
+    let path = cli_command_lock_path();
     let deadline = Instant::now() + Duration::from_secs(120);
 
     loop {
         match fs::create_dir(&path) {
             Ok(()) => {
-                if let Err(error) = fs::write(
-                    cli_command_lock_owner_path(&path),
-                    std::process::id().to_string(),
-                ) {
+                if let Err(error) = record_cli_command_lock_owner(&path) {
                     if error.kind() == io::ErrorKind::NotFound {
                         let _ = fs::remove_dir(&path);
                         continue;
@@ -218,6 +276,39 @@ fn acquire_cli_command_lock() -> Result<CliCommandLock, Box<dyn Error>> {
             }
         }
     }
+}
+
+fn cli_command_lock_path() -> PathBuf {
+    let scope = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("rmux"));
+    let scope = scope.canonicalize().unwrap_or(scope);
+    let mut hasher = DefaultHasher::new();
+    scope.hash(&mut hasher);
+    std::env::temp_dir().join(format!("rmux-cli-command-{:016x}.lock", hasher.finish()))
+}
+
+fn empty_socket_path_lock_path() -> PathBuf {
+    let scope = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("rmux"));
+    let scope = scope.canonicalize().unwrap_or(scope);
+    let mut hasher = DefaultHasher::new();
+    scope.hash(&mut hasher);
+    std::env::temp_dir().join(format!("rmux-empty-socket-{:016x}.lock", hasher.finish()))
+}
+
+fn record_cli_command_lock_owner(path: &Path) -> io::Result<()> {
+    let owner_path = cli_command_lock_owner_path(path);
+    let owner = std::process::id().to_string();
+    let mut last_error = None;
+    for _ in 0..5 {
+        match fs::write(&owner_path, &owner) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Err(error),
+            Err(error) => {
+                last_error = Some(error);
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| io::Error::other("failed to write lock owner")))
 }
 
 fn cli_command_lock_owner_path(path: &Path) -> PathBuf {

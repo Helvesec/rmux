@@ -14,6 +14,14 @@ impl ScreenWriter for Screen {
         self.write_char(ch, cell, acs);
     }
 
+    fn collect_add_ascii_run(&mut self, bytes: &[u8], cell: &CellState, acs: bool) {
+        if !self.write_plain_ascii_run(bytes, cell, acs) {
+            for &byte in bytes {
+                self.write_char(char::from(byte), cell, acs);
+            }
+        }
+    }
+
     fn cursor_up(&mut self, n: u32) {
         self.clear_pending_wrap();
         self.cursor_y = self.cursor_y.saturating_sub(n);
@@ -63,6 +71,7 @@ impl ScreenWriter for Screen {
         if self.cursor_y < self.rupper || self.cursor_y > self.rlower {
             return;
         }
+        self.clear_selected_cells();
 
         let upper = self.cursor_y;
         let lower = self.rlower;
@@ -77,6 +86,7 @@ impl ScreenWriter for Screen {
         if self.cursor_y < self.rupper || self.cursor_y > self.rlower {
             return;
         }
+        self.clear_selected_cells();
 
         let upper = self.cursor_y;
         let lower = self.rlower;
@@ -88,6 +98,7 @@ impl ScreenWriter for Screen {
 
     fn scroll_up(&mut self, n: u32, bg: i32) {
         self.clear_pending_wrap();
+        self.clear_selected_cells();
         let lines = n
             .max(1)
             .min(self.rlower.saturating_sub(self.rupper).saturating_add(1));
@@ -99,6 +110,7 @@ impl ScreenWriter for Screen {
 
     fn scroll_down(&mut self, n: u32, bg: i32) {
         self.clear_pending_wrap();
+        self.clear_selected_cells();
         let lines = n
             .max(1)
             .min(self.rlower.saturating_sub(self.rupper).saturating_add(1));
@@ -116,6 +128,7 @@ impl ScreenWriter for Screen {
         }
 
         if self.cursor_y == self.rlower {
+            self.clear_selected_cells();
             self.grid
                 .scroll_region_up(self.rupper, self.rlower, bg, self.rupper == 0);
         } else if self.cursor_y < self.grid.sy().saturating_sub(1) {
@@ -126,6 +139,7 @@ impl ScreenWriter for Screen {
     fn reverse_index(&mut self, bg: i32) {
         self.clear_pending_wrap();
         if self.cursor_y == self.rupper {
+            self.clear_selected_cells();
             self.grid.scroll_region_down(self.rupper, self.rlower, bg);
         } else if self.cursor_y > 0 {
             self.cursor_y -= 1;
@@ -159,11 +173,13 @@ impl ScreenWriter for Screen {
 
     fn insert_character(&mut self, n: u32, bg: i32) {
         self.clear_pending_wrap();
+        self.clear_selected_cells();
         let x = self.cursor_column();
         let sx = self.grid.sx();
         let count = n.max(1).min(sx.saturating_sub(x));
         let blank = self.blank_cell(bg);
         if let Some(line) = self.current_line_mut() {
+            line.materialize_for_cell_mutation();
             let cells = line
                 .cells()
                 .iter()
@@ -190,11 +206,13 @@ impl ScreenWriter for Screen {
 
     fn delete_character(&mut self, n: u32, bg: i32) {
         self.clear_pending_wrap();
+        self.clear_selected_cells();
         let x = self.cursor_column();
         let sx = self.grid.sx();
         let count = n.max(1).min(sx.saturating_sub(x));
         let blank = self.blank_cell(bg);
         if let Some(line) = self.current_line_mut() {
+            line.materialize_for_cell_mutation();
             let cells = line.cells().to_vec();
             for index in x..sx {
                 if let Some(target) = line.cell_mut(index) {
@@ -219,6 +237,11 @@ impl ScreenWriter for Screen {
     }
 
     fn clear_end_of_screen(&mut self, bg: i32) {
+        if self.cursor_y == 0 && self.cursor_column() == 0 {
+            self.clear_selected_cells();
+            self.grid.clear_visible_to_history(bg);
+            return;
+        }
         let x = self.cursor_column();
         if self.cursor_y < self.grid.sy() {
             self.clear_line_range(self.cursor_y, x, self.grid.sx().saturating_sub(1), bg);
@@ -236,10 +259,12 @@ impl ScreenWriter for Screen {
     }
 
     fn clear_screen(&mut self, bg: i32) {
-        self.grid.clear_visible(bg);
+        self.clear_selected_cells();
+        self.grid.clear_visible_to_history(bg);
     }
 
     fn clear_history(&mut self) {
+        self.clear_selected_cells();
         self.grid.clear_history();
     }
 
@@ -286,9 +311,13 @@ impl ScreenWriter for Screen {
     }
 
     fn alternate_on(&mut self, bg: i32, save_cursor: bool) {
+        if !self.alternate_screen_enabled {
+            return;
+        }
         if self.is_alternate() {
             return;
         }
+        self.clear_selected_cells();
 
         let mut saved_grid = Grid::new(self.grid.size(), 0);
         saved_grid.replace_visible(self.grid.visible_lines());
@@ -307,11 +336,14 @@ impl ScreenWriter for Screen {
         self.grid.clear_visible(bg);
         self.grid.set_history_enabled(false);
         self.pending_wrap = false;
-        self.cursor_x = 0;
-        self.cursor_y = 0;
+        if !save_cursor || !self.preserve_alternate_screen_cursor {
+            self.cursor_x = 0;
+            self.cursor_y = 0;
+        }
     }
 
     fn alternate_off(&mut self, _bg: i32, restore_cursor: bool) {
+        self.clear_selected_cells();
         let saved_cursor = if restore_cursor {
             self.saved_cursor_x
                 .zip(self.saved_cursor_y)
@@ -412,6 +444,7 @@ impl ScreenWriter for Screen {
     }
 
     fn alignment_test(&mut self) {
+        self.clear_selected_cells();
         self.rupper = 0;
         self.rlower = self.grid.sy().saturating_sub(1);
         let sx = self.grid.sx();
@@ -434,6 +467,7 @@ impl ScreenWriter for Screen {
     }
 
     fn full_reset(&mut self) {
+        self.clear_selected_cells();
         if self.is_alternate() {
             self.alternate_off(COLOUR_DEFAULT, false);
         }
@@ -487,6 +521,14 @@ impl ScreenWriter for Screen {
         ));
     }
 
+    fn dcs_passthrough(&mut self, data: &[u8]) {
+        self.push_terminal_passthrough(TerminalPassthrough::raw(
+            self.cursor_x,
+            self.cursor_y,
+            data.to_vec(),
+        ));
+    }
+
     fn sixel_passthrough(&mut self, data: &[u8]) {
         self.push_terminal_passthrough(TerminalPassthrough::sixel(
             self.cursor_x,
@@ -530,7 +572,16 @@ impl ScreenWriter for Screen {
     fn osc_fg_colour(&mut self, _data: &str, _end: InputEndType) {}
     fn osc_bg_colour(&mut self, _data: &str, _end: InputEndType) {}
     fn osc_cursor_colour(&mut self, _data: &str, _end: InputEndType) {}
-    fn osc_clipboard(&mut self, _data: &str, _end: InputEndType) {}
+    fn osc_clipboard(&mut self, data: &str, end: InputEndType) {
+        let mut sequence = Vec::with_capacity(data.len() + 7);
+        sequence.extend_from_slice(b"\x1b]52;");
+        sequence.extend_from_slice(data.as_bytes());
+        match end {
+            InputEndType::Bel => sequence.push(b'\x07'),
+            InputEndType::St => sequence.extend_from_slice(b"\x1b\\"),
+        }
+        self.push_terminal_passthrough(TerminalPassthrough::clipboard(sequence));
+    }
     fn osc_reset_palette(&mut self, _data: &str) {}
     fn osc_reset_fg(&mut self) {}
     fn osc_reset_bg(&mut self) {}

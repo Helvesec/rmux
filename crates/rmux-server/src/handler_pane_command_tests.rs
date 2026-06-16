@@ -212,6 +212,7 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
             command: Some(vec![initial_command.clone()]),
             process_command: None,
             client_environment: None,
+            skip_environment_update: false,
         }))
         .await;
     assert!(matches!(created, rmux_proto::Response::NewSession(_)));
@@ -267,6 +268,8 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
             detached: false,
             size: None,
             preserve_zoom: false,
+            full_size: false,
+            stdin_payload: None,
         }))
         .await;
     let split_target = match split {
@@ -475,6 +478,8 @@ async fn split_window_ext_applies_start_directory_to_spawned_process() {
             detached: false,
             size: None,
             preserve_zoom: false,
+            full_size: false,
+            stdin_payload: None,
         }))
         .await;
     let _split_target = match response {
@@ -487,6 +492,52 @@ async fn split_window_ext_applies_start_directory_to_spawned_process() {
 
     let _ = fs::remove_file(output);
     let _ = fs::remove_dir_all(cwd);
+}
+
+#[tokio::test]
+async fn detached_split_with_zoom_keeps_original_pane_zoomed() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha-detached-split-zoom");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        rmux_proto::Response::NewSession(_)
+    ));
+
+    let response = handler
+        .handle(Request::SplitWindowExt(SplitWindowExtRequest {
+            target: SplitWindowTarget::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
+            direction: SplitDirection::Vertical,
+            before: false,
+            environment: None,
+            command: None,
+            process_command: None,
+            start_directory: None,
+            keep_alive_on_exit: None,
+            detached: true,
+            size: None,
+            preserve_zoom: true,
+            full_size: false,
+            stdin_payload: None,
+        }))
+        .await;
+    let new_pane = match response {
+        rmux_proto::Response::SplitWindow(response) => response.pane,
+        other => panic!("expected split-window success, got {other:?}"),
+    };
+
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("session exists");
+    let window = session.window_at(0).expect("window exists");
+    assert!(window.is_zoomed());
+    assert_eq!(window.active_pane_index(), 0);
+    assert_eq!(new_pane.pane_index(), 1);
 }
 
 #[tokio::test]
@@ -511,6 +562,8 @@ async fn split_window_rolls_back_session_when_spawn_fails() {
             detached: false,
             size: None,
             preserve_zoom: false,
+            full_size: false,
+            stdin_payload: None,
         }))
         .await;
 
@@ -546,6 +599,7 @@ async fn pane_output_sequence_advances_when_transcript_changes() {
             command: Some(vec![pipe_discard_command()]),
             process_command: None,
             client_environment: None,
+            skip_environment_update: false,
         }))
         .await;
     assert!(matches!(created, rmux_proto::Response::NewSession(_)));
@@ -976,6 +1030,9 @@ async fn display_panes_uses_the_default_select_pane_template() {
             .handle(Request::SelectPane(SelectPaneRequest {
                 target: PaneTarget::with_window(alpha.clone(), 0, 0),
                 title: None,
+                style: None,
+                input_disabled: None,
+                preserve_zoom: false,
             }))
             .await,
         rmux_proto::Response::SelectPane(_)
@@ -1035,6 +1092,9 @@ async fn display_panes_default_template_runs_select_pane_hooks() {
             .handle(Request::SelectPane(SelectPaneRequest {
                 target: PaneTarget::with_window(alpha.clone(), 0, 0),
                 title: None,
+                style: None,
+                input_disabled: None,
+                preserve_zoom: false,
             }))
             .await,
         rmux_proto::Response::SelectPane(_)
@@ -1114,6 +1174,9 @@ async fn display_panes_without_a_command_keeps_the_active_pane() {
             .handle(Request::SelectPane(SelectPaneRequest {
                 target: PaneTarget::with_window(alpha.clone(), 0, 0),
                 title: None,
+                style: None,
+                input_disabled: None,
+                preserve_zoom: false,
             }))
             .await,
         rmux_proto::Response::SelectPane(_)
@@ -1694,6 +1757,7 @@ async fn pane_snapshot_returns_live_screen_built_via_terminal_parser() {
             command: Some(vec![pipe_discard_command()]),
             process_command: None,
             client_environment: None,
+            skip_environment_update: false,
         }))
         .await;
     assert!(matches!(created, rmux_proto::Response::NewSession(_)));
@@ -1824,6 +1888,7 @@ async fn pane_snapshot_folds_invalid_utf8_through_parser_not_raw_bytes() {
             command: Some(vec![pipe_discard_command()]),
             process_command: None,
             client_environment: None,
+            skip_environment_update: false,
         }))
         .await;
     assert!(matches!(created, rmux_proto::Response::NewSession(_)));
@@ -1910,6 +1975,7 @@ async fn pane_snapshot_revision_changes_after_clear_history() {
             command: Some(vec![pipe_discard_command()]),
             process_command: None,
             client_environment: None,
+            skip_environment_update: false,
         }))
         .await;
     assert!(matches!(created, rmux_proto::Response::NewSession(_)));

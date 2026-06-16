@@ -310,7 +310,7 @@ fn assert_cleanup_kill_result(output: &Output) {
             let stderr_text = stderr(output);
             assert!(
                 stderr_text.contains("no server running on ")
-                    || stderr_text.contains("session not found: workflow"),
+                    || stderr_text.contains("can't find session: workflow"),
                 "cleanup kill should report an absent server or a missing session, got: {stderr_text}",
             );
         }
@@ -330,7 +330,7 @@ fn assert_missing_kill(output: &Output, session_name: &str) {
         "missing kill should not produce stdout"
     );
     assert!(
-        stderr(output).contains(&format!("session not found: {session_name}")),
+        stderr(output).contains(&format!("can't find session: {session_name}")),
         "missing kill should report the missing session, got: {}",
         stderr(output)
     );

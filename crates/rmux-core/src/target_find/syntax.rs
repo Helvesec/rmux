@@ -30,7 +30,13 @@ impl<'a> TargetParts<'a> {
         } else if raw.starts_with('$') {
             session = Some(raw);
         } else if raw.starts_with('@') {
-            window = Some(raw);
+            if let Some((window_part, pane_part)) = raw.split_once('.') {
+                window = Some(window_part);
+                pane = Some(pane_part);
+                pane_only = true;
+            } else {
+                window = Some(raw);
+            }
         } else if raw.starts_with('%') {
             pane = Some(raw);
         } else {

@@ -15,9 +15,13 @@ const KEY_DISPATCHED_TAG: u8 = 9;
 const LOCK_SHELL_COMMAND_TAG: u8 = 10;
 const DETACH_EXEC_SHELL_COMMAND_TAG: u8 = 11;
 const RESIZE_GEOMETRY_TAG: u8 = 12;
+const RENDER_TAG: u8 = 13;
 const DATA_HEADER_LEN: usize = 5;
 const RESIZE_FRAME_LEN: usize = 5;
 const SINGLE_TAG_FRAME_LEN: usize = 1;
+
+/// Encoded byte length of a raw-data attach frame header.
+pub const ATTACH_DATA_HEADER_LEN: usize = DATA_HEADER_LEN;
 
 /// Typed attach-stream input captured from an attached client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +125,8 @@ impl AttachShellCommand {
 pub enum AttachMessage {
     /// Raw pane I/O bytes.
     Data(Vec<u8>),
+    /// Rendered terminal frame bytes that supersede older render frames.
+    Render(Vec<u8>),
     /// Typed key input from an attached client.
     Keystroke(AttachedKeystroke),
     /// Structured acknowledgement for a typed key input message.
@@ -151,6 +157,7 @@ pub enum AttachMessage {
 pub fn encode_attach_message(message: &AttachMessage) -> Result<Vec<u8>, RmuxError> {
     match message {
         AttachMessage::Data(bytes) => encode_data_message(bytes),
+        AttachMessage::Render(bytes) => encode_data_like_message(RENDER_TAG, bytes),
         AttachMessage::Keystroke(keystroke) => encode_structured_message(KEYSTROKE_TAG, keystroke),
         AttachMessage::KeyDispatched(response) => {
             encode_structured_message(KEY_DISPATCHED_TAG, response)
@@ -173,6 +180,83 @@ pub fn encode_attach_message(message: &AttachMessage) -> Result<Vec<u8>, RmuxErr
             encode_structured_message(DETACH_EXEC_SHELL_COMMAND_TAG, command)
         }
     }
+}
+
+/// Encodes raw attach data bytes without first materializing an [`AttachMessage`].
+pub fn encode_attach_data(bytes: &[u8]) -> Result<Vec<u8>, RmuxError> {
+    encode_data_message(bytes)
+}
+
+/// Encodes raw attach data bytes into a caller-provided buffer.
+///
+/// Returns the number of initialized bytes in `frame`. This avoids a heap
+/// allocation for small hot-path attach data frames.
+pub fn encode_attach_data_into_slice(bytes: &[u8], frame: &mut [u8]) -> Result<usize, RmuxError> {
+    encode_data_like_message_into_slice(DATA_TAG, bytes, frame)
+}
+
+/// A borrowed raw-data attach frame decoded from an input buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachDataFrame<'a> {
+    payload: &'a [u8],
+    frame_len: usize,
+}
+
+impl<'a> AttachDataFrame<'a> {
+    /// Returns the raw pane bytes carried by this data frame.
+    #[must_use]
+    pub const fn payload(self) -> &'a [u8] {
+        self.payload
+    }
+
+    /// Returns the total encoded frame length, including tag and length header.
+    #[must_use]
+    pub const fn frame_len(self) -> usize {
+        self.frame_len
+    }
+}
+
+/// Attempts to decode a complete raw-data frame without allocating.
+///
+/// Returns `Ok(None)` when the buffer is empty, starts with another attach
+/// message type, or does not yet contain the full data payload.
+pub fn decode_attach_data_frame(input: &[u8]) -> Result<Option<AttachDataFrame<'_>>, RmuxError> {
+    decode_attach_data_frame_with_limit(input, DEFAULT_MAX_FRAME_LENGTH)
+}
+
+/// Attempts to decode a complete raw-data frame with an explicit payload limit.
+pub fn decode_attach_data_frame_with_limit(
+    input: &[u8],
+    max_data_length: usize,
+) -> Result<Option<AttachDataFrame<'_>>, RmuxError> {
+    if input.first().copied() != Some(DATA_TAG) {
+        return Ok(None);
+    }
+    if input.len() < DATA_HEADER_LEN {
+        return Ok(None);
+    }
+
+    let length = u32::from_le_bytes(
+        input[1..DATA_HEADER_LEN]
+            .try_into()
+            .map_err(|_| RmuxError::Decode("invalid attach data header".to_owned()))?,
+    ) as usize;
+    if length > max_data_length {
+        return Err(RmuxError::FrameTooLarge {
+            length,
+            maximum: max_data_length,
+        });
+    }
+
+    let frame_len = DATA_HEADER_LEN + length;
+    if input.len() < frame_len {
+        return Ok(None);
+    }
+
+    Ok(Some(AttachDataFrame {
+        payload: &input[DATA_HEADER_LEN..frame_len],
+        frame_len,
+    }))
 }
 
 /// Incremental decoder for attach-stream messages.
@@ -203,6 +287,12 @@ impl AttachFrameDecoder {
         self.buffer.extend_from_slice(bytes);
     }
 
+    /// Returns whether the decoder has no buffered partial frame.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
     /// Attempts to decode the next full attach-stream message.
     pub fn next_message(&mut self) -> Result<Option<AttachMessage>, RmuxError> {
         let Some(&tag) = self.buffer.first() else {
@@ -222,6 +312,7 @@ impl AttachFrameDecoder {
             LOCK_SHELL_COMMAND_TAG => self.next_lock_shell_command_message(),
             DETACH_EXEC_SHELL_COMMAND_TAG => self.next_detach_exec_shell_command_message(),
             RESIZE_GEOMETRY_TAG => self.next_resize_geometry_message(),
+            RENDER_TAG => self.next_render_message(),
             other => {
                 self.buffer.clear();
                 Err(RmuxError::Decode(format!(
@@ -229,6 +320,46 @@ impl AttachFrameDecoder {
                 )))
             }
         }
+    }
+
+    /// Decodes the next raw-data message into `scratch` without allocating.
+    ///
+    /// Returns `Ok(None)` when the decoder is empty, the next message is not
+    /// raw data, the frame is incomplete, or the payload is larger than
+    /// `scratch`. In those cases the buffered bytes are left untouched so the
+    /// caller can fall back to [`Self::next_message`].
+    pub fn next_data_payload_into<'a>(
+        &mut self,
+        scratch: &'a mut [u8],
+    ) -> Result<Option<&'a [u8]>, RmuxError> {
+        let Some(&DATA_TAG) = self.buffer.first() else {
+            return Ok(None);
+        };
+        if self.buffer.len() < DATA_HEADER_LEN {
+            return Ok(None);
+        }
+
+        let length = u32::from_le_bytes(
+            self.buffer[1..DATA_HEADER_LEN]
+                .try_into()
+                .map_err(|_| RmuxError::Decode("invalid attach data header".to_owned()))?,
+        ) as usize;
+        if length > self.max_data_length {
+            self.buffer.clear();
+            return Err(RmuxError::FrameTooLarge {
+                length,
+                maximum: self.max_data_length,
+            });
+        }
+
+        let required = DATA_HEADER_LEN + length;
+        if self.buffer.len() < required || length > scratch.len() {
+            return Ok(None);
+        }
+
+        scratch[..length].copy_from_slice(&self.buffer[DATA_HEADER_LEN..required]);
+        self.buffer.drain(..required);
+        Ok(Some(&scratch[..length]))
     }
 
     fn next_data_message(&mut self) -> Result<Option<AttachMessage>, RmuxError> {
@@ -255,8 +386,9 @@ impl AttachFrameDecoder {
             return Ok(None);
         }
 
-        let frame: Vec<u8> = self.buffer.drain(..required).collect();
-        Ok(Some(AttachMessage::Data(frame[DATA_HEADER_LEN..].to_vec())))
+        self.buffer.drain(..DATA_HEADER_LEN);
+        let bytes = self.buffer.drain(..length).collect();
+        Ok(Some(AttachMessage::Data(bytes)))
     }
 
     fn next_resize_message(&mut self) -> Result<Option<AttachMessage>, RmuxError> {
@@ -277,6 +409,11 @@ impl AttachFrameDecoder {
         );
 
         Ok(Some(AttachMessage::Resize(TerminalSize { cols, rows })))
+    }
+
+    fn next_render_message(&mut self) -> Result<Option<AttachMessage>, RmuxError> {
+        self.next_data_like_message(RENDER_TAG)
+            .map(|message| message.map(AttachMessage::Render))
     }
 
     fn next_resize_geometry_message(&mut self) -> Result<Option<AttachMessage>, RmuxError> {
@@ -401,14 +538,14 @@ impl AttachFrameDecoder {
             return Ok(None);
         }
 
-        let frame: Vec<u8> = self.buffer.drain(..required).collect();
-        if frame[0] != tag {
+        if self.buffer[0] != tag {
             self.buffer.clear();
             return Err(RmuxError::Decode(
                 "invalid attach data-like frame".to_owned(),
             ));
         }
-        Ok(Some(frame[DATA_HEADER_LEN..].to_vec()))
+        self.buffer.drain(..DATA_HEADER_LEN);
+        Ok(Some(self.buffer.drain(..length).collect()))
     }
 }
 
@@ -423,13 +560,7 @@ fn encode_data_message(bytes: &[u8]) -> Result<Vec<u8>, RmuxError> {
 }
 
 fn encode_data_like_message(tag: u8, bytes: &[u8]) -> Result<Vec<u8>, RmuxError> {
-    if bytes.len() > DEFAULT_MAX_FRAME_LENGTH {
-        return Err(RmuxError::FrameTooLarge {
-            length: bytes.len(),
-            maximum: DEFAULT_MAX_FRAME_LENGTH,
-        });
-    }
-
+    validate_data_like_payload(bytes)?;
     let length = u32::try_from(bytes.len()).map_err(|_| RmuxError::FrameTooLarge {
         length: bytes.len(),
         maximum: u32::MAX as usize,
@@ -440,6 +571,40 @@ fn encode_data_like_message(tag: u8, bytes: &[u8]) -> Result<Vec<u8>, RmuxError>
     frame.extend_from_slice(&length.to_le_bytes());
     frame.extend_from_slice(bytes);
     Ok(frame)
+}
+
+fn encode_data_like_message_into_slice(
+    tag: u8,
+    bytes: &[u8],
+    frame: &mut [u8],
+) -> Result<usize, RmuxError> {
+    validate_data_like_payload(bytes)?;
+    let frame_len = DATA_HEADER_LEN + bytes.len();
+    if frame.len() < frame_len {
+        return Err(RmuxError::Encode(format!(
+            "attach frame buffer too small: need {frame_len}, have {}",
+            frame.len()
+        )));
+    }
+
+    let length = u32::try_from(bytes.len()).map_err(|_| RmuxError::FrameTooLarge {
+        length: bytes.len(),
+        maximum: u32::MAX as usize,
+    })?;
+    frame[0] = tag;
+    frame[1..DATA_HEADER_LEN].copy_from_slice(&length.to_le_bytes());
+    frame[DATA_HEADER_LEN..frame_len].copy_from_slice(bytes);
+    Ok(frame_len)
+}
+
+fn validate_data_like_payload(bytes: &[u8]) -> Result<(), RmuxError> {
+    if bytes.len() > DEFAULT_MAX_FRAME_LENGTH {
+        return Err(RmuxError::FrameTooLarge {
+            length: bytes.len(),
+            maximum: DEFAULT_MAX_FRAME_LENGTH,
+        });
+    }
+    Ok(())
 }
 
 fn encode_structured_message<T>(tag: u8, message: &T) -> Result<Vec<u8>, RmuxError>

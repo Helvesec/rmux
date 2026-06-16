@@ -436,6 +436,8 @@ async fn window_move_swap_and_rotate_requests_round_trip_through_the_socket(
             renumber: false,
             kill_destination: false,
             detached: true,
+            after: false,
+            before: false,
         }))
         .await?;
     assert_eq!(

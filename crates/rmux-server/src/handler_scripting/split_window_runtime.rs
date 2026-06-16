@@ -54,6 +54,7 @@ impl RequestHandler {
                     target: Some(Target::Pane(pane)),
                     print: true,
                     message: Some(command.format),
+                    empty_target_context: false,
                 },
             )
             .await;

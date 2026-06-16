@@ -18,6 +18,13 @@ use super::{
 use crate::cli_args::{BindKeyArgs, ListKeysArgs, SendKeysArgs, SendPrefixArgs, UnbindKeyArgs};
 
 pub(super) fn run_send_keys(args: SendKeysArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
+    if args.unsupported_prefix {
+        return Err(ExitFailure::new(1, "command send-keys: unknown flag -p"));
+    }
+    if args.repeat_count == Some(0) {
+        return Err(ExitFailure::new(1, "repeat count too small"));
+    }
+
     if send_keys_uses_legacy_path(&args) {
         let target = args
             .target
@@ -78,6 +85,7 @@ fn send_keys_uses_legacy_path(args: &SendKeysArgs) -> bool {
         && !args.key_table
         && !args.mouse
         && args.repeat_count.is_none()
+        && !args.unsupported_prefix
         && !args.reset_terminal
         && !args.copy_mode
 }
@@ -145,6 +153,14 @@ fn run_default_list_keys(request: ListKeysRequest) -> Result<i32, ExitFailure> {
         None => None,
     };
     let store = KeyBindingStore::default();
+    if let Some(table_name) = request.table_name.as_deref() {
+        if store.table(table_name).is_none() {
+            return Err(ExitFailure::new(
+                1,
+                format!("table {table_name} doesn't exist"),
+            ));
+        }
+    }
     let mut bindings = list_default_key_bindings(&store, &request, sort_order);
     if let Some(filter_key) = filter_key {
         bindings.retain(|binding| key_code_lookup_bits(binding.binding().key()) == filter_key);
@@ -156,12 +172,14 @@ fn run_default_list_keys(request: ListKeysRequest) -> Result<i32, ExitFailure> {
     if request.notes && !request.include_unnoted {
         bindings.retain(|binding| binding.binding().note().is_some());
     }
+    let render_metrics = ListKeysRenderMetrics::from_bindings(&bindings);
+    let notes_key_width = list_keys_notes_key_width(&bindings);
     if request.first_only {
         bindings.truncate(1);
     }
 
-    let render_metrics = ListKeysRenderMetrics::from_bindings(&bindings);
-    let output = render_default_list_keys_output(&bindings, &request, render_metrics);
+    let output =
+        render_default_list_keys_output(&bindings, &request, render_metrics, notes_key_width);
     write_command_output(&output)?;
     Ok(0)
 }
@@ -186,11 +204,22 @@ fn render_default_list_keys_output(
     bindings: &[KeyBindingDisplay],
     request: &ListKeysRequest,
     render_metrics: ListKeysRenderMetrics,
+    notes_key_width: usize,
 ) -> CommandOutput {
     let template = request.format.as_deref().unwrap_or(LIST_KEYS_TEMPLATE);
+    let note_prefix_width = note_prefix_width(request);
     let lines = bindings
         .iter()
         .map(|binding| {
+            if request.format.is_none() && request.notes {
+                return render_notes_binding_line(
+                    binding,
+                    request,
+                    "C-b",
+                    note_prefix_width,
+                    notes_key_width,
+                );
+            }
             if request.format.is_none() && request.key.is_some() && !request.notes {
                 return render_default_key_filtered_binding_line(binding, render_metrics);
             }
@@ -202,7 +231,10 @@ fn render_default_list_keys_output(
             let context = FormatContext::new()
                 .with_named_value("key_repeat", bool_format(binding.binding().repeat()))
                 .with_named_value("key_note", binding.binding().note().unwrap_or_default())
-                .with_named_value("key_prefix", request.prefix.clone().unwrap_or_default())
+                .with_named_value(
+                    "key_prefix",
+                    note_prefix(binding.table_name(), request, "C-b", note_prefix_width),
+                )
                 .with_named_value("key_table", binding.table_name())
                 .with_named_value("key_string", binding.key_string())
                 .with_named_value("key_command", binding.command_string())
@@ -220,6 +252,43 @@ fn render_default_list_keys_output(
         })
         .collect::<Vec<_>>();
     command_output_from_lines(&lines)
+}
+
+fn render_notes_binding_line(
+    binding: &KeyBindingDisplay,
+    request: &ListKeysRequest,
+    effective_prefix: &str,
+    note_prefix_width: usize,
+    key_width: usize,
+) -> String {
+    let prefix = note_prefix(
+        binding.table_name(),
+        request,
+        effective_prefix,
+        note_prefix_width,
+    );
+    let key = list_keys_note_key(binding.key_string());
+    format!(
+        "{prefix}{key:<key_width$} {note}",
+        note = binding.binding().note().unwrap_or_default()
+    )
+}
+
+fn list_keys_notes_key_width(bindings: &[KeyBindingDisplay]) -> usize {
+    bindings
+        .iter()
+        .map(|binding| list_keys_note_key(binding.key_string()).len())
+        .max()
+        .unwrap_or(0)
+}
+
+fn list_keys_note_key(key: &str) -> &str {
+    key.strip_prefix('\\')
+        .or_else(|| {
+            key.strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+        })
+        .unwrap_or(key)
 }
 
 fn render_default_key_filtered_binding_line(
@@ -272,6 +341,30 @@ fn bool_format(value: bool) -> &'static str {
     } else {
         "0"
     }
+}
+
+fn note_prefix_width(request: &ListKeysRequest) -> usize {
+    request.prefix.as_deref().map_or("C-b".len() + 1, str::len)
+}
+
+fn note_prefix(
+    table_name: &str,
+    request: &ListKeysRequest,
+    effective_prefix: &str,
+    width: usize,
+) -> String {
+    if !request.notes {
+        return request.prefix.clone().unwrap_or_default();
+    }
+
+    if table_name != "prefix" {
+        return " ".repeat(width);
+    }
+
+    request
+        .prefix
+        .clone()
+        .unwrap_or_else(|| format!("{effective_prefix} "))
 }
 
 pub(super) fn run_send_prefix(

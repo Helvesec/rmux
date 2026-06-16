@@ -45,7 +45,7 @@ pub(super) async fn execute_attached_binding_commands(
         }
 
         let handler = handler.clone();
-        spawn_background_async("rmux-attached-prompt", move || async move {
+        let _ = spawn_background_async("rmux-attached-prompt", move || async move {
             let _ = handler
                 .execute_parsed_commands(requester_pid, commands, context)
                 .await;

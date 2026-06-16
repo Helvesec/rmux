@@ -1,3 +1,4 @@
+use super::attach_support::AttachRegistration;
 use super::RequestHandler;
 use crate::input_keys::MouseForwardEvent;
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
@@ -6,8 +7,8 @@ use crate::pane_io::AttachControl;
 use crate::server_access::current_owner_uid;
 use rmux_core::{input::InputParser, Screen};
 use rmux_proto::request::{
-    AttachSessionExt2Request, AttachSessionExtRequest, NewSessionExtRequest, SplitWindowExtRequest,
-    SwitchClientExt2Request,
+    AttachSessionExt2Request, AttachSessionExt3Request, AttachSessionExtRequest,
+    NewSessionExtRequest, SplitWindowExtRequest, SwitchClientExt2Request,
 };
 use rmux_proto::{
     AttachSessionResponse, AttachedKeystroke, CapturePaneRequest, CopyModeRequest,
@@ -16,11 +17,14 @@ use rmux_proto::{
     PaneTarget, RenameSessionRequest, Request, ResizePaneAdjustment, Response, RmuxError,
     ScopeSelector, SelectLayoutRequest, SelectLayoutTarget, SelectPaneRequest, SendKeysRequest,
     SessionName, SetOptionMode, SetOptionRequest, SplitWindowRequest, SplitWindowTarget,
-    SwitchClientRequest, TerminalSize, WindowTarget, DEFAULT_MAX_FRAME_LENGTH,
+    SwitchClientRequest, TerminalSize, WindowTarget, CAPABILITY_ATTACH_RENDER,
+    DEFAULT_MAX_FRAME_LENGTH,
 };
 #[cfg(unix)]
 use rmux_pty::{ChildCommand, TerminalSize as PtyTerminalSize};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -115,6 +119,8 @@ fn take_render_frame(control: AttachControl) -> String {
         AttachControl::Exited => panic!("expected a switch refresh"),
         AttachControl::DetachKill => panic!("expected a switch refresh"),
         AttachControl::DetachExecShellCommand(_) => panic!("expected a switch refresh"),
+        AttachControl::InteractiveInput => panic!("expected a switch refresh"),
+        AttachControl::Refresh => panic!("expected a switch refresh"),
         AttachControl::Overlay(_) => panic!("expected a switch refresh"),
         AttachControl::Write(_) => panic!("expected a switch refresh"),
         AttachControl::LockShellCommand(_) => panic!("expected a switch refresh"),
@@ -156,7 +162,109 @@ async fn create_attached_session(
     control_rx
 }
 
-#[cfg(windows)]
+#[tokio::test]
+async fn web_render_refreshes_are_marked_pending_before_building_switches() {
+    let handler = RequestHandler::new();
+    let session = session_name("web-refresh-coalesce");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let uid = current_owner_uid();
+    handler
+        .register_attach_with_access(
+            77,
+            session.clone(),
+            AttachRegistration {
+                control_tx,
+                control_backlog: Arc::new(AtomicUsize::new(0)),
+                closing: Arc::new(AtomicBool::new(false)),
+                persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
+                terminal_context: OuterTerminalContext::default(),
+                flags: super::attach_support::ClientFlags::default(),
+                render_stream: true,
+                uid,
+                user: rmux_os::identity::UserIdentity::Uid(uid),
+                can_write: true,
+                client_size: Some(TerminalSize { cols: 80, rows: 24 }),
+            },
+        )
+        .await;
+
+    handler.refresh_attached_session(&session).await;
+    handler.refresh_attached_session(&session).await;
+
+    assert!(matches!(control_rx.try_recv(), Ok(AttachControl::Refresh)));
+    assert!(matches!(control_rx.try_recv(), Err(TryRecvError::Empty)));
+    let active_attach = handler.active_attach.lock().await;
+    let active = active_attach.by_pid.get(&77).expect("attach is active");
+    assert!(active.render_refresh_pending);
+}
+
+#[tokio::test]
+async fn refresh_attached_session_removes_clients_over_backlog_limit() {
+    let handler = RequestHandler::new();
+    let session = session_name("refresh-backlog");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let control_backlog = Arc::new(AtomicUsize::new(
+        super::attach_support::ATTACH_CONTROL_BACKLOG_LIMIT,
+    ));
+    let closing = Arc::new(AtomicBool::new(false));
+    let uid = current_owner_uid();
+    handler
+        .register_attach_with_access(
+            77,
+            session.clone(),
+            AttachRegistration {
+                control_tx,
+                control_backlog: control_backlog.clone(),
+                closing: closing.clone(),
+                persistent_overlay_epoch: Arc::new(AtomicU64::new(0)),
+                terminal_context: OuterTerminalContext::default(),
+                flags: super::attach_support::ClientFlags::default(),
+                render_stream: false,
+                uid,
+                user: rmux_os::identity::UserIdentity::Uid(uid),
+                can_write: true,
+                client_size: Some(TerminalSize { cols: 80, rows: 24 }),
+            },
+        )
+        .await;
+
+    handler.refresh_attached_session(&session).await;
+
+    assert!(closing.load(Ordering::SeqCst));
+    assert!(!handler.active_attach.lock().await.by_pid.contains_key(&77));
+    assert!(matches!(control_rx.try_recv(), Ok(AttachControl::Detach)));
+    assert_eq!(
+        control_backlog.load(Ordering::Acquire),
+        super::attach_support::ATTACH_CONTROL_BACKLOG_LIMIT,
+        "refresh should not enqueue another tracked frame once the backlog is saturated"
+    );
+}
+
+#[cfg(any(unix, windows))]
 async fn create_line_exiting_attached_session(
     handler: &RequestHandler,
     requester_pid: u32,
@@ -276,6 +384,7 @@ async fn create_session_with_command(
             command: Some(command),
             process_command: None,
             client_environment: None,
+            skip_environment_update: false,
         }))
         .await;
     assert!(
@@ -297,6 +406,23 @@ fn quiet_ready_command(marker: &str) -> Vec<String> {
         "/q".to_owned(),
         "/c".to_owned(),
         format!("echo {marker} & ping -n 120 127.0.0.1 >NUL"),
+    ]
+}
+
+#[cfg(unix)]
+fn line_exiting_command(marker: &str) -> Vec<String> {
+    vec![
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        format!(
+            "printf '%s\\n' '{marker}'; \
+             while IFS= read -r line; do \
+                 if [ \"$line\" = exit ] || [ \"$line\" = RMUX_EXIT ]; then \
+                     printf 'logout\\n'; \
+                     exit 0; \
+                 fi; \
+             done"
+        ),
     ]
 }
 
@@ -354,6 +480,22 @@ fn quiet_attached_command() -> Vec<String> {
         .into_iter()
         .map(str::to_owned)
         .collect()
+}
+
+#[cfg(windows)]
+fn quiet_attached_command() -> Vec<String> {
+    let system_root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+    let cmd = std::path::PathBuf::from(system_root)
+        .join("System32")
+        .join("cmd.exe");
+    vec![
+        cmd.to_string_lossy().into_owned(),
+        "/d".to_owned(),
+        "/q".to_owned(),
+        "/c".to_owned(),
+        "ping -n 120 127.0.0.1 >NUL".to_owned(),
+    ]
 }
 
 async fn active_panes(handler: &RequestHandler, session: &SessionName) -> String {
@@ -450,6 +592,7 @@ async fn display_target_format(
             target: Some(rmux_proto::Target::Pane(target)),
             print: true,
             message: Some(format.to_owned()),
+            empty_target_context: false,
         }))
         .await;
     let Response::DisplayMessage(response) = response else {

@@ -243,6 +243,56 @@ async fn share_websocket_auth_ready_snapshot_operator_and_revoke_loop() {
 }
 
 #[tokio::test]
+async fn ready_exposes_spectator_pairing_code_only_to_operator() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name = create_session(&handler, "websocket-ready-pairing-code").await;
+    let created = create_share(
+        &handler,
+        CreateWebShareRequest {
+            require_pin: true,
+            operator: true,
+            spectator: true,
+            ..share_request(WebShareScope::Pane(PaneTarget::new(session_name, 0).into()))
+        },
+    )
+    .await;
+    let operator_token = token_from_url(created.operator_url.as_deref().expect("operator URL"));
+    let operator_pin = created
+        .operator_pairing_code
+        .as_deref()
+        .expect("operator pin");
+    let spectator_token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
+    let spectator_pin = created
+        .spectator_pairing_code
+        .as_deref()
+        .expect("spectator pin");
+
+    let mut operator =
+        TestWebSocket::connect_with_pin(Arc::clone(&handler), &operator_token, operator_pin).await;
+    let operator_ready = operator.read_json().await;
+    assert_eq!(operator_ready["type"], "ready");
+    assert_eq!(operator_ready["role"], "operator");
+    assert_eq!(
+        operator_ready["spectator_pairing_code"].as_str(),
+        Some(spectator_pin)
+    );
+
+    let mut spectator =
+        TestWebSocket::connect_with_pin(Arc::clone(&handler), &spectator_token, spectator_pin)
+            .await;
+    let spectator_ready = spectator.read_json().await;
+    assert_eq!(spectator_ready["type"], "ready");
+    assert_eq!(spectator_ready["role"], "spectator");
+    assert!(
+        spectator_ready.get("spectator_pairing_code").is_none(),
+        "spectator clients must not receive the group pairing code"
+    );
+
+    operator.close().await;
+    spectator.close().await;
+}
+
+#[tokio::test]
 async fn pane_share_rejects_browser_resize() {
     let handler = Arc::new(RequestHandler::new());
     let session_name = create_session(&handler, "websocket-pane-no-browser-resize").await;
@@ -492,7 +542,7 @@ async fn spectator_session_share_rejects_binary_frames() {
 }
 
 #[tokio::test]
-async fn spectator_session_share_rejects_scroll_text_frames() {
+async fn spectator_session_share_allows_scroll_text_frames() {
     let handler = Arc::new(RequestHandler::new());
     let session_name = create_session(&handler, "websocket-spectator-scroll").await;
     let created = create_share(
@@ -509,12 +559,16 @@ async fn spectator_session_share_rejects_scroll_text_frames() {
     assert_eq!(ready["scope"], "session");
     assert_eq!(ready["role"], "spectator");
 
+    client.read_binary_with_prefix(0x10, "snapshot").await;
     client
-        .send_json(r#"{"type":"pane_scroll","pane_id":0,"delta":1}"#)
+        .send_json(r#"{"type":"pane_scroll","pane_id":0,"delta":-1}"#)
         .await;
-    client
-        .read_close(4006, "pane_scroll_requires_operator")
-        .await;
+    read_session_view_until(&mut client, "spectator scroll session view", |view| {
+        view["panes"]
+            .as_array()
+            .is_some_and(|panes| !panes.is_empty())
+    })
+    .await;
     client.close().await;
 }
 
@@ -748,10 +802,10 @@ async fn handshake_rejects_wrong_pin_with_same_collapsed_close() {
 }
 
 #[tokio::test]
-async fn handshake_rejects_capacity_reached_with_capacity_close() {
+async fn handshake_rejects_capacity_reached_with_collapsed_close() {
     // The share caps spectators at 1. Once that slot is held by a live viewer,
-    // a second spectator hits the capacity-reached path after token auth. This
-    // is safe to expose distinctly because token/PIN auth has already succeeded.
+    // a second spectator hits the capacity-reached path after token auth. Keep
+    // the wire close collapsed so PIN-protected shares do not expose an oracle.
     let handler = Arc::new(RequestHandler::new());
     let session_name = create_session(&handler, "websocket-capacity").await;
     let created = create_share(
@@ -772,7 +826,7 @@ async fn handshake_rejects_capacity_reached_with_capacity_close() {
         mut stream, task, ..
     } = drive_handshake_through_auth(Arc::clone(&handler), &token, &token_id, &auth_text()).await;
 
-    assert_close(&mut stream, 4009, "capacity_reached").await;
+    assert_close(&mut stream, 4000, "handshake_rejected").await;
 
     drop(stream);
     let _ = task.await.expect("server task joins");
@@ -780,7 +834,7 @@ async fn handshake_rejects_capacity_reached_with_capacity_close() {
 }
 
 #[tokio::test]
-async fn handshake_rejects_pin_protected_capacity_after_valid_pin_with_capacity_close() {
+async fn handshake_rejects_pin_protected_capacity_after_valid_pin_with_collapsed_close() {
     let handler = Arc::new(RequestHandler::new());
     let session_name = create_session(&handler, "websocket-pin-capacity").await;
     let created = create_share(
@@ -810,7 +864,7 @@ async fn handshake_rejects_pin_protected_capacity_after_valid_pin_with_capacity_
     )
     .await;
 
-    assert_close(&mut stream, 4009, "capacity_reached").await;
+    assert_close(&mut stream, 4000, "handshake_rejected").await;
 
     drop(stream);
     let _ = task.await.expect("server task joins");
@@ -1253,7 +1307,7 @@ struct HandshakeSession {
     sealer: Sealer,
 }
 
-/// Drives a real v4 handshake all the way through sending the encrypted auth
+/// Drives a real v1 handshake all the way through sending the encrypted auth
 /// frame and returns the live client session.
 ///
 /// `token` derives the PSK and `token_id` is sent on the wire; passing a

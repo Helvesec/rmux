@@ -1,6 +1,6 @@
 use super::{
-    encode_attach_message, AttachFrameDecoder, AttachMessage, AttachShellCommand,
-    AttachedKeystroke, KeyDispatched,
+    decode_attach_data_frame, encode_attach_data_into_slice, encode_attach_message,
+    AttachFrameDecoder, AttachMessage, AttachShellCommand, AttachedKeystroke, KeyDispatched,
 };
 use crate::{RmuxError, TerminalGeometry, TerminalPixels, TerminalSize};
 
@@ -13,6 +13,77 @@ fn data_messages_round_trip() {
 
     assert_eq!(
         decoder.next_message().expect("decode attach message"),
+        Some(message)
+    );
+    assert_eq!(
+        decoder.next_message().expect("buffer should be empty"),
+        None
+    );
+}
+
+#[test]
+fn borrowed_data_frame_decode_returns_payload_without_consuming_buffer() {
+    let encoded =
+        encode_attach_message(&AttachMessage::Data(b"hello".to_vec())).expect("encode data");
+    let frame = decode_attach_data_frame(&encoded)
+        .expect("decode borrowed data")
+        .expect("complete data frame");
+
+    assert_eq!(frame.payload(), b"hello");
+    assert_eq!(frame.frame_len(), encoded.len());
+    assert!(decode_attach_data_frame(&encoded[..encoded.len() - 1])
+        .expect("partial data is not an error")
+        .is_none());
+    assert!(decode_attach_data_frame(
+        &encode_attach_message(&AttachMessage::Unlock).expect("unlock")
+    )
+    .expect("non-data frame is not an error")
+    .is_none());
+}
+
+#[test]
+fn attach_data_slice_encoder_matches_allocating_encoder() {
+    let encoded =
+        encode_attach_message(&AttachMessage::Data(b"hello".to_vec())).expect("encode data");
+    let mut frame = [0_u8; 32];
+
+    let len = encode_attach_data_into_slice(b"hello", &mut frame).expect("encode into slice");
+
+    assert_eq!(&frame[..len], encoded.as_slice());
+}
+
+#[test]
+fn decoder_copies_small_data_payload_into_caller_scratch() {
+    let data = encode_attach_message(&AttachMessage::Data(b"abc".to_vec())).expect("encode data");
+    let unlock = encode_attach_message(&AttachMessage::Unlock).expect("encode unlock");
+    let mut decoder = AttachFrameDecoder::new();
+    decoder.push_bytes(&data);
+    decoder.push_bytes(&unlock);
+    let mut scratch = [0_u8; 8];
+
+    let payload = decoder
+        .next_data_payload_into(&mut scratch)
+        .expect("decode data payload")
+        .expect("data frame should fit scratch");
+
+    assert_eq!(payload, b"abc");
+    assert_eq!(
+        decoder.next_message().expect("decode next frame"),
+        Some(AttachMessage::Unlock)
+    );
+}
+
+#[test]
+fn render_messages_round_trip() {
+    let message = AttachMessage::Render(b"frame".to_vec());
+    let encoded = encode_attach_message(&message).expect("encode attach render message");
+    let mut decoder = AttachFrameDecoder::new();
+    decoder.push_bytes(&encoded);
+
+    assert_eq!(
+        decoder
+            .next_message()
+            .expect("decode attach render message"),
         Some(message)
     );
     assert_eq!(

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -33,6 +33,9 @@ pub(in crate::handler) struct ActiveAttach {
     pub(in crate::handler) pan_ox: u32,
     pub(in crate::handler) pan_oy: u32,
     pub(in crate::handler) control_tx: mpsc::UnboundedSender<AttachControl>,
+    pub(in crate::handler) control_backlog: Arc<AtomicUsize>,
+    pub(in crate::handler) render_stream: bool,
+    pub(in crate::handler) render_refresh_pending: bool,
     pub(in crate::handler) uid: u32,
     pub(in crate::handler) user: UserIdentity,
     pub(in crate::handler) can_write: bool,
@@ -80,10 +83,12 @@ pub(in crate::handler) struct DisplayPanesLabel {
 #[derive(Debug)]
 pub(crate) struct AttachRegistration {
     pub(crate) control_tx: mpsc::UnboundedSender<AttachControl>,
+    pub(crate) control_backlog: Arc<AtomicUsize>,
     pub(crate) closing: Arc<AtomicBool>,
     pub(crate) persistent_overlay_epoch: Arc<AtomicU64>,
     pub(crate) terminal_context: OuterTerminalContext,
     pub(crate) flags: ClientFlags,
+    pub(crate) render_stream: bool,
     pub(crate) uid: u32,
     pub(crate) user: UserIdentity,
     pub(crate) can_write: bool,

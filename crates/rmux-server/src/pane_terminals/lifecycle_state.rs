@@ -43,7 +43,7 @@ pub(crate) enum PaneLifecycleProcessState {
 pub(crate) struct PaneLifecycleExitState {
     pub(crate) status: Option<i32>,
     pub(crate) signal: Option<i32>,
-    pub(crate) time: i64,
+    pub(crate) time: Option<i64>,
 }
 
 impl From<PaneExitMetadata> for PaneLifecycleExitState {
@@ -101,7 +101,7 @@ impl PaneLifecycleState {
     }
 
     pub(crate) fn encoded_command(&self) -> Option<String> {
-        self.command.as_deref().map(encode_command_field)
+        self.command.as_deref().map(format_command_field)
     }
 
     pub(crate) fn working_directory(&self) -> Option<&Path> {
@@ -267,6 +267,20 @@ pub(crate) fn terminal_size_from_geometry(geometry: PaneGeometry) -> TerminalSiz
         cols: geometry.cols(),
         rows: geometry.rows(),
     }
+}
+
+fn format_command_field(command: &[String]) -> String {
+    if let [command] = command {
+        return quote_single_shell_command(command);
+    }
+    encode_command_field(command)
+}
+
+fn quote_single_shell_command(command: &str) -> String {
+    if !command.contains(char::is_whitespace) && !command.contains('"') && !command.contains('\\') {
+        return command.to_owned();
+    }
+    format!("\"{}\"", command.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn encode_command_field(command: &[String]) -> String {

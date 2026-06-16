@@ -93,12 +93,24 @@ impl RequestHandler {
         {
             return false;
         }
-        if !self
-            .retained_exited_outputs
-            .lock()
-            .expect("retained exited output mutex must not be poisoned")
-            .is_empty(std::time::Instant::now())
-        {
+        let retained_outputs_empty = {
+            let mut retained_outputs = self
+                .retained_exited_outputs
+                .lock()
+                .expect("retained exited output mutex must not be poisoned");
+            if retained_outputs.is_empty(std::time::Instant::now()) {
+                true
+            } else if matches!(
+                reason,
+                Some(PendingShutdownReason::ExitEmpty | PendingShutdownReason::SeamlessUpgradeIdle)
+            ) {
+                retained_outputs.clear();
+                true
+            } else {
+                false
+            }
+        };
+        if !retained_outputs_empty {
             return false;
         }
         if !self.shutdown_requested.swap(false, Ordering::SeqCst) {
@@ -200,7 +212,7 @@ impl RequestHandler {
         drop(active_attach);
 
         if self.active_detached_requests.load(Ordering::SeqCst) != 0 {
-            return IdleShutdownState::Stale;
+            return IdleShutdownState::Unknown;
         }
 
         let Ok(active_detached_connections) = self.active_detached_connections.try_lock() else {
@@ -278,6 +290,26 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(500), shutdown_rx)
             .await
             .expect("retry should preserve requester exclusion and request shutdown")
+            .expect("shutdown receiver should complete cleanly");
+    }
+
+    #[tokio::test]
+    async fn idle_shutdown_retries_after_in_flight_detached_request() {
+        let handler = RequestHandler::new();
+        let (shutdown_handle, shutdown_rx) = ShutdownHandle::new();
+        handler.install_shutdown_handle(shutdown_handle);
+        let _request = handler.begin_detached_request();
+
+        handler.queue_shutdown_request(PendingShutdownReason::ExitEmpty);
+        assert!(
+            !handler.request_shutdown_if_pending(),
+            "in-flight detached requests should defer, not cancel, exit-empty shutdown"
+        );
+        drop(_request);
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), shutdown_rx)
+            .await
+            .expect("retry should request shutdown after detached request finishes")
             .expect("shutdown receiver should complete cleanly");
     }
 }

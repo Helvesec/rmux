@@ -15,6 +15,7 @@ mod cli_args;
 mod cli_response;
 mod os_string;
 mod process_locale;
+mod server_runtime;
 
 use std::env;
 use std::ffi::OsString;
@@ -23,7 +24,6 @@ use std::path::PathBuf;
 
 use rmux_client::INTERNAL_DAEMON_FLAG;
 use rmux_server::{ConfigFileSelection as ServerConfigFileSelection, DaemonConfig, ServerDaemon};
-use tokio::runtime::Builder;
 
 fn main() {
     match process_locale::initialize_process_locale()
@@ -218,6 +218,8 @@ where
 }
 
 fn run_hidden_daemon(args: InternalDaemonArgs) -> io::Result<()> {
+    reject_unsupported_web_args(&args)?;
+
     let mut config = match args.socket_path {
         Some(socket_path) => DaemonConfig::new(socket_path),
         None => DaemonConfig::with_default_socket_path()?,
@@ -237,13 +239,8 @@ fn run_hidden_daemon(args: InternalDaemonArgs) -> io::Result<()> {
     if let Some(frontend) = args.web_frontend {
         config = config.with_web_frontend(frontend);
     }
-    #[cfg(unix)]
-    let runtime = Builder::new_current_thread().enable_all().build()?;
-    #[cfg(windows)]
-    let runtime = Builder::new_multi_thread()
-        .worker_threads(hidden_daemon_worker_threads())
-        .enable_all()
-        .build()?;
+    rmux_os::memory::configure_daemon_allocator();
+    let runtime = server_runtime::build_daemon_runtime()?;
 
     runtime.block_on(async move {
         let server = ServerDaemon::new(config).bind().await?;
@@ -251,12 +248,21 @@ fn run_hidden_daemon(args: InternalDaemonArgs) -> io::Result<()> {
     })
 }
 
-#[cfg(windows)]
-fn hidden_daemon_worker_threads() -> usize {
-    std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(4)
-        .max(4)
+fn reject_unsupported_web_args(args: &InternalDaemonArgs) -> io::Result<()> {
+    #[cfg(not(feature = "web"))]
+    if args.web_port.is_some() || args.web_frontend.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "rmux was built without web-share support",
+        ));
+    }
+
+    #[cfg(feature = "web")]
+    {
+        let _ = args;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -267,16 +273,10 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    #[cfg(windows)]
-    #[test]
-    fn hidden_daemon_worker_threads_has_responsiveness_floor() {
-        assert!(super::hidden_daemon_worker_threads() >= 4);
-    }
-
     const EXPECTED_BINARY_NAME: &str = "rmux";
 
     #[test]
-    fn binary_contract_is_rmux() {
+    fn compiled_binary_name_is_rmux() {
         let compiled_binary_name = option_env!("CARGO_BIN_NAME").unwrap_or(env!("CARGO_PKG_NAME"));
         assert_eq!(compiled_binary_name, EXPECTED_BINARY_NAME);
     }
@@ -342,16 +342,36 @@ mod tests {
     }
 
     #[test]
-    fn try_main_reports_clap_failures_for_invalid_public_invocations() {
+    fn try_main_reports_absent_server_before_command_parse_failures() {
+        #[cfg(unix)]
+        let socket_args = [
+            OsString::from("-S"),
+            OsString::from(format!(
+                "/tmp/rmux-main-missing-{}-parse.sock",
+                std::process::id()
+            )),
+        ];
+        #[cfg(windows)]
+        let socket_args = [
+            OsString::from("-L"),
+            OsString::from(format!("main-missing-{}-parse", std::process::id())),
+        ];
+
         let result = try_main([
             OsString::from("rmux"),
-            OsString::from("detach-client"),
-            OsString::from("unexpected"),
+            socket_args[0].clone(),
+            socket_args[1].clone(),
+            OsString::from("new-session"),
+            OsString::from("-s"),
         ]);
 
-        let error = result.expect_err("unexpected detach arguments should fail");
+        let error = result.expect_err("missing new-session value should fail");
         assert_eq!(error.exit_code(), 1);
-        assert!(error.message().contains("unexpected"));
+        assert!(
+            error.message().contains("error connecting to"),
+            "{}",
+            error.message()
+        );
     }
 
     #[test]

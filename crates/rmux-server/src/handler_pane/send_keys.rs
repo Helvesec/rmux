@@ -1,13 +1,14 @@
 use rmux_core::{key_code_lookup_bits, key_string_lookup_key, key_string_lookup_string};
 use rmux_proto::{
-    ErrorResponse, OptionName, Response, RmuxError, SendKeysResponse, SendPrefixResponse,
+    ErrorResponse, OptionName, PaneTarget, Response, RmuxError, SendKeysResponse,
+    SendPrefixResponse,
 };
 
 use super::super::RequestHandler;
 use super::{
     encode_key_for_target, encode_mouse_for_target, encode_tokens_for_target,
     expand_send_key_tokens, prepare_pane_input_write, prepare_synchronized_pane_input_writes,
-    resolve_input_target, write_bytes_to_target, write_bytes_to_targets,
+    resolve_input_target, write_bytes_to_targets, PaneInputWrite,
 };
 use crate::keys::{parse_key_code, resolve_hex_key};
 
@@ -17,9 +18,23 @@ impl RequestHandler {
         request: rmux_proto::SendKeysRequest,
     ) -> Response {
         let key_count = request.keys.len();
+        let keys = if request.keys.is_empty() {
+            request.keys
+        } else {
+            match self
+                .consume_copy_mode_key_tokens(std::process::id(), &request.target, &request.keys)
+                .await
+            {
+                Ok(keys) => keys,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            }
+        };
+        if key_count > 0 && keys.is_empty() {
+            return Response::SendKeys(SendKeysResponse { key_count });
+        }
         let prepared = {
             let state = self.state.lock().await;
-            let resolved = match encode_tokens_for_target(&state, &request.target, &request.keys) {
+            let resolved = match encode_tokens_for_target(&state, &request.target, &keys) {
                 Ok(resolved) => resolved,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
@@ -30,7 +45,8 @@ impl RequestHandler {
                 };
             (writes, resolved)
         };
-        write_bytes_to_targets(prepared.0, prepared.1, key_count).await
+        self.write_pane_input_and_mark_interactive(prepared.0, prepared.1, key_count)
+            .await
     }
 
     #[async_recursion::async_recursion]
@@ -195,15 +211,41 @@ impl RequestHandler {
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
             drop(state);
-            return write_bytes_to_target(write, bytes, 0).await;
+            return self
+                .write_pane_input_and_mark_interactive(vec![write], bytes, 0)
+                .await;
+        }
+
+        let tokens =
+            if !tokens.is_empty() && !request.hex && !request.literal && !request.reset_terminal {
+                match self
+                    .consume_copy_mode_key_tokens(
+                        target_attach_pid.unwrap_or(requester_pid),
+                        &target,
+                        &tokens,
+                    )
+                    .await
+                {
+                    Ok(tokens) => tokens,
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                }
+            } else {
+                tokens
+            };
+        if !request.keys.is_empty() && tokens.is_empty() {
+            return Response::SendKeys(SendKeysResponse {
+                key_count: request.keys.len(),
+            });
         }
 
         let prepared = {
             let state = self.state.lock().await;
-            let mut bytes = Vec::new();
             if request.reset_terminal {
-                bytes.extend_from_slice(b"\x1bc");
+                if let Err(error) = state.reset_pane_terminal_state(&target) {
+                    return Response::Error(ErrorResponse { error });
+                }
             }
+            let mut bytes = Vec::new();
             if request.hex {
                 for token in &tokens {
                     let Some(byte) = resolve_hex_key(token) else {
@@ -231,7 +273,35 @@ impl RequestHandler {
             };
             (writes, repeated)
         };
-        write_bytes_to_targets(prepared.0, prepared.1, tokens.len()).await
+        self.write_pane_input_and_mark_interactive(prepared.0, prepared.1, request.keys.len())
+            .await
+    }
+
+    async fn consume_copy_mode_key_tokens(
+        &self,
+        requester_pid: u32,
+        target: &PaneTarget,
+        tokens: &[String],
+    ) -> Result<Vec<String>, RmuxError> {
+        let mut remaining = Vec::new();
+        for (index, token) in tokens.iter().enumerate() {
+            if !self.target_is_in_copy_mode(target).await? {
+                remaining.extend(tokens[index..].iter().cloned());
+                break;
+            }
+            let Some(key) = parse_key_code(token) else {
+                remaining.extend(tokens[index..].iter().cloned());
+                break;
+            };
+            let handled = self
+                .handle_detached_copy_mode_key_code(requester_pid, target.clone(), key)
+                .await?;
+            if !handled {
+                remaining.extend(tokens[index..].iter().cloned());
+                break;
+            }
+        }
+        Ok(remaining)
     }
 
     pub(in crate::handler) async fn handle_send_prefix(
@@ -288,7 +358,10 @@ impl RequestHandler {
             (writes, encoded, canonical_key)
         };
 
-        match write_bytes_to_targets(writes, encoded, 1).await {
+        match self
+            .write_pane_input_and_mark_interactive(writes, encoded, 1)
+            .await
+        {
             Response::SendKeys(_) => Response::SendPrefix(SendPrefixResponse {
                 target: Some(target),
                 key: canonical_key,
@@ -297,4 +370,33 @@ impl RequestHandler {
             other => other,
         }
     }
+
+    async fn write_pane_input_and_mark_interactive(
+        &self,
+        writes: Vec<PaneInputWrite>,
+        bytes: Vec<u8>,
+        key_count: usize,
+    ) -> Response {
+        let wrote_bytes = !bytes.is_empty();
+        let sessions = input_write_sessions(&writes);
+        let response = write_bytes_to_targets(writes, bytes, key_count).await;
+        if wrote_bytes && matches!(response, Response::SendKeys(_)) {
+            for session_name in sessions {
+                self.mark_attached_session_interactive_input(&session_name)
+                    .await;
+            }
+        }
+        response
+    }
+}
+
+fn input_write_sessions(writes: &[PaneInputWrite]) -> Vec<rmux_proto::SessionName> {
+    let mut sessions = Vec::new();
+    for write in writes {
+        let session_name = write.session_name();
+        if !sessions.iter().any(|existing| existing == session_name) {
+            sessions.push(session_name.clone());
+        }
+    }
+    sessions
 }

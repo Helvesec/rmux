@@ -28,6 +28,7 @@ impl Connection {
             delay_seconds: delay_seconds.map(RunShellDelaySeconds),
             start_directory,
             target,
+            source_depth: None,
         }))
     }
 

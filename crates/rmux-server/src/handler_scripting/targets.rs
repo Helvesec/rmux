@@ -9,7 +9,8 @@ use rmux_proto::{
     Target, WindowTarget,
 };
 
-use super::values::missing_argument;
+use super::super::target_support::pane_id_target;
+use super::values::{missing_argument, parse_u32};
 
 pub(super) fn resolve_queue_target_arguments(
     command_name: &str,
@@ -46,6 +47,42 @@ pub(super) fn resolve_queue_target_arguments(
                 value
             };
             resolved.push(format!("-{flag}"));
+            if let Some(anchor) = resolve_queue_placement_anchor_target(
+                command_name,
+                flag,
+                &value,
+                &all_arguments,
+                sessions,
+                find_context,
+            )? {
+                resolved.push(anchor);
+                continue;
+            }
+            if let Some(session_value) =
+                queue_session_destination_value(command_name, flag, &value, &all_arguments)
+            {
+                let session = resolve_target_argument_with_spec(
+                    session_value,
+                    CommandTargetSpec {
+                        flag,
+                        find_type: TargetFindType::Session,
+                        flags: TargetFindFlags::NONE,
+                    },
+                    sessions,
+                    find_context,
+                )?;
+                resolved.push(format!("{session}:"));
+                continue;
+            }
+            if preserve_link_window_bare_destination_value(
+                command_name,
+                flag,
+                &value,
+                &all_arguments,
+            ) {
+                resolved.push(value);
+                continue;
+            }
             let spec = queue_target_spec_for_flag(command_name, flag, &value, &all_arguments)
                 .expect("prevalidated target flag must have a queue target spec");
             resolved.push(resolve_target_argument_with_spec(
@@ -60,6 +97,128 @@ pub(super) fn resolve_queue_target_arguments(
     }
 
     Ok(resolved)
+}
+
+fn resolve_queue_placement_anchor_target(
+    command_name: &str,
+    flag: char,
+    value: &str,
+    arguments: &[String],
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Result<Option<String>, RmuxError> {
+    if !link_or_move_window_command(command_name)
+        || flag != 't'
+        || !arguments
+            .iter()
+            .any(|argument| matches!(argument.as_str(), "-a" | "-b"))
+    {
+        return Ok(None);
+    }
+    let Some(session_value) = signed_window_target_session_part(value) else {
+        return Ok(None);
+    };
+    let target = if let Some(session_value) = session_value {
+        let resolved = resolve_target_argument_with_spec(
+            session_value.to_owned(),
+            CommandTargetSpec {
+                flag,
+                find_type: TargetFindType::Session,
+                flags: TargetFindFlags::NONE,
+            },
+            sessions,
+            find_context,
+        )?;
+        let Target::Session(session_name) = Target::parse(&resolved)? else {
+            unreachable!("session target lookup must return a session");
+        };
+        let window_index = sessions
+            .session(&session_name)
+            .ok_or_else(|| crate::pane_terminals::session_not_found(&session_name))?
+            .active_window_index();
+        WindowTarget::with_window(session_name, window_index)
+    } else {
+        implicit_window_target(sessions, find_context, command_name)?
+    };
+    Ok(Some(target.to_string()))
+}
+
+fn queue_session_destination_value(
+    command_name: &str,
+    flag: char,
+    value: &str,
+    arguments: &[String],
+) -> Option<String> {
+    if flag != 't' {
+        return None;
+    }
+    if !link_or_move_window_command(command_name) {
+        return None;
+    }
+    if arguments
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-a" | "-b"))
+    {
+        return None;
+    }
+    if command_name == "move-window" && arguments.iter().any(|argument| argument == "-r") {
+        return None;
+    }
+    session_only_window_destination_value(value)
+}
+
+fn session_only_window_destination_value(value: &str) -> Option<String> {
+    if let Some(session) = value
+        .strip_suffix(':')
+        .filter(|session| !session.is_empty())
+    {
+        return Some(session.to_owned());
+    }
+    None
+}
+
+fn preserve_link_window_bare_destination_value(
+    command_name: &str,
+    flag: char,
+    value: &str,
+    arguments: &[String],
+) -> bool {
+    if flag != 't' {
+        return false;
+    }
+    if !link_or_move_window_command(command_name) {
+        return false;
+    }
+    if arguments
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-a" | "-b"))
+    {
+        return false;
+    }
+    if command_name == "move-window" && arguments.iter().any(|argument| argument == "-r") {
+        return false;
+    }
+    bare_link_window_destination_candidate(value)
+}
+
+pub(in crate::handler::scripting_support) fn bare_link_window_destination_candidate(
+    value: &str,
+) -> bool {
+    !value.is_empty()
+        && !value.contains([':', '.'])
+        && !value.starts_with(['@', '%', '+', '-', '='])
+        && value.parse::<u32>().is_err()
+        && !matches!(
+            value,
+            "!" | "^" | "$" | "{start}" | "{last}" | "{end}" | "{next}" | "{previous}"
+        )
+}
+
+fn link_or_move_window_command(command_name: &str) -> bool {
+    matches!(
+        command_name,
+        "link-window" | "linkw" | "move-window" | "movew"
+    )
 }
 
 pub(super) fn resolve_queue_target_argument(
@@ -106,7 +265,11 @@ fn queue_target_spec_for_flag(
     arguments: &[String],
 ) -> Option<CommandTargetSpec> {
     let mut spec = target_spec_for_flag(command_name, flag)?;
-    if command_name == "move-window" && flag == 't' && arguments.iter().any(|arg| arg == "-r") {
+    if command_name == "move-window"
+        && flag == 't'
+        && arguments.iter().any(|arg| arg == "-r")
+        && !has_explicit_window_part(value)
+    {
         spec.find_type = TargetFindType::Session;
         spec.flags = TargetFindFlags::QUIET;
     } else if command_name == "new-window" && flag == 't' && new_window_target_is_session(value) {
@@ -116,6 +279,31 @@ fn queue_target_spec_for_flag(
         spec.find_type = hook_target_find_type(value, arguments);
     }
     Some(spec)
+}
+
+fn has_explicit_window_part(value: &str) -> bool {
+    value
+        .split_once(':')
+        .map(|(_, window)| !window.is_empty())
+        .unwrap_or(false)
+}
+
+fn signed_window_target_session_part(raw_target: &str) -> Option<Option<&str>> {
+    if signed_window_index_target(raw_target) {
+        return Some(None);
+    }
+    let (session, window) = raw_target.split_once(':')?;
+    if session.is_empty() || !signed_window_index_target(window) {
+        return None;
+    }
+    Some(Some(session))
+}
+
+fn signed_window_index_target(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix(['+', '-']) else {
+        return false;
+    };
+    rest.is_empty() || rest.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn hook_target_find_type(value: &str, arguments: &[String]) -> TargetFindType {
@@ -163,7 +351,8 @@ fn short_flag_argument_parts(argument: &str) -> Option<(char, Option<&str>)> {
 fn queue_target_resolution_enabled(command_name: &str) -> bool {
     matches!(
         command_name,
-        "break-pane"
+        "attach-session"
+            | "break-pane"
             | "capture-pane"
             | "display-message"
             | "display-menu"
@@ -176,6 +365,7 @@ fn queue_target_resolution_enabled(command_name: &str) -> bool {
             | "kill-window"
             | "last-pane"
             | "last-window"
+            | "link-window"
             | "list-panes"
             | "list-windows"
             | "move-pane"
@@ -214,30 +404,38 @@ fn queue_target_resolution_enabled(command_name: &str) -> bool {
     )
 }
 
+pub(super) struct QueueTargetFindContextInput<'a> {
+    pub(super) sessions: &'a SessionStore,
+    pub(super) options: &'a OptionStore,
+    pub(super) requester_pane_id: Option<u32>,
+    pub(super) attached_session: Option<&'a SessionName>,
+    pub(super) current_target: Option<&'a Target>,
+    pub(super) mouse_target: Option<&'a Target>,
+    pub(super) marked_target: Option<&'a PaneTarget>,
+}
+
 pub(super) fn queue_target_find_context(
-    sessions: &SessionStore,
-    options: &OptionStore,
-    requester_pid: u32,
-    attached_session: Option<&SessionName>,
-    current_target: Option<&Target>,
-    mouse_target: Option<&Target>,
-    marked_target: Option<&PaneTarget>,
+    input: QueueTargetFindContextInput<'_>,
 ) -> TargetFindContext {
-    let context = if let Some(current_target) = current_target {
+    let context = if let Some(current_target) = input.current_target {
         TargetFindContext::from_target(current_target.clone())
-    } else if let Some(client_target) = client_rmux_pane_target(sessions, requester_pid) {
-        TargetFindContext::from_target(client_target)
     } else {
-        let current = attached_session
-            .and_then(|session_name| active_session_target(sessions, session_name))
-            .or_else(|| latest_detached_session_target(sessions));
+        let current = input
+            .requester_pane_id
+            .and_then(|pane_id| pane_id_target(input.sessions, pane_id))
+            .or_else(|| {
+                input
+                    .attached_session
+                    .and_then(|session_name| active_session_target(input.sessions, session_name))
+            })
+            .or_else(|| latest_detached_session_target(input.sessions));
         TargetFindContext::new(current)
     };
 
     let context = context
-        .with_mouse_target(mouse_target.cloned())
-        .with_marked_target(marked_target.cloned().map(Target::Pane));
-    crate::handler::with_visible_pane_bases(context, sessions, options)
+        .with_mouse_target(input.mouse_target.cloned())
+        .with_marked_target(input.marked_target.cloned().map(Target::Pane));
+    crate::handler::with_visible_pane_bases(context, input.sessions, input.options)
 }
 
 fn latest_detached_session_target(sessions: &SessionStore) -> Option<Target> {
@@ -252,25 +450,6 @@ fn latest_detached_session_target(sessions: &SessionStore) -> Option<Target> {
                 .then(right_name.as_str().cmp(left_name.as_str()))
         })
         .and_then(|(session_name, _)| active_session_target(sessions, session_name))
-}
-
-fn client_rmux_pane_target(sessions: &SessionStore, requester_pid: u32) -> Option<Target> {
-    if requester_pid == std::process::id() {
-        return None;
-    }
-
-    let environment = rmux_os::process::environment(requester_pid)?;
-    let rmux_pane = environment.get("RMUX_PANE")?;
-    let pane_id = rmux_pane.strip_prefix('%')?.parse::<u32>().ok()?;
-
-    sessions
-        .resolve_unresolved_target(
-            &UnresolvedTarget::new(format!("%{pane_id}")),
-            TargetFindType::Pane,
-            TargetFindFlags::CANFAIL,
-            &TargetFindContext::new(None),
-        )
-        .ok()
 }
 
 pub(super) fn active_session_target(
@@ -391,14 +570,94 @@ fn parse_new_window_target(value: String) -> Result<(SessionName, Option<u32>), 
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NewWindowTargetIndex {
+    Absolute(u32),
+    Relative(i32),
+}
+
+impl NewWindowTargetIndex {
+    pub(super) fn checked_add_one(self) -> Result<Self, RmuxError> {
+        match self {
+            Self::Absolute(index) => Ok(Self::Absolute(index.checked_add(1).ok_or_else(|| {
+                RmuxError::Server("window index space exhausted for new-window".to_owned())
+            })?)),
+            Self::Relative(offset) => {
+                Ok(Self::Relative(offset.checked_add(1).ok_or_else(|| {
+                    RmuxError::Server("window offset space exhausted for new-window".to_owned())
+                })?))
+            }
+        }
+    }
+}
+
+pub(super) fn parse_queued_new_window_target_argument(
+    value: String,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Result<(SessionName, Option<NewWindowTargetIndex>), RmuxError> {
+    if let Some((session_name, window_part)) = value.split_once(':') {
+        if !session_name.is_empty() {
+            if let Some(offset) = parse_new_window_relative_offset(window_part)? {
+                let resolved = resolve_target_argument_with_spec(
+                    session_name.to_owned(),
+                    CommandTargetSpec {
+                        flag: 't',
+                        find_type: TargetFindType::Session,
+                        flags: TargetFindFlags::NONE,
+                    },
+                    sessions,
+                    find_context,
+                )?;
+                let (resolved_session, _) = parse_new_window_target(resolved)?;
+                return Ok((
+                    resolved_session,
+                    Some(NewWindowTargetIndex::Relative(offset)),
+                ));
+            }
+        }
+    } else if let Some(offset) = parse_new_window_relative_offset(&value)? {
+        let session_name = implicit_session_name(sessions, find_context, "new-window")?;
+        return Ok((session_name, Some(NewWindowTargetIndex::Relative(offset))));
+    }
+
+    let (session_name, window_index) =
+        parse_new_window_target_argument(value, sessions, find_context)?;
+    Ok((
+        session_name,
+        window_index.map(NewWindowTargetIndex::Absolute),
+    ))
+}
+
 pub(super) fn parse_new_window_target_argument(
     value: String,
     sessions: &SessionStore,
     find_context: &TargetFindContext,
 ) -> Result<(SessionName, Option<u32>), RmuxError> {
     if let Some((session_name, window_part)) = value.split_once(':') {
-        if window_part.is_empty() {
-            return Ok((parse_session_name(session_name.to_owned())?, None));
+        if !session_name.is_empty() && new_window_window_part_is_absolute(window_part) {
+            let resolved = resolve_target_argument_with_spec(
+                session_name.to_owned(),
+                CommandTargetSpec {
+                    flag: 't',
+                    find_type: TargetFindType::Session,
+                    flags: TargetFindFlags::NONE,
+                },
+                sessions,
+                find_context,
+            )?;
+            let (resolved_session, _) = parse_new_window_target(resolved)?;
+            let window_index = if window_part.is_empty() {
+                None
+            } else {
+                Some(parse_u32("new-window", "target-window", window_part)?)
+            };
+            return Ok((resolved_session, window_index));
+        }
+        if new_window_window_part_is_relative(window_part) {
+            let resolved =
+                resolve_queue_target_argument("new-window", 't', value, sessions, find_context)?;
+            return parse_new_window_target(resolved);
         }
     }
 
@@ -427,6 +686,38 @@ pub(super) fn parse_new_window_target_argument(
             parse_new_window_target(resolved)
         }
     }
+}
+
+fn new_window_window_part_is_absolute(window_part: &str) -> bool {
+    window_part.is_empty() || window_part.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn new_window_window_part_is_relative(window_part: &str) -> bool {
+    let Some(rest) = window_part.strip_prefix(['+', '-']) else {
+        return false;
+    };
+    rest.is_empty() || rest.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn parse_new_window_relative_offset(value: &str) -> Result<Option<i32>, RmuxError> {
+    let Some(sign) = value
+        .chars()
+        .next()
+        .filter(|sign| matches!(sign, '+' | '-'))
+    else {
+        return Ok(None);
+    };
+    let rest = &value[sign.len_utf8()..];
+    if !rest.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(None);
+    }
+    let magnitude = if rest.is_empty() {
+        1
+    } else {
+        rest.parse::<i32>()
+            .map_err(|_| RmuxError::invalid_target(value, "offset must fit in a signed integer"))?
+    };
+    Ok(Some(if sign == '+' { magnitude } else { -magnitude }))
 }
 
 pub(super) fn parse_target_arg(command: &str, value: String) -> Result<Target, RmuxError> {
@@ -500,4 +791,49 @@ pub(super) fn is_unsupported_named_layout(layout: rmux_proto::LayoutName) -> boo
         rmux_proto::LayoutName::MainHorizontalMirrored
             | rmux_proto::LayoutName::MainVerticalMirrored
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_name(value: &str) -> SessionName {
+        SessionName::new(value).expect("valid session name")
+    }
+
+    fn session_store_with_alpha_beta() -> SessionStore {
+        let mut sessions = SessionStore::new();
+        for name in ["alpha", "beta"] {
+            sessions
+                .create_session(
+                    session_name(name),
+                    rmux_proto::TerminalSize { cols: 80, rows: 24 },
+                )
+                .expect("session create succeeds");
+        }
+        sessions
+    }
+
+    #[test]
+    fn queue_keeps_bare_link_window_destination_unresolved() {
+        let sessions = session_store_with_alpha_beta();
+        let resolved = resolve_queue_target_arguments(
+            "link-window",
+            vec![
+                "-s".to_owned(),
+                "alpha:0".to_owned(),
+                "-t".to_owned(),
+                "beta".to_owned(),
+            ],
+            &sessions,
+            &TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+                session_name("alpha"),
+                0,
+                0,
+            )))),
+        )
+        .expect("queue targets resolve");
+
+        assert_eq!(resolved, ["-s", "alpha:0", "-t", "beta"]);
+    }
 }

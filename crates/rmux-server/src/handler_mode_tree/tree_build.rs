@@ -15,7 +15,7 @@ use super::mode_tree_model::{
 use super::mode_tree_order::{finalize_mode_tree, pane_item_id, session_item_id, window_item_id};
 use super::mode_tree_sort::{sort_sessions, sort_windows};
 
-const TMUX_WINDOW_TREE_DEFAULT_FORMAT: &str = "#{?pane_format,#{?pane_marked,#[reverse],}#{pane_current_command}#{?pane_active,*,}#{?pane_marked,M,}#{?#{&&:#{pane_title},#{!=:#{pane_title},#{host_short}}},: \"#{pane_title}\",},window_format,#{?window_marked_flag,#[reverse],}#{window_name}#{window_flags}#{?#{&&:#{==:#{window_panes},1},#{&&:#{pane_title},#{!=:#{pane_title},#{host_short}}}},: \"#{pane_title}\",},#{session_windows} windows#{?session_grouped, (group #{session_group}: #{session_group_list}),}#{?session_attached, (attached),}}";
+const TMUX_WINDOW_TREE_DEFAULT_FORMAT: &str = "#{?pane_format,#{?pane_marked,#[reverse],}#{pane_current_command}#{?pane_active,*,}#{?pane_marked,M,}#{?#{&&:#{pane_title},#{!=:#{pane_title},#{host_short}}},: \"#{pane_title}\",},#{?window_format,#{?window_marked_flag,#[reverse],}#{window_name}#{window_flags}#{?#{&&:#{==:#{window_panes},1},#{&&:#{pane_title},#{!=:#{pane_title},#{host_short}}}},: \"#{pane_title}\",},#{session_windows} windows#{?session_grouped, (group #{session_group}: #{session_group_list}),}#{?session_attached, (attached),}}}";
 
 pub(super) fn build_tree_items(
     mode: &ModeTreeClientState,
@@ -51,10 +51,18 @@ fn build_tree_session(
 ) -> Result<Option<(ModeTreeItem, Vec<ModeTreeItem>)>, RmuxError> {
     let session_id = session_item_id(session_name);
     let mut collected = Vec::new();
-    let attached_count = attached_counts
+    let mut attached_count = attached_counts
         .iter()
         .find_map(|(name, count)| (name == session_name).then_some(*count))
         .unwrap_or(0);
+    if attached_count == 0
+        && mode
+            .host_pane
+            .as_ref()
+            .is_some_and(|target| target.session_name() == session_name)
+    {
+        attached_count = 1;
+    }
 
     let mut windows = session.windows().iter().collect::<Vec<_>>();
     sort_windows(&mut windows, mode.sort_order, mode.reversed);

@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use common::{assert_success, stderr, terminate_child, CliHarness};
+use common::{assert_success, stderr, stdout, terminate_child, CliHarness};
 
 const FILE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -111,6 +111,33 @@ fn pane_transfer_commands_round_trip_through_the_binary() -> Result<(), Box<dyn 
         stderr(&relative).is_empty(),
         "relative swap-pane should stay silent on success"
     );
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn cross_session_join_pane_renumbers_colliding_source_pane_index() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("cross-session-join-pane-renumber")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "sleep 60"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "beta", "sleep 60"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:0.0", "sleep 60"])?);
+    assert_success(&harness.run(&["join-pane", "-d", "-s", "alpha:0.0", "-t", "beta:0.0"])?);
+
+    let listed = harness.run(&[
+        "list-panes",
+        "-t",
+        "beta:0",
+        "-F",
+        "#{pane_index}:#{pane_id}",
+    ])?;
+    assert_eq!(listed.status.code(), Some(0));
+    assert_eq!(stdout(&listed).lines().count(), 2);
+    assert!(stdout(&listed).starts_with("0:%"));
+    assert!(stdout(&listed).contains("\n1:%"));
+    assert!(stderr(&listed).is_empty());
 
     terminate_child(daemon.child_mut())?;
     Ok(())

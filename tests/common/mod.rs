@@ -31,7 +31,8 @@ pub(crate) use attach::{
     AttachedSession,
 };
 pub(crate) use cli::{
-    assert_clap_failure, assert_success, stderr, stdout, CliHarness, DaemonGuard,
+    acquire_empty_socket_path_lock, assert_clap_failure, assert_success, stderr, stdout,
+    CliHarness, DaemonGuard,
 };
 pub(crate) use tmux_compat::{
     CapturedCommand, EnvironmentOverrides, FrozenTmuxBinary, TmuxCompatHarness, TmuxCompatRun,

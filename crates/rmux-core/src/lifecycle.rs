@@ -74,6 +74,11 @@ pub enum LifecycleEvent {
         /// The targeted window.
         target: WindowTarget,
     },
+    /// A window size changed.
+    WindowResized {
+        /// The targeted window.
+        target: WindowTarget,
+    },
     /// A window's active pane changed.
     WindowPaneChanged {
         /// The targeted window.
@@ -103,6 +108,17 @@ pub enum LifecycleEvent {
         /// The removed window ID captured at notification time, when known.
         window_id: Option<u32>,
         /// The removed window name captured at notification time, when known.
+        window_name: Option<String>,
+    },
+    /// A pane died and was kept by `remain-on-exit`.
+    PaneDied {
+        /// The targeted pane.
+        target: PaneTarget,
+        /// The dead pane ID captured at notification time, when known.
+        pane_id: Option<u32>,
+        /// The dead pane's window ID captured at notification time, when known.
+        window_id: Option<u32>,
+        /// The dead pane's window name captured at notification time, when known.
         window_name: Option<String>,
     },
     /// A pane mode or display overlay state changed.
@@ -158,11 +174,13 @@ impl LifecycleEvent {
             Self::WindowUnlinked { .. } => HookName::WindowUnlinked,
             Self::WindowRenamed { .. } => HookName::WindowRenamed,
             Self::WindowLayoutChanged { .. } => HookName::WindowLayoutChanged,
+            Self::WindowResized { .. } => HookName::WindowResized,
             Self::WindowPaneChanged { .. } => HookName::WindowPaneChanged,
             Self::AlertBell { .. } => HookName::AlertBell,
             Self::AlertActivity { .. } => HookName::AlertActivity,
             Self::AlertSilence { .. } => HookName::AlertSilence,
             Self::PaneExited { .. } => HookName::PaneExited,
+            Self::PaneDied { .. } => HookName::PaneDied,
             Self::PaneModeChanged { .. } => HookName::PaneModeChanged,
             Self::PasteBufferChanged { .. } => HookName::PasteBufferChanged,
             Self::PasteBufferDeleted { .. } => HookName::PasteBufferDeleted,
@@ -190,12 +208,14 @@ impl LifecycleEvent {
             }
             Self::WindowRenamed { target }
             | Self::WindowLayoutChanged { target }
+            | Self::WindowResized { target }
             | Self::WindowPaneChanged { target }
             | Self::AlertBell { target }
             | Self::AlertActivity { target }
             | Self::AlertSilence { target }
             | Self::AfterSelectWindow { target } => ScopeSelector::Window(target.clone()),
             Self::PaneExited { target, .. }
+            | Self::PaneDied { target, .. }
             | Self::PaneModeChanged { target }
             | Self::AfterSelectPane { target }
             | Self::AfterSendKeys { target } => ScopeSelector::Pane(target.clone()),
@@ -224,12 +244,14 @@ impl LifecycleEvent {
             | Self::WindowUnlinked { session_name, .. } => Some(session_name),
             Self::WindowRenamed { target }
             | Self::WindowLayoutChanged { target }
+            | Self::WindowResized { target }
             | Self::WindowPaneChanged { target }
             | Self::AlertBell { target }
             | Self::AlertActivity { target }
             | Self::AlertSilence { target }
             | Self::AfterSelectWindow { target } => Some(target.session_name()),
             Self::PaneExited { target, .. }
+            | Self::PaneDied { target, .. }
             | Self::PaneModeChanged { target }
             | Self::AfterSelectPane { target }
             | Self::AfterSendKeys { target } => Some(target.session_name()),
@@ -258,12 +280,14 @@ impl LifecycleEvent {
             }
             Self::WindowRenamed { target }
             | Self::WindowLayoutChanged { target }
+            | Self::WindowResized { target }
             | Self::WindowPaneChanged { target }
             | Self::AlertBell { target }
             | Self::AlertActivity { target }
             | Self::AlertSilence { target }
             | Self::AfterSelectWindow { target } => Some(target.clone()),
             Self::PaneExited { target, .. }
+            | Self::PaneDied { target, .. }
             | Self::PaneModeChanged { target }
             | Self::AfterSelectPane { target }
             | Self::AfterSendKeys { target } => Some(WindowTarget::with_window(
@@ -279,6 +303,7 @@ impl LifecycleEvent {
     pub fn pane_target(&self) -> Option<&PaneTarget> {
         match self {
             Self::PaneExited { target, .. }
+            | Self::PaneDied { target, .. }
             | Self::PaneModeChanged { target }
             | Self::AfterSelectPane { target }
             | Self::AfterSendKeys { target } => Some(target),
@@ -299,9 +324,9 @@ impl LifecycleEvent {
     #[must_use]
     pub const fn window_id(&self) -> Option<u32> {
         match self {
-            Self::WindowUnlinked { window_id, .. } | Self::PaneExited { window_id, .. } => {
-                *window_id
-            }
+            Self::WindowUnlinked { window_id, .. }
+            | Self::PaneExited { window_id, .. }
+            | Self::PaneDied { window_id, .. } => *window_id,
             _ => None,
         }
     }
@@ -310,9 +335,9 @@ impl LifecycleEvent {
     #[must_use]
     pub fn window_name_snapshot(&self) -> Option<&str> {
         match self {
-            Self::WindowUnlinked { window_name, .. } | Self::PaneExited { window_name, .. } => {
-                window_name.as_deref()
-            }
+            Self::WindowUnlinked { window_name, .. }
+            | Self::PaneExited { window_name, .. }
+            | Self::PaneDied { window_name, .. } => window_name.as_deref(),
             _ => None,
         }
     }
@@ -321,7 +346,7 @@ impl LifecycleEvent {
     #[must_use]
     pub const fn pane_id(&self) -> Option<u32> {
         match self {
-            Self::PaneExited { pane_id, .. } => *pane_id,
+            Self::PaneExited { pane_id, .. } | Self::PaneDied { pane_id, .. } => *pane_id,
             _ => None,
         }
     }
@@ -366,12 +391,14 @@ impl LifecycleEvent {
             }
             Self::WindowRenamed { target }
             | Self::WindowLayoutChanged { target }
+            | Self::WindowResized { target }
             | Self::WindowPaneChanged { target }
             | Self::AlertBell { target }
             | Self::AlertActivity { target }
             | Self::AlertSilence { target }
             | Self::AfterSelectWindow { target } => Some(Target::Window(target.clone())),
             Self::PaneExited { target, .. }
+            | Self::PaneDied { target, .. }
             | Self::PaneModeChanged { target }
             | Self::AfterSelectPane { target }
             | Self::AfterSendKeys { target } => Some(Target::Pane(target.clone())),

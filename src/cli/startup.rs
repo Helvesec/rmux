@@ -2,9 +2,9 @@ use std::path::Path;
 
 use rmux_client::AutoStartConfig;
 use rmux_server::{DaemonConfig, ServerDaemon};
-use tokio::runtime::Builder;
 
 use crate::cli_args::{Cli, Command, ConfigFileSelection, StartServerArgs};
+use crate::server_runtime::build_daemon_runtime;
 
 use super::ExitFailure;
 
@@ -22,10 +22,19 @@ impl StartupOptions {
         }
     }
 
-    pub(in crate::cli) fn for_command(&self, command_has_start_server_flag: bool) -> Self {
+    pub(in crate::cli) fn for_command(
+        &self,
+        command_has_start_server_flag: bool,
+        command_requires_web: bool,
+    ) -> Self {
+        let config = if command_requires_web {
+            self.config.clone().with_web_required()
+        } else {
+            self.config.clone()
+        };
         Self {
             no_start_server: self.no_start_server || !command_has_start_server_flag,
-            config: self.config.clone(),
+            config,
         }
     }
 }
@@ -142,10 +151,7 @@ pub(super) fn run_foreground_server(
         ),
         startup_config,
     );
-    let runtime = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| ExitFailure::new(1, error.to_string()))?;
+    let runtime = build_daemon_runtime().map_err(|error| ExitFailure::new(1, error.to_string()))?;
 
     runtime
         .block_on(async move {

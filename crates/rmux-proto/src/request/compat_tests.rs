@@ -1,10 +1,12 @@
 use super::{
-    NewSessionExtRequest, NewWindowRequest, RespawnPaneRequest, RespawnWindowRequest,
+    DisplayMessageExtRequest, DisplayMessageRequest, LastPaneRequest, MoveWindowRequest,
+    MoveWindowTarget, NewSessionExtRequest, NewWindowRequest, RespawnPaneRequest,
+    RespawnWindowRequest, SelectPaneAdjacentRequest, SelectPaneRequest, SetOptionByNameRequest,
     ShowOptionsRequest, SplitWindowExtRequest, SplitWindowTarget,
 };
 use crate::{
-    OptionScopeSelector, PaneTarget, ProcessCommand, SessionName, SplitDirection, TerminalSize,
-    WindowTarget,
+    OptionScopeSelector, PaneTarget, ProcessCommand, SelectPaneDirection, SessionName,
+    SetOptionMode, SplitDirection, Target, TerminalSize, WindowTarget,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -61,10 +63,63 @@ struct OldNewSessionExtRequest {
 }
 
 #[derive(Serialize)]
+struct OldDisplayMessageRequest {
+    target: Option<Target>,
+    print: bool,
+    message: Option<String>,
+}
+
+#[derive(Serialize)]
+struct OldDisplayMessageExtRequest {
+    target: Option<Target>,
+    print: bool,
+    message: Option<String>,
+    target_client: Option<String>,
+}
+
+#[derive(Serialize)]
 struct OldShowOptionsRequest {
     scope: OptionScopeSelector,
     name: Option<String>,
     value_only: bool,
+}
+
+#[derive(Serialize)]
+struct OldSetOptionByNameRequest {
+    scope: OptionScopeSelector,
+    name: String,
+    value: Option<String>,
+    mode: SetOptionMode,
+    only_if_unset: bool,
+    unset: bool,
+    unset_pane_overrides: bool,
+}
+
+#[derive(Serialize)]
+struct OldMoveWindowRequest {
+    source: Option<WindowTarget>,
+    target: MoveWindowTarget,
+    renumber: bool,
+    kill_destination: bool,
+    detached: bool,
+}
+
+#[derive(Serialize)]
+struct OldLastPaneRequest {
+    target: WindowTarget,
+}
+
+#[derive(Serialize)]
+struct OldSelectPaneRequest {
+    target: PaneTarget,
+    title: Option<String>,
+    input_disabled: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct OldSelectPaneAdjacentRequest {
+    target: PaneTarget,
+    direction: SelectPaneDirection,
 }
 
 fn session_name(value: &str) -> SessionName {
@@ -177,6 +232,48 @@ fn split_window_ext_request_deserializes_old_payloads_with_defaulted_fields() {
     assert!(!decoded.detached);
     assert_eq!(decoded.size, None);
     assert!(!decoded.preserve_zoom);
+    assert!(!decoded.full_size);
+}
+
+#[test]
+fn display_message_requests_deserialize_old_payloads_with_defaulted_fields() {
+    let target = Some(Target::Pane(PaneTarget::with_window(
+        session_name("alpha"),
+        0,
+        1,
+    )));
+    let bytes = bincode::serialize(&OldDisplayMessageRequest {
+        target: target.clone(),
+        print: true,
+        message: Some("#{pane_id}".to_owned()),
+    })
+    .expect("old display-message request serializes");
+
+    let decoded: DisplayMessageRequest =
+        bincode::deserialize(&bytes).expect("new request decodes old payload");
+
+    assert_eq!(decoded.target, target);
+    assert!(decoded.print);
+    assert_eq!(decoded.message.as_deref(), Some("#{pane_id}"));
+    assert!(!decoded.empty_target_context);
+
+    let ext_target = Some(Target::Session(session_name("alpha")));
+    let bytes = bincode::serialize(&OldDisplayMessageExtRequest {
+        target: ext_target.clone(),
+        print: false,
+        message: Some("#{client_name}".to_owned()),
+        target_client: Some("client".to_owned()),
+    })
+    .expect("old display-message-ext request serializes");
+
+    let decoded: DisplayMessageExtRequest =
+        bincode::deserialize(&bytes).expect("new request decodes old payload");
+
+    assert_eq!(decoded.target, ext_target);
+    assert!(!decoded.print);
+    assert_eq!(decoded.message.as_deref(), Some("#{client_name}"));
+    assert_eq!(decoded.target_client.as_deref(), Some("client"));
+    assert!(!decoded.empty_target_context);
 }
 
 #[test]
@@ -194,6 +291,8 @@ fn split_window_ext_request_round_trips_current_payload_fields() {
         detached: true,
         size: Some("5".to_owned()),
         preserve_zoom: true,
+        full_size: true,
+        stdin_payload: None,
     };
 
     let decoded: SplitWindowExtRequest =
@@ -205,6 +304,60 @@ fn split_window_ext_request_round_trips_current_payload_fields() {
     assert!(decoded.detached);
     assert_eq!(decoded.size.as_deref(), Some("5"));
     assert!(decoded.preserve_zoom);
+    assert!(decoded.full_size);
+}
+
+#[test]
+fn last_pane_request_deserializes_old_payloads_with_defaulted_fields() {
+    let target = WindowTarget::with_window(session_name("alpha"), 0);
+    let bytes = bincode::serialize(&OldLastPaneRequest {
+        target: target.clone(),
+    })
+    .expect("old last-pane request serializes");
+
+    let decoded: LastPaneRequest =
+        bincode::deserialize(&bytes).expect("new request decodes old payload");
+
+    assert_eq!(decoded.target, target);
+    assert!(!decoded.preserve_zoom);
+    assert_eq!(decoded.input_disabled, None);
+}
+
+#[test]
+fn select_pane_request_deserializes_old_payloads_with_defaulted_fields() {
+    let target = PaneTarget::with_window(session_name("alpha"), 0, 1);
+    let bytes = bincode::serialize(&OldSelectPaneRequest {
+        target: target.clone(),
+        title: Some("logs".to_owned()),
+        input_disabled: None,
+    })
+    .expect("old select-pane request serializes");
+
+    let decoded: SelectPaneRequest =
+        bincode::deserialize(&bytes).expect("new request decodes old payload");
+
+    assert_eq!(decoded.target, target);
+    assert_eq!(decoded.title.as_deref(), Some("logs"));
+    assert_eq!(decoded.input_disabled, None);
+    assert!(!decoded.preserve_zoom);
+    assert_eq!(decoded.style, None);
+}
+
+#[test]
+fn select_pane_adjacent_request_deserializes_old_payloads_with_defaulted_fields() {
+    let target = PaneTarget::with_window(session_name("alpha"), 0, 1);
+    let bytes = bincode::serialize(&OldSelectPaneAdjacentRequest {
+        target: target.clone(),
+        direction: SelectPaneDirection::Left,
+    })
+    .expect("old select-pane-adjacent request serializes");
+
+    let decoded: SelectPaneAdjacentRequest =
+        bincode::deserialize(&bytes).expect("new request decodes old payload");
+
+    assert_eq!(decoded.target, target);
+    assert_eq!(decoded.direction, SelectPaneDirection::Left);
+    assert!(!decoded.preserve_zoom);
 }
 
 #[test]
@@ -261,6 +414,7 @@ fn new_session_ext_request_deserializes_old_payloads_with_defaulted_fields() {
     assert_eq!(decoded.command, Some(vec!["printf ready".to_owned()]));
     assert_eq!(decoded.process_command, None);
     assert_eq!(decoded.client_environment, None);
+    assert!(!decoded.skip_environment_update);
 }
 
 #[test]
@@ -280,4 +434,58 @@ fn show_options_request_deserializes_old_payloads_with_defaulted_fields() {
     assert_eq!(decoded.name.as_deref(), Some("status-left"));
     assert!(decoded.value_only);
     assert!(!decoded.include_inherited);
+    assert!(!decoded.quiet);
+}
+
+#[test]
+fn set_option_by_name_request_deserializes_old_payloads_with_defaulted_fields() {
+    let scope = OptionScopeSelector::SessionGlobal;
+    let bytes = bincode::serialize(&OldSetOptionByNameRequest {
+        scope: scope.clone(),
+        name: "@probe".to_owned(),
+        value: Some("#{session_name}".to_owned()),
+        mode: SetOptionMode::Replace,
+        only_if_unset: false,
+        unset: false,
+        unset_pane_overrides: false,
+    })
+    .expect("old set-option-by-name request serializes");
+
+    let decoded: SetOptionByNameRequest =
+        bincode::deserialize(&bytes).expect("new request decodes old payload");
+
+    assert_eq!(decoded.scope, scope);
+    assert_eq!(decoded.name, "@probe");
+    assert_eq!(decoded.value.as_deref(), Some("#{session_name}"));
+    assert_eq!(decoded.mode, SetOptionMode::Replace);
+    assert!(!decoded.only_if_unset);
+    assert!(!decoded.unset);
+    assert!(!decoded.unset_pane_overrides);
+    assert!(!decoded.format);
+    assert_eq!(decoded.format_target, None);
+}
+
+#[test]
+fn move_window_request_deserializes_old_payloads_with_defaulted_fields() {
+    let source = WindowTarget::with_window(session_name("alpha"), 0);
+    let target = WindowTarget::with_window(session_name("alpha"), 1);
+    let bytes = bincode::serialize(&OldMoveWindowRequest {
+        source: Some(source.clone()),
+        target: MoveWindowTarget::Window(target.clone()),
+        renumber: false,
+        kill_destination: true,
+        detached: false,
+    })
+    .expect("old move-window request serializes");
+
+    let decoded: MoveWindowRequest =
+        bincode::deserialize(&bytes).expect("new request decodes old payload");
+
+    assert_eq!(decoded.source, Some(source));
+    assert_eq!(decoded.target, MoveWindowTarget::Window(target));
+    assert!(!decoded.renumber);
+    assert!(decoded.kill_destination);
+    assert!(!decoded.detached);
+    assert!(!decoded.after);
+    assert!(!decoded.before);
 }

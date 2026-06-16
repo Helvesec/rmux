@@ -1,5 +1,7 @@
+use std::ffi::OsString;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -7,6 +9,12 @@ use std::time::Duration;
 use super::{StartupError, SOCKET_DIRECTORY_MODE, UNSAFE_PERMISSION_MASK};
 
 const STALE_PROBE_TIMEOUT: Duration = Duration::from_millis(50);
+const CUSTOM_SOCKET_PARENT_UNSAFE_PERMISSION_MASK: u32 = 0o022;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PreparedSocketParent {
+    pub(super) lock_path: PathBuf,
+}
 
 pub(super) fn reject_socket_symlink(socket_path: &Path) -> Result<(), StartupError> {
     match fs::symlink_metadata(socket_path) {
@@ -34,6 +42,123 @@ pub(super) fn startup_lock_path(socket_path: &Path) -> PathBuf {
         .map(Path::to_path_buf)
         .unwrap_or_default();
     parent.join(lock_name)
+}
+
+pub(super) fn prepare_socket_parent(
+    socket_path: &Path,
+    parent: &Path,
+    owner_uid: u32,
+) -> Result<PreparedSocketParent, StartupError> {
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            prepare_symlinked_socket_parent(socket_path, parent, owner_uid)
+        }
+        Ok(metadata) if is_shared_sticky_directory(&metadata, owner_uid) => {
+            let lock_dir = shared_startup_lock_dir(parent, owner_uid);
+            ensure_owner_only_directory(&lock_dir, owner_uid)?;
+            Ok(PreparedSocketParent {
+                lock_path: startup_lock_path_in_dir(socket_path, &lock_dir),
+            })
+        }
+        Ok(metadata) => {
+            if is_default_owner_socket_directory(parent, owner_uid) {
+                validate_directory_metadata(parent, &metadata, owner_uid)?;
+            } else {
+                validate_existing_socket_parent(parent, &metadata, owner_uid)?;
+            }
+            Ok(PreparedSocketParent {
+                lock_path: startup_lock_path(socket_path),
+            })
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            ensure_owner_only_directory(parent, owner_uid)?;
+            Ok(PreparedSocketParent {
+                lock_path: startup_lock_path(socket_path),
+            })
+        }
+        Err(error) => Err(StartupError::Filesystem {
+            operation: "stat socket parent directory",
+            path: parent.to_path_buf(),
+            source: error,
+        }),
+    }
+}
+
+fn prepare_symlinked_socket_parent(
+    socket_path: &Path,
+    parent: &Path,
+    owner_uid: u32,
+) -> Result<PreparedSocketParent, StartupError> {
+    let metadata = fs::metadata(parent).map_err(|error| StartupError::Filesystem {
+        operation: "stat resolved socket parent directory",
+        path: parent.to_path_buf(),
+        source: error,
+    })?;
+
+    if !is_shared_sticky_directory(&metadata, owner_uid) {
+        return Err(StartupError::SymlinkRejected {
+            path: parent.to_path_buf(),
+        });
+    }
+
+    let lock_dir = shared_startup_lock_dir(parent, owner_uid);
+    ensure_owner_only_directory(&lock_dir, owner_uid)?;
+    Ok(PreparedSocketParent {
+        lock_path: startup_lock_path_in_dir(socket_path, &lock_dir),
+    })
+}
+
+fn is_shared_sticky_directory(metadata: &fs::Metadata, owner_uid: u32) -> bool {
+    metadata.file_type().is_dir()
+        && metadata.uid() != owner_uid
+        && has_mode_bit(metadata.mode(), libc::S_ISVTX)
+        && metadata.mode() & 0o022 != 0
+}
+
+pub(super) fn has_mode_bit<T>(mode: u32, bit: T) -> bool
+where
+    T: Into<u32>,
+{
+    mode & bit.into() != 0
+}
+
+fn shared_startup_lock_dir(parent: &Path, owner_uid: u32) -> PathBuf {
+    parent
+        .join(format!("rmux-{owner_uid}"))
+        .join("startup-locks")
+}
+
+fn is_default_owner_socket_directory(parent: &Path, owner_uid: u32) -> bool {
+    parent
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == format!("rmux-{owner_uid}"))
+}
+
+fn startup_lock_path_in_dir(socket_path: &Path, lock_dir: &Path) -> PathBuf {
+    let mut lock_name = OsString::new();
+    if let Some(file_name) = socket_path.file_name() {
+        lock_name.push(file_name);
+    } else {
+        lock_name.push("socket");
+    }
+    lock_name.push(format!(
+        ".{:016x}.startup-lock",
+        stable_path_hash(socket_path)
+    ));
+    lock_dir.join(lock_name)
+}
+
+fn stable_path_hash(path: &Path) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001b3;
+
+    let mut hash = FNV_OFFSET;
+    for byte in path.as_os_str().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
 }
 
 pub(super) fn ensure_owner_only_directory(path: &Path, owner_uid: u32) -> Result<(), StartupError> {
@@ -105,6 +230,44 @@ fn validate_directory_metadata(
                 mode,
             });
         }
+    }
+    Ok(())
+}
+
+fn validate_existing_socket_parent(
+    path: &Path,
+    metadata: &fs::Metadata,
+    owner_uid: u32,
+) -> Result<(), StartupError> {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(StartupError::SymlinkRejected {
+            path: path.to_path_buf(),
+        });
+    }
+    if !file_type.is_dir() {
+        return Err(StartupError::Filesystem {
+            operation: "ensure socket parent directory",
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "expected a directory at this path",
+            ),
+        });
+    }
+    if metadata.uid() != owner_uid {
+        return Err(StartupError::UnsafeOwner {
+            path: path.to_path_buf(),
+            expected_uid: owner_uid,
+            actual_uid: metadata.uid(),
+        });
+    }
+    let mode = metadata.mode() & 0o7777;
+    if mode & CUSTOM_SOCKET_PARENT_UNSAFE_PERMISSION_MASK != 0 {
+        return Err(StartupError::UnsafePermissions {
+            path: path.to_path_buf(),
+            mode,
+        });
     }
     Ok(())
 }

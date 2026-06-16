@@ -90,8 +90,10 @@ pub fn render_dec_modes(mode_bits: u32, cursor_style: u32, out: &mut Vec<u8>) {
         out.extend_from_slice(b"\x1b[?1005h");
     }
 
-    // modifyOtherKeys (xterm `CSI > 4 ; n m`).
-    if on(mode::MODE_KEYS_EXTENDED_2) {
+    // Keyboard enhancement protocols.
+    if on(mode::MODE_KEYS_KITTY) {
+        out.extend_from_slice(b"\x1b[>1u");
+    } else if on(mode::MODE_KEYS_EXTENDED_2) {
         out.extend_from_slice(b"\x1b[>4;2m");
     } else if on(mode::MODE_KEYS_EXTENDED) {
         out.extend_from_slice(b"\x1b[>4;1m");
@@ -173,11 +175,14 @@ pub fn render_dec_modes_for_snapshot(mode_bits: u32, cursor_style: u32, out: &mu
         out.extend_from_slice(b"\x1b[?1005h");
     }
 
-    if on(mode::MODE_KEYS_EXTENDED_2) {
+    if on(mode::MODE_KEYS_KITTY) {
+        out.extend_from_slice(b"\x1b[>1u");
+    } else if on(mode::MODE_KEYS_EXTENDED_2) {
         out.extend_from_slice(b"\x1b[>4;2m");
     } else if on(mode::MODE_KEYS_EXTENDED) {
         out.extend_from_slice(b"\x1b[>4;1m");
     } else {
+        out.extend_from_slice(b"\x1b[<u");
         out.extend_from_slice(b"\x1b[>4;0m");
     }
 
@@ -243,6 +248,17 @@ mod tests {
     }
 
     #[test]
+    fn kitty_keyboard_mode_is_reasserted_as_csi_u() {
+        let bits = mode::MODE_CURSOR
+            | mode::MODE_WRAP
+            | mode::MODE_KEYS_EXTENDED_2
+            | mode::MODE_KEYS_KITTY;
+        let out = rendered(bits, 0);
+        assert!(out.contains("\x1b[>1u"), "{out:?}");
+        assert!(!out.contains("\x1b[>4;2m"), "{out:?}");
+    }
+
+    #[test]
     fn snapshot_mode_render_clears_stale_transient_modes() {
         let mut out = Vec::new();
         render_dec_modes_for_snapshot(mode::MODE_CURSOR | mode::MODE_WRAP, 0, &mut out);
@@ -251,6 +267,7 @@ mod tests {
         assert!(out.contains("\x1b[?2026l"), "{out:?}");
         assert!(out.contains("\x1b[?2004l"), "{out:?}");
         assert!(out.contains("\x1b[?1006l"), "{out:?}");
+        assert!(out.contains("\x1b[<u"), "{out:?}");
         assert!(out.contains("\x1b[>4;0m"), "{out:?}");
         assert!(out.contains("\x1b[0 q"), "{out:?}");
         assert!(!out.contains("\x1b[?2026h"), "{out:?}");
@@ -273,5 +290,19 @@ mod tests {
         assert!(out.contains("\x1b[?2004h"), "{out:?}");
         assert!(out.contains("\x1b[>4;2m"), "{out:?}");
         assert!(out.contains("\x1b[4 q"), "{out:?}");
+    }
+
+    #[test]
+    fn snapshot_mode_render_prefers_kitty_keyboard_over_xterm_modifier_mode() {
+        let bits = mode::MODE_CURSOR
+            | mode::MODE_WRAP
+            | mode::MODE_KEYS_EXTENDED_2
+            | mode::MODE_KEYS_KITTY;
+        let mut out = Vec::new();
+        render_dec_modes_for_snapshot(bits, 0, &mut out);
+        let out = String::from_utf8(out).expect("snapshot modes are ascii");
+
+        assert!(out.contains("\x1b[>1u"), "{out:?}");
+        assert!(!out.contains("\x1b[>4;2m"), "{out:?}");
     }
 }

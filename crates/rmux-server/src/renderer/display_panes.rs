@@ -1,6 +1,8 @@
 use rmux_core::{OptionStore, Pane, PaneGeometry, Session, Window};
 use rmux_proto::{OptionName, PaneTarget};
 
+use crate::pane_visible_geometry::visible_pane_content_geometry;
+
 const DISPLAY_PANE_GLYPHS: [[[u8; 5]; 5]; 10] = [
     [
         [1, 1, 1, 1, 1],
@@ -347,15 +349,28 @@ fn visible_pane_geometry(
             return None;
         }
         let size = geometry.content_size();
+        let pane = visible_pane_content_geometry(
+            options,
+            session.name(),
+            session.active_window_index(),
+            PaneGeometry::new(0, 0, size.cols, size.rows),
+            geometry.content_rows,
+        );
         return Some(PaneGeometry::new(
-            0,
-            geometry.content_y_offset,
-            size.cols,
-            size.rows,
+            pane.x(),
+            pane.y().saturating_add(geometry.content_y_offset),
+            pane.cols(),
+            pane.rows(),
         ));
     }
 
-    let pane = super::content_pane_geometry(pane, geometry.content_rows);
+    let pane = visible_pane_content_geometry(
+        options,
+        session.name(),
+        session.active_window_index(),
+        pane.geometry(),
+        geometry.content_rows,
+    );
     Some(PaneGeometry::new(
         pane.x(),
         pane.y().saturating_add(geometry.content_y_offset),

@@ -56,7 +56,7 @@ async fn source_file_handles_crlf_backslash_continuations() {
 
     assert_eq!(
         response,
-        Response::SourceFile(rmux_proto::SourceFileResponse { output: None })
+        Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
     );
     assert_eq!(
         handler
@@ -105,6 +105,229 @@ async fn source_file_parse_only_reports_parse_without_executing() {
 }
 
 #[tokio::test]
+async fn source_file_parse_only_validates_command_flags_without_executing() {
+    let handler = RequestHandler::new();
+    let root = temp_root("parse-only-invalid-command");
+    let config = root.join("main.conf");
+    write_config(&config, "new-window -Q\nset-buffer -b parsed value\n");
+
+    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.parse_only = true;
+
+    let response = handler.handle(Request::SourceFile(request)).await;
+
+    let Response::Error(response) = response else {
+        panic!("expected source-file -n to reject invalid command flags");
+    };
+    assert!(
+        response
+            .error
+            .to_string()
+            .contains("command new-window: unknown flag -Q"),
+        "{}",
+        response.error
+    );
+    assert!(matches!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("parsed".to_owned()),
+            }))
+            .await,
+        Response::Error(_)
+    ));
+}
+
+#[tokio::test]
+async fn source_file_parse_only_validates_nested_source_files_without_executing() {
+    let handler = RequestHandler::new();
+    let root = temp_root("parse-only-nested-source");
+    write_config(
+        &root.join("main.conf"),
+        "source-file inner.conf\nset-buffer -b outer parsed\n",
+    );
+    write_config(
+        &root.join("inner.conf"),
+        "set-buffer -b inner parsed\nnew-window -Q\n",
+    );
+
+    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.parse_only = true;
+
+    let Response::Error(response) = handler.handle(Request::SourceFile(request)).await else {
+        panic!("expected source-file -n to reject nested invalid command flags");
+    };
+    assert!(
+        response.error.to_string().contains("inner.conf:2:")
+            && response
+                .error
+                .to_string()
+                .contains("command new-window: unknown flag -Q"),
+        "{}",
+        response.error
+    );
+    for name in ["inner", "outer"] {
+        assert!(matches!(
+            handler
+                .handle(Request::ShowBuffer(ShowBufferRequest {
+                    name: Some(name.to_owned()),
+                }))
+                .await,
+            Response::Error(_)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn source_file_parse_only_aggregates_command_validation_errors() {
+    let handler = RequestHandler::new();
+    let root = temp_root("parse-only-aggregate-errors");
+    write_config(
+        &root.join("main.conf"),
+        "new-window -Q\nserver-access --help\n",
+    );
+
+    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.parse_only = true;
+
+    let Response::Error(response) = handler.handle(Request::SourceFile(request)).await else {
+        panic!("expected source-file -n to aggregate invalid command flags");
+    };
+    let message = response.error.to_string();
+    assert!(
+        message.contains("main.conf:1: command new-window: unknown flag -Q"),
+        "{message}"
+    );
+    assert!(
+        message.contains("main.conf:2: command server-access: unknown flag --help"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn source_file_parse_only_validates_nested_command_blocks() {
+    let handler = RequestHandler::new();
+    let root = temp_root("parse-only-command-block");
+    write_config(
+        &root.join("main.conf"),
+        "if-shell -F 1 { new-window -Q }\nset-buffer -b after parsed\n",
+    );
+
+    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.parse_only = true;
+
+    let Response::Error(response) = handler.handle(Request::SourceFile(request)).await else {
+        panic!("expected source-file -n to reject invalid command inside block");
+    };
+    assert!(
+        response
+            .error
+            .to_string()
+            .contains("main.conf:1: command new-window: unknown flag -Q"),
+        "{}",
+        response.error
+    );
+    assert!(matches!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("after".to_owned()),
+            }))
+            .await,
+        Response::Error(_)
+    ));
+}
+
+#[tokio::test]
+async fn source_file_parse_only_validates_embedded_binding_and_hook_commands() {
+    let handler = RequestHandler::new();
+    let root = temp_root("parse-only-embedded-commands");
+    write_config(
+        &root.join("main.conf"),
+        "bind-key X { new-window -Q }\nset-hook -g after-new-session { server-access --help }\n",
+    );
+
+    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.parse_only = true;
+
+    let Response::Error(response) = handler.handle(Request::SourceFile(request)).await else {
+        panic!("expected source-file -n to reject invalid embedded commands");
+    };
+    let message = response.error.to_string();
+    assert!(
+        message.contains("main.conf:1: command new-window: unknown flag -Q"),
+        "{message}"
+    );
+    assert!(
+        message.contains("main.conf:1: command server-access: unknown flag --help"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+async fn source_file_parse_only_preserves_bind_key_quoted_semicolons() {
+    let handler = RequestHandler::new();
+    let root = temp_root("parse-only-bind-key-quoted-semicolon");
+    write_config(
+        &root.join("main.conf"),
+        "bind-key X display-message \"foo; new-window -Q\"\n",
+    );
+
+    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.parse_only = true;
+
+    assert_eq!(
+        handler.handle(Request::SourceFile(request)).await,
+        Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
+    );
+}
+
+#[tokio::test]
+async fn source_file_parse_only_rejects_server_access_help_and_bare_dash() {
+    let handler = RequestHandler::new();
+    let root = temp_root("parse-only-server-access-flags");
+    write_config(
+        &root.join("main.conf"),
+        "server-access --help\nserver-access -\n",
+    );
+
+    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.parse_only = true;
+
+    let Response::Error(response) = handler.handle(Request::SourceFile(request)).await else {
+        panic!("expected source-file -n to reject invalid server-access flags");
+    };
+    let message = response.error.to_string();
+    assert!(
+        message.contains("main.conf:1: command server-access: unknown flag --help"),
+        "{message}"
+    );
+    assert!(
+        message.contains("main.conf:2: command server-access: invalid flag -"),
+        "{message}"
+    );
+}
+
+#[tokio::test]
 async fn source_file_quiet_suppresses_missing_file_and_glob_miss() {
     let handler = RequestHandler::new();
     let root = temp_root("quiet");
@@ -118,7 +341,7 @@ async fn source_file_quiet_suppresses_missing_file_and_glob_miss() {
 
     assert_eq!(
         handler.handle(Request::SourceFile(request)).await,
-        Response::SourceFile(rmux_proto::SourceFileResponse { output: None })
+        Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
     );
 }
 
@@ -156,7 +379,7 @@ async fn source_file_format_expands_path_against_target_context() {
 
     assert_eq!(
         response,
-        Response::SourceFile(rmux_proto::SourceFileResponse { output: None })
+        Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
     );
     assert_eq!(
         handler
@@ -208,7 +431,7 @@ async fn source_file_if_condition_uses_target_format_context_at_parse_time() {
 
     assert_eq!(
         response,
-        Response::SourceFile(rmux_proto::SourceFileResponse { output: None })
+        Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
     );
     assert_eq!(
         handler
@@ -241,7 +464,7 @@ async fn nested_source_file_format_expansion_sees_current_file() {
 
     assert_eq!(
         response,
-        Response::SourceFile(rmux_proto::SourceFileResponse { output: None })
+        Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
     );
     assert_eq!(
         handler
@@ -253,6 +476,93 @@ async fn nested_source_file_format_expansion_sees_current_file() {
             .expect("current-file buffer output")
             .stdout(),
         b"ok"
+    );
+}
+
+#[tokio::test]
+async fn nested_source_file_format_path_inherits_current_target() {
+    let handler = RequestHandler::new();
+    let session = session_name("s");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let root = temp_root("nested-format-option-path");
+    write_config(
+        &root.join("main.conf"),
+        "set -g @name s\nsource-file -F '#{@name}.conf'\n",
+    );
+    write_config(&root.join("s.conf"), "set-buffer -b nested-target ok\n");
+
+    let response = handler
+        .handle(source_file_request(
+            vec!["main.conf".to_owned()],
+            Some(root),
+        ))
+        .await;
+
+    assert_eq!(
+        response,
+        Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
+    );
+    assert_eq!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("nested-target".to_owned()),
+            }))
+            .await
+            .command_output()
+            .expect("nested-target buffer output")
+            .stdout(),
+        b"ok"
+    );
+}
+
+#[tokio::test]
+async fn nested_source_file_preserves_implicit_target_canfail_behavior() {
+    let handler = RequestHandler::new();
+    for session in [session_name("alpha"), session_name("beta")] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session,
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
+
+    let root = temp_root("nested-source-implicit-canfail");
+    write_config(&root.join("main.conf"), "source-file inner.conf\n");
+    write_config(
+        &root.join("inner.conf"),
+        "display-message -p -t nosuch '#{session_name}:#{window_index}.#{pane_index}'\n",
+    );
+
+    let response = handler
+        .handle(source_file_request(
+            vec!["main.conf".to_owned()],
+            Some(root),
+        ))
+        .await;
+
+    assert_eq!(
+        response
+            .command_output()
+            .expect("nested source-file output")
+            .stdout(),
+        b":.\n"
     );
 }
 
@@ -270,12 +580,14 @@ async fn source_file_nested_limit_reports_too_many_nested_files() {
         ))
         .await;
 
-    assert!(matches!(
-        response,
-        Response::Error(rmux_proto::ErrorResponse { error
-            })
-            if error.to_string().contains("too many nested files")
-    ));
+    let Response::Error(error) = response else {
+        panic!("source-file should report recursion limit, got {response:?}");
+    };
+    assert!(
+        error.error.to_string().contains("too many nested files"),
+        "unexpected error: {:?}",
+        error
+    );
 }
 
 #[tokio::test]
@@ -291,7 +603,14 @@ async fn source_file_non_quiet_rejects_empty_glob_pattern() {
         ))
         .await;
 
-    assert!(matches!(response, Response::Error(_)));
+    let Response::Error(error) = response else {
+        panic!("source-file should report empty glob, got {response:?}");
+    };
+    assert!(
+        error.error.to_string().contains("nonexistent*.conf"),
+        "unexpected error: {:?}",
+        error
+    );
 }
 
 #[tokio::test]
@@ -310,7 +629,7 @@ async fn source_file_multiple_paths_loads_all_in_order() {
 
     assert_eq!(
         response,
-        Response::SourceFile(rmux_proto::SourceFileResponse { output: None })
+        Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
     );
     assert_eq!(
         handler
@@ -344,15 +663,17 @@ async fn source_file_continues_after_missing_paths_and_reports_one_clean_error_p
         ))
         .await;
 
-    match response {
-        Response::Error(rmux_proto::ErrorResponse { error }) => {
-            assert_eq!(
-                error.to_string(),
-                "server error: missing-a.conf: No such file or directory\nmissing-b.conf: No such file or directory"
-            );
-        }
-        other => panic!("expected source-file error, got {other:?}"),
-    }
+    let Response::Error(error) = response else {
+        panic!("source-file should report missing paths, got {response:?}");
+    };
+    assert!(
+        matches!(
+            error.error,
+            rmux_proto::RmuxError::Server(ref message)
+                if message == "missing-a.conf: No such file or directory\nmissing-b.conf: No such file or directory"
+        ),
+        "unexpected missing-path error: {error:?}"
+    );
     assert_eq!(
         handler
             .handle(Request::ShowBuffer(ShowBufferRequest {
@@ -363,5 +684,56 @@ async fn source_file_continues_after_missing_paths_and_reports_one_clean_error_p
             .expect("multi buffer output")
             .stdout(),
         b"second"
+    );
+}
+
+#[tokio::test]
+async fn source_file_continues_after_runtime_errors_and_reports_error() {
+    let handler = RequestHandler::new();
+    let root = temp_root("runtime-error-continues");
+    write_config(
+        &root.join("runtime.conf"),
+        "source-file /definitely/missing.conf\ndisplay-message -p after\nset-option -g @after_runtime yes\n",
+    );
+
+    let response = handler
+        .handle(source_file_request(
+            vec!["runtime.conf".to_owned()],
+            Some(root),
+        ))
+        .await;
+
+    let Response::SourceFile(response) = response else {
+        panic!("source-file should report nested runtime error, got {response:?}");
+    };
+    assert_eq!(response.exit_status(), Some(1));
+    let output = response
+        .command_output()
+        .expect("source-file should preserve later stdout")
+        .stdout();
+    assert!(
+        String::from_utf8_lossy(output).contains("after\n"),
+        "source-file should preserve later stdout, got {}",
+        String::from_utf8_lossy(output)
+    );
+    assert!(
+        String::from_utf8_lossy(output).contains("definitely/missing.conf"),
+        "source-file should keep runtime error visible, got {}",
+        String::from_utf8_lossy(output)
+    );
+    assert_eq!(
+        handler
+            .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
+                scope: OptionScopeSelector::SessionGlobal,
+                name: Some("@after_runtime".to_owned()),
+                value_only: true,
+                include_inherited: false,
+                quiet: false,
+            }))
+            .await
+            .command_output()
+            .expect("show-options output")
+            .stdout(),
+        b"yes\n"
     );
 }

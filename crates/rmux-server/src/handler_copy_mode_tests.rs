@@ -193,6 +193,8 @@ async fn set_copy_command(handler: &RequestHandler, command: String) {
             only_if_unset: false,
             unset: false,
             unset_pane_overrides: false,
+            format: false,
+            format_target: None,
         }))
         .await;
     assert!(

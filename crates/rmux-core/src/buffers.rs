@@ -213,15 +213,15 @@ impl BufferStore {
 
     /// Deletes a buffer by name.
     ///
-    /// When `name` is `None`, deletes the stack-head buffer.
+    /// When `name` is `None`, deletes the most recent automatic buffer.
     /// Returns the name of the deleted buffer.
     pub fn delete(&mut self, name: Option<&str>) -> Result<String, RmuxError> {
         let target = match name {
             Some(name) => name.to_owned(),
             None => self
-                .stack_head()
+                .top_unnamed()
                 .map(str::to_owned)
-                .ok_or_else(|| RmuxError::Server("no buffers".to_owned()))?,
+                .ok_or_else(|| RmuxError::Server("no buffer".to_owned()))?,
         };
 
         if self.buffers.remove(&target).is_none() {
@@ -248,8 +248,8 @@ impl BufferStore {
         }
     }
 
-    /// Returns the content of a buffer by name, or the stack-head buffer when
-    /// `name` is `None`.
+    /// Returns the content of a buffer by name, or the most recent automatic
+    /// buffer when `name` is `None`.
     pub fn show(&self, name: Option<&str>) -> Result<(&str, &[u8]), RmuxError> {
         let (name, content, _) = self.show_with_order(name)?;
         Ok((name, content))
@@ -265,7 +265,7 @@ impl BufferStore {
                 name.to_owned()
             }
             None => self
-                .stack_head()
+                .top_unnamed()
                 .ok_or_else(|| RmuxError::Server("no buffers".to_owned()))?
                 .to_owned(),
         };

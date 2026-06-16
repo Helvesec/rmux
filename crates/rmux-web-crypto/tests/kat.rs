@@ -5,11 +5,14 @@ use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use hex_literal::hex;
 use hkdf::Hkdf;
+use libcrux_ml_kem::mlkem768::{self, MlKem768Ciphertext, MlKem768PrivateKey};
 use rmux_web_crypto::ml_kem::{
     encapsulate, KeyPair, CIPHERTEXT_LEN, ENCAPSULATION_KEY_LEN, ENCAPS_RANDOMNESS_LEN,
     KEYGEN_RANDOMNESS_LEN, SHARED_SECRET_LEN,
 };
 use sha2::{Digest, Sha256};
+
+const DECAPSULATION_KEY_LEN: usize = 2400;
 
 /// RFC 5869, Appendix A, Test Case 1: HKDF-SHA256.
 ///
@@ -120,8 +123,27 @@ fn cctv_ml_kem_768_encapsulation() {
     assert_eq!(shared_secret, vector.k, "ML-KEM-768 shared secret mismatch");
 }
 
+/// C2SP CCTV ML-KEM-768 decapsulation vector.
+///
+/// Exercises decapsulation against a published private-key vector. The public
+/// rmux wrapper intentionally does not expose private-key import, so this test
+/// calls the same libcrux decapsulation surface with the external `dk`.
+#[test]
+fn cctv_ml_kem_768_decapsulation() {
+    let vector = MlKemVector::load();
+    let private_key = MlKem768PrivateKey::from(&vector.dk);
+    let ciphertext = MlKem768Ciphertext::from(&vector.c);
+
+    assert_eq!(
+        mlkem768::decapsulate(&private_key, &ciphertext),
+        vector.k,
+        "ML-KEM-768 decapsulated shared secret mismatch"
+    );
+}
+
 struct MlKemVector {
     ek: [u8; ENCAPSULATION_KEY_LEN],
+    dk: [u8; DECAPSULATION_KEY_LEN],
     m: [u8; ENCAPS_RANDOMNESS_LEN],
     k: [u8; SHARED_SECRET_LEN],
     c: [u8; CIPHERTEXT_LEN],
@@ -132,6 +154,7 @@ impl MlKemVector {
         let fixture = include_str!("vectors/ml_kem_768_cctv_unlucky.txt");
         Self {
             ek: fixture_hex(fixture, "ek"),
+            dk: fixture_hex(fixture, "dk"),
             m: fixture_hex(fixture, "m"),
             k: fixture_hex(fixture, "K"),
             c: fixture_hex(fixture, "c"),

@@ -58,6 +58,19 @@ fn show_environment_accepts_global_and_session_scope() {
 }
 
 #[test]
+fn set_environment_accepts_hyphen_prefixed_values() {
+    let cli = parse_args(&["set-environment", "TERM", "-screen"])
+        .expect("set-environment accepts hyphen-prefixed values");
+    match cli.command.expect("parsed command") {
+        super::Command::SetEnvironment(args) => {
+            assert_eq!(args.name, "TERM");
+            assert_eq!(args.value.as_deref(), Some("-screen"));
+        }
+        _ => panic!("expected SetEnvironment command"),
+    }
+}
+
+#[test]
 fn show_hooks_accepts_default_current_session_scope() {
     parse_args(&["show-hooks"]).expect("default show-hooks parses");
 }
@@ -102,6 +115,18 @@ fn expanded_option_surface_accepts_representative_options() {
         "on",
     ])
     .expect("set-window-option accepts session targets");
+
+    let cli = parse_args(&["set-option", "-gF", "@probe", "#{session_name}"])
+        .expect("set-option accepts format expansion");
+    match cli.command.expect("parsed command") {
+        super::Command::SetOption(args) => {
+            assert!(args.global);
+            assert!(args.format);
+            assert_eq!(args.option, "@probe");
+            assert_eq!(args.value.as_deref(), Some("#{session_name}"));
+        }
+        _ => panic!("expected SetOption command"),
+    }
 }
 
 #[test]

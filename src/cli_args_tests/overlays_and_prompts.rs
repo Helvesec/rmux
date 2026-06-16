@@ -96,7 +96,7 @@ fn display_popup_parses_overlay_flags_and_queue_command() {
         super::super::Command::DisplayPopup(args) => {
             assert!(args.no_border);
             assert!(args.close_all);
-            assert!(args.close_on_exit);
+            assert_eq!(args.close_on_exit, 1);
             assert!(args.close_on_key);
             assert!(args.no_title_border);
             assert_eq!(args.border_lines.as_deref(), Some("double"));
@@ -177,5 +177,19 @@ fn prompt_commands_accept_target_client_flags() {
             assert!(args.queue_command.contains("-t 99999"));
         }
         other => panic!("expected ConfirmBefore command, got {other:?}"),
+    }
+}
+
+#[test]
+fn command_prompt_rejects_tmux_invalid_short_flags() {
+    for flag in ["-e", "-l"] {
+        let error = parse_args(&["command-prompt", flag, "display-message hi"]).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("command command-prompt: unknown flag {flag}")),
+            "{error}"
+        );
     }
 }

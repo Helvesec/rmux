@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::io;
 use std::mem::{size_of, MaybeUninit};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::PathBuf;
+use std::ptr::null;
 
 use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
 use windows_sys::Win32::Foundation::{
@@ -11,6 +13,11 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
 use windows_sys::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, WaitForSingleObject,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
@@ -23,6 +30,78 @@ const MAX_ENVIRONMENT_WIDE_CHARS: usize = 32 * 1024;
 const ENVIRONMENT_READ_CHUNK_WIDE_CHARS: usize = 2048;
 const MAX_REMOTE_UNICODE_STRING_BYTES: usize = u16::MAX as usize - 1;
 
+/// Windows job object assigned to a child process so descendants can be
+/// terminated as one process tree.
+pub struct ProcessJob {
+    handle: OwnedHandle,
+}
+
+impl ProcessJob {
+    /// Creates a kill-on-close job object and assigns `child` to it.
+    pub fn for_child(child: &impl AsRawHandle) -> io::Result<Self> {
+        Self::for_raw_handle(child.as_raw_handle())
+    }
+
+    /// Creates a kill-on-close job object and assigns a live process handle to it.
+    pub fn for_raw_handle(process_handle: RawHandle) -> io::Result<Self> {
+        if process_handle.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "process handle is null",
+            ));
+        }
+        let handle = create_job_object()?;
+        // SAFETY: Both handles are live for the duration of the call. The API
+        // associates the process with the job without taking ownership.
+        let ok = unsafe {
+            AssignProcessToJobObject(handle.as_raw_handle() as HANDLE, process_handle as HANDLE)
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { handle })
+    }
+
+    /// Terminates every process currently assigned to this job object.
+    pub fn terminate(&self, exit_code: u32) -> io::Result<()> {
+        // SAFETY: `self.handle` is a live job handle owned by this guard; the
+        // API does not take ownership of it.
+        let ok = unsafe { TerminateJobObject(self.handle.as_raw_handle() as HANDLE, exit_code) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+fn create_job_object() -> io::Result<OwnedHandle> {
+    // SAFETY: Null security attributes and name request the default unnamed
+    // job object. The returned handle is checked before ownership transfer.
+    let handle = unsafe { CreateJobObjectW(null(), null()) };
+    if handle.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `CreateJobObjectW` returned a non-null owned handle and this
+    // function transfers it exactly once into `OwnedHandle`.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle as _) };
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: `handle` is a live job handle, `limits` points to an initialized
+    // structure of the declared size, and the API borrows it only for the call.
+    let ok = unsafe {
+        SetInformationJobObject(
+            handle.as_raw_handle() as HANDLE,
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const _,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(handle)
+}
+
 pub(super) fn current_path(pid: u32) -> io::Result<Option<String>> {
     let Some(process) = RemoteProcess::open_for_query_and_read(pid)? else {
         return Ok(None);
@@ -30,7 +109,9 @@ pub(super) fn current_path(pid: u32) -> io::Result<Option<String>> {
     let Some(parameters) = process.process_parameters()? else {
         return Ok(None);
     };
-    process.read_unicode_string(parameters.current_directory.dos_path)
+    Ok(process
+        .read_unicode_string(parameters.current_directory.dos_path)?
+        .map(trim_trailing_current_directory_separator))
 }
 
 pub(super) fn command_name(pid: u32) -> io::Result<Option<String>> {
@@ -59,6 +140,35 @@ pub(super) fn command_name(pid: u32) -> io::Result<Option<String>> {
 
 pub(super) fn fd_path(_pid: u32, _fd: i32) -> io::Result<Option<PathBuf>> {
     Ok(None)
+}
+
+fn trim_trailing_current_directory_separator(mut path: String) -> String {
+    while path.ends_with(['\\', '/']) && !is_windows_root_path(&path) {
+        path.pop();
+    }
+    path
+}
+
+fn is_windows_root_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.len() == 3 && bytes[1] == b':' && is_separator(bytes[2]) {
+        return bytes[0].is_ascii_alphabetic();
+    }
+    if !path.starts_with(r"\\") {
+        return false;
+    }
+    let without_trailing = path.trim_end_matches(['\\', '/']);
+    let Some(rest) = without_trailing.get(2..) else {
+        return false;
+    };
+    rest.split(['\\', '/'])
+        .filter(|part| !part.is_empty())
+        .count()
+        == 2
+}
+
+fn is_separator(byte: u8) -> bool {
+    byte == b'\\' || byte == b'/'
 }
 
 pub(super) fn is_live(pid: u32) -> io::Result<Option<bool>> {
@@ -570,6 +680,38 @@ mod tests {
         ] {
             assert_eq!(validate_remote_unicode_string(value), None);
         }
+    }
+
+    #[test]
+    fn trims_trailing_current_directory_separator_without_stripping_roots() {
+        assert_eq!(
+            trim_trailing_current_directory_separator(r"C:\Users\User\".to_owned()),
+            r"C:\Users\User"
+        );
+        assert_eq!(
+            trim_trailing_current_directory_separator(r"C:\".to_owned()),
+            r"C:\"
+        );
+        assert_eq!(
+            trim_trailing_current_directory_separator(r"\\server\share\project\".to_owned()),
+            r"\\server\share\project"
+        );
+        assert_eq!(
+            trim_trailing_current_directory_separator(r"\\server\share\".to_owned()),
+            r"\\server\share\"
+        );
+        assert_eq!(
+            trim_trailing_current_directory_separator("\\".to_owned()),
+            r""
+        );
+        assert_eq!(
+            trim_trailing_current_directory_separator("\\\\".to_owned()),
+            r""
+        );
+        assert_eq!(
+            trim_trailing_current_directory_separator("\\/".to_owned()),
+            r""
+        );
     }
 
     #[cfg(windows)]

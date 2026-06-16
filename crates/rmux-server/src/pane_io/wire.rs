@@ -3,8 +3,11 @@ use std::io;
 #[cfg(unix)]
 use std::time::Duration;
 
-use rmux_core::events::OutputCursorItem;
-use rmux_proto::{encode_attach_message, AttachFrameDecoder, AttachMessage};
+use rmux_core::events::{OutputCursorItem, OutputGap};
+use rmux_proto::{
+    encode_attach_data, encode_attach_data_into_slice, encode_attach_message, AttachFrameDecoder,
+    AttachMessage, ATTACH_DATA_HEADER_LEN,
+};
 #[cfg(unix)]
 use rmux_pty::PtyIo;
 #[cfg(unix)]
@@ -19,9 +22,8 @@ use super::attach_transport::{AttachTransport, TryAttachRead};
 use super::types::{AttachTarget, OpenAttachTarget, PaneOutputReceiver};
 
 #[cfg(unix)]
-// Eight 8 KiB immediate reads lets a pane deliver roughly 64 KiB of queued
-// output before yielding, which keeps startup snappy without monopolizing a
-// Tokio worker when a pane is producing sustained output.
+// Eight immediate 64 KiB reads amortize readiness wakeups under sustained PTY
+// output while still yielding regularly enough to keep other panes responsive.
 const MAX_IMMEDIATE_PANE_READS: usize = 8;
 #[cfg(unix)]
 const MAX_STARTUP_EIO_READS: usize = 256;
@@ -29,6 +31,7 @@ const MAX_STARTUP_EIO_READS: usize = 256;
 const STARTUP_EIO_YIELD_READS: usize = 8;
 #[cfg(unix)]
 const STARTUP_EIO_BACKOFF: Duration = Duration::from_millis(1);
+const STACK_ATTACH_DATA_PAYLOAD: usize = 1024;
 
 #[cfg(unix)]
 #[derive(Debug, Default)]
@@ -39,15 +42,21 @@ pub(super) struct PaneReadinessState {
     startup_eio_exhausted: bool,
 }
 
-pub(super) fn open_attach_target(target: AttachTarget) -> io::Result<OpenAttachTarget> {
+pub(super) fn open_attach_target(
+    target: AttachTarget,
+    render_stream: bool,
+) -> io::Result<OpenAttachTarget> {
     let AttachTarget {
         session_name,
+        input_target,
         pane_master,
         pane_output,
+        pane_output_start_sequence,
         render_frame,
         outer_terminal,
         cursor_style,
         active_pane_geometry,
+        raw_passthrough,
         kitty_graphics_passthrough,
         sixel_passthrough,
         persistent_overlay_state_id,
@@ -55,29 +64,30 @@ pub(super) fn open_attach_target(target: AttachTarget) -> io::Result<OpenAttachT
     } = target;
     Ok(OpenAttachTarget {
         session_name,
-        _pane_master: pane_master,
-        pane_output: Some(pane_output.subscribe()),
+        input_target,
+        pane_master,
+        predicted_echo: Default::default(),
+        predicted_echo_started_at: None,
+        pane_output: Some(pane_output.subscribe_live_from_sequence(pane_output_start_sequence)),
         render_frame,
         outer_terminal,
         cursor_style,
         active_pane_geometry,
+        raw_passthrough,
         kitty_graphics_passthrough,
         sixel_passthrough,
         persistent_overlay_state_id,
         live_pane,
+        render_stream,
     })
 }
 
 #[cfg(unix)]
-pub(super) fn open_pane_writer(pane_master: PtyMaster) -> io::Result<(AsyncFd<PtyIo>, PtyIo)> {
+pub(super) fn open_pane_writer(pane_master: PtyMaster) -> io::Result<AsyncFd<PtyIo>> {
     let pane_writer = pane_master.into_io();
-    let reply_writer = pane_writer.try_clone().map_err(io::Error::other)?;
-    // PtyIo::try_clone() uses dup(2), so both handles share one open file
-    // description. O_NONBLOCK applies to the reply writer too; Unix PTY writes
-    // go through unix_io::write_all(), which handles EAGAIN with poll().
     pane_writer.set_nonblocking()?;
 
-    Ok((AsyncFd::new(pane_writer)?, reply_writer))
+    AsyncFd::new(pane_writer)
 }
 
 pub(super) async fn emit_render_frame(
@@ -87,6 +97,23 @@ pub(super) async fn emit_render_frame(
 ) -> io::Result<()> {
     let frame = outer_terminal.wrap_render_frame(render_frame);
     emit_attach_bytes(stream, &frame).await
+}
+
+pub(super) async fn emit_coalescible_render_frame(
+    stream: &AttachTransport,
+    outer_terminal: &OuterTerminal,
+    render_frame: &[u8],
+    render_stream: bool,
+) -> io::Result<()> {
+    let frame = outer_terminal.wrap_render_frame(render_frame);
+    if frame.is_empty() {
+        return Ok(());
+    }
+    if render_stream {
+        emit_attach_frame(stream, &AttachMessage::Render(frame)).await
+    } else {
+        emit_attach_bytes(stream, &frame).await
+    }
 }
 
 pub(super) async fn read_socket_bytes(
@@ -108,7 +135,7 @@ pub(super) async fn emit_attach_message(
     message: &AttachMessage,
 ) -> io::Result<()> {
     let frame = encode_attach_message(message).map_err(io::Error::other)?;
-    emit_attach_bytes(stream, &frame).await
+    write_all_to_stream(stream, &frame).await
 }
 
 pub(super) async fn emit_attach_frame(
@@ -125,16 +152,20 @@ pub(super) async fn recv_pane_output(
     match pane_output.recv().await {
         OutputCursorItem::Event(event) => Ok(OutputCursorItem::Event(event)),
         OutputCursorItem::Gap(gap) => {
-            warn!(
-                expected_sequence = gap.expected_sequence(),
-                resume_sequence = gap.resume_sequence(),
-                missed_events = gap.missed_events(),
-                recent_bytes = gap.recent_snapshot().len(),
-                "attach pane output receiver lagged"
-            );
+            warn_pane_output_gap(&gap);
             Ok(OutputCursorItem::Gap(gap))
         }
     }
+}
+
+pub(super) fn warn_pane_output_gap(gap: &OutputGap) {
+    warn!(
+        expected_sequence = gap.expected_sequence(),
+        resume_sequence = gap.resume_sequence(),
+        missed_events = gap.missed_events(),
+        recent_bytes = gap.recent_snapshot().len(),
+        "attach pane output receiver lagged"
+    );
 }
 
 pub(super) async fn recv_pane_output_optional(
@@ -150,8 +181,13 @@ pub(super) async fn emit_attach_data_frame(
     stream: &AttachTransport,
     bytes: &[u8],
 ) -> io::Result<()> {
-    let frame =
-        encode_attach_message(&AttachMessage::Data(bytes.to_vec())).map_err(io::Error::other)?;
+    if bytes.len() <= STACK_ATTACH_DATA_PAYLOAD {
+        let mut frame = [0_u8; STACK_ATTACH_DATA_PAYLOAD + ATTACH_DATA_HEADER_LEN];
+        let len = encode_attach_data_into_slice(bytes, &mut frame).map_err(io::Error::other)?;
+        return write_all_to_stream(stream, &frame[..len]).await;
+    }
+
+    let frame = encode_attach_data(bytes).map_err(io::Error::other)?;
     write_all_to_stream(stream, &frame).await
 }
 
@@ -174,23 +210,28 @@ pub(super) async fn emit_attach_stop(
     .await
 }
 
-pub(super) async fn emit_detached_message(
+pub(super) async fn emit_detached_attach_stop(
     stream: &AttachTransport,
     current_target: &OpenAttachTarget,
 ) -> io::Result<()> {
-    emit_attach_bytes(
-        stream,
+    let mut bytes = current_target.outer_terminal.attach_stop_sequence();
+    bytes.extend_from_slice(
         format!(
             "[detached (from session {})]\r\n",
             current_target.session_name
         )
         .as_bytes(),
-    )
-    .await
+    );
+    emit_attach_bytes(stream, &bytes).await
 }
 
-pub(super) async fn emit_exited_message(stream: &AttachTransport) -> io::Result<()> {
-    emit_attach_bytes(stream, b"[exited]\r\n").await
+pub(super) async fn emit_exited_attach_stop(
+    stream: &AttachTransport,
+    current_target: &OpenAttachTarget,
+) -> io::Result<()> {
+    let mut bytes = current_target.outer_terminal.attach_stop_sequence();
+    bytes.extend_from_slice(b"[exited]\r\n");
+    emit_attach_bytes(stream, &bytes).await
 }
 
 #[cfg(unix)]
@@ -247,6 +288,17 @@ pub(super) async fn read_from_pane(
             Ok(Err(error)) => return Err(error),
             Err(_would_block) => continue,
         }
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn try_read_available_from_pane(
+    pane_reader: &AsyncFd<PtyIo>,
+    buffer: &mut [u8],
+) -> io::Result<Option<usize>> {
+    match try_read_pane_now(pane_reader.get_ref(), buffer)? {
+        PaneRead::Bytes(bytes_read) => Ok(Some(bytes_read)),
+        PaneRead::NotReady | PaneRead::SlaveUnavailable => Ok(None),
     }
 }
 
@@ -442,7 +494,7 @@ mod unix_tests {
         let output_reader = spawned.master().try_clone()?;
 
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let (pane_reader, _reply_writer) = open_pane_writer(output_reader)?;
+        let pane_reader = open_pane_writer(output_reader)?;
         let captured =
             read_until_contains(&pane_reader, "PRE_READY", Duration::from_millis(500)).await?;
 
@@ -464,7 +516,7 @@ mod unix_tests {
             .size(PtyTerminalSize::new(80, 24))
             .spawn()?;
         let output_reader = spawned.master().try_clone()?;
-        let (pane_reader, _reply_writer) = open_pane_writer(output_reader)?;
+        let pane_reader = open_pane_writer(output_reader)?;
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         let captured =
@@ -509,5 +561,75 @@ mod unix_tests {
         }
 
         Ok(String::from_utf8_lossy(&captured).into_owned())
+    }
+}
+
+#[cfg(test)]
+mod emit_render_tests {
+    use super::{emit_attach_message, emit_coalescible_render_frame};
+    use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
+    use crate::pane_io::attach_transport::AttachTransport;
+    use rmux_core::OptionStore;
+    use rmux_proto::{AttachFrameDecoder, AttachMessage, AttachShellCommand};
+    use tokio::io::AsyncReadExt;
+
+    async fn emitted_message(render_stream: bool) -> AttachMessage {
+        let (stream, mut peer) = tokio::io::duplex(1024);
+        let stream = AttachTransport::from_io(stream);
+        let outer_terminal =
+            OuterTerminal::resolve(&OptionStore::default(), OuterTerminalContext::default());
+
+        emit_coalescible_render_frame(&stream, &outer_terminal, b"frame", render_stream)
+            .await
+            .expect("render frame emits");
+
+        let mut bytes = [0_u8; 128];
+        let count = peer.read(&mut bytes).await.expect("read emitted frame");
+        let mut decoder = AttachFrameDecoder::new();
+        decoder.push_bytes(&bytes[..count]);
+        decoder
+            .next_message()
+            .expect("decode succeeds")
+            .expect("message emitted")
+    }
+
+    #[tokio::test]
+    async fn coalescible_render_falls_back_to_data_for_legacy_clients() {
+        assert!(matches!(
+            emitted_message(false).await,
+            AttachMessage::Data(bytes) if bytes.ends_with(b"frame")
+        ));
+    }
+
+    #[tokio::test]
+    async fn coalescible_render_uses_render_for_capable_clients() {
+        assert!(matches!(
+            emitted_message(true).await,
+            AttachMessage::Render(bytes) if bytes.ends_with(b"frame")
+        ));
+    }
+
+    #[tokio::test]
+    async fn attach_control_messages_are_not_wrapped_as_terminal_data() {
+        let (stream, mut peer) = tokio::io::duplex(1024);
+        let stream = AttachTransport::from_io(stream);
+        let message = AttachMessage::DetachExecShellCommand(AttachShellCommand::new(
+            "echo detached".to_owned(),
+            "/bin/sh".to_owned(),
+            "/tmp".to_owned(),
+        ));
+
+        emit_attach_message(&stream, &message)
+            .await
+            .expect("attach message emits");
+
+        let mut bytes = [0_u8; 256];
+        let count = peer.read(&mut bytes).await.expect("read emitted frame");
+        let mut decoder = AttachFrameDecoder::new();
+        decoder.push_bytes(&bytes[..count]);
+        assert_eq!(
+            decoder.next_message().expect("decode succeeds"),
+            Some(message)
+        );
     }
 }

@@ -5,15 +5,23 @@ const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 pub(super) enum BracketedPasteDecode {
     NotPaste,
     Partial,
-    Matched { size: usize },
+    Matched {
+        size: usize,
+        body_start: usize,
+        body_end: usize,
+    },
 }
 
 pub(super) fn decode_bracketed_paste(input: &[u8]) -> BracketedPasteDecode {
     if input.starts_with(BRACKETED_PASTE_START) {
         let body = &input[BRACKETED_PASTE_START.len()..];
         if let Some(end_offset) = find_subslice(body, BRACKETED_PASTE_END) {
+            let body_start = BRACKETED_PASTE_START.len();
+            let body_end = body_start + end_offset;
             return BracketedPasteDecode::Matched {
-                size: BRACKETED_PASTE_START.len() + end_offset + BRACKETED_PASTE_END.len(),
+                size: body_end + BRACKETED_PASTE_END.len(),
+                body_start,
+                body_end,
             };
         }
         return BracketedPasteDecode::Partial;
@@ -64,7 +72,11 @@ mod tests {
     fn matches_through_the_closing_delimiter() {
         assert_eq!(
             decode_bracketed_paste(b"\x1b[200~line\r\n\x02\x1b[201~tail"),
-            BracketedPasteDecode::Matched { size: 19 }
+            BracketedPasteDecode::Matched {
+                size: 19,
+                body_start: 6,
+                body_end: 13,
+            }
         );
     }
 

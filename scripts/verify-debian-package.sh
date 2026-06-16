@@ -29,6 +29,24 @@ sha256_file() {
   sha256sum "$1" | awk '{print $1}'
 }
 
+run_daemon_smoke() {
+  local binary label sessions
+  binary="$1"
+  label="package-smoke-$$-$(date +%s)"
+  "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
+  if ! "$binary" -L "$label" new-session -d -s package_smoke >/dev/null; then
+    "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
+    die "packaged rmux failed to create a session through its daemon"
+  fi
+  if ! sessions="$("$binary" -L "$label" list-sessions -F '#{session_name}')"; then
+    "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
+    die "packaged rmux failed to list sessions through its daemon"
+  fi
+  "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
+  printf '%s\n' "$sessions" | grep -qx 'package_smoke' ||
+    die "daemon smoke did not list package_smoke session"
+}
+
 archive=""
 checksums=""
 run_binary=0
@@ -96,6 +114,7 @@ dpkg-deb -x "$archive_abs" "$tmpdir/root"
 
 for required in \
   usr/bin/rmux \
+  usr/bin/rmux-daemon \
   usr/share/man/man1/rmux.1.gz \
   usr/share/doc/rmux/README.md \
   usr/share/doc/rmux/LICENSE-APACHE \
@@ -105,6 +124,7 @@ do
   [ -e "$tmpdir/root/$required" ] || die "missing package file: $required"
 done
 [ -x "$tmpdir/root/usr/bin/rmux" ] || die "packaged rmux is not executable"
+[ -x "$tmpdir/root/usr/bin/rmux-daemon" ] || die "packaged rmux-daemon is not executable"
 
 metadata="$tmpdir/root/usr/share/rmux/artifact-metadata.json"
 grep -q '"artifact_kind"[[:space:]]*:[[:space:]]*"debian-package-binary"' "$metadata" || die "metadata artifact_kind is not debian-package-binary"
@@ -116,13 +136,19 @@ metadata_binary_hash="$(sed -n 's/.*"binary_sha256"[[:space:]]*:[[:space:]]*"\([
 [ -n "$metadata_binary_hash" ] || die "metadata binary_sha256 is missing or invalid"
 packaged_binary_hash="$(sha256_file "$tmpdir/root/usr/bin/rmux")"
 [ "$metadata_binary_hash" = "$packaged_binary_hash" ] || die "metadata binary_sha256 does not match packaged binary"
+metadata_daemon_hash="$(sed -n 's/.*"daemon_binary_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$metadata" | head -n 1 | tr 'A-F' 'a-f')"
+[ -n "$metadata_daemon_hash" ] || die "metadata daemon_binary_sha256 is missing or invalid"
+packaged_daemon_hash="$(sha256_file "$tmpdir/root/usr/bin/rmux-daemon")"
+[ "$metadata_daemon_hash" = "$packaged_daemon_hash" ] || die "metadata daemon_binary_sha256 does not match packaged daemon binary"
 
 if [ "$run_binary" -eq 1 ]; then
   "$tmpdir/root/usr/bin/rmux" -V >/dev/null
   "$tmpdir/root/usr/bin/rmux" diagnose --json >/dev/null
+  run_daemon_smoke "$tmpdir/root/usr/bin/rmux"
 fi
 
 printf 'package=%s\n' "$archive_abs"
 printf 'sha256=%s\n' "$actual_hash"
 printf 'binary_sha256=%s\n' "$packaged_binary_hash"
+printf 'daemon_binary_sha256=%s\n' "$packaged_daemon_hash"
 printf 'run_binary=%s\n' "$([ "$run_binary" -eq 1 ] && printf true || printf false)"

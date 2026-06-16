@@ -116,6 +116,11 @@ fn resolves_session_window_and_pane_id_forms() {
         .and_then(|session| session.window_at(1))
         .map(Window::id)
         .expect("alpha window id exists");
+    let active_window_id = store
+        .session(&session_name("alpha"))
+        .and_then(|session| session.window_at(2))
+        .map(Window::id)
+        .expect("alpha active window id exists");
 
     assert_eq!(
         resolve(&store, "$0", TargetFindType::Session).expect("session id resolves"),
@@ -133,6 +138,24 @@ fn resolves_session_window_and_pane_id_forms() {
     assert_eq!(
         resolve(&store, "alpha:.%2", TargetFindType::Pane).expect("pane id resolves"),
         Target::Pane(PaneTarget::with_window(session_name("alpha"), 2, 0))
+    );
+    assert_eq!(
+        resolve(
+            &store,
+            &format!("{active_window_id}.%2"),
+            TargetFindType::Pane,
+        )
+        .expect("window id plus pane id resolves"),
+        Target::Pane(PaneTarget::with_window(session_name("alpha"), 2, 0))
+    );
+    assert_eq!(
+        resolve(
+            &store,
+            &format!("{active_window_id}.1"),
+            TargetFindType::Pane,
+        )
+        .expect("window id plus pane index resolves"),
+        Target::Pane(PaneTarget::with_window(session_name("alpha"), 2, 1))
     );
 }
 
@@ -225,6 +248,44 @@ fn window_index_flag_allows_nonexistent_window_targets() {
 }
 
 #[test]
+fn window_index_flag_resolves_plus_window_slots_relative_to_current() {
+    let store = populated_store();
+
+    let target = store
+        .resolve_unresolved_target(
+            &UnresolvedTarget::new("alpha:+3"),
+            TargetFindType::Window,
+            TargetFindFlags::WINDOW_INDEX,
+            &current(),
+        )
+        .expect("positive destination slots resolve relative to the active window");
+
+    assert_eq!(
+        target,
+        Target::Window(WindowTarget::with_window(session_name("alpha"), 5))
+    );
+}
+
+#[test]
+fn window_index_flag_resolves_negative_window_slots_relative_to_current() {
+    let store = populated_store();
+
+    let target = store
+        .resolve_unresolved_target(
+            &UnresolvedTarget::new("alpha:-1"),
+            TargetFindType::Window,
+            TargetFindFlags::WINDOW_INDEX,
+            &current(),
+        )
+        .expect("negative destination slots resolve relative to the current window");
+
+    assert_eq!(
+        target,
+        Target::Window(WindowTarget::with_window(session_name("alpha"), 1))
+    );
+}
+
+#[test]
 fn window_index_flag_resolves_empty_window_part_to_next_available_slot() {
     let store = populated_store();
 
@@ -252,6 +313,25 @@ fn window_index_flag_resolves_empty_window_part_to_next_available_slot() {
     assert_eq!(
         current_session,
         Target::Window(WindowTarget::with_window(session_name("alpha"), 3))
+    );
+}
+
+#[test]
+fn window_index_flag_still_resolves_special_window_tokens() {
+    let store = populated_store();
+
+    let target = store
+        .resolve_unresolved_target(
+            &UnresolvedTarget::new("alpha:{end}"),
+            TargetFindType::Window,
+            TargetFindFlags::WINDOW_INDEX,
+            &current(),
+        )
+        .expect("special destination token resolves");
+
+    assert_eq!(
+        target,
+        Target::Window(WindowTarget::with_window(session_name("alpha"), 2))
     );
 }
 
@@ -514,6 +594,17 @@ fn command_metadata_captures_find_type_and_flags() {
         .expect("source spec")
         .flags
         .contains(TargetFindFlags::DEFAULT_MARKED));
+
+    let link_window = command_target_metadata("link-window").expect("metadata exists");
+    assert_eq!(
+        link_window.source.expect("source spec").find_type,
+        TargetFindType::Window
+    );
+    assert!(link_window
+        .target
+        .expect("target spec")
+        .flags
+        .contains(TargetFindFlags::WINDOW_INDEX));
 
     let show_environment = command_target_metadata("show-environment").expect("metadata exists");
     assert!(show_environment

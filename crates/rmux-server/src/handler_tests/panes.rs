@@ -39,6 +39,9 @@ async fn split_window_routes_session_and_pane_targets_to_the_expected_panes() {
         .handle(Request::SelectPane(SelectPaneRequest {
             target: PaneTarget::new(alpha.clone(), 1),
             title: None,
+            style: None,
+            input_disabled: None,
+            preserve_zoom: false,
         }))
         .await;
     assert_eq!(
@@ -93,6 +96,78 @@ async fn split_window_routes_session_and_pane_targets_to_the_expected_panes() {
             .collect::<Vec<_>>(),
         vec![0, 1, 2, 3]
     );
+}
+
+#[tokio::test]
+async fn select_pane_style_sets_pane_style_and_format_colours() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let target = PaneTarget::new(alpha.clone(), 1);
+
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 10 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(alpha.clone()),
+                direction: rmux_proto::SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+
+    let response = handler
+        .handle(Request::SelectPane(SelectPaneRequest {
+            target: target.clone(),
+            title: None,
+            style: Some("fg=blue,bg=red".to_owned()),
+            input_disabled: None,
+            preserve_zoom: false,
+        }))
+        .await;
+
+    assert_eq!(
+        response,
+        Response::SelectPane(rmux_proto::SelectPaneResponse {
+            target: target.clone(),
+        })
+    );
+    {
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&alpha).expect("session exists");
+        assert_eq!(session.active_pane_index(), 1);
+        assert_eq!(
+            state.options.pane_value(&target, OptionName::WindowStyle),
+            Some("fg=blue,bg=red")
+        );
+    }
+
+    let response = handler
+        .handle(Request::DisplayMessage(DisplayMessageRequest {
+            target: Some(Target::Pane(target)),
+            print: true,
+            message: Some("#{pane_active}:#{pane_fg}:#{pane_bg}".to_owned()),
+            empty_target_context: false,
+        }))
+        .await;
+    let Response::DisplayMessage(response) = response else {
+        panic!("expected display-message response");
+    };
+    let output = response
+        .command_output()
+        .expect("display-message -p returns output");
+    assert_eq!(output.stdout(), b"1:blue:red\n");
 }
 
 #[tokio::test]
@@ -246,6 +321,9 @@ async fn kill_pane_removes_the_terminal_and_uses_last_pane_fallback() {
             .handle(Request::SelectPane(SelectPaneRequest {
                 target: PaneTarget::new(alpha.clone(), 1),
                 title: None,
+                style: None,
+                input_disabled: None,
+                preserve_zoom: false,
             }))
             .await,
         Response::SelectPane(_)
@@ -255,6 +333,9 @@ async fn kill_pane_removes_the_terminal_and_uses_last_pane_fallback() {
             .handle(Request::SelectPane(SelectPaneRequest {
                 target: PaneTarget::new(alpha.clone(), 0),
                 title: None,
+                style: None,
+                input_disabled: None,
+                preserve_zoom: false,
             }))
             .await,
         Response::SelectPane(_)

@@ -509,6 +509,8 @@ pub enum ResizePaneAdjustment {
         /// The requested pane height in rows.
         rows: u16,
     },
+    /// Trims lines below the cursor and pulls history into the viewport.
+    TrimBelow,
 }
 
 fn parse_pane_index(target: &str, pane_index: &str) -> Result<u32, RmuxError> {

@@ -11,6 +11,8 @@ pub(crate) struct NewSessionArgs {
     pub(crate) working_directory: Option<String>,
     #[arg(short = 'D', action = ArgAction::SetTrue)]
     pub(crate) detach_other_clients: bool,
+    #[arg(short = 'E', action = ArgAction::SetTrue)]
+    pub(crate) skip_environment_update: bool,
     #[arg(short = 'd', action = ArgAction::SetTrue)]
     pub(crate) detached: bool,
     #[arg(short = 'e')]
@@ -29,12 +31,33 @@ pub(crate) struct NewSessionArgs {
     pub(crate) group_target: Option<SessionName>,
     #[arg(short = 'X', action = ArgAction::SetTrue)]
     pub(crate) kill_other_clients: bool,
-    #[arg(short = 'x')]
+    #[arg(short = 'x', value_parser = parse_new_session_cols)]
     pub(crate) cols: Option<u16>,
-    #[arg(short = 'y')]
+    #[arg(short = 'y', value_parser = parse_new_session_rows)]
     pub(crate) rows: Option<u16>,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     pub(crate) command: Vec<String>,
+}
+
+fn parse_new_session_cols(value: &str) -> Result<u16, String> {
+    parse_new_session_dimension(value, "width")
+}
+
+fn parse_new_session_rows(value: &str) -> Result<u16, String> {
+    parse_new_session_dimension(value, "height")
+}
+
+fn parse_new_session_dimension(value: &str, label: &str) -> Result<u16, String> {
+    let parsed = value
+        .parse::<i64>()
+        .map_err(|_| format!("{label} invalid"))?;
+    if parsed < 0 {
+        return Err(format!("{label} too small"));
+    }
+    if parsed > i64::from(u16::MAX) {
+        return Err(format!("{label} too large"));
+    }
+    u16::try_from(parsed).map_err(|_| format!("{label} invalid"))
 }
 
 #[derive(Debug, Clone, Args)]
@@ -49,7 +72,7 @@ pub(crate) struct AttachSessionArgs {
     pub(crate) flags: Vec<String>,
     #[arg(short = 'r', action = ArgAction::SetTrue)]
     pub(crate) read_only: bool,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(short = 'x', action = ArgAction::SetTrue)]
     pub(crate) kill_other_clients: bool,
@@ -63,7 +86,7 @@ pub(crate) struct ClientTargetArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct SessionTargetArgs {
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
 }
 
@@ -73,7 +96,7 @@ pub(crate) struct KillSessionArgs {
     pub(crate) kill_all_except_target: bool,
     #[arg(short = 'C', action = ArgAction::SetTrue)]
     pub(crate) clear_alerts: bool,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
 }
 
@@ -111,7 +134,7 @@ impl ServerAccessArgs {
 pub(crate) struct AlertSessionTargetArgs {
     #[arg(short = 'a', action = ArgAction::SetTrue)]
     pub(crate) alerts_only: bool,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
 }
 
@@ -127,19 +150,40 @@ pub(crate) struct ShowMessagesArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct ListSessionsArgs {
-    #[arg(short = 'F')]
+    #[arg(short = 'F', conflicts_with = "json")]
     pub(crate) format: Option<String>,
     #[arg(short = 'f')]
     pub(crate) filter: Option<String>,
-    #[arg(short = 'O')]
+    #[arg(long = "json", action = ArgAction::SetTrue)]
+    pub(crate) json: bool,
+    #[arg(short = 'O', num_args = 0..=1, default_missing_value = "", allow_hyphen_values = true)]
     pub(crate) sort_order: Option<String>,
     #[arg(short = 'r', action = ArgAction::SetTrue)]
     pub(crate) reversed: bool,
 }
 
+impl ListSessionsArgs {
+    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
+        if self.sort_order.is_some() {
+            return Err(unknown_flag_error("list-sessions", "-O"));
+        }
+        if self.reversed {
+            return Err(unknown_flag_error("list-sessions", "-r"));
+        }
+        Ok(self)
+    }
+}
+
+fn unknown_flag_error(command_name: &str, flag: &str) -> clap::Error {
+    clap::Error::raw(
+        clap::error::ErrorKind::UnknownArgument,
+        format!("command {command_name}: unknown flag {flag}"),
+    )
+}
+
 #[derive(Debug, Clone, Args)]
 pub(crate) struct RenameSessionArgs {
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(value_parser = parse_session_name, allow_hyphen_values = true)]
     pub(crate) new_name: SessionName,

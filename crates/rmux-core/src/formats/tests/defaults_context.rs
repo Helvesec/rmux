@@ -1,10 +1,24 @@
 use super::*;
+use crate::formats::DEFAULT_LIST_WINDOWS_ALL_FORMAT;
 
 #[test]
 fn default_list_windows_format_matches_canonical_output() {
     let rendered = render_template(DEFAULT_LIST_WINDOWS_FORMAT, &StaticWindowValues);
 
-    assert_eq!(rendered, "5: logs* (3 panes) [120x40]");
+    assert_eq!(
+        rendered,
+        format!(
+            "5: logs* (3 panes) [120x40] [layout {}] @9 (active)",
+            sample_window_layout()
+        )
+    );
+}
+
+#[test]
+fn default_list_windows_all_format_matches_canonical_output() {
+    let rendered = render_template(DEFAULT_LIST_WINDOWS_ALL_FORMAT, &StaticWindowValues);
+
+    assert_eq!(rendered, "alpha:5: logs* (3 panes) [120x40] ");
 }
 
 #[test]
@@ -64,11 +78,11 @@ fn modifiers_and_bare_aliases() {
 #[test]
 fn tmux_runtime_modifiers_cover_ascii_colour_width_and_name_existence() {
     let rendered = render_template(
-            "#{a:98}|#{a:N}|#{c:red}|#{c:window_name}|#{w:window_name}|#{N:window_name}|#{N/w:logs}|#{N/s:alpha}|#{N/s:beta}",
+            "#{a:98}|#{a:N}|#{c:red}|#{c:window_name}|#{w:window_name}|#{w:#{window_name}}|#{w:literal}|#{N:window_name}|#{N/w:logs}|#{N/s:alpha}|#{N/s:beta}",
             &StaticWindowValues,
         );
 
-    assert_eq!(rendered, "b||800000||4|0|1|1|0");
+    assert_eq!(rendered, "b||800000||4|4|0|0|1|1|0");
 }
 
 #[test]
@@ -102,19 +116,22 @@ fn malformed_or_empty_expressions_keep_compatibility_behavior() {
         ),
         ""
     );
+
+    assert_eq!(
+        render_template("a#{?b}z|#{#{#{x}}}", &StaticWindowValues),
+        "a"
+    );
+    assert_eq!(render_template("#{#{#{x}}}", &StaticWindowValues), "");
 }
 
 #[test]
 fn edge_case_empty_template_and_boundary_hash_patterns() {
     assert_eq!(render_template("", &StaticWindowValues), "");
-    // Trailing `#` — tmux drops it (breaks out of loop without output).
-    assert_eq!(render_template("#", &StaticWindowValues), "");
+    assert_eq!(render_template("#", &StaticWindowValues), "#");
     assert_eq!(render_template("##", &StaticWindowValues), "#");
-    // `###`: first pair `##` outputs `#`, then trailing `#` is dropped.
-    assert_eq!(render_template("###", &StaticWindowValues), "#");
+    assert_eq!(render_template("###", &StaticWindowValues), "##");
     assert_eq!(render_template("####", &StaticWindowValues), "##");
-    // Trailing `#` after text — tmux drops the trailing `#`.
-    assert_eq!(render_template("text#", &StaticWindowValues), "text");
+    assert_eq!(render_template("text#", &StaticWindowValues), "text#");
     assert_eq!(render_template("#{}", &StaticWindowValues), "");
     // Unclosed `#{` — tmux drops everything from `#` onward.
     assert_eq!(render_template("#{", &StaticWindowValues), "");
@@ -122,32 +139,26 @@ fn edge_case_empty_template_and_boundary_hash_patterns() {
 
 #[test]
 fn edge_case_conditional_with_missing_branches() {
-    // No commas at all: the body is the final unpaired default, expanded
-    // and returned directly. Since "window_active" is a bare string with
-    // no `#{}`, it expands to the literal "window_active".
     assert_eq!(
         render_template("#{?window_active}", &StaticWindowValues),
-        "window_active"
+        ""
     );
-    // To actually check a variable, use #{} syntax:
+    assert_eq!(
+        render_template("a#{?window_active}z", &StaticWindowValues),
+        "a"
+    );
     assert_eq!(
         render_template("#{?#{window_active}}", &StaticWindowValues),
-        "1"
+        ""
     );
-    // Single comma: (window_active, yes). The condition "window_active"
-    // is a bare string which resolves to the literal (not the variable).
-    // Since the literal is truthy, it returns "yes".
     assert_eq!(
         render_template("#{?window_active,yes}", &StaticWindowValues),
-        "yes"
+        ""
     );
-    // With #{} variable lookup: window_active="1" → truthy → "yes".
     assert_eq!(
         render_template("#{?#{window_active},yes}", &StaticWindowValues),
-        "yes"
+        ""
     );
-    // Falsy variable with #{}: window_last_flag="0" → false → no more
-    // pairs → empty.
     assert_eq!(
         render_template("#{?#{window_last_flag},yes}", &StaticWindowValues),
         ""
@@ -173,6 +184,20 @@ fn nested_conditionals_render_inner_templates_in_selected_branches() {
             &StaticWindowValues
         ),
         "logs"
+    );
+}
+
+#[test]
+fn multi_pair_conditional_default_can_contain_nested_conditionals() {
+    let session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 24 });
+    let context = FormatContext::from_session(&session).with_session_attached(1);
+
+    assert_eq!(
+        render_template(
+            "#{?pane_format,pane,window_format,window,#{session_windows} windows#{?session_attached, (attached),}}",
+            &context,
+        ),
+        "1 windows (attached)"
     );
 }
 

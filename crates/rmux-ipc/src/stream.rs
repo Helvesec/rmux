@@ -174,12 +174,10 @@ pub fn connect_blocking(
     timeout: Duration,
 ) -> io::Result<BlockingLocalStream> {
     use rustix::net::sockopt::socket_error;
-    use rustix::net::{
-        connect as socket_connect, socket_with, AddressFamily, SocketAddrUnix, SocketType,
-    };
+    use rustix::net::{connect as socket_connect, socket_with, AddressFamily, SocketType};
 
     let socket_path = endpoint.as_path();
-    let address = SocketAddrUnix::new(socket_path)?;
+    let address = endpoint.socket_addr_unix()?;
     let socket = socket_with(
         AddressFamily::UNIX,
         SocketType::STREAM,

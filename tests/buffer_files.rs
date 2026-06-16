@@ -4,6 +4,8 @@ mod common;
 
 use std::error::Error;
 use std::fs;
+use std::io::Write;
+use std::process::Stdio;
 
 use common::{assert_success, stderr, stdout, terminate_child, CliHarness};
 
@@ -55,6 +57,65 @@ fn load_buffer_accepts_mixed_flag_order() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn load_buffer_reads_stdin_when_path_is_dash() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("load-buffer-dash")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    let load = run_with_stdin(
+        &harness,
+        &["load-buffer", "-b", "dash", "-"],
+        b"stdin bytes",
+    )?;
+    assert_success(&load);
+
+    let show = harness.run(&["show-buffer", "-b", "dash"])?;
+    assert_eq!(show.status.code(), Some(0));
+    assert_eq!(stdout(&show), "stdin bytes");
+    assert!(stderr(&show).is_empty());
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn load_buffer_empty_stdin_is_successful_noop() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("load-buffer-dash-empty")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    let load = run_with_stdin(&harness, &["load-buffer", "-b", "empty", "-"], b"")?;
+    assert_success(&load);
+
+    let show = harness.run(&["show-buffer", "-b", "empty"])?;
+    assert_eq!(show.status.code(), Some(1));
+    assert!(stderr(&show).contains("no buffer empty"));
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn load_buffer_empty_file_is_successful_noop() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("load-buffer-empty-file")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+    let input_path = harness.tmpdir().join("empty.txt");
+    fs::write(&input_path, "")?;
+
+    assert_success(&harness.run(&[
+        "load-buffer",
+        "-b",
+        "empty",
+        input_path.to_str().expect("utf-8 test path"),
+    ])?);
+
+    let show = harness.run(&["show-buffer", "-b", "empty"])?;
+    assert_eq!(show.status.code(), Some(1));
+    assert!(stderr(&show).contains("no buffer empty"));
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
 fn save_buffer_writes_server_side_file() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("save-buffer")?;
     let mut daemon = harness.start_hidden_daemon()?;
@@ -97,6 +158,36 @@ fn save_buffer_accepts_mixed_flag_order_and_appends() -> Result<(), Box<dyn Erro
 }
 
 #[test]
+fn save_buffer_writes_stdout_when_path_is_dash() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("save-buffer-dash")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["set-buffer", "-b", "saved", "stdout bytes"])?);
+    let save = harness.run(&["save-buffer", "-b", "saved", "-"])?;
+    assert_eq!(save.status.code(), Some(0));
+    assert_eq!(stdout(&save), "stdout bytes");
+    assert!(stderr(&save).is_empty());
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn save_buffer_append_flag_still_writes_stdout_when_path_is_dash() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("save-buffer-dash-append")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["set-buffer", "-b", "saved", "append stdout"])?);
+    let save = harness.run(&["save-buffer", "-a", "-b", "saved", "-"])?;
+    assert_eq!(save.status.code(), Some(0));
+    assert_eq!(stdout(&save), "append stdout");
+    assert!(stderr(&save).is_empty());
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
 fn load_buffer_resolves_relative_paths_against_client_cwd() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("load-buffer-relative")?;
     let mut daemon = harness.start_hidden_daemon()?;
@@ -119,6 +210,26 @@ fn load_buffer_resolves_relative_paths_against_client_cwd() -> Result<(), Box<dy
 
     terminate_child(daemon.child_mut())?;
     Ok(())
+}
+
+fn run_with_stdin(
+    harness: &CliHarness,
+    args: &[&str],
+    stdin: &[u8],
+) -> Result<std::process::Output, Box<dyn Error>> {
+    let mut command = harness.base_command();
+    command.args(args);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    let mut child = command.spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(stdin)?;
+    Ok(child.wait_with_output()?)
 }
 
 #[test]

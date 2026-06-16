@@ -1,13 +1,16 @@
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicUsize;
 
 use tokio::sync::mpsc;
 
+use super::control::try_recv_attach_control;
 use super::types::{AttachControl, AttachTarget, OpenAttachTarget, OverlayFrame};
 
 pub(super) fn discard_stale_persistent_overlays(
     attach_controls: Option<&mut mpsc::UnboundedReceiver<AttachControl>>,
     deferred_controls: &mut VecDeque<AttachControl>,
     barrier_state_id: u64,
+    control_backlog: &AtomicUsize,
 ) {
     let mut retained_controls = VecDeque::with_capacity(deferred_controls.len());
     while let Some(control) = deferred_controls.pop_front() {
@@ -26,7 +29,7 @@ pub(super) fn discard_stale_persistent_overlays(
     let Some(control_rx) = attach_controls else {
         return;
     };
-    while let Ok(control) = control_rx.try_recv() {
+    while let Ok(control) = try_recv_attach_control(control_rx, control_backlog) {
         match control {
             AttachControl::Switch(next_target)
                 if is_stale_persistent_switch(Some(barrier_state_id), next_target.as_ref()) => {}
@@ -44,6 +47,7 @@ pub(super) fn advance_persistent_overlay_state(
     attach_controls: Option<&mut mpsc::UnboundedReceiver<AttachControl>>,
     deferred_controls: &mut VecDeque<AttachControl>,
     barrier_state_id: u64,
+    control_backlog: &AtomicUsize,
 ) {
     if barrier_state_id == 0 {
         return;
@@ -52,19 +56,25 @@ pub(super) fn advance_persistent_overlay_state(
         return;
     }
     *current_state_id = Some(barrier_state_id);
-    discard_stale_persistent_overlays(attach_controls, deferred_controls, barrier_state_id);
+    discard_stale_persistent_overlays(
+        attach_controls,
+        deferred_controls,
+        barrier_state_id,
+        control_backlog,
+    );
 }
 
 pub(super) fn prime_persistent_overlay_barriers(
     current_state_id: &mut Option<u64>,
     attach_controls: Option<&mut mpsc::UnboundedReceiver<AttachControl>>,
     deferred_controls: &mut VecDeque<AttachControl>,
+    control_backlog: &AtomicUsize,
 ) {
     let Some(control_rx) = attach_controls else {
         return;
     };
 
-    while let Ok(control) = control_rx.try_recv() {
+    while let Ok(control) = try_recv_attach_control(control_rx, control_backlog) {
         deferred_controls.push_back(control);
     }
 
@@ -87,6 +97,7 @@ pub(super) fn prime_persistent_overlay_barriers(
             Some(control_rx),
             deferred_controls,
             barrier_state_id,
+            control_backlog,
         );
     }
 }
@@ -121,10 +132,11 @@ pub(super) fn take_pending_persistent_overlay_for_state(
     expected_state_id: Option<u64>,
     render_generation: u64,
     current_overlay_generation: u64,
+    control_backlog: &AtomicUsize,
 ) -> Option<OverlayFrame> {
     let expected_state_id = expected_state_id?;
     if let Some(control_rx) = attach_controls {
-        while let Ok(control) = control_rx.try_recv() {
+        while let Ok(control) = try_recv_attach_control(control_rx, control_backlog) {
             deferred_controls.push_back(control);
         }
     }
@@ -246,6 +258,9 @@ pub(super) fn defer_persistent_clear(
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::sync::mpsc;
 
     use crate::pane_io::{AttachControl, OverlayFrame};
 
@@ -267,8 +282,16 @@ mod tests {
             AttachControl::Write(b"after".to_vec()),
         ]);
 
-        let overlay = take_pending_persistent_overlay_for_state(None, &mut controls, Some(9), 2, 0)
-            .expect("matching overlay");
+        let control_backlog = AtomicUsize::new(0);
+        let overlay = take_pending_persistent_overlay_for_state(
+            None,
+            &mut controls,
+            Some(9),
+            2,
+            0,
+            &control_backlog,
+        )
+        .expect("matching overlay");
 
         assert_eq!(overlay.frame, b"MENU");
         assert_eq!(controls.len(), 2);
@@ -288,7 +311,15 @@ mod tests {
             OverlayFrame::persistent_with_state(b"OLD".to_vec(), 1, 4, 8),
         )]);
 
-        let overlay = take_pending_persistent_overlay_for_state(None, &mut controls, Some(9), 2, 0);
+        let control_backlog = AtomicUsize::new(0);
+        let overlay = take_pending_persistent_overlay_for_state(
+            None,
+            &mut controls,
+            Some(9),
+            2,
+            0,
+            &control_backlog,
+        );
 
         assert!(overlay.is_none());
         assert_eq!(controls.len(), 1);
@@ -306,9 +337,36 @@ mod tests {
         let mut current_state_id = None;
         let mut controls = VecDeque::new();
 
-        advance_persistent_overlay_state(&mut current_state_id, None, &mut controls, 0);
+        let control_backlog = AtomicUsize::new(0);
+        advance_persistent_overlay_state(
+            &mut current_state_id,
+            None,
+            &mut controls,
+            0,
+            &control_backlog,
+        );
 
         assert_eq!(current_state_id, None);
+    }
+
+    #[test]
+    fn priming_overlay_barriers_decrements_received_control_backlog() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(AttachControl::AdvancePersistentOverlayState(7))
+            .expect("control send succeeds");
+        let control_backlog = AtomicUsize::new(1);
+        let mut current_state_id = None;
+        let mut controls = VecDeque::new();
+
+        super::prime_persistent_overlay_barriers(
+            &mut current_state_id,
+            Some(&mut rx),
+            &mut controls,
+            &control_backlog,
+        );
+
+        assert_eq!(current_state_id, Some(7));
+        assert_eq!(control_backlog.load(Ordering::Acquire), 0);
     }
 
     #[test]

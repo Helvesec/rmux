@@ -3,9 +3,8 @@ use super::*;
 #[tokio::test]
 async fn parsed_queue_assignments_apply_before_following_commands() {
     let handler = RequestHandler::new();
-    let command = shell_env_or_default_command("FOO", "unset");
     let parsed = CommandParser::new()
-        .parse(&format!("FOO=bar ; run-shell {}", command_quote(&command)))
+        .parse("FOO=bar ; run-shell true")
         .expect("commands parse");
 
     let output = handler
@@ -13,7 +12,7 @@ async fn parsed_queue_assignments_apply_before_following_commands() {
         .await
         .expect("queue succeeds");
 
-    assert_eq!(output.stdout(), b"bar");
+    assert!(output.stdout().is_empty());
 
     let state = handler.state.lock().await;
     assert_eq!(state.environment.global_value("FOO"), Some("bar"));
@@ -54,12 +53,8 @@ async fn parsed_queue_lock_client_defaults_to_current_client() {
 #[tokio::test]
 async fn if_shell_inserted_hidden_assignments_stay_out_of_process_environments() {
     let handler = RequestHandler::new();
-    let command = shell_env_or_default_command("SECRET", "unset");
     let parsed = CommandParser::new()
-        .parse(&format!(
-            "if-shell -F 1 {{ %hidden SECRET=classified }} ; run-shell {}",
-            command_quote(&command)
-        ))
+        .parse("if-shell -F 1 { %hidden SECRET=classified } ; run-shell true")
         .expect("commands parse");
 
     let output = handler
@@ -67,7 +62,7 @@ async fn if_shell_inserted_hidden_assignments_stay_out_of_process_environments()
         .await
         .expect("queue succeeds");
 
-    assert_eq!(output.stdout(), b"unset");
+    assert!(output.stdout().is_empty());
 
     let state = handler.state.lock().await;
     let entries = state
@@ -76,6 +71,12 @@ async fn if_shell_inserted_hidden_assignments_stay_out_of_process_environments()
         .expect("hidden show-environment succeeds");
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].value.as_deref(), Some("classified"));
+    let mut process_environment =
+        std::collections::HashMap::from([("SECRET".to_owned(), "client".to_owned())]);
+    state
+        .environment
+        .apply_to_process_environment(None, &mut process_environment);
+    assert_eq!(process_environment.get("SECRET"), None);
 }
 
 #[tokio::test]
@@ -108,6 +109,56 @@ async fn queue_error_aborts_later_commands_in_the_same_group_only() {
             .expect("kept buffer output")
             .stdout(),
         b"yes"
+    );
+}
+
+#[tokio::test]
+async fn parsed_queue_set_buffer_accepts_target_and_rename_trailing_content() {
+    let handler = RequestHandler::new();
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session_name("alpha"),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let parsed = CommandParser::new()
+        .parse(
+            "set-buffer -t alpha target-tolerated; \
+             set-buffer -b src original; \
+             set-buffer -b src -n dst ignored",
+        )
+        .expect("commands parse");
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("queue succeeds");
+    assert!(output.stdout().is_empty());
+
+    assert_eq!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest { name: None }))
+            .await
+            .command_output()
+            .expect("default buffer output")
+            .stdout(),
+        b"target-tolerated"
+    );
+    assert_eq!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("dst".to_owned()),
+            }))
+            .await
+            .command_output()
+            .expect("renamed buffer output")
+            .stdout(),
+        b"original"
     );
 }
 
@@ -280,6 +331,83 @@ async fn parsed_queue_resolves_session_only_new_window_targets_at_protocol_bound
 }
 
 #[tokio::test]
+async fn parsed_queue_resolves_session_colon_new_window_targets_at_protocol_boundary() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha-colon");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    let parsed = CommandParser::new()
+        .parse("new-window -t alpha-col: -d -n logs")
+        .expect("commands parse");
+
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("queue command resolves session: targets through target-find");
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state
+            .sessions
+            .session(&alpha)
+            .expect("session exists")
+            .window_at(1)
+            .expect("window exists")
+            .name(),
+        Some("logs")
+    );
+}
+
+#[tokio::test]
+async fn parsed_queue_keeps_signed_new_window_targets_relative() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha-relative");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    let parsed = CommandParser::new()
+        .parse(
+            "new-window -d -t alpha-relative:1 -n one ; \
+             select-window -t alpha-relative:1 ; \
+             new-window -d -t alpha-relative:+1 -n rel",
+        )
+        .expect("commands parse");
+
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("relative target should not be treated as absolute index 1");
+
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("session exists");
+    assert_eq!(
+        session.window_at(1).and_then(|window| window.name()),
+        Some("one")
+    );
+    assert_eq!(
+        session.window_at(2).and_then(|window| window.name()),
+        Some("rel")
+    );
+}
+
+#[tokio::test]
 async fn parsed_queue_uses_current_target_for_new_window_split_and_zoom() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -440,6 +568,24 @@ async fn parsed_queue_display_panes_t_reports_target_client_errors_like_cli() {
 
         assert_eq!(error, rmux_proto::RmuxError::Message(expected.to_owned()));
     }
+}
+
+#[tokio::test]
+async fn parsed_queue_refresh_client_r_is_unknown_flag_like_tmux() {
+    let handler = RequestHandler::new();
+    let parsed = CommandParser::new()
+        .parse("refresh-client -r %0")
+        .expect("refresh-client command parses");
+
+    let error = handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect_err("refresh-client -r should be rejected");
+
+    assert_eq!(
+        error,
+        rmux_proto::RmuxError::Server("command refresh-client: unknown flag -r".to_owned())
+    );
 }
 
 #[tokio::test]

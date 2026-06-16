@@ -1,22 +1,22 @@
 use super::{decode_frame, encode_frame, FrameDecoder};
 use crate::{
-    AttachSessionExt2Request, AttachSessionRequest, BreakPaneRequest, CapturePaneRequest,
-    ClockModeRequest, ControlMode, ControlModeRequest, ControlModeResponse, CopyModeRequest,
-    DeleteBufferRequest, DetachClientExtRequest, DetachClientRequest, DisplayMessageExtRequest,
-    DisplayMessageRequest, DisplayPanesRequest, HasSessionRequest, HookLifecycle, HookName,
-    JoinPaneRequest, KillPaneRequest, KillSessionRequest, KillWindowRequest, LastPaneRequest,
-    LastWindowRequest, LayoutName, ListBuffersRequest, ListClientsRequest, ListPanesRequest,
-    ListSessionsRequest, ListWindowsRequest, LoadBufferRequest, MoveWindowRequest,
-    MoveWindowTarget, NewSessionRequest, NewWindowRequest, NextLayoutRequest, NextWindowRequest,
-    OptionName, PaneTarget, PasteBufferRequest, PreviousLayoutRequest, PreviousWindowRequest,
-    RefreshClientRequest, RenameSessionRequest, RenameWindowRequest, Request, ResizePaneAdjustment,
-    ResizePaneRequest, RotateWindowDirection, RotateWindowRequest, SaveBufferRequest,
-    ScopeSelector, SelectLayoutRequest, SelectLayoutTarget, SelectPaneAdjacentRequest,
-    SelectPaneDirection, SelectPaneRequest, SelectWindowRequest, SendKeysExt2Request,
-    SendKeysRequest, SessionName, SetBufferRequest, SetEnvironmentRequest, SetHookRequest,
-    SetOptionMode, SetOptionRequest, ShowBufferRequest, ShowMessagesRequest, SourceFileRequest,
-    SplitDirection, SplitWindowExtRequest, SplitWindowRequest, SplitWindowTarget,
-    SuspendClientRequest, SwapPaneDirection, SwapPaneRequest, SwapWindowRequest,
+    AttachSessionExt2Request, AttachSessionExt3Request, AttachSessionRequest, BreakPaneRequest,
+    CapturePaneRequest, ClockModeRequest, ControlMode, ControlModeRequest, ControlModeResponse,
+    CopyModeRequest, DeleteBufferRequest, DetachClientExtRequest, DetachClientRequest,
+    DisplayMessageExtRequest, DisplayMessageRequest, DisplayPanesRequest, HasSessionRequest,
+    HookLifecycle, HookName, JoinPaneRequest, KillPaneRequest, KillSessionRequest,
+    KillWindowRequest, LastPaneRequest, LastWindowRequest, LayoutName, ListBuffersRequest,
+    ListClientsRequest, ListPanesRequest, ListSessionsRequest, ListWindowsRequest,
+    LoadBufferRequest, MoveWindowRequest, MoveWindowTarget, NewSessionRequest, NewWindowRequest,
+    NextLayoutRequest, NextWindowRequest, OptionName, PaneTarget, PasteBufferRequest,
+    PreviousLayoutRequest, PreviousWindowRequest, RefreshClientRequest, RenameSessionRequest,
+    RenameWindowRequest, Request, ResizePaneAdjustment, ResizePaneRequest, RotateWindowDirection,
+    RotateWindowRequest, SaveBufferRequest, ScopeSelector, SelectLayoutRequest, SelectLayoutTarget,
+    SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneRequest, SelectWindowRequest,
+    SendKeysExt2Request, SendKeysRequest, SessionName, SetBufferRequest, SetEnvironmentRequest,
+    SetHookRequest, SetOptionMode, SetOptionRequest, ShowBufferRequest, ShowMessagesRequest,
+    SourceFileRequest, SplitDirection, SplitWindowExtRequest, SplitWindowRequest,
+    SplitWindowTarget, SuspendClientRequest, SwapPaneDirection, SwapPaneRequest, SwapWindowRequest,
     SwitchClientExt3Request, SwitchClientRequest, Target, TerminalSize, WindowTarget,
 };
 
@@ -88,6 +88,8 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
             renumber: false,
             kill_destination: true,
             detached: false,
+            after: false,
+            before: false,
         }),
         Request::SwapWindow(SwapWindowRequest {
             source: WindowTarget::with_window(alpha.clone(), 1),
@@ -114,6 +116,8 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
         }),
         Request::LastPane(LastPaneRequest {
             target: WindowTarget::new(beta.clone()),
+            preserve_zoom: false,
+            input_disabled: None,
         }),
         Request::JoinPane(JoinPaneRequest {
             source: PaneTarget::with_window(beta.clone(), 1, 2),
@@ -160,10 +164,14 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
         Request::SelectPane(SelectPaneRequest {
             target: pane.clone(),
             title: None,
+            style: None,
+            input_disabled: None,
+            preserve_zoom: false,
         }),
         Request::SelectPaneAdjacent(SelectPaneAdjacentRequest {
             target: pane.clone(),
             direction: SelectPaneDirection::Right,
+            preserve_zoom: false,
         }),
         Request::SendKeys(SendKeysRequest {
             target: pane,
@@ -181,6 +189,8 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
             detached: false,
             size: None,
             preserve_zoom: false,
+            full_size: false,
+            stdin_payload: None,
         }),
         Request::AttachSession(AttachSessionRequest {
             target: alpha.clone(),
@@ -284,12 +294,14 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
             ))),
             print: true,
             message: Some("#{session_name}".to_owned()),
+            empty_target_context: false,
         }),
         Request::DisplayMessageExt(DisplayMessageExtRequest {
             target: Some(Target::Session(beta.clone())),
             print: true,
             message: Some("#{client_name}".to_owned()),
             target_client: Some("=".to_owned()),
+            empty_target_context: false,
         }),
         Request::SendKeysExt2(SendKeysExt2Request {
             target: Some(PaneTarget::with_window(beta.clone(), 0, 1)),
@@ -435,6 +447,24 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
                 rows: 40,
             }),
         }),
+        Request::AttachSessionExt3(AttachSessionExt3Request::from_ext2(
+            AttachSessionExt2Request {
+                target: Some(beta.clone()),
+                target_spec: Some("beta:0.1".to_owned()),
+                detach_other_clients: true,
+                kill_other_clients: false,
+                read_only: true,
+                skip_environment_update: true,
+                flags: Some(vec!["active-pane".to_owned()]),
+                working_directory: Some("/tmp".to_owned()),
+                client_terminal: crate::ClientTerminalContext::default(),
+                client_size: Some(TerminalSize {
+                    cols: 120,
+                    rows: 40,
+                }),
+            },
+            vec![crate::CAPABILITY_ATTACH_RENDER.to_owned()],
+        )),
         Request::SwitchClientExt3(SwitchClientExt3Request {
             target_client: Some("=".to_owned()),
             target: Some("beta:0.1".to_owned()),
@@ -468,6 +498,7 @@ fn display_message_request_appends_after_existing_request_variants() {
         )),
         print: true,
         message: Some("#{session_name}".to_owned()),
+        empty_target_context: false,
     });
 
     let encoded = bincode::serialize(&request).expect("request encodes");
@@ -643,6 +674,24 @@ fn client_surface_request_variants_append_after_server_access() {
                 zoom: true,
             }),
         ),
+        (
+            117_u32,
+            Request::AttachSessionExt3(AttachSessionExt3Request::from_ext2(
+                AttachSessionExt2Request {
+                    target: Some(SessionName::new("alpha").expect("valid session")),
+                    target_spec: Some("alpha:2".to_owned()),
+                    detach_other_clients: false,
+                    kill_other_clients: false,
+                    read_only: false,
+                    skip_environment_update: false,
+                    flags: None,
+                    working_directory: Some("/tmp".to_owned()),
+                    client_terminal: crate::ClientTerminalContext::default(),
+                    client_size: Some(TerminalSize { cols: 90, rows: 30 }),
+                },
+                vec![crate::CAPABILITY_ATTACH_RENDER.to_owned()],
+            )),
+        ),
     ];
 
     for (expected_tag, request) in cases {
@@ -715,6 +764,24 @@ fn decoder_rejects_oversized_frames() {
             maximum: 8,
         })
     );
+}
+
+#[test]
+fn decoder_clears_buffer_after_unsupported_wire_version() {
+    let unsupported_version = if crate::RMUX_WIRE_VERSION == 1 { 2 } else { 1 };
+    let mut frame = vec![crate::RMUX_FRAME_MAGIC, unsupported_version as u8];
+    frame.extend_from_slice(&4u32.to_le_bytes());
+    frame.extend_from_slice(&[0, 0, 0, 0]);
+
+    let mut decoder = FrameDecoder::new();
+    decoder.push_bytes(&frame);
+
+    assert!(matches!(
+        decoder.next_frame::<Request>(),
+        Err(crate::RmuxError::UnsupportedWireVersion { .. })
+    ));
+    assert!(decoder.remaining_bytes().is_empty());
+    assert_eq!(decoder.next_frame::<Request>(), Ok(None));
 }
 
 #[test]

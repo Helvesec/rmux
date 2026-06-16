@@ -71,6 +71,62 @@ fn show_options_quotes_whitespace_and_renders_array_indexes() {
         ]
     );
 
+    let pane_colours = store
+        .show_options_lines_filtered(
+            &OptionScopeSelector::WindowGlobal,
+            Some("pane-colours"),
+            false,
+        )
+        .expect("pane-colours show succeeds");
+    assert_eq!(pane_colours, vec!["pane-colours".to_owned()]);
+
+    let local_pane_colours = store
+        .show_options_lines_filtered(
+            &OptionScopeSelector::Window(WindowTarget::with_window(session_name("alpha"), 0)),
+            Some("pane-colours"),
+            false,
+        )
+        .expect("local pane-colours show succeeds");
+    assert!(local_pane_colours.is_empty());
+
+    let inherited_local_pane_colours = store
+        .show_options_lines_with_mode_filtered(
+            &OptionScopeSelector::Window(WindowTarget::with_window(session_name("alpha"), 0)),
+            Some("pane-colours"),
+            false,
+            ShowOptionsMode::ResolvedWithInheritanceMarkers,
+        )
+        .expect("local pane-colours -A show succeeds");
+    assert_eq!(
+        inherited_local_pane_colours,
+        vec!["pane-colours".to_owned()]
+    );
+    let inherited_pane_pane_colours = store
+        .show_options_lines_with_mode_filtered(
+            &OptionScopeSelector::Pane(PaneTarget::with_window(session_name("alpha"), 0, 0)),
+            Some("pane-colours"),
+            false,
+            ShowOptionsMode::ResolvedWithInheritanceMarkers,
+        )
+        .expect("pane pane-colours -A show succeeds");
+    assert_eq!(inherited_pane_pane_colours, vec!["pane-colours".to_owned()]);
+
+    let terminal_features = store
+        .show_options_lines_filtered(
+            &OptionScopeSelector::WindowGlobal,
+            Some("terminal-features"),
+            false,
+        )
+        .expect("terminal-features show succeeds");
+    assert_eq!(
+        terminal_features,
+        vec![
+            "terminal-features[0] xterm*:clipboard:ccolour:cstyle:focus:title".to_owned(),
+            "terminal-features[1] screen*:title".to_owned(),
+            "terminal-features[2] rxvt*:ignorefkeys".to_owned(),
+        ]
+    );
+
     store
         .set(
             ScopeSelector::Global,

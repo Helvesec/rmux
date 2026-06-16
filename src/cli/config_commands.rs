@@ -5,16 +5,20 @@ mod hooks;
 #[path = "config_commands/options.rs"]
 mod options;
 
-use rmux_client::connect;
-use rmux_proto::{ErrorResponse, Response, RmuxError, ScopeSelector, SetEnvironmentMode};
+use rmux_client::{connect, ClientError};
+use rmux_proto::{
+    ErrorResponse, Request, Response, RmuxError, ScopeSelector, SetEnvironmentMode,
+    SetOptionByNameRequest,
+};
 
+use crate::cli::target_resolution::resolve_session_target_spec;
 use crate::cli::{
-    expect_command_output, expect_command_success, resolve_current_session_target, run_command,
-    run_payload_command_resolved, write_command_output, ExitFailure,
+    expect_command_output, expect_command_success, resolve_current_session_target,
+    run_command_resolved, run_payload_command_resolved, write_command_output, ExitFailure,
 };
 use crate::cli_args::{
-    build_scope, SetEnvironmentArgs, SetOptionArgs, SetOptionCommandKind, ShowEnvironmentArgs,
-    ShowOptionsArgs, ShowOptionsCommandKind,
+    SetEnvironmentArgs, SetOptionArgs, SetOptionCommandKind, ShowEnvironmentArgs, ShowOptionsArgs,
+    ShowOptionsCommandKind, TargetSpec,
 };
 pub(crate) use hooks::{run_set_hook, run_show_hooks};
 use options::{resolve_set_option_args, resolve_show_options_scope, ResolvedSetOptionCommand};
@@ -35,15 +39,17 @@ pub(crate) fn run_set_option(
     };
 
     let response = connection
-        .set_option_by_name(
-            request.scope,
-            request.option,
-            request.value,
-            request.mode,
-            request.only_if_unset,
-            request.unset,
-            request.unset_pane_overrides,
-        )
+        .roundtrip(&Request::SetOptionByName(SetOptionByNameRequest {
+            scope: request.scope,
+            name: request.option,
+            value: request.value,
+            mode: request.mode,
+            only_if_unset: request.only_if_unset,
+            unset: request.unset,
+            unset_pane_overrides: request.unset_pane_overrides,
+            format: request.format,
+            format_target: request.format_target,
+        }))
         .map_err(ExitFailure::from_client)?;
     match response {
         response if quiet && quiet_option_response(&response) => Ok(0),
@@ -59,23 +65,22 @@ pub(crate) fn run_set_environment(
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     let mode = resolve_set_environment_mode(&args)?;
+    if args.name.contains('=') {
+        return Err(ExitFailure::new(1, "variable name contains ="));
+    }
     let value = match mode {
         Some(SetEnvironmentMode::Clear | SetEnvironmentMode::Unset) => String::new(),
         Some(SetEnvironmentMode::Set) | None => args
             .value
             .clone()
-            .ok_or_else(|| ExitFailure::new(1, "set-environment requires a value"))?,
+            .ok_or_else(|| ExitFailure::new(1, "no value specified"))?,
     };
 
-    run_command(socket_path, "set-environment", move |connection| {
-        connection.set_environment(
-            build_scope(args.global, args.target),
-            args.name,
-            value,
-            mode,
-            args.hidden,
-            args.format,
-        )
+    run_command_resolved(socket_path, "set-environment", move |connection| {
+        let scope = resolve_environment_scope(connection, args.global, args.target)?;
+        connection
+            .set_environment(scope, args.name, value, mode, args.hidden, args.format)
+            .map_err(ExitFailure::from_client)
     })
 }
 
@@ -101,10 +106,19 @@ pub(crate) fn run_show_options(
     };
     let include_inherited = args.include_inherited;
     let response = connection
-        .show_options(scope, args.name, args.value_only, include_inherited)
-        .map_err(ExitFailure::from_client)?;
+        .show_options(
+            scope,
+            args.name,
+            args.value_only,
+            include_inherited,
+            args.quiet,
+        )
+        .map_err(show_options_exit_failure)?;
     match response {
         response if quiet && quiet_option_response(&response) => Ok(0),
+        Response::Error(ErrorResponse {
+            error: RmuxError::Server(message) | RmuxError::Message(message),
+        }) => Err(show_options_message_failure(message)),
         response => {
             let output = expect_command_output(&response, command_name)?;
             write_command_output(output)?;
@@ -113,10 +127,40 @@ pub(crate) fn run_show_options(
     }
 }
 
+fn show_options_exit_failure(error: ClientError) -> ExitFailure {
+    match error {
+        ClientError::Protocol(RmuxError::Server(message) | RmuxError::Message(message)) => {
+            let normalized = message
+                .strip_prefix("server error: ")
+                .unwrap_or(&message)
+                .to_owned();
+            if option_lookup_error(&normalized) {
+                ExitFailure::new(1, normalized)
+            } else {
+                ExitFailure::from_client(ClientError::Protocol(RmuxError::Server(message)))
+            }
+        }
+        error => ExitFailure::from_client(error),
+    }
+}
+
+fn show_options_message_failure(message: String) -> ExitFailure {
+    let normalized = message
+        .strip_prefix("server error: ")
+        .unwrap_or(&message)
+        .to_owned();
+    if option_lookup_error(&normalized) {
+        ExitFailure::new(1, normalized)
+    } else {
+        ExitFailure::new(1, message)
+    }
+}
+
 fn quiet_option_failure(error: &ExitFailure) -> bool {
     let message = error.message();
     message.starts_with("invalid option: ")
         || message.starts_with("server error: unknown option: ")
+        || message.starts_with("server error: invalid option: ")
         || message.starts_with("server error: ambiguous option: ")
 }
 
@@ -130,7 +174,9 @@ fn quiet_option_response(response: &Response) -> bool {
 }
 
 fn option_lookup_error(message: &str) -> bool {
-    message.starts_with("unknown option: ") || message.starts_with("ambiguous option: ")
+    message.starts_with("unknown option: ")
+        || message.starts_with("invalid option: ")
+        || message.starts_with("ambiguous option: ")
 }
 
 pub(crate) fn run_show_environment(
@@ -138,25 +184,27 @@ pub(crate) fn run_show_environment(
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
     run_payload_command_resolved(socket_path, "show-environment", move |connection| {
-        let scope = resolve_show_environment_scope(connection, args.global, args.target)?;
+        let scope = resolve_environment_scope(connection, args.global, args.target)?;
         connection
             .show_environment(scope, args.name, args.hidden, args.shell_format)
             .map_err(ExitFailure::from_client)
     })
 }
 
-fn resolve_show_environment_scope(
+fn resolve_environment_scope(
     connection: &mut rmux_client::Connection,
     global: bool,
-    target: Option<rmux_proto::SessionName>,
+    target: Option<TargetSpec>,
 ) -> Result<ScopeSelector, ExitFailure> {
     if global {
         return Ok(ScopeSelector::Global);
     }
-    target
-        .map(ScopeSelector::Session)
-        .map(Ok)
-        .unwrap_or_else(|| resolve_current_session_target(connection).map(ScopeSelector::Session))
+    match target {
+        Some(target) => {
+            resolve_session_target_spec(connection, &target, false).map(ScopeSelector::Session)
+        }
+        None => resolve_current_session_target(connection).map(ScopeSelector::Session),
+    }
 }
 
 fn resolve_set_environment_mode(
@@ -199,10 +247,11 @@ mod tests {
         resolve_show_options_scope,
     };
     use crate::cli_args::{
-        parse_target_spec, SetOptionArgs, SetOptionCommandKind, ShowOptionsArgs,
-        ShowOptionsCommandKind, TargetSpec,
+        parse_target_spec, SetEnvironmentArgs, SetOptionArgs, SetOptionCommandKind,
+        ShowOptionsArgs, ShowOptionsCommandKind, TargetSpec,
     };
     use rmux_proto::{OptionScopeSelector, SessionName, WindowTarget};
+    use std::path::Path;
 
     fn target_spec(value: &str) -> TargetSpec {
         parse_target_spec(value).expect("valid target spec")
@@ -216,6 +265,7 @@ mod tests {
             pane: false,
             quiet: false,
             append: false,
+            format: false,
             only_if_unset: false,
             unset: false,
             unset_pane_overrides: false,
@@ -259,6 +309,48 @@ mod tests {
     }
 
     #[test]
+    fn set_environment_without_value_reports_tmux_message_before_connecting() {
+        let error = super::run_set_environment(
+            SetEnvironmentArgs {
+                global: false,
+                target: None,
+                format: false,
+                hidden: false,
+                clear: false,
+                unset: false,
+                name: "FOO".to_owned(),
+                value: None,
+            },
+            Path::new("/tmp/rmux-setenv-value-test.sock"),
+        )
+        .expect_err("missing set-environment value should fail before connecting");
+
+        assert_eq!(error.exit_code(), 1);
+        assert_eq!(error.message(), "no value specified");
+    }
+
+    #[test]
+    fn set_environment_rejects_equals_in_name_before_value_validation() {
+        let error = super::run_set_environment(
+            SetEnvironmentArgs {
+                global: true,
+                target: None,
+                format: false,
+                hidden: false,
+                clear: false,
+                unset: false,
+                name: "FOO=bar".to_owned(),
+                value: None,
+            },
+            Path::new("/tmp/rmux-setenv-equals-test.sock"),
+        )
+        .expect_err("set-environment names containing equals should fail before connecting");
+
+        assert_eq!(error.exit_code(), 1);
+        assert_eq!(error.message(), "variable name contains =");
+    }
+
+    #[test]
     fn set_window_option_uses_window_scope_for_window_targets() {
         let session = SessionName::new("alpha").expect("valid session");
         let window = WindowTarget::with_window(session, 0);
@@ -271,6 +363,7 @@ mod tests {
                 pane: false,
                 quiet: false,
                 append: false,
+                format: false,
                 only_if_unset: false,
                 unset: false,
                 unset_pane_overrides: false,
@@ -360,6 +453,7 @@ mod tests {
                 pane: false,
                 quiet: false,
                 append: false,
+                format: false,
                 only_if_unset: false,
                 unset: false,
                 unset_pane_overrides: false,
@@ -388,6 +482,7 @@ mod tests {
                 pane: false,
                 quiet: false,
                 append: false,
+                format: false,
                 only_if_unset: false,
                 unset: false,
                 unset_pane_overrides: false,
@@ -416,6 +511,7 @@ mod tests {
                 pane: false,
                 quiet: false,
                 append: false,
+                format: false,
                 only_if_unset: false,
                 unset: false,
                 unset_pane_overrides: false,
@@ -469,6 +565,31 @@ mod tests {
             scope,
             ShowOptionsScope::Resolved(OptionScopeSelector::SessionGlobal)
         );
+    }
+
+    #[test]
+    fn show_options_window_and_pane_flags_without_target_use_current_target() {
+        let window_scope = resolve_show_options_scope(
+            ShowOptionsCommandKind::ShowOptions,
+            &ShowOptionsArgs {
+                global: false,
+                window: true,
+                ..show_global_args(Some("@missing"))
+            },
+        )
+        .expect("show-options -w resolves");
+        assert_eq!(window_scope, ShowOptionsScope::CurrentWindow);
+
+        let pane_scope = resolve_show_options_scope(
+            ShowOptionsCommandKind::ShowOptions,
+            &ShowOptionsArgs {
+                global: false,
+                pane: true,
+                ..show_global_args(Some("@missing"))
+            },
+        )
+        .expect("show-options -p resolves");
+        assert_eq!(pane_scope, ShowOptionsScope::CurrentPane);
     }
 
     #[test]
@@ -581,6 +702,7 @@ mod tests {
                 pane: false,
                 quiet: false,
                 append: false,
+                format: false,
                 only_if_unset: false,
                 unset: false,
                 unset_pane_overrides: false,

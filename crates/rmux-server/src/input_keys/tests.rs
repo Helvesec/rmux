@@ -42,6 +42,33 @@ fn extended_key_round_trips_csi_u_unicode() {
 }
 
 #[test]
+fn extended_key_round_trips_csi_u_shift_enter() {
+    let key = parse_key("S-Enter");
+    let encoded =
+        encode_key(mode::MODE_KEYS_EXTENDED_2, ExtendedKeyFormat::CsiU, key).expect("encode");
+    assert_eq!(encoded, b"\x1b[13;2u");
+    assert_eq!(
+        decode_extended_key(&encoded, None),
+        ExtendedKeyDecode::Matched {
+            size: encoded.len(),
+            key,
+        }
+    );
+}
+
+#[test]
+fn kitty_keyboard_mode_forces_csi_u_format() {
+    let key = parse_key("S-Enter");
+    let encoded = encode_key(
+        mode::MODE_KEYS_EXTENDED_2 | mode::MODE_KEYS_KITTY,
+        ExtendedKeyFormat::Xterm,
+        key,
+    )
+    .expect("encode");
+    assert_eq!(encoded, b"\x1b[13;2u");
+}
+
+#[test]
 fn extended_key_shift_only_printables_strip_shift() {
     assert_eq!(
         decode_extended_key(b"\x1b[65;2u", None),
@@ -68,6 +95,12 @@ fn standard_mode_meta_printable_falls_back_to_escape_prefix() {
 }
 
 #[test]
+fn standard_mode_shift_enter_maps_to_line_feed() {
+    let encoded = encode_key(0, ExtendedKeyFormat::Xterm, parse_key("S-Enter")).expect("encode");
+    assert_eq!(encoded, b"\n");
+}
+
+#[test]
 fn mode1_prefers_vt10x_for_compatible_ctrl_keys() {
     let encoded = encode_key(
         mode::MODE_KEYS_EXTENDED,
@@ -76,6 +109,33 @@ fn mode1_prefers_vt10x_for_compatible_ctrl_keys() {
     )
     .expect("encode");
     assert_eq!(encoded, [0x00]);
+}
+
+#[test]
+fn standard_mode_control_space_encodes_nul() {
+    let encoded = encode_key(0, ExtendedKeyFormat::Xterm, parse_key("C-Space")).expect("encode");
+    assert_eq!(encoded, [0x00]);
+
+    let meta = encode_key(0, ExtendedKeyFormat::Xterm, parse_key("M-C-Space")).expect("encode");
+    assert_eq!(meta, [0x1b, 0x00]);
+}
+
+#[test]
+fn standard_mode_control_question_encodes_delete() {
+    let encoded = encode_key(0, ExtendedKeyFormat::Xterm, parse_key("C-?")).expect("encode");
+    assert_eq!(encoded, [0x7f]);
+}
+
+#[test]
+fn standard_mode_tmux_noop_control_digits_encode_empty() {
+    for key in ["C-3", "C-4", "C-5", "C-7", "C-8"] {
+        let encoded = encode_key(0, ExtendedKeyFormat::Xterm, parse_key(key)).expect("encode");
+        assert_eq!(
+            encoded,
+            Vec::<u8>::new(),
+            "{key} should be a successful no-op"
+        );
+    }
 }
 
 #[test]
@@ -381,6 +441,14 @@ fn standard_key_encode_uses_xterm_modified_cursor_sequences() {
             "{name} should use xterm modified cursor encoding"
         );
     }
+}
+
+#[test]
+fn meta_backspace_encodes_escape_del() {
+    assert_eq!(
+        encode_key(0, ExtendedKeyFormat::Xterm, parse_key("M-BSpace")).as_deref(),
+        Some(b"\x1b\x7f".as_slice())
+    );
 }
 
 #[test]

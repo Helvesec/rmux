@@ -191,7 +191,7 @@ fn tmux_compat_harness_records_effective_tmux_argv_and_env_overrides() -> Result
         .with_tmpdir(override_tmpdir.clone())
         .with_tmux("inside-tmux")
         .with_term("screen-256color")
-        .with_env("RMUX_TMUX_COMPAT_EXTRA", "set");
+        .with_env("RMUX_TEST_EXTRA", "set");
     let run = harness.run_pair_with(&fake_tmux, &["-V"], config)?;
 
     assert_eq!(run.tmux.program, "tmux");
@@ -230,7 +230,7 @@ fn tmux_compat_harness_records_effective_tmux_argv_and_env_overrides() -> Result
                 Some(OsString::from("screen-256color"))
             ),
             (
-                OsString::from("RMUX_TMUX_COMPAT_EXTRA"),
+                OsString::from("RMUX_TEST_EXTRA"),
                 Some(OsString::from("set"))
             ),
         ]
@@ -858,7 +858,7 @@ fn tmux_compat_link_and_unlink_window_round_trip_when_frozen_tmux_is_available(
 fn write_fake_tmux(path: &std::path::Path) -> Result<(), Box<dyn Error>> {
     fs::write(
         path,
-        "#!/bin/sh\nprintf 'TMPDIR=%s\\n' \"$TMPDIR\"\nprintf 'RMUX_TMPDIR=%s\\n' \"$RMUX_TMPDIR\"\nprintf 'TMUX_TMPDIR=%s\\n' \"$TMUX_TMPDIR\"\nprintf 'TMUX=%s\\n' \"${TMUX-unset}\"\nprintf 'TERM=%s\\n' \"$TERM\"\nprintf 'EXTRA=%s\\n' \"$RMUX_TMUX_COMPAT_EXTRA\"\nprintf 'ARGV='\nfor arg in \"$@\"; do printf '[%s]' \"$arg\"; done\nprintf '\\n'\n",
+        "#!/bin/sh\nprintf 'TMPDIR=%s\\n' \"$TMPDIR\"\nprintf 'RMUX_TMPDIR=%s\\n' \"$RMUX_TMPDIR\"\nprintf 'TMUX_TMPDIR=%s\\n' \"$TMUX_TMPDIR\"\nprintf 'TMUX=%s\\n' \"${TMUX-unset}\"\nprintf 'TERM=%s\\n' \"$TERM\"\nprintf 'EXTRA=%s\\n' \"$RMUX_TEST_EXTRA\"\nprintf 'ARGV='\nfor arg in \"$@\"; do printf '[%s]' \"$arg\"; done\nprintf '\\n'\n",
     )?;
 
     #[cfg(unix)]

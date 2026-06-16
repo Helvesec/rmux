@@ -1,7 +1,6 @@
 use clap::{ArgAction, ArgGroup, Args};
-use rmux_proto::SessionName;
 
-use super::{parse_session_name, parse_target_spec, TargetSpec};
+use super::{parse_target_spec, TargetSpec};
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct RefreshClientArgs {
@@ -23,8 +22,6 @@ pub(crate) struct RefreshClientArgs {
     pub(crate) clipboard_query: bool,
     #[arg(short = 'L', action = ArgAction::SetTrue)]
     pub(crate) pan_left: bool,
-    #[arg(short = 'r')]
-    pub(crate) colour_report: Option<String>,
     #[arg(short = 'R', action = ArgAction::SetTrue)]
     pub(crate) pan_right: bool,
     #[arg(short = 'S', action = ArgAction::SetTrue)]
@@ -39,16 +36,30 @@ pub(crate) struct RefreshClientArgs {
 
 #[derive(Debug, Clone, Args)]
 pub(crate) struct ListClientsArgs {
-    #[arg(short = 'F')]
+    #[arg(short = 'F', conflicts_with = "json")]
     pub(crate) format: Option<String>,
     #[arg(short = 'f')]
     pub(crate) filter: Option<String>,
-    #[arg(short = 'O')]
-    pub(crate) sort_order: Option<String>,
-    #[arg(short = 'r', action = ArgAction::SetTrue)]
-    pub(crate) reversed: bool,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(long = "json", action = ArgAction::SetTrue)]
+    pub(crate) json: bool,
+    #[arg(short = 'O', hide = true)]
+    unsupported_sort_order: Option<String>,
+    #[arg(short = 'r', action = ArgAction::SetTrue, hide = true)]
+    unsupported_reversed: bool,
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target_session: Option<TargetSpec>,
+}
+
+impl ListClientsArgs {
+    pub(crate) fn unsupported_flag(&self) -> Option<&'static str> {
+        if self.unsupported_reversed {
+            Some("-r")
+        } else if self.unsupported_sort_order.is_some() {
+            Some("-O")
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -89,8 +100,8 @@ pub(crate) struct DetachClientArgs {
     pub(crate) exec_command: Option<String>,
     #[arg(short = 'P', action = ArgAction::SetTrue)]
     pub(crate) kill_on_detach: bool,
-    #[arg(short = 's', value_parser = parse_session_name)]
-    pub(crate) target_session: Option<SessionName>,
+    #[arg(short = 's', value_parser = parse_target_spec, allow_hyphen_values = true)]
+    pub(crate) target_session: Option<TargetSpec>,
     #[arg(short = 't', allow_hyphen_values = true)]
     pub(crate) target_client: Option<String>,
 }

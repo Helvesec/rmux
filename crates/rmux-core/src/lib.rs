@@ -48,8 +48,8 @@ pub use environment::{EnvironmentStore, ShowEnvironmentEntry, ENVIRON_HIDDEN};
 pub use formats::format_skip_delimiter;
 pub use grid::GridRenderOptions;
 pub use hooks::{
-    validate_hook_registration, validate_hook_scope, HookBindingView, HookDispatch, HookGlobalRoot,
-    HookSetOptions, HookStore,
+    hook_global_root, validate_hook_registration, validate_hook_scope, HookBindingView,
+    HookDispatch, HookGlobalRoot, HookSetOptions, HookStore,
 };
 pub use identity::{PaneId, SessionId, SessionName, WindowId};
 pub use input::{

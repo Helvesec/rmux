@@ -34,7 +34,35 @@ fn issue_8_prompt_created_window_exit_removes_dead_pane() -> Result<(), Box<dyn 
         release_path.display()
     );
     send_prompt_command(&mut attach, &command)?;
-    let _ = read_until_contains(attach.master_mut(), "ISSUE8_WINDOW_READY", IO_TIMEOUT)?;
+    let _ = read_until_contains(attach.master_mut(), "ISSUE8_WINDOW_READY", IO_TIMEOUT)
+        .map_err(|error| {
+            let windows = harness
+                .run(&[
+                    "list-windows",
+                    "-a",
+                    "-F",
+                    "#{session_name}:#{window_index}:#{window_active}:#{window_name}",
+                ])
+                .ok()
+                .map(|output| common::stdout(&output))
+                .unwrap_or_else(|| "<list-windows failed>".to_owned());
+            let panes = harness
+                .run(&[
+                    "list-panes",
+                    "-a",
+                    "-F",
+                    "#{session_name}:#{window_index}.#{pane_index}:#{pane_current_command}:#{pane_dead}",
+                ])
+                .ok()
+                .map(|output| common::stdout(&output))
+                .unwrap_or_else(|| "<list-panes failed>".to_owned());
+            let capture = harness
+                .run(&["capture-pane", "-p", "-t", "alpha:1.0"])
+                .ok()
+                .map(|output| common::stdout(&output))
+                .unwrap_or_else(|| "<capture-pane failed>".to_owned());
+            format!("{error}; windows={windows:?}; panes={panes:?}; capture={capture:?}")
+        })?;
     wait_for_non_empty_window_name(&harness, "1")?;
     fs::write(&release_path, "")?;
     wait_for_panes(&harness, &["0:0", "0:1"], &["1:0"])?;
@@ -56,19 +84,22 @@ fn issue_8_prompt_created_window_exit_removes_dead_pane() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn fresh_pane_title_has_user_host_and_path_before_shell_updates_it() -> Result<(), Box<dyn Error>> {
+fn fresh_pane_title_starts_as_host_short_before_shell_updates_it() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("issue8-initial-pane-title")?;
     let mut daemon = harness.start_hidden_daemon()?;
 
     assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
 
-    let output = harness.run(&["display-message", "-p", "-t", "alpha:0.0", "#{pane_title}"])?;
+    let output = harness.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "#{pane_title}|#{host_short}",
+    ])?;
     let title = common::stdout(&output);
-    let title = title.trim();
-    assert!(
-        title.contains('@') && title.contains(':') && !title.ends_with(':'),
-        "initial pane title should include user, host, and path, got {title:?}"
-    );
+    let (pane_title, host_short) = title.trim().split_once('|').expect("format separator");
+    assert_eq!(pane_title, host_short);
 
     terminate_child(daemon.child_mut())?;
     Ok(())

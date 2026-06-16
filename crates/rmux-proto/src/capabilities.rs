@@ -14,6 +14,8 @@ pub const CAPABILITY_FRAMED_ERRORS: &str = "protocol.framed_errors";
 pub const CAPABILITY_ATTACH_STREAM: &str = "stream.attach";
 /// Stable feature id for attach-stream resize messages that carry pixel geometry.
 pub const CAPABILITY_ATTACH_RESIZE_GEOMETRY: &str = "stream.attach.resize_geometry";
+/// Stable feature id for coalescible attach-stream render messages.
+pub const CAPABILITY_ATTACH_RENDER: &str = "stream.attach.render";
 /// Stable feature id for control-mode framed-to-raw stream upgrades.
 pub const CAPABILITY_CONTROL_STREAM: &str = "stream.control";
 /// Stable feature id for daemon shutdown over detached RPC.
@@ -47,6 +49,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     CAPABILITY_FRAMED_ERRORS,
     CAPABILITY_ATTACH_STREAM,
     CAPABILITY_ATTACH_RESIZE_GEOMETRY,
+    CAPABILITY_ATTACH_RENDER,
     CAPABILITY_CONTROL_STREAM,
     CAPABILITY_DAEMON_SHUTDOWN,
     CAPABILITY_DAEMON_STATUS,
@@ -146,5 +149,20 @@ impl HandshakeResponse {
                 .map(str::to_owned)
                 .collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HandshakeResponse, CAPABILITY_ATTACH_RENDER};
+
+    #[test]
+    fn current_handshake_advertises_attach_render_capability() {
+        let response = HandshakeResponse::current();
+
+        assert!(response
+            .capabilities
+            .iter()
+            .any(|capability| capability == CAPABILITY_ATTACH_RENDER));
     }
 }

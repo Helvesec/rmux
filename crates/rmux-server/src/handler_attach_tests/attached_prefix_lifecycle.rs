@@ -3,6 +3,14 @@ use super::*;
 #[cfg(windows)]
 const WINDOWS_ATTACH_EXIT_TIMEOUT: Duration = Duration::from_secs(20);
 
+#[cfg(unix)]
+const PROMPT_NEW_WINDOW_INPUT: &[u8] =
+    b"\x02:new-window -- 'printf ISSUE8_WINDOW_READY; sleep 30'\r";
+
+#[cfg(windows)]
+const PROMPT_NEW_WINDOW_INPUT: &[u8] =
+    b"\x02:new-window -- cmd.exe /d /q /c \"echo ISSUE8_WINDOW_READY & ping -n 30 127.0.0.1 >NUL\"\r";
+
 #[tokio::test]
 async fn attached_prefix_d_dispatches_detach_client() {
     let handler = RequestHandler::new();
@@ -55,6 +63,30 @@ async fn attached_prefix_d_dispatches_detach_client_across_separate_reads() {
         detached,
         "C-b d must still detach when prefix and command arrive in separate reads"
     );
+}
+
+#[tokio::test]
+async fn attached_send_prefix_then_does_not_detach() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let alpha = session_name("alpha");
+    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x02")
+        .await
+        .expect("prefix key input");
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x02d")
+        .await
+        .expect("send-prefix then d input");
+
+    while let Ok(control) = control_rx.try_recv() {
+        assert!(
+            !matches!(control, AttachControl::Detach),
+            "C-b C-b d must send a literal prefix followed by d, not detach"
+        );
+    }
 }
 
 #[tokio::test]
@@ -112,6 +144,38 @@ async fn attached_command_prompt_renames_current_session() {
     assert!(
         !frame.contains("[alpha]"),
         "renamed session status must not keep old name: {frame:?}"
+    );
+}
+
+#[tokio::test]
+async fn attached_command_prompt_can_create_window_from_same_read() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let alpha = session_name("alpha");
+    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, PROMPT_NEW_WINDOW_INPUT)
+        .await
+        .expect("prefix command prompt input");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let windows = active_windows(&handler, &alpha).await;
+        if windows == "0:0\n1:1\n" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for prompt-created window, got {windows:?}"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    let frame = wait_for_switch_frame_containing(&mut control_rx, "ISSUE8_WINDOW_READY").await;
+    assert!(
+        frame.contains("ISSUE8_WINDOW_READY"),
+        "prompt-created window must render its first output, got {frame:?}"
     );
 }
 
@@ -288,12 +352,18 @@ async fn wait_for_switch_frame_containing(
 ) -> String {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let Some(control) = tokio::time::timeout(Duration::from_millis(250), control_rx.recv())
-            .await
-            .expect("timed out waiting for attach refresh")
-        else {
-            panic!("attach refresh channel closed");
-        };
+        let control =
+            match tokio::time::timeout(Duration::from_millis(250), control_rx.recv()).await {
+                Ok(Some(control)) => control,
+                Ok(None) => panic!("attach refresh channel closed"),
+                Err(_) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "timed out waiting for attach frame containing {expected:?}"
+                    );
+                    continue;
+                }
+            };
         if let AttachControl::Switch(target) = control {
             let frame = String::from_utf8(target.render_frame).expect("render frame is utf-8");
             if frame.contains(expected) {

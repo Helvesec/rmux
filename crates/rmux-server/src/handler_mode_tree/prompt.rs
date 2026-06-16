@@ -307,6 +307,8 @@ impl RequestHandler {
                 only_if_unset: false,
                 unset: false,
                 unset_pane_overrides: false,
+                format: false,
+                format_target: None,
             })
             .await;
         if let Response::Error(error) = response {

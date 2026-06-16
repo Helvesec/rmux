@@ -23,6 +23,7 @@ enum PaneExitPlan {
         runtime_session_name: rmux_proto::SessionName,
         target: PaneTarget,
         prepare_dead: bool,
+        pane_event: super::super::QueuedLifecycleEvent,
         output: ExitedPaneOutput,
     },
     RemovePane {
@@ -133,10 +134,22 @@ impl RequestHandler {
 
                 if let Some(metadata) = metadata {
                     if should_keep_dead_pane(&state, &target, metadata) {
+                        let (pane_id, window_id, window_name) =
+                            pane_lifecycle_identifiers(&state, &target, event.pane_id);
+                        let pane_event = prepare_lifecycle_event(
+                            &mut state,
+                            &LifecycleEvent::PaneDied {
+                                target: target.clone(),
+                                pane_id: Some(pane_id),
+                                window_id,
+                                window_name,
+                            },
+                        );
                         Some(PaneExitPlan::KeepDead {
                             runtime_session_name,
                             target,
                             prepare_dead: !was_dead,
+                            pane_event,
                             output,
                         })
                     } else {
@@ -268,6 +281,7 @@ impl RequestHandler {
                 runtime_session_name,
                 target,
                 prepare_dead,
+                pane_event,
                 output,
             } => {
                 output.ensure_eof(event.generation).await;
@@ -279,6 +293,7 @@ impl RequestHandler {
                     )
                     .await;
                 }
+                self.emit_prepared(pane_event);
                 let session_names = if self.attached_count(target.session_name()).await == 0 {
                     let mut state = self.state.lock().await;
                     match apply_dead_pane_automatic_window_name(&mut state, &target) {
@@ -497,6 +512,28 @@ fn should_keep_dead_pane(
         "failed" => metadata.signal.is_some() || metadata.status.is_some_and(|status| status != 0),
         _ => false,
     }
+}
+
+fn pane_lifecycle_identifiers(
+    state: &HandlerState,
+    target: &PaneTarget,
+    fallback_pane_id: rmux_core::PaneId,
+) -> (u32, Option<u32>, Option<String>) {
+    let Some(session) = state.sessions.session(target.session_name()) else {
+        return (fallback_pane_id.as_u32(), None, None);
+    };
+    let Some(window) = session.window_at(target.window_index()) else {
+        return (fallback_pane_id.as_u32(), None, None);
+    };
+    let pane_id = window
+        .pane(target.pane_index())
+        .map(|pane| pane.id().as_u32())
+        .unwrap_or_else(|| fallback_pane_id.as_u32());
+    (
+        pane_id,
+        Some(window.id().as_u32()),
+        Some(window.name().unwrap_or_default().to_owned()),
+    )
 }
 
 fn append_remain_on_exit_message(

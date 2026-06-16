@@ -43,6 +43,13 @@ pub(crate) struct WebSessionSnapshot {
     active_cursor_style: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WebSessionPaneFrame {
+    pub(crate) size: TerminalSize,
+    pub(crate) pane: WebSessionPaneView,
+    pub(crate) frame: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct WebSessionView {
     pub(crate) size: TerminalSize,
@@ -61,6 +68,7 @@ pub(crate) struct WebSessionPaneView {
     pub(crate) history_size: usize,
     pub(crate) scroll_offset: usize,
     pub(crate) alternate_on: bool,
+    pub(crate) mouse_on: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -150,6 +158,12 @@ impl WebSessionSnapshot {
     }
 }
 
+impl WebSessionPaneFrame {
+    pub(crate) fn new(size: TerminalSize, pane: WebSessionPaneView, frame: Vec<u8>) -> Self {
+        Self { size, pane, frame }
+    }
+}
+
 impl WebSessionView {
     pub(crate) fn new(size: TerminalSize) -> Self {
         Self {
@@ -167,16 +181,22 @@ impl WebSessionView {
         });
     }
 
-    pub(crate) fn add_pane(
-        &mut self,
+    pub(crate) fn push_pane(&mut self, pane: WebSessionPaneView) {
+        self.panes.push(pane);
+    }
+}
+
+impl WebSessionPaneView {
+    pub(crate) fn new(
         id: PaneId,
         geometry: PaneGeometry,
         active: bool,
         history_size: usize,
         scroll_offset: usize,
         alternate_on: bool,
-    ) {
-        self.panes.push(WebSessionPaneView {
+        mouse_on: bool,
+    ) -> Self {
+        Self {
             id: id.as_u32(),
             x: geometry.x(),
             y: geometry.y(),
@@ -186,7 +206,8 @@ impl WebSessionView {
             history_size,
             scroll_offset,
             alternate_on,
-        });
+            mouse_on,
+        }
     }
 }
 

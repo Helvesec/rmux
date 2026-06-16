@@ -8,7 +8,7 @@ Usage: scripts/generate-chocolatey-package.sh --version <semver> --checksums <SH
 Generate the RMUX Chocolatey package source from GitHub Release checksums.
 
 Options:
-  --version <semver|vsemver>   Release version, for example 0.5.0 or v0.5.0
+  --version <semver|vsemver>   Release version, for example 1.2.3 or v1.2.3
   --checksums <path>           SHA256SUMS file from the GitHub Release
   --output-dir <dir>           Write rmux.nuspec and tools/ scripts here
   --repository <owner/repo>    GitHub repository (default: Helvesec/rmux)
@@ -31,7 +31,7 @@ normalize_version() {
   esac
   case "$version" in
     [0-9]*.[0-9]*.[0-9]*) printf '%s\n' "$version" ;;
-    *) die "version must look like 0.5.0 or v0.5.0, got: $raw" ;;
+    *) die "version must look like 1.2.3 or v1.2.3, got: $raw" ;;
   esac
 }
 
@@ -96,6 +96,7 @@ write_install() {
 \$toolsDir = Split-Path -Parent \$MyInvocation.MyCommand.Definition
 \$installDir = Join-Path \$toolsDir '$package_dir'
 \$rmuxExe = Join-Path \$installDir 'rmux.exe'
+\$rmuxDaemonExe = Join-Path \$installDir 'rmux-daemon.exe'
 
 \$zipArgs = @{
   packageName = \$packageName
@@ -110,8 +111,12 @@ Install-ChocolateyZipPackage @zipArgs
 if (-not (Test-Path \$rmuxExe)) {
   throw "rmux.exe was not extracted to \$rmuxExe"
 }
+if (-not (Test-Path \$rmuxDaemonExe)) {
+  throw "rmux-daemon.exe was not extracted to \$rmuxDaemonExe"
+}
 
 Install-BinFile -Name 'rmux' -Path \$rmuxExe
+Install-BinFile -Name 'rmux-daemon' -Path \$rmuxDaemonExe
 EOF
 }
 
@@ -122,6 +127,7 @@ write_uninstall() {
 $ErrorActionPreference = 'Stop'
 
 Uninstall-BinFile -Name 'rmux'
+Uninstall-BinFile -Name 'rmux-daemon'
 EOF
 }
 

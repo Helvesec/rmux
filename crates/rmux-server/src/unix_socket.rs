@@ -19,10 +19,13 @@ pub(crate) struct SocketFileIdentity {
 
 pub(crate) struct BoundUnixListener {
     pub(crate) listener: LocalListener,
-    pub(crate) identity: SocketFileIdentity,
+    pub(crate) identity: Option<SocketFileIdentity>,
 }
 
 pub(crate) fn bind_unix_listener_at(socket_path: &Path) -> io::Result<BoundUnixListener> {
+    if socket_path.as_os_str().is_empty() {
+        return bind_empty_socket_listener();
+    }
     prepare_socket_path(socket_path)?;
     bind_prepared_unix_listener(socket_path)
 }
@@ -31,6 +34,9 @@ pub(crate) fn rebind_unix_listener_at(
     socket_path: &Path,
     current_identity: Option<SocketFileIdentity>,
 ) -> io::Result<BoundUnixListener> {
+    if socket_path.as_os_str().is_empty() {
+        return bind_empty_socket_listener();
+    }
     prepare_socket_parent(socket_path)?;
     remove_rebindable_socket(socket_path, current_identity)?;
     bind_prepared_unix_listener(socket_path)
@@ -41,7 +47,19 @@ fn bind_prepared_unix_listener(socket_path: &Path) -> io::Result<BoundUnixListen
     let listener = LocalListener::bind(&endpoint)?;
     enforce_bound_socket_permissions(socket_path)?;
     let identity = socket_file_identity(socket_path)?;
-    Ok(BoundUnixListener { listener, identity })
+    Ok(BoundUnixListener {
+        listener,
+        identity: Some(identity),
+    })
+}
+
+fn bind_empty_socket_listener() -> io::Result<BoundUnixListener> {
+    let endpoint = rmux_ipc::resolve_endpoint(None, Some(Path::new("")))?;
+    let listener = LocalListener::bind(&endpoint)?;
+    Ok(BoundUnixListener {
+        listener,
+        identity: None,
+    })
 }
 
 fn prepare_socket_path(socket_path: &Path) -> io::Result<()> {
@@ -86,14 +104,11 @@ pub(crate) fn ensure_parent_directory(parent: &Path) -> io::Result<()> {
 }
 
 fn ensure_directory(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!(
-                "socket directory '{}' is not a plain directory",
-                path.display()
-            ),
+            format!("socket directory '{}' is not a directory", path.display()),
         ));
     }
     Ok(())
@@ -350,8 +365,11 @@ mod tests {
         remove_file_if_present(&socket_path).expect("unlink first socket path");
         let foreign = StdUnixListener::bind(&socket_path).expect("bind foreign replacement");
 
-        let removed = remove_socket_file_if_identity_matches(&socket_path, bound.identity)
-            .expect("identity guarded cleanup");
+        let removed = remove_socket_file_if_identity_matches(
+            &socket_path,
+            bound.identity.expect("filesystem socket identity"),
+        )
+        .expect("identity guarded cleanup");
 
         assert!(!removed, "cleanup must not remove a different socket inode");
         assert!(
@@ -368,8 +386,8 @@ mod tests {
         let socket_path = unique_socket_path("current-rebind");
         let bound = bind_unix_listener_at(&socket_path).expect("bind first socket");
 
-        let rebound = rebind_unix_listener_at(&socket_path, Some(bound.identity))
-            .expect("rebind current socket");
+        let rebound =
+            rebind_unix_listener_at(&socket_path, bound.identity).expect("rebind current socket");
 
         assert!(UnixStream::connect(&socket_path).is_ok());
         drop(rebound.listener);

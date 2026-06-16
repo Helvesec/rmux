@@ -33,6 +33,7 @@ async fn display_message_pane_synchronized_reflects_window_option() {
             target: Some(Target::Pane(PaneTarget::with_window(alpha, 0, 0))),
             print: true,
             message: Some("#{pane_synchronized}".to_owned()),
+            empty_target_context: false,
         }))
         .await;
 

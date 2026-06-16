@@ -1,16 +1,43 @@
 //! Opt-in process signal listener for owned sessions.
 
+#[cfg(windows)]
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::thread;
 
+#[cfg(windows)]
 use tokio::task::JoinHandle;
 
 use crate::transport::TransportClient;
-use crate::SessionName;
+#[cfg(unix)]
+use crate::RmuxError;
+use crate::{Result, SessionName};
 use rmux_proto::{KillSessionRequest, Request};
 
 pub(super) fn install_default_signal_handlers(
+    transport: TransportClient,
+    target: SessionName,
+    installed: Arc<AtomicBool>,
+) -> Result<OwnedSessionSignalHandlers> {
+    #[cfg(unix)]
+    {
+        install_unix_signal_handlers(transport, target, installed)
+    }
+    #[cfg(windows)]
+    {
+        Ok(install_tokio_signal_handlers(transport, target, installed))
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = (transport, target);
+        Ok(OwnedSessionSignalHandlers { installed })
+    }
+}
+
+#[cfg(windows)]
+fn install_tokio_signal_handlers(
     transport: TransportClient,
     target: SessionName,
     installed: Arc<AtomicBool>,
@@ -29,10 +56,62 @@ pub(super) fn install_default_signal_handlers(
     OwnedSessionSignalHandlers { task, installed }
 }
 
+#[cfg(unix)]
+fn install_unix_signal_handlers(
+    transport: TransportClient,
+    target: SessionName,
+    installed: Arc<AtomicBool>,
+) -> Result<OwnedSessionSignalHandlers> {
+    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+
+    let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+        RmuxError::protocol(rmux_proto::RmuxError::Server(format!(
+            "owned session signal handlers require a Tokio runtime: {error}"
+        )))
+    })?;
+    let mut signals =
+        Signals::new([SIGINT, SIGTERM, SIGHUP]).map_err(|source| RmuxError::Transport {
+            operation: "install owned-session signal handlers".to_owned(),
+            source,
+        })?;
+    let handle = signals.handle();
+    let thread = thread::Builder::new()
+        .name("rmux-sdk-owned-signals".to_owned())
+        .spawn(move || {
+            if signals.forever().next().is_some() {
+                runtime.spawn(async move {
+                    let _ = transport
+                        .request(Request::KillSession(KillSessionRequest {
+                            target,
+                            kill_all_except_target: false,
+                            clear_alerts: false,
+                        }))
+                        .await;
+                });
+            }
+        })
+        .map_err(|source| RmuxError::Transport {
+            operation: "start owned-session signal handler".to_owned(),
+            source,
+        })?;
+
+    Ok(OwnedSessionSignalHandlers {
+        signal_handle: handle,
+        thread: Some(thread),
+        installed,
+    })
+}
+
 /// Guard returned by [`OwnedSession::install_default_signal_handlers`](super::OwnedSession::install_default_signal_handlers).
 #[derive(Debug)]
 #[must_use = "dropping this guard disables the installed signal listener"]
 pub struct OwnedSessionSignalHandlers {
+    #[cfg(unix)]
+    signal_handle: signal_hook::iterator::Handle,
+    #[cfg(unix)]
+    thread: Option<thread::JoinHandle<()>>,
+    #[cfg(windows)]
     task: JoinHandle<()>,
     installed: Arc<AtomicBool>,
 }
@@ -44,27 +123,16 @@ impl OwnedSessionSignalHandlers {
 
 impl Drop for OwnedSessionSignalHandlers {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            self.signal_handle.close();
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+        #[cfg(windows)]
         self.task.abort();
         self.installed.store(false, Ordering::Release);
-    }
-}
-
-#[cfg(unix)]
-async fn wait_for_default_shutdown_signal() {
-    use tokio::signal::unix::SignalKind;
-
-    let mut waiters = ShutdownSignalWaiters::new();
-    waiters.spawn(recv_ctrl_c());
-    waiters.spawn(recv_unix_signal(SignalKind::terminate()));
-    waiters.spawn(recv_unix_signal(SignalKind::hangup()));
-    waiters.wait().await;
-
-    async fn recv_unix_signal(kind: SignalKind) {
-        let Ok(mut signal) = tokio::signal::unix::signal(kind) else {
-            std::future::pending::<()>().await;
-            return;
-        };
-        let _ = signal.recv().await;
     }
 }
 
@@ -81,11 +149,10 @@ async fn wait_for_default_shutdown_signal() {
 
 #[cfg(all(not(unix), not(windows)))]
 async fn wait_for_default_shutdown_signal() {
-    let mut waiters = ShutdownSignalWaiters::new();
-    waiters.spawn(recv_ctrl_c());
-    waiters.wait().await;
+    std::future::pending::<()>().await;
 }
 
+#[cfg(windows)]
 async fn recv_ctrl_c() {
     if tokio::signal::ctrl_c().await.is_err() {
         std::future::pending::<()>().await;
@@ -128,12 +195,14 @@ async fn recv_windows_ctrl_shutdown() {
     let _ = signal.recv().await;
 }
 
+#[cfg(windows)]
 struct ShutdownSignalWaiters {
     sender: tokio::sync::mpsc::Sender<()>,
     receiver: tokio::sync::mpsc::Receiver<()>,
     tasks: Vec<JoinHandle<()>>,
 }
 
+#[cfg(windows)]
 impl ShutdownSignalWaiters {
     fn new() -> Self {
         let (sender, receiver) = tokio::sync::mpsc::channel(1);

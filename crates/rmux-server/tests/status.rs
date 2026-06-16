@@ -165,7 +165,7 @@ async fn status_interval_refreshes_time_formats_without_pane_output() -> Result<
         let Some(message) = message else {
             break;
         };
-        if let AttachMessage::Data(bytes) = message {
+        if let AttachMessage::Data(bytes) | AttachMessage::Render(bytes) = message {
             output.push_str(&String::from_utf8_lossy(&bytes));
             if extract_tick_second(&output).is_some_and(|tick| tick != first_tick) {
                 drop(attach_stream);
@@ -244,7 +244,7 @@ async fn status_interval_does_not_refresh_suspended_attach_client() -> Result<()
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match timeout(remaining, read_attach_message(&mut attach_stream)).await {
-            Ok(Ok(Some(AttachMessage::Data(bytes)))) => {
+            Ok(Ok(Some(AttachMessage::Data(bytes) | AttachMessage::Render(bytes)))) => {
                 drop(attach_stream);
                 handle.shutdown().await?;
                 return Err(io::Error::other(format!(
@@ -340,7 +340,7 @@ async fn read_attach_data_until_contains(
             break;
         };
 
-        if let AttachMessage::Data(bytes) = message {
+        if let AttachMessage::Data(bytes) | AttachMessage::Render(bytes) = message {
             output.push_str(&String::from_utf8_lossy(&bytes));
             if output.contains(needle) {
                 return Ok(output);
@@ -381,6 +381,14 @@ async fn read_attach_message(
             })))
         }
         5 => Ok(Some(AttachMessage::Suspend)),
+        13 => {
+            let mut length = [0_u8; 4];
+            stream.read_exact(&mut length).await?;
+            let payload_len = u32::from_le_bytes(length) as usize;
+            let mut payload = vec![0_u8; payload_len];
+            stream.read_exact(&mut payload).await?;
+            Ok(Some(AttachMessage::Render(payload)))
+        }
         other => Err(rmux_proto::RmuxError::Decode(format!(
             "unknown attach-stream message tag {other}"
         ))

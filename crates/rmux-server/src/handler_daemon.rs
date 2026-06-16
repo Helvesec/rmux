@@ -18,6 +18,7 @@ impl RequestHandler {
             wire_version: RMUX_WIRE_VERSION,
             session_count,
             client_count,
+            config_loading: self.config_loading_active(),
         })
     }
 

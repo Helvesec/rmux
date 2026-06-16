@@ -87,9 +87,11 @@ impl TerminalParser {
     /// scrollback limit.
     #[must_use]
     pub(crate) fn new(size: TerminalSize, history_limit: usize) -> Self {
+        let mut screen = Screen::new(size, history_limit);
+        screen.set_preserve_alternate_screen_cursor(true);
         Self {
             parser: InputParser::new(),
-            screen: Screen::new(size, history_limit),
+            screen,
         }
     }
 
@@ -108,6 +110,11 @@ impl TerminalParser {
     /// the underlying screen.
     pub(crate) fn set_utf8_config(&mut self, config: Utf8Config) {
         self.screen.set_utf8_config(config);
+    }
+
+    /// Enables or disables DEC alternate-screen entry on the underlying screen.
+    pub(crate) fn set_alternate_screen_enabled(&mut self, enabled: bool) {
+        self.screen.set_alternate_screen_enabled(enabled);
     }
 
     /// Updates the tmux `input-buffer-size` parser limit.
@@ -246,6 +253,18 @@ mod tests {
         assert_eq!(passthroughs[0].cursor_x(), 2);
         assert_eq!(passthroughs[0].cursor_y(), 1);
         assert_eq!(passthroughs[0].payload(), b"q#0!10~");
+        assert!(parser.take_terminal_passthrough().is_empty());
+    }
+
+    #[test]
+    fn dcs_passthrough_drains_once() {
+        let mut parser = TerminalParser::new(size(20, 4), 10);
+        parser.feed(b"\x1b[2;3H\x1bPtmux;\x1b]52;c;QQ==\x07\x1b\\");
+        let passthroughs = parser.take_terminal_passthrough();
+        assert_eq!(passthroughs.len(), 1);
+        assert_eq!(passthroughs[0].cursor_x(), 2);
+        assert_eq!(passthroughs[0].cursor_y(), 1);
+        assert_eq!(passthroughs[0].payload(), b"\x1b]52;c;QQ==\x07");
         assert!(parser.take_terminal_passthrough().is_empty());
     }
 

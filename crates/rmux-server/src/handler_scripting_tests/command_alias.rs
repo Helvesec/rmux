@@ -46,7 +46,7 @@ async fn runtime_command_alias_option_drives_source_file_parser() {
                 Some(root)
             ))
             .await,
-        Response::SourceFile(rmux_proto::SourceFileResponse { output: None })
+        Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
     );
 
     assert_eq!(

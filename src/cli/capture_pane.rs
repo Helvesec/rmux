@@ -40,7 +40,7 @@ pub(super) fn capture_pane_request(
         escape_ansi: args.escape_ansi,
         escape_sequences: args.escape_sequences,
         join_wrapped: args.join_wrapped,
-        use_mode_screen: args.use_mode_screen,
+        use_mode_screen: false,
         preserve_trailing_spaces: args.preserve_trailing_spaces,
         do_not_trim_spaces: args.do_not_trim_spaces,
         pending_input: args.pending_input,
@@ -88,8 +88,8 @@ fn parse_capture_bound(
         Some(value) => value
             .parse::<i64>()
             .map(|value| (Some(value), false))
-            .map_err(|error| {
-                ExitFailure::new(1, format!("invalid {} value '{}': {}", flag, value, error))
+            .map_err(|_| {
+                ExitFailure::new(1, format!("command capture-pane: {flag} expects a number"))
             }),
     }
 }

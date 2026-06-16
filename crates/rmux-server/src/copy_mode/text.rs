@@ -39,11 +39,12 @@ impl LineTextMap {
         let mut text = String::new();
         let mut spans = Vec::new();
         for x in owner_positions(line) {
-            let Some(cell) = line.cell(x) else {
-                continue;
-            };
             let start = text.len();
-            text.push_str(cell.text());
+            if let Some(cell) = line.cell(x) {
+                text.push_str(cell.text());
+            } else {
+                text.push(' ');
+            }
             spans.push((start..text.len(), x));
         }
         Self { text, spans }
@@ -95,16 +96,18 @@ pub(super) fn position_ge(left: CopyPosition, right: CopyPosition) -> bool {
 }
 
 pub(super) fn owner_positions(line: &ScreenLineView) -> Vec<u32> {
-    line.cells()
-        .iter()
-        .enumerate()
-        .filter_map(|(index, cell)| (!cell.is_padding()).then_some(index as u32))
+    (0..line.width())
+        .filter(|x| line.cell(*x).is_none_or(|cell| !cell.is_padding()))
         .collect()
 }
 
 pub(super) fn line_char(line: &ScreenLineView, x: u32) -> Option<char> {
     let owner = line.owning_cell_x(x).unwrap_or(x);
-    line.cell(owner)?.text().chars().next()
+    match line.cell(owner) {
+        Some(cell) => cell.text().chars().next(),
+        None if owner < line.width() => Some(' '),
+        None => None,
+    }
 }
 
 pub(super) fn classify_word_char(ch: char, separators: &str, spaces_only: bool) -> WordClass {

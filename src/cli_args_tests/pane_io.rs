@@ -88,9 +88,12 @@ fn display_panes_accepts_duration_no_command_and_template_flags() {
 
 #[test]
 fn last_pane_preserves_tmux_style_raw_targets() {
-    let cli = parse_args(&["last-pane", "-t", "alpha:0.1"]).unwrap();
+    let cli = parse_args(&["last-pane", "-d", "-Z", "-t", "alpha:0.1"]).unwrap();
     match cli.command.expect("parsed command") {
         super::super::Command::LastPane(args) => {
+            assert!(args.disable_input);
+            assert!(!args.enable_input);
+            assert!(args.keep_zoom);
             assert_eq!(
                 args.target.as_ref().expect("target").to_string(),
                 "alpha:0.1"
@@ -98,6 +101,13 @@ fn last_pane_preserves_tmux_style_raw_targets() {
         }
         _ => panic!("expected LastPane command"),
     }
+}
+
+#[test]
+fn last_pane_rejects_conflicting_input_flags() {
+    let error = parse_args(&["last-pane", "-d", "-e"]).unwrap_err();
+
+    assert!(error.to_string().contains("cannot be used"));
 }
 
 #[test]
@@ -142,6 +152,18 @@ fn select_pane_accepts_session_targets_like_tmux() {
     match cli.command.expect("parsed command") {
         super::super::Command::SelectPane(args) => {
             assert_eq!(args.target.expect("target exists").to_string(), "alpha")
+        }
+        _ => panic!("expected SelectPane command"),
+    }
+}
+
+#[test]
+fn select_pane_accepts_pane_style_flag() {
+    let cli = parse_args(&["select-pane", "-t", "%0", "-P", "bg=blue,fg=white"]).unwrap();
+    match cli.command.expect("parsed command") {
+        super::super::Command::SelectPane(args) => {
+            assert_eq!(args.target.expect("target exists").to_string(), "%0");
+            assert_eq!(args.style.as_deref(), Some("bg=blue,fg=white"));
         }
         _ => panic!("expected SelectPane command"),
     }
@@ -218,6 +240,45 @@ fn select_pane_accepts_directional_flags_with_optional_target() {
             assert_eq!(
                 args.direction(),
                 Some(rmux_proto::SelectPaneDirection::Down)
+            );
+        }
+        _ => panic!("expected SelectPane command"),
+    }
+}
+
+#[test]
+fn select_pane_accepts_last_keep_zoom_and_input_flags() {
+    let cli = parse_args(&["select-pane", "-l", "-Z", "-t", "%1"]).unwrap();
+    match cli.command.expect("parsed command") {
+        super::super::Command::SelectPane(args) => {
+            assert!(args.last);
+            assert!(args.keep_zoom);
+            assert_eq!(args.target.as_ref().expect("target").to_string(), "%1");
+        }
+        _ => panic!("expected SelectPane command"),
+    }
+
+    let cli = parse_args(&["select-pane", "-d", "-t", "alpha:0.1"]).unwrap();
+    match cli.command.expect("parsed command") {
+        super::super::Command::SelectPane(args) => {
+            assert!(args.disable_input);
+            assert!(!args.enable_input);
+            assert_eq!(
+                args.target.as_ref().expect("target").to_string(),
+                "alpha:0.1"
+            );
+        }
+        _ => panic!("expected SelectPane command"),
+    }
+
+    let cli = parse_args(&["select-pane", "-e", "-t", "alpha:0.1"]).unwrap();
+    match cli.command.expect("parsed command") {
+        super::super::Command::SelectPane(args) => {
+            assert!(!args.disable_input);
+            assert!(args.enable_input);
+            assert_eq!(
+                args.target.as_ref().expect("target").to_string(),
+                "alpha:0.1"
             );
         }
         _ => panic!("expected SelectPane command"),
@@ -310,6 +371,22 @@ fn send_keys_parses_target_client_without_treating_it_as_input() {
 }
 
 #[test]
+fn send_keys_marks_unsupported_prefix_flag_before_input_values() {
+    let cli = parse_args(&["send-keys", "-p", "-t", "alpha:0.0", "abc"]).unwrap();
+    match cli.command.expect("parsed command") {
+        super::super::Command::SendKeys(args) => {
+            assert!(args.unsupported_prefix);
+            assert_eq!(
+                args.target.as_ref().expect("target").to_string(),
+                "alpha:0.0"
+            );
+            assert_eq!(args.keys, vec!["abc"]);
+        }
+        _ => panic!("expected SendKeys command"),
+    }
+}
+
+#[test]
 fn capture_pane_accepts_public_command_name_and_flags() {
     let cli = parse_args(&[
         "capture-pane",
@@ -347,6 +424,32 @@ fn capture_pane_alias_accepts_print_mode() {
             assert_eq!(target_text(&args.target), "alpha:0.0");
         }
         _ => panic!("expected CapturePane command"),
+    }
+}
+
+#[test]
+fn capture_pane_rejects_tmux_invalid_mode_screen_flag() {
+    let error = parse_args(&["capture-pane", "-M", "-p", "-t", "alpha:0.0"]).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("command capture-pane: unknown flag -M"),
+        "{error}"
+    );
+}
+
+#[test]
+fn copy_mode_rejects_tmux_invalid_short_flags() {
+    for flag in ["-d", "-S"] {
+        let error = parse_args(&["copy-mode", flag, "-t", "alpha:0.0"]).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("command copy-mode: unknown flag {flag}")),
+            "{error}"
+        );
     }
 }
 

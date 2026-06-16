@@ -7,6 +7,8 @@ use std::ffi::OsString;
 use std::io;
 #[cfg(windows)]
 use std::mem::size_of;
+#[cfg(target_os = "linux")]
+use std::os::fd::{FromRawFd, IntoRawFd};
 
 #[cfg(windows)]
 use crate::is_peer_disconnect;
@@ -57,9 +59,45 @@ impl LocalListener {
 
 #[cfg(unix)]
 fn bind_impl(endpoint: &LocalEndpoint) -> io::Result<LocalListener> {
+    if !endpoint.is_filesystem_path() {
+        return bind_rustix_listener(endpoint);
+    }
     Ok(LocalListener {
         inner: tokio::net::UnixListener::bind(endpoint.as_path())?,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn bind_rustix_listener(endpoint: &LocalEndpoint) -> io::Result<LocalListener> {
+    use rustix::net::{bind, listen, socket_with, AddressFamily, SocketFlags, SocketType};
+
+    let socket = socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+        None,
+    )?;
+    let address = endpoint.socket_addr_unix()?;
+    bind(&socket, &address)?;
+    listen(&socket, 1024)?;
+
+    let listener = unsafe {
+        // SAFETY: `socket` is a listening Unix stream socket and ownership is
+        // transferred exactly once into the standard listener.
+        std::os::unix::net::UnixListener::from_raw_fd(socket.into_raw_fd())
+    };
+    listener.set_nonblocking(true)?;
+    Ok(LocalListener {
+        inner: tokio::net::UnixListener::from_std(listener)?,
+    })
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn bind_rustix_listener(_endpoint: &LocalEndpoint) -> io::Result<LocalListener> {
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "abstract Unix socket endpoints are unsupported on this platform",
+    ))
 }
 
 #[cfg(windows)]

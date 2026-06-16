@@ -1,4 +1,4 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
 use std::process::{Command, Stdio};
@@ -148,20 +148,42 @@ pub(super) fn startup_operation_timeout(default_timeout: Option<Duration>) -> Op
 }
 
 fn spawn_hidden_daemon(endpoint: &OsStr) -> io::Result<()> {
-    match spawn_hidden_daemon_with_breakaway(endpoint, true) {
-        Ok(()) => Ok(()),
-        Err(error) if rmux_os::daemon::should_retry_hidden_daemon_without_breakaway(&error) => {
-            spawn_hidden_daemon_with_breakaway(endpoint, false)
+    let candidates = hidden_daemon_binary_candidates();
+    let mut last_error = None;
+    for (index, binary) in candidates.iter().enumerate() {
+        let result = match spawn_hidden_daemon_with_binary(endpoint, binary, true) {
+            Ok(()) => return Ok(()),
+            Err(error) if rmux_os::daemon::should_retry_hidden_daemon_without_breakaway(&error) => {
+                spawn_hidden_daemon_with_binary(endpoint, binary, false)
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && index + 1 < candidates.len() =>
+            {
+                last_error = Some(error);
+                continue;
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) => Err(error),
     }
+
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "no rmux hidden daemon binary candidate was available",
+        )
+    }))
 }
 
-fn spawn_hidden_daemon_with_breakaway(
+fn spawn_hidden_daemon_with_binary(
     endpoint: &OsStr,
+    binary: &OsStr,
     allow_job_breakaway: bool,
 ) -> io::Result<()> {
-    let mut command = Command::new(daemon_binary());
+    let mut command = Command::new(binary);
     command
         .arg(INTERNAL_DAEMON_FLAG)
         .arg(endpoint)
@@ -174,8 +196,20 @@ fn spawn_hidden_daemon_with_breakaway(
     Ok(())
 }
 
-fn daemon_binary() -> std::ffi::OsString {
+pub(super) fn daemon_binary() -> std::ffi::OsString {
     std::env::var_os(discovery::SDK_DAEMON_BINARY_ENV).unwrap_or_else(|| "rmux".into())
+}
+
+fn hidden_daemon_binary_candidates() -> Vec<OsString> {
+    hidden_daemon_binary_candidates_from_env(std::env::var_os(discovery::SDK_DAEMON_BINARY_ENV))
+}
+
+fn hidden_daemon_binary_candidates_from_env(override_binary: Option<OsString>) -> Vec<OsString> {
+    if let Some(binary) = override_binary {
+        return vec![binary];
+    }
+
+    vec![OsString::from("rmux-daemon"), OsString::from("rmux")]
 }
 
 fn startup_error(error: impl fmt::Display) -> RmuxError {
@@ -284,4 +318,27 @@ fn timeout_error(operation: &str, timeout: Duration) -> io::Error {
             timeout.as_secs_f32()
         ),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use super::hidden_daemon_binary_candidates_from_env;
+
+    #[test]
+    fn hidden_daemon_spawn_prefers_minimal_sibling_binary() {
+        assert_eq!(
+            hidden_daemon_binary_candidates_from_env(None),
+            vec![OsString::from("rmux-daemon"), OsString::from("rmux")]
+        );
+    }
+
+    #[test]
+    fn hidden_daemon_spawn_honors_explicit_sdk_binary_override() {
+        assert_eq!(
+            hidden_daemon_binary_candidates_from_env(Some(OsString::from("/tmp/custom-rmux"))),
+            vec![OsString::from("/tmp/custom-rmux")]
+        );
+    }
 }

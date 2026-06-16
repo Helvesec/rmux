@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use rmux_proto::SessionName;
+use rmux_proto::{SessionName, TerminalSize};
 
 use super::{current_unix_timestamp, synchronized_active_window, Session, WindowIdAllocator};
 use crate::{AlertFlags, Pane, PaneId, SessionId, Window, WINLINK_ALERTFLAGS};
@@ -47,6 +47,12 @@ impl Session {
     #[must_use]
     pub fn cwd(&self) -> Option<&Path> {
         self.cwd.as_deref()
+    }
+
+    /// Returns the terminal size last applied to the session as a whole.
+    #[must_use]
+    pub const fn terminal_size(&self) -> TerminalSize {
+        self.terminal_size
     }
 
     pub(crate) fn set_id(&mut self, id: SessionId) {

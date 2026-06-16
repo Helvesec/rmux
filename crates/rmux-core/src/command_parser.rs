@@ -33,6 +33,10 @@ use lexer::Lexer;
 use lookup::lookup_command_at;
 pub use table::{CommandEntry, COMMAND_TABLE};
 
+const DEFAULT_MAX_COMMAND_BYTES: usize = 16 * 1024;
+/// Maximum size of a single command parsed from `source-file` input.
+pub const SOURCE_FILE_MAX_COMMAND_BYTES: usize = 1024 * 1024;
+
 /// Parses a tmux command string with default expansion context.
 pub fn parse_command_string(input: &str) -> Result<ParsedCommands, CommandParseError> {
     CommandParser::new().parse(input)
@@ -114,6 +118,19 @@ impl ParsedCommands {
         self.commands.append(&mut other.commands);
     }
 
+    /// Adds an offset to every source line recorded in this command list.
+    ///
+    /// Recovery parsers use this after parsing a suffix of a larger source
+    /// file so diagnostics and verbose output still reference original lines.
+    pub fn add_line_offset(&mut self, offset: usize) {
+        if offset == 0 {
+            return;
+        }
+        for command in &mut self.commands {
+            command.add_line_offset(offset);
+        }
+    }
+
     /// Converts the parsed commands back to a tmux-style command string.
     #[must_use]
     pub fn to_tmux_string(&self) -> String {
@@ -122,6 +139,17 @@ impl ParsedCommands {
             .map(ParsedCommand::to_tmux_string)
             .collect::<Vec<_>>()
             .join(" ; ")
+    }
+
+    /// Converts the parsed commands to a command string suitable for
+    /// embedding in a `bind-key` line.
+    #[must_use]
+    pub fn to_tmux_binding_string(&self) -> String {
+        self.commands
+            .iter()
+            .map(ParsedCommand::to_tmux_string)
+            .collect::<Vec<_>>()
+            .join(" \\; ")
     }
 }
 
@@ -170,7 +198,18 @@ impl ParsedCommand {
         }
     }
 
-    fn to_tmux_string(&self) -> String {
+    fn add_line_offset(&mut self, offset: usize) {
+        self.line = self.line.saturating_add(offset);
+        for argument in &mut self.arguments {
+            if let CommandArgument::Commands(commands) = argument {
+                commands.add_line_offset(offset);
+            }
+        }
+    }
+
+    /// Converts this command back to a tmux-style command string.
+    #[must_use]
+    pub fn to_tmux_string(&self) -> String {
         std::iter::once(self.name.clone())
             .chain(self.arguments.iter().map(CommandArgument::to_tmux_string))
             .collect::<Vec<_>>()
@@ -247,13 +286,27 @@ impl EnvironmentAssignment {
 }
 
 /// A reusable parser with parse-time expansion context.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct CommandParser {
     environment: Vec<(String, String)>,
     format_variables: Vec<(String, String)>,
     home_dir: Option<String>,
     user_home_dirs: Vec<(String, String)>,
     command_aliases: Vec<CommandAlias>,
+    max_command_bytes: usize,
+}
+
+impl Default for CommandParser {
+    fn default() -> Self {
+        Self {
+            environment: Vec::new(),
+            format_variables: Vec::new(),
+            home_dir: None,
+            user_home_dirs: Vec::new(),
+            command_aliases: Vec::new(),
+            max_command_bytes: DEFAULT_MAX_COMMAND_BYTES,
+        }
+    }
 }
 
 impl CommandParser {
@@ -341,6 +394,13 @@ impl CommandParser {
         self
     }
 
+    /// Overrides the maximum parsed command size.
+    #[must_use]
+    pub fn with_max_command_bytes(mut self, max_command_bytes: usize) -> Self {
+        self.max_command_bytes = max_command_bytes;
+        self
+    }
+
     /// Parses a tmux command string through the tmux-style lexer.
     pub fn parse(&self, input: &str) -> Result<ParsedCommands, CommandParseError> {
         self.parse_inner(input, false, CommandGrouping::ByLine)
@@ -364,11 +424,22 @@ impl CommandParser {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        let arguments = arguments
+            .into_iter()
+            .map(|argument| argument.as_ref().to_owned())
+            .collect::<Vec<_>>();
+        let command_bytes = arguments
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+            .saturating_add(arguments.len().saturating_sub(1));
+        ensure_command_length(command_bytes, 0, self.max_command_bytes)?;
+
         let mut commands = ParsedCommands::with_grouping(CommandGrouping::ByLine);
         let mut current = Vec::new();
 
         for argument in arguments {
-            let mut value = argument.as_ref().to_owned();
+            let mut value = argument;
             let mut ends_command = false;
 
             if value.ends_with(';') {
@@ -404,6 +475,7 @@ impl CommandParser {
     ) -> Result<ParsedCommands, CommandParseError> {
         let mut parser = GrammarParser::new(Lexer::new(input, self), grouping);
         let commands = parser.parse_all()?;
+        ensure_parsed_command_lengths(&commands, self.max_command_bytes)?;
         self.expand_and_lookup(commands, no_alias)
     }
 
@@ -502,6 +574,46 @@ impl CommandParser {
     }
 }
 
+fn ensure_command_length(
+    bytes: usize,
+    line: usize,
+    max_command_bytes: usize,
+) -> Result<(), CommandParseError> {
+    if bytes > max_command_bytes {
+        return Err(CommandParseError::new(line, "command too long"));
+    }
+    Ok(())
+}
+
+fn ensure_parsed_command_lengths(
+    commands: &ParsedCommands,
+    max_command_bytes: usize,
+) -> Result<(), CommandParseError> {
+    for command in commands.commands() {
+        ensure_parsed_command_length(command, max_command_bytes)?;
+    }
+    Ok(())
+}
+
+fn ensure_parsed_command_length(
+    command: &ParsedCommand,
+    max_command_bytes: usize,
+) -> Result<(), CommandParseError> {
+    let mut bytes = command.name.len();
+    for argument in command.arguments() {
+        bytes = bytes.saturating_add(1);
+        match argument {
+            CommandArgument::String(value) => {
+                bytes = bytes.saturating_add(value.len());
+            }
+            CommandArgument::Commands(commands) => {
+                ensure_parsed_command_lengths(commands, max_command_bytes)?;
+            }
+        }
+    }
+    ensure_command_length(bytes, command.line(), max_command_bytes)
+}
+
 struct ParseTimeFormatVariables<'a> {
     values: &'a [(String, String)],
 }
@@ -572,14 +684,34 @@ fn escape_argument(value: &str) -> String {
     if value.is_empty() {
         return "''".to_owned();
     }
-    if !value
-        .chars()
-        .any(|ch| ch.is_whitespace() || matches!(ch, ';' | '{' | '}' | '\'' | '"' | '#'))
-    {
-        return value.to_owned();
+    if !value.chars().any(argument_needs_quotes) {
+        return value.replace('\\', r"\\");
     }
 
-    format!("'{}'", value.replace('\'', "'\\''"))
+    if value.contains('"') && !value.contains('\'') && !value.contains('$') {
+        return format!("'{value}'");
+    }
+
+    format!("\"{}\"", escape_double_quoted_argument(value))
+}
+
+fn argument_needs_quotes(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, ';' | '{' | '}' | '\'' | '"' | '#' | '$')
+}
+
+fn escape_double_quoted_argument(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '$' => escaped.push_str(r"\$"),
+            '\\' | '"' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 #[cfg(test)]

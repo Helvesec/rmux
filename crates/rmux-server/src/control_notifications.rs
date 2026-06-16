@@ -99,6 +99,8 @@ pub(crate) fn collect_control_notifications(
         | LifecycleEvent::AlertActivity { .. }
         | LifecycleEvent::AlertSilence { .. }
         | LifecycleEvent::PaneExited { .. }
+        | LifecycleEvent::PaneDied { .. }
+        | LifecycleEvent::WindowResized { .. }
         | LifecycleEvent::AfterSelectWindow { .. }
         | LifecycleEvent::AfterSelectPane { .. }
         | LifecycleEvent::AfterSendKeys { .. }

@@ -53,6 +53,7 @@ impl Session {
             ResizePaneAdjustment::Right { cells } => {
                 let _ = window.resize_pane_by(pane_index, ResizePaneAdjustment::Right { cells });
             }
+            ResizePaneAdjustment::TrimBelow => {}
             ResizePaneAdjustment::Zoom => unreachable!("zoom returned early"),
         }
         Ok(())

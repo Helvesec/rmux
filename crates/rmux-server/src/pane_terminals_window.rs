@@ -7,7 +7,7 @@ use rmux_core::{
 use rmux_proto::{
     CommandOutput, KillWindowResponse, LastWindowResponse, ListWindowsResponse, NewWindowResponse,
     NextWindowResponse, OptionName, PreviousWindowResponse, RenameWindowResponse, RmuxError,
-    SelectWindowResponse, SessionName, WindowListEntry, WindowTarget,
+    ScopeSelector, SelectWindowResponse, SessionName, SetOptionMode, WindowListEntry, WindowTarget,
 };
 
 #[path = "pane_terminals/window_link_commands.rs"]
@@ -48,6 +48,7 @@ impl HandlerState {
             detached,
             spawn,
         } = options;
+        let explicit_name = name.is_some();
         let previous_session = self
             .sessions
             .session(session_name)
@@ -96,6 +97,10 @@ impl HandlerState {
             self.replace_session(session_name, previous_session)?;
             return Err(error);
         }
+        let target = WindowTarget::with_window(session_name.clone(), window_index);
+        if explicit_name {
+            self.disable_automatic_rename_for_window(&target)?;
+        }
 
         debug_assert_eq!(
             self.sessions
@@ -106,9 +111,7 @@ impl HandlerState {
         self.synchronize_session_group_from(session_name)?;
         self.sync_pane_lifecycle_dimensions_for_session(session_name);
 
-        Ok(NewWindowResponse {
-            target: WindowTarget::with_window(session_name.clone(), window_index),
-        })
+        Ok(NewWindowResponse { target })
     }
 
     pub(crate) fn kill_window(
@@ -244,11 +247,31 @@ impl HandlerState {
                 .ok_or_else(|| session_not_found(target.session_name()))?;
             session.rename_window(target.window_index(), new_name)?;
         }
+        self.disable_automatic_rename_for_window(&target)?;
+        self.synchronize_linked_window_options_from_slot(
+            target.session_name(),
+            target.window_index(),
+        );
         self.clear_auto_named_window_family(target.session_name(), target.window_index());
-        self.synchronize_linked_window_from_slot(target.session_name(), target.window_index())?;
-        self.synchronize_session_group_from(target.session_name())?;
+        self.synchronize_linked_window_family_from_slot(
+            target.session_name(),
+            target.window_index(),
+        )?;
 
         Ok(RenameWindowResponse { target })
+    }
+
+    pub(crate) fn disable_automatic_rename_for_window(
+        &mut self,
+        target: &WindowTarget,
+    ) -> Result<(), RmuxError> {
+        self.options.set(
+            ScopeSelector::Window(target.clone()),
+            OptionName::AutomaticRename,
+            "off".to_owned(),
+            SetOptionMode::Replace,
+        )?;
+        Ok(())
     }
 
     pub(crate) fn next_window(
@@ -313,7 +336,7 @@ impl HandlerState {
         let session_name = request.target.session_name().clone();
         let window_index = request.target.window_index();
 
-        self.mutate_session_and_resize_terminals(&session_name, |session| {
+        let response = self.mutate_session_and_resize_terminals(&session_name, |session| {
             let current_size = session
                 .window_at(window_index)
                 .ok_or_else(|| {
@@ -349,6 +372,8 @@ impl HandlerState {
                     ResizeWindowAdjustment::Down(amount) => {
                         sy = sy.saturating_add(amount);
                     }
+                    ResizeWindowAdjustment::LargestLinkedSession
+                    | ResizeWindowAdjustment::SmallestLinkedSession => {}
                 }
             }
 
@@ -363,7 +388,11 @@ impl HandlerState {
             Ok(rmux_proto::ResizeWindowResponse {
                 target: request.target.clone(),
             })
-        })
+        })?;
+
+        self.synchronize_linked_window_family_from_slot(&session_name, window_index)?;
+
+        Ok(response)
     }
 
     pub(crate) fn respawn_window(
@@ -407,6 +436,8 @@ impl HandlerState {
             .ok_or_else(|| RmuxError::Server("window has no panes".to_owned()))?;
         let runtime_session_name =
             self.runtime_session_name_for_window(&session_name, window_index);
+        let base_environment =
+            self.session_base_environment_for_window(&session_name, window_index);
 
         // Kill terminals for panes that disappear with the old window layout.
         for removed_pane_id in pane_ids.iter().copied().filter(|id| *id != pane_id) {
@@ -429,7 +460,12 @@ impl HandlerState {
         }
 
         // Spawn the new terminal for the single fresh pane.
-        self.reset_window_terminal(&session_name, window_index, spawn)?;
+        self.reset_window_terminal_with_base_environment(
+            &session_name,
+            window_index,
+            spawn,
+            base_environment.as_ref(),
+        )?;
 
         self.synchronize_session_group_from(&session_name)?;
         self.sync_pane_lifecycle_dimensions_for_session(&session_name);

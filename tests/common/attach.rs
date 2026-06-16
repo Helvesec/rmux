@@ -55,7 +55,7 @@ impl AttachedSession {
         F: FnOnce(&mut Command),
     {
         let pty = PtyPair::open_with_size(size)?;
-        let master = File::from(pty.master().try_clone()?.into_owned_fd());
+        let master = File::from(pty.master().try_clone()?.into_owned_fd()?);
         let terminal = File::from(pty.slave().try_clone()?.into_owned_fd());
         let original_termios = prepare_canonical_termios(&terminal)?;
 

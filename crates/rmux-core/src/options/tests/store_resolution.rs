@@ -131,7 +131,7 @@ fn terminal_features_append_preserves_default_then_existing_order() {
 }
 
 #[test]
-fn append_to_non_appendable_options_is_rejected_without_creating_overrides() {
+fn append_to_non_string_scalar_options_is_rejected() {
     let mut store = OptionStore::new();
 
     let error = store
@@ -141,13 +141,13 @@ fn append_to_non_appendable_options_is_rejected_without_creating_overrides() {
             "off".to_owned(),
             SetOptionMode::Append,
         )
-        .expect_err("status append must fail");
+        .expect_err("flag append is not a real append");
 
     assert_eq!(
         error,
-        rmux_proto::RmuxError::InvalidSetOption("status is not an array option".to_owned())
+        RmuxError::InvalidSetOption("status is not an array option".to_owned())
     );
-    assert!(store.is_empty());
+    assert_eq!(store.global_value(OptionName::Status), None);
 }
 
 #[test]
@@ -206,6 +206,36 @@ fn allow_passthrough_preserves_all_for_tmux_compatibility() {
         store.resolve_for_window(&alpha, 0, OptionName::AllowPassthrough),
         Some("all")
     );
+}
+
+#[test]
+fn prefix_options_accept_modified_named_keys() {
+    let mut store = OptionStore::new();
+
+    for (input, canonical) in [
+        ("C-PageUp", "C-PPage"),
+        ("C-PageDown", "C-NPage"),
+        ("C-Insert", "C-IC"),
+        ("C-Delete", "C-DC"),
+        ("C-PPage", "C-PPage"),
+        ("C-NPage", "C-NPage"),
+        ("C-IC", "C-IC"),
+        ("C-DC", "C-DC"),
+    ] {
+        store
+            .set(
+                ScopeSelector::Global,
+                OptionName::Prefix,
+                input.to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("modified named key is accepted as a prefix");
+        assert_eq!(
+            store.resolve(Some(&session_name("alpha")), OptionName::Prefix),
+            Some(canonical),
+            "{input} should store as canonical key name"
+        );
+    }
 }
 
 #[test]
@@ -380,6 +410,98 @@ fn renaming_a_session_rekeys_session_window_and_pane_values() {
     );
     assert_eq!(
         store.resolve_for_pane(&beta, 3, 1, OptionName::WindowStyle),
+        Some("default,bold")
+    );
+}
+
+#[test]
+fn swapping_windows_rekeys_window_and_pane_values() {
+    let mut store = OptionStore::new();
+    let alpha = session_name("alpha");
+    let source = WindowTarget::with_window(alpha.clone(), 1);
+    let target = WindowTarget::with_window(alpha.clone(), 3);
+    let source_pane = PaneTarget::with_window(alpha.clone(), 1, 0);
+    let target_pane = PaneTarget::with_window(alpha.clone(), 3, 0);
+
+    store
+        .set(
+            ScopeSelector::Window(source.clone()),
+            OptionName::AutomaticRename,
+            "off".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("source window set succeeds");
+    store
+        .set(
+            ScopeSelector::Pane(source_pane.clone()),
+            OptionName::WindowStyle,
+            "default,bold".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("source pane set succeeds");
+
+    store.swap_window_overrides(&source, &target);
+
+    assert_eq!(
+        store.window_value(&source, OptionName::AutomaticRename),
+        None
+    );
+    assert_eq!(
+        store.pane_value(&source_pane, OptionName::WindowStyle),
+        None
+    );
+    assert_eq!(
+        store.window_value(&target, OptionName::AutomaticRename),
+        Some("off")
+    );
+    assert_eq!(
+        store.pane_value(&target_pane, OptionName::WindowStyle),
+        Some("default,bold")
+    );
+}
+
+#[test]
+fn moving_windows_rekeys_window_and_pane_values() {
+    let mut store = OptionStore::new();
+    let alpha = session_name("alpha");
+    let source = WindowTarget::with_window(alpha.clone(), 2);
+    let target = WindowTarget::with_window(alpha.clone(), 4);
+    let source_pane = PaneTarget::with_window(alpha.clone(), 2, 0);
+    let target_pane = PaneTarget::with_window(alpha.clone(), 4, 0);
+
+    store
+        .set(
+            ScopeSelector::Window(source.clone()),
+            OptionName::AutomaticRename,
+            "off".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("source window set succeeds");
+    store
+        .set(
+            ScopeSelector::Pane(source_pane.clone()),
+            OptionName::WindowStyle,
+            "default,bold".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("source pane set succeeds");
+
+    store.move_window_overrides(&source, &target);
+
+    assert_eq!(
+        store.window_value(&source, OptionName::AutomaticRename),
+        None
+    );
+    assert_eq!(
+        store.pane_value(&source_pane, OptionName::WindowStyle),
+        None
+    );
+    assert_eq!(
+        store.window_value(&target, OptionName::AutomaticRename),
+        Some("off")
+    );
+    assert_eq!(
+        store.pane_value(&target_pane, OptionName::WindowStyle),
         Some("default,bold")
     );
 }

@@ -24,7 +24,8 @@ impl HandlerState {
             )?
         };
 
-        if source_session_name == target_session_name
+        if !(request.after || request.before)
+            && source_session_name == target_session_name
             && request.source.window_index() == target_window_index
         {
             return Err(RmuxError::Server(format!(
@@ -128,7 +129,9 @@ impl HandlerState {
                 let _ = self
                     .terminals
                     .remove_pane_batch(&runtime_session_name, &pane_ids)?;
-                let _ = self.remove_pane_outputs(&runtime_session_name, &pane_ids);
+                let mut removed_outputs =
+                    self.remove_pane_outputs(&runtime_session_name, &pane_ids);
+                removed_outputs.abort_output_readers();
                 self.remove_pane_lifecycles(&pane_ids);
             }
         }

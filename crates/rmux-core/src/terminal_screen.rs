@@ -46,6 +46,11 @@ impl TerminalScreen {
         self.parser.set_utf8_config(config);
     }
 
+    /// Enables or disables DEC alternate-screen entry for subsequent output.
+    pub fn set_alternate_screen_enabled(&mut self, enabled: bool) {
+        self.parser.set_alternate_screen_enabled(enabled);
+    }
+
     /// Updates the tmux `input-buffer-size` parser limit.
     pub fn set_input_buffer_limit(&mut self, limit: usize) {
         self.parser.set_input_buffer_limit(limit);

@@ -80,6 +80,81 @@ async fn bind_key_without_a_command_updates_note_and_repeat_in_place() {
 }
 
 #[tokio::test]
+async fn list_keys_notes_render_effective_prefix_column() {
+    let handler = RequestHandler::new();
+
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::Prefix,
+            value: "C-a".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)));
+
+    for request in [
+        BindKeyRequest {
+            table_name: "prefix".to_owned(),
+            key: "X".to_owned(),
+            note: Some("note text".to_owned()),
+            repeat: false,
+            command: Some(vec!["display-message".to_owned(), "hi".to_owned()]),
+        },
+        BindKeyRequest {
+            table_name: "root".to_owned(),
+            key: "F12".to_owned(),
+            note: Some("root note".to_owned()),
+            repeat: false,
+            command: Some(vec!["display-message".to_owned(), "root".to_owned()]),
+        },
+    ] {
+        let response = handler.handle(Request::BindKey(request)).await;
+        assert!(matches!(response, Response::BindKey(_)));
+    }
+
+    let listed = handler
+        .handle(Request::ListKeys(ListKeysRequest {
+            table_name: None,
+            first_only: false,
+            notes: true,
+            include_unnoted: false,
+            reversed: false,
+            format: None,
+            sort_order: None,
+            prefix: None,
+            key: None,
+        }))
+        .await;
+    let Response::ListKeys(response) = listed else {
+        panic!("expected list-keys response");
+    };
+    let stdout = String::from_utf8(response.command_output().stdout().to_vec()).unwrap();
+    assert!(stdout.contains("C-a X       note text\n"), "{stdout:?}");
+    assert!(stdout.contains("    F12     root note\n"), "{stdout:?}");
+
+    let listed = handler
+        .handle(Request::ListKeys(ListKeysRequest {
+            table_name: None,
+            first_only: false,
+            notes: true,
+            include_unnoted: false,
+            reversed: false,
+            format: None,
+            sort_order: None,
+            prefix: Some("PFX".to_owned()),
+            key: None,
+        }))
+        .await;
+    let Response::ListKeys(response) = listed else {
+        panic!("expected list-keys response");
+    };
+    let stdout = String::from_utf8(response.command_output().stdout().to_vec()).unwrap();
+    assert!(stdout.contains("PFXX       note text\n"), "{stdout:?}");
+    assert!(stdout.contains("   F12     root note\n"), "{stdout:?}");
+}
+
+#[tokio::test]
 async fn list_keys_single_key_filter_uses_tmux_unpadded_alignment() {
     let handler = RequestHandler::new();
 

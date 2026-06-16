@@ -67,6 +67,9 @@ async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), B
             .send_request(&Request::SelectPane(SelectPaneRequest {
                 target: PaneTarget::new(session.clone(), 1),
                 title: None,
+                style: None,
+                input_disabled: None,
+                preserve_zoom: false,
             }))
             .await?,
         Response::SelectPane(rmux_proto::SelectPaneResponse {
@@ -78,6 +81,9 @@ async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), B
             .send_request(&Request::SelectPane(SelectPaneRequest {
                 target: PaneTarget::new(session.clone(), 0),
                 title: None,
+                style: None,
+                input_disabled: None,
+                preserve_zoom: false,
             }))
             .await?,
         Response::SelectPane(rmux_proto::SelectPaneResponse {
@@ -88,6 +94,8 @@ async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), B
         client
             .send_request(&Request::LastPane(LastPaneRequest {
                 target: WindowTarget::new(session.clone()),
+                preserve_zoom: false,
+                input_disabled: None,
             }))
             .await?,
         Response::LastPane(rmux_proto::LastPaneResponse {

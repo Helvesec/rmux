@@ -1,9 +1,9 @@
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 
-use crate::terminal::shell_tokio_command;
+use crate::terminal::shell_std_command;
 use rmux_proto::RmuxError;
-use tokio::io::AsyncWriteExt;
 
 use super::args::{
     ensure_max_positional, ensure_no_extra_args, parse_flagged_args, parse_positionals,
@@ -241,25 +241,33 @@ impl CopyModeState {
     }
 
     fn current_line_transfer_bytes(&self) -> Vec<u8> {
-        let text = self.full_line_text(self.cursor.y, true);
-        if text.is_empty() {
-            b"\n".to_vec()
-        } else {
-            format!("{text}\n").into_bytes()
-        }
+        self.line_transfer_text(self.logical_line_text(self.cursor.y, true))
+            .into_bytes()
     }
 
     fn current_end_of_line_transfer_bytes(&self) -> Vec<u8> {
-        let line = self.line(self.cursor.y);
-        let start = line.owning_cell_x(self.cursor.x).unwrap_or(0);
-        let end = self.line_end_x(self.cursor.y);
-        let text = self.extract_line_range(&line, start, end, true);
-        format!("{text}\n").into_bytes()
+        let end_y = self.logical_line_end_y(self.cursor.y);
+        let mut text = String::new();
+        for y in self.cursor.y..=end_y {
+            let line = self.line(y);
+            let start = if y == self.cursor.y {
+                line.owning_cell_x(self.cursor.x).unwrap_or(0)
+            } else {
+                0
+            };
+            let end = self.line_end_x(y);
+            text.push_str(&self.extract_line_range(&line, start, end, y == end_y));
+        }
+        text = self.line_transfer_text(text);
+        text.into_bytes()
     }
 
     fn extract_selection(&self) -> Option<String> {
         let selection = self.selection_snapshot()?;
         let (start, end) = normalize_positions(selection.anchor, selection.end);
+        if selection.mode == SelectionMode::Line {
+            return Some(self.extract_line_selection(start.y, end.y));
+        }
         if selection.mode == SelectionMode::Char && !self.rectangle {
             return Some(match self.mode_keys {
                 ModeKeys::Vi => self.extract_char_selection_inclusive(start, end),
@@ -272,7 +280,7 @@ impl CopyModeState {
         for y in start.y..=end.y {
             let line = self.line(y);
             let text = match selection.mode {
-                SelectionMode::Line => self.full_line_text(y, true),
+                SelectionMode::Line => unreachable!("line selections are handled above"),
                 SelectionMode::Char | SelectionMode::Word if self.rectangle => {
                     self.extract_line_range(&line, rect_min_x, rect_max_x, false)
                 }
@@ -296,11 +304,29 @@ impl CopyModeState {
         Some(lines.join("\n"))
     }
 
+    fn extract_line_selection(&self, start_y: usize, end_y: usize) -> String {
+        let mut lines = Vec::new();
+        let mut y = start_y;
+        while y <= end_y {
+            let span_end = self.logical_line_end_y(y).min(end_y);
+            lines.push(self.logical_line_text_range(y, span_end, true));
+            y = span_end.saturating_add(1);
+        }
+        self.line_transfer_text(lines.join("\n"))
+    }
+
+    fn line_transfer_text(&self, mut text: String) -> String {
+        if self.mode_keys == ModeKeys::Vi {
+            text.push('\n');
+        }
+        text
+    }
+
     fn extract_char_selection_exclusive(&self, start: CopyPosition, end: CopyPosition) -> String {
         if start == end {
             return String::new();
         }
-        let mut lines = Vec::new();
+        let mut text = String::new();
         for y in start.y..=end.y {
             let line = self.line(y);
             let range_start = if y == start.y { start.x } else { 0 };
@@ -309,25 +335,28 @@ impl CopyModeState {
             } else {
                 Some(self.line_end_x(y))
             }) else {
-                lines.push(String::new());
+                if y != end.y && !line.wrapped() {
+                    text.push('\n');
+                }
                 continue;
             };
-            if range_end < range_start {
-                lines.push(String::new());
-                continue;
+            if range_end >= range_start {
+                text.push_str(&self.extract_line_range(
+                    &line,
+                    range_start,
+                    range_end,
+                    y != start.y || y != end.y,
+                ));
             }
-            lines.push(self.extract_line_range(
-                &line,
-                range_start,
-                range_end,
-                y != start.y || y != end.y,
-            ));
+            if y != end.y && !line.wrapped() {
+                text.push('\n');
+            }
         }
-        lines.join("\n")
+        text
     }
 
     fn extract_char_selection_inclusive(&self, start: CopyPosition, end: CopyPosition) -> String {
-        let mut lines = Vec::new();
+        let mut text = String::new();
         for y in start.y..=end.y {
             let line = self.line(y);
             let range_start = if y == start.y { start.x } else { 0 };
@@ -336,18 +365,19 @@ impl CopyModeState {
             } else {
                 self.line_end_x(y)
             };
-            if range_end < range_start {
-                lines.push(String::new());
-                continue;
+            if range_end >= range_start {
+                text.push_str(&self.extract_line_range(
+                    &line,
+                    range_start,
+                    range_end,
+                    y != start.y || y != end.y,
+                ));
             }
-            lines.push(self.extract_line_range(
-                &line,
-                range_start,
-                range_end,
-                y != start.y || y != end.y,
-            ));
+            if y != end.y && !line.wrapped() {
+                text.push('\n');
+            }
         }
-        lines.join("\n")
+        text
     }
 
     fn exclusive_char_line_end(&self, end: CopyPosition) -> Option<u32> {
@@ -379,27 +409,35 @@ pub(crate) async fn run_pipe_command(
         return Ok(());
     }
 
+    let shell = PathBuf::from(shell);
+    let command = command.to_owned();
     let cwd = working_directory
-        .map(PathBuf::as_path)
-        .unwrap_or_else(|| std::path::Path::new("."));
-    let mut child = shell_tokio_command(std::path::Path::new(shell), cwd, command);
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("."));
+    let data = data.to_vec();
+    tokio::task::spawn_blocking(move || run_pipe_command_blocking(shell, command, cwd, data))
+        .await
+        .map_err(|error| RmuxError::Server(format!("pipe command task failed: {error}")))?
+}
+
+fn run_pipe_command_blocking(
+    shell: PathBuf,
+    command: String,
+    working_directory: PathBuf,
+    data: Vec<u8>,
+) -> Result<(), RmuxError> {
+    let mut child = shell_std_command(&shell, &working_directory, &command);
     child.stdin(Stdio::piped());
-    child.kill_on_drop(true);
-    if let Some(directory) = working_directory {
-        child.current_dir(directory);
-    }
+    child.current_dir(&working_directory);
     let mut child = child.spawn().map_err(|error| {
         RmuxError::Server(format!("failed to spawn pipe command '{command}': {error}"))
     })?;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(data).await.map_err(|error| {
+        stdin.write_all(&data).map_err(|error| {
             RmuxError::Server(format!("failed to write selection to '{command}': {error}"))
         })?;
-        stdin.shutdown().await.map_err(|error| {
-            RmuxError::Server(format!("failed to close stdin for '{command}': {error}"))
-        })?;
     }
-    let status = child.wait().await.map_err(|error| {
+    let status = child.wait().map_err(|error| {
         RmuxError::Server(format!(
             "failed to wait for pipe command '{command}': {error}"
         ))

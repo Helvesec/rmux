@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use rmux_client::connect;
-use rmux_client::{detect_context, ClientContext};
+use rmux_client::{detect_context, detect_parent, ClientContext, ClientContextParent};
 use rmux_proto::request::{AttachSessionExt2Request, SwitchClientExt3Request};
 use rmux_proto::request::{KillSessionRequest, ListSessionsRequest, NewSessionExtRequest};
 use rmux_proto::{ClientTerminalContext, ErrorResponse, Response};
 
+use super::json_output::{list_sessions_json_format, write_list_sessions_json};
 use super::{attach_with_connection, current_terminal_size, run_switch_client_on_connection};
 use super::{
     build_terminal_size, connect_with_startserver, expect_command_success, optional_client_flags,
@@ -13,7 +14,6 @@ use super::{
     run_command_resolved, run_payload_command, unexpected_response, write_command_output,
     ExitFailure, StartupOptions,
 };
-use crate::cli::client_environment::client_environment_assignments;
 use crate::cli_args::{
     KillSessionArgs, ListSessionsArgs, NewSessionArgs, RenameSessionArgs, SessionTargetArgs,
 };
@@ -24,6 +24,15 @@ pub(super) fn run_new_session(
     startup: StartupOptions,
     client_terminal: ClientTerminalContext,
 ) -> Result<i32, ExitFailure> {
+    validate_new_session_size(args.cols, args.rows)?;
+
+    if !args.detached && detect_parent() == ClientContextParent::Tmux {
+        return Err(ExitFailure::new(
+            1,
+            "sessions should be nested with care, unset $TMUX to force",
+        ));
+    }
+
     let mut connection = connect_with_startserver(socket_path, startup)?;
     let client_flags = optional_client_flags(args.flags.clone());
     let client_size = current_terminal_size();
@@ -47,12 +56,13 @@ pub(super) fn run_new_session(
             print_format: args.print_format,
             command: (!args.command.is_empty()).then_some(args.command),
             process_command: None,
-            client_environment: Some(client_environment_assignments()),
+            client_environment: invoking_client_environment(),
+            skip_environment_update: args.skip_environment_update,
         })
         .map_err(ExitFailure::from_client)?;
     let output = response.command_output().cloned();
-    let target = match response {
-        Response::NewSession(response) => response.session_name,
+    let (target, detached) = match response {
+        Response::NewSession(response) => (response.session_name, response.detached),
         other => {
             expect_command_success(other, "new-session")?;
             unreachable!("new-session success must return a new-session response")
@@ -63,7 +73,7 @@ pub(super) fn run_new_session(
         write_command_output(&output)?;
     }
 
-    if args.detached {
+    if detached {
         return Ok(0);
     }
 
@@ -101,8 +111,39 @@ pub(super) fn run_new_session(
     }
 }
 
+fn validate_new_session_size(cols: Option<u16>, rows: Option<u16>) -> Result<(), ExitFailure> {
+    if cols == Some(0) {
+        return Err(ExitFailure::new(1, "width too small"));
+    }
+    if rows == Some(0) {
+        return Err(ExitFailure::new(1, "height too small"));
+    }
+    Ok(())
+}
+
 fn current_working_directory_string() -> Option<String> {
     current_working_directory().map(|path| path.to_string_lossy().into_owned())
+}
+
+#[cfg(windows)]
+fn invoking_client_environment() -> Option<Vec<String>> {
+    Some(
+        std::env::vars_os()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .filter(|(name, _)| !name.starts_with('='))
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect(),
+    )
+}
+
+#[cfg(not(windows))]
+fn invoking_client_environment() -> Option<Vec<String>> {
+    None
 }
 
 fn current_working_directory() -> Option<PathBuf> {
@@ -122,7 +163,7 @@ pub(super) fn run_has_session(
         .unwrap_or_else(|| "can't find session".to_owned());
     let target = match args.target.as_ref() {
         Some(target) => resolve_session_target_spec(&mut connection, target, false)
-            .map_err(map_has_session_lookup_error)?,
+            .map_err(|error| map_has_session_lookup_error(error, target.raw()))?,
         None => resolve_current_session_target(&mut connection)?,
     };
     let response = connection
@@ -142,7 +183,10 @@ pub(super) fn run_has_session(
     }
 }
 
-fn map_has_session_lookup_error(error: ExitFailure) -> ExitFailure {
+fn map_has_session_lookup_error(error: ExitFailure, raw_target: &str) -> ExitFailure {
+    if error.message().contains("ambiguous session match") {
+        return ExitFailure::new(1, format!("can't find session: {raw_target}"));
+    }
     normalize_session_lookup_error(error, "can't find session: {}")
 }
 
@@ -167,7 +211,7 @@ pub(super) fn run_kill_session(
 }
 
 fn map_kill_session_lookup_error(error: ExitFailure) -> ExitFailure {
-    normalize_session_lookup_error(error, "session not found: {}")
+    normalize_session_lookup_error(error, "can't find session: {}")
 }
 
 fn normalize_session_lookup_error(error: ExitFailure, format: &str) -> ExitFailure {
@@ -197,6 +241,21 @@ pub(super) fn run_list_sessions(
     args: ListSessionsArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
+    if args.json {
+        let mut connection = connect(socket_path)
+            .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+        let response = connection
+            .list_sessions(ListSessionsRequest {
+                format: Some(list_sessions_json_format()),
+                filter: args.filter,
+                sort_order: args.sort_order,
+                reversed: args.reversed,
+            })
+            .map_err(ExitFailure::from_client)?;
+        let output = super::expect_command_output(&response, "list-sessions")?;
+        return write_list_sessions_json(output);
+    }
+
     run_payload_command(socket_path, "list-sessions", move |connection| {
         connection.list_sessions(ListSessionsRequest {
             format: args.format,

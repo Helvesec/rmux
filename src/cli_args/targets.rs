@@ -92,12 +92,21 @@ pub(super) fn parse_session_name(value: &str) -> Result<SessionName, String> {
 }
 
 pub(crate) fn parse_target_spec(value: &str) -> Result<TargetSpec, String> {
-    match Target::parse(value) {
+    let parse_value = exact_match_target(value);
+
+    if contains_runtime_target_id(parse_value) {
+        return Ok(TargetSpec {
+            raw: value.to_owned(),
+            exact: None,
+        });
+    }
+
+    match Target::parse(parse_value) {
         Ok(target) => Ok(TargetSpec {
             raw: value.to_owned(),
             exact: Some(target),
         }),
-        Err(_) if is_runtime_resolved_target_shape(value) => Ok(TargetSpec {
+        Err(_) if is_runtime_resolved_target_shape(parse_value) => Ok(TargetSpec {
             raw: value.to_owned(),
             exact: None,
         }),
@@ -105,11 +114,23 @@ pub(crate) fn parse_target_spec(value: &str) -> Result<TargetSpec, String> {
     }
 }
 
+fn exact_match_target(value: &str) -> &str {
+    value.strip_prefix('=').unwrap_or(value)
+}
+
 fn is_runtime_resolved_target_shape(value: &str) -> bool {
     !value.is_empty()
 }
 
+fn contains_runtime_target_id(value: &str) -> bool {
+    value
+        .split([':', '.'])
+        .any(|part| part.starts_with(['$', '@']))
+}
+
 pub(super) fn parse_target(value: &str) -> Result<Target, String> {
+    let value = exact_match_target(value);
+
     if let Some(session_name) = value.strip_suffix(':') {
         if !session_name.is_empty() {
             return parse_session_name(session_name).map(Target::Session);

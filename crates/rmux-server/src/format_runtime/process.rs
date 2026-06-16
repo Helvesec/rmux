@@ -104,23 +104,34 @@ impl RuntimeFormatContext<'_> {
     #[cfg(unix)]
     pub(super) fn pane_current_command(&self) -> Option<String> {
         let state = self.state?;
-        self.pane_foreground_pid()
-            .and_then(process::command_name)
-            .or_else(|| {
-                let session_name = self.session_name()?;
-                let window_index = self.window_index?;
-                let pane = self.pane?;
-                state
-                    .pane_profile_in_window(session_name, window_index, pane.index())
-                    .ok()
-                    .and_then(|profile| {
-                        profile
-                            .shell()
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .map(str::to_owned)
-                    })
-            })
+        let session_name = self.session_name()?;
+        let window_index = self.window_index?;
+        let pane = self.pane?;
+        let runtime_name = state
+            .pane_runtime_window_name_in_window(session_name, window_index, pane.index())
+            .ok()
+            .flatten();
+        let shell_name = state
+            .pane_profile_in_window(session_name, window_index, pane.index())
+            .ok()
+            .and_then(|profile| {
+                profile
+                    .shell()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            });
+        let foreground_name = self.pane_foreground_pid().and_then(process::command_name);
+        match (foreground_name, runtime_name, shell_name) {
+            (Some(foreground), Some(runtime), Some(shell))
+                if foreground == shell && runtime != shell =>
+            {
+                Some(runtime)
+            }
+            (Some(foreground), _, _) => Some(foreground),
+            (None, Some(runtime), _) => Some(runtime),
+            (None, None, shell) => shell,
+        }
     }
 }
 

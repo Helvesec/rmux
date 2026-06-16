@@ -10,7 +10,7 @@ keywords = ["terminal", "multiplexer", "os"]
 categories = ["os", "command-line-interface"]
 
 [dependencies]
-rmux-types = { path = "../rmux-types", version = "0.5.0" }
+rmux-types = { path = "../rmux-types", version = "0.6.0" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.185"
@@ -24,6 +24,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_JobObjects",
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",

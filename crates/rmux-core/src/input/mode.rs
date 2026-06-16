@@ -42,8 +42,10 @@ pub const MODE_KEYS_EXTENDED_2: u32 = 0x4_0000;
 pub const MODE_THEME_UPDATES: u32 = 0x8_0000;
 /// Synchronized output.
 pub const MODE_SYNC: u32 = 0x10_0000;
+/// Kitty keyboard protocol, encoded with CSI-u sequences.
+pub const MODE_KEYS_KITTY: u32 = 0x20_0000;
 
 /// All mouse modes combined.
 pub const ALL_MOUSE_MODES: u32 = MODE_MOUSE_STANDARD | MODE_MOUSE_BUTTON | MODE_MOUSE_ALL;
 /// Extended key modes combined.
-pub const EXTENDED_KEY_MODES: u32 = MODE_KEYS_EXTENDED | MODE_KEYS_EXTENDED_2;
+pub const EXTENDED_KEY_MODES: u32 = MODE_KEYS_EXTENDED | MODE_KEYS_EXTENDED_2 | MODE_KEYS_KITTY;

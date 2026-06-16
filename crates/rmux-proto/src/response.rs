@@ -1,6 +1,7 @@
 //! Detached response contracts.
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{ControlModeResponse, HandshakeResponse, LayoutName, RmuxError, SdkWaitId};
 
@@ -621,17 +622,22 @@ impl DisplayMessageResponse {
 }
 
 /// Response payload for `run-shell`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RunShellResponse {
     /// Captured stdout for foreground `run-shell`.
     pub output: Option<CommandOutput>,
+    /// Exit status returned by a foreground shell command.
+    pub exit_status: Option<i32>,
 }
 
 impl RunShellResponse {
     /// Builds a background `run-shell` response.
     #[must_use]
     pub const fn background() -> Self {
-        Self { output: None }
+        Self {
+            output: None,
+            exit_status: None,
+        }
     }
 
     /// Builds a response with no command output.
@@ -645,6 +651,25 @@ impl RunShellResponse {
     pub fn from_output(output: CommandOutput) -> Self {
         Self {
             output: Some(output),
+            exit_status: Some(0),
+        }
+    }
+
+    /// Builds a foreground shell response with an exact exit status.
+    #[must_use]
+    pub const fn from_exit_status(exit_status: i32) -> Self {
+        Self {
+            output: None,
+            exit_status: Some(exit_status),
+        }
+    }
+
+    /// Builds a foreground shell response with output and an exact exit status.
+    #[must_use]
+    pub fn from_output_and_exit_status(output: CommandOutput, exit_status: i32) -> Self {
+        Self {
+            output: Some(output),
+            exit_status: Some(exit_status),
         }
     }
 
@@ -653,6 +678,90 @@ impl RunShellResponse {
     pub fn command_output(&self) -> Option<&CommandOutput> {
         self.output.as_ref()
     }
+
+    /// Returns the shell exit status when the response came from a foreground shell.
+    #[must_use]
+    pub const fn exit_status(&self) -> Option<i32> {
+        self.exit_status
+    }
+}
+
+impl<'de> Deserialize<'de> for RunShellResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_struct(
+            "RunShellResponse",
+            &["output", "exit_status"],
+            RunShellResponseVisitor,
+        )
+    }
+}
+
+struct RunShellResponseVisitor;
+
+impl<'de> Visitor<'de> for RunShellResponseVisitor {
+    type Value = RunShellResponse;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a run-shell response")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let output = seq
+            .next_element()?
+            .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+        let exit_status = compat_next_response_element(&mut seq)?;
+        Ok(RunShellResponse {
+            output,
+            exit_status,
+        })
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut output = None;
+        let mut exit_status = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "output" => output = Some(map.next_value()?),
+                "exit_status" => exit_status = Some(map.next_value()?),
+                _ => {
+                    let _: de::IgnoredAny = map.next_value()?;
+                }
+            }
+        }
+
+        Ok(RunShellResponse {
+            output: output.ok_or_else(|| de::Error::missing_field("output"))?,
+            exit_status: exit_status.unwrap_or_default(),
+        })
+    }
+}
+
+fn compat_next_response_element<'de, A, T>(seq: &mut A) -> Result<T, A::Error>
+where
+    A: SeqAccess<'de>,
+    T: Deserialize<'de> + Default,
+{
+    match seq.next_element::<T>() {
+        Ok(Some(value)) => Ok(value),
+        Ok(None) => Ok(T::default()),
+        Err(error) if is_truncated_compat_sequence(&error) => Ok(T::default()),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_truncated_compat_sequence(error: &impl std::fmt::Display) -> bool {
+    let message = error.to_string();
+    message.contains("UnexpectedEof") || message.contains("unexpected end of file")
 }
 
 /// Response payload for `if-shell`.
@@ -689,13 +798,19 @@ impl IfShellResponse {
 pub struct SourceFileResponse {
     /// Verbose parsed-command output, when requested.
     pub output: Option<CommandOutput>,
+    /// Exit status surfaced by a nested foreground command.
+    #[serde(default)]
+    pub exit_status: Option<i32>,
 }
 
 impl SourceFileResponse {
     /// Builds a response without command output.
     #[must_use]
     pub const fn no_output() -> Self {
-        Self { output: None }
+        Self {
+            output: None,
+            exit_status: None,
+        }
     }
 
     /// Builds a response with command output.
@@ -703,6 +818,7 @@ impl SourceFileResponse {
     pub fn from_output(output: CommandOutput) -> Self {
         Self {
             output: Some(output),
+            exit_status: None,
         }
     }
 
@@ -710,6 +826,19 @@ impl SourceFileResponse {
     #[must_use]
     pub fn command_output(&self) -> Option<&CommandOutput> {
         self.output.as_ref()
+    }
+
+    /// Adds a command exit status to the response.
+    #[must_use]
+    pub const fn with_exit_status(mut self, exit_status: Option<i32>) -> Self {
+        self.exit_status = exit_status;
+        self
+    }
+
+    /// Returns the surfaced nested command exit status, if any.
+    #[must_use]
+    pub const fn exit_status(&self) -> Option<i32> {
+        self.exit_status
     }
 }
 
@@ -756,6 +885,24 @@ pub struct ErrorResponse {
 mod tests {
     use super::*;
     use crate::{OptionScopeSelector, SetOptionMode};
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct OldRunShellResponse {
+        output: Option<CommandOutput>,
+    }
+
+    #[test]
+    fn run_shell_response_deserializes_old_payloads_with_no_exit_status() {
+        let bytes = bincode::serialize(&OldRunShellResponse { output: None })
+            .expect("old run-shell response serializes");
+
+        let decoded: RunShellResponse =
+            bincode::deserialize(&bytes).expect("new run-shell response decodes old payload");
+
+        assert_eq!(decoded.command_output(), None);
+        assert_eq!(decoded.exit_status(), None);
+    }
 
     #[test]
     fn response_command_names_cover_base_aliases_and_error_tag() {

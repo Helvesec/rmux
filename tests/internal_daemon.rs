@@ -4,6 +4,7 @@ mod common;
 
 use std::error::Error;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -71,6 +72,7 @@ fn ensure_server_running_reexecs_the_hidden_rmux_daemon() -> Result<(), Box<dyn 
     let _cleanup = AutoStartCleanup::new(socket_path.clone(), pid_path.clone());
 
     fs::create_dir_all(launcher_dir)?;
+    fs::set_permissions(launcher_dir, fs::Permissions::from_mode(0o700))?;
     write_hidden_launcher(&launcher_path, &pid_path)?;
     std::env::set_var(BINARY_OVERRIDE_ENV, &launcher_path);
     std::env::set_var(BINARY_OVERRIDE_TEST_OPT_IN_ENV, "1");

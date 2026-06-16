@@ -6,7 +6,8 @@ use rmux_proto::{
 
 use super::super::{
     client_environment_snapshot, client_spawn_environment, prepare_lifecycle_event,
-    scripting_support::format_context_for_target, RequestHandler,
+    scripting_support::{format_context_for_target, render_start_directory_template},
+    RequestHandler,
 };
 use crate::format_runtime::render_runtime_template;
 use crate::hook_runtime::PendingInlineHookFormat;
@@ -37,6 +38,8 @@ struct SplitWindowParts {
     detached: bool,
     size: Option<String>,
     preserve_zoom: bool,
+    full_size: bool,
+    stdin_payload: Option<Vec<u8>>,
 }
 
 impl RequestHandler {
@@ -295,6 +298,8 @@ impl RequestHandler {
                 detached: false,
                 size: None,
                 preserve_zoom: false,
+                full_size: false,
+                stdin_payload: None,
             },
         )
         .await
@@ -319,6 +324,8 @@ impl RequestHandler {
                 detached: request.detached,
                 size: request.size,
                 preserve_zoom: request.preserve_zoom,
+                full_size: request.full_size,
+                stdin_payload: request.stdin_payload,
             },
         )
         .await
@@ -341,21 +348,39 @@ impl RequestHandler {
             detached,
             size,
             preserve_zoom,
+            full_size,
+            stdin_payload,
         } = parts;
         let session_name = match &target {
             rmux_proto::SplitWindowTarget::Session(session_name) => session_name.clone(),
             rmux_proto::SplitWindowTarget::Pane(target) => target.session_name().clone(),
         };
+        let format_target = match &target {
+            rmux_proto::SplitWindowTarget::Session(session_name) => {
+                Target::Session(session_name.clone())
+            }
+            rmux_proto::SplitWindowTarget::Pane(target) => Target::Pane(target.clone()),
+        };
         let socket_path = self.socket_path();
         let process_command = process_command
-            .or_else(|| rmux_proto::ProcessCommand::from_legacy_command(command.as_deref()));
+            .or_else(|| crate::legacy_command::from_legacy_command(command.as_deref()));
         if let Err(error) = validate_process_command(process_command.as_ref()) {
             return Response::Error(ErrorResponse { error });
         }
+        let attached_count = self.attached_count(&session_name).await;
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
         let response = {
             let mut state = self.state.lock().await;
+            let start_directory = match render_start_directory_template(
+                &state,
+                &format_target,
+                attached_count,
+                start_directory,
+            ) {
+                Ok(start_directory) => start_directory,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
             let split_effects =
                 split_window_effects(&state, &target, direction, detached, size.as_deref());
             let split_effects = match split_effects {
@@ -373,6 +398,7 @@ impl RequestHandler {
                 start_directory.as_deref(),
                 keep_alive_on_exit,
                 split_effects.size,
+                full_size,
                 Some(self.pane_alert_callback()),
                 Some(self.pane_exit_callback()),
             ) {
@@ -382,7 +408,32 @@ impl RequestHandler {
                     split_effects,
                     preserve_zoom,
                 ) {
-                    Ok(()) => Response::SplitWindow(response),
+                    Ok(()) => {
+                        if let Some(payload) = stdin_payload
+                            .as_deref()
+                            .filter(|payload| !payload.is_empty())
+                        {
+                            if let Err(error) = inject_split_window_stdin_output(
+                                &mut state,
+                                &response.pane,
+                                payload,
+                            ) {
+                                return Response::Error(ErrorResponse { error });
+                            }
+                        }
+                        if is_split_window_stdin_dead_pane(
+                            process_command.as_ref(),
+                            keep_alive_on_exit,
+                            stdin_payload.as_deref(),
+                        ) {
+                            if let Err(error) =
+                                state.mark_pane_dead_without_exit_details(&response.pane)
+                            {
+                                return Response::Error(ErrorResponse { error });
+                            }
+                        }
+                        Response::SplitWindow(response)
+                    }
                     Err(error) => Response::Error(ErrorResponse { error }),
                 },
                 Err(error) => Response::Error(ErrorResponse { error }),
@@ -554,6 +605,63 @@ impl RequestHandler {
                 ));
         }
     }
+}
+
+fn inject_split_window_stdin_output(
+    state: &mut HandlerState,
+    target: &rmux_proto::PaneTarget,
+    payload: &[u8],
+) -> Result<(), rmux_proto::RmuxError> {
+    let payload = normalize_split_window_stdin_payload(payload);
+    let transcript = state.transcript_handle(target)?;
+    transcript
+        .lock()
+        .expect("pane transcript mutex must not be poisoned")
+        .append_bytes(&payload);
+    let pane_output = state.pane_output_for_target(
+        target.session_name(),
+        target.window_index(),
+        target.pane_index(),
+    )?;
+    let _ = pane_output.send_for_generation(None, payload);
+    Ok(())
+}
+
+fn normalize_split_window_stdin_payload(payload: &[u8]) -> Vec<u8> {
+    let mut normalized = Vec::with_capacity(payload.len().saturating_mul(2));
+    let mut previous_was_cr = false;
+    for byte in payload {
+        match *byte {
+            b'\n' if previous_was_cr => {
+                normalized.push(b'\n');
+                previous_was_cr = false;
+            }
+            b'\n' => {
+                normalized.push(b'\r');
+                normalized.push(b'\n');
+                previous_was_cr = false;
+            }
+            b'\r' => {
+                normalized.push(b'\r');
+                previous_was_cr = true;
+            }
+            byte => {
+                normalized.push(byte);
+                previous_was_cr = false;
+            }
+        }
+    }
+    normalized
+}
+
+fn is_split_window_stdin_dead_pane(
+    process_command: Option<&rmux_proto::ProcessCommand>,
+    keep_alive_on_exit: Option<bool>,
+    stdin_payload: Option<&[u8]>,
+) -> bool {
+    keep_alive_on_exit == Some(true)
+        && stdin_payload.is_some()
+        && process_command.is_some_and(rmux_proto::ProcessCommand::is_empty)
 }
 
 fn join_pane_unlinked_window_snapshot(

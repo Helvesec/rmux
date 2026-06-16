@@ -3,8 +3,9 @@ use rmux_proto::{
     MoveWindowRequest, MoveWindowTarget, NewWindowRequest, NextWindowRequest,
     PreviousWindowRequest, RenameWindowRequest, Request, Response, RotateWindowDirection,
     RotateWindowRequest, SelectCustomLayoutRequest, SelectLayoutRequest, SelectLayoutTarget,
-    SelectWindowRequest, SessionName, SplitDirection, SplitWindowExtRequest, SplitWindowRequest,
-    SplitWindowTarget, SwapWindowRequest, UnlinkWindowRequest, WindowTarget,
+    SelectOldLayoutRequest, SelectWindowRequest, SessionName, SplitDirection,
+    SplitWindowExtRequest, SplitWindowRequest, SplitWindowTarget, SpreadLayoutRequest,
+    SwapWindowRequest, UnlinkWindowRequest, WindowTarget,
 };
 
 use crate::{connection::Connection, ClientError};
@@ -180,12 +181,37 @@ impl Connection {
         kill_destination: bool,
         detached: bool,
     ) -> Result<Response, ClientError> {
+        self.move_window_with_position(
+            source,
+            target,
+            renumber,
+            kill_destination,
+            detached,
+            false,
+            false,
+        )
+    }
+
+    /// Sends a `move-window` request with optional `-a`/`-b` placement over the detached RPC channel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn move_window_with_position(
+        &mut self,
+        source: Option<WindowTarget>,
+        target: MoveWindowTarget,
+        renumber: bool,
+        kill_destination: bool,
+        detached: bool,
+        after: bool,
+        before: bool,
+    ) -> Result<Response, ClientError> {
         self.roundtrip(&Request::MoveWindow(MoveWindowRequest {
             source,
             target,
             renumber,
             kill_destination,
             detached,
+            after,
+            before,
         }))
     }
 
@@ -344,6 +370,8 @@ impl Connection {
                 detached: false,
                 size: None,
                 preserve_zoom: false,
+                full_size: false,
+                stdin_payload: None,
             }));
         }
         self.split_window_with_options(SplitWindowOptions {
@@ -380,6 +408,8 @@ impl Connection {
                 detached: false,
                 size: None,
                 preserve_zoom: false,
+                full_size: false,
+                stdin_payload: None,
             }));
         }
         self.roundtrip(&Request::SplitWindow(SplitWindowRequest {
@@ -412,6 +442,19 @@ impl Connection {
             target,
             layout,
         }))
+    }
+
+    /// Sends a `select-layout -o` request over the detached RPC channel.
+    pub fn select_old_layout(
+        &mut self,
+        target: SelectLayoutTarget,
+    ) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::SelectOldLayout(SelectOldLayoutRequest { target }))
+    }
+
+    /// Sends a `select-layout -E` request over the detached RPC channel.
+    pub fn spread_layout(&mut self, target: SelectLayoutTarget) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::SpreadLayout(SpreadLayoutRequest { target }))
     }
 
     /// Sends a `next-layout` request over the detached RPC channel.

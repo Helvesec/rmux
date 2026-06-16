@@ -59,7 +59,7 @@ impl SessionStore {
         if raw == "." {
             return self.current_target_for_type(find_type, flags, context);
         }
-        if matches!(raw, "@" | "{active}" | "{current}") {
+        if matches!(raw, "{active}" | "{current}") {
             return self.current_target_for_type(find_type, flags, context);
         }
         if matches!(raw, "=" | "{mouse}") {
@@ -256,6 +256,9 @@ impl SessionStore {
             .ok_or_else(|| target_not_found(session_name.as_str(), "session"))?;
 
         if value.starts_with('@') {
+            if value == "@" {
+                return Err(target_not_found(value, "window"));
+            }
             let window_id = crate::WindowId::new(parse_required_prefixed_id(value, '@')?);
             let Some(window_index) = session
                 .windows()
@@ -265,6 +268,12 @@ impl SessionStore {
                 return Err(target_not_found(value, "window"));
             };
             return self.parts_for_window(session_name, window_index);
+        }
+
+        if flags.contains(TargetFindFlags::WINDOW_INDEX) {
+            if let Some(window_index) = resolve_absolute_window_index_slot(value)? {
+                return Ok(ResolvedParts::window(session_name.clone(), window_index));
+            }
         }
 
         if !flags.contains(TargetFindFlags::EXACT_WINDOW) {
@@ -322,18 +331,18 @@ impl SessionStore {
         value: &str,
         context: &TargetFindContext,
     ) -> Result<ResolvedParts, RmuxError> {
+        if value == "@" {
+            return Err(target_not_found(value, "window"));
+        }
         let window_id = crate::WindowId::new(parse_required_prefixed_id(value, '@')?);
         if let Ok(current) = self.current_parts(context) {
-            if let Some(window) = self
-                .session(&current.session_name)
-                .and_then(|session| session.window_at(current.window_index))
-            {
-                if window.id() == window_id {
-                    return Ok(ResolvedParts::window(
-                        current.session_name,
-                        current.window_index,
-                    ));
-                }
+            if let Some(window_index) = self.session(&current.session_name).and_then(|session| {
+                session
+                    .windows()
+                    .iter()
+                    .find_map(|(index, window)| (window.id() == window_id).then_some(*index))
+            }) {
+                return Ok(ResolvedParts::window(current.session_name, window_index));
             }
         }
 
@@ -595,6 +604,15 @@ impl SessionStore {
         });
         unique_match(matches, raw, "pane")?.ok_or_else(|| target_not_found(value, "pane"))
     }
+}
+
+fn resolve_absolute_window_index_slot(value: &str) -> Result<Option<u32>, RmuxError> {
+    if value.is_empty() || value.starts_with(['+', '-']) || matches!(value, "!" | "^" | "$") {
+        return Ok(None);
+    }
+    value.parse::<u32>().map(Some).map_err(|_| {
+        RmuxError::invalid_target(value, "window index must fit in an unsigned integer")
+    })
 }
 
 #[cfg(test)]

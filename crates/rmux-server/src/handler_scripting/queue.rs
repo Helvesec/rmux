@@ -21,6 +21,7 @@ pub(in crate::handler) struct QueueExecutionContext {
     pub(super) source_file_depth: usize,
     pub(super) current_file: Option<String>,
     pub(super) current_target: Option<Target>,
+    pub(super) current_target_allows_canfail_fallback: bool,
     pub(super) mouse_target: Option<Target>,
 }
 
@@ -31,6 +32,7 @@ impl QueueExecutionContext {
             source_file_depth: 0,
             current_file: None,
             current_target: None,
+            current_target_allows_canfail_fallback: false,
             mouse_target: None,
         }
     }
@@ -41,6 +43,7 @@ impl QueueExecutionContext {
             source_file_depth: 0,
             current_file: None,
             current_target: None,
+            current_target_allows_canfail_fallback: false,
             mouse_target: None,
         }
     }
@@ -55,6 +58,7 @@ impl QueueExecutionContext {
             source_file_depth,
             current_file,
             current_target: self.current_target.clone(),
+            current_target_allows_canfail_fallback: self.current_target_allows_canfail_fallback,
             mouse_target: self.mouse_target.clone(),
         }
     }
@@ -63,8 +67,22 @@ impl QueueExecutionContext {
         mut self,
         current_target: Option<Target>,
     ) -> Self {
+        self.current_target_allows_canfail_fallback = current_target.is_some();
         self.current_target = current_target;
         self
+    }
+
+    pub(in crate::handler) fn with_implicit_current_target(
+        mut self,
+        current_target: Option<Target>,
+    ) -> Self {
+        self.current_target = current_target;
+        self.current_target_allows_canfail_fallback = false;
+        self
+    }
+
+    pub(in crate::handler) fn uses_explicit_current_target(&self) -> bool {
+        self.current_target_allows_canfail_fallback
     }
 
     pub(in crate::handler) fn with_mouse_target(mut self, mouse_target: Option<Target>) -> Self {
@@ -75,6 +93,12 @@ impl QueueExecutionContext {
     pub(in crate::handler) fn current_target(&self) -> Option<&Target> {
         self.current_target.as_ref()
     }
+
+    pub(in crate::handler) fn canfail_fallback_target(&self) -> Option<&Target> {
+        self.current_target_allows_canfail_fallback
+            .then_some(self.current_target.as_ref())
+            .flatten()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -82,11 +106,13 @@ pub(in crate::handler) enum QueueCommandAction {
     Normal {
         output: Option<CommandOutput>,
         error: Option<RmuxError>,
+        exit_status: Option<i32>,
     },
     InsertAfter {
         batches: Vec<(ParsedCommands, QueueExecutionContext)>,
         output: Option<CommandOutput>,
         error: Option<RmuxError>,
+        exit_status: Option<i32>,
     },
 }
 
@@ -132,12 +158,21 @@ pub(super) fn queue_action_from_response(
 ) -> Result<QueueCommandAction, RmuxError> {
     match response {
         Response::Error(ErrorResponse { error }) => Err(error),
+        Response::RunShell(response) => Ok(QueueCommandAction::Normal {
+            output: response
+                .command_output()
+                .filter(|output| !output.stdout().is_empty())
+                .cloned(),
+            error: None,
+            exit_status: response.exit_status().filter(|status| *status != 0),
+        }),
         response => Ok(QueueCommandAction::Normal {
             output: response
                 .command_output()
                 .filter(|output| !output.stdout().is_empty())
                 .cloned(),
             error: None,
+            exit_status: None,
         }),
     }
 }
@@ -150,10 +185,12 @@ pub(super) fn prompt_queue_action_from_result(
             batches: vec![(parsed, context)],
             output: None,
             error: result.error,
+            exit_status: None,
         },
         None => QueueCommandAction::Normal {
             output: None,
             error: result.error,
+            exit_status: None,
         },
     }
 }

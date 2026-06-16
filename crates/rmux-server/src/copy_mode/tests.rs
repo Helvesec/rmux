@@ -58,6 +58,13 @@ fn vi_context() -> CopyModeCommandContext {
     }
 }
 
+fn punctuation_word_context() -> CopyModeCommandContext {
+    CopyModeCommandContext {
+        word_separators: " .-_@".to_owned(),
+        ..test_context()
+    }
+}
+
 #[test]
 fn cursor_down_and_cancel_only_cancels_at_bottom() {
     let screen = build_screen(20, 3, "line1\r\nline2\r\nline3");
@@ -247,6 +254,173 @@ fn vi_search_positions_at_match_start() {
 }
 
 #[test]
+fn jump_to_forward_moves_before_the_matched_character_and_repeats() {
+    let screen = build_screen(20, 3, "aXbXcXdXe");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    state.execute_command("history-top", &[], &ctx).unwrap();
+    state
+        .execute_command("jump-to-forward", &["X".to_owned()], &ctx)
+        .unwrap();
+    assert_eq!(state.cursor, CopyPosition { x: 2, y: 0 });
+
+    state.execute_command("jump-again", &[], &ctx).unwrap();
+    assert_eq!(state.cursor, CopyPosition { x: 4, y: 0 });
+}
+
+#[test]
+fn jump_to_backward_skips_adjacent_match_and_repeats() {
+    let screen = build_screen(20, 3, "aXbXcXdXe");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    state.execute_command("history-top", &[], &ctx).unwrap();
+    state.execute_command("end-of-line", &[], &ctx).unwrap();
+
+    state
+        .execute_command("jump-to-backward", &["X".to_owned()], &ctx)
+        .unwrap();
+    assert_eq!(state.cursor, CopyPosition { x: 8, y: 0 });
+
+    state.execute_command("jump-again", &[], &ctx).unwrap();
+    assert_eq!(state.cursor, CopyPosition { x: 6, y: 0 });
+
+    state.execute_command("jump-again", &[], &ctx).unwrap();
+    assert_eq!(state.cursor, CopyPosition { x: 4, y: 0 });
+
+    state.execute_command("jump-again", &[], &ctx).unwrap();
+    assert_eq!(state.cursor, CopyPosition { x: 2, y: 0 });
+}
+
+#[test]
+fn jump_to_backward_skips_adjacent_wide_match() {
+    let screen = build_screen(20, 3, "界a界b");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    state.execute_command("history-top", &[], &ctx).unwrap();
+    state.cursor = CopyPosition { x: 5, y: 0 };
+    state
+        .execute_command("jump-to-backward", &["界".to_owned()], &ctx)
+        .unwrap();
+
+    assert_eq!(state.cursor, CopyPosition { x: 2, y: 0 });
+}
+
+#[test]
+fn jump_to_forward_skips_adjacent_match_like_tmux() {
+    let screen = build_screen(20, 3, "abXd");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    state.execute_command("history-top", &[], &ctx).unwrap();
+    state
+        .execute_command("jump-to-forward", &["X".to_owned()], &ctx)
+        .unwrap();
+
+    assert_eq!(state.cursor, CopyPosition { x: 1, y: 0 });
+}
+
+#[test]
+fn next_word_stops_on_separator_tokens_like_tmux() {
+    let screen = build_screen(30, 5, "foo.bar baz-qux end\r\n");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = punctuation_word_context();
+
+    state.execute_command("history-top", &[], &ctx).unwrap();
+
+    for expected in [
+        CopyPosition { x: 3, y: 0 },
+        CopyPosition { x: 4, y: 0 },
+        CopyPosition { x: 8, y: 0 },
+        CopyPosition { x: 11, y: 0 },
+        CopyPosition { x: 12, y: 0 },
+        CopyPosition { x: 16, y: 0 },
+        CopyPosition { x: 1, y: 4 },
+    ] {
+        state.execute_command("next-word", &[], &ctx).unwrap();
+        assert_eq!(state.cursor, expected);
+    }
+}
+
+#[test]
+fn next_word_end_stops_after_current_token_like_tmux() {
+    let screen = build_screen(30, 5, "foo.bar baz-qux end\r\n");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = punctuation_word_context();
+
+    state.execute_command("history-top", &[], &ctx).unwrap();
+
+    for expected in [
+        CopyPosition { x: 3, y: 0 },
+        CopyPosition { x: 4, y: 0 },
+        CopyPosition { x: 7, y: 0 },
+        CopyPosition { x: 11, y: 0 },
+        CopyPosition { x: 12, y: 0 },
+        CopyPosition { x: 15, y: 0 },
+        CopyPosition { x: 19, y: 0 },
+        CopyPosition { x: 0, y: 4 },
+    ] {
+        state.execute_command("next-word-end", &[], &ctx).unwrap();
+        assert_eq!(state.cursor, expected);
+    }
+}
+
+#[test]
+fn previous_word_stops_on_separator_tokens_like_tmux() {
+    let screen = build_screen(30, 5, "foo.bar baz-qux end\r\n");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = punctuation_word_context();
+
+    state.execute_command("history-top", &[], &ctx).unwrap();
+    state.cursor = CopyPosition { x: 16, y: 0 };
+
+    for expected in [
+        CopyPosition { x: 12, y: 0 },
+        CopyPosition { x: 11, y: 0 },
+        CopyPosition { x: 8, y: 0 },
+        CopyPosition { x: 4, y: 0 },
+        CopyPosition { x: 3, y: 0 },
+        CopyPosition { x: 0, y: 0 },
+    ] {
+        state.execute_command("previous-word", &[], &ctx).unwrap();
+        assert_eq!(state.cursor, expected);
+    }
+}
+
+#[test]
+fn next_space_moves_to_the_terminal_boundary_after_the_last_word_like_tmux() {
+    let screen = build_screen(30, 5, "foo.bar baz-qux end\r\n");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = punctuation_word_context();
+
+    state.execute_command("history-top", &[], &ctx).unwrap();
+    state.cursor = CopyPosition { x: 16, y: 0 };
+
+    state.execute_command("next-space", &[], &ctx).unwrap();
+    assert_eq!(state.cursor, CopyPosition { x: 1, y: 4 });
+}
+
+#[test]
+fn copy_cursor_word_uses_the_next_word_from_separators_like_tmux() {
+    let screen = build_screen(30, 5, "foo.bar baz-qux end\r\n");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = punctuation_word_context();
+
+    state.execute_command("history-top", &[], &ctx).unwrap();
+
+    state.cursor = CopyPosition { x: 3, y: 0 };
+    assert_eq!(state.summary().copy_cursor_word, "bar");
+
+    state.cursor = CopyPosition { x: 11, y: 0 };
+    assert_eq!(state.summary().copy_cursor_word, "qux");
+
+    state.cursor = CopyPosition { x: 1, y: 4 };
+    assert_eq!(state.summary().copy_cursor_word, "");
+}
+
+#[test]
 fn emacs_search_positions_past_match_end() {
     let screen = build_screen(30, 3, "hello needle world");
     let mut state = CopyModeState::for_test(screen);
@@ -326,6 +500,23 @@ fn character_selection_excludes_the_cursor_cell_like_tmux() {
 }
 
 #[test]
+fn cursor_right_wraps_after_logical_line_end() {
+    let screen = build_screen(30, 5, "foo.bar baz-qux end\r\n\r\n");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    let _ = state.execute_command("history-top", &[], &ctx);
+    for _ in 0..20 {
+        let _ = state.execute_command("cursor-right", &[], &ctx);
+    }
+
+    let summary = state.summary();
+    assert_eq!(summary.cursor_x, 0);
+    assert_eq!(summary.cursor_y, 1);
+    assert_eq!(summary.copy_cursor_line, "");
+}
+
+#[test]
 fn multiline_character_selection_excludes_first_cell_of_end_line_like_tmux() {
     let screen = build_screen(20, 3, "alpha\r\nbeta\r\ngamma\r\n");
     let mut state = CopyModeState::for_test(screen);
@@ -340,6 +531,266 @@ fn multiline_character_selection_excludes_first_cell_of_end_line_like_tmux() {
         .execute_command("copy-selection-and-cancel", &[], &ctx)
         .unwrap();
     assert_eq!(outcome.transfer.unwrap().data, b"beta\n");
+}
+
+#[test]
+fn middle_line_uses_upper_middle_on_even_height_like_tmux() {
+    let screen = build_screen(
+        20,
+        6,
+        "line1\r\nline2\r\nline3\r\nline4\r\nline5\r\nline6\r\n",
+    );
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    let _ = state.execute_command("history-top", &[], &ctx);
+    let _ = state.execute_command("middle-line", &[], &ctx);
+
+    assert_eq!(state.summary().cursor_y, 2);
+    assert_eq!(state.summary().copy_cursor_line, "line3");
+}
+
+#[test]
+fn goto_line_scrolls_from_bottom_like_tmux() {
+    let screen = build_screen(
+        30,
+        4,
+        "L1\r\nL2\r\nL3\r\nL4\r\nL5\r\nL6\r\nL7\r\nL8\r\nL9\r\nL10\r\nPROMPT",
+    );
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    state.set_show_position(false);
+    let _ = state.execute_command("goto-line", &["1".to_owned()], &ctx);
+    let summary = state.summary();
+    assert_eq!(summary.scroll_position, 1);
+    assert_eq!(summary.cursor_y, 3);
+    assert_eq!(summary.copy_cursor_line, "L10");
+
+    let _ = state.execute_command("goto-line", &["999".to_owned()], &ctx);
+    let summary = state.summary();
+    assert_eq!(summary.scroll_position, 7);
+    assert_eq!(summary.cursor_y, 3);
+    assert_eq!(summary.copy_cursor_line, "L4");
+
+    let _ = state.execute_command("goto-line", &["bad".to_owned()], &ctx);
+    let summary = state.summary();
+    assert_eq!(summary.scroll_position, 7);
+    assert_eq!(summary.copy_cursor_line, "L4");
+
+    let _ = state.execute_command("goto-line", &["-5".to_owned()], &ctx);
+    let summary = state.summary();
+    assert_eq!(summary.scroll_position, 7);
+    assert_eq!(summary.copy_cursor_line, "L4");
+}
+
+#[test]
+fn line_selection_omits_trailing_newline() {
+    let screen = build_screen(20, 3, "alpha\r\nbeta\r\ngamma\r\n");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    let _ = state.execute_command("history-top", &[], &ctx);
+    let _ = state.execute_command("select-line", &[], &ctx);
+    assert_eq!(state.summary().cursor_x, 5);
+    assert_eq!(
+        state.summary().selection_end.unwrap(),
+        CopyPosition { x: 5, y: 0 }
+    );
+
+    let outcome = state.execute_command("copy-selection", &[], &ctx).unwrap();
+    assert_eq!(outcome.transfer.unwrap().data, b"alpha");
+}
+
+#[test]
+fn vi_line_selection_includes_trailing_newline() {
+    let screen = build_screen(20, 3, "alpha\r\nbeta\r\ngamma\r\n");
+    let mut state = CopyModeState::new(screen, None, false, &vi_context(), false, true);
+    let ctx = vi_context();
+
+    let _ = state.execute_command("history-top", &[], &ctx);
+    let _ = state.execute_command("select-line", &[], &ctx);
+
+    let outcome = state.execute_command("copy-selection", &[], &ctx).unwrap();
+    assert_eq!(outcome.transfer.unwrap().data, b"alpha\n");
+}
+
+#[test]
+fn line_selection_keeps_internal_newlines_without_trailing_newline() {
+    let screen = build_screen(20, 3, "alpha\r\nbeta\r\ngamma\r\n");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    let _ = state.execute_command("history-top", &[], &ctx);
+    let _ = state.execute_command("select-line", &[], &ctx);
+    let _ = state.execute_command("cursor-down", &[], &ctx);
+
+    let outcome = state.execute_command("copy-selection", &[], &ctx).unwrap();
+    assert_eq!(outcome.transfer.unwrap().data, b"alpha\nbeta");
+}
+
+#[test]
+fn line_selection_joins_wrapped_physical_rows_without_trailing_newline() {
+    let screen = build_screen(20, 4, "ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    let _ = state.execute_command("history-top", &[], &ctx);
+    let _ = state.execute_command("select-line", &[], &ctx);
+
+    let outcome = state.execute_command("copy-selection", &[], &ctx).unwrap();
+    assert_eq!(
+        outcome.transfer.unwrap().data,
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    );
+}
+
+#[test]
+fn character_selection_joins_wrapped_physical_rows_without_newlines() {
+    let screen = build_screen(10, 8, "0123456789ABCDEFGHIJKLMNO\r\n");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    state.execute_command("history-top", &[], &ctx).unwrap();
+    state.execute_command("start-of-line", &[], &ctx).unwrap();
+    state.execute_command("begin-selection", &[], &ctx).unwrap();
+    state.execute_command("end-of-line", &[], &ctx).unwrap();
+
+    let outcome = state.execute_command("copy-selection", &[], &ctx).unwrap();
+    assert_eq!(outcome.transfer.unwrap().data, b"0123456789ABCDEFGHIJKLMNO");
+}
+
+#[test]
+fn copy_pipe_uses_wrapped_character_selection_without_newlines() {
+    let screen = build_screen(10, 8, "0123456789ABCDEFGHIJKLMNO\r\n");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    state.execute_command("history-top", &[], &ctx).unwrap();
+    state.execute_command("start-of-line", &[], &ctx).unwrap();
+    state.execute_command("begin-selection", &[], &ctx).unwrap();
+    state.execute_command("end-of-line", &[], &ctx).unwrap();
+
+    let outcome = state.execute_command("copy-pipe", &[], &ctx).unwrap();
+    assert_eq!(outcome.transfer.unwrap().data, b"0123456789ABCDEFGHIJKLMNO");
+}
+
+#[test]
+fn copy_line_omits_trailing_newline() {
+    let screen = build_screen(20, 3, "alpha\r\nbeta\r\n");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    let _ = state.execute_command("history-top", &[], &ctx);
+
+    let outcome = state.execute_command("copy-line", &[], &ctx).unwrap();
+    assert_eq!(outcome.transfer.unwrap().data, b"alpha");
+}
+
+#[test]
+fn vi_copy_line_includes_trailing_newline() {
+    let screen = build_screen(20, 3, "alpha\r\nbeta\r\n");
+    let mut state = CopyModeState::new(screen, None, false, &vi_context(), false, true);
+    let ctx = vi_context();
+
+    let _ = state.execute_command("history-top", &[], &ctx);
+
+    let outcome = state.execute_command("copy-line", &[], &ctx).unwrap();
+    assert_eq!(outcome.transfer.unwrap().data, b"alpha\n");
+}
+
+#[test]
+fn copy_line_on_empty_line_yields_empty_data() {
+    let screen = build_screen(20, 3, "\r\n");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    let _ = state.execute_command("history-top", &[], &ctx);
+
+    let outcome = state.execute_command("copy-line", &[], &ctx).unwrap();
+    assert_eq!(outcome.transfer.unwrap().data, b"");
+}
+
+#[test]
+fn vi_copy_line_on_empty_line_yields_newline() {
+    let screen = build_screen(20, 3, "\r\n");
+    let mut state = CopyModeState::new(screen, None, false, &vi_context(), false, true);
+    let ctx = vi_context();
+
+    let _ = state.execute_command("history-top", &[], &ctx);
+
+    let outcome = state.execute_command("copy-line", &[], &ctx).unwrap();
+    assert_eq!(outcome.transfer.unwrap().data, b"\n");
+}
+
+#[test]
+fn copy_end_of_line_omits_trailing_newline() {
+    let screen = build_screen(20, 3, "alpha\r\nbeta\r\n");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    let _ = state.execute_command("history-top", &[], &ctx);
+
+    let outcome = state
+        .execute_command("copy-end-of-line", &[], &ctx)
+        .unwrap();
+    assert_eq!(outcome.transfer.unwrap().data, b"alpha");
+}
+
+#[test]
+fn vi_copy_end_of_line_includes_trailing_newline() {
+    let screen = build_screen(20, 3, "alpha\r\nbeta\r\n");
+    let mut state = CopyModeState::new(screen, None, false, &vi_context(), false, true);
+    let ctx = vi_context();
+
+    let _ = state.execute_command("history-top", &[], &ctx);
+
+    let outcome = state
+        .execute_command("copy-end-of-line", &[], &ctx)
+        .unwrap();
+    assert_eq!(outcome.transfer.unwrap().data, b"alpha\n");
+}
+
+#[test]
+fn end_of_line_moves_to_wrapped_logical_line_end_like_tmux() {
+    let screen = build_screen(20, 4, "ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    let _ = state.execute_command("history-top", &[], &ctx);
+    let _ = state.execute_command("end-of-line", &[], &ctx);
+
+    assert_eq!(state.summary().cursor_x, 6);
+    assert_eq!(state.summary().cursor_y, 1);
+}
+
+#[test]
+fn copy_end_of_line_uses_wrapped_logical_line_without_trailing_newline() {
+    let screen = build_screen(20, 4, "ABCDEFGHIJKLMNOPQRSTUVWXYZ\r\n");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    let _ = state.execute_command("history-top", &[], &ctx);
+
+    let outcome = state
+        .execute_command("copy-end-of-line", &[], &ctx)
+        .unwrap();
+    assert_eq!(
+        outcome.transfer.unwrap().data,
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    );
+}
+
+#[test]
+fn end_of_line_stops_after_content_like_tmux() {
+    let screen = build_screen(20, 3, "alpha\r\nbeta\r\ngamma\r\n");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    let _ = state.execute_command("history-top", &[], &ctx);
+    let _ = state.execute_command("end-of-line", &[], &ctx);
+
+    assert_eq!(state.summary().cursor_x, 5);
 }
 
 #[test]
@@ -425,4 +876,67 @@ fn unknown_command_returns_error() {
 
     let result = state.execute_command("not-a-real-command", &[], &ctx);
     assert!(result.is_err());
+}
+
+#[test]
+fn rg15_next_word_at_end_lands_after_last_word_when_last_row_is_populated() {
+    let screen = build_screen(30, 3, "alpha\r\nbeta\r\ngamma");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    state.execute_command("history-top", &[], &ctx).unwrap();
+    assert_eq!(state.cursor, CopyPosition { x: 0, y: 0 });
+
+    for _ in 0..10 {
+        state.execute_command("next-word", &[], &ctx).unwrap();
+    }
+    assert_eq!(state.cursor, CopyPosition { x: 5, y: 2 });
+    assert_eq!(state.summary().copy_cursor_word, "");
+}
+
+#[test]
+fn rg15_next_word_single_line_lands_after_only_word() {
+    let screen = build_screen(30, 1, "alpharbeta");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    state.execute_command("history-top", &[], &ctx).unwrap();
+    state.cursor = CopyPosition { x: 0, y: 0 };
+
+    state.execute_command("next-word", &[], &ctx).unwrap();
+    let after_first = state.cursor;
+    state.execute_command("next-word", &[], &ctx).unwrap();
+    let after_second = state.cursor;
+
+    assert_eq!(after_first, CopyPosition { x: 10, y: 0 });
+    assert_eq!(after_second, CopyPosition { x: 10, y: 0 });
+    assert_eq!(state.summary().copy_cursor_word, "");
+}
+
+#[test]
+fn next_word_at_full_width_final_line_stays_at_logical_end() {
+    let screen = build_screen(5, 1, "abcde");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    state.execute_command("history-top", &[], &ctx).unwrap();
+    state.execute_command("next-word", &[], &ctx).unwrap();
+    state.execute_command("next-word", &[], &ctx).unwrap();
+
+    assert_eq!(state.cursor, CopyPosition { x: 5, y: 0 });
+    assert_eq!(state.summary().copy_cursor_word, "");
+}
+
+#[test]
+fn rg15_next_space_at_end_lands_after_last_word_when_last_row_is_populated() {
+    let screen = build_screen(30, 3, "alpha\r\nbeta\r\ngamma");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    state.execute_command("history-top", &[], &ctx).unwrap();
+    for _ in 0..10 {
+        state.execute_command("next-space", &[], &ctx).unwrap();
+    }
+    assert_eq!(state.cursor, CopyPosition { x: 5, y: 2 });
+    assert_eq!(state.summary().copy_cursor_word, "");
 }

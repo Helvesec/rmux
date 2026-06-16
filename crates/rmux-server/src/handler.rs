@@ -72,10 +72,14 @@ mod web_support;
 #[cfg(not(all(any(unix, windows), feature = "web")))]
 #[path = "handler_web_disabled.rs"]
 mod web_support;
+#[cfg(all(test, any(unix, windows), feature = "web"))]
+pub(crate) use web_support::TestWebSessionView;
+#[cfg(all(test, any(unix, windows), feature = "web"))]
+pub(crate) use web_support::WebSessionPaneView;
 #[cfg(all(any(unix, windows), feature = "web"))]
 pub(crate) use web_support::{
-    WebPaneSnapshot, WebPaneStream, WebSessionAttachEvent, WebSessionSnapshot, WebSessionStream,
-    WebShareStream,
+    WebPaneSnapshot, WebPaneStream, WebSessionAttachEvent, WebSessionPaneFrame, WebSessionSnapshot,
+    WebSessionStream, WebShareStream,
 };
 #[path = "handler_window.rs"]
 mod window_support;
@@ -85,16 +89,20 @@ use crate::wait_for::WaitForStore;
 #[cfg(all(any(unix, windows), feature = "web"))]
 use crate::web::WebShareRegistry;
 use attach_support::{ActiveAttachState, ClientFlags};
-pub(in crate::handler) use client_environment_support::client_spawn_environment;
-pub(in crate::handler) use client_runtime_support::{
-    attached_client_matches_target, client_environment_snapshot, clipboard_query_sequence,
-    command_output_from_lines, effective_client_terminal_context, format_client_uid,
-    format_client_user, format_requester_uid, normalize_target_client, parse_client_flags,
-    parse_session_sort_order, session_selection_prefers_live_process, sort_list_clients,
-    switch_target_selector_count, update_environment_from_client, ListClientSnapshot,
-    SessionSortOrder, LIST_CLIENTS_TEMPLATE,
+pub(in crate::handler) use client_environment_support::{
+    client_spawn_environment, initial_session_spawn_environment,
 };
-use client_runtime_support::{current_process_environment_snapshot, seed_global_environment};
+pub(in crate::handler) use client_runtime_support::{
+    attached_client_matches_target, client_environment_snapshot, command_output_from_lines,
+    effective_client_terminal_context, format_client_uid, format_client_user, format_requester_uid,
+    normalize_target_client, parse_client_flags, parse_session_sort_order,
+    session_selection_prefers_live_process, sort_list_clients, switch_target_selector_count,
+    update_environment_from_client, ListClientSnapshot, SessionSortOrder, LIST_CLIENTS_TEMPLATE,
+};
+use client_runtime_support::{
+    current_process_environment_display_snapshot, current_process_environment_snapshot,
+    seed_global_display_environment, seed_global_environment,
+};
 #[cfg(test)]
 pub(in crate::handler) use client_runtime_support::{
     format_attached_client_flags, format_control_client_flags,
@@ -137,6 +145,7 @@ pub(crate) struct RequestHandler {
     active_attach: Arc<Mutex<ActiveAttachState>>,
     active_control: Arc<Mutex<ActiveControlState>>,
     silence_timers: Arc<StdMutex<HashMap<WindowTarget, alert_support::SilenceTimerState>>>,
+    pane_alert_coalescer: Arc<StdMutex<alert_support::PaneAlertCoalescer>>,
     prompt_history: Arc<Mutex<prompt_support::PromptHistoryStore>>,
     wait_for: Arc<StdMutex<WaitForStore>>,
     hook_events: broadcast::Sender<QueuedLifecycleEvent>,
@@ -169,6 +178,16 @@ pub(crate) struct RequestHandler {
     paste_buffer_delete_pause: Arc<StdMutex<Option<Arc<PasteBufferDeletePause>>>>,
 }
 
+pub(crate) struct ConfigLoadingGuard {
+    depth: Arc<AtomicUsize>,
+}
+
+impl Drop for ConfigLoadingGuard {
+    fn drop(&mut self) {
+        self.depth.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 impl Clone for RequestHandler {
     fn clone(&self) -> Self {
         Self {
@@ -176,6 +195,7 @@ impl Clone for RequestHandler {
             active_attach: self.active_attach.clone(),
             active_control: self.active_control.clone(),
             silence_timers: self.silence_timers.clone(),
+            pane_alert_coalescer: self.pane_alert_coalescer.clone(),
             prompt_history: self.prompt_history.clone(),
             wait_for: self.wait_for.clone(),
             hook_events: self.hook_events.clone(),
@@ -216,6 +236,7 @@ pub(crate) struct WeakRequestHandler {
     active_attach: Weak<Mutex<ActiveAttachState>>,
     active_control: Weak<Mutex<ActiveControlState>>,
     silence_timers: Weak<StdMutex<HashMap<WindowTarget, alert_support::SilenceTimerState>>>,
+    pane_alert_coalescer: Weak<StdMutex<alert_support::PaneAlertCoalescer>>,
     prompt_history: Weak<Mutex<prompt_support::PromptHistoryStore>>,
     wait_for: Weak<StdMutex<WaitForStore>>,
     hook_events: broadcast::Sender<QueuedLifecycleEvent>,
@@ -253,6 +274,7 @@ impl WeakRequestHandler {
             active_attach: self.active_attach.upgrade()?,
             active_control: self.active_control.upgrade()?,
             silence_timers: self.silence_timers.upgrade()?,
+            pane_alert_coalescer: self.pane_alert_coalescer.upgrade()?,
             prompt_history: self.prompt_history.upgrade()?,
             wait_for: self.wait_for.upgrade()?,
             hook_events: self.hook_events.clone(),
@@ -323,9 +345,10 @@ impl RequestHandler {
     }
 
     pub(crate) fn with_owner_uid(owner_uid: u32) -> Self {
-        Self::with_owner_uid_and_environment(
+        Self::with_owner_uid_and_environment_and_display(
             owner_uid,
             Some(current_process_environment_snapshot()),
+            Some(current_process_environment_display_snapshot()),
             SubscriptionLimits::default(),
         )
     }
@@ -335,9 +358,10 @@ impl RequestHandler {
         owner_uid: u32,
         subscription_limits: SubscriptionLimits,
     ) -> Self {
-        Self::with_owner_uid_and_environment(
+        Self::with_owner_uid_and_environment_and_display(
             owner_uid,
             Some(current_process_environment_snapshot()),
+            Some(current_process_environment_display_snapshot()),
             subscription_limits,
         )
     }
@@ -348,18 +372,34 @@ impl RequestHandler {
         subscription_limits: SubscriptionLimits,
         web_settings: crate::web::WebShareSettings,
     ) -> Self {
-        let mut handler = Self::with_owner_uid_and_environment(
+        let mut handler = Self::with_owner_uid_and_environment_and_display(
             owner_uid,
             Some(current_process_environment_snapshot()),
+            Some(current_process_environment_display_snapshot()),
             subscription_limits,
         );
         handler.web_shares = Arc::new(WebShareRegistry::new(web_settings));
         handler
     }
 
+    #[cfg(test)]
     fn with_owner_uid_and_environment(
         owner_uid: u32,
         environment: Option<HashMap<String, String>>,
+        subscription_limits: SubscriptionLimits,
+    ) -> Self {
+        Self::with_owner_uid_and_environment_and_display(
+            owner_uid,
+            environment,
+            None,
+            subscription_limits,
+        )
+    }
+
+    fn with_owner_uid_and_environment_and_display(
+        owner_uid: u32,
+        environment: Option<HashMap<String, String>>,
+        display_environment: Option<HashMap<String, String>>,
         subscription_limits: SubscriptionLimits,
     ) -> Self {
         let (hook_events, _receiver) = broadcast::channel(HOOK_EVENT_BUFFER);
@@ -372,11 +412,17 @@ impl RequestHandler {
         if let Some(environment) = environment {
             seed_global_environment(&mut state, environment);
         }
+        if let Some(environment) = display_environment {
+            seed_global_display_environment(&mut state, environment);
+        }
         Self {
             state: Arc::new(Mutex::new(state)),
             active_attach: Arc::new(Mutex::new(ActiveAttachState::default())),
             active_control: Arc::new(Mutex::new(ActiveControlState::default())),
             silence_timers: Arc::new(StdMutex::new(HashMap::new())),
+            pane_alert_coalescer: Arc::new(StdMutex::new(
+                alert_support::PaneAlertCoalescer::default(),
+            )),
             prompt_history: Arc::new(Mutex::new(prompt_support::PromptHistoryStore::default())),
             wait_for: Arc::new(StdMutex::new(WaitForStore::default())),
             hook_events,
@@ -422,6 +468,7 @@ impl RequestHandler {
             active_attach: Arc::downgrade(&self.active_attach),
             active_control: Arc::downgrade(&self.active_control),
             silence_timers: Arc::downgrade(&self.silence_timers),
+            pane_alert_coalescer: Arc::downgrade(&self.pane_alert_coalescer),
             prompt_history: Arc::downgrade(&self.prompt_history),
             wait_for: Arc::downgrade(&self.wait_for),
             hook_events: self.hook_events.clone(),
@@ -476,6 +523,13 @@ impl RequestHandler {
             .clone()
     }
 
+    pub(crate) fn start_config_loading(&self) -> ConfigLoadingGuard {
+        self.config_loading_depth.fetch_add(1, Ordering::Relaxed);
+        ConfigLoadingGuard {
+            depth: self.config_loading_depth.clone(),
+        }
+    }
+
     pub(crate) fn config_loading_active(&self) -> bool {
         self.config_loading_depth.load(Ordering::Relaxed) != 0
     }
@@ -526,27 +580,6 @@ impl RequestHandler {
 
     #[cfg(not(test))]
     async fn pause_before_paste_buffer_delete(&self) {}
-
-    async fn take_startup_config_error(&self) -> Option<RmuxError> {
-        let mut errors = self.startup_config_errors.lock().await;
-        if errors.is_empty() {
-            return None;
-        }
-
-        match errors.len() {
-            1 => Some(errors.pop().expect("one startup config error")),
-            _ => Some(RmuxError::Server(
-                errors
-                    .drain(..)
-                    .map(|error| match error {
-                        RmuxError::Server(message) => message,
-                        other => other.to_string(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            )),
-        }
-    }
 }
 
 #[cfg(test)]

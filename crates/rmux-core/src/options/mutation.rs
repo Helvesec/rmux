@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use crate::{colour_to_string, command_parser::parse_command_string, parse_colour, Style};
+use crate::{
+    colour_to_string, command_parser::parse_command_string, key_string_lookup_key,
+    key_string_lookup_string, parse_colour, Style, KEYC_UNKNOWN,
+};
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{OptionName, RmuxError, ScopeSelector, SetOptionMode};
 
@@ -54,6 +57,7 @@ fn validate_query_mutation(
     }
 
     if mode == SetOptionMode::Append
+        && !unset
         && !query.is_array()
         && !matches!(query.value_type(), OptionValueType::String)
     {
@@ -115,13 +119,17 @@ pub(super) fn normalize_scalar_value(
             Ok(StoredOptionValue::String(next))
         }
         OptionValueType::Number { minimum } => {
-            let parsed = value
-                .ok_or_else(|| RmuxError::InvalidSetOption("empty value".to_owned()))?
-                .parse::<u32>()
-                .map_err(|_| invalid_number(query.canonical_name(), minimum))?;
-            if parsed < minimum {
-                return Err(invalid_number(query.canonical_name(), minimum));
+            let raw = value.ok_or_else(|| RmuxError::InvalidSetOption("empty value".to_owned()))?;
+            let parsed = raw
+                .parse::<i64>()
+                .map_err(|_| RmuxError::InvalidSetOption(format!("value is invalid: {raw}")))?;
+            if parsed < i64::from(minimum) {
+                return Err(RmuxError::InvalidSetOption(format!(
+                    "value is too small: {raw}"
+                )));
             }
+            let parsed = u32::try_from(parsed)
+                .map_err(|_| RmuxError::InvalidSetOption(format!("value is too large: {raw}")))?;
             Ok(StoredOptionValue::Number(parsed))
         }
         OptionValueType::Key => {
@@ -141,12 +149,7 @@ pub(super) fn normalize_scalar_value(
                 None | Some("") => !matches!(current, Some("on")),
                 Some(raw) if matches_flag_true(raw) => true,
                 Some(raw) if matches_flag_false(raw) => false,
-                Some(_) => {
-                    return Err(RmuxError::InvalidSetOption(format!(
-                        "{} expects on or off",
-                        query.canonical_name()
-                    )))
-                }
+                Some(raw) => return Err(RmuxError::InvalidSetOption(format!("bad value: {raw}"))),
             };
             Ok(StoredOptionValue::Flag(toggled))
         }
@@ -154,7 +157,13 @@ pub(super) fn normalize_scalar_value(
             let raw = value.unwrap_or_default();
             if raw.is_empty() {
                 let current = current.unwrap_or(choices[0]);
-                let next = if choices.len() == 2 {
+                let next = if choices.contains(&"on") && choices.contains(&"off") {
+                    if current == "on" {
+                        "off"
+                    } else {
+                        "on"
+                    }
+                } else if choices.len() == 2 {
                     if current == choices[0] {
                         choices[1]
                     } else {
@@ -168,11 +177,7 @@ pub(super) fn normalize_scalar_value(
             if choices.contains(&raw) {
                 Ok(StoredOptionValue::Choice(raw.to_owned()))
             } else {
-                Err(RmuxError::InvalidSetOption(format!(
-                    "{} expects one of: {}",
-                    query.canonical_name(),
-                    choices.join(", ")
-                )))
+                Err(RmuxError::InvalidSetOption(format!("unknown value: {raw}")))
             }
         }
         OptionValueType::Command => {
@@ -360,12 +365,6 @@ fn allowed_scope_message(metadata: &OptionMetadata) -> String {
     scopes.join(" or ")
 }
 
-fn invalid_number(name: &str, minimum: u32) -> RmuxError {
-    RmuxError::InvalidSetOption(format!(
-        "{name} expects a number greater than or equal to {minimum}"
-    ))
-}
-
 fn invalid_integer(name: &str, label: &str) -> RmuxError {
     RmuxError::InvalidSetOption(format!("{name} expects a {label}"))
 }
@@ -381,78 +380,11 @@ fn matches_default_size_pattern(value: &str) -> bool {
 }
 
 fn normalize_key(value: &str) -> Option<String> {
-    let mut rest = value.trim();
-    if rest.is_empty() {
+    let key = key_string_lookup_string(value.trim())?;
+    if key == KEYC_UNKNOWN {
         return None;
     }
-
-    let mut ctrl = false;
-    let mut meta = false;
-    let mut shift = false;
-    while let Some((prefix, tail)) = rest.split_once('-') {
-        match prefix.to_ascii_lowercase().as_str() {
-            "c" => ctrl = true,
-            "m" => meta = true,
-            "s" => shift = true,
-            _ => break,
-        }
-        rest = tail;
-    }
-
-    if rest.is_empty() {
-        return None;
-    }
-
-    let tail = match rest.to_ascii_lowercase().as_str() {
-        "none" => "None".to_owned(),
-        "bspace" => "BSpace".to_owned(),
-        "enter" => "Enter".to_owned(),
-        "space" => "Space".to_owned(),
-        "tab" => "Tab".to_owned(),
-        "up" => "Up".to_owned(),
-        "down" => "Down".to_owned(),
-        "left" => "Left".to_owned(),
-        "right" => "Right".to_owned(),
-        "home" => "Home".to_owned(),
-        "end" => "End".to_owned(),
-        "escape" | "esc" => "Escape".to_owned(),
-        _ if rest.starts_with('F')
-            && rest[1..]
-                .chars()
-                .all(|character| character.is_ascii_digit()) =>
-        {
-            rest.to_owned()
-        }
-        _ if rest.starts_with('f')
-            && rest[1..]
-                .chars()
-                .all(|character| character.is_ascii_digit()) =>
-        {
-            format!("F{}", &rest[1..])
-        }
-        _ if rest.chars().count() == 1 => {
-            let character = rest.chars().next().expect("single-char tail");
-            if ctrl && character.is_ascii_alphabetic() {
-                character.to_ascii_lowercase().to_string()
-            } else {
-                character.to_string()
-            }
-        }
-        _ => return None,
-    };
-
-    let mut normalized = String::new();
-    if ctrl {
-        normalized.push_str("C-");
-    }
-    if meta {
-        normalized.push_str("M-");
-    }
-    if shift {
-        normalized.push_str("S-");
-    }
-    normalized.push_str(&tail);
-    Some(normalized)
+    Some(key_string_lookup_key(key, false))
 }
 
 fn normalize_colour(value: &str) -> Result<String, ()> {

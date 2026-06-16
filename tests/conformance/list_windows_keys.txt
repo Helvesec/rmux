@@ -1,0 +1,10 @@
+session_name
+window_index
+window_id
+window_name
+window_panes
+window_width
+window_height
+window_layout
+window_active
+window_last_flag

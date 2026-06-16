@@ -1,5 +1,6 @@
 use super::{
     lookup_command, parse_command_arguments, CommandArgument, CommandParser, COMMAND_TABLE,
+    SOURCE_FILE_MAX_COMMAND_BYTES,
 };
 
 fn command_names(input: &str) -> Vec<String> {
@@ -19,6 +20,7 @@ fn frozen_command_inventory_has_expected_entries_and_aliases() {
     assert_eq!(lookup_command("new").unwrap().name, "new-session");
     assert_eq!(lookup_command("ls").unwrap().name, "list-sessions");
     assert_eq!(lookup_command("splitw").unwrap().name, "split-window");
+    assert_eq!(lookup_command("cap").unwrap().name, "capture-pane");
 }
 
 #[test]
@@ -37,6 +39,42 @@ fn lookup_rejects_unknown_commands_with_tmux_diagnostic() {
         lookup_command("bogus").unwrap_err().to_string(),
         "unknown command: bogus"
     );
+}
+
+#[test]
+fn rejects_commands_longer_than_tmux_command_buffer() {
+    let long_argument = "x".repeat(17 * 1024);
+    let error = CommandParser::new()
+        .parse(&format!("display-message {long_argument}"))
+        .unwrap_err();
+    assert_eq!(error.to_string(), "command too long");
+
+    let error = parse_command_arguments(["display-message", long_argument.as_str()]).unwrap_err();
+    assert_eq!(error.to_string(), "command too long");
+}
+
+#[test]
+fn large_comments_do_not_count_as_command_bytes() {
+    let comments = "#\n".repeat(16 * 1024);
+    let commands = CommandParser::new()
+        .parse(&format!("{comments}display-message ok"))
+        .unwrap();
+
+    assert_eq!(commands.commands().len(), 1);
+    assert_eq!(commands.commands()[0].name(), "display-message");
+}
+
+#[test]
+fn source_file_parser_accepts_long_commands_without_relaxing_argv_limit() {
+    let long_argument = "x".repeat(20 * 1024);
+    let commands = CommandParser::new()
+        .with_max_command_bytes(SOURCE_FILE_MAX_COMMAND_BYTES)
+        .parse(&format!("set-buffer -b big {long_argument}"))
+        .unwrap();
+
+    assert_eq!(commands.commands().len(), 1);
+    assert_eq!(commands.commands()[0].name(), "set-buffer");
+    assert!(parse_command_arguments(["set-buffer", "-b", "big", long_argument.as_str()]).is_err());
 }
 
 #[test]
@@ -80,12 +118,12 @@ fn rejects_invalid_escape_sequences() {
 #[test]
 fn preserves_quoted_windows_drive_path_backslashes() {
     let commands = CommandParser::new()
-        .parse(r#"set-environment -g AUDIT_PATH "C:\Users\Shadow\Documents\rmux""#)
+        .parse(r#"set-environment -g AUDIT_PATH "C:\Users\RMUXUser\Documents\rmux""#)
         .unwrap();
 
     assert_eq!(
         commands.commands()[0].arguments()[2].as_string(),
-        Some(r"C:\Users\Shadow\Documents\rmux")
+        Some(r"C:\Users\RMUXUser\Documents\rmux")
     );
 }
 
@@ -93,12 +131,12 @@ fn preserves_quoted_windows_drive_path_backslashes() {
 #[test]
 fn preserves_standard_escaped_backslashes_in_windows_drive_paths() {
     let commands = CommandParser::new()
-        .parse(r#"set-environment -g AUDIT_PATH "C:\\Users\\Shadow""#)
+        .parse(r#"set-environment -g AUDIT_PATH "C:\\Users\\RMUXUser""#)
         .unwrap();
 
     assert_eq!(
         commands.commands()[0].arguments()[2].as_string(),
-        Some(r"C:\Users\Shadow")
+        Some(r"C:\Users\RMUXUser")
     );
 }
 
@@ -182,6 +220,76 @@ fn parses_semicolon_separated_commands_and_trailing_separator() {
         command_names("new-session -d ; list-sessions ;"),
         ["new-session", "list-sessions"]
     );
+}
+
+#[test]
+fn serializes_embedded_command_lists_with_escaped_separators() {
+    let commands = CommandParser::new()
+        .parse(r#"run-shell "echo one" ; run-shell "echo two""#)
+        .expect("command list parses");
+
+    assert_eq!(
+        commands.to_tmux_binding_string(),
+        r#"run-shell "echo one" \; run-shell "echo two""#
+    );
+}
+
+#[test]
+fn serializes_arguments_with_tmux_quote_style() {
+    for (input, expected) in [
+        (
+            r#"display-message "with space""#,
+            r#"display-message "with space""#,
+        ),
+        (
+            r#"display-message "has'dquote""#,
+            r#"display-message "has'dquote""#,
+        ),
+        (
+            r#"display-message 'has"quote'"#,
+            r#"display-message 'has"quote'"#,
+        ),
+        (
+            r#"display-message "both'\"quotes""#,
+            r#"display-message "both'\"quotes""#,
+        ),
+        (
+            r#"display-message 'dollar$HOME'"#,
+            r#"display-message "dollar\$HOME""#,
+        ),
+        (
+            r#"display-message 'back\slash'"#,
+            r#"display-message back\\slash"#,
+        ),
+        (
+            r#"display-message 'hash#tag'"#,
+            r#"display-message "hash#tag""#,
+        ),
+        (
+            r#"display-message 'semi;colon'"#,
+            r#"display-message "semi;colon""#,
+        ),
+        (
+            r#"display-message 'brace{value}'"#,
+            r#"display-message "brace{value}""#,
+        ),
+    ] {
+        let commands = CommandParser::new().parse(input).expect("command parses");
+        assert_eq!(commands.to_tmux_string(), expected);
+    }
+}
+
+#[test]
+fn serializes_dollar_arguments_for_lossless_reparse() {
+    let commands = CommandParser::new()
+        .parse(r#"if-shell -F '#{==:#{hook_session} #{hook_window},$0 @1}' 'display-message ok'"#)
+        .expect("command parses");
+    let serialized = commands.to_tmux_string();
+    let reparsed = CommandParser::new()
+        .parse(&serialized)
+        .expect("serialized command reparses");
+
+    assert_eq!(reparsed, commands);
 }
 
 #[test]

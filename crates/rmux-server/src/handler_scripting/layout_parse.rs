@@ -148,6 +148,7 @@ pub(super) fn parse_resize_pane(
     let mut adjustment = None;
     let mut absolute_width = None;
     let mut absolute_height = None;
+    let mut trim_below = false;
 
     while let Some(token) = args.peek() {
         match token {
@@ -234,16 +235,29 @@ pub(super) fn parse_resize_pane(
                 }
                 adjustment = Some(ResizePaneAdjustment::Zoom);
             }
+            "-T" => {
+                let _ = args.optional();
+                trim_below = true;
+            }
+            "-M" => {
+                let _ = args.optional();
+            }
             _ => break,
         }
     }
     args.no_extra("resize-pane")?;
-    let adjustment = adjustment.or(match (absolute_width, absolute_height) {
-        (Some(columns), Some(rows)) => Some(ResizePaneAdjustment::AbsoluteSize { columns, rows }),
-        (Some(columns), None) => Some(ResizePaneAdjustment::AbsoluteWidth { columns }),
-        (None, Some(rows)) => Some(ResizePaneAdjustment::AbsoluteHeight { rows }),
-        (None, None) => None,
-    });
+    let adjustment = if trim_below {
+        Some(ResizePaneAdjustment::TrimBelow)
+    } else {
+        adjustment.or(match (absolute_width, absolute_height) {
+            (Some(columns), Some(rows)) => {
+                Some(ResizePaneAdjustment::AbsoluteSize { columns, rows })
+            }
+            (Some(columns), None) => Some(ResizePaneAdjustment::AbsoluteWidth { columns }),
+            (None, Some(rows)) => Some(ResizePaneAdjustment::AbsoluteHeight { rows }),
+            (None, None) => None,
+        })
+    };
 
     Ok(Request::ResizePane(ResizePaneRequest {
         target: target.unwrap_or(implicit_pane_target(sessions, find_context, "resize-pane")?),

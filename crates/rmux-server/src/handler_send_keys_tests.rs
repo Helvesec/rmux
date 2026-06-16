@@ -48,6 +48,9 @@ mod attached_input_bounds;
 #[path = "handler_send_keys_tests/mouse_copy_mode.rs"]
 mod mouse_copy_mode;
 
+#[path = "handler_send_keys_tests/copy_mode_vi.rs"]
+mod copy_mode_vi;
+
 async fn handle_boxed(handler: &RequestHandler, request: Request) -> Response {
     Box::pin(handler.handle(request)).await
 }

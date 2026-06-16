@@ -311,11 +311,12 @@ fn clipboard_encoding_honours_feature_and_set_clipboard_option() {
     );
     let encoded = String::from_utf8(
         enabled
-            .encode_clipboard_set(b"hi")
+            .encode_forced_clipboard_set(b"hi")
             .expect("clipboard write is available"),
     )
     .expect("utf8");
     assert_eq!(encoded, "\u{1b}]52;;aGk=\u{7}");
+    assert!(enabled.clipboard_passthrough_enabled());
 
     let mut disabled_options = OptionStore::new();
     disabled_options
@@ -330,7 +331,8 @@ fn clipboard_encoding_honours_feature_and_set_clipboard_option() {
         &disabled_options,
         OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
     );
-    assert!(disabled.encode_clipboard_set(b"hi").is_none());
+    assert!(!disabled.clipboard_passthrough_enabled());
+    assert!(disabled.encode_forced_clipboard_set(b"hi").is_some());
 }
 
 #[test]
@@ -509,7 +511,7 @@ fn clipboard_encoding_rejects_empty_bytes() {
         &options,
         OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
     );
-    assert!(terminal.encode_clipboard_set(b"").is_none());
+    assert!(terminal.encode_forced_clipboard_set(b"").is_none());
 }
 
 #[test]

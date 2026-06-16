@@ -108,6 +108,14 @@ target_label() {
   esac
 }
 
+validate_platform_label() {
+  case "$1" in
+    ""|*[!A-Za-z0-9_.-]*)
+      die "platform label must contain only ASCII letters, digits, '.', '_' or '-'"
+      ;;
+  esac
+}
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 configuration="release"
 target=""
@@ -168,6 +176,7 @@ fi
 if [ -z "$platform_label" ]; then
   platform_label="$(target_label "$target")"
 fi
+validate_platform_label "$platform_label"
 
 profile_dir="debug"
 cargo_args=(build --locked --target "$target")
@@ -177,19 +186,26 @@ if [ "$configuration" = "release" ]; then
 fi
 
 if [ "$skip_build" -eq 0 ]; then
-  cargo "${cargo_args[@]}"
+  cargo "${cargo_args[@]}" --package rmux --bin rmux
+  cargo "${cargo_args[@]}" --package rmux --bin rmux-daemon
 elif [ "$allow_stale_binary" -eq 0 ]; then
   die "--skip-build is local-only packaging; pass --allow-stale-binary to acknowledge that"
 fi
 
 target_dir="${CARGO_TARGET_DIR:-target}"
 binary="$target_dir/$target/$profile_dir/rmux"
+daemon_binary="$target_dir/$target/$profile_dir/rmux-daemon"
+completion_cache="${RMUX_COMPLETIONS_DIR:-$target_dir/$target/$profile_dir/completions}"
 [ -f "$binary" ] || die "expected binary was not found: $binary"
 [ -x "$binary" ] || die "expected binary is not executable: $binary"
+[ -f "$daemon_binary" ] || die "expected daemon binary was not found: $daemon_binary"
+[ -x "$daemon_binary" ] || die "expected daemon binary is not executable: $daemon_binary"
 if [ "${RMUX_PACKAGE_CODESIGN_ADHOC:-0}" = "1" ]; then
   command -v codesign >/dev/null 2>&1 || die "RMUX_PACKAGE_CODESIGN_ADHOC=1 requires codesign"
   codesign --force --sign - "$binary"
+  codesign --force --sign - "$daemon_binary"
   codesign --verify --verbose=2 "$binary"
+  codesign --verify --verbose=2 "$daemon_binary"
 fi
 
 dist_dir="$(mkdir -p "$output_dir" && cd "$output_dir" && pwd)"
@@ -197,13 +213,46 @@ package_name="rmux-$version-$platform_label"
 stage_dir="$dist_dir/$package_name"
 archive_path="$dist_dir/$package_name.tar.gz"
 checksums_path="$dist_dir/SHA256SUMS.txt"
+completion_tmp=""
+tmp_tar=""
+cleanup_package_work() {
+  [ -z "$completion_tmp" ] || rm -rf "$completion_tmp"
+  [ -z "$tmp_tar" ] || rm -f "$tmp_tar"
+  rm -rf "$stage_dir"
+}
+trap cleanup_package_work EXIT
 
 case "$stage_dir" in "$dist_dir"/*) ;; *) die "stage path escapes output dir" ;; esac
 rm -rf "$stage_dir"
 mkdir -p "$stage_dir/bin" "$stage_dir/share/man/man1" "$stage_dir/share/rmux"
 
 cp "$binary" "$stage_dir/bin/rmux"
+cp "$daemon_binary" "$stage_dir/bin/rmux-daemon"
 cp rmux.1 "$stage_dir/share/man/man1/rmux.1"
+completion_tmp="$(mktemp -d "${TMPDIR:-/tmp}/rmux-completions.XXXXXX")"
+if [ "$skip_build" -eq 0 ]; then
+  cargo run --quiet --package xtask -- generate-completions --output-dir "$completion_tmp" >/dev/null
+  rm -rf "$completion_cache"
+  mkdir -p "$completion_cache"
+  cp "$completion_tmp/rmux.bash" "$completion_tmp/_rmux" "$completion_tmp/rmux.fish" \
+    "$completion_tmp/_rmux.ps1" "$completion_tmp/rmux.elv" "$completion_cache/"
+else
+  for completion_file in rmux.bash _rmux rmux.fish _rmux.ps1 rmux.elv; do
+    [ -f "$completion_cache/$completion_file" ] || die "--skip-build requires prebuilt completions in $completion_cache; rerun without --skip-build or set RMUX_COMPLETIONS_DIR"
+    cp "$completion_cache/$completion_file" "$completion_tmp/$completion_file"
+  done
+fi
+mkdir -p \
+  "$stage_dir/share/bash-completion/completions" \
+  "$stage_dir/share/zsh/site-functions" \
+  "$stage_dir/share/fish/vendor_completions.d" \
+  "$stage_dir/share/powershell/Completions" \
+  "$stage_dir/share/elvish/lib"
+install -m 0644 "$completion_tmp/rmux.bash" "$stage_dir/share/bash-completion/completions/rmux"
+install -m 0644 "$completion_tmp/_rmux" "$stage_dir/share/zsh/site-functions/_rmux"
+install -m 0644 "$completion_tmp/rmux.fish" "$stage_dir/share/fish/vendor_completions.d/rmux.fish"
+install -m 0644 "$completion_tmp/_rmux.ps1" "$stage_dir/share/powershell/Completions/_rmux.ps1"
+install -m 0644 "$completion_tmp/rmux.elv" "$stage_dir/share/elvish/lib/rmux.elv"
 license_copied=false
 for license_file in LICENSE LICENSE.* LICENSE-*; do
   [ -f "$license_file" ] || continue
@@ -213,8 +262,11 @@ done
 [ "$license_copied" = true ] || die "license files are missing"
 
 binary_abs="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"
+daemon_binary_abs="$(cd "$(dirname "$daemon_binary")" && pwd)/$(basename "$daemon_binary")"
 binary_sha256="$(sha256_file "$binary")"
+daemon_binary_sha256="$(sha256_file "$daemon_binary")"
 binary_bytes="$(wc -c < "$binary" | tr -d ' ')"
+daemon_binary_bytes="$(wc -c < "$daemon_binary" | tr -d ' ')"
 git_commit="$(git rev-parse HEAD)"
 git_dirty=false
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
@@ -233,6 +285,9 @@ cat > "$stage_dir/share/rmux/artifact-metadata.json" <<EOF
   "binary_path": "$(printf '%s' "$binary_abs" | json_escape)",
   "binary_sha256": "$binary_sha256",
   "binary_bytes": $binary_bytes,
+  "daemon_binary_path": "$(printf '%s' "$daemon_binary_abs" | json_escape)",
+  "daemon_binary_sha256": "$daemon_binary_sha256",
+  "daemon_binary_bytes": $daemon_binary_bytes,
   "rmux_version": "$version",
   "git_commit": "$git_commit",
   "git_dirty": $git_dirty,
@@ -272,4 +327,5 @@ printf '%s  %s\n' "$archive_sha256" "$(basename "$archive_path")" > "$checksums_
 printf 'package=%s\n' "$archive_path"
 printf 'sha256=%s\n' "$archive_sha256"
 printf 'binary_sha256=%s\n' "$binary_sha256"
+printf 'daemon_binary_sha256=%s\n' "$daemon_binary_sha256"
 printf 'release_artifact=%s\n' "$release_artifact"

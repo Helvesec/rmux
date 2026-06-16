@@ -15,6 +15,8 @@ use rmux_proto::{
 
 #[path = "handler_copy_mode/input.rs"]
 mod input;
+#[path = "handler_copy_mode/key_binding.rs"]
+pub(in crate::handler) mod key_binding;
 #[path = "handler_copy_mode/search.rs"]
 mod search;
 
@@ -216,6 +218,17 @@ impl RequestHandler {
         target: PaneTarget,
         event: PromptInputEvent,
     ) -> Result<bool, RmuxError> {
+        self.handle_copy_mode_key_event(attach_pid, target, event, true)
+            .await
+    }
+
+    async fn handle_copy_mode_key_event(
+        &self,
+        requester_pid: u32,
+        target: PaneTarget,
+        event: PromptInputEvent,
+        allow_prompt: bool,
+    ) -> Result<bool, RmuxError> {
         let mode_keys = {
             let state = self.state.lock().await;
             if !target_is_in_copy_mode(&state, &target) {
@@ -226,11 +239,14 @@ impl RequestHandler {
 
         match attached_copy_mode_input_action(mode_keys, &event) {
             AttachedCopyModeInputAction::Search(direction) => {
-                self.start_copy_mode_search_prompt(attach_pid, target, direction)
+                if !allow_prompt {
+                    return Ok(false);
+                }
+                self.start_copy_mode_search_prompt(requester_pid, target, direction)
                     .await?;
             }
             AttachedCopyModeInputAction::Command(command) => {
-                self.execute_copy_mode_command(attach_pid, target, command, &[], 1)
+                self.execute_copy_mode_command(requester_pid, target, command, &[], 1)
                     .await?;
             }
             AttachedCopyModeInputAction::Ignore => return Ok(false),

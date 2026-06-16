@@ -13,6 +13,7 @@ SDK demo/playwright-report/
 # Local release orchestrator. Kept in the repo working directory, not tracked.
 /rmux-release.sh
 /.release-deployment/
+/.rmux-audit/
 
 # Local secret material and environment overrides.
 .env

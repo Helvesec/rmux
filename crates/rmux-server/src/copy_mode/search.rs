@@ -279,18 +279,29 @@ impl CopyModeState {
         }
         let current_owner = line.owning_cell_x(self.cursor.x).unwrap_or(0);
         let found = match kind {
-            JumpKind::Forward | JumpKind::ToForward => positions
-                .into_iter()
+            JumpKind::Forward => positions
+                .iter()
+                .copied()
                 .find(|x| *x > current_owner && line_char(&line, *x) == Some(ch)),
-            JumpKind::Backward | JumpKind::ToBackward => positions
-                .into_iter()
+            JumpKind::ToForward => positions
+                .iter()
+                .copied()
+                .find(|x| *x > current_owner.saturating_add(1) && line_char(&line, *x) == Some(ch)),
+            JumpKind::Backward => positions
+                .iter()
                 .rev()
+                .copied()
                 .find(|x| *x < current_owner && line_char(&line, *x) == Some(ch)),
+            JumpKind::ToBackward => positions.iter().rev().copied().find(|x| {
+                self.next_owner_in_line(&line, *x)
+                    .is_some_and(|next| next < current_owner)
+                    && line_char(&line, *x) == Some(ch)
+            }),
         };
         if let Some(found) = found {
             self.cursor.x = match kind {
                 JumpKind::Forward | JumpKind::Backward => found,
-                JumpKind::ToForward => self.previous_owner_in_line(&line, found).unwrap_or(found),
+                JumpKind::ToForward => previous_owner(&positions, found).unwrap_or(found),
                 JumpKind::ToBackward => self.next_owner_in_line(&line, found).unwrap_or(found),
             };
             self.ensure_cursor_visible();
@@ -298,4 +309,8 @@ impl CopyModeState {
         }
         Ok(())
     }
+}
+
+fn previous_owner(positions: &[u32], found: u32) -> Option<u32> {
+    positions.iter().rev().copied().find(|x| *x < found)
 }

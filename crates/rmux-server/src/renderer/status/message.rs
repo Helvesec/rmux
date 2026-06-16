@@ -15,7 +15,7 @@ pub(in crate::renderer) fn format_status_message_line(
     message: &str,
     command_prompt: bool,
 ) -> FormattedLine {
-    let mut runtime = RuntimeFormatContext::new(active_format_context(session, 0, None))
+    let mut runtime = RuntimeFormatContext::new(active_format_context(session, 0, None, None))
         .with_options(options)
         .with_session(session)
         .with_window(session.active_window_index(), session.window())

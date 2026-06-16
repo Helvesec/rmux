@@ -12,6 +12,7 @@ RMUX="${RMUX_BINARY:-$ROOT/target/debug/rmux}"
 RUN_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/rmux-input-golden-run.XXXXXX")"
 RMUX_TMPDIR="$RUN_ROOT/socket"
 export RMUX_TMPDIR
+mkdir -p "$RMUX_TMPDIR"
 
 cleanup() {
     "$RMUX" -L "$LABEL" kill-server >/dev/null 2>&1 || true
@@ -138,20 +139,20 @@ SHORT_HEAD="$(git -C "$ROOT" rev-parse --short=12 HEAD)"
 LABEL="input-golden-unix-$$"
 SESSION="p4e"
 PANE="$SESSION:0.0"
-PAYLOAD="$OUT_DIR/expected-input.bin"
+EXPECTED="$OUT_DIR/expected-input.bin"
+ATTACH_PAYLOAD="$OUT_DIR/attach-input.bin"
 CAPTURED="$OUT_DIR/captured-input.bin"
 SUMMARY="$OUT_DIR/summary.json"
 
 printf '[input-golden] cargo build --locked\n'
 cargo build --locked --manifest-path "$ROOT/Cargo.toml"
 
-python3 - "$PAYLOAD" <<'PY'
+python3 - "$EXPECTED" "$ATTACH_PAYLOAD" <<'PY'
 import pathlib
 import sys
 
-payload = (
-    b"\x1b[200~"
-    + "RMUX_P4E_BEGIN\r\n".encode()
+expected = (
+    "RMUX_P4E_BEGIN\r\n".encode()
     + "ASCII marker survives input golden trace\r\n".encode()
     + "CRLF marker A\r\nCRLF marker B\r\n".encode()
     + "UTF8 CJK marker: 東京 한글\r\n".encode("utf-8")
@@ -161,9 +162,10 @@ payload = (
     + b"CSI-u-looking bytes: \x1b[9;2u\r\n"
     + b"Nested-start-looking bytes: \x1b[200~ stay payload\r\n"
     + "RMUX_P4E_END\r\n".encode()
-    + b"\x1b[201~"
 )
-pathlib.Path(sys.argv[1]).write_bytes(payload)
+attach_payload = b"\x1b[200~" + expected + b"\x1b[201~"
+pathlib.Path(sys.argv[1]).write_bytes(expected)
+pathlib.Path(sys.argv[2]).write_bytes(attach_payload)
 PY
 
 collector_path="$(shell_quote "$CAPTURED")"
@@ -173,21 +175,22 @@ collector="stty -echo -icrnl; cat > $collector_path; printf 'RMUX_P4E_DONE\n'; s
 "$RMUX" -L "$LABEL" send-keys -t "$PANE" "$collector" Enter
 wait_until 'collector file creation' test -f "$CAPTURED"
 
-attach_payload_and_detach "$PAYLOAD"
+attach_payload_and_detach "$ATTACH_PAYLOAD"
 wait_until 'collector done marker' capture_contains 'RMUX_P4E_DONE'
 wait_until 'collector sha marker' capture_contains 'RMUX_P4E_SHA'
 
-cmp -s "$PAYLOAD" "$CAPTURED" || fail "captured bytes differ from expected payload"
+cmp -s "$EXPECTED" "$CAPTURED" || fail "captured bytes differ from expected payload"
 
-python3 - "$SUMMARY" "$PAYLOAD" "$CAPTURED" "$HEAD" "$SHORT_HEAD" <<'PY'
+python3 - "$SUMMARY" "$EXPECTED" "$ATTACH_PAYLOAD" "$CAPTURED" "$HEAD" "$SHORT_HEAD" <<'PY'
 import hashlib
 import json
 import pathlib
 import platform
 import sys
 
-summary_path, expected_path, captured_path, head, short_head = sys.argv[1:6]
+summary_path, expected_path, attach_path, captured_path, head, short_head = sys.argv[1:7]
 expected = pathlib.Path(expected_path).read_bytes()
+attach_payload = pathlib.Path(attach_path).read_bytes()
 captured = pathlib.Path(captured_path).read_bytes()
 
 def has(data: bytes, needle: bytes) -> bool:
@@ -202,20 +205,22 @@ summary = {
     "short_head": short_head,
     "verdict": "PASS_BYTE_PARITY",
     "expected_sha256": hashlib.sha256(expected).hexdigest(),
+    "attach_payload_sha256": hashlib.sha256(attach_payload).hexdigest(),
     "captured_sha256": hashlib.sha256(captured).hexdigest(),
     "expected_bytes": len(expected),
+    "attach_payload_bytes": len(attach_payload),
     "captured_bytes": len(captured),
     "facts": {
         "exact_input_bytes": expected == captured,
+        "outer_bracketed_paste_wrappers_stripped": not captured.startswith(b"\x1b[200~")
+        and not captured.endswith(b"\x1b[201~"),
         "ascii_marker": has(captured, b"ASCII marker survives input golden trace"),
         "crlf_marker_a": has(captured, b"CRLF marker A"),
         "crlf_marker_b": has(captured, b"CRLF marker B"),
         "ctrl_b_byte": b"\x02" in captured,
-        "bracketed_paste_start_wrapper": has(captured, b"\x1b[200~"),
-        "bracketed_paste_end_wrapper": has(captured, b"\x1b[201~"),
         "sgr_mouse_looking_esc": has(captured, b"\x1b[<64;2;2M"),
         "csi_u_looking_esc": has(captured, b"\x1b[9;2u"),
-        "nested_start_looking_esc": captured.count(b"\x1b[200~") >= 2,
+        "nested_start_looking_esc": captured.count(b"\x1b[200~") == 1,
         "cjk_marker": "東京".encode("utf-8") in captured and "한글".encode("utf-8") in captured,
         "combining_acute": "cafe\u0301".encode("utf-8") in captured,
     },
@@ -227,7 +232,8 @@ pathlib.Path(summary_path).write_text(
 PY
 
 cat >"$OUT_DIR/SHA256SUMS.txt" <<EOF
-$(sha256_file "$PAYLOAD")  expected-input.bin
+$(sha256_file "$EXPECTED")  expected-input.bin
+$(sha256_file "$ATTACH_PAYLOAD")  attach-input.bin
 $(sha256_file "$CAPTURED")  captured-input.bin
 $(sha256_file "$SUMMARY")  summary.json
 EOF

@@ -1,12 +1,13 @@
 use super::*;
 
 #[test]
-fn display_message_accepts_print_target_and_hyphen_prefixed_format_text() {
+fn display_message_accepts_print_target_and_hyphen_prefixed_format_text_after_separator() {
     let cli = parse_args(&[
         "display-message",
         "-p",
         "-t",
         "alpha:0.1",
+        "--",
         "-#{session_name}",
     ])
     .unwrap();
@@ -36,8 +37,62 @@ fn display_message_accepts_target_client_without_treating_it_as_message() {
 }
 
 #[test]
-fn run_shell_accepts_background_and_hyphen_prefixed_shell_text() {
-    let cli = parse_args(&["run-shell", "-b", "-printf", "ok"]).unwrap();
+fn display_message_accepts_compact_delay_flag() {
+    let cli = parse_args(&["display-message", "-d0", "-p", "hello"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::DisplayMessage(args) => {
+            assert_eq!(args.delay.as_deref(), Some("0"));
+            assert!(args.print);
+            assert_eq!(args.message, vec!["hello"]);
+        }
+        _ => panic!("expected DisplayMessage command"),
+    }
+}
+
+#[test]
+fn display_message_rejects_unknown_flags_before_message() {
+    let error = parse_args(&["display-message", "-Q", "hello"]).unwrap_err();
+
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    assert!(error
+        .to_string()
+        .contains("command display-message: unknown flag -Q"));
+}
+
+#[test]
+fn if_shell_rejects_unknown_flags_before_condition() {
+    let error = parse_args(&["if-shell", "-Q", "true", "display-message ok"]).unwrap_err();
+
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    assert!(error
+        .to_string()
+        .contains("command if-shell: unknown flag -Q"));
+}
+
+#[test]
+fn run_shell_rejects_unknown_flags_before_shell_text() {
+    let error = parse_args(&["run-shell", "-b", "-printf", "ok"]).unwrap_err();
+
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    assert!(error
+        .to_string()
+        .contains("command run-shell: unknown flag -p"));
+}
+
+#[test]
+fn run_shell_rejects_stderr_output_flag() {
+    let error = parse_args(&["run-shell", "-E", "true"]).unwrap_err();
+
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    assert!(error
+        .to_string()
+        .contains("command run-shell: unknown flag -E"));
+}
+
+#[test]
+fn run_shell_accepts_hyphen_prefixed_shell_text_after_separator() {
+    let cli = parse_args(&["run-shell", "-b", "--", "-printf", "ok"]).unwrap();
 
     match cli.command.expect("parsed command") {
         super::super::Command::RunShell(args) => {
@@ -96,6 +151,28 @@ fn source_file_accepts_flags_target_and_hyphen_path() {
 }
 
 #[test]
+fn source_file_rejects_unknown_flags_before_paths() {
+    let error = parse_args(&["source-file", "-N", "/tmp/missing.conf"]).unwrap_err();
+
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    assert!(error
+        .to_string()
+        .contains("command source-file: unknown flag -N"));
+}
+
+#[test]
+fn source_file_accepts_hyphen_prefixed_path_after_separator() {
+    let cli = parse_args(&["source-file", "--", "-N"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::SourceFile(args) => {
+            assert_eq!(args.paths, vec!["-N"]);
+        }
+        _ => panic!("expected SourceFile command"),
+    }
+}
+
+#[test]
 fn set_buffer_and_show_aliases_accept_tmux_short_forms() {
     let cli = parse_args(&["setb", "-b", "named", "payload"]).unwrap();
     match cli.command.expect("parsed command") {
@@ -115,10 +192,7 @@ fn set_buffer_and_show_aliases_accept_tmux_short_forms() {
     let cli = parse_args(&["showenv", "-t", "alpha"]).unwrap();
     match cli.command.expect("parsed command") {
         super::super::Command::ShowEnvironment(args) => {
-            assert_eq!(
-                args.target,
-                Some(rmux_proto::SessionName::new("alpha").unwrap())
-            );
+            assert_eq!(args.target.expect("target").to_string(), "alpha");
             assert!(!args.global);
         }
         _ => panic!("expected ShowEnvironment command"),
@@ -136,6 +210,28 @@ fn set_buffer_and_show_aliases_accept_tmux_short_forms() {
     }
 
     assert!(parse_args(&["show-window-options", "-gqv", "pane-border-style"]).is_err());
+}
+
+#[test]
+fn set_buffer_accepts_target_and_rename_with_trailing_content() {
+    let cli = parse_args(&["set-buffer", "-t", "alpha", "payload"]).unwrap();
+    match cli.command.expect("parsed command") {
+        super::super::Command::SetBuffer(args) => {
+            assert_eq!(args.target.expect("target").to_string(), "alpha");
+            assert_eq!(args.content.as_deref(), Some("payload"));
+        }
+        _ => panic!("expected SetBuffer command"),
+    }
+
+    let cli = parse_args(&["set-buffer", "-b", "src", "-n", "dst", "ignored"]).unwrap();
+    match cli.command.expect("parsed command") {
+        super::super::Command::SetBuffer(args) => {
+            assert_eq!(args.name.as_deref(), Some("src"));
+            assert_eq!(args.new_name.as_deref(), Some("dst"));
+            assert_eq!(args.content.as_deref(), Some("ignored"));
+        }
+        _ => panic!("expected SetBuffer command"),
+    }
 }
 
 #[test]
@@ -258,7 +354,7 @@ fn link_window_accepts_tmux_position_and_target_flags() {
             assert!(!args.before);
             assert!(args.detached);
             assert!(args.kill_target);
-            assert_eq!(args.source.to_string(), "alpha:0");
+            assert_eq!(args.source.as_ref().expect("source").to_string(), "alpha:0");
             assert_eq!(target_text(&args.target), "beta:1");
         }
         _ => panic!("expected LinkWindow command"),
@@ -272,7 +368,20 @@ fn link_window_accepts_tmux_position_and_target_flags() {
             assert!(args.before);
             assert!(!args.detached);
             assert!(!args.kill_target);
-            assert_eq!(args.source.to_string(), "alpha:0");
+            assert_eq!(args.source.as_ref().expect("source").to_string(), "alpha:0");
+            assert_eq!(target_text(&args.target), "beta:1");
+        }
+        _ => panic!("expected LinkWindow command"),
+    }
+}
+
+#[test]
+fn link_window_accepts_implicit_source() {
+    let cli = parse_args(&["link-window", "-t", "beta:1"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::LinkWindow(args) => {
+            assert!(args.source.is_none());
             assert_eq!(target_text(&args.target), "beta:1");
         }
         _ => panic!("expected LinkWindow command"),
@@ -297,7 +406,7 @@ fn link_and_unlink_window_aliases_dispatch_to_the_window_commands() {
     let cli = parse_args(&["link", "-s", "alpha:0", "-t", "beta:1"]).unwrap();
     match cli.command.expect("parsed command") {
         super::super::Command::LinkWindow(args) => {
-            assert_eq!(args.source.to_string(), "alpha:0");
+            assert_eq!(args.source.as_ref().expect("source").to_string(), "alpha:0");
             assert_eq!(target_text(&args.target), "beta:1");
         }
         _ => panic!("expected LinkWindow command"),
@@ -306,7 +415,7 @@ fn link_and_unlink_window_aliases_dispatch_to_the_window_commands() {
     let cli = parse_args(&["linkw", "-s", "alpha:0", "-t", "beta:1"]).unwrap();
     match cli.command.expect("parsed command") {
         super::super::Command::LinkWindow(args) => {
-            assert_eq!(args.source.to_string(), "alpha:0");
+            assert_eq!(args.source.as_ref().expect("source").to_string(), "alpha:0");
             assert_eq!(target_text(&args.target), "beta:1");
         }
         _ => panic!("expected LinkWindow command"),

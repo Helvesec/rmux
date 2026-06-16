@@ -6,7 +6,10 @@ use rmux_proto::{OptionName, PaneTarget, SessionName, WindowTarget};
 use super::mutation::{
     default_array_items, default_scalar_text, normalize_scalar_value, split_array_assignment,
 };
-use super::registry::{option_metadata, registry, resolve_option_name, DefaultValue, GlobalRoot};
+use super::registry::{
+    option_metadata, registry, resolve_exact_option_name, resolve_option_name, DefaultValue,
+    GlobalRoot,
+};
 use super::render::format_rendered_option_value;
 use super::scope::{
     push_known_global_roots, scope_allows_pane, scope_allows_session, scope_allows_window,
@@ -179,7 +182,7 @@ impl OptionStore {
         session_name: Option<&SessionName>,
         name: &str,
     ) -> Option<String> {
-        let query = resolve_option_name(name).ok()?;
+        let query = resolve_exact_option_name(name).ok()?;
         let value = match session_name {
             Some(session_name) => self
                 .resolve_name_from_nodes(
@@ -192,7 +195,14 @@ impl OptionStore {
                 )
                 .or_else(|| self.default_value_as_string(&query)),
             None => self
-                .resolve_name_from_nodes(&query, [Some(&self.server_global)])
+                .resolve_name_from_nodes(
+                    &query,
+                    [
+                        Some(&self.server_global),
+                        Some(&self.session_global),
+                        Some(&self.window_global),
+                    ],
+                )
                 .or_else(|| self.default_value_as_string(&query)),
         }?;
         Some(format_rendered_option_value(&query, value))
@@ -229,7 +239,7 @@ impl OptionStore {
         window_index: u32,
         name: &str,
     ) -> Option<String> {
-        let query = resolve_option_name(name).ok()?;
+        let query = resolve_exact_option_name(name).ok()?;
         let target = WindowTarget::with_window(session_name.clone(), window_index);
         let value = self
             .resolve_name_from_nodes(
@@ -281,7 +291,7 @@ impl OptionStore {
         pane_index: u32,
         name: &str,
     ) -> Option<String> {
-        let query = resolve_option_name(name).ok()?;
+        let query = resolve_exact_option_name(name).ok()?;
         let pane_target = PaneTarget::with_window(session_name.clone(), window_index, pane_index);
         let window_target = WindowTarget::with_window(session_name.clone(), window_index);
         let value = self

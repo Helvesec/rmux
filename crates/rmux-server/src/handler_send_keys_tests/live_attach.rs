@@ -193,6 +193,87 @@ async fn live_attach_extended_keys_are_reencoded_for_the_target_pane() {
 }
 
 #[tokio::test]
+async fn live_attach_shift_enter_csi_u_survives_extended_key_mode() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let set_format = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::ExtendedKeysFormat,
+            value: "csi-u".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(set_format, Response::SetOption(_)));
+
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[>4;2m")
+            .expect("extended key mode transcript update");
+    }
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let expected = b"\x1b[13;2u";
+    let capture =
+        RawPaneInputProbe::start(&handler, &alpha, "live-attach-shift-enter", expected.len()).await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, expected)
+        .await
+        .expect("live attach S-Enter input");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, expected).await;
+}
+
+#[tokio::test]
+async fn live_attach_shift_enter_uses_csi_u_after_kitty_keyboard_request() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[>1u")
+            .expect("kitty keyboard request transcript update");
+    }
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let expected = b"\x1b[13;2u";
+    let capture = RawPaneInputProbe::start(
+        &handler,
+        &alpha,
+        "live-attach-kitty-shift-enter",
+        expected.len(),
+    )
+    .await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, expected)
+        .await
+        .expect("live attach Kitty S-Enter input");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, expected).await;
+}
+
+#[tokio::test]
 async fn live_attach_standalone_escape_flushes_when_timeout_expires() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -428,6 +509,138 @@ async fn live_attach_fragmented_meta_key_consumes_pending_escape_before_timeout(
 }
 
 #[tokio::test]
+async fn live_attach_control_bytes_dispatch_tmux_distinct_bindings() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    for (key, literal) in [
+        ("C-h", "H"),
+        ("BSpace", "B"),
+        ("C-j", "J"),
+        ("Enter", "E"),
+        ("C-Space", "S"),
+        ("C-\\", "L"),
+        ("C-]", "R"),
+        ("C-^", "C"),
+        ("C-_", "U"),
+    ] {
+        let rebound = handler
+            .handle(Request::BindKey(BindKeyRequest {
+                table_name: "root".to_owned(),
+                key: key.to_owned(),
+                note: Some("live-attach-control-byte".to_owned()),
+                repeat: false,
+                command: Some(vec![
+                    "send-keys".to_owned(),
+                    "-l".to_owned(),
+                    literal.to_owned(),
+                ]),
+            }))
+            .await;
+        assert!(matches!(rebound, Response::BindKey(_)), "{key} should bind");
+    }
+
+    let input = b"\x08\x7f\x0a\x0d\x00\x1c\x1d\x1e\x1f";
+    let expected = b"HBJESLRCU";
+    let capture = RawPaneInputProbe::start(
+        &handler,
+        &alpha,
+        "live-attach-control-bindings",
+        expected.len(),
+    )
+    .await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, input)
+        .await
+        .expect("live attach control binding input");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, expected).await;
+}
+
+#[tokio::test]
+async fn live_attach_nul_dispatches_c_at_alias_binding() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let rebound = handler
+        .handle(Request::BindKey(BindKeyRequest {
+            table_name: "root".to_owned(),
+            key: "C-@".to_owned(),
+            note: Some("live-attach-control-byte-alias".to_owned()),
+            repeat: false,
+            command: Some(vec![
+                "send-keys".to_owned(),
+                "-l".to_owned(),
+                "A".to_owned(),
+            ]),
+        }))
+        .await;
+    assert!(matches!(rebound, Response::BindKey(_)));
+
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "live-attach-c-at-alias", 1).await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x00")
+        .await
+        .expect("live attach C-@ alias input");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, b"A").await;
+}
+
+#[tokio::test]
+async fn live_attach_meta_control_bytes_do_not_wait_for_following_input() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let expected = b"\x1b\x01\x1b\x7f";
+    let capture =
+        RawPaneInputProbe::start(&handler, &alpha, "live-attach-meta-control", expected.len())
+            .await;
+
+    let mut pending_input = Vec::new();
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"\x1b\x01")
+        .await
+        .expect("meta control input");
+    assert!(pending_input.is_empty());
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"\x1b\x7f")
+        .await
+        .expect("meta backspace input");
+    assert!(pending_input.is_empty());
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, expected).await;
+}
+
+#[tokio::test]
 async fn live_attach_committed_utf8_text_preserves_latin_and_ime_payload_chunks() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -463,7 +676,7 @@ async fn live_attach_committed_utf8_text_preserves_latin_and_ime_payload_chunks(
 }
 
 #[tokio::test]
-async fn live_attach_focus_sequences_pass_through_unchanged() {
+async fn live_attach_preserves_c1_and_malformed_utf8_bytes() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
@@ -475,14 +688,76 @@ async fn live_attach_focus_sequences_pass_through_unchanged() {
         .register_attach(requester_pid, alpha.clone(), control_tx)
         .await;
 
-    let expected = b"\x1b[I\x1b[O";
-    let capture =
-        RawPaneInputProbe::start(&handler, &alpha, "live-attach-focus", expected.len()).await;
+    let input = b"\x9bA\xc3(\xe2(\xa1";
+    let expected = input;
+    let capture = RawPaneInputProbe::start(
+        &handler,
+        &alpha,
+        "live-attach-invalid-bytes",
+        expected.len(),
+    )
+    .await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, input)
+        .await
+        .expect("invalid byte input");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, expected).await;
+}
+
+#[tokio::test]
+async fn live_attach_focus_sequences_are_consumed_at_attach_boundary() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "live-attach-focus", 0).await;
 
     handler
         .handle_attached_live_input_for_test(requester_pid, b"\x1b[I\x1b[O")
         .await
         .expect("live attach focus input");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, b"").await;
+}
+
+#[tokio::test]
+async fn live_attach_focus_sequences_forward_when_pane_focus_mode_is_enabled() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
+            .expect("focus mode transcript update");
+    }
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let expected = b"\x1b[I\x1b[O";
+    let capture =
+        RawPaneInputProbe::start(&handler, &alpha, "live-attach-focus-mode", expected.len()).await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, expected)
+        .await
+        .expect("live attach focus mode input");
 
     capture.finish(&handler, &alpha).await;
     capture.assert_contents(&handler, expected).await;
@@ -578,6 +853,9 @@ async fn live_attach_mouse_down_selects_the_clicked_pane() {
         .handle(Request::SelectPane(SelectPaneRequest {
             target: PaneTarget::new(alpha.clone(), 0),
             title: None,
+            style: None,
+            input_disabled: None,
+            preserve_zoom: false,
         }))
         .await;
     assert!(matches!(selected, Response::SelectPane(_)));
@@ -676,6 +954,72 @@ async fn live_attach_sgr_wheel_forwards_when_pane_mouse_any_is_enabled() {
         .expect("current wheel event");
     assert_eq!(event.location, MouseLocation::Pane);
     assert_eq!(event.raw.b, 64);
+}
+
+#[tokio::test]
+async fn live_attach_sgr_motion_forwards_without_explicit_binding_when_mouse_all_is_enabled() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1003h\x1b[?1006h")
+            .expect("mouse all and sgr transcript update");
+    }
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let expected = b"\x1b[<35;2;2M";
+    let capture =
+        RawPaneInputProbe::start(&handler, &alpha, "live-attach-sgr-motion", expected.len()).await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, expected)
+        .await
+        .expect("live attach motion input");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, expected).await;
+}
+
+#[tokio::test]
+async fn live_attach_sgr_release_forwards_without_explicit_binding_when_mouse_all_is_enabled() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1003h\x1b[?1006h")
+            .expect("mouse all and sgr transcript update");
+    }
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let expected = b"\x1b[<0;2;2m";
+    let capture =
+        RawPaneInputProbe::start(&handler, &alpha, "live-attach-sgr-release", expected.len()).await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, expected)
+        .await
+        .expect("live attach release input");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, expected).await;
 }
 
 #[tokio::test]

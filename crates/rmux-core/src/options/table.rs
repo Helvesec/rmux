@@ -51,7 +51,7 @@ const STATUS_FORMAT2: &str =
     "#[align=centre]#{P:#{?pane_active,#[reverse],}#{pane_index}[#{pane_width}x#{pane_height}]#[default] }";
 const STATUS_FORMAT_DEFAULT: &[&str] = &[STATUS_FORMAT1, STATUS_FORMAT2];
 const STATUS_RIGHT_DEFAULT: &str =
-    "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}\"#{=21:host_short}\" %H:%M %d-%b-%y";
+    "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}\"#{=21:pane_title}\" %H:%M %d-%b-%y";
 #[cfg(unix)]
 const DEFAULT_SHELL: &str = "";
 #[cfg(windows)]

@@ -76,6 +76,9 @@ async fn attached_session_mutations_emit_refresh_switches() {
         .handle(Request::SelectPane(SelectPaneRequest {
             target: PaneTarget::new(alpha, 1),
             title: None,
+            style: None,
+            input_disabled: None,
+            preserve_zoom: false,
         }))
         .await;
     assert_eq!(

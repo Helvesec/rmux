@@ -15,7 +15,6 @@ mod layout;
 mod status;
 
 use self::layout::border_layout_cells_with_geometry;
-pub(super) use self::layout::content_pane_geometry;
 pub(super) use self::status::render_pane_border_status_lines;
 
 #[cfg_attr(not(test), allow(dead_code))]

@@ -189,7 +189,7 @@ where
     } = context;
     while let Some(message) = decoder.next_message().map_err(ClientError::from)? {
         match message {
-            AttachMessage::Data(bytes) => {
+            AttachMessage::Data(bytes) | AttachMessage::Render(bytes) => {
                 metrics.observe_data_frame(&bytes);
                 if contains_subslice(&bytes, ALT_SCREEN_EXIT_FALLBACK)
                     || contains_subslice(&bytes, DETACHED_BANNER_PREFIX)

@@ -3,8 +3,9 @@
 
 use std::collections::BTreeSet;
 use std::error::Error;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
+use std::os::fd::AsFd;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,20 +13,61 @@ use std::time::Duration;
 
 use rmux_proto::{
     decode_frame, encode_frame, AttachSessionRequest, AttachSessionResponse, FrameDecoder, Request,
-    Response, RmuxError, SessionName, TerminalSize, DEFAULT_MAX_FRAME_LENGTH, RMUX_FRAME_MAGIC,
-    RMUX_WIRE_VERSION,
+    Response, RmuxError, SessionName, TerminalSize, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
+    RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION,
 };
 use rmux_server::{DaemonConfig, ServerDaemon, ServerHandle};
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
+use rustix::fs::{flock, FlockOperation};
 use rustix::termios::{
     tcgetattr, tcgetwinsize, tcsetattr, OptionalActions, SpecialCodeIndex, Termios,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, MutexGuard};
 
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
-pub(crate) static PTY_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+static IN_PROCESS_PTY_TEST_LOCK: Mutex<()> = Mutex::const_new(());
+pub(crate) static PTY_TEST_LOCK: PtyTestLock = PtyTestLock;
+
+pub(crate) struct PtyTestLock;
+
+pub(crate) struct PtyTestGuard {
+    _in_process: MutexGuard<'static, ()>,
+    file: File,
+}
+
+impl PtyTestLock {
+    pub(crate) async fn lock(&'static self) -> PtyTestGuard {
+        let in_process = IN_PROCESS_PTY_TEST_LOCK.lock().await;
+        let path = std::env::temp_dir().join("rmux-server-pty-tests.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap_or_else(|error| {
+                panic!("failed to open PTY test lock '{}': {error}", path.display())
+            });
+        flock(file.as_fd(), FlockOperation::LockExclusive).unwrap_or_else(|error| {
+            panic!(
+                "failed to acquire PTY test lock '{}': {error}",
+                path.display()
+            )
+        });
+        PtyTestGuard {
+            _in_process: in_process,
+            file,
+        }
+    }
+}
+
+impl Drop for PtyTestGuard {
+    fn drop(&mut self) {
+        let _ = flock(self.file.as_fd(), FlockOperation::Unlock);
+    }
+}
 
 pub(crate) async fn start_server(harness: &TestHarness) -> Result<ServerHandle, Box<dyn Error>> {
     let socket_path = harness.socket_path().to_path_buf();
@@ -293,10 +335,10 @@ async fn read_detached_frame_exact(stream: &mut UnixStream) -> Result<Vec<u8>, B
     if length == 0 {
         return Err(RmuxError::EmptyFrame.into());
     }
-    if length > DEFAULT_MAX_FRAME_LENGTH {
+    if length > DEFAULT_MAX_DETACHED_FRAME_LENGTH {
         return Err(RmuxError::FrameTooLarge {
             length,
-            maximum: DEFAULT_MAX_FRAME_LENGTH,
+            maximum: DEFAULT_MAX_DETACHED_FRAME_LENGTH,
         }
         .into());
     }

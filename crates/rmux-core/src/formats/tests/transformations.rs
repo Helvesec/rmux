@@ -71,6 +71,23 @@ fn modifier_dirname() {
     );
 }
 
+#[test]
+fn modifier_dirname_matches_empty_and_trailing_slash_semantics() {
+    let context = FormatContext::new()
+        .with_named_value("path", "/a/b/c")
+        .with_named_value("slash", "/a/b/")
+        .with_named_value("single", "file")
+        .with_named_value("root", "/");
+
+    assert_eq!(
+        render_template(
+            "#{d:path}|#{d:slash}|#{d:single}|#{d:missing}|#{d:}|#{d:root}",
+            &context
+        ),
+        "/a/b|/a|.|||/"
+    );
+}
+
 // -----------------------------------------------------------------------
 // New tests — length
 // -----------------------------------------------------------------------
@@ -128,12 +145,10 @@ fn escaped_comma_inside_conditional_value() {
 
 #[test]
 fn escaped_comma_in_boolean_operand() {
-    // `#,` inside a boolean body should not split the operand.
-    // The body "hello#,world" has an escaped comma — format_skip should
-    // skip it, so it's treated as a single operand.
+    // An escaped comma leaves the boolean operator without a real delimiter.
     assert_eq!(
         render_template("#{||:hello#,world}", &StaticWindowValues),
-        "1" // "hello,world" is truthy
+        ""
     );
 }
 
@@ -167,6 +182,39 @@ fn job_expansion_unclosed_breaks_out() {
     assert_eq!(
         render_template("before#(no close", &StaticWindowValues),
         "before"
+    );
+}
+
+#[test]
+fn session_loop_keeps_commas_in_body() {
+    struct LoopValues;
+
+    impl FormatVariables for LoopValues {
+        fn format_value(&self, _variable: FormatVariable) -> Option<String> {
+            None
+        }
+
+        fn format_loop(
+            &self,
+            scope: char,
+            body: &str,
+            current_body: Option<&str>,
+            _count_only: bool,
+        ) -> Option<String> {
+            Some(format!(
+                "{scope}:{body}:{}",
+                current_body.unwrap_or("<none>")
+            ))
+        }
+    }
+
+    assert_eq!(
+        render_template("#{S:#{session_name},CURRENT}", &LoopValues),
+        "S:#{session_name},CURRENT:<none>"
+    );
+    assert_eq!(
+        render_template("#{W:#{window_index},CURRENT}", &LoopValues),
+        "W:#{window_index}:CURRENT"
     );
 }
 
@@ -209,13 +257,14 @@ fn fnmatch_character_class() {
 
 #[test]
 fn multi_pair_conditional_with_nested_expansion() {
-    // Multi-pair where condition uses #{} expansion.
+    // tmux does not treat an expanded true condition in the false arm as a
+    // new chained condition; the remaining body is returned as the false arm.
     assert_eq!(
         render_template(
             "#{?#{window_last_flag},first,#{window_active},#{window_name},default}",
             &StaticWindowValues
         ),
-        "logs"
+        "1,logs,default"
     );
 }
 
@@ -248,14 +297,12 @@ fn modifier_dirname_no_slash() {
 
 #[test]
 fn trailing_hash_in_various_positions() {
-    // tmux drops trailing `#` at the end of expansion.
-    assert_eq!(render_template("abc#", &StaticWindowValues), "abc");
+    assert_eq!(render_template("abc#", &StaticWindowValues), "abc#");
     assert_eq!(
         render_template("#{session_name}#", &StaticWindowValues),
-        "alpha"
+        "alpha#"
     );
-    // `#####` = `##` + `##` + trailing `#` dropped = `##`
-    assert_eq!(render_template("#####", &StaticWindowValues), "##");
+    assert_eq!(render_template("#####", &StaticWindowValues), "###");
 }
 
 #[test]

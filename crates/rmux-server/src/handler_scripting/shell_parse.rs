@@ -6,19 +6,30 @@ use rmux_proto::{
 };
 
 use super::tokens::{rebuild_shell_command, CommandTokens};
-use super::values::{missing_argument, parse_f64};
+use super::values::{missing_argument, parse_non_negative_f64, unsupported_flag};
 use super::{parse_pane_target, parse_target_arg};
 
 pub(super) fn parse_run_shell(mut args: CommandTokens) -> Result<Request, RmuxError> {
     let mut background = false;
     let mut as_commands = false;
-    let mut show_stderr = false;
+    let show_stderr = false;
     let mut delay_seconds = None;
     let mut start_directory = None;
     let mut target = None;
 
-    while let Some(token) = args.peek() {
-        match token {
+    while let Some(token) = args.peek().map(str::to_owned) {
+        if let Some(flags) = args.optional_compact_flags("bCE") {
+            for flag in flags {
+                match flag {
+                    'b' => background = true,
+                    'C' => as_commands = true,
+                    'E' => return Err(unsupported_flag("run-shell", "-E")),
+                    _ => unreachable!("compact run-shell flags are prevalidated"),
+                }
+            }
+            continue;
+        }
+        match token.as_str() {
             "--" => {
                 let _ = args.optional();
                 break;
@@ -32,18 +43,21 @@ pub(super) fn parse_run_shell(mut args: CommandTokens) -> Result<Request, RmuxEr
                 as_commands = true;
             }
             "-E" => {
-                let _ = args.optional();
-                show_stderr = true;
+                return Err(unsupported_flag("run-shell", "-E"));
             }
             "-d" => {
                 let _ = args.optional();
-                delay_seconds = Some(parse_f64("run-shell", "-d", &args.required("-d delay")?)?);
+                delay_seconds = Some(parse_non_negative_f64(
+                    "run-shell",
+                    "-d",
+                    &args.required("-d delay")?,
+                )?);
             }
             flag if flag.starts_with("-d") && flag.len() > 2 => {
                 let flag = args
                     .optional()
                     .expect("peeked run-shell -d<delay> flag must still be present");
-                delay_seconds = Some(parse_f64("run-shell", "-d", &flag[2..])?);
+                delay_seconds = Some(parse_non_negative_f64("run-shell", "-d", &flag[2..])?);
             }
             "-c" => {
                 let _ = args.optional();
@@ -76,6 +90,7 @@ pub(super) fn parse_run_shell(mut args: CommandTokens) -> Result<Request, RmuxEr
         delay_seconds: delay_seconds.map(RunShellDelaySeconds),
         start_directory,
         target,
+        source_depth: None,
     }))
 }
 

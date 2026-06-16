@@ -15,6 +15,7 @@ The zip contains:
 ```text
 rmux-<semver>-windows-x86_64/
   rmux.exe
+  rmux-daemon.exe
   README.md
   LICENSE-APACHE
   LICENSE-MIT
@@ -36,7 +37,7 @@ For a local package-manager dry run, use the `dist/SHA256SUMS.txt` produced by
 the downloaded release checksum file instead.
 
 ```sh
-version=0.5.0
+version=0.6.0
 checksums=dist/SHA256SUMS.txt
 scripts/generate-winget-manifest.sh \
   --version "$version" \
@@ -67,7 +68,7 @@ Validate and test on Windows before submission:
 ```powershell
 pwsh ./scripts/validate-winget-manifest.ps1 `
   -Manifest target/package-managers/winget/Helvesec.RMUX.yaml `
-  -Version 0.5.0 `
+  -Version 0.6.0 `
   -Checksums dist/SHA256SUMS.txt
 winget validate target/package-managers/winget/Helvesec.RMUX.yaml
 winget install --manifest target/package-managers/winget/Helvesec.RMUX.yaml

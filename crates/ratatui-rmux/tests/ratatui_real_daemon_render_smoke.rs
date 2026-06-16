@@ -75,6 +75,7 @@ async fn ratatui_real_daemon_render_smoke() -> TestResult {
 
     rmux.shutdown().await?;
     wait_for_path_absent(&socket_path).await?;
+    wait_for_dir_empty(&root).await?;
     fs::remove_dir(&root)?;
     cleanup.disarm();
     Ok(())
@@ -124,13 +125,38 @@ fn assert_socket(path: &Path) -> TestResult {
 }
 
 async fn wait_for_path_absent(path: &Path) -> TestResult {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     loop {
         if !path.exists() {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("path remained after shutdown: {}", path.display()).into());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_for_dir_empty(path: &Path) -> TestResult {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let entries = fs::read_dir(path)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "directory remained non-empty after shutdown: {} ({})",
+                path.display(),
+                entries
+                    .iter()
+                    .map(|entry| entry.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .into());
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }

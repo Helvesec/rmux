@@ -1,15 +1,15 @@
 use rmux_core::{key_code_lookup_bits, key_string_lookup_key};
 use rmux_proto::{
     ErrorResponse, OptionName, PaneTarget, Response, RmuxError, SendKeysResponse, SessionName,
-    Target,
 };
 use rmux_pty::PtyMaster;
 
-use super::display_message_context;
-use crate::format_runtime::render_runtime_template;
 use crate::input_keys::{encode_key, encode_mouse_event, ExtendedKeyFormat};
 use crate::keys::parse_key_code;
 use crate::pane_terminals::{session_not_found, HandlerState};
+
+#[cfg(unix)]
+const IMMEDIATE_PANE_INPUT_MAX_BYTES: usize = 256;
 
 pub(super) struct PaneInputWrite {
     session_name: SessionName,
@@ -18,8 +18,15 @@ pub(super) struct PaneInputWrite {
     sink: PaneInputSink,
 }
 
+impl PaneInputWrite {
+    pub(super) fn session_name(&self) -> &SessionName {
+        &self.session_name
+    }
+}
+
 enum PaneInputSink {
     Pty(PtyMaster),
+    Disabled,
     #[cfg(test)]
     CapturedForTest,
 }
@@ -32,6 +39,17 @@ pub(super) fn prepare_pane_input_write(
     let session_name = target.session_name().clone();
     let window_index = target.window_index();
     let pane_index = target.pane_index();
+    let pane_id = pane_id_for_input_target(state, target)?;
+    if state.pane_input_is_disabled(pane_id) {
+        #[cfg(not(test))]
+        let _ = bytes;
+        return Ok(PaneInputWrite {
+            session_name,
+            window_index,
+            pane_index,
+            sink: PaneInputSink::Disabled,
+        });
+    }
     let master = state.pane_master_in_window(&session_name, window_index, pane_index)?;
     #[cfg(not(test))]
     let _ = bytes;
@@ -113,7 +131,9 @@ fn synchronized_input_targets(
 
     Ok(panes
         .into_iter()
-        .filter(|(_, pane_id)| !state.pane_is_dead(session_name, *pane_id))
+        .filter(|(_, pane_id)| {
+            !state.pane_is_dead(session_name, *pane_id) && !state.pane_input_is_disabled(*pane_id)
+        })
         .map(|(pane_index, _)| {
             PaneTarget::with_window(session_name.clone(), window_index, pane_index)
         })
@@ -158,6 +178,7 @@ pub(super) async fn write_bytes_to_target_io(
         sink,
     } = write;
     match sink {
+        PaneInputSink::Disabled => Ok(()),
         PaneInputSink::Pty(master) => write_pane_bytes(master, bytes).await.map_err(|error| {
             RmuxError::Server(format!(
                 "failed to write to pane {}:{}.{}: {}",
@@ -169,11 +190,55 @@ pub(super) async fn write_bytes_to_target_io(
     }
 }
 
+fn pane_id_for_input_target(
+    state: &HandlerState,
+    target: &PaneTarget,
+) -> Result<rmux_core::PaneId, RmuxError> {
+    let session_name = target.session_name();
+    let window_index = target.window_index();
+    let pane_index = target.pane_index();
+    let session = state
+        .sessions
+        .session(session_name)
+        .ok_or_else(|| session_not_found(session_name))?;
+    let window = session.window_at(window_index).ok_or_else(|| {
+        RmuxError::invalid_target(
+            format!("{session_name}:{window_index}"),
+            "window index does not exist in session",
+        )
+    })?;
+    window
+        .pane(pane_index)
+        .map(rmux_core::Pane::id)
+        .ok_or_else(|| {
+            RmuxError::invalid_target(target.to_string(), "pane index does not exist in window")
+        })
+}
+
 #[cfg(any(unix, windows))]
 async fn write_pane_bytes(master: PtyMaster, bytes: Vec<u8>) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if should_try_immediate_pane_input(bytes.len()) {
+        let written = master.try_write_immediate(&bytes)?;
+        if written == bytes.len() {
+            return Ok(());
+        }
+        return write_pane_bytes_blocking(master, bytes[written..].to_vec()).await;
+    }
+
+    write_pane_bytes_blocking(master, bytes).await
+}
+
+#[cfg(any(unix, windows))]
+async fn write_pane_bytes_blocking(master: PtyMaster, bytes: Vec<u8>) -> std::io::Result<()> {
     tokio::task::spawn_blocking(move || master.write_all(&bytes))
         .await
         .map_err(|error| std::io::Error::other(format!("pane write task failed: {error}")))?
+}
+
+#[cfg(unix)]
+fn should_try_immediate_pane_input(byte_len: usize) -> bool {
+    (1..=IMMEDIATE_PANE_INPUT_MAX_BYTES).contains(&byte_len)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -301,18 +366,25 @@ pub(super) fn encode_mouse_for_target(
 }
 
 pub(super) fn expand_send_key_tokens(
-    state: &HandlerState,
-    target: &PaneTarget,
+    _state: &HandlerState,
+    _target: &PaneTarget,
     tokens: &[String],
-    expand_formats: bool,
+    _expand_formats: bool,
 ) -> Result<Vec<String>, RmuxError> {
-    if !expand_formats {
-        return Ok(tokens.to_vec());
-    }
+    Ok(tokens.to_vec())
+}
 
-    let (_, runtime) = display_message_context(state, &Target::Pane(target.clone()), 0)?;
-    Ok(tokens
-        .iter()
-        .map(|token| render_runtime_template(token, &runtime, false))
-        .collect())
+#[cfg(all(test, unix))]
+mod tests {
+    #[test]
+    fn immediate_pane_input_is_reserved_for_short_interactive_writes() {
+        assert!(!super::should_try_immediate_pane_input(0));
+        assert!(super::should_try_immediate_pane_input(1));
+        assert!(super::should_try_immediate_pane_input(
+            super::IMMEDIATE_PANE_INPUT_MAX_BYTES
+        ));
+        assert!(!super::should_try_immediate_pane_input(
+            super::IMMEDIATE_PANE_INPUT_MAX_BYTES + 1
+        ));
+    }
 }

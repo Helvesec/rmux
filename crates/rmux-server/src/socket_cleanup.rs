@@ -27,8 +27,8 @@ impl SocketCleanup {
         self.socket_identity
     }
 
-    pub(crate) fn update_socket_identity(&mut self, socket_identity: SocketFileIdentity) {
-        self.socket_identity = Some(socket_identity);
+    pub(crate) fn update_socket_identity(&mut self, socket_identity: Option<SocketFileIdentity>) {
+        self.socket_identity = socket_identity;
     }
 }
 
@@ -44,6 +44,7 @@ impl Drop for SocketCleanup {
         for lock_path in startup_lock_paths(&self.socket_path) {
             let _ = remove_regular_file_if_present(&lock_path);
         }
+        crate::tmux_shim::cleanup_tmux_shim(&self.socket_path);
     }
 }
 
@@ -99,7 +100,7 @@ mod tests {
     async fn drop_preserves_recreated_foreign_socket() {
         let socket_path = unique_socket_path();
         let bound = crate::unix_socket::bind_unix_listener_at(&socket_path).expect("bind socket");
-        let cleanup = SocketCleanup::new(socket_path.clone(), Some(bound.identity));
+        let cleanup = SocketCleanup::new(socket_path.clone(), bound.identity);
         std::fs::remove_file(&socket_path).expect("unlink original socket path");
         let foreign = StdUnixListener::bind(&socket_path).expect("bind foreign replacement");
 

@@ -1,11 +1,12 @@
 use std::collections::HashSet;
 
 use rmux_core::{LifecycleEvent, PaneId};
-use rmux_proto::{
-    ErrorResponse, HookName, PaneTarget, ProcessCommand, Response, ScopeSelector, Target,
-};
+use rmux_proto::{ErrorResponse, HookName, PaneTarget, Response, ScopeSelector, Target};
 
-use super::{client_environment_snapshot, client_spawn_environment, RequestHandler};
+use super::{
+    client_environment_snapshot, client_spawn_environment,
+    scripting_support::render_start_directory_template, RequestHandler,
+};
 use crate::hook_runtime::PendingInlineHookFormat;
 use crate::pane_terminals::{
     HandlerState, NewWindowOptions, RespawnWindowOptions, WindowSpawnOptions,
@@ -32,12 +33,22 @@ impl RequestHandler {
         let command = request.command;
         let process_command = request
             .process_command
-            .or_else(|| ProcessCommand::from_legacy_command(command.as_deref()));
+            .or_else(|| crate::legacy_command::from_legacy_command(command.as_deref()));
         let socket_path = self.socket_path();
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
+        let attached_count = self.attached_count(&session_name).await;
         let response = {
             let mut state = self.state.lock().await;
+            let start_directory = match render_start_directory_template(
+                &state,
+                &Target::Session(session_name.clone()),
+                attached_count,
+                start_directory,
+            ) {
+                Ok(start_directory) => start_directory,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
             let options = NewWindowOptions {
                 name: request.name,
                 detached: request.detached,
@@ -184,19 +195,26 @@ impl RequestHandler {
         &self,
         request: rmux_proto::RenameWindowRequest,
     ) -> Response {
-        let session_name = request.target.session_name().clone();
         let target = request.target.clone();
-        let response = {
+        let (response, refresh_sessions) = {
             let mut state = self.state.lock().await;
             match state.rename_window(request.target, request.name) {
-                Ok(response) => Response::RenameWindow(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+                Ok(response) => {
+                    let refresh_sessions = state.window_linked_session_family_list(
+                        target.session_name(),
+                        target.window_index(),
+                    );
+                    (Response::RenameWindow(response), refresh_sessions)
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), Vec::new()),
             }
         };
 
         if matches!(response, Response::RenameWindow(_)) {
             self.emit(LifecycleEvent::WindowRenamed { target }).await;
-            self.refresh_attached_session(&session_name).await;
+            for refresh_session in refresh_sessions {
+                self.refresh_attached_session(&refresh_session).await;
+            }
         }
 
         response
@@ -486,13 +504,26 @@ impl RequestHandler {
         &self,
         request: rmux_proto::ResizeWindowRequest,
     ) -> Response {
+        let request = match self
+            .resolve_resize_window_linked_session_size(request)
+            .await
+        {
+            Ok(request) => request,
+            Err(error) => return Response::Error(ErrorResponse { error }),
+        };
         let session_name = request.target.session_name().clone();
         let target = request.target.clone();
-        let response = {
+        let (response, refresh_sessions) = {
             let mut state = self.state.lock().await;
             match state.resize_window(request) {
-                Ok(response) => Response::ResizeWindow(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+                Ok(response) => {
+                    let refresh_sessions = state.window_linked_session_family_list(
+                        target.session_name(),
+                        target.window_index(),
+                    );
+                    (Response::ResizeWindow(response), refresh_sessions)
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), Vec::new()),
             }
         };
 
@@ -503,9 +534,14 @@ impl RequestHandler {
                 Some(Target::Window(target.clone())),
                 PendingInlineHookFormat::AfterCommand,
             );
-            self.emit(LifecycleEvent::WindowLayoutChanged { target })
-                .await;
-            self.refresh_attached_session(&session_name).await;
+            self.emit(LifecycleEvent::WindowLayoutChanged {
+                target: target.clone(),
+            })
+            .await;
+            self.emit(LifecycleEvent::WindowResized { target }).await;
+            for refresh_session in refresh_sessions {
+                self.refresh_attached_session(&refresh_session).await;
+            }
         }
 
         response
@@ -514,15 +550,27 @@ impl RequestHandler {
     pub(super) async fn handle_respawn_window(
         &self,
         requester_pid: u32,
-        request: rmux_proto::RespawnWindowRequest,
+        mut request: rmux_proto::RespawnWindowRequest,
     ) -> Response {
         let session_name = request.target.session_name().clone();
+        let target = request.target.clone();
         let socket_path = self.socket_path();
-        let process_command = ProcessCommand::from_legacy_command(request.command.as_deref());
+        let process_command =
+            crate::legacy_command::from_legacy_command(request.command.as_deref());
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
+        let attached_count = self.attached_count(&session_name).await;
         let response = {
             let mut state = self.state.lock().await;
+            request.start_directory = match render_start_directory_template(
+                &state,
+                &Target::Window(target),
+                attached_count,
+                request.start_directory,
+            ) {
+                Ok(start_directory) => start_directory,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
             match state.respawn_window(
                 request.target,
                 RespawnWindowOptions {
@@ -549,6 +597,74 @@ impl RequestHandler {
 
         response
     }
+
+    async fn resolve_resize_window_linked_session_size(
+        &self,
+        mut request: rmux_proto::ResizeWindowRequest,
+    ) -> Result<rmux_proto::ResizeWindowRequest, rmux_proto::RmuxError> {
+        use rmux_proto::ResizeWindowAdjustment::{LargestLinkedSession, SmallestLinkedSession};
+
+        let largest = match request.adjustment {
+            Some(LargestLinkedSession) => true,
+            Some(SmallestLinkedSession) => false,
+            _ => return Ok(request),
+        };
+
+        let (linked_sessions, fallback_size) = {
+            let state = self.state.lock().await;
+            let session = state
+                .sessions
+                .session(request.target.session_name())
+                .ok_or_else(|| {
+                    crate::pane_terminals::session_not_found(request.target.session_name())
+                })?;
+            let _window = session
+                .window_at(request.target.window_index())
+                .ok_or_else(|| {
+                    rmux_proto::RmuxError::invalid_target(
+                        request.target.to_string(),
+                        "window index does not exist in session",
+                    )
+                })?;
+            (
+                state.window_linked_sessions_list(
+                    request.target.session_name(),
+                    request.target.window_index(),
+                ),
+                session.terminal_size(),
+            )
+        };
+        let linked_sessions = linked_sessions.into_iter().collect::<HashSet<_>>();
+        let selected = {
+            let active_attach = self.active_attach.lock().await;
+            let sizes = active_attach
+                .by_pid
+                .values()
+                .filter(|active| {
+                    !active.suspended && linked_sessions.contains(&active.session_name)
+                })
+                .map(|active| active.client_size);
+            if largest {
+                sizes.max_by_key(resize_window_size_rank)
+            } else {
+                sizes.min_by_key(resize_window_size_rank)
+            }
+        }
+        .unwrap_or(fallback_size);
+
+        request.width = Some(selected.cols);
+        request.height = Some(selected.rows);
+        request.adjustment = None;
+        Ok(request)
+    }
+}
+
+fn resize_window_size_rank(size: &rmux_proto::TerminalSize) -> (u32, u16, u16) {
+    (
+        u32::from(size.cols) * u32::from(size.rows),
+        size.cols,
+        size.rows,
+    )
 }
 
 fn move_window_refresh_sessions(
@@ -575,6 +691,10 @@ fn move_window_lifecycle_events(
     request: &rmux_proto::MoveWindowRequest,
     unlinked_window: Option<&UnlinkedWindowSnapshot>,
 ) -> Vec<LifecycleEvent> {
+    if request.renumber {
+        return Vec::new();
+    }
+
     let Some(source) = &request.source else {
         return Vec::new();
     };
@@ -644,7 +764,7 @@ fn move_window_replaced_destination_pane_ids(
     state: &HandlerState,
     request: &rmux_proto::MoveWindowRequest,
 ) -> Vec<PaneId> {
-    if request.renumber || !request.kill_destination {
+    if request.renumber || !request.kill_destination || request.after || request.before {
         return Vec::new();
     }
     let Some(source) = request.source.as_ref() else {

@@ -1,4 +1,7 @@
-use rmux_core::formats::{render_list_panes_line, FormatContext, DEFAULT_DISPLAY_MESSAGE_FORMAT};
+use rmux_core::formats::{
+    render_list_panes_line, FormatContext, DEFAULT_DISPLAY_MESSAGE_FORMAT,
+    DEFAULT_LIST_PANES_SESSION_FORMAT, DEFAULT_LIST_PANES_WINDOW_FORMAT,
+};
 use rmux_proto::{
     CommandOutput, DisplayMessageResponse, ErrorResponse, ListPanesResponse, Response, RmuxError,
     Target, TerminalSize,
@@ -22,6 +25,7 @@ impl RequestHandler {
             request.print,
             request.message,
             None,
+            request.empty_target_context,
         )
         .await
     }
@@ -37,6 +41,7 @@ impl RequestHandler {
             request.print,
             request.message,
             request.target_client,
+            request.empty_target_context,
         )
         .await
     }
@@ -48,6 +53,7 @@ impl RequestHandler {
         print: bool,
         message: Option<String>,
         target_client: Option<String>,
+        empty_target_context: bool,
     ) -> Response {
         let target_attach_pid = match target_client.as_deref() {
             Some(target_client) => match self
@@ -59,6 +65,7 @@ impl RequestHandler {
                 Ok(None) => {
                     return Response::DisplayMessage(DisplayMessageResponse::no_output());
                 }
+                Err(error) if print && display_message_client_is_control_only(&error) => None,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             },
             None => None,
@@ -114,6 +121,24 @@ impl RequestHandler {
             .or(fallback_session_name);
         let template = message.as_deref().unwrap_or(DEFAULT_DISPLAY_MESSAGE_FORMAT);
         let mut uses_lone_session_print_context = false;
+
+        if empty_target_context {
+            if !print {
+                return Response::DisplayMessage(DisplayMessageResponse::no_output());
+            }
+            let expanded = {
+                let state = self.state.lock().await;
+                let mut runtime =
+                    RuntimeFormatContext::new(FormatContext::new()).with_state(&state);
+                if let Some(client) = requester_client.as_ref() {
+                    runtime = with_runtime_client_values(runtime, client);
+                }
+                render_runtime_template(template, &runtime, true)
+            };
+            return Response::DisplayMessage(DisplayMessageResponse::from_output(
+                CommandOutput::from_stdout(format!("{expanded}\n").into_bytes()),
+            ));
+        }
 
         if print && session_name.is_none() {
             session_name = {
@@ -268,15 +293,22 @@ impl RequestHandler {
         }
 
         Response::ListPanes(ListPanesResponse {
-            output: command_output_from_lines(&collect_list_pane_lines(
+            output: collect_list_pane_output(
                 &state,
                 session,
                 attached_count,
                 request.target_window_index,
                 request.format.as_deref(),
-            )),
+            ),
         })
     }
+}
+
+fn display_message_client_is_control_only(error: &RmuxError) -> bool {
+    matches!(
+        error,
+        RmuxError::Server(message) if message == "display-message requires an attached client"
+    )
 }
 
 pub(in crate::handler) fn display_message_context<'a>(
@@ -449,50 +481,59 @@ pub(in crate::handler) fn attached_status_message_for_error(error: &RmuxError) -
     }
 }
 
-fn collect_list_pane_lines(
+fn collect_list_pane_output(
     state: &HandlerState,
     session: &rmux_core::Session,
     attached_count: usize,
     target_window_index: Option<u32>,
     format: Option<&str>,
-) -> Vec<String> {
+) -> CommandOutput {
     let active_window = session.active_window_index();
     let last_window = session.last_window_index();
     let session_context =
         FormatContext::from_session(session).with_session_attached(attached_count);
+    let format = format.or(Some(if target_window_index.is_some() {
+        DEFAULT_LIST_PANES_WINDOW_FORMAT
+    } else {
+        DEFAULT_LIST_PANES_SESSION_FORMAT
+    }));
 
-    session
-        .windows()
-        .iter()
-        .filter(|(window_index, _)| {
-            target_window_index
-                .map(|target| **window_index == target)
-                .unwrap_or(true)
-        })
-        .flat_map(|(window_index, window)| {
-            let active = *window_index == active_window;
-            let last = Some(*window_index) == last_window;
-            let window_context =
-                session_context
-                    .clone()
-                    .with_window(*window_index, window, active, last);
+    let mut stdout = Vec::new();
+    for (window_index, window) in session.windows() {
+        if target_window_index.is_some_and(|target| *window_index != target) {
+            continue;
+        }
 
-            window.panes().iter().map(move |pane| {
-                let context = window_context
-                    .clone()
-                    .with_pane(pane, pane.index() == window.active_pane_index());
-                let mut runtime = RuntimeFormatContext::new(context)
-                    .with_state(state)
-                    .with_session(session)
-                    .with_window(*window_index, window)
-                    .with_pane(pane);
-                if attached_count == 0 {
-                    runtime = runtime.with_unclipped_geometry();
-                }
-                render_list_panes_line(&runtime, format)
-            })
-        })
-        .collect()
+        let active = *window_index == active_window;
+        let last = Some(*window_index) == last_window;
+        let window_context =
+            session_context
+                .clone()
+                .with_window(*window_index, window, active, last);
+
+        for pane in window.panes() {
+            let context = window_context
+                .clone()
+                .with_pane(pane, pane.index() == window.active_pane_index());
+            let mut runtime = RuntimeFormatContext::new(context)
+                .with_state(state)
+                .with_session(session)
+                .with_window(*window_index, window)
+                .with_pane(pane);
+            if attached_count == 0 {
+                runtime = runtime.with_unclipped_geometry();
+            }
+            if !stdout.is_empty() {
+                stdout.push(b'\n');
+            }
+            stdout.extend_from_slice(render_list_panes_line(&runtime, format).as_bytes());
+        }
+    }
+
+    if !stdout.is_empty() {
+        stdout.push(b'\n');
+    }
+    CommandOutput::from_stdout(stdout)
 }
 
 pub(in crate::handler) fn command_output_from_lines(lines: &[String]) -> CommandOutput {

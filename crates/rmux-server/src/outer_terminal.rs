@@ -361,14 +361,22 @@ impl OuterTerminal {
         }
     }
 
-    pub(crate) fn encode_clipboard_set(&self, bytes: &[u8]) -> Option<Vec<u8>> {
-        if !self.clipboard_writes_enabled || bytes.is_empty() {
+    pub(crate) fn encode_forced_clipboard_set(&self, bytes: &[u8]) -> Option<Vec<u8>> {
+        if bytes.is_empty() {
             return None;
         }
+        self.encode_clipboard_payload(bytes)
+    }
+
+    fn encode_clipboard_payload(&self, bytes: &[u8]) -> Option<Vec<u8>> {
         let template = self.clipboard_template.as_deref()?;
         let encoded = encode_base64(bytes);
         let rendered = render_string_string_template(template, "", &encoded);
         Some(rendered.into_bytes())
+    }
+
+    pub(crate) fn clipboard_passthrough_enabled(&self) -> bool {
+        self.clipboard_writes_enabled && self.clipboard_template.is_some()
     }
 
     fn focus_sequence(&self) -> Option<String> {

@@ -4,8 +4,8 @@ use rmux_client::Connection;
 use rmux_proto::{HookLifecycle, HookName, ResolveTargetType, ScopeSelector, Target, WindowTarget};
 
 use crate::cli::{
-    resolve_current_session_target, resolve_target_spec, run_command_resolved,
-    run_payload_command_resolved, ExitFailure,
+    resolve_current_pane_target, resolve_current_session_target, resolve_target_spec,
+    run_command_resolved, run_payload_command_resolved, ExitFailure,
 };
 use crate::cli_args::{SetHookArgs, ShowHooksArgs, TargetSpec};
 
@@ -83,18 +83,12 @@ fn resolve_hook_scope(
             target,
             kind: HookTargetKind::Window,
         }),
-        (true, false, None) => Err(ExitFailure::new(
-            1,
-            format!("{command} -w requires a target"),
-        )),
+        (true, false, None) => Ok(HookScope::CurrentWindow),
         (false, true, Some(target)) => Ok(HookScope::Unresolved {
             target,
             kind: HookTargetKind::Pane,
         }),
-        (false, true, None) => Err(ExitFailure::new(
-            1,
-            format!("{command} -p requires a target"),
-        )),
+        (false, true, None) => Ok(HookScope::CurrentPane),
         (false, false, Some(target)) => Ok(HookScope::Unresolved {
             target,
             kind: HookTargetKind::Natural,
@@ -132,6 +126,8 @@ struct ShowHooksScope(HookScope);
 enum HookScope {
     Resolved(ScopeSelector),
     CurrentSession,
+    CurrentWindow,
+    CurrentPane,
     Unresolved {
         target: TargetSpec,
         kind: HookTargetKind,
@@ -165,6 +161,16 @@ impl HookScope {
             Self::Resolved(scope) => Ok(scope),
             Self::CurrentSession => {
                 resolve_current_session_target(connection).map(ScopeSelector::Session)
+            }
+            Self::CurrentWindow => {
+                let pane = resolve_current_pane_target(connection, command)?;
+                Ok(ScopeSelector::Window(WindowTarget::with_window(
+                    pane.session_name().clone(),
+                    pane.window_index(),
+                )))
+            }
+            Self::CurrentPane => {
+                resolve_current_pane_target(connection, command).map(ScopeSelector::Pane)
             }
             Self::Unresolved { target, kind } => {
                 resolve_unresolved_hook_scope(connection, command, &target, kind)

@@ -1,4 +1,4 @@
-//! Web-share wire protocol (v1, X25519 + ML-KEM-768 hybrid).
+//! Web-share wire protocol (v2, X25519 + ML-KEM-768 hybrid).
 //!
 //! This module owns the shared vocabulary — constants, the client/auth wire
 //! types, and the small parse/validate helpers — and re-exports the directional
@@ -34,8 +34,8 @@ pub(crate) use inbound::{
     handle_session_operator_binary_frame,
 };
 pub(crate) use outbound::{
-    queue_output, queue_resize, queue_session_snapshot, queue_session_view, queue_snapshot,
-    send_ready, send_revoked, send_viewer_count,
+    queue_output, queue_session_keyframe, queue_session_pane_frame, queue_session_view,
+    queue_snapshot, send_ready, send_revoked, send_viewer_count,
 };
 
 pub(crate) const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -52,15 +52,19 @@ pub(crate) const WEB_SHARE_PROTOCOL_VERSION: u16 = 1;
 /// PIN/identity oracle, so those failures collapse to this one pair. The
 /// precise reason is logged server-side, never sent.
 pub(crate) const HANDSHAKE_REJECTED: (u16, &str) = (4000, "handshake_rejected");
-/// Role capacity reached after token and PIN authentication succeeded.
-pub(crate) const CAPACITY_REACHED: (u16, &str) = (4009, "capacity_reached");
-const SERVER_CAPABILITIES: &[&str] = &[E2EE_CAPABILITY, "terminal-palette-v1"];
+pub(crate) const PANE_FRAME_CAPABILITY: &str = "pane-frame-v1";
+const SERVER_CAPABILITIES: &[&str] = &[
+    E2EE_CAPABILITY,
+    "terminal-palette-v1",
+    PANE_FRAME_CAPABILITY,
+];
 const OPERATOR_INPUT_FRAME_MAX: usize = 4 * 1024;
 const MAX_PANE_RESIZE_CELLS: u16 = 10_000;
 const WS_OUTPUT_RAW: u8 = 0x01;
 const WS_RESIZE_NOTIFY: u8 = 0x02;
 const WS_SNAPSHOT_FULL: u8 = 0x10;
 const WS_SESSION_VIEW: u8 = 0x11;
+const WS_SESSION_PANE_FRAME: u8 = 0x12;
 const WS_INPUT_TEXT: u8 = 0x80;
 const WS_INPUT_KEY: u8 = 0x81;
 const WS_RESIZE_REQUEST: u8 = 0x82;
@@ -74,14 +78,23 @@ pub(crate) struct SessionScrollRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionClientTextOutcome {
+    None,
+    Scroll(SessionScrollRequest),
+    Snapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionOperatorBinaryOutcome {
     None,
+    Resize,
     Snapshot,
 }
 
 #[derive(Debug)]
 pub(crate) struct AuthMessage {
     pub(crate) pin: Option<String>,
+    pub(crate) supports_session_pane_frame: bool,
 }
 
 #[derive(Debug, Deserialize)]

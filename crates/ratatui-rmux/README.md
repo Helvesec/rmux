@@ -12,8 +12,8 @@ state.
 ```toml
 [dependencies]
 ratatui = "0.29"
-ratatui-rmux = "0.5"
-rmux-sdk = "0.5"
+ratatui-rmux = "0.6"
+rmux-sdk = "0.6"
 ```
 
 ```rust

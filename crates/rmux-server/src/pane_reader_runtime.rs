@@ -1,6 +1,7 @@
 use std::future::Future;
 
 use tokio::runtime::Handle;
+use tokio::task::AbortHandle;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PaneReaderRuntime {
@@ -22,10 +23,10 @@ impl PaneReaderRuntime {
         Self { handle }
     }
 
-    pub(crate) fn spawn<F>(&self, task: F)
+    pub(crate) fn spawn<F>(&self, task: F) -> AbortHandle
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.handle.spawn(task);
+        self.handle.spawn(task).abort_handle()
     }
 }

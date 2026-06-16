@@ -87,6 +87,17 @@ fn parse_details_line_decodes_sticky_lifecycle_fields_without_env() {
 }
 
 #[test]
+fn parse_details_line_decodes_tmux_quoted_shell_command() {
+    let line = "%2\t1234\t0\t\t\t80\t24\t10\t5\t1\t0\t128\t4\t\"sleep 60\"\
+             \t3\t5\t7\t/tmp/start";
+    let details = parse_details_line(line).expect("parses");
+    assert_eq!(
+        details.start_command.as_deref(),
+        Some(["sleep 60".to_owned()].as_slice())
+    );
+}
+
+#[test]
 fn parse_details_line_rejects_malformed_encoded_command() {
     let line = "%2\t1234\t0\t\t\t80\t24\t10\t5\t1\t0\t128\t4\tbad%XX\t1\t1\t1\t/tmp";
     assert!(parse_details_line(line).is_err());

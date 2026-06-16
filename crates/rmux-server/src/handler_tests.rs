@@ -10,11 +10,11 @@ use rmux_core::{
 use rmux_ipc::PeerIdentity;
 use rmux_os::identity::UserIdentity;
 use rmux_proto::{
-    ControlMode, ErrorResponse, HasSessionRequest, HookName, KillPaneRequest, KillSessionRequest,
-    LayoutName, ListPanesRequest, ListSessionsRequest, NewSessionExtRequest, NewSessionRequest,
-    OptionName, PaneTarget, RenameSessionRequest, Request, ResizePaneAdjustment, Response,
-    RmuxError, ScopeSelector, SelectPaneRequest, SessionName, SetOptionMode, SetOptionRequest,
-    SplitWindowRequest, SplitWindowTarget, TerminalSize,
+    ControlMode, DisplayMessageRequest, ErrorResponse, HasSessionRequest, HookName,
+    KillPaneRequest, KillSessionRequest, LayoutName, ListPanesRequest, ListSessionsRequest,
+    NewSessionExtRequest, NewSessionRequest, OptionName, PaneTarget, RenameSessionRequest, Request,
+    ResizePaneAdjustment, Response, RmuxError, ScopeSelector, SelectPaneRequest, SessionName,
+    SetOptionMode, SetOptionRequest, SplitWindowRequest, SplitWindowTarget, Target, TerminalSize,
 };
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;

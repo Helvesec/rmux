@@ -109,6 +109,8 @@ async fn attach_session_upgrade_renders_only_the_active_window() {
         Response::SplitWindow(_)
     ));
 
+    let ready_marker = format!("RMUX_ATTACH_ACTIVE_READY_{}", std::process::id());
+    let quiet_command = rmux_proto::ProcessCommand::Argv(quiet_ready_command(&ready_marker));
     let mut state = handler.state.lock().await;
     let pane_id = state.sessions.allocate_pane_id();
     let session = state.sessions.session_mut(&alpha).expect("session exists");
@@ -122,7 +124,7 @@ async fn attach_session_upgrade_renders_only_the_active_window() {
             5,
             crate::pane_terminals::WindowSpawnOptions {
                 start_directory: None,
-                command: None,
+                command: Some(&quiet_command),
                 socket_path: Path::new("/tmp/rmux-test.sock"),
                 spawn_environment: None,
                 environment_overrides: None,
@@ -133,6 +135,13 @@ async fn attach_session_upgrade_renders_only_the_active_window() {
         .expect("window 5 terminal insert succeeds");
     drop(state);
 
+    wait_for_capture_containing(
+        &handler,
+        PaneTarget::with_window(alpha.clone(), 5, 0),
+        &ready_marker,
+        "active window fixture should settle before transcript replacement",
+    )
+    .await;
     replace_transcript_contents(
         &handler,
         &PaneTarget::with_window(alpha.clone(), 5, 0),
@@ -157,11 +166,9 @@ async fn attach_session_upgrade_renders_only_the_active_window() {
         render_frame.contains("visible-active-pane"),
         "attach must replay the active pane screen, got {render_frame:?}"
     );
-    let host = crate::host_name::local_hostname().expect("host name must resolve");
-    let host_short = host.split('.').next().unwrap_or(&host);
     assert!(
-        render_frame.contains(&format!("\"{host_short}\"")),
-        "attach status must render the host name, got {render_frame:?}"
+        render_frame.contains("\"pane-host\""),
+        "attach status must render the active pane title, got {render_frame:?}"
     );
     assert!(!render_frame.contains('┬'));
     assert!(!render_frame.contains('┴'));
@@ -257,6 +264,8 @@ async fn attach_session_replays_all_visible_pane_screens() {
                 detached: false,
                 size: None,
                 preserve_zoom: false,
+                full_size: false,
+                stdin_payload: None,
             }))
             .await,
         Response::SplitWindow(_)
@@ -437,5 +446,90 @@ async fn attach_session_target_spec_selects_requested_window_and_pane_before_att
             .expect("window 1 exists")
             .active_pane_index(),
         1
+    );
+}
+
+#[tokio::test]
+async fn legacy_attach_request_disables_render_stream_frames() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let outcome = handler
+        .dispatch(
+            std::process::id(),
+            Request::AttachSessionExt2(AttachSessionExt2Request {
+                target: Some(alpha.clone()),
+                target_spec: Some(alpha.to_string()),
+                detach_other_clients: false,
+                kill_other_clients: false,
+                read_only: false,
+                skip_environment_update: false,
+                flags: None,
+                working_directory: None,
+                client_terminal: rmux_proto::ClientTerminalContext::default(),
+                client_size: Some(TerminalSize { cols: 80, rows: 24 }),
+            }),
+        )
+        .await;
+
+    assert!(matches!(outcome.response, Response::AttachSession(_)));
+    assert!(
+        !outcome.attach.expect("attach upgrade").render_stream,
+        "Ext2 clients cannot decode AttachMessage::Render"
+    );
+}
+
+#[tokio::test]
+async fn attach_render_capability_enables_render_stream_frames() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let request = AttachSessionExt3Request::from_ext2(
+        AttachSessionExt2Request {
+            target: Some(alpha.clone()),
+            target_spec: Some(alpha.to_string()),
+            detach_other_clients: false,
+            kill_other_clients: false,
+            read_only: false,
+            skip_environment_update: false,
+            flags: None,
+            working_directory: None,
+            client_terminal: rmux_proto::ClientTerminalContext::default(),
+            client_size: Some(TerminalSize { cols: 80, rows: 24 }),
+        },
+        vec![CAPABILITY_ATTACH_RENDER.to_owned()],
+    );
+    let outcome = handler
+        .dispatch(std::process::id(), Request::AttachSessionExt3(request))
+        .await;
+
+    assert!(matches!(outcome.response, Response::AttachSession(_)));
+    assert!(
+        outcome.attach.expect("attach upgrade").render_stream,
+        "Ext3 clients explicitly opted into AttachMessage::Render"
     );
 }

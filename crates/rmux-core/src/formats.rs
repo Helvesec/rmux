@@ -20,6 +20,8 @@ mod condition;
 mod context;
 #[path = "formats/expand.rs"]
 mod expand;
+#[path = "formats/expression.rs"]
+mod expression;
 #[path = "formats/glob.rs"]
 mod glob;
 #[path = "formats/modifiers.rs"]
@@ -34,11 +36,13 @@ mod transforms;
 use condition::{format_bool_op_n, format_conditional};
 pub use context::{
     is_known_format_variable_name, FormatContext, FormatVariable, FormatVariables,
-    DEFAULT_DISPLAY_MESSAGE_FORMAT, DEFAULT_LIST_PANES_FORMAT, DEFAULT_LIST_SESSIONS_FORMAT,
-    DEFAULT_LIST_WINDOWS_FORMAT, FORMAT_VARIABLES, TMUX_FORMAT_TABLE_NAMES,
-    TMUX_TIME_FORMAT_VARIABLE_NAMES,
+    DEFAULT_DISPLAY_MESSAGE_FORMAT, DEFAULT_LIST_PANES_ALL_FORMAT, DEFAULT_LIST_PANES_FORMAT,
+    DEFAULT_LIST_PANES_SESSION_FORMAT, DEFAULT_LIST_PANES_WINDOW_FORMAT,
+    DEFAULT_LIST_SESSIONS_FORMAT, DEFAULT_LIST_WINDOWS_ALL_FORMAT, DEFAULT_LIST_WINDOWS_FORMAT,
+    FORMAT_VARIABLES, TMUX_FORMAT_TABLE_NAMES, TMUX_TIME_FORMAT_VARIABLE_NAMES,
 };
-use expand::format_expand1;
+use expand::{format_expand1, FORMAT_LOOP_LIMIT};
+use expression::format_expression;
 use glob::format_fnmatch;
 use modifiers::{parse_modifiers, FormatModifier};
 use scan::format_skip;
@@ -62,6 +66,27 @@ where
     let mut state = ExpandState {
         loop_depth: 0,
         expand_time: false,
+        stop_expansion: false,
+        preserve_jobs: false,
+    };
+    format_expand1(&mut state, template, variables)
+}
+
+/// Renders a format template while preserving `#(...)` command jobs literally.
+///
+/// Runtime renderers that can actually execute jobs use this mode to keep jobs
+/// introduced by expanded option values, such as `#{T:status-left}`, available
+/// for a later execution pass.
+#[must_use]
+pub fn render_template_preserving_jobs<V>(template: &str, variables: &V) -> String
+where
+    V: FormatVariables + ?Sized,
+{
+    let mut state = ExpandState {
+        loop_depth: 0,
+        expand_time: false,
+        stop_expansion: false,
+        preserve_jobs: true,
     };
     format_expand1(&mut state, template, variables)
 }
@@ -108,6 +133,8 @@ pub fn is_truthy(value: &str) -> bool {
 struct ExpandState {
     loop_depth: u32,
     expand_time: bool,
+    stop_expansion: bool,
+    preserve_jobs: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -136,8 +163,6 @@ where
 /// Bitflags for modifier effects.
 const MOD_LITERAL: u32 = 1 << 0;
 const MOD_EXPAND: u32 = 1 << 1;
-const MOD_NOT: u32 = 1 << 2;
-const MOD_NOT_NOT: u32 = 1 << 3;
 const MOD_QUOTE_SHELL: u32 = 1 << 4;
 const MOD_QUOTE_STYLE: u32 = 1 << 5;
 const MOD_BASENAME: u32 = 1 << 6;
@@ -169,6 +194,8 @@ where
     let mut colour_hex = false;
     let mut display_width = false;
     let mut name_exists: Option<&FormatModifier> = None;
+    let mut expression: Option<&FormatModifier> = None;
+    let mut search: Option<&FormatModifier> = None;
 
     for fm in &modifiers {
         if fm.modifier.len() == 1 {
@@ -176,7 +203,6 @@ where
                 b'm' | b'<' | b'>' => cmp = Some(fm),
                 b'a' => ascii_char = true,
                 b'c' => colour_hex = true,
-                b'!' => flags |= MOD_NOT,
                 b's' if fm.argv.len() >= 2 => {
                     subs.push(fm);
                 }
@@ -222,14 +248,15 @@ where
                     deferred_loop_scope = Some(fm.modifier.as_bytes()[0] as char)
                 }
                 b'N' => name_exists = Some(fm),
+                b'e' => expression = Some(fm),
+                b'C' => search = Some(fm),
                 b'w' => display_width = true,
-                // Runtime-deferred: C, R, e
+                // Runtime-deferred: R
                 _ => {}
             }
         } else if fm.modifier.len() == 2 {
             match fm.modifier.as_str() {
                 "||" | "&&" => bool_op_n = Some(fm),
-                "!!" => flags |= MOD_NOT_NOT,
                 "==" | "!=" | "<=" | ">=" => cmp = Some(fm),
                 _ => {}
             }
@@ -237,7 +264,12 @@ where
     }
 
     if let Some(scope) = deferred_loop_scope {
-        if let Some(value) = variables.format_loop(scope, body, false) {
+        let (body, current_body) = if scope == 'S' {
+            (body, None)
+        } else {
+            split_loop_body(body)
+        };
+        if let Some(value) = variables.format_loop(scope, body, current_body, false) {
             return value;
         }
     }
@@ -253,6 +285,17 @@ where
             .map(bool_value)
             .unwrap_or_default();
     }
+    if let Some(modifier) = search {
+        let options = modifier
+            .argv
+            .first()
+            .map(String::as_str)
+            .unwrap_or_default();
+        let pattern = format_expand1(state, body, variables);
+        return variables
+            .format_search(options, &pattern)
+            .unwrap_or_default();
+    }
 
     // --- Dispatch with classified modifiers ---
 
@@ -263,23 +306,7 @@ where
 
     let value;
 
-    if flags & MOD_NOT != 0 {
-        // Unary boolean negation.
-        let expanded = format_expand1(state, body, variables);
-        value = if is_truthy(&expanded) {
-            "0".to_owned()
-        } else {
-            "1".to_owned()
-        };
-    } else if flags & MOD_NOT_NOT != 0 {
-        // Double-negation / boolean coercion.
-        let expanded = format_expand1(state, body, variables);
-        value = if is_truthy(&expanded) {
-            "1".to_owned()
-        } else {
-            "0".to_owned()
-        };
-    } else if let Some(op) = bool_op_n {
+    if let Some(op) = bool_op_n {
         // N-ary boolean operator.
         let is_and = op.modifier == "&&";
         value = format_bool_op_n(state, body, is_and, variables);
@@ -304,6 +331,8 @@ where
     } else if let Some(cond_body) = body.strip_prefix('?') {
         // Multi-pair conditional.
         value = format_conditional(state, cond_body, variables);
+    } else if let Some(expression) = expression {
+        value = format_expression(state, body, expression, variables);
     } else {
         // Variable lookup.
         if body.contains("#{") {
@@ -324,6 +353,7 @@ where
     // Expand modifier (re-expand the resolved value).
     if flags & MOD_EXPAND != 0 {
         result = format_expand1(state, &result, variables);
+        result = expand_time_tokens(&result);
     } else if flags & MOD_EXPAND_TIME != 0 {
         let previous = state.expand_time;
         state.expand_time = true;
@@ -366,13 +396,15 @@ where
     // Padding.
     if width > 0 {
         let w = width as usize;
-        if result.len() < w {
-            result = format!("{result:width$}", width = w);
+        let current_width = text_width(&result, &Utf8Config::default());
+        if current_width < w {
+            result.push_str(&" ".repeat(w - current_width));
         }
     } else if width < 0 {
         let w = (-width) as usize;
-        if result.len() < w {
-            result = format!("{result:>width$}", width = w);
+        let current_width = text_width(&result, &Utf8Config::default());
+        if current_width < w {
+            result = format!("{}{result}", " ".repeat(w - current_width));
         }
     }
 
@@ -385,11 +417,7 @@ where
 
     // Dirname.
     if flags & MOD_DIRNAME != 0 {
-        if let Some(pos) = result.rfind('/') {
-            result = result[..pos].to_owned();
-        } else {
-            result = ".".to_owned();
-        }
+        result = format_dirname(&result);
     }
 
     // Length.
@@ -410,13 +438,23 @@ where
     }
 
     // Quoting.
-    if flags & MOD_QUOTE_SHELL != 0 {
+    if flags & MOD_QUOTE_SHELL != 0 && !is_single_nested_expansion(body) {
         result = shell_quote(&result);
     } else if flags & MOD_QUOTE_STYLE != 0 {
         result = style_quote(&result);
     }
 
     result
+}
+
+fn split_loop_body(body: &str) -> (&str, Option<&str>) {
+    format_skip(body.as_bytes(), b",")
+        .map(|offset| (&body[..offset], Some(&body[offset + 1..])))
+        .unwrap_or((body, None))
+}
+
+fn is_single_nested_expansion(body: &str) -> bool {
+    body.starts_with("#{") && format_skip(body.as_bytes(), b"}") == Some(body.len() - 1)
 }
 
 fn format_ascii_character<V>(
@@ -452,19 +490,30 @@ where
 
 fn format_display_width<V>(
     result: &str,
-    body: &str,
-    state: &mut ExpandState,
-    variables: &V,
+    _body: &str,
+    _state: &mut ExpandState,
+    _variables: &V,
 ) -> String
 where
     V: FormatVariables + ?Sized,
 {
-    let operand = if result.is_empty() {
-        format_expand1(state, body, variables)
-    } else {
-        result.to_owned()
-    };
-    text_width(&operand, &Utf8Config::default()).to_string()
+    text_width(result, &Utf8Config::default()).to_string()
+}
+
+fn format_dirname(value: &str) -> String {
+    if value.is_empty() {
+        return String::new();
+    }
+    if value.chars().all(|character| character == '/') {
+        return value.to_owned();
+    }
+
+    let trimmed = value.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(0) => "/".to_owned(),
+        Some(position) => trimmed[..position].to_owned(),
+        None => ".".to_owned(),
+    }
 }
 
 // ---------------------------------------------------------------------------

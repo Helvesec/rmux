@@ -1,0 +1,6 @@
+%begin 1760000000 0 1
+%end 1760000000 0 1
+%window-add @1
+%layout-change @1 80x24,0,0,1 80x24,0,0,1 *
+%output %1 hello\012
+%exit

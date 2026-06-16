@@ -118,6 +118,45 @@ fn set_option_accepts_window_scope_and_optional_value() {
 }
 
 #[test]
+fn set_option_rejects_dash_dash_before_value() {
+    let error = parse_args(&["set-option", "-g", "status-left", "--", "-abc"]).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("command set-option: too many arguments (need at most 2)"),
+        "{error}"
+    );
+}
+
+#[test]
+fn set_option_accepts_dash_dash_before_option_name() {
+    let cli = parse_args(&["set-option", "-g", "--", "status-left", "plain"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::SetOption(args) => {
+            assert!(args.global);
+            assert_eq!(args.option, "status-left");
+            assert_eq!(args.value.as_deref(), Some("plain"));
+        }
+        _ => panic!("expected SetOption command"),
+    }
+}
+
+#[test]
+fn set_option_accepts_trailing_dash_dash_as_value() {
+    let cli = parse_args(&["set-option", "-g", "status-left", "--"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::SetOption(args) => {
+            assert!(args.global);
+            assert_eq!(args.option, "status-left");
+            assert_eq!(args.value.as_deref(), Some("--"));
+        }
+        _ => panic!("expected SetOption command"),
+    }
+}
+
+#[test]
 fn set_window_option_parses_as_a_distinct_public_command() {
     let cli = parse_args(&["set-window-option", "-g", "pane-border-style", "fg=colour1"]).unwrap();
 
@@ -164,20 +203,49 @@ fn show_window_options_parses_as_a_distinct_public_command() {
 }
 
 #[test]
-fn set_environment_requires_scope_group() {
-    let error = parse_args(&["set-environment", "TERM", "screen"]).unwrap_err();
-    assert_eq!(
-        error.kind(),
-        clap::error::ErrorKind::MissingRequiredArgument
+fn show_window_options_rejects_server_only_include_inherited_flag() {
+    let error = parse_args(&["show-window-options", "-A"]).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("command show-window-options: unknown flag -A"),
+        "{error}"
     );
 }
 
 #[test]
-fn set_hook_requires_scope_group() {
-    let error = parse_args(&["set-hook", "client-attached", "true"]).unwrap_err();
-    assert_eq!(
-        error.kind(),
-        clap::error::ErrorKind::MissingRequiredArgument
+fn set_environment_accepts_default_global_and_session_scope() {
+    parse_args(&["set-environment", "TERM", "screen"]).expect("default set-environment parses");
+    parse_args(&["set-environment", "-g", "TERM", "screen"])
+        .expect("global set-environment parses");
+    parse_args(&["set-environment", "-t", "alpha", "TERM", "screen"])
+        .expect("session set-environment parses");
+}
+
+#[test]
+fn set_hook_accepts_current_pane_and_window_scopes_without_target() {
+    for flag in ["-p", "-w"] {
+        let cli = parse_args(&["set-hook", flag, "pane-died", "display-message hi"]).unwrap();
+
+        match cli.command.expect("parsed command") {
+            super::super::Command::SetHook(args) => {
+                assert_eq!(args.pane, flag == "-p");
+                assert_eq!(args.window, flag == "-w");
+                assert!(args.target.is_none());
+            }
+            _ => panic!("expected SetHook command"),
+        }
+    }
+}
+
+#[test]
+fn set_hook_unknown_hook_uses_tmux_error_text() {
+    let error = parse_args(&["set-hook", "-g", "no-such-hook", "display hi"]).unwrap_err();
+
+    assert!(
+        error.to_string().contains("invalid option: no-such-hook"),
+        "{error}"
     );
 }
 
@@ -188,6 +256,19 @@ fn detach_client_rejects_trailing_arguments() {
         error.kind(),
         clap::error::ErrorKind::UnknownArgument
     ));
+}
+
+#[test]
+fn detach_client_accepts_session_id_target() {
+    let cli = parse_args(&["detach-client", "-s", "$1"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::DetachClient(args) => {
+            assert_eq!(args.target_session.expect("target").to_string(), "$1");
+            assert!(args.target_client.is_none());
+        }
+        _ => panic!("expected DetachClient command"),
+    }
 }
 
 #[test]

@@ -1,3 +1,6 @@
+use std::collections::HashSet;
+use std::sync::Arc;
+
 use rmux_core::{
     AlertFlags, LifecycleEvent, WINDOW_ACTIVITY, WINDOW_BELL, WINDOW_SILENCE, WINLINK_ACTIVITY,
     WINLINK_BELL, WINLINK_SILENCE,
@@ -11,10 +14,15 @@ use crate::renderer;
 
 #[path = "handler_alerts/automatic_names.rs"]
 mod automatic_names;
+#[path = "handler_alerts/pane_alert_coalescer.rs"]
+mod pane_alert_coalescer;
 #[path = "handler_alerts/show_messages.rs"]
 mod show_messages;
 #[path = "handler_alerts/silence_timers.rs"]
 mod silence_timers;
+
+pub(in crate::handler) use pane_alert_coalescer::PaneAlertCoalescer;
+use pane_alert_coalescer::PANE_ALERT_COALESCE_DELAY;
 
 const SHOW_MESSAGES_TEMPLATE: &str = "#{t/p:message_time}: #{message_text}";
 
@@ -135,12 +143,41 @@ impl RequestHandler {
     pub(super) fn pane_alert_callback(&self) -> PaneAlertCallback {
         let handler = self.downgrade();
         let runtime = tokio::runtime::Handle::current();
+        let pending_alerts = Arc::clone(&self.pane_alert_coalescer);
         std::sync::Arc::new(move |event: PaneAlertEvent| {
             let Some(handler) = handler.upgrade() else {
                 return;
             };
+            let should_spawn = {
+                let mut pending_alerts = pending_alerts
+                    .lock()
+                    .expect("pane alert coalescer mutex must not be poisoned");
+                pending_alerts.push(event)
+            };
+            if !should_spawn {
+                return;
+            };
+            let pending_alerts = Arc::clone(&pending_alerts);
             runtime.spawn(async move {
-                handler.handle_pane_alert_event(event).await;
+                tokio::time::sleep(PANE_ALERT_COALESCE_DELAY).await;
+                let events = {
+                    let mut pending_alerts = pending_alerts
+                        .lock()
+                        .expect("pane alert coalescer mutex must not be poisoned");
+                    pending_alerts.take_pending()
+                };
+                let mut inactive_output_refreshes = HashSet::new();
+                for event in events {
+                    for session_name in handler
+                        .handle_pane_alert_event_deferred_refresh(event)
+                        .await
+                    {
+                        inactive_output_refreshes.insert(session_name);
+                    }
+                }
+                for session_name in inactive_output_refreshes {
+                    handler.refresh_attached_session(&session_name).await;
+                }
             });
         })
     }
@@ -208,20 +245,30 @@ impl RequestHandler {
         changed
     }
 
+    #[cfg(test)]
     pub(super) async fn handle_pane_alert_event(&self, event: PaneAlertEvent) {
-        let Some((target, refresh_for_inactive_pane_output)) = ({
+        for session_name in self.handle_pane_alert_event_deferred_refresh(event).await {
+            self.refresh_attached_session(&session_name).await;
+        }
+    }
+
+    async fn handle_pane_alert_event_deferred_refresh(
+        &self,
+        event: PaneAlertEvent,
+    ) -> Vec<SessionName> {
+        let (target, inactive_output_refresh) = {
             let state = self.state.lock().await;
             let Some(runtime_session_name) = state.resolve_pane_event_runtime_session(
                 &event.session_name,
                 event.pane_id,
                 event.generation,
             ) else {
-                return;
+                return Vec::new();
             };
             let Some(pane_target) =
                 state.pane_target_for_runtime_pane(&runtime_session_name, event.pane_id)
             else {
-                return;
+                return Vec::new();
             };
             let window_index = pane_target.window_index();
             let refresh_for_inactive_pane_output = state
@@ -231,18 +278,21 @@ impl RequestHandler {
                     session.active_window_index() != window_index
                         || session.active_pane_id() != Some(event.pane_id)
                 });
-            Some((
+            let inactive_output_refresh = if refresh_for_inactive_pane_output {
+                state.window_linked_session_family_list(pane_target.session_name(), window_index)
+            } else {
+                Vec::new()
+            };
+            (
                 WindowTarget::with_window(pane_target.session_name().clone(), window_index),
-                refresh_for_inactive_pane_output,
-            ))
-        }) else {
-            return;
+                inactive_output_refresh,
+            )
         };
+        if !event.queue_activity_alert && event.bell_count == 0 {
+            return inactive_output_refresh;
+        }
         self.refresh_automatic_window_name_for_window_target(&target)
             .await;
-        if refresh_for_inactive_pane_output {
-            self.refresh_attached_session(target.session_name()).await;
-        }
         // Combine activity + bell into a single queue call when both are present.
         // Bells are flag-based (not counted), so one queue call is sufficient.
         let flags = if event.bell_count > 0 {
@@ -251,6 +301,7 @@ impl RequestHandler {
             WINDOW_ACTIVITY
         };
         self.alerts_queue_window(target, flags).await;
+        inactive_output_refresh
     }
 
     async fn process_queued_alerts(&self, target: WindowTarget) {

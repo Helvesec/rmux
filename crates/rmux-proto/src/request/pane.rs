@@ -70,6 +70,12 @@ pub struct SplitWindowExtRequest {
     /// Whether an existing zoomed window should remain zoomed after split.
     #[serde(default)]
     pub preserve_zoom: bool,
+    /// Whether the new pane should split the full window root (`split-window -f`).
+    #[serde(default)]
+    pub full_size: bool,
+    /// Raw bytes read from client stdin for `split-window -I`.
+    #[serde(default)]
+    pub stdin_payload: Option<Vec<u8>>,
 }
 
 impl<'de> Deserialize<'de> for SplitWindowExtRequest {
@@ -91,6 +97,8 @@ impl<'de> Deserialize<'de> for SplitWindowExtRequest {
                 "detached",
                 "size",
                 "preserve_zoom",
+                "full_size",
+                "stdin_payload",
             ],
             compat::SplitWindowExtRequestVisitor,
         )
@@ -124,10 +132,29 @@ pub struct SwapPaneRequest {
 }
 
 /// Request payload for `last-pane`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LastPaneRequest {
     /// The addressed window.
     pub target: WindowTarget,
+    /// Whether an existing zoomed window should remain zoomed after selecting.
+    #[serde(default)]
+    pub preserve_zoom: bool,
+    /// Optional input gating to apply to the newly selected pane.
+    #[serde(default)]
+    pub input_disabled: Option<bool>,
+}
+
+impl<'de> Deserialize<'de> for LastPaneRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_struct(
+            "LastPaneRequest",
+            &["target", "preserve_zoom", "input_disabled"],
+            compat::LastPaneRequestVisitor,
+        )
+    }
 }
 
 /// Request payload for `join-pane`.
@@ -309,13 +336,41 @@ impl<'de> Deserialize<'de> for RespawnPaneRequest {
 }
 
 /// Request payload for `select-pane`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SelectPaneRequest {
     /// The exact pane target.
     pub target: PaneTarget,
     /// Optional pane title to set without changing the active pane (`-T`).
     #[serde(default)]
     pub title: Option<String>,
+    /// Optional pane input state mutation (`select-pane -d` / `-e`).
+    #[serde(default)]
+    pub input_disabled: Option<bool>,
+    /// Whether an existing zoomed window should remain zoomed after selecting.
+    #[serde(default)]
+    pub preserve_zoom: bool,
+    /// Optional pane style to set on the pane-local `window-style` option (`-P`).
+    #[serde(default)]
+    pub style: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for SelectPaneRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_struct(
+            "SelectPaneRequest",
+            &[
+                "target",
+                "title",
+                "input_disabled",
+                "preserve_zoom",
+                "style",
+            ],
+            compat::SelectPaneRequestVisitor,
+        )
+    }
 }
 
 /// SDK pane input request that can address a stable pane id.
@@ -420,12 +475,28 @@ pub enum SelectPaneDirection {
 }
 
 /// Request payload for directional `select-pane`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SelectPaneAdjacentRequest {
     /// The pane used as the directional anchor.
     pub target: PaneTarget,
     /// The requested adjacent-pane direction.
     pub direction: SelectPaneDirection,
+    /// Whether an existing zoomed window should remain zoomed after selecting.
+    #[serde(default)]
+    pub preserve_zoom: bool,
+}
+
+impl<'de> Deserialize<'de> for SelectPaneAdjacentRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_struct(
+            "SelectPaneAdjacentRequest",
+            &["target", "direction", "preserve_zoom"],
+            compat::SelectPaneAdjacentRequestVisitor,
+        )
+    }
 }
 
 /// Request payload for `select-pane -m` and `select-pane -M`.

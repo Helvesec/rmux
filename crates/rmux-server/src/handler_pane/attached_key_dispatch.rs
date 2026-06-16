@@ -4,6 +4,7 @@ use rmux_core::key_code_lookup_bits;
 use rmux_proto::{ErrorResponse, OptionName, PaneTarget, Response, RmuxError, Target};
 use tracing::warn;
 
+use super::super::copy_mode_support::key_binding::direct_copy_mode_command;
 use super::super::RequestHandler;
 use super::{attached_status_message_for_error, display_time, AttachedKeyDispatch};
 use crate::key_table::{
@@ -16,11 +17,8 @@ use crate::renderer;
 
 #[path = "attached_key_dispatch/commands.rs"]
 mod commands;
-#[path = "attached_key_dispatch/copy_mode.rs"]
-mod copy_mode;
 
 use commands::{execute_attached_binding_commands, AttachedBindingCommandContext};
-use copy_mode::direct_copy_mode_command;
 
 impl RequestHandler {
     #[async_recursion::async_recursion]
@@ -394,6 +392,9 @@ impl RequestHandler {
                     .handle_select_pane(rmux_proto::SelectPaneRequest {
                         target,
                         title: None,
+                        style: None,
+                        input_disabled: None,
+                        preserve_zoom: false,
                     })
                     .await;
                 match response {

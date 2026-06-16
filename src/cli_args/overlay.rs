@@ -43,8 +43,8 @@ pub(crate) struct DisplayPopupArgs {
     pub(crate) no_border: bool,
     #[arg(short = 'C', action = ArgAction::SetTrue)]
     pub(crate) close_all: bool,
-    #[arg(short = 'E', action = ArgAction::SetTrue)]
-    pub(crate) close_on_exit: bool,
+    #[arg(short = 'E', action = ArgAction::Count)]
+    pub(crate) close_on_exit: u8,
     #[arg(short = 'k', action = ArgAction::SetTrue)]
     pub(crate) close_on_key: bool,
     #[arg(short = 'N', action = ArgAction::SetTrue)]

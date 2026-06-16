@@ -1,16 +1,15 @@
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rmux_core::alternate_screen_exit_sequence;
 use rmux_proto::{
-    encode_attach_message, AttachFrameDecoder, AttachMessage, AttachedKeystroke, TerminalGeometry,
-    TerminalPixels,
+    encode_attach_message, AttachFrameDecoder, AttachMessage, TerminalGeometry, TerminalPixels,
 };
 use rmux_pty::PtyPair;
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
@@ -104,12 +103,14 @@ fn resize_watcher_reports_pixel_dimensions_when_available() -> Result<(), Box<dy
 }
 
 #[test]
-fn input_loop_emits_typed_keystroke_frame() -> Result<(), Box<dyn std::error::Error>> {
+fn input_loop_emits_raw_data_frame_for_native_typed_bytes() -> Result<(), Box<dyn std::error::Error>>
+{
     let (client_stream, mut server_stream) = UnixStream::pair()?;
     let (mut input_writer, input_reader) = UnixStream::pair()?;
     let (_resize_tx, resize_rx) = mpsc::channel();
     let closed = Arc::new(AtomicBool::new(false));
     let locked = Arc::new(AtomicBool::new(false));
+    let (_wakeup, wakeup_reader) = UnixStream::pair()?;
 
     let input_thread = std::thread::spawn(move || {
         input_loop(
@@ -119,6 +120,7 @@ fn input_loop_emits_typed_keystroke_frame() -> Result<(), Box<dyn std::error::Er
             false,
             closed,
             locked,
+            wakeup_reader,
         )
     });
 
@@ -131,12 +133,6 @@ fn input_loop_emits_typed_keystroke_frame() -> Result<(), Box<dyn std::error::Er
     decoder.push_bytes(&frame[..bytes_read]);
 
     assert_eq!(
-        decoder.next_message()?,
-        Some(AttachMessage::Keystroke(AttachedKeystroke::new(
-            b"a".to_vec()
-        )))
-    );
-    assert_ne!(
         decoder.next_message()?,
         Some(AttachMessage::Data(b"a".to_vec()))
     );
@@ -223,11 +219,302 @@ fn output_loop_errors_when_server_hangs_up_before_attach_stop(
 }
 
 #[test]
+fn output_loop_flushes_pending_render_before_accepting_next_frame(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, mut server_stream) = UnixStream::pair()?;
+    let output = SharedOutput::default();
+    let captured = output.clone();
+    let closed = Arc::new(AtomicBool::new(false));
+    let locked = Arc::new(AtomicBool::new(false));
+    let (action_tx, _action_rx) = mpsc::channel();
+    let screen_tracker = AttachScreenTracker::default();
+
+    server_stream.write_all(&encode_attach_message(&AttachMessage::Render(
+        b"render-one\n".to_vec(),
+    ))?)?;
+    server_stream.write_all(&encode_attach_message(&AttachMessage::Render(
+        b"render-two\n".to_vec(),
+    ))?)?;
+    server_stream.write_all(&encode_attach_message(&AttachMessage::Data(
+        b"[detached (from session alpha)]\r\n".to_vec(),
+    ))?)?;
+    server_stream.shutdown(std::net::Shutdown::Write)?;
+
+    output_loop(
+        client_stream,
+        Vec::new(),
+        output,
+        closed,
+        locked,
+        screen_tracker,
+        action_tx,
+    )?;
+
+    let rendered = String::from_utf8(captured.into_bytes()?)?;
+    assert!(
+        rendered.contains("render-one\n"),
+        "render deltas must be flushed before accepting later render frames: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("render-two\n"),
+        "latest render frame was not flushed: {rendered:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn output_loop_replaces_pending_render_after_first_paint() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (client_stream, mut server_stream) = UnixStream::pair()?;
+    let output = SharedOutput::default();
+    let captured = output.clone();
+    let closed = Arc::new(AtomicBool::new(false));
+    let locked = Arc::new(AtomicBool::new(false));
+    let (action_tx, _action_rx) = mpsc::channel();
+    let screen_tracker = AttachScreenTracker::default();
+
+    server_stream.write_all(&encode_attach_message(&AttachMessage::Render(
+        b"initial\n".to_vec(),
+    ))?)?;
+    server_stream.write_all(&encode_attach_message(&AttachMessage::Render(
+        b"stale\n".to_vec(),
+    ))?)?;
+    server_stream.write_all(&encode_attach_message(&AttachMessage::Render(
+        b"latest\n".to_vec(),
+    ))?)?;
+    server_stream.write_all(&encode_attach_message(&AttachMessage::Data(
+        b"[detached (from session alpha)]\r\n".to_vec(),
+    ))?)?;
+    server_stream.shutdown(std::net::Shutdown::Write)?;
+
+    output_loop(
+        client_stream,
+        Vec::new(),
+        output,
+        closed,
+        locked,
+        screen_tracker,
+        action_tx,
+    )?;
+
+    let rendered = String::from_utf8(captured.into_bytes()?)?;
+    assert!(rendered.contains("initial\n"), "{rendered:?}");
+    assert!(!rendered.contains("stale\n"), "{rendered:?}");
+    assert!(rendered.contains("latest\n"), "{rendered:?}");
+    Ok(())
+}
+
+#[test]
+fn output_loop_waits_briefly_to_coalesce_render_frames() -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, mut server_stream) = UnixStream::pair()?;
+    let output = SharedOutput::default();
+    let captured = output.clone();
+    let closed = Arc::new(AtomicBool::new(false));
+    let locked = Arc::new(AtomicBool::new(false));
+    let (action_tx, _action_rx) = mpsc::channel();
+    let screen_tracker = AttachScreenTracker::default();
+
+    let output_thread = std::thread::spawn(move || {
+        output_loop(
+            client_stream,
+            Vec::new(),
+            output,
+            closed,
+            locked,
+            screen_tracker,
+            action_tx,
+        )
+    });
+
+    server_stream.write_all(&encode_attach_message(&AttachMessage::Render(
+        b"initial\n".to_vec(),
+    ))?)?;
+    let mut replacement_burst = Vec::new();
+    replacement_burst.extend(encode_attach_message(&AttachMessage::Render(
+        b"stale\n".to_vec(),
+    ))?);
+    replacement_burst.extend(encode_attach_message(&AttachMessage::Render(
+        b"latest\n".to_vec(),
+    ))?);
+    server_stream.write_all(&replacement_burst)?;
+    server_stream.write_all(&encode_attach_message(&AttachMessage::Data(
+        b"[detached (from session alpha)]\r\n".to_vec(),
+    ))?)?;
+    server_stream.shutdown(std::net::Shutdown::Write)?;
+    output_thread
+        .join()
+        .map_err(|_| "output loop thread panicked")??;
+
+    let rendered = String::from_utf8(captured.into_bytes()?)?;
+    assert!(rendered.contains("initial\n"), "{rendered:?}");
+    assert!(!rendered.contains("stale\n"), "{rendered:?}");
+    assert!(rendered.contains("latest\n"), "{rendered:?}");
+    Ok(())
+}
+
+#[test]
+fn output_loop_flushes_render_before_idle_gap_when_stream_stays_busy(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, mut server_stream) = UnixStream::pair()?;
+    let output = SharedOutput::default();
+    let captured = output.clone();
+    let closed = Arc::new(AtomicBool::new(false));
+    let locked = Arc::new(AtomicBool::new(false));
+    let (action_tx, _action_rx) = mpsc::channel();
+    let screen_tracker = AttachScreenTracker::default();
+
+    let output_thread = std::thread::spawn(move || {
+        output_loop(
+            client_stream,
+            Vec::new(),
+            output,
+            closed,
+            locked,
+            screen_tracker,
+            action_tx,
+        )
+    });
+
+    for index in 0..8 {
+        server_stream.write_all(&encode_attach_message(&AttachMessage::Render(
+            format!("render-{index}\n").into_bytes(),
+        ))?)?;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while captured.snapshot()?.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "render output was not flushed while the stream stayed busy"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    server_stream.write_all(&encode_attach_message(&AttachMessage::Data(
+        b"[detached (from session alpha)]\r\n".to_vec(),
+    ))?)?;
+    server_stream.shutdown(std::net::Shutdown::Write)?;
+    output_thread
+        .join()
+        .map_err(|_| "output loop thread panicked")??;
+
+    let rendered = String::from_utf8(captured.into_bytes()?)?;
+    assert!(rendered.contains("render-"), "{rendered:?}");
+    Ok(())
+}
+
+#[test]
+fn output_loop_keeps_original_render_deadline_across_replacements(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, mut server_stream) = UnixStream::pair()?;
+    let output = SharedOutput::default();
+    let captured = output.clone();
+    let closed = Arc::new(AtomicBool::new(false));
+    let locked = Arc::new(AtomicBool::new(false));
+    let (action_tx, _action_rx) = mpsc::channel();
+    let screen_tracker = AttachScreenTracker::default();
+    let writer_done = Arc::new(AtomicBool::new(false));
+    let writer_done_for_thread = Arc::clone(&writer_done);
+
+    let output_thread = std::thread::spawn(move || {
+        output_loop(
+            client_stream,
+            Vec::new(),
+            output,
+            closed,
+            locked,
+            screen_tracker,
+            action_tx,
+        )
+    });
+
+    let writer_thread = std::thread::spawn(move || -> Result<(), io::Error> {
+        let initial = encode_attach_message(&AttachMessage::Render(b"initial\n".to_vec()))
+            .expect("initial render frame should encode");
+        server_stream.write_all(&initial)?;
+        for index in 0..100 {
+            let frame = encode_attach_message(&AttachMessage::Render(
+                format!("render-{index}\n").into_bytes(),
+            ))
+            .expect("render frame should encode");
+            server_stream.write_all(&frame)?;
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        writer_done_for_thread.store(true, Ordering::SeqCst);
+        let detach = encode_attach_message(&AttachMessage::Data(
+            b"[detached (from session alpha)]\r\n".to_vec(),
+        ))
+        .expect("detach frame should encode");
+        server_stream.write_all(&detach)?;
+        server_stream.shutdown(std::net::Shutdown::Write)
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let rendered = String::from_utf8(captured.snapshot()?)?;
+        if rendered.contains("render-") {
+            break;
+        }
+        assert!(
+            !writer_done.load(Ordering::SeqCst),
+            "render output was not flushed before the writer went idle"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "render output was not flushed while replacements kept arriving"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    writer_thread
+        .join()
+        .map_err(|_| "writer thread panicked")??;
+    output_thread
+        .join()
+        .map_err(|_| "output loop thread panicked")??;
+    Ok(())
+}
+
+#[derive(Clone, Default)]
+struct SharedOutput {
+    bytes: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedOutput {
+    fn snapshot(&self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        Ok(self
+            .bytes
+            .lock()
+            .map_err(|_| "shared output lock poisoned")?
+            .clone())
+    }
+
+    fn into_bytes(self) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        self.snapshot()
+    }
+}
+
+impl Write for SharedOutput {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes
+            .lock()
+            .map_err(|_| std::io::Error::other("shared output lock poisoned"))?
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
 fn raw_terminal_flush_pending_input_discards_mouse_sequence_tails(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pair = PtyPair::open_with_size(rmux_pty::TerminalSize::new(80, 24))?;
     let (master, slave) = pair.into_split();
-    let mut master = File::from(master.into_owned_fd());
+    let mut master = File::from(master.into_owned_fd()?);
     let terminal = File::from(slave.into_owned_fd());
     let raw_terminal = RawTerminal::from_fd(&terminal)?;
 
@@ -253,7 +540,7 @@ fn attach_with_terminal_flushes_stale_mouse_input_before_forwarding_keys(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pair = PtyPair::open_with_size(rmux_pty::TerminalSize::new(80, 24))?;
     let (master, slave) = pair.into_split();
-    let mut master = File::from(master.into_owned_fd());
+    let mut master = File::from(master.into_owned_fd()?);
     let terminal = File::from(slave.into_owned_fd());
     let input = terminal.try_clone()?;
     let output = Vec::new();
@@ -273,17 +560,17 @@ fn attach_with_terminal_flushes_stale_mouse_input_before_forwarding_keys(
 
     let mut decoder = AttachFrameDecoder::new();
     let mut saw_resize = false;
-    let mut saw_keystroke = false;
+    let mut saw_input = false;
     let mut frame = [0_u8; 128];
-    while !saw_keystroke {
+    while !saw_input {
         let bytes_read = server_stream.read(&mut frame)?;
         decoder.push_bytes(&frame[..bytes_read]);
         while let Some(message) = decoder.next_message()? {
             match message {
                 AttachMessage::Resize(TerminalSize { cols: 80, rows: 24 }) => saw_resize = true,
-                AttachMessage::Keystroke(keystroke) => {
-                    assert_eq!(keystroke.bytes(), b"a");
-                    saw_keystroke = true;
+                AttachMessage::Data(bytes) => {
+                    assert_eq!(bytes, b"a");
+                    saw_input = true;
                 }
                 other => panic!("unexpected attach message: {other:?}"),
             }
@@ -324,7 +611,7 @@ fn attach_with_terminal_restores_mouse_off_after_protocol_error(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let pair = PtyPair::open_with_size(rmux_pty::TerminalSize::new(80, 24))?;
     let (master, slave) = pair.into_split();
-    let mut master = File::from(master.into_owned_fd());
+    let mut master = File::from(master.into_owned_fd()?);
     let terminal = File::from(slave.into_owned_fd());
     let _slave_keepalive = terminal.try_clone()?;
     let input = terminal.try_clone()?;

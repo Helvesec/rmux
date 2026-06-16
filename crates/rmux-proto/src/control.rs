@@ -159,25 +159,63 @@ pub fn format_exit_line(reason: Option<&str>) -> String {
 
 /// Formats a tmux-compatible control-mode data payload.
 ///
-/// Bytes < 0x20 (control chars), DEL (0x7F), `\`, and bytes >= 0x80 are
-/// `\NNN` octal-escaped. tmux itself only escapes < 0x20 and `\`, but
-/// extending the escape set to include 0x7F+ guarantees correct
-/// round-tripping through UTF-8 strings without altering the wire
-/// semantics for any printable ASCII data.
+/// ASCII control bytes, DEL, and `\` are `\NNN` octal-escaped. Valid UTF-8
+/// text is left intact so clients that expect tmux-style Unicode output do
+/// not see every non-ASCII byte expanded into octal sequences. Invalid UTF-8
+/// bytes are escaped one byte at a time.
 #[must_use]
 pub fn octal_escape(bytes: &[u8]) -> String {
     let mut output = String::with_capacity(bytes.len());
-    for &byte in bytes {
-        if (b' '..0x7F).contains(&byte) && byte != b'\\' {
-            output.push(byte as char);
-        } else {
-            output.push('\\');
-            output.push(char::from(b'0' + ((byte >> 6) & 0x7)));
-            output.push(char::from(b'0' + ((byte >> 3) & 0x7)));
-            output.push(char::from(b'0' + (byte & 0x7)));
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match std::str::from_utf8(&bytes[offset..]) {
+            Ok(valid) => {
+                push_escaped_text(&mut output, valid);
+                break;
+            }
+            Err(error) if error.valid_up_to() > 0 => {
+                let valid_end = offset + error.valid_up_to();
+                let valid = std::str::from_utf8(&bytes[offset..valid_end])
+                    .expect("valid_up_to must describe valid UTF-8");
+                push_escaped_text(&mut output, valid);
+                offset = valid_end;
+            }
+            Err(error) => {
+                let invalid_len = error.error_len().unwrap_or(1);
+                for &byte in &bytes[offset..offset + invalid_len] {
+                    push_octal_escape(&mut output, byte);
+                }
+                offset += invalid_len;
+            }
         }
     }
     output
+}
+
+fn push_escaped_text(output: &mut String, text: &str) {
+    for character in text.chars() {
+        if character.is_ascii() {
+            let byte = character as u8;
+            if needs_octal_escape(byte) {
+                push_octal_escape(output, byte);
+            } else {
+                output.push(character);
+            }
+        } else {
+            output.push(character);
+        }
+    }
+}
+
+const fn needs_octal_escape(byte: u8) -> bool {
+    byte < b' ' || byte == b'\\' || byte == 0x7F
+}
+
+fn push_octal_escape(output: &mut String, byte: u8) {
+    output.push('\\');
+    output.push(char::from(b'0' + ((byte >> 6) & 0x7)));
+    output.push(char::from(b'0' + ((byte >> 3) & 0x7)));
+    output.push(char::from(b'0' + (byte & 0x7)));
 }
 
 #[cfg(test)]
@@ -202,8 +240,11 @@ mod tests {
         assert_eq!(octal_escape(b"\\\0"), "\\134\\000");
         assert_eq!(octal_escape(b" "), " ");
         assert_eq!(octal_escape(b"~"), "~");
-        // DEL and high bytes are octal-escaped for safe UTF-8 round-tripping.
+        // DEL is escaped; valid UTF-8 non-ASCII is left intact.
         assert_eq!(octal_escape(b"\x7f"), "\\177");
+        assert_eq!(octal_escape("é".as_bytes()), "é");
+        assert_eq!(octal_escape("hello 👋".as_bytes()), "hello 👋");
+        // Invalid UTF-8 still round-trips as octal bytes.
         assert_eq!(octal_escape(b"\x80"), "\\200");
         assert_eq!(octal_escape(b"\xff"), "\\377");
         // All printable ASCII passes through literally.

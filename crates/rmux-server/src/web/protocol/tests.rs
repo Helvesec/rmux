@@ -41,6 +41,7 @@ fn auth_wire_requires_versioned_e2ee_capability_payload() {
 fn session_key_tokens_encode_to_terminal_bytes() {
     assert_eq!(encode_session_key("C-c").as_deref(), Some(&[0x03][..]));
     assert_eq!(encode_session_key("Enter").as_deref(), Some(&b"\r"[..]));
+    assert_eq!(encode_session_key("S-Enter").as_deref(), Some(&b"\n"[..]));
     assert_eq!(encode_session_key("not-a-key"), None);
 }
 

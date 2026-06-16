@@ -61,7 +61,30 @@ impl Connection {
 
     /// Sends a `last-pane` request over the detached RPC channel.
     pub fn last_pane(&mut self, target: WindowTarget) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::LastPane(LastPaneRequest { target }))
+        self.last_pane_with_zoom(target, false)
+    }
+
+    /// Sends a `last-pane` request with optional zoom preservation.
+    pub fn last_pane_with_zoom(
+        &mut self,
+        target: WindowTarget,
+        preserve_zoom: bool,
+    ) -> Result<Response, ClientError> {
+        self.last_pane_with_options(target, preserve_zoom, None)
+    }
+
+    /// Sends a `last-pane` request with tmux selection options.
+    pub fn last_pane_with_options(
+        &mut self,
+        target: WindowTarget,
+        preserve_zoom: bool,
+        input_disabled: Option<bool>,
+    ) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::LastPane(LastPaneRequest {
+            target,
+            preserve_zoom,
+            input_disabled,
+        }))
     }
 
     /// Sends a `join-pane` request over the detached RPC channel.
@@ -148,7 +171,50 @@ impl Connection {
         target: PaneTarget,
         title: Option<String>,
     ) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::SelectPane(SelectPaneRequest { target, title }))
+        self.select_pane_with_title_and_zoom(target, title, false)
+    }
+
+    /// Sends a `select-pane` request with optional title and zoom preservation.
+    pub fn select_pane_with_title_and_zoom(
+        &mut self,
+        target: PaneTarget,
+        title: Option<String>,
+        preserve_zoom: bool,
+    ) -> Result<Response, ClientError> {
+        self.select_pane_with_options(target, title, None, None, preserve_zoom)
+    }
+
+    /// Sends a `select-pane` request with optional title, style, input state, and zoom preservation.
+    pub fn select_pane_with_options(
+        &mut self,
+        target: PaneTarget,
+        title: Option<String>,
+        style: Option<String>,
+        input_disabled: Option<bool>,
+        preserve_zoom: bool,
+    ) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::SelectPane(SelectPaneRequest {
+            target,
+            title,
+            input_disabled,
+            preserve_zoom,
+            style,
+        }))
+    }
+
+    /// Sends a `select-pane -d` / `-e` input-state request.
+    pub fn select_pane_input(
+        &mut self,
+        target: PaneTarget,
+        disabled: bool,
+    ) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::SelectPane(SelectPaneRequest {
+            target,
+            title: None,
+            style: None,
+            input_disabled: Some(disabled),
+            preserve_zoom: false,
+        }))
     }
 
     /// Sends a directional `select-pane` request over the detached RPC channel.
@@ -157,9 +223,20 @@ impl Connection {
         target: PaneTarget,
         direction: SelectPaneDirection,
     ) -> Result<Response, ClientError> {
+        self.select_pane_adjacent_with_zoom(target, direction, false)
+    }
+
+    /// Sends a directional `select-pane` request with optional zoom preservation.
+    pub fn select_pane_adjacent_with_zoom(
+        &mut self,
+        target: PaneTarget,
+        direction: SelectPaneDirection,
+        preserve_zoom: bool,
+    ) -> Result<Response, ClientError> {
         self.roundtrip(&Request::SelectPaneAdjacent(SelectPaneAdjacentRequest {
             target,
             direction,
+            preserve_zoom,
         }))
     }
 

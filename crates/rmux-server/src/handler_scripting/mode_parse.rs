@@ -2,16 +2,17 @@ use rmux_proto::{Request, RmuxError};
 
 use super::parse_pane_target;
 use super::tokens::CommandTokens;
+use super::values::unsupported_flag;
 
 pub(super) fn parse_copy_mode(mut args: CommandTokens) -> Result<Request, RmuxError> {
     let mut target = None;
     let mut source = None;
-    let mut page_down = false;
+    let page_down = false;
     let mut exit_on_scroll = false;
     let mut hide_position = false;
     let mut mouse_drag_start = false;
     let mut cancel_mode = false;
-    let mut scrollbar_scroll = false;
+    let scrollbar_scroll = false;
     let mut page_up = false;
 
     while let Some(token) = args.peek() {
@@ -20,10 +21,7 @@ pub(super) fn parse_copy_mode(mut args: CommandTokens) -> Result<Request, RmuxEr
                 let _ = args.optional();
                 break;
             }
-            "-d" => {
-                let _ = args.optional();
-                page_down = true;
-            }
+            "-d" => return Err(unsupported_flag("copy-mode", "-d")),
             "-e" => {
                 let _ = args.optional();
                 exit_on_scroll = true;
@@ -40,10 +38,7 @@ pub(super) fn parse_copy_mode(mut args: CommandTokens) -> Result<Request, RmuxEr
                 let _ = args.optional();
                 cancel_mode = true;
             }
-            "-S" => {
-                let _ = args.optional();
-                scrollbar_scroll = true;
-            }
+            "-S" => return Err(unsupported_flag("copy-mode", "-S")),
             "-s" => {
                 let _ = args.optional();
                 source = Some(parse_pane_target(

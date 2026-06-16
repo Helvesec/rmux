@@ -57,6 +57,82 @@ fn raw_cli_top_level_flags_match_tmux_usage_contract() {
 }
 
 #[test]
+fn synthetic_completion_tree_tracks_public_command_surface() {
+    let completion = super::super::completion_command();
+    let actual = completion
+        .get_subcommands()
+        .map(|command| command.get_name().to_owned())
+        .collect::<BTreeSet<_>>();
+    let mut expected = super::super::implemented_command_surface()
+        .iter()
+        .map(|entry| entry.name.to_owned())
+        .collect::<BTreeSet<_>>();
+    expected.extend(
+        super::super::documented_cli_aliases()
+            .iter()
+            .map(|alias| alias.alias.to_owned()),
+    );
+
+    assert_eq!(actual, expected);
+
+    let split_window = completion
+        .get_subcommands()
+        .find(|command| command.get_name() == "split-window")
+        .expect("split-window completion subcommand");
+    let horizontal = split_window
+        .get_arguments()
+        .find(|argument| argument.get_short() == Some('h'))
+        .expect("split-window -h horizontal flag");
+    assert!(matches!(horizontal.get_action(), ArgAction::SetTrue));
+    assert!(
+        !split_window
+            .get_arguments()
+            .any(|argument| argument.get_short() == Some('h')
+                && matches!(argument.get_action(), ArgAction::Help)),
+        "synthetic completions must not turn split-window -h into clap help"
+    );
+}
+
+#[test]
+fn command_target_flags_accept_hyphen_prefixed_values() {
+    for args in [
+        &["list-panes", "-t", "-scratch"][..],
+        &["list-windows", "-t", "-scratch"][..],
+        &["set-option", "-t", "-scratch", "@flag", "on"][..],
+        &["source-file", "-t", "-scratch", "/tmp/rmux.conf"][..],
+        &["send-keys", "-t", "-scratch", "Enter"][..],
+    ] {
+        parse_args(args).unwrap_or_else(|error| {
+            panic!("target value beginning with '-' should parse for {args:?}: {error}")
+        });
+    }
+}
+
+#[test]
+fn command_value_flags_report_missing_values_with_tmux_style_prefix() {
+    for (args, expected) in [
+        (
+            &["list-panes", "-t"][..],
+            "command list-panes: -t expects an argument",
+        ),
+        (
+            &["set-option", "-t"][..],
+            "command set-option: -t expects an argument",
+        ),
+        (
+            &["web-share", "--frontend-url"][..],
+            "command web-share: --frontend-url expects an argument",
+        ),
+    ] {
+        let error = parse_args(args).unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?} in {error}"
+        );
+    }
+}
+
+#[test]
 fn implemented_surface_matches_the_full_tmux_command_table() {
     let expected = super::super::COMMAND_TABLE
         .iter()
@@ -64,6 +140,7 @@ fn implemented_surface_matches_the_full_tmux_command_table() {
         .collect::<Vec<_>>();
     let actual = super::super::implemented_command_surface()
         .iter()
+        .filter(|entry| entry.name != "capabilities")
         .map(|entry| rendered_surface_entry(entry))
         .collect::<Vec<_>>();
 
@@ -76,6 +153,9 @@ fn implemented_surface_matches_the_full_tmux_command_table() {
             entry.name
         );
     }
+
+    let top_level_help = parse_args(&["--help"]).unwrap_err().to_string();
+    assert!(top_level_help.contains("capabilities"));
 }
 
 #[test]
@@ -144,6 +224,8 @@ fn manpage_surface_matches_implemented_commands_and_aliases() {
     }
 
     assert!(manpage.contains(".B -Vh"));
+    assert!(manpage.contains(&format!("\"RMUX {}\"", env!("CARGO_PKG_VERSION"))));
+    assert!(manpage.contains(".RB [ -2CDhlNuVv ]"));
     assert!(manpage.contains(".BR \"rmux <command> --help\" ."));
     assert!(manpage.contains(".BR \"rmux split-window -h\" ."));
 }

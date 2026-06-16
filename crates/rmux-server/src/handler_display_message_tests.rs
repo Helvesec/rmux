@@ -116,6 +116,7 @@ async fn display_message_print_expands_shared_formats_without_attached_client() 
                 "#{session_name}:#{session_windows}:#{window_index}:#{pane_index}:#{pane_active}"
                     .to_owned(),
             ),
+            empty_target_context: false,
         }))
         .await;
 
@@ -166,6 +167,7 @@ async fn display_message_last_window_index_is_highest_session_window_index() {
             target: Some(Target::Pane(PaneTarget::new(alpha, 0))),
             print: true,
             message: Some("#{active_window_index}:#{last_window_index}".to_owned()),
+            empty_target_context: false,
         }))
         .await;
 
@@ -235,6 +237,7 @@ async fn display_message_reports_session_and_window_stack_order() {
                 ))),
                 print: true,
                 message: Some("#{session_stack}:#{window_stack_index}".to_owned()),
+                empty_target_context: false,
             }))
             .await;
 
@@ -287,6 +290,7 @@ async fn display_message_print_uses_full_detached_geometry_for_window_and_pane_f
                 "#{session_width}x#{session_height}|#{window_width}x#{window_height}|#{window_layout}|#{pane_width}x#{pane_height}"
                     .to_owned(),
             ),
+            empty_target_context: false,
             }))
         .await;
 
@@ -350,6 +354,7 @@ async fn display_message_print_uses_lone_session_context_for_user_options() {
             target: None,
             print: true,
             message: Some("opt=#{@my-user-opt}".to_owned()),
+            empty_target_context: false,
         }))
         .await;
 
@@ -387,6 +392,7 @@ async fn display_message_print_leaves_lone_session_size_formats_empty_without_ex
                 "#{session_name}|#{session_attached}|#{session_width}|#{session_height}|#{window_width}|#{window_height}|#{pane_width}|#{pane_height}"
                     .to_owned(),
             ),
+            empty_target_context: false,
             }))
         .await;
 
@@ -435,6 +441,7 @@ async fn display_message_print_uses_stored_default_window_name_for_detached_sess
             target: Some(Target::Session(alpha)),
             print: true,
             message: Some("#{window_name}".to_owned()),
+            empty_target_context: false,
         }))
         .await;
 
@@ -493,6 +500,7 @@ async fn display_message_print_uses_osc7_path_on_windows() {
             target: Some(Target::Pane(target)),
             print: true,
             message: Some("#{pane_current_path}".to_owned()),
+            empty_target_context: false,
         }))
         .await;
 
@@ -549,6 +557,7 @@ async fn display_message_print_reports_marked_pane_runtime_flags() {
             target: Some(Target::Pane(PaneTarget::with_window(alpha.clone(), 0, 0))),
             print: true,
             message: Some(format.to_owned()),
+            empty_target_context: false,
         }))
         .await;
     let pane1 = handler
@@ -556,6 +565,7 @@ async fn display_message_print_reports_marked_pane_runtime_flags() {
             target: Some(Target::Pane(PaneTarget::with_window(alpha, 0, 1))),
             print: true,
             message: Some(format.to_owned()),
+            empty_target_context: false,
         }))
         .await;
 
@@ -603,6 +613,7 @@ async fn display_message_print_treats_flag_options_like_tmux_in_conditionals() {
             target: Some(Target::Pane(PaneTarget::with_window(alpha, 0, 0))),
             print: true,
             message: Some("#{synchronize-panes}|#{?synchronize-panes,yes,no}".to_owned()),
+            empty_target_context: false,
         }))
         .await;
 
@@ -648,6 +659,7 @@ async fn display_message_print_expands_runtime_session_window_and_pane_loops() {
             target: Some(Target::Pane(PaneTarget::with_window(alpha.clone(), 0, 0))),
             print: true,
             message: Some("#{window_name}".to_owned()),
+            empty_target_context: false,
         }))
         .await;
     let Response::DisplayMessage(window_name) = window_name else {
@@ -667,7 +679,10 @@ async fn display_message_print_expands_runtime_session_window_and_pane_loops() {
         .handle(Request::DisplayMessage(DisplayMessageRequest {
             target: Some(Target::Pane(PaneTarget::with_window(alpha, 0, 0))),
             print: true,
-            message: Some("#{S:#W}|#{W:#W}|#{P:#{pane_index}}|#{N:#W}".to_owned()),
+            message: Some(
+                "#{S:#W}|#{W:#W,[#W]}|#{P:#{pane_index},[#{pane_index}]}|#{N:#W}".to_owned(),
+            ),
+            empty_target_context: false,
         }))
         .await;
     let Response::DisplayMessage(loops) = loops else {
@@ -678,7 +693,56 @@ async fn display_message_print_expands_runtime_session_window_and_pane_loops() {
             .command_output()
             .expect("display-message -p returns output")
             .stdout(),
-        format!("{window_name}|{window_name}|01|1\n").as_bytes()
+        format!("{window_name}|[{window_name}]|0[1]|1\n").as_bytes()
+    );
+}
+
+#[tokio::test]
+async fn display_message_session_loop_keeps_comma_body() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: beta,
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let response = handler
+        .handle(Request::DisplayMessage(DisplayMessageRequest {
+            target: Some(Target::Pane(PaneTarget::with_window(alpha, 0, 0))),
+            print: true,
+            message: Some("#{S:#{session_name},CURRENT}".to_owned()),
+            empty_target_context: false,
+        }))
+        .await;
+    let Response::DisplayMessage(response) = response else {
+        panic!("expected display-message response");
+    };
+    assert_eq!(
+        response
+            .command_output()
+            .expect("display-message -p returns output")
+            .stdout(),
+        b"alpha,CURRENTbeta,CURRENT\n"
     );
 }
 
@@ -720,6 +784,7 @@ async fn display_message_name_exists_modifier_checks_window_names_not_window_cou
             target: Some(Target::Pane(PaneTarget::with_window(alpha, 0, 0))),
             print: true,
             message: Some("#{N:#W}|#{N/w:w1}|#{N/s:alpha}|#{N/s:missing}".to_owned()),
+            empty_target_context: false,
         }))
         .await;
     let Response::DisplayMessage(name_exists) = name_exists else {
@@ -735,6 +800,56 @@ async fn display_message_name_exists_modifier_checks_window_names_not_window_cou
 }
 
 #[tokio::test]
+async fn display_message_content_search_modifier_reports_visible_line() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 8 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(
+                &alpha,
+                0,
+                0,
+                b"\x1b[H\x1b[2Jalpha one\r\nNeedle two\r\nlast row",
+            )
+            .expect("transcript append succeeds");
+    }
+
+    let response = handler
+        .handle(Request::DisplayMessage(DisplayMessageRequest {
+            target: Some(Target::Pane(PaneTarget::with_window(alpha, 0, 0))),
+            print: true,
+            message: Some(
+                "#{C:alpha}|#{C:Needle}|#{C:absent}|#{C/i:needle}|#{C/r:N.*le}".to_owned(),
+            ),
+            empty_target_context: false,
+        }))
+        .await;
+    let Response::DisplayMessage(response) = response else {
+        panic!("expected display-message response for content search modifier");
+    };
+    assert_eq!(
+        response
+            .command_output()
+            .expect("display-message -p returns output")
+            .stdout(),
+        b"1|2|0|2|2\n"
+    );
+}
+
+#[tokio::test]
 async fn bare_display_message_without_target_or_attached_client_is_a_silent_noop() {
     let handler = RequestHandler::new();
 
@@ -743,6 +858,7 @@ async fn bare_display_message_without_target_or_attached_client_is_a_silent_noop
             target: None,
             print: false,
             message: Some("unused".to_owned()),
+            empty_target_context: false,
         }))
         .await;
 
@@ -776,6 +892,7 @@ async fn bare_display_message_uses_status_overlay_for_attached_session() {
             target: Some(Target::Session(alpha)),
             print: false,
             message: Some("hello #{session_name}".to_owned()),
+            empty_target_context: false,
         }))
         .await;
 
@@ -819,6 +936,7 @@ async fn display_message_target_client_delivers_only_to_that_client() {
             print: false,
             message: Some("for second".to_owned()),
             target_client: Some("43".to_owned()),
+            empty_target_context: false,
         }))
         .await;
 
@@ -858,6 +976,7 @@ async fn display_message_missing_target_client_is_noop_unless_printing() {
             print: false,
             message: Some("hidden".to_owned()),
             target_client: Some("999999".to_owned()),
+            empty_target_context: false,
         }))
         .await;
     assert_eq!(
@@ -871,6 +990,7 @@ async fn display_message_missing_target_client_is_noop_unless_printing() {
             print: true,
             message: Some("hello".to_owned()),
             target_client: Some("999999".to_owned()),
+            empty_target_context: false,
         }))
         .await;
     assert_eq!(
@@ -907,6 +1027,7 @@ async fn display_message_target_client_uses_client_session_for_overlay_delivery(
             print: false,
             message: Some("format #{session_name}".to_owned()),
             target_client: Some("42".to_owned()),
+            empty_target_context: false,
         }))
         .await;
 
@@ -958,6 +1079,7 @@ async fn display_message_uses_display_time_option_for_overlay_clear() {
             target: Some(Target::Session(alpha)),
             print: false,
             message: Some("quick clear".to_owned()),
+            empty_target_context: false,
         }))
         .await;
 

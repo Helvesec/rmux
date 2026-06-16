@@ -2,41 +2,56 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rmux_ipc::LocalListener;
-use tokio::sync::mpsc;
+use tracing::debug;
 #[cfg(unix)]
-use tracing::{debug, warn};
+use tracing::warn;
 
+use crate::daemon::ShutdownHandle;
 use crate::handler::RequestHandler;
-use crate::signals::ServerSignal;
+use crate::signals::{ServerSignal, SignalWatcher};
 use crate::socket_cleanup::SocketCleanup;
 
-pub(crate) async fn receive_server_signal(
-    server_signals: &mut Option<mpsc::UnboundedReceiver<ServerSignal>>,
-) -> Option<ServerSignal> {
+pub(crate) fn poll_server_signal(server_signals: &Option<SignalWatcher>) -> Option<ServerSignal> {
+    server_signals.as_ref().and_then(SignalWatcher::poll)
+}
+
+#[cfg(unix)]
+pub(crate) async fn wait_server_signal(
+    server_signals: &Option<SignalWatcher>,
+) -> std::io::Result<()> {
     match server_signals {
-        Some(server_signals) => server_signals.recv().await,
+        Some(watcher) => watcher.wait().await,
         None => std::future::pending().await,
     }
 }
 
+#[cfg(not(unix))]
+pub(crate) async fn wait_server_signal(
+    _server_signals: &Option<SignalWatcher>,
+) -> std::io::Result<()> {
+    std::future::pending().await
+}
+
 pub(crate) async fn handle_server_signal(
     signal: Option<ServerSignal>,
-    server_signals: &mut Option<mpsc::UnboundedReceiver<ServerSignal>>,
+    shutdown_handle: &ShutdownHandle,
     handler: &Arc<RequestHandler>,
     socket_path: &Path,
     listener: &mut LocalListener,
     cleanup: &mut SocketCleanup,
 ) {
     match signal {
+        Some(ServerSignal::Shutdown(reason)) => {
+            debug!(reason, "requesting shutdown after server signal");
+            shutdown_handle.request_shutdown();
+        }
         Some(ServerSignal::ChildChanged) => {
             handler.continue_stopped_panes().await;
         }
         Some(ServerSignal::RecreateSocket) => {
             recreate_listener_after_signal(socket_path, listener, cleanup);
         }
-        None => {
-            *server_signals = None;
-        }
+        None => {}
     }
 }
 

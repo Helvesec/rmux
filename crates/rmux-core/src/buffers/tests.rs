@@ -20,6 +20,7 @@ fn set_unnamed_buffer_creates_deterministic_names() {
 
     assert_eq!(store.len(), 2);
     assert_eq!(store.stack_head(), Some("buffer1"));
+    assert_eq!(store.top_unnamed(), Some("buffer1"));
 }
 
 #[test]
@@ -83,6 +84,28 @@ fn delete_stack_head_when_no_name_provided() {
 }
 
 #[test]
+fn delete_without_name_ignores_newer_named_buffers() {
+    let mut store = BufferStore::new();
+    store.set(None, b"auto".to_vec(), 50).unwrap();
+    store.set(Some("named"), b"manual".to_vec(), 50).unwrap();
+
+    let deleted = store.delete(None).unwrap();
+    assert_eq!(deleted, "buffer0");
+    assert!(store.get("buffer0").is_none());
+    assert_eq!(store.get("named"), Some(b"manual".as_slice()));
+}
+
+#[test]
+fn delete_without_name_rejects_named_only_store() {
+    let mut store = BufferStore::new();
+    store.set(Some("named"), b"manual".to_vec(), 50).unwrap();
+
+    let err = store.delete(None).unwrap_err();
+    assert!(err.to_string().contains("no buffer"));
+    assert_eq!(store.get("named"), Some(b"manual".as_slice()));
+}
+
+#[test]
 fn delete_named_buffer() {
     let mut store = BufferStore::new();
     store.set(Some("target"), b"data".to_vec(), 50).unwrap();
@@ -123,7 +146,7 @@ fn delete_nonexistent_returns_error() {
 fn delete_empty_store_returns_error() {
     let mut store = BufferStore::new();
     let err = store.delete(None).unwrap_err();
-    assert!(err.to_string().contains("no buffers"));
+    assert!(err.to_string().contains("no buffer"));
 }
 
 #[test]
@@ -133,6 +156,27 @@ fn show_returns_content() {
     let (name, content) = store.show(None).unwrap();
     assert_eq!(name, "buffer0");
     assert_eq!(content, b"hello");
+}
+
+#[test]
+fn show_without_name_ignores_newer_named_buffers() {
+    let mut store = BufferStore::new();
+    store.set(None, b"auto".to_vec(), 50).unwrap();
+    store.set(Some("named"), b"manual".to_vec(), 50).unwrap();
+
+    let (name, content) = store.show(None).unwrap();
+    assert_eq!(name, "buffer0");
+    assert_eq!(content, b"auto");
+}
+
+#[test]
+fn show_without_name_rejects_named_only_store() {
+    let mut store = BufferStore::new();
+    store.set(Some("named"), b"manual".to_vec(), 50).unwrap();
+
+    let err = store.show(None).unwrap_err();
+    assert!(err.to_string().contains("no buffers"));
+    assert_eq!(store.get("named"), Some(b"manual".as_slice()));
 }
 
 #[test]

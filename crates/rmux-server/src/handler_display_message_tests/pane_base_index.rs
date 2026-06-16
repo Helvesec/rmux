@@ -60,6 +60,7 @@ async fn pane_index_formats_use_window_local_pane_base_index() {
             target: Some(Target::Pane(PaneTarget::with_window(alpha.clone(), 0, 1))),
             message: Some("#{pane_index}:#P".to_owned()),
             print: true,
+            empty_target_context: false,
         }))
         .await;
     let Response::DisplayMessage(DisplayMessageResponse { output, .. }) = display else {

@@ -322,6 +322,11 @@ impl Window {
         self.automatic_rename = false;
     }
 
+    /// Re-enables runtime automatic renaming for this window.
+    pub fn enable_automatic_rename(&mut self) {
+        self.automatic_rename = true;
+    }
+
     /// Updates the runtime window name while preserving automatic renaming.
     pub fn set_automatic_name(&mut self, name: String) {
         self.name = Some(name);

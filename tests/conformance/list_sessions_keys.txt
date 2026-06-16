@@ -1,0 +1,7 @@
+session_id
+session_name
+session_windows
+session_attached
+session_grouped
+session_group
+session_created

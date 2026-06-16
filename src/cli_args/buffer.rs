@@ -1,14 +1,8 @@
-use clap::{ArgAction, ArgGroup, Args};
+use clap::{ArgAction, Args};
 
 use super::{parse_target_spec, TargetSpec};
 
 #[derive(Debug, Clone, Args)]
-#[command(group(
-    ArgGroup::new("buffer_action")
-        .required(true)
-        .multiple(false)
-        .args(["content", "new_name"])
-))]
 pub(crate) struct SetBufferArgs {
     #[arg(short = 'a', action = ArgAction::SetTrue)]
     pub(crate) append: bool,
@@ -16,10 +10,24 @@ pub(crate) struct SetBufferArgs {
     pub(crate) name: Option<String>,
     #[arg(short = 'n')]
     pub(crate) new_name: Option<String>,
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
+    pub(crate) target: Option<TargetSpec>,
     #[arg(short = 'w', action = ArgAction::SetTrue)]
     pub(crate) set_clipboard: bool,
     #[arg()]
     pub(crate) content: Option<String>,
+}
+
+impl SetBufferArgs {
+    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
+        if self.content.is_none() && self.new_name.is_none() {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "set-buffer requires content or -n new-name",
+            ));
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -32,7 +40,7 @@ pub(crate) struct ShowBufferArgs {
 pub(crate) struct PasteBufferArgs {
     #[arg(short = 'b')]
     pub(crate) name: Option<String>,
-    #[arg(short = 't', value_parser = parse_target_spec)]
+    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
     #[arg(short = 'd', action = ArgAction::SetTrue)]
     pub(crate) delete_after: bool,
@@ -78,8 +86,20 @@ pub(crate) struct ListBuffersArgs {
     pub(crate) format: Option<String>,
     #[arg(short = 'f')]
     pub(crate) filter: Option<String>,
-    #[arg(short = 'O')]
-    pub(crate) sort_order: Option<String>,
-    #[arg(short = 'r', action = ArgAction::SetTrue)]
-    pub(crate) reversed: bool,
+    #[arg(short = 'O', hide = true)]
+    unsupported_sort_order: Option<String>,
+    #[arg(short = 'r', action = ArgAction::SetTrue, hide = true)]
+    unsupported_reversed: bool,
+}
+
+impl ListBuffersArgs {
+    pub(crate) fn unsupported_flag(&self) -> Option<&'static str> {
+        if self.unsupported_reversed {
+            Some("-r")
+        } else if self.unsupported_sort_order.is_some() {
+            Some("-O")
+        } else {
+            None
+        }
+    }
 }

@@ -1,5 +1,7 @@
 use regex::RegexBuilder;
 
+use crate::utf8::{text_width, truncate_right_to_width, truncate_to_width, Utf8Config};
+
 use super::FormatModifier;
 
 /// Shell quoting: backslash-escapes tmux shell special characters.
@@ -70,25 +72,46 @@ pub(super) fn apply_substitution(value: &str, modifier: &FormatModifier) -> Stri
         .case_insensitive(case_insensitive)
         .build()
     {
-        Ok(regex) => regex.replace_all(value, replacement.as_str()).into_owned(),
+        Ok(regex) => regex
+            .replace_all(value, tmux_regex_replacement(replacement).as_str())
+            .into_owned(),
         Err(_) => value.replace(pattern, replacement),
     }
 }
 
+fn tmux_regex_replacement(replacement: &str) -> String {
+    let mut translated = String::with_capacity(replacement.len());
+    let mut chars = replacement.chars().peekable();
+
+    while let Some(character) = chars.next() {
+        match character {
+            '\\' if chars.peek().is_some_and(char::is_ascii_digit) => {
+                translated.push_str("${");
+                translated.push(chars.next().expect("peeked digit exists"));
+                translated.push('}');
+            }
+            '$' => translated.push_str("$$"),
+            _ => translated.push(character),
+        }
+    }
+
+    translated
+}
+
 pub(super) fn truncate_left(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
+    let config = Utf8Config::default();
+    if text_width(s, &config) <= max {
         s.to_owned()
     } else {
-        chars[..max].iter().collect()
+        truncate_to_width(s, max, &config)
     }
 }
 
 pub(super) fn truncate_right(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
-        s.to_owned()
-    } else {
-        chars[chars.len() - max..].iter().collect()
+    let config = Utf8Config::default();
+    if text_width(s, &config) <= max {
+        return s.to_owned();
     }
+
+    truncate_right_to_width(s, max, &config)
 }

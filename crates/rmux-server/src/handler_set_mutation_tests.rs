@@ -113,7 +113,7 @@ async fn terminal_features_append_preserves_order_and_invalid_requests_fail_firs
         })
     );
 
-    let invalid_append = handler
+    let scalar_append = handler
         .handle(Request::SetOption(SetOptionRequest {
             scope: ScopeSelector::Global,
             option: OptionName::Status,
@@ -122,8 +122,8 @@ async fn terminal_features_append_preserves_order_and_invalid_requests_fail_firs
         }))
         .await;
     assert_eq!(
-        invalid_append,
-        Response::Error(ErrorResponse {
+        scalar_append,
+        Response::Error(rmux_proto::ErrorResponse {
             error: RmuxError::InvalidSetOption("status is not an array option".to_owned()),
         })
     );
@@ -152,6 +152,7 @@ async fn terminal_features_append_preserves_order_and_invalid_requests_fail_firs
             "xterm*:clipboard:ccolour:cstyle:focus:title,screen*:title,rxvt*:ignorefkeys,xterm*:RGB,screen*:AX"
         )
     );
+    assert_eq!(state.options.global_value(OptionName::Status), None);
 }
 
 #[tokio::test]
@@ -177,6 +178,8 @@ async fn set_option_by_name_refreshes_existing_transcripts_for_server_utf8_optio
                 only_if_unset: false,
                 unset: false,
                 unset_pane_overrides: false,
+                format: false,
+                format_target: None,
             }))
             .await,
         Response::SetOptionByName(rmux_proto::SetOptionByNameResponse {

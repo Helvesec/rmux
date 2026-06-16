@@ -3,7 +3,8 @@ use rmux_proto::{ErrorResponse, HookName, Response, ScopeSelector, Target};
 
 use super::super::{
     client_environment_snapshot, client_spawn_environment, prepare_lifecycle_event,
-    scripting_support::format_context_for_target, RequestHandler,
+    scripting_support::{format_context_for_target, render_start_directory_template},
+    RequestHandler,
 };
 use crate::format_runtime::render_runtime_template;
 use crate::hook_runtime::PendingInlineHookFormat;
@@ -66,14 +67,25 @@ impl RequestHandler {
     pub(in crate::handler) async fn handle_respawn_pane(
         &self,
         requester_pid: u32,
-        request: rmux_proto::RespawnPaneRequest,
+        mut request: rmux_proto::RespawnPaneRequest,
     ) -> Response {
         let session_name = request.target.session_name().clone();
+        let target = request.target.clone();
         let socket_path = self.socket_path();
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
+        let attached_count = self.attached_count(&session_name).await;
         let response = {
             let mut state = self.state.lock().await;
+            request.start_directory = match render_start_directory_template(
+                &state,
+                &Target::Pane(target),
+                attached_count,
+                request.start_directory,
+            ) {
+                Ok(start_directory) => start_directory,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
             match state.respawn_pane(
                 request,
                 &socket_path,

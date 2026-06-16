@@ -10,10 +10,10 @@ pub(super) struct FormatModifier {
 }
 
 /// Single-char modifiers that take no arguments when followed by `;` or `:`.
-const SINGLE_NO_ARG: &[u8] = b"labcdnwETSWPL!<>";
+const SINGLE_NO_ARG: &[u8] = b"labcdnwETSWPL<>";
 
 /// Double-char modifiers that take no arguments.
-const DOUBLE_NO_ARG: &[&str] = &["||", "&&", "!!", "!=", "==", "<=", ">="];
+const DOUBLE_NO_ARG: &[&str] = &["||", "&&", "!=", "==", "<=", ">="];
 
 /// Single-char modifiers that may take arguments.
 const SINGLE_WITH_ARG: &[u8] = b"mCLNPSst=pReqW";

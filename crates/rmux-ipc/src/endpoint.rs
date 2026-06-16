@@ -30,6 +30,8 @@ const FALLBACK_SOCKET_ROOT: &str = "/tmp";
 const RMUX_ENV: &str = "RMUX";
 #[cfg(unix)]
 const RMUX_TMPDIR_ENV: &str = "RMUX_TMPDIR";
+#[cfg(unix)]
+const TMUX_TMPDIR_ENV: &str = "TMUX_TMPDIR";
 const SOCKET_DIR_PREFIX: &str = "rmux";
 #[cfg(windows)]
 const PIPE_PREFIX: &str = r"\\.\pipe\";
@@ -38,13 +40,34 @@ const PIPE_PREFIX: &str = r"\\.\pipe\";
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LocalEndpoint {
     path: PathBuf,
+    #[cfg(target_os = "linux")]
+    kind: UnixEndpointKind,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum UnixEndpointKind {
+    Filesystem,
+    Abstract,
 }
 
 impl LocalEndpoint {
     /// Builds an endpoint from an explicit Unix socket path.
     #[must_use]
     pub fn from_path(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            #[cfg(target_os = "linux")]
+            kind: UnixEndpointKind::Filesystem,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn from_linux_abstract_name(name: Vec<u8>) -> Self {
+        Self {
+            path: path_buf_from_bytes(name),
+            kind: UnixEndpointKind::Abstract,
+        }
     }
 
     /// Returns the Unix socket path for this endpoint.
@@ -57,6 +80,46 @@ impl LocalEndpoint {
     #[must_use]
     pub fn into_path(self) -> PathBuf {
         self.path
+    }
+
+    /// Returns whether this endpoint is backed by a filesystem socket path.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn is_filesystem_path(&self) -> bool {
+        self.is_filesystem_path_impl()
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn is_filesystem_path_impl(&self) -> bool {
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_filesystem_path_impl(&self) -> bool {
+        matches!(self.kind, UnixEndpointKind::Filesystem)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn socket_addr_unix(&self) -> io::Result<rustix::net::SocketAddrUnix> {
+        self.socket_addr_unix_impl()
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn socket_addr_unix_impl(&self) -> io::Result<rustix::net::SocketAddrUnix> {
+        rustix::net::SocketAddrUnix::new(&self.path).map_err(Into::into)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn socket_addr_unix_impl(&self) -> io::Result<rustix::net::SocketAddrUnix> {
+        match self.kind {
+            UnixEndpointKind::Filesystem => {
+                rustix::net::SocketAddrUnix::new(&self.path).map_err(Into::into)
+            }
+            UnixEndpointKind::Abstract => rustix::net::SocketAddrUnix::new_abstract_name(
+                os_str_bytes(self.path.as_os_str()).as_ref(),
+            )
+            .map_err(Into::into),
+        }
     }
 
     /// Returns the Windows named-pipe path for this endpoint.
@@ -80,7 +143,18 @@ pub fn endpoint_for_label(label: impl AsRef<OsStr>) -> io::Result<LocalEndpoint>
 #[cfg(unix)]
 fn endpoint_for_label_impl(label: &OsStr) -> io::Result<LocalEndpoint> {
     let user_id = rmux_os::identity::real_user_id();
-    endpoint_from_parts(std::env::var_os(RMUX_TMPDIR_ENV).as_deref(), user_id, label)
+    let tmpdir = socket_tmpdir_env();
+    endpoint_from_parts(tmpdir.as_deref(), user_id, label)
+}
+
+#[cfg(unix)]
+fn socket_tmpdir_env() -> Option<OsString> {
+    non_empty_env(RMUX_TMPDIR_ENV).or_else(|| non_empty_env(TMUX_TMPDIR_ENV))
+}
+
+#[cfg(unix)]
+fn non_empty_env(name: &str) -> Option<OsString> {
+    std::env::var_os(name).filter(|value| !value.is_empty())
 }
 
 #[cfg(windows)]
@@ -116,7 +190,8 @@ fn endpoint_from_parts(
 
 /// Resolves the top-level endpoint from `-L`, `-S`, `$RMUX`, or defaults.
 ///
-/// `-S` wins over `-L`; both command-line forms win over `$RMUX`.
+/// `-S` wins over `-L`; both command-line forms win over inherited
+/// multiplexer environment.
 pub fn resolve_endpoint(
     socket_name: Option<&OsStr>,
     socket_path: Option<&Path>,
@@ -130,17 +205,23 @@ pub fn resolve_endpoint(
     if let Some(socket_path) = socket_path_from_rmux_env(std::env::var_os(RMUX_ENV).as_deref()) {
         return Ok(LocalEndpoint::from_path(socket_path));
     }
-
     default_endpoint()
 }
 
 #[cfg(unix)]
 fn endpoint_for_socket_path(socket_path: &Path) -> io::Result<LocalEndpoint> {
+    if socket_path.as_os_str().is_empty() {
+        return endpoint_for_empty_socket_path();
+    }
     Ok(LocalEndpoint::from_path(socket_path.to_path_buf()))
 }
 
 #[cfg(windows)]
 fn endpoint_for_socket_path(socket_path: &Path) -> io::Result<LocalEndpoint> {
+    if socket_path.as_os_str().is_empty() {
+        return endpoint_for_empty_socket_path();
+    }
+
     if socket_path_is_rmux_owned(socket_path) {
         return Ok(LocalEndpoint::from_path(socket_path.to_path_buf()));
     }
@@ -148,6 +229,23 @@ fn endpoint_for_socket_path(socket_path: &Path) -> io::Result<LocalEndpoint> {
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "Windows -S requires an explicit \\\\.\\pipe\\rmux-... endpoint; use -L for labels",
+    ))
+}
+
+fn endpoint_for_empty_socket_path() -> io::Result<LocalEndpoint> {
+    endpoint_for_empty_socket_path_impl()
+}
+
+#[cfg(target_os = "linux")]
+fn endpoint_for_empty_socket_path_impl() -> io::Result<LocalEndpoint> {
+    Ok(LocalEndpoint::from_linux_abstract_name(Vec::new()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn endpoint_for_empty_socket_path_impl() -> io::Result<LocalEndpoint> {
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "-S '' is only supported on Linux abstract Unix sockets",
     ))
 }
 
@@ -174,36 +272,41 @@ pub fn socket_root_from_parts(rmux_tmpdir: Option<&OsStr>) -> io::Result<PathBuf
 }
 
 fn socket_path_from_rmux_env(rmux: Option<&OsStr>) -> Option<PathBuf> {
-    let rmux = rmux?;
-    let bytes = os_str_bytes(rmux);
+    socket_path_from_env(rmux)
+}
+
+#[cfg(all(test, unix))]
+fn socket_path_from_mux_env(rmux: Option<&OsStr>) -> Option<PathBuf> {
+    socket_path_from_env(rmux)
+}
+
+fn socket_path_from_env(value: Option<&OsStr>) -> Option<PathBuf> {
+    let value = value?;
+    let bytes = os_str_bytes(value);
     if bytes.is_empty() || bytes.first() == Some(&b',') {
         return None;
     }
 
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == b',')
-        .unwrap_or(bytes.len());
+    let end = match bytes.iter().position(|byte| *byte == b',') {
+        Some(end) => end,
+        None => bytes.len(),
+    };
     let path = path_buf_from_bytes(bytes[..end].to_vec());
-    socket_path_is_rmux_owned(&path).then_some(path)
-}
-
-fn socket_path_is_rmux_owned(path: &Path) -> bool {
-    socket_path_is_rmux_owned_impl(path)
+    inherited_socket_path(path)
 }
 
 #[cfg(unix)]
-fn socket_path_is_rmux_owned_impl(path: &Path) -> bool {
-    path.parent()
-        .and_then(Path::file_name)
-        .and_then(OsStr::to_str)
-        .is_some_and(|name| {
-            name.starts_with(SOCKET_DIR_PREFIX) && name[SOCKET_DIR_PREFIX.len()..].starts_with('-')
-        })
+fn inherited_socket_path(path: PathBuf) -> Option<PathBuf> {
+    path.is_absolute().then_some(path)
 }
 
 #[cfg(windows)]
-fn socket_path_is_rmux_owned_impl(path: &Path) -> bool {
+fn inherited_socket_path(path: PathBuf) -> Option<PathBuf> {
+    socket_path_is_rmux_owned(&path).then_some(path)
+}
+
+#[cfg(windows)]
+fn socket_path_is_rmux_owned(path: &Path) -> bool {
     let value = path.as_os_str().to_string_lossy();
     let Some(rest) = strip_ascii_prefix(&value, PIPE_PREFIX) else {
         return false;
@@ -383,6 +486,16 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::ffi::OsStr;
+    #[cfg(unix)]
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex,
+    };
+
+    #[cfg(unix)]
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    #[cfg(unix)]
+    static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     #[cfg(unix)]
     #[test]
@@ -392,6 +505,31 @@ mod tests {
 
         assert!(path_string.ends_with("/default"));
         assert!(path_string.contains("/rmux-"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn empty_socket_path_uses_a_stable_non_default_endpoint() {
+        let empty = resolve_endpoint(None, Some(Path::new(""))).expect("empty -S endpoint");
+        assert!(!empty.is_filesystem_path());
+        let empty_path = empty.clone().into_path();
+        let repeated = resolve_endpoint(None, Some(Path::new("")))
+            .expect("repeated empty -S endpoint")
+            .into_path();
+        let default = default_endpoint().expect("default endpoint").into_path();
+
+        assert_eq!(empty_path, repeated);
+        assert_ne!(empty_path, default);
+        assert!(empty_path.as_os_str().is_empty());
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn empty_socket_path_is_rejected_without_linux_abstract_sockets() {
+        let error = resolve_endpoint(None, Some(Path::new("")))
+            .expect_err("empty -S endpoint should be unsupported");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[cfg(unix)]
@@ -404,6 +542,40 @@ mod tests {
             .expect("socket root"),
             std::fs::canonicalize("/tmp").expect("canonical /tmp")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_tmpdir_sets_the_label_socket_root() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let root = unique_socket_root("tmux-tmpdir-fallback");
+        let root = std::fs::canonicalize(root).expect("canonical tmpdir root");
+        let _rmux = EnvGuard::remove(RMUX_TMPDIR_ENV);
+        let _tmux = EnvGuard::set(TMUX_TMPDIR_ENV, root.as_os_str());
+
+        let path = endpoint_for_label("tmux-tmpdir-label")
+            .expect("endpoint")
+            .into_path();
+
+        assert_eq!(socket_label_root(&path), Some(root.as_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rmux_tmpdir_wins_over_tmux_tmpdir() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let rmux_root = unique_socket_root("rmux-tmpdir-priority");
+        let rmux_root = std::fs::canonicalize(rmux_root).expect("canonical rmux tmpdir root");
+        let tmux_root = unique_socket_root("tmux-tmpdir-priority");
+        let tmux_root = std::fs::canonicalize(tmux_root).expect("canonical tmux tmpdir root");
+        let _rmux = EnvGuard::set(RMUX_TMPDIR_ENV, rmux_root.as_os_str());
+        let _tmux = EnvGuard::set(TMUX_TMPDIR_ENV, tmux_root.as_os_str());
+
+        let path = endpoint_for_label("tmpdir-priority-label")
+            .expect("endpoint")
+            .into_path();
+
+        assert_eq!(socket_label_root(&path), Some(rmux_root.as_path()));
     }
 
     #[cfg(windows)]
@@ -443,6 +615,92 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn tmux_env_accepts_rmux_owned_socket_endpoint() {
+        let path = socket_path_from_mux_env(Some(OsStr::new("/tmp/rmux-1000/default,123,0")))
+            .expect("tmux socket endpoint");
+
+        assert_eq!(path, PathBuf::from("/tmp/rmux-1000/default"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mux_env_accepts_explicit_unix_socket_endpoint() {
+        let path = socket_path_from_mux_env(Some(OsStr::new("/tmp/custom-rmux.sock,123,0")))
+            .expect("explicit socket endpoint");
+
+        assert_eq!(path, PathBuf::from("/tmp/custom-rmux.sock"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rmux_env_accepts_explicit_unix_socket_without_tmux_suffix() {
+        let path = socket_path_from_rmux_env(Some(OsStr::new("/tmp/custom-rmux.sock")))
+            .expect("explicit rmux socket endpoint");
+
+        assert_eq!(path, PathBuf::from("/tmp/custom-rmux.sock"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mux_env_rejects_relative_socket_endpoint() {
+        assert_eq!(
+            socket_path_from_mux_env(Some(OsStr::new("relative.sock,123,0"))),
+            None
+        );
+        assert_eq!(
+            socket_path_from_rmux_env(Some(OsStr::new("relative.sock"))),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    fn unique_socket_root(name: &str) -> PathBuf {
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("rmux-ipc-{name}-{}-{counter}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create socket root");
+        root
+    }
+
+    #[cfg(unix)]
+    fn socket_label_root(path: &Path) -> Option<&Path> {
+        path.parent().and_then(Path::parent)
+    }
+
+    #[cfg(unix)]
+    struct EnvGuard {
+        name: &'static str,
+        previous: Option<OsString>,
+    }
+
+    #[cfg(unix)]
+    impl EnvGuard {
+        fn set(name: &'static str, value: &OsStr) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+
+        fn remove(name: &'static str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::remove_var(name);
+            Self { name, previous }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.name, previous);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn rmux_env_accepts_windows_named_pipe_endpoint() {
@@ -459,9 +717,27 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn rmux_env_rejects_explicit_custom_windows_pipe_endpoint() {
+        let path =
+            socket_path_from_rmux_env(Some(OsStr::new(r"\\.\pipe\external-peer-default,123,0")));
+
+        assert_eq!(path, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_socket_path_rejects_non_rmux_pipe() {
         let error = endpoint_for_socket_path(Path::new(r"\\.\pipe\external-peer-default"))
             .expect_err("non-rmux pipe should be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_socket_path_rejects_non_pipe_path() {
+        let error = endpoint_for_socket_path(Path::new(r"C:\tmp\rmux.sock"))
+            .expect_err("non-pipe path should be rejected");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }

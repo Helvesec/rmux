@@ -13,7 +13,7 @@ English · [Français](README.fr.md) · [简体中文](README.zh-CN.md) · [日�
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![Release validation](https://github.com/Helvesec/rmux/actions/workflows/ci.yml/badge.svg)](https://github.com/Helvesec/rmux/actions/workflows/ci.yml)
-[![rmux 0.5.0](https://img.shields.io/badge/rmux-0.5.0-informational.svg)](#install)
+[![rmux 0.6.0](https://img.shields.io/badge/rmux-0.6.0-informational.svg)](#install)
 [![Platform: Linux | macOS | Windows](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#platform-support)
 [![Unsafe policy](https://img.shields.io/badge/unsafe-restricted-success.svg)](#verification)
 
@@ -112,11 +112,11 @@ sudo curl -fsSL https://packages.rmux.io/rpm/rmux.repo -o /etc/yum.repos.d/rmux.
 sudo dnf install rmux
 ```
 
-Direct downloads are available from the [v0.5.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.5.0):
+Direct downloads are available from the [v0.6.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.6.0):
 
-- `rmux-0.5.0-linux-x86_64.tar.gz`
-- `rmux_0.5.0_amd64.deb`
-- `rmux-0.5.0-1.x86_64.rpm`
+- `rmux-0.6.0-linux-x86_64.tar.gz`
+- `rmux_0.6.0_amd64.deb`
+- `rmux-0.6.0-1.x86_64.rpm`
 
 </details>
 
@@ -136,10 +136,10 @@ curl -fsSL https://rmux.io/install.sh | sh
 brew install helvesec/rmux/rmux
 ```
 
-Direct downloads are available from the [v0.5.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.5.0):
+Direct downloads are available from the [v0.6.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.6.0):
 
-- `rmux-0.5.0-macos-aarch64.tar.gz`
-- `rmux-0.5.0-macos-x86_64.tar.gz`
+- `rmux-0.6.0-macos-aarch64.tar.gz`
+- `rmux-0.6.0-macos-x86_64.tar.gz`
 
 </details>
 
@@ -160,9 +160,9 @@ scoop bucket add rmux https://github.com/Helvesec/scoop-rmux
 scoop install rmux
 ```
 
-Direct downloads are available from the [v0.5.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.5.0):
+Direct downloads are available from the [v0.6.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.6.0):
 
-- `rmux-0.5.0-windows-x86_64.zip`
+- `rmux-0.6.0-windows-x86_64.zip`
 
 </details>
 
@@ -193,7 +193,7 @@ cargo add ratatui-rmux
 
 </details>
 
-SHA256 checksums are published with every GitHub Release. APT, DNF, Homebrew, and Scoop packages are live for v0.5.0. WinGet and Chocolatey metadata is generated for release submission.
+SHA256 checksums are published with every GitHub Release. APT, DNF, Homebrew, Scoop, Chocolatey, and WinGet metadata are generated from the same release assets.
 
 ## Documentation
 
@@ -205,6 +205,7 @@ It includes:
 - [CLI reference](https://rmux.io/docs/cli/)
 - [Examples](https://rmux.io/docs/examples/)
 - [API reference](https://rmux.io/docs/api/)
+- [Repository SDK overview](docs/scripting-sdk.md)
 - [Web Share](https://rmux.io/docs/web-share/)
 
 For an ergonomic, human-oriented profile that keeps native terminal selection intuitive while adding easier split bindings and clipboard integration, see [docs/human-friendly-config.md](docs/human-friendly-config.md).
@@ -233,7 +234,7 @@ Use `rmux -V` for the RMUX package version. For build and support details, use `
 
 ```toml
 [dependencies]
-rmux-sdk = "0.5"
+rmux-sdk = "0.6"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -290,9 +291,9 @@ fn render(snapshot: PaneSnapshot, area: Rect, buffer: &mut Buffer) {
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://rmux.io/rmux-architecture-dark.png?v=0.5.0-web-share">
-  <source media="(prefers-color-scheme: light)" srcset="https://rmux.io/rmux-architecture-light.png?v=0.5.0-web-share">
-  <img src="https://rmux.io/rmux-architecture-dark.png?v=0.5.0-web-share" alt="RMUX runtime architecture" width="800">
+  <source media="(prefers-color-scheme: dark)" srcset="https://rmux.io/rmux-architecture-dark.png?v=0.6.0-web-share">
+  <source media="(prefers-color-scheme: light)" srcset="https://rmux.io/rmux-architecture-light.png?v=0.6.0-web-share">
+  <img src="https://rmux.io/rmux-architecture-dark.png?v=0.6.0-web-share" alt="RMUX runtime architecture" width="800">
 </picture>
 
 </div>
@@ -343,14 +344,16 @@ On Windows, RMUX reads `.rmux.conf` from:
 
 ### `tmux.conf` migration fallback
 
-When RMUX starts with the default config search and no RMUX config file is loaded, it can import a filtered `tmux.conf` as a migration fallback. Explicit config loading with `-f` does not use this fallback.
+When RMUX starts with the default config search and no RMUX config file is loaded, it loads `tmux.conf` as a migration fallback. Explicit config loading with `-f` does not use this fallback.
 
 Fallback paths:
 
 - Linux and macOS: `/etc/tmux.conf`, `~/.tmux.conf`, `$XDG_CONFIG_HOME/tmux/tmux.conf`, `~/.config/tmux/tmux.conf`
 - Windows: `%XDG_CONFIG_HOME%\tmux\tmux.conf`, `%USERPROFILE%\.tmux.conf`, `%APPDATA%\tmux\tmux.conf`
 
-RMUX imports supported static options and key unbindings. It skips tmux key bindings, environment or terminal capability mutations, plugin user options and hooks, shell commands, command blocks, conditionals, format jobs such as `#(cmd)`, recursive `source-file` entries, and unsupported options. Set `RMUX_DISABLE_TMUX_FALLBACK=1` to disable the fallback.
+RMUX parses fallback files as tmux command files and executes supported commands in order, including user options, hooks, `run-shell`, conditionals, recursive `source-file`, and status jobs such as `#(cmd)`. Unsupported commands and invalid lines are reported with file and line context, but config loading continues so a single plugin-specific command does not prevent the session from starting. Set `RMUX_DISABLE_TMUX_FALLBACK=1` to disable the fallback.
+
+Inside RMUX panes, hooks, status jobs, and `run-shell`, RMUX prepends a private per-socket shim directory to `PATH` and exports `TMUX_PROGRAM`. The shim provides `tmux` by routing back to RMUX, so TPM and common tmux plugins can call `tmux` without changing user config. Set `RMUX_DISABLE_TMUX_SHIM=1` only if an environment deliberately wants plugin scripts to reach a real external tmux binary.
 
 ## Terminal Compatibility Notes
 

@@ -1,0 +1,6 @@
+[test-groups]
+daemon-integration = { max-threads = 6 }
+
+[[profile.default.overrides]]
+filter = 'kind(test) & (package(rmux) | package(rmux-client) | package(rmux-server) | package(rmux-sdk) | package(rmux-pty))'
+test-group = 'daemon-integration'

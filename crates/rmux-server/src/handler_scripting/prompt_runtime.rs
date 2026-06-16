@@ -32,6 +32,7 @@ impl RequestHandler {
                 return Ok(QueueCommandAction::Normal {
                     output: None,
                     error: None,
+                    exit_status: None,
                 });
             }
             PromptStartOutcome::Waiting(receiver) => {
@@ -154,6 +155,7 @@ impl RequestHandler {
                 return Ok(QueueCommandAction::Normal {
                     output: None,
                     error: None,
+                    exit_status: None,
                 });
             }
             PromptStartOutcome::Waiting(receiver) => {
@@ -190,7 +192,7 @@ impl RequestHandler {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(task);
         } else {
-            spawn_background_async("rmux-attached-prompt-finish", move || task);
+            let _ = spawn_background_async("rmux-attached-prompt-finish", move || task);
         }
     }
 

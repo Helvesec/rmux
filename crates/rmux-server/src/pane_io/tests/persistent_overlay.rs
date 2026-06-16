@@ -19,9 +19,11 @@ async fn forward_attach_clears_persistent_overlay_with_fresh_switch_frame() {
         Vec::new(),
         shutdown_rx,
         control_rx,
+        Arc::new(AtomicUsize::new(0)),
         closing,
         Arc::new(AtomicU64::new(0)),
         live_input,
+        false,
     ));
 
     let initial = read_attach_data_until(&mut peer, b"BASE-OLD").await;
@@ -93,9 +95,11 @@ async fn forward_attach_does_not_paint_stale_base_while_overlay_dismiss_refresh_
         Vec::new(),
         shutdown_rx,
         control_rx,
+        Arc::new(AtomicUsize::new(0)),
         closing,
         Arc::new(AtomicU64::new(0)),
         live_input,
+        false,
     ));
 
     let _ = read_attach_data_until(&mut peer, b"STALE-BASE").await;
@@ -161,9 +165,11 @@ async fn forward_attach_defers_kitty_passthroughs_until_persistent_overlay_clear
         Vec::new(),
         shutdown_rx,
         control_rx,
+        Arc::new(AtomicUsize::new(0)),
         closing,
         Arc::new(AtomicU64::new(0)),
         live_input,
+        false,
     ));
 
     let _ = read_attach_data_until(&mut peer, b"BASE-0").await;
@@ -246,9 +252,11 @@ async fn forward_attach_defers_sixel_passthroughs_until_persistent_overlay_clear
         Vec::new(),
         shutdown_rx,
         control_rx,
+        Arc::new(AtomicUsize::new(0)),
         closing,
         Arc::new(AtomicU64::new(0)),
         live_input,
+        false,
     ));
 
     let _ = read_attach_data_until(&mut peer, b"BASE-0").await;
@@ -320,9 +328,11 @@ async fn forward_attach_drops_kitty_passthroughs_when_target_gate_is_disabled() 
         Vec::new(),
         shutdown_rx,
         control_rx,
+        Arc::new(AtomicUsize::new(0)),
         closing,
         Arc::new(AtomicU64::new(0)),
         live_input,
+        false,
     ));
 
     let _ = read_attach_data_until(&mut peer, b"BASE-0").await;
@@ -369,7 +379,7 @@ async fn read_attach_data_for(peer: &mut tokio::net::UnixStream, duration: Durat
                 }
                 decoder.push_bytes(&frame_bytes[..bytes_read]);
                 while let Some(message) = decoder.next_message().expect("decode attach frame") {
-                    if let AttachMessage::Data(bytes) = message {
+                    if let AttachMessage::Data(bytes) | AttachMessage::Render(bytes) = message {
                         collected.extend_from_slice(&bytes);
                     }
                 }

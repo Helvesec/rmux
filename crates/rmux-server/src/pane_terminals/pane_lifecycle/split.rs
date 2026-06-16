@@ -4,7 +4,7 @@
 //! the split flow — which is dense with rollback paths — owns its own
 //! module. Keeps the same `impl HandlerState` so callers see no API change.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rmux_proto::{
     OptionName, PaneTarget, ProcessCommand, RmuxError, ScopeSelector, SetOptionMode,
@@ -26,6 +26,15 @@ use super::clone_terminal_for_exit_watcher;
 use super::clone_terminal_for_output_reader;
 use super::preview::{preview_split, split_window_internal_direction, split_window_session_name};
 
+type CommittedSplit = (
+    rmux_core::SessionId,
+    rmux_core::WindowId,
+    rmux_core::PaneId,
+    u32,
+    rmux_core::PaneGeometry,
+    Option<PathBuf>,
+);
+
 impl HandlerState {
     /// Splits the addressed pane, spawning a new pane terminal.
     ///
@@ -44,6 +53,7 @@ impl HandlerState {
         start_directory: Option<&Path>,
         keep_alive_on_exit: Option<bool>,
         split_size: Option<u32>,
+        full_size: bool,
         pane_alert_callback: Option<PaneAlertCallback>,
         pane_exit_callback: Option<PaneExitCallback>,
     ) -> Result<SplitWindowResponse, RmuxError> {
@@ -60,19 +70,26 @@ impl HandlerState {
         let runtime_session_name =
             self.runtime_session_name_for_window(&session_name, window_index);
         let new_pane_id = self.sessions.allocate_pane_id();
-        let (session_id, window_id, new_pane_id, new_pane_geometry, requested_cwd) = self
-            .commit_split_into_session(
-                &session_name,
-                &target,
-                window_index,
-                new_pane_id,
-                new_pane_index,
-                internal_direction,
-                before,
-                split_size,
-            )?;
+        let (
+            session_id,
+            window_id,
+            new_pane_id,
+            committed_pane_index,
+            new_pane_geometry,
+            requested_cwd,
+        ) = self.commit_split_into_session(
+            &session_name,
+            &target,
+            window_index,
+            new_pane_id,
+            new_pane_index,
+            internal_direction,
+            before,
+            split_size,
+            full_size,
+        )?;
         let new_target =
-            PaneTarget::with_window(session_name.clone(), window_index, new_pane_index);
+            PaneTarget::with_window(session_name.clone(), window_index, committed_pane_index);
         if let Some(keep_alive) = keep_alive_on_exit {
             self.options.set(
                 ScopeSelector::Pane(new_target.clone()),
@@ -82,12 +99,21 @@ impl HandlerState {
             )?;
         }
 
-        let profile = match TerminalProfile::for_session(
+        let base_environment = match &target {
+            SplitWindowTarget::Session(session_name) => {
+                self.session_base_environment_for_active_pane(session_name)
+            }
+            SplitWindowTarget::Pane(target) => {
+                self.session_base_environment_for_pane_target(target)
+            }
+        };
+        let profile = match TerminalProfile::for_session_with_base_environment(
             &self.environment,
             &self.options,
             &session_name,
             session_id.as_u32(),
             socket_path,
+            base_environment.as_ref(),
             spawn_environment,
             true,
             environment_overrides,
@@ -222,16 +248,8 @@ impl HandlerState {
         direction: SplitDirection,
         before: bool,
         split_size: Option<u32>,
-    ) -> Result<
-        (
-            rmux_core::SessionId,
-            rmux_core::WindowId,
-            rmux_core::PaneId,
-            rmux_core::PaneGeometry,
-            Option<std::path::PathBuf>,
-        ),
-        RmuxError,
-    > {
+        full_size: bool,
+    ) -> Result<CommittedSplit, RmuxError> {
         // Capture `cwd` as an owned `PathBuf` so the caller can keep it past
         // the `&mut SessionStore` borrow.
         let session = self
@@ -244,14 +262,25 @@ impl HandlerState {
             }
             SplitWindowTarget::Pane(pane) => (pane.window_index(), pane.pane_index()),
         };
-        let committed_index = session.split_pane_in_window_with_id_and_direction_before(
-            target_window_index,
-            target_pane_index,
-            new_pane_id,
-            direction,
-            before,
-        )?;
-        debug_assert_eq!(committed_index, expected_pane_index);
+        let committed_index = if full_size {
+            session.split_pane_full_size_in_window_with_id_and_direction_before(
+                target_window_index,
+                target_pane_index,
+                new_pane_id,
+                direction,
+                before,
+            )?
+        } else {
+            let committed_index = session.split_pane_in_window_with_id_and_direction_before(
+                target_window_index,
+                target_pane_index,
+                new_pane_id,
+                direction,
+                before,
+            )?;
+            debug_assert_eq!(committed_index, expected_pane_index);
+            committed_index
+        };
         if let Some(split_size) = split_size {
             session.resize_pane_to_in_window(
                 target_window_index,
@@ -266,8 +295,12 @@ impl HandlerState {
             .pane(committed_index)
             .ok_or_else(|| missing_pane_terminal(session_name, window_index, committed_index))?;
         let pane_id = pane.id();
-        let pane_geometry =
-            pane_terminal_geometry_for_session(session, &self.options, pane.geometry());
+        let pane_geometry = pane_terminal_geometry_for_session(
+            session,
+            &self.options,
+            window_index,
+            pane.geometry(),
+        );
         let window_id = session
             .window_at(window_index)
             .expect("split target window must exist")
@@ -276,6 +309,7 @@ impl HandlerState {
             session.id(),
             window_id,
             pane_id,
+            committed_index,
             pane_geometry,
             session.cwd().map(std::path::Path::to_path_buf),
         ))

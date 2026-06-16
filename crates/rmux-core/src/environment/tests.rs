@@ -30,6 +30,32 @@ fn global_set_then_read_returns_the_exact_value() {
     assert_eq!(store.resolve(None, "TERM"), Some("xterm-256color"));
 }
 
+#[cfg(windows)]
+#[test]
+fn named_show_environment_lookup_is_case_insensitive_on_windows() {
+    let mut store = EnvironmentStore::new();
+
+    store.set(
+        ScopeSelector::Global,
+        "Path".to_owned(),
+        "C:\\rmux".to_owned(),
+    );
+
+    let entries = store
+        .show_environment_entries(&ScopeSelector::Global, false, Some("PATH"))
+        .expect("case-insensitive lookup succeeds");
+
+    assert_eq!(
+        entries,
+        vec![ShowEnvironmentEntry {
+            name: "Path".to_owned(),
+            value: Some("C:\\rmux".to_owned()),
+            flags: 0,
+            value_is_display_escape: false,
+        }]
+    );
+}
+
 #[test]
 fn session_values_override_global_values_in_resolved_snapshots() {
     let mut store = EnvironmentStore::new();
@@ -102,6 +128,78 @@ fn hidden_and_cleared_entries_are_suppressed_from_child_environment() {
 }
 
 #[test]
+fn implicit_globals_can_be_skipped_for_client_based_spawn_environments() {
+    let mut store = EnvironmentStore::new();
+    let alpha = session_name("alpha");
+    let mut default_process_environment = HashMap::from([("FOO".to_owned(), "client".to_owned())]);
+    let mut client_based_environment = default_process_environment.clone();
+
+    store.set_implicit_global("FOO".to_owned(), "server".to_owned());
+    store.set_implicit_global("BAR".to_owned(), "server-only".to_owned());
+
+    store.apply_to_process_environment(Some(&alpha), &mut default_process_environment);
+    assert_eq!(
+        default_process_environment.get("FOO").map(String::as_str),
+        Some("server")
+    );
+    assert_eq!(
+        default_process_environment.get("BAR").map(String::as_str),
+        Some("server-only")
+    );
+
+    store.apply_to_process_environment_without_implicit_globals(
+        Some(&alpha),
+        &mut client_based_environment,
+    );
+    assert_eq!(
+        client_based_environment.get("FOO").map(String::as_str),
+        Some("client")
+    );
+    assert_eq!(client_based_environment.get("BAR"), None);
+
+    store.set(
+        ScopeSelector::Global,
+        "FOO".to_owned(),
+        "explicit-global".to_owned(),
+    );
+    store.apply_to_process_environment_without_implicit_globals(
+        Some(&alpha),
+        &mut client_based_environment,
+    );
+    assert_eq!(
+        client_based_environment.get("FOO").map(String::as_str),
+        Some("explicit-global")
+    );
+}
+
+#[test]
+fn display_only_implicit_globals_are_not_applied_to_child_environments() {
+    let mut store = EnvironmentStore::new();
+    let alpha = session_name("alpha");
+    let mut process_environment = HashMap::from([("RAW".to_owned(), "raw-bytes".to_owned())]);
+
+    store.set_implicit_global_display("RAW".to_owned(), "A\\377B".to_owned());
+
+    assert_eq!(store.global_value("RAW"), None);
+    store.apply_to_process_environment(Some(&alpha), &mut process_environment);
+    assert_eq!(
+        process_environment.get("RAW").map(String::as_str),
+        Some("raw-bytes")
+    );
+    assert_eq!(
+        store
+            .show_environment_entries(&ScopeSelector::Global, false, Some("RAW"))
+            .expect("show env"),
+        vec![ShowEnvironmentEntry {
+            name: "RAW".to_owned(),
+            value: Some("A\\377B".to_owned()),
+            flags: 0,
+            value_is_display_escape: true,
+        }]
+    );
+}
+
+#[test]
 fn clear_creates_tombstone_and_unset_removes_entry() {
     let mut store = EnvironmentStore::new();
     let alpha = session_name("alpha");
@@ -119,6 +217,72 @@ fn clear_creates_tombstone_and_unset_removes_entry() {
 
     assert!(store.unset(ScopeSelector::Session(alpha.clone()), "TERM"));
     assert!(!store.contains_entry(&ScopeSelector::Session(alpha), "TERM"));
+}
+
+#[test]
+fn unset_global_suppresses_process_environment_but_session_unset_removes_only_local_entry() {
+    let mut store = EnvironmentStore::new();
+    let alpha = session_name("alpha");
+    let mut process_environment = HashMap::from([
+        ("FOO".to_owned(), "client".to_owned()),
+        ("BAR".to_owned(), "client".to_owned()),
+    ]);
+
+    assert!(!store.unset(ScopeSelector::Global, "FOO"));
+    store.unset(ScopeSelector::Session(alpha.clone()), "BAR");
+
+    store.apply_to_process_environment(Some(&alpha), &mut process_environment);
+
+    assert!(!store.contains_entry(&ScopeSelector::Global, "FOO"));
+    assert_eq!(process_environment.get("FOO"), None);
+    assert_eq!(
+        process_environment.get("BAR").map(String::as_str),
+        Some("client")
+    );
+    assert!(store
+        .show_environment_entries(&ScopeSelector::Global, false, None)
+        .expect("show env")
+        .is_empty());
+    assert_eq!(
+        store.suppressed_process_environment_names(Some(&alpha), true),
+        ["FOO".to_owned()].into_iter().collect()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn unset_global_suppresses_process_environment_case_insensitively() {
+    let mut store = EnvironmentStore::new();
+    let alpha = session_name("alpha");
+    let mut process_environment = HashMap::from([("Path".to_owned(), "client".to_owned())]);
+
+    assert!(!store.unset(ScopeSelector::Global, "PATH"));
+
+    store.apply_to_process_environment(Some(&alpha), &mut process_environment);
+
+    assert_eq!(process_environment.get("Path"), None);
+}
+
+#[cfg(windows)]
+#[test]
+fn explicit_global_set_replaces_implicit_case_insensitively() {
+    let mut store = EnvironmentStore::new();
+    let alpha = session_name("alpha");
+    let mut process_environment = HashMap::from([("RmuxCase".to_owned(), "client".to_owned())]);
+
+    store.set_implicit_global("RmuxCase".to_owned(), "base".to_owned());
+    store.set(
+        ScopeSelector::Global,
+        "RMUXCASE".to_owned(),
+        "override".to_owned(),
+    );
+    store.apply_to_process_environment(Some(&alpha), &mut process_environment);
+
+    assert_eq!(process_environment.len(), 1);
+    assert_eq!(
+        process_environment.get("RMUXCASE").map(String::as_str),
+        Some("override")
+    );
 }
 
 #[test]
@@ -148,11 +312,13 @@ fn show_environment_filters_hidden_entries_and_preserves_tombstones() {
                 name: "EMPTY".to_owned(),
                 value: None,
                 flags: 0,
+                value_is_display_escape: false,
             },
             ShowEnvironmentEntry {
                 name: "TERM".to_owned(),
                 value: Some("screen".to_owned()),
                 flags: 0,
+                value_is_display_escape: false,
             },
         ]
     );
@@ -164,6 +330,7 @@ fn show_environment_filters_hidden_entries_and_preserves_tombstones() {
             name: "SECRET".to_owned(),
             value: Some("value".to_owned()),
             flags: ENVIRON_HIDDEN,
+            value_is_display_escape: false,
         }]
     );
 }
@@ -253,6 +420,22 @@ fn removing_a_session_discards_only_its_local_values() {
 }
 
 #[test]
+fn removing_a_session_discards_its_unset_tombstones() {
+    let mut store = EnvironmentStore::new();
+    let alpha = session_name("alpha");
+    let mut process_environment = HashMap::from([("SECRET".to_owned(), "client".to_owned())]);
+
+    store.unset(ScopeSelector::Session(alpha.clone()), "SECRET");
+    let _ = store.remove_session(&alpha);
+    store.apply_to_process_environment(Some(&alpha), &mut process_environment);
+
+    assert_eq!(
+        process_environment.get("SECRET").map(String::as_str),
+        Some("client")
+    );
+}
+
+#[test]
 fn renaming_a_session_moves_only_its_local_values() {
     let mut store = EnvironmentStore::new();
     let alpha = session_name("alpha");
@@ -275,6 +458,32 @@ fn renaming_a_session_moves_only_its_local_values() {
 
     assert_eq!(store.resolve(Some(&alpha), "TERM"), Some("screen"));
     assert_eq!(store.resolve(Some(&beta), "TERM"), Some("tmux-256color"));
+}
+
+#[test]
+fn renaming_a_session_keeps_session_unset_as_local_removal_only() {
+    let mut store = EnvironmentStore::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    let mut old_environment = HashMap::from([("SECRET".to_owned(), "old".to_owned())]);
+    let mut new_environment = HashMap::from([("SECRET".to_owned(), "new".to_owned())]);
+
+    store.unset(ScopeSelector::Session(alpha.clone()), "SECRET");
+    store
+        .rename_session(&alpha, beta.clone())
+        .expect("rename succeeds");
+
+    store.apply_to_process_environment(Some(&alpha), &mut old_environment);
+    store.apply_to_process_environment(Some(&beta), &mut new_environment);
+
+    assert_eq!(
+        old_environment.get("SECRET").map(String::as_str),
+        Some("old")
+    );
+    assert_eq!(
+        new_environment.get("SECRET").map(String::as_str),
+        Some("new")
+    );
 }
 
 #[test]

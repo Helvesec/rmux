@@ -114,13 +114,23 @@ impl RequestHandler {
     }
 
     pub(crate) async fn finish_control(&self, requester_pid: u32, control_id: u64) {
-        let mut active_control = self.active_control.lock().await;
-        if active_control
-            .by_pid
-            .get(&requester_pid)
-            .is_some_and(|active| active.id == control_id)
-        {
-            active_control.by_pid.remove(&requester_pid);
+        let removed_session = {
+            let mut active_control = self.active_control.lock().await;
+            if active_control
+                .by_pid
+                .get(&requester_pid)
+                .is_some_and(|active| active.id == control_id)
+            {
+                active_control
+                    .by_pid
+                    .remove(&requester_pid)
+                    .and_then(|active| active.session_name)
+            } else {
+                None
+            }
+        };
+        if let Some(session_name) = removed_session {
+            self.destroy_unattached_sessions(vec![session_name]).await;
         }
     }
 
@@ -235,6 +245,9 @@ impl RequestHandler {
         };
 
         match attach_candidates.len() + control_candidates.len() {
+            0 if command_name == "show-messages" => Err(rmux_proto::RmuxError::Message(
+                "no current client".to_owned(),
+            )),
             0 => Err(attached_client_required(command_name)),
             1 => {
                 if let Some(pid) = attach_candidates.first().copied() {
@@ -324,6 +337,36 @@ impl RequestHandler {
                 .send(ControlServerEvent::Exit(reason.clone()))
                 .is_ok()
         });
+    }
+
+    pub(super) async fn detach_control_clients_for_session(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        reason: Option<String>,
+    ) -> Vec<u32> {
+        let mut active_control = self.active_control.lock().await;
+        let control_pids = active_control
+            .by_pid
+            .iter()
+            .filter_map(|(&pid, active)| {
+                (active.session_name.as_ref() == Some(session_name)).then_some(pid)
+            })
+            .collect::<Vec<_>>();
+
+        for control_pid in &control_pids {
+            let Some(active) = active_control.by_pid.get(control_pid) else {
+                continue;
+            };
+            active.closing.store(true, Ordering::SeqCst);
+            let _ = active
+                .event_tx
+                .send(ControlServerEvent::Exit(reason.clone()));
+        }
+        for control_pid in &control_pids {
+            active_control.by_pid.remove(control_pid);
+        }
+
+        control_pids
     }
 
     pub(super) async fn refresh_all_control_sessions(&self) {
@@ -417,6 +460,8 @@ impl RequestHandler {
             | LifecycleEvent::AlertActivity { .. }
             | LifecycleEvent::AlertSilence { .. }
             | LifecycleEvent::PaneExited { .. }
+            | LifecycleEvent::PaneDied { .. }
+            | LifecycleEvent::WindowResized { .. }
             | LifecycleEvent::AfterSelectWindow { .. }
             | LifecycleEvent::AfterSelectPane { .. }
             | LifecycleEvent::AfterSendKeys { .. }

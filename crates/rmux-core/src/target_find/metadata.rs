@@ -15,8 +15,10 @@ pub fn command_target_metadata(command_name: &str) -> Option<CommandTargetMetada
         | "respawn-pane" | "select-pane" | "send-keys" | "split-window" => {
             Some(metadata(None, Some(spec('t', Type::Pane, Flags::NONE))))
         }
-        "display-message" | "if-shell" | "show-hooks" | "show-options" | "run-shell"
-        | "source-file" => Some(metadata(None, Some(spec('t', Type::Pane, Flags::CANFAIL)))),
+        "display-menu" | "display-message" | "display-popup" | "if-shell" | "show-hooks"
+        | "show-options" | "run-shell" | "source-file" => {
+            Some(metadata(None, Some(spec('t', Type::Pane, Flags::CANFAIL))))
+        }
         "join-pane" | "move-pane" | "swap-pane" => Some(metadata(
             Some(spec('s', Type::Pane, Flags::DEFAULT_MARKED)),
             Some(spec('t', Type::Pane, Flags::NONE)),
@@ -24,7 +26,7 @@ pub fn command_target_metadata(command_name: &str) -> Option<CommandTargetMetada
         "kill-window" | "last-pane" | "list-panes" | "next-layout" | "previous-layout"
         | "rename-window" | "respawn-window" | "rotate-window" | "select-layout"
         | "select-window" => Some(metadata(None, Some(spec('t', Type::Window, Flags::NONE)))),
-        "move-window" => Some(metadata(
+        "link-window" | "move-window" => Some(metadata(
             Some(spec('s', Type::Window, Flags::NONE)),
             Some(spec('t', Type::Window, Flags::WINDOW_INDEX)),
         )),
@@ -36,8 +38,8 @@ pub fn command_target_metadata(command_name: &str) -> Option<CommandTargetMetada
             Some(spec('s', Type::Window, Flags::DEFAULT_MARKED)),
             Some(spec('t', Type::Window, Flags::NONE)),
         )),
-        "display-panes" | "has-session" | "kill-session" | "last-window" | "list-windows"
-        | "next-window" | "previous-window" | "rename-session" => {
+        "attach-session" | "display-panes" | "has-session" | "kill-session" | "last-window"
+        | "list-windows" | "next-window" | "previous-window" | "rename-session" => {
             Some(metadata(None, Some(spec('t', Type::Session, Flags::NONE))))
         }
         "set-hook" => Some(metadata(None, Some(spec('t', Type::Pane, Flags::CANFAIL)))),

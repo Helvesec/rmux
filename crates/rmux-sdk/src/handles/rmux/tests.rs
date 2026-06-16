@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io;
 use std::time::Duration;
 
@@ -7,13 +8,14 @@ use super::connect::windows_pipe_connect_retryable;
 use super::Rmux;
 use crate::diagnostics::FEATURE_PROTOCOL_CAPABILITIES;
 use crate::transport::TransportClient;
-use crate::RmuxError;
+use crate::{RmuxEndpoint, RmuxError};
 use rmux_proto::{
     encode_frame, ErrorResponse, FrameDecoder, HandshakeResponse, HasSessionRequest,
     HasSessionResponse, KillServerRequest, KillServerResponse, Request, Response, SessionName,
     CAPABILITY_DAEMON_SHUTDOWN, CAPABILITY_HANDSHAKE, RMUX_WIRE_VERSION,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_NOT_CONNECTED,
@@ -25,6 +27,36 @@ fn alpha() -> SessionName {
 
 fn cleanup_request() -> Request {
     Request::HasSession(HasSessionRequest { target: alpha() })
+}
+
+#[test]
+fn endpoint_args_preserve_default_endpoint() {
+    assert!(super::endpoint_args(RmuxEndpoint::Default).is_empty());
+}
+
+#[test]
+fn endpoint_args_pass_unix_socket_through_s_flag() {
+    let args = super::endpoint_args(RmuxEndpoint::UnixSocket("/tmp/rmux.sock".into()));
+
+    assert_eq!(
+        args,
+        vec![OsString::from("-S"), OsString::from("/tmp/rmux.sock")]
+    );
+}
+
+#[test]
+fn endpoint_args_pass_windows_pipe_through_s_flag() {
+    let args = super::endpoint_args(RmuxEndpoint::WindowsPipe(
+        r"\\.\pipe\rmux-sdk-test".to_owned(),
+    ));
+
+    assert_eq!(
+        args,
+        vec![
+            OsString::from("-S"),
+            OsString::from(r"\\.\pipe\rmux-sdk-test")
+        ]
+    );
 }
 
 #[test]
@@ -103,6 +135,46 @@ async fn shutdown_negotiates_capabilities_then_waits_for_transport_close() {
         .await
         .expect("shutdown task")
         .expect("shutdown succeeds");
+}
+
+#[tokio::test]
+async fn capabilities_are_public_and_cached_for_has_capability() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let rmux = Rmux::from_transport_for_test(TransportClient::spawn(client_stream), None);
+
+    let capabilities = rmux.capabilities();
+    tokio::pin!(capabilities);
+    tokio::select! {
+        result = &mut capabilities => panic!("capabilities returned before handshake response: {result:?}"),
+        request = read_request(&mut server_stream) => assert!(matches!(request, Request::Handshake(_))),
+    }
+    write_response(
+        &mut server_stream,
+        Response::Handshake(HandshakeResponse {
+            wire_version: RMUX_WIRE_VERSION,
+            capabilities: vec![
+                CAPABILITY_HANDSHAKE.to_owned(),
+                "sdk.test.feature".to_owned(),
+            ],
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        capabilities.await.expect("capabilities succeed"),
+        vec![
+            CAPABILITY_HANDSHAKE.to_owned(),
+            "sdk.test.feature".to_owned()
+        ]
+    );
+
+    assert!(timeout(
+        Duration::from_millis(100),
+        rmux.has_capability("sdk.test.feature")
+    )
+    .await
+    .expect("cached has_capability should not wait for another handshake")
+    .expect("has_capability succeeds"));
 }
 
 #[test]

@@ -8,6 +8,8 @@ use crate::handler_support::attached_client_required;
 use crate::pane_io::AttachControl;
 use crate::pane_terminals::session_not_found;
 
+#[cfg(feature = "web")]
+use super::super::attach_support::attach_render_target_for_session;
 use super::super::{
     attach_support::attach_target_for_session, client_environment_snapshot,
     control_support::ManagedClient, parse_session_sort_order, switch_target_selector_count,
@@ -277,7 +279,7 @@ impl RequestHandler {
 
         match client {
             ManagedClient::Attach(attach_pid) => {
-                let Some((terminal_context, client_size, client_pixels)) = self
+                let Some((terminal_context, client_size, client_pixels, render_stream)) = self
                     .terminal_context_and_size_for_attached_client(attach_pid)
                     .await
                 else {
@@ -299,12 +301,36 @@ impl RequestHandler {
                 }
                 let target = {
                     let state = self.state.lock().await;
-                    match attach_target_for_session(
-                        &state,
-                        &session_name,
-                        attached_count,
-                        &terminal_context,
-                    ) {
+                    #[cfg(feature = "web")]
+                    let result = if render_stream {
+                        attach_render_target_for_session(
+                            &state,
+                            &session_name,
+                            attached_count,
+                            &terminal_context,
+                            &self.socket_path(),
+                        )
+                    } else {
+                        attach_target_for_session(
+                            &state,
+                            &session_name,
+                            attached_count,
+                            &terminal_context,
+                            &self.socket_path(),
+                        )
+                    };
+                    #[cfg(not(feature = "web"))]
+                    let result = {
+                        let _ = render_stream;
+                        attach_target_for_session(
+                            &state,
+                            &session_name,
+                            attached_count,
+                            &terminal_context,
+                            &self.socket_path(),
+                        )
+                    };
+                    match result {
                         Ok(target) => target,
                         Err(error) => return Response::Error(ErrorResponse { error }),
                     }

@@ -1,9 +1,11 @@
+use rmux_core::formats::{FormatVariable, FormatVariables};
 use rmux_core::{style::Style, OptionStore, Utf8Config};
 use rmux_proto::{OptionName, SessionName};
 
-use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
+use crate::format_runtime::RuntimeFormatContext;
 
 use super::super::{format_draw_line, FormattedLine};
+use super::{render_status_template_jobs_with_profile, status_job_cache_ttl};
 
 pub(super) fn render_explicit_status_format_line(
     session_name: &SessionName,
@@ -25,7 +27,14 @@ pub(super) fn render_explicit_status_format_line(
         return None;
     }
 
-    let expanded = render_runtime_template(&template, runtime, true);
+    let ttl = status_job_cache_ttl(options, session_name);
+    let status_runtime = StatusFormatVariables::new(runtime, session_name, options, ttl);
+    let expanded = render_status_template_jobs_with_profile(
+        &template,
+        &status_runtime,
+        status_runtime.profile.as_ref(),
+        ttl,
+    );
     Some(format_draw_line(&expanded, base_style, width, utf8_config))
 }
 
@@ -34,4 +43,71 @@ fn has_explicit_status_format(options: &OptionStore, session_name: &SessionName)
         .session_value(session_name, OptionName::StatusFormat)
         .is_some()
         || options.global_value(OptionName::StatusFormat).is_some()
+}
+
+struct StatusFormatVariables<'a, 'runtime> {
+    inner: &'a RuntimeFormatContext<'runtime>,
+    profile: Option<crate::terminal::TerminalProfile>,
+    status_left: Option<String>,
+    status_right: Option<String>,
+}
+
+impl<'a, 'runtime> StatusFormatVariables<'a, 'runtime> {
+    fn new(
+        inner: &'a RuntimeFormatContext<'runtime>,
+        session_name: &SessionName,
+        options: &OptionStore,
+        ttl: std::time::Duration,
+    ) -> Self {
+        let profile = inner.status_job_profile();
+        let status_left = options
+            .resolve(Some(session_name), OptionName::StatusLeft)
+            .map(|template| {
+                render_status_template_jobs_with_profile(template, inner, profile.as_ref(), ttl)
+            });
+        let status_right = options
+            .resolve(Some(session_name), OptionName::StatusRight)
+            .map(|template| {
+                render_status_template_jobs_with_profile(template, inner, profile.as_ref(), ttl)
+            });
+        Self {
+            inner,
+            profile,
+            status_left,
+            status_right,
+        }
+    }
+}
+
+impl FormatVariables for StatusFormatVariables<'_, '_> {
+    fn format_value(&self, variable: FormatVariable) -> Option<String> {
+        self.inner.format_value(variable)
+    }
+
+    fn format_loop(
+        &self,
+        scope: char,
+        body: &str,
+        current_body: Option<&str>,
+        count_only: bool,
+    ) -> Option<String> {
+        self.inner
+            .format_loop(scope, body, current_body, count_only)
+    }
+
+    fn format_name_exists(&self, scope: Option<char>, name: &str) -> Option<bool> {
+        self.inner.format_name_exists(scope, name)
+    }
+
+    fn format_search(&self, options: &str, pattern: &str) -> Option<String> {
+        self.inner.format_search(options, pattern)
+    }
+
+    fn format_value_by_name(&self, name: &str) -> Option<String> {
+        match name {
+            "status-left" => self.status_left.clone(),
+            "status-right" => self.status_right.clone(),
+            _ => self.inner.format_value_by_name(name),
+        }
+    }
 }

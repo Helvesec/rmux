@@ -41,7 +41,7 @@ use self::mode_tree_preview::{mode_tree_preview_lines, preview_lines_for_target}
 const MODE_TREE_HELP: &str =
     "mode-tree: Enter accept  q close  f filter  C-s/C-r search  t tag  C-t tag-all  v preview";
 const DEFAULT_KEY_FORMAT: &str =
-    "#{?#{e|<:#{line},10},#{line},#{e|<:#{line},36},M-#{a:#{e|+:97,#{e|-:#{line},10}}}}";
+    "#{?#{e|<:#{line},10},#{line},#{?#{e|<:#{line},36},M-#{a:#{e|+:97,#{e|-:#{line},10}}},}}";
 const CHOOSE_TREE_DEFAULT_TEMPLATE: &str = "switch-client -Zt '%%'";
 const CHOOSE_BUFFER_DEFAULT_TEMPLATE: &str = "paste-buffer -p -b '%%'";
 const CHOOSE_CLIENT_DEFAULT_TEMPLATE: &str = "detach-client -t '%%'";

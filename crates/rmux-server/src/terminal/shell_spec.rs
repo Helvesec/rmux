@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 
 use rmux_pty::ChildCommand;
-use tokio::process::Command as TokioCommand;
 
 #[cfg(windows)]
 use super::executable_name;
@@ -24,10 +23,6 @@ impl ShellSpec {
 
     pub(super) fn command_child(&self, cwd: &Path, command: &str) -> ChildCommand {
         self.command_plan(cwd, command).into_child_command()
-    }
-
-    pub(super) fn command_tokio_child(&self, cwd: &Path, command: &str) -> TokioCommand {
-        self.command_plan(cwd, command).into_tokio_command()
     }
 
     pub(super) fn command_std_child(&self, cwd: &Path, command: &str) -> StdCommand {
@@ -129,12 +124,6 @@ impl ShellCommandPlan {
             command = command.arg0(arg0);
         }
         command.args(self.args)
-    }
-
-    fn into_tokio_command(self) -> TokioCommand {
-        let mut command = TokioCommand::new(self.program);
-        command.args(self.args);
-        command
     }
 
     fn into_std_command(self) -> StdCommand {

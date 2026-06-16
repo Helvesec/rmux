@@ -69,6 +69,7 @@ impl ScreenCellView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScreenLineView {
     pub(super) cells: Vec<ScreenCellView>,
+    width: u32,
     pub(super) wrapped: bool,
     pub(super) start_prompt: bool,
     pub(super) start_output: bool,
@@ -80,6 +81,12 @@ impl ScreenLineView {
     #[must_use]
     pub fn cells(&self) -> &[ScreenCellView] {
         &self.cells
+    }
+
+    /// Returns the terminal-width column span represented by this line.
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.width
     }
 
     /// Returns one cell by column.
@@ -115,7 +122,12 @@ impl ScreenLineView {
     /// Resolves the owning non-padding cell for a column.
     #[must_use]
     pub fn owning_cell_x(&self, x: u32) -> Option<u32> {
-        let cell = self.cell(x)?;
+        if x >= self.width {
+            return None;
+        }
+        let Some(cell) = self.cell(x) else {
+            return Some(x);
+        };
         if !cell.is_padding() {
             return Some(x);
         }
@@ -141,9 +153,34 @@ impl Screen {
     #[must_use]
     pub fn absolute_line_view(&self, absolute_y: usize) -> Option<ScreenLineView> {
         let line = self.grid.absolute_line(absolute_y)?;
-        Some(ScreenLineView {
-            cells: line
-                .cells()
+        let width = u32::from(self.grid.size().cols.max(1));
+        let cells = if let Some(text) = line.plain_text() {
+            let mut cells = text
+                .bytes()
+                .map(|byte| ScreenCellView {
+                    text: char::from(byte).to_string(),
+                    width: 1,
+                    padding: false,
+                    attr: 0,
+                    fg: crate::input::COLOUR_DEFAULT,
+                    bg: crate::input::COLOUR_DEFAULT,
+                    us: crate::input::COLOUR_DEFAULT,
+                    link: 0,
+                })
+                .collect::<Vec<_>>();
+            cells.resize_with(width as usize, || ScreenCellView {
+                text: " ".to_owned(),
+                width: 1,
+                padding: false,
+                attr: 0,
+                fg: crate::input::COLOUR_DEFAULT,
+                bg: crate::input::COLOUR_DEFAULT,
+                us: crate::input::COLOUR_DEFAULT,
+                link: 0,
+            });
+            cells
+        } else {
+            line.cells()
                 .iter()
                 .map(|cell| ScreenCellView {
                     text: cell.text().to_owned(),
@@ -155,7 +192,11 @@ impl Screen {
                     us: cell.us(),
                     link: cell.link(),
                 })
-                .collect(),
+                .collect()
+        };
+        Some(ScreenLineView {
+            cells,
+            width,
             wrapped: line.flags().contains(GridLineFlags::WRAPPED),
             start_prompt: line.flags().contains(GridLineFlags::START_PROMPT),
             start_output: line.flags().contains(GridLineFlags::START_OUTPUT),

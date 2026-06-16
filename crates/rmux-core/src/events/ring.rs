@@ -1,22 +1,37 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use super::cursor::{OutputCursor, OutputCursorItem, OutputGap};
 use crate::TerminalPassthrough;
 
 /// Default retained pane-output events per pane.
-pub const DEFAULT_OUTPUT_RING_CAPACITY: usize = 1024;
+pub const DEFAULT_OUTPUT_RING_CAPACITY: usize = 2048;
 /// Default retained recent live output bytes per pane.
-pub const DEFAULT_RECENT_LIVE_BUFFER_CAPACITY: usize = 1024 * 1024;
+pub const DEFAULT_RECENT_LIVE_BUFFER_CAPACITY: usize = 256 * 1024;
 
 /// A single pane-output event retained by an [`OutputRing`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputEvent {
     sequence: u64,
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
     passthroughs: Vec<TerminalPassthrough>,
 }
 
 impl OutputEvent {
+    /// Creates an output event from already shared bytes.
+    #[must_use]
+    pub fn from_shared(
+        sequence: u64,
+        bytes: Arc<[u8]>,
+        passthroughs: Vec<TerminalPassthrough>,
+    ) -> Self {
+        Self {
+            sequence,
+            bytes,
+            passthroughs,
+        }
+    }
+
     /// Returns this event's monotonic per-ring sequence.
     #[must_use]
     pub const fn sequence(&self) -> u64 {
@@ -29,6 +44,18 @@ impl OutputEvent {
         &self.bytes
     }
 
+    /// Returns the raw byte count without cloning the event payload.
+    #[must_use]
+    pub fn byte_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Returns whether the event carries no raw bytes.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
     /// Returns terminal passthrough events produced by this output event.
     #[must_use]
     pub fn passthroughs(&self) -> &[TerminalPassthrough] {
@@ -38,13 +65,23 @@ impl OutputEvent {
     /// Consumes this event and returns its raw bytes.
     #[must_use]
     pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
+        self.bytes.to_vec()
     }
 
     /// Consumes this event and returns both raw bytes and terminal side effects.
     #[must_use]
     pub fn into_parts(self) -> (Vec<u8>, Vec<TerminalPassthrough>) {
-        (self.bytes, self.passthroughs)
+        (self.bytes.to_vec(), self.passthroughs)
+    }
+
+    /// Consumes this event and returns only terminal side effects.
+    ///
+    /// Live render subscribers already derive visible state from the pane
+    /// transcript, so cloning raw output bytes just to inspect passthroughs is
+    /// unnecessary on that hot path.
+    #[must_use]
+    pub fn into_passthroughs(self) -> Vec<TerminalPassthrough> {
+        self.passthroughs
     }
 
     /// Returns a copy of this event carrying terminal passthrough side effects.
@@ -140,6 +177,7 @@ impl RecentOutputSnapshot {
 pub struct OutputRing {
     event_capacity: usize,
     recent_byte_capacity: usize,
+    retained_event_bytes: usize,
     next_sequence: u64,
     events: VecDeque<OutputEvent>,
     recent: RecentLiveBuffer,
@@ -160,8 +198,12 @@ impl OutputRing {
         Self {
             event_capacity,
             recent_byte_capacity,
+            retained_event_bytes: 0,
             next_sequence: 0,
-            events: VecDeque::with_capacity(event_capacity),
+            // Keep the retention budget logical, not preallocated. Idle panes
+            // are common and should not pay for 1024 event slots before the
+            // first byte is emitted.
+            events: VecDeque::new(),
             recent: RecentLiveBuffer::new(recent_byte_capacity),
         }
     }
@@ -176,27 +218,53 @@ impl OutputRing {
     }
 
     /// Appends one output event, rotates the ring, and updates recent live bytes.
-    pub fn push(&mut self, bytes: Vec<u8>) -> OutputEvent {
-        let event = OutputEvent {
-            sequence: self.next_sequence,
-            bytes,
-            passthroughs: Vec::new(),
-        };
+    pub fn push(&mut self, bytes: Vec<u8>) -> u64 {
+        self.push_shared_with_recent_retention(bytes.into(), true)
+    }
+
+    /// Appends one output event, optionally updating the lag-recovery buffer.
+    pub fn push_with_recent_retention(&mut self, bytes: Vec<u8>, retain_recent: bool) -> u64 {
+        self.push_shared_with_recent_retention(bytes.into(), retain_recent)
+    }
+
+    /// Appends one shared output event without copying its byte payload.
+    pub fn push_shared(&mut self, bytes: Arc<[u8]>) -> u64 {
+        self.push_shared_with_recent_retention(bytes, true)
+    }
+
+    /// Appends one shared output event, optionally updating lag recovery bytes.
+    pub fn push_shared_with_recent_retention(
+        &mut self,
+        bytes: Arc<[u8]>,
+        retain_recent: bool,
+    ) -> u64 {
+        let sequence = self.next_sequence;
         self.next_sequence = self
             .next_sequence
             .checked_add(1)
             .expect("output ring sequence space exhausted");
-        self.recent.push(event.sequence, &event.bytes);
-        self.events.push_back(event.clone());
-        while self.events.len() > self.event_capacity {
-            let _ = self.events.pop_front();
+        if retain_recent {
+            self.recent.push(sequence, Arc::clone(&bytes));
         }
-        event
+        self.retained_event_bytes = self.retained_event_bytes.saturating_add(bytes.len());
+        self.events.push_back(OutputEvent {
+            sequence,
+            bytes,
+            passthroughs: Vec::new(),
+        });
+        while self.events.len() > self.event_capacity {
+            self.pop_oldest_event();
+        }
+        while self.retained_event_bytes > self.recent_byte_capacity && self.events.len() > 1 {
+            self.pop_oldest_event();
+        }
+        sequence
     }
 
     /// Clears retained events and recent bytes without rewinding the sequence.
     pub fn clear_retained(&mut self) {
         self.events.clear();
+        self.retained_event_bytes = 0;
         self.recent.clear();
     }
 
@@ -307,6 +375,12 @@ impl OutputRing {
         self.events.len()
     }
 
+    /// Returns the total raw bytes retained by event payloads.
+    #[must_use]
+    pub const fn retained_event_bytes(&self) -> usize {
+        self.retained_event_bytes
+    }
+
     /// Returns the total bytes currently retained in recent live storage.
     #[must_use]
     pub fn recent_len(&self) -> usize {
@@ -323,6 +397,12 @@ impl OutputRing {
     #[must_use]
     pub fn retained_events(&self) -> Vec<OutputEvent> {
         self.events.iter().cloned().collect()
+    }
+
+    fn pop_oldest_event(&mut self) {
+        if let Some(event) = self.events.pop_front() {
+            self.retained_event_bytes = self.retained_event_bytes.saturating_sub(event.byte_len());
+        }
     }
 }
 
@@ -342,7 +422,9 @@ struct RecentLiveBuffer {
 #[derive(Debug, Clone)]
 struct RecentLiveChunk {
     sequence: u64,
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
+    start: usize,
+    end: usize,
     starts_at_event_start: bool,
 }
 
@@ -355,26 +437,37 @@ impl RecentLiveBuffer {
         }
     }
 
-    fn push(&mut self, sequence: u64, bytes: &[u8]) {
+    fn push(&mut self, sequence: u64, bytes: Arc<[u8]>) {
         if bytes.is_empty() {
             return;
         }
         if bytes.len() >= self.capacity {
+            let starts_at_event_start = bytes.len() == self.capacity;
+            let bytes = if starts_at_event_start {
+                bytes
+            } else {
+                Arc::from(&bytes[bytes.len() - self.capacity..])
+            };
             self.chunks.clear();
             self.chunks.push_back(RecentLiveChunk {
                 sequence,
-                bytes: bytes[bytes.len() - self.capacity..].to_vec(),
-                starts_at_event_start: bytes.len() == self.capacity,
+                start: 0,
+                end: bytes.len(),
+                bytes,
+                starts_at_event_start,
             });
             self.len = self.capacity;
             return;
         }
+        let byte_len = bytes.len();
         self.chunks.push_back(RecentLiveChunk {
             sequence,
-            bytes: bytes.to_vec(),
+            bytes,
+            start: 0,
+            end: byte_len,
             starts_at_event_start: true,
         });
-        self.len = self.len.saturating_add(bytes.len());
+        self.len = self.len.saturating_add(byte_len);
         self.trim_front();
     }
 
@@ -390,11 +483,15 @@ impl RecentLiveBuffer {
                 self.len = 0;
                 return;
             };
-            if front.bytes.len() <= overflow {
-                self.len -= front.bytes.len();
+            let front_len = front.end.saturating_sub(front.start);
+            if front_len <= overflow {
+                self.len -= front_len;
                 let _ = self.chunks.pop_front();
             } else {
-                front.bytes = front.bytes.split_off(overflow);
+                let start = front.start + overflow;
+                front.bytes = Arc::from(&front.bytes[start..front.end]);
+                front.start = 0;
+                front.end = front.bytes.len();
                 front.starts_at_event_start = false;
                 self.len -= overflow;
             }
@@ -418,7 +515,7 @@ impl RecentLiveBuffer {
         let mut snapshot_chunks = Vec::with_capacity(self.chunks.len());
         for chunk in &self.chunks {
             let start = bytes.len();
-            bytes.extend_from_slice(&chunk.bytes);
+            bytes.extend_from_slice(&chunk.bytes[chunk.start..chunk.end]);
             snapshot_chunks.push(RecentOutputSnapshotChunk {
                 sequence: chunk.sequence,
                 start,
@@ -447,8 +544,24 @@ mod tests {
             ring.recent_byte_capacity(),
             DEFAULT_RECENT_LIVE_BUFFER_CAPACITY
         );
-        assert_eq!(DEFAULT_OUTPUT_RING_CAPACITY, 1_024);
-        assert_eq!(DEFAULT_RECENT_LIVE_BUFFER_CAPACITY, 1_048_576);
+        assert_eq!(DEFAULT_OUTPUT_RING_CAPACITY, 2_048);
+        assert_eq!(DEFAULT_RECENT_LIVE_BUFFER_CAPACITY, 262_144);
+    }
+
+    #[test]
+    fn default_ring_preserves_immediate_sdk_burst_budget() {
+        let mut ring = OutputRing::default();
+        let mut cursor = ring.cursor_from_now();
+
+        for index in 0..1_200 {
+            ring.push(format!("line-{index:04}\n").into_bytes());
+        }
+
+        let Some(OutputCursorItem::Event(first)) = ring.poll_cursor(&mut cursor) else {
+            panic!("default output ring must retain the head of a fresh SDK burst");
+        };
+        assert_eq!(first.sequence(), 0);
+        assert_eq!(first.bytes(), b"line-0000\n");
     }
 
     #[test]
@@ -466,6 +579,33 @@ mod tests {
         assert_eq!(sequences, vec![1, 2]);
         assert_eq!(ring.oldest_sequence(), 1);
         assert_eq!(ring.next_sequence(), 3);
+    }
+
+    #[test]
+    fn ring_rotation_obeys_recent_byte_budget_for_retained_events() {
+        let mut ring = OutputRing::new(8, 6);
+        ring.push(b"aaaa".to_vec());
+        ring.push(b"bbbb".to_vec());
+        ring.push(b"cc".to_vec());
+
+        let sequences = ring
+            .retained_events()
+            .iter()
+            .map(|event| event.sequence())
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![1, 2]);
+        assert_eq!(ring.retained_event_bytes(), 6);
+        assert_eq!(ring.oldest_sequence(), 1);
+    }
+
+    #[test]
+    fn ring_keeps_newest_event_when_single_event_exceeds_byte_budget() {
+        let mut ring = OutputRing::new(8, 4);
+        ring.push(b"abcdef".to_vec());
+
+        assert_eq!(ring.retained_events().len(), 1);
+        assert_eq!(ring.retained_event_bytes(), 6);
+        assert_eq!(ring.oldest_sequence(), 0);
     }
 
     #[test]
@@ -495,7 +635,7 @@ mod tests {
             .recent
             .chunks
             .iter()
-            .map(|chunk| chunk.bytes.capacity())
+            .map(|chunk| chunk.bytes.len())
             .sum::<usize>();
         assert!(
             retained_capacity <= ring.recent_byte_capacity(),

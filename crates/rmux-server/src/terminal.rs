@@ -1,10 +1,11 @@
-use std::collections::HashMap;
-use std::ffi::OsString;
+use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::io;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use rmux_core::{EnvironmentStore, OptionStore, PaneId};
 use rmux_proto::{AttachShellCommand, OptionName, ProcessCommand, RmuxError, SessionName};
@@ -22,10 +23,33 @@ use shell_spec::ShellSpec;
 pub(crate) struct TerminalProfile {
     cwd: PathBuf,
     shell: PathBuf,
-    environment: HashMap<String, String>,
+    raw_environment: Arc<Vec<(OsString, OsString)>>,
+}
+
+/// Session-level environment captured from the pane that created a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionBaseEnvironment {
+    raw_environment: Vec<(OsString, OsString)>,
+}
+
+impl SessionBaseEnvironment {
+    pub(crate) fn from_profile(profile: &TerminalProfile) -> Self {
+        Self {
+            raw_environment: profile.raw_environment.as_ref().clone(),
+        }
+    }
+
+    fn environment_map(&self) -> HashMap<String, String> {
+        environment_from_os_pairs(self.raw_environment.iter().cloned())
+    }
+
+    fn raw_environment(&self) -> &[(OsString, OsString)] {
+        &self.raw_environment
+    }
 }
 
 impl TerminalProfile {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_session(
         environment: &EnvironmentStore,
@@ -39,13 +63,46 @@ impl TerminalProfile {
         pane_id: Option<PaneId>,
         requested_cwd: Option<&Path>,
     ) -> Result<Self, RmuxError> {
-        Self::for_session_with_spawn_environment(
+        Self::for_session_with_environment(
             environment,
             options,
             session_name,
             session_id,
             socket_path,
+            None,
             spawn_environment,
+            None,
+            include_terminal_defaults,
+            overrides,
+            pane_id,
+            requested_cwd,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_session_with_base_environment(
+        environment: &EnvironmentStore,
+        options: &OptionStore,
+        session_name: &SessionName,
+        session_id: u32,
+        socket_path: &Path,
+        base_environment: Option<&SessionBaseEnvironment>,
+        spawn_environment: Option<&HashMap<String, String>>,
+        include_terminal_defaults: bool,
+        overrides: Option<&[String]>,
+        pane_id: Option<PaneId>,
+        requested_cwd: Option<&Path>,
+    ) -> Result<Self, RmuxError> {
+        let base_environment_map = base_environment.map(SessionBaseEnvironment::environment_map);
+        Self::for_session_with_environment(
+            environment,
+            options,
+            session_name,
+            session_id,
+            socket_path,
+            base_environment_map.as_ref(),
+            spawn_environment,
+            base_environment.map(SessionBaseEnvironment::raw_environment),
             include_terminal_defaults,
             overrides,
             pane_id,
@@ -61,18 +118,21 @@ impl TerminalProfile {
         session_id: u32,
         socket_path: &Path,
         spawn_environment: Option<&HashMap<String, String>>,
+        raw_base_environment: Option<&[(OsString, OsString)]>,
         include_terminal_defaults: bool,
         overrides: Option<&[String]>,
         pane_id: Option<PaneId>,
         requested_cwd: Option<&Path>,
     ) -> Result<Self, RmuxError> {
-        Self::for_session_with_spawn_environment(
+        Self::for_session_with_environment(
             environment,
             options,
             session_name,
             session_id,
             socket_path,
             spawn_environment,
+            None,
+            raw_base_environment,
             include_terminal_defaults,
             overrides,
             pane_id,
@@ -81,51 +141,100 @@ impl TerminalProfile {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn for_session_with_spawn_environment(
+    fn for_session_with_environment(
         environment: &EnvironmentStore,
         options: &OptionStore,
         session_name: &SessionName,
         session_id: u32,
         socket_path: &Path,
+        base_environment: Option<&HashMap<String, String>>,
         spawn_environment: Option<&HashMap<String, String>>,
+        raw_base_environment: Option<&[(OsString, OsString)]>,
         include_terminal_defaults: bool,
         overrides: Option<&[String]>,
         pane_id: Option<PaneId>,
         requested_cwd: Option<&Path>,
     ) -> Result<Self, RmuxError> {
-        let mut resolved = base_process_environment();
-        environment.apply_to_process_environment(Some(session_name), &mut resolved);
+        let mut resolved = base_environment
+            .cloned()
+            .unwrap_or_else(base_process_environment);
+        let include_implicit_globals = base_environment.is_none();
+        if base_environment.is_some() {
+            environment.apply_to_process_environment_without_implicit_globals(
+                Some(session_name),
+                &mut resolved,
+            );
+        } else {
+            environment.apply_to_process_environment(Some(session_name), &mut resolved);
+        }
         if let Some(spawn_environment) = spawn_environment {
             for (name, value) in spawn_environment {
                 set_environment_value(&mut resolved, name.clone(), value.clone());
             }
         }
 
+        Self::from_resolved_environment(
+            resolved,
+            raw_base_environment,
+            environment
+                .suppressed_process_environment_names(Some(session_name), include_implicit_globals),
+            options,
+            session_name,
+            session_id,
+            socket_path,
+            include_terminal_defaults,
+            overrides,
+            pane_id,
+            requested_cwd,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_resolved_environment(
+        mut resolved: HashMap<String, String>,
+        raw_base_environment: Option<&[(OsString, OsString)]>,
+        suppressed_raw_names: HashSet<String>,
+        options: &OptionStore,
+        session_name: &SessionName,
+        session_id: u32,
+        socket_path: &Path,
+        include_terminal_defaults: bool,
+        overrides: Option<&[String]>,
+        pane_id: Option<PaneId>,
+        requested_cwd: Option<&Path>,
+    ) -> Result<Self, RmuxError> {
         if include_terminal_defaults {
-            if let Some(default_terminal) =
-                options.resolve(Some(session_name), OptionName::DefaultTerminal)
+            if let Some(default_terminal) = options
+                .resolve(Some(session_name), OptionName::DefaultTerminal)
+                .or_else(|| options.resolve(None, OptionName::DefaultTerminal))
             {
-                resolved.insert("TERM".to_owned(), default_terminal.to_owned());
+                set_environment_value(
+                    &mut resolved,
+                    "TERM".to_owned(),
+                    default_terminal.to_owned(),
+                );
             }
-            resolved.insert("TERM_PROGRAM".to_owned(), "rmux".to_owned());
-            resolved.insert(
+            set_environment_value(&mut resolved, "TERM_PROGRAM".to_owned(), "rmux".to_owned());
+            set_environment_value(
+                &mut resolved,
                 "TERM_PROGRAM_VERSION".to_owned(),
                 env!("CARGO_PKG_VERSION").to_owned(),
             );
         } else {
-            resolved.remove("TERM_PROGRAM");
-            resolved.remove("TERM_PROGRAM_VERSION");
+            remove_environment_value(&mut resolved, "TERM_PROGRAM");
+            remove_environment_value(&mut resolved, "TERM_PROGRAM_VERSION");
         }
 
-        resolved.insert(
-            "RMUX".to_owned(),
-            format!(
-                "{},{},{}",
-                socket_path.display(),
-                std::process::id(),
-                session_id
-            ),
+        let mux_socket_path = mux_environment_socket_path(socket_path);
+        let mux_env = format!(
+            "{},{},{}",
+            mux_socket_path.display(),
+            std::process::id(),
+            session_id
         );
+        set_environment_value(&mut resolved, "RMUX".to_owned(), mux_env.clone());
+        set_environment_value(&mut resolved, "TMUX".to_owned(), mux_env);
+        crate::tmux_shim::apply_tmux_shim_environment(&mut resolved, socket_path);
 
         if let Some(overrides) = overrides {
             for (name, value) in parse_environment_assignments(overrides)? {
@@ -142,7 +251,9 @@ impl TerminalProfile {
         );
 
         if let Some(pane_id) = pane_id {
-            resolved.insert("RMUX_PANE".to_owned(), format!("%{}", pane_id.as_u32()));
+            let pane_env = format!("%{}", pane_id.as_u32());
+            set_environment_value(&mut resolved, "RMUX_PANE".to_owned(), pane_env.clone());
+            set_environment_value(&mut resolved, "TMUX_PANE".to_owned(), pane_env);
         }
 
         set_environment_value(
@@ -154,7 +265,12 @@ impl TerminalProfile {
         Ok(Self {
             cwd,
             shell,
-            environment: resolved,
+            raw_environment: raw_process_environment(
+                raw_base_environment,
+                &resolved,
+                &suppressed_raw_names,
+            )
+            .into(),
         })
     }
 
@@ -168,8 +284,43 @@ impl TerminalProfile {
         include_terminal_defaults: bool,
         requested_cwd: Option<&Path>,
     ) -> Result<Self, RmuxError> {
-        let mut resolved = base_process_environment();
-        environment.apply_to_process_environment(session_name, &mut resolved);
+        Self::for_run_shell_with_base_environment(
+            environment,
+            options,
+            session_name,
+            session_id,
+            socket_path,
+            None,
+            include_terminal_defaults,
+            None,
+            requested_cwd,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_run_shell_with_base_environment(
+        environment: &EnvironmentStore,
+        options: &OptionStore,
+        session_name: Option<&SessionName>,
+        session_id: Option<u32>,
+        socket_path: &Path,
+        base_environment: Option<&SessionBaseEnvironment>,
+        include_terminal_defaults: bool,
+        pane_id: Option<PaneId>,
+        requested_cwd: Option<&Path>,
+    ) -> Result<Self, RmuxError> {
+        let mut resolved = base_environment
+            .map(SessionBaseEnvironment::environment_map)
+            .unwrap_or_else(base_process_environment);
+        let include_implicit_globals = base_environment.is_none();
+        if base_environment.is_some() {
+            environment
+                .apply_to_process_environment_without_implicit_globals(session_name, &mut resolved);
+        } else {
+            environment.apply_to_process_environment(session_name, &mut resolved);
+        }
+        remove_environment_value(&mut resolved, "RMUX_PANE");
+        remove_environment_value(&mut resolved, "TMUX_PANE");
 
         if include_terminal_defaults {
             if let Some(default_terminal) = session_name
@@ -178,24 +329,36 @@ impl TerminalProfile {
                 })
                 .or_else(|| options.resolve(None, OptionName::DefaultTerminal))
             {
-                resolved.insert("TERM".to_owned(), default_terminal.to_owned());
+                set_environment_value(
+                    &mut resolved,
+                    "TERM".to_owned(),
+                    default_terminal.to_owned(),
+                );
             }
-            resolved.insert("TERM_PROGRAM".to_owned(), "rmux".to_owned());
-            resolved.insert(
+            set_environment_value(&mut resolved, "TERM_PROGRAM".to_owned(), "rmux".to_owned());
+            set_environment_value(
+                &mut resolved,
                 "TERM_PROGRAM_VERSION".to_owned(),
                 env!("CARGO_PKG_VERSION").to_owned(),
             );
         }
 
-        resolved.insert(
-            "RMUX".to_owned(),
-            format!(
-                "{},{},{}",
-                socket_path.display(),
-                std::process::id(),
-                session_id.map_or(-1_i32, |id| i32::try_from(id).unwrap_or(i32::MAX))
-            ),
+        let mux_session_id = session_id.map_or(0_i32, |id| i32::try_from(id).unwrap_or(i32::MAX));
+        let mux_socket_path = mux_environment_socket_path(socket_path);
+        let mux_env = format!(
+            "{},{},{}",
+            mux_socket_path.display(),
+            std::process::id(),
+            mux_session_id
         );
+        set_environment_value(&mut resolved, "RMUX".to_owned(), mux_env.clone());
+        set_environment_value(&mut resolved, "TMUX".to_owned(), mux_env);
+        crate::tmux_shim::apply_tmux_shim_environment(&mut resolved, socket_path);
+        if let Some(pane_id) = pane_id {
+            let pane_env = format!("%{}", pane_id.as_u32());
+            set_environment_value(&mut resolved, "RMUX_PANE".to_owned(), pane_env.clone());
+            set_environment_value(&mut resolved, "TMUX_PANE".to_owned(), pane_env);
+        }
 
         let cwd = resolve_working_directory(requested_cwd)?;
         let shell = resolve_shell_path(options, session_name, &resolved);
@@ -210,17 +373,42 @@ impl TerminalProfile {
             cwd.to_string_lossy().into_owned(),
         );
 
+        let mut suppressed = environment
+            .suppressed_process_environment_names(session_name, include_implicit_globals);
+        suppressed.insert("RMUX_PANE".to_owned());
+        suppressed.insert("TMUX_PANE".to_owned());
         Ok(Self {
             cwd,
             shell,
-            environment: resolved,
+            raw_environment: raw_process_environment(
+                base_environment.map(SessionBaseEnvironment::raw_environment),
+                &resolved,
+                &suppressed,
+            )
+            .into(),
         })
     }
 
     pub(crate) fn environment(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.environment
+        self.raw_environment
             .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .filter_map(|(name, value)| Some((name.to_str()?, value.to_str()?)))
+    }
+
+    pub(crate) fn raw_environment(&self) -> impl Iterator<Item = (&OsStr, &OsStr)> {
+        self.raw_environment
+            .iter()
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str()))
+    }
+
+    pub(crate) fn with_source_depth(mut self, depth: usize) -> Self {
+        let value = depth.to_string();
+        set_raw_environment_value(
+            Arc::make_mut(&mut self.raw_environment),
+            OsString::from("RMUX_SOURCE_DEPTH"),
+            OsString::from(value),
+        );
+        self
     }
 
     pub(crate) fn cwd(&self) -> &Path {
@@ -231,8 +419,14 @@ impl TerminalProfile {
         &self.shell
     }
 
-    pub(crate) fn shell_command(&self, command: &str) -> tokio::process::Command {
-        shell_tokio_command(&self.shell, &self.cwd, command)
+    pub(crate) fn resolved_default_shell(
+        environment: &EnvironmentStore,
+        options: &OptionStore,
+        session_name: Option<&SessionName>,
+    ) -> PathBuf {
+        let mut resolved = base_process_environment();
+        environment.apply_to_process_environment(session_name, &mut resolved);
+        resolve_shell_path(options, session_name, &resolved)
     }
 
     pub(crate) fn shell_std_command(&self, command: &str) -> Command {
@@ -256,7 +450,22 @@ impl TerminalProfile {
     }
 
     pub(crate) fn environment_value(&self, name: &str) -> Option<&str> {
-        self.environment.get(name).map(String::as_str)
+        self.raw_environment
+            .iter()
+            .find(|(candidate, _)| os_environment_name_eq(candidate, name))
+            .and_then(|(_, value)| value.to_str())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_environment(mut self, environment: HashMap<String, String>) -> Self {
+        for (name, value) in environment {
+            set_raw_environment_value(
+                Arc::make_mut(&mut self.raw_environment),
+                OsString::from(name),
+                OsString::from(value),
+            );
+        }
+        self
     }
 
     pub(crate) fn default_window_name(&self) -> Option<String> {
@@ -268,20 +477,8 @@ impl TerminalProfile {
     }
 
     pub(crate) fn initial_pane_title(&self) -> Option<String> {
-        let user = self
-            .environment_value("USER")
-            .or_else(|| self.environment_value("LOGNAME"))
-            .or_else(|| self.environment_value("USERNAME"))?;
         let host = crate::host_name::local_hostname()?;
-        let path = abbreviate_home(
-            &self.cwd.to_string_lossy(),
-            self.environment_value("HOME")
-                .or_else(|| self.environment_value("USERPROFILE")),
-        );
-        Some(format!(
-            "{user}@{}:{path}",
-            host.split('.').next().unwrap_or(&host)
-        ))
+        Some(host.split('.').next().unwrap_or(&host).to_owned())
     }
 
     pub(crate) fn automatic_window_name(&self, command: Option<&ProcessCommand>) -> Option<String> {
@@ -302,27 +499,43 @@ impl TerminalProfile {
             Some(ProcessCommand::Argv(_)) | Some(_) => shell_program_name(&self.shell),
         }
     }
-}
 
-fn abbreviate_home(path: &str, home: Option<&str>) -> String {
-    let Some(home) = home.filter(|home| !home.is_empty()) else {
-        return path.to_owned();
-    };
-    if path == home {
-        "~".to_owned()
-    } else if let Some(suffix) = path.strip_prefix(home).and_then(|suffix| {
-        suffix
-            .strip_prefix('/')
-            .or_else(|| suffix.strip_prefix('\\'))
-    }) {
-        format!("~/{suffix}")
-    } else {
-        path.to_owned()
+    fn environment_map(&self) -> HashMap<String, String> {
+        environment_from_os_pairs(self.raw_environment.iter().cloned())
     }
 }
 
 pub(crate) fn base_process_environment() -> HashMap<String, String> {
     environment_from_os_pairs(std::env::vars_os())
+}
+
+pub(crate) fn base_process_environment_display_only() -> HashMap<String, String> {
+    display_environment_from_os_pairs(std::env::vars_os())
+}
+
+fn raw_process_environment(
+    raw_base_environment: Option<&[(OsString, OsString)]>,
+    resolved: &HashMap<String, String>,
+    suppressed_names: &HashSet<String>,
+) -> Vec<(OsString, OsString)> {
+    let mut raw = match raw_base_environment {
+        Some(environment) => environment.to_vec(),
+        None => std::env::vars_os().collect(),
+    };
+    raw.retain(|(name, _)| {
+        !suppressed_names
+            .iter()
+            .any(|suppressed| os_environment_name_eq(name, suppressed))
+            && !resolved
+                .keys()
+                .any(|resolved_name| os_environment_name_eq(name, resolved_name))
+    });
+    raw.extend(
+        resolved
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+    );
+    raw
 }
 
 fn environment_from_os_pairs<I>(pairs: I) -> HashMap<String, String>
@@ -333,6 +546,52 @@ where
         .into_iter()
         .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
         .collect()
+}
+
+fn display_environment_from_os_pairs<I>(pairs: I) -> HashMap<String, String>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    pairs
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let name = name.into_string().ok()?;
+            if value.clone().into_string().is_ok() {
+                return None;
+            }
+            Some((name, display_os_environment_value(&value)))
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn display_os_environment_value(value: &OsStr) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| match *byte {
+            b'\\' => "\\\\".to_owned(),
+            0x20..=0x7e => char::from(*byte).to_string(),
+            other => format!("\\{other:03o}"),
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn display_os_environment_value(value: &OsStr) -> String {
+    value.to_string_lossy().into_owned()
+}
+
+#[cfg(windows)]
+fn os_environment_name_eq(left: &OsStr, right: &str) -> bool {
+    left.to_string_lossy().eq_ignore_ascii_case(right)
+}
+
+#[cfg(not(windows))]
+fn os_environment_name_eq(left: &OsStr, right: &str) -> bool {
+    left == OsStr::new(right)
 }
 
 fn shell_command_window_name(command: &str) -> Option<String> {
@@ -351,7 +610,7 @@ pub(crate) fn spawn_pane_process(
         .clear_env()
         .current_dir(profile.cwd());
 
-    for (name, value) in profile.environment() {
+    for (name, value) in profile.raw_environment() {
         command = command.env(name, value);
     }
 
@@ -366,7 +625,11 @@ pub(crate) fn spawn_pane_process(
 }
 
 pub(crate) fn validate_process_command(command: Option<&ProcessCommand>) -> Result<(), RmuxError> {
-    if command.is_some_and(ProcessCommand::is_empty) {
+    let empty_argv = matches!(
+        command,
+        Some(ProcessCommand::Argv(argv)) if argv.is_empty() || argv.first().is_some_and(String::is_empty)
+    );
+    if empty_argv {
         return Err(RmuxError::empty_process_command());
     }
     Ok(())
@@ -376,7 +639,8 @@ fn spawn_command(profile: &TerminalProfile, command: Option<&ProcessCommand>) ->
     match command {
         Some(ProcessCommand::Shell(command)) => profile.shell_child_command(command),
         Some(ProcessCommand::Argv(argv)) if !argv.is_empty() => {
-            let program = resolve_program_path(Path::new(&argv[0]), &profile.environment);
+            let environment = profile.environment_map();
+            let program = resolve_program_path(Path::new(&argv[0]), &environment);
             ChildCommand::new(program).args(&argv[1..])
         }
         Some(ProcessCommand::Argv(_)) | Some(_) | None => profile.interactive_child_command(),
@@ -387,16 +651,6 @@ pub(crate) fn shell_child_command(shell: &Path, cwd: &Path, command: &str) -> Ch
     ShellSpec::new(shell).command_child(cwd, command)
 }
 
-pub(crate) fn shell_tokio_command(
-    shell: &Path,
-    cwd: &Path,
-    command: &str,
-) -> tokio::process::Command {
-    let mut command = ShellSpec::new(shell).command_tokio_child(cwd, command);
-    configure_hidden_tokio_helper(&mut command);
-    command
-}
-
 pub(crate) fn shell_std_command(shell: &Path, cwd: &Path, command: &str) -> Command {
     let mut command = ShellSpec::new(shell).command_std_child(cwd, command);
     configure_hidden_std_helper(&mut command);
@@ -405,14 +659,6 @@ pub(crate) fn shell_std_command(shell: &Path, cwd: &Path, command: &str) -> Comm
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-#[cfg(windows)]
-fn configure_hidden_tokio_helper(command: &mut tokio::process::Command) {
-    command.creation_flags(CREATE_NO_WINDOW);
-}
-
-#[cfg(not(windows))]
-fn configure_hidden_tokio_helper(_command: &mut tokio::process::Command) {}
 
 #[cfg(windows)]
 fn configure_hidden_std_helper(command: &mut Command) {
@@ -482,6 +728,11 @@ pub(crate) fn parse_environment_assignments(
     let mut environment = HashMap::new();
 
     for value in values {
+        #[cfg(windows)]
+        if value.starts_with('=') {
+            continue;
+        }
+
         let Some((name, value)) = value.split_once('=') else {
             return Err(RmuxError::Server(format!(
                 "environment assignment must be NAME=VALUE: {value}"
@@ -499,16 +750,33 @@ pub(crate) fn parse_environment_assignments(
 }
 
 fn set_environment_value(environment: &mut HashMap<String, String>, name: String, value: String) {
+    remove_environment_value(environment, &name);
+
+    environment.insert(name, value);
+}
+
+fn remove_environment_value(environment: &mut HashMap<String, String>, name: &str) {
     #[cfg(windows)]
     if let Some(existing) = environment
         .keys()
-        .find(|key| key.eq_ignore_ascii_case(&name))
+        .find(|key| key.eq_ignore_ascii_case(name))
         .cloned()
     {
         environment.remove(&existing);
+        return;
     }
 
-    environment.insert(name, value);
+    environment.remove(name);
+}
+
+fn set_raw_environment_value(
+    environment: &mut Vec<(OsString, OsString)>,
+    name: OsString,
+    value: OsString,
+) {
+    let name_string = name.to_string_lossy().into_owned();
+    environment.retain(|(existing, _)| !os_environment_name_eq(existing, &name_string));
+    environment.push((name, value));
 }
 
 fn resolve_working_directory(requested_cwd: Option<&Path>) -> Result<PathBuf, RmuxError> {
@@ -529,6 +797,29 @@ fn resolve_working_directory(requested_cwd: Option<&Path>) -> Result<PathBuf, Rm
     Err(RmuxError::Server(
         "failed to resolve a working directory".to_owned(),
     ))
+}
+
+fn mux_environment_socket_path(socket_path: &Path) -> PathBuf {
+    let absolute = if socket_path.is_absolute() {
+        socket_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(socket_path))
+            .unwrap_or_else(|_| socket_path.to_path_buf())
+    };
+    canonical_path_or_parent(absolute)
+}
+
+fn canonical_path_or_parent(path: PathBuf) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(&path) {
+        return canonical;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(file_name)) => std::fs::canonicalize(parent)
+            .map(|canonical_parent| canonical_parent.join(file_name))
+            .unwrap_or(path),
+        _ => path,
+    }
 }
 
 fn default_working_directory() -> PathBuf {

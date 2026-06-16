@@ -109,6 +109,53 @@ fn only_if_unset_rejects_already_set_option() {
 }
 
 #[test]
+fn only_if_unset_allows_default_or_inherited_values() {
+    let mut store = OptionStore::new();
+    let alpha = SessionName::new("alpha").expect("valid session name");
+
+    store
+        .set_by_name(
+            OptionScopeSelector::Session(alpha.clone()),
+            "status",
+            Some("off".to_owned()),
+            SetOptionMode::Replace,
+            true,
+            false,
+            false,
+        )
+        .expect("default value does not count as explicitly set");
+    assert_eq!(store.resolve(Some(&alpha), OptionName::Status), Some("off"));
+
+    store
+        .set_by_name(
+            OptionScopeSelector::SessionGlobal,
+            "status-left",
+            Some("global".to_owned()),
+            SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect("global set succeeds");
+
+    store
+        .set_by_name(
+            OptionScopeSelector::Session(alpha.clone()),
+            "status-left",
+            Some("session".to_owned()),
+            SetOptionMode::Replace,
+            true,
+            false,
+            false,
+        )
+        .expect("inherited value does not count as explicitly set");
+    assert_eq!(
+        store.resolve(Some(&alpha), OptionName::StatusLeft),
+        Some("session")
+    );
+}
+
+#[test]
 fn prefix_matching_resolves_unambiguous_prefix() {
     let query = super::resolve_option_name("buffer-l").expect("prefix matches");
     assert_eq!(query.canonical_name(), "buffer-limit");

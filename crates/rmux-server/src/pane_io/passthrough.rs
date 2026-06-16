@@ -11,17 +11,21 @@ pub(super) fn render_passthroughs(
     }
 
     let mut frame = Vec::new();
+    let mut saved_cursor = false;
     for passthrough in passthroughs {
         if !passthrough_enabled(target, passthrough.kind()) {
             continue;
         }
-        if frame.is_empty() {
+        if passthrough_requires_cursor_position(passthrough.kind()) && !saved_cursor {
             frame.extend_from_slice(b"\x1b[s");
+            saved_cursor = true;
         }
-        append_cursor_position(&mut frame, target.active_pane_geometry, passthrough);
+        if passthrough_requires_cursor_position(passthrough.kind()) {
+            append_cursor_position(&mut frame, target.active_pane_geometry, passthrough);
+        }
         frame.extend_from_slice(&passthrough.render_sequence());
     }
-    if !frame.is_empty() {
+    if saved_cursor {
         frame.extend_from_slice(b"\x1b[u");
     }
     frame
@@ -29,8 +33,19 @@ pub(super) fn render_passthroughs(
 
 fn passthrough_enabled(target: &OpenAttachTarget, kind: TerminalPassthroughKind) -> bool {
     match kind {
+        TerminalPassthroughKind::Raw => target.raw_passthrough,
+        TerminalPassthroughKind::Clipboard => target.outer_terminal.clipboard_passthrough_enabled(),
         TerminalPassthroughKind::KittyGraphics => target.kitty_graphics_passthrough,
         TerminalPassthroughKind::Sixel => target.sixel_passthrough,
+    }
+}
+
+fn passthrough_requires_cursor_position(kind: TerminalPassthroughKind) -> bool {
+    match kind {
+        TerminalPassthroughKind::Raw
+        | TerminalPassthroughKind::KittyGraphics
+        | TerminalPassthroughKind::Sixel => true,
+        TerminalPassthroughKind::Clipboard => false,
     }
 }
 
@@ -51,7 +66,7 @@ fn append_cursor_position(
 #[cfg(test)]
 mod tests {
     use rmux_core::{OptionStore, PaneGeometry, TerminalPassthrough};
-    use rmux_proto::SessionName;
+    use rmux_proto::{OptionName, PaneTarget, ScopeSelector, SessionName, SetOptionMode};
     use rmux_pty::PtyPair;
 
     use super::{append_cursor_position, render_passthroughs};
@@ -77,7 +92,14 @@ mod tests {
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            _pane_master: pty.into_master(),
+            input_target: PaneTarget::with_window(
+                SessionName::new("alpha").expect("valid session name"),
+                0,
+                0,
+            ),
+            pane_master: Some(pty.into_master()),
+            predicted_echo: Default::default(),
+            predicted_echo_started_at: None,
             pane_output: Some(pane_output.subscribe()),
             render_frame: Vec::new(),
             outer_terminal: OuterTerminal::resolve(
@@ -86,10 +108,12 @@ mod tests {
             ),
             cursor_style: 0,
             active_pane_geometry: PaneGeometry::new(5, 6, 80, 24),
+            raw_passthrough: false,
             kitty_graphics_passthrough: true,
             sixel_passthrough: false,
             persistent_overlay_state_id: None,
             live_pane: None,
+            render_stream: false,
         };
 
         let frame = render_passthroughs(
@@ -109,7 +133,14 @@ mod tests {
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            _pane_master: pty.into_master(),
+            input_target: PaneTarget::with_window(
+                SessionName::new("alpha").expect("valid session name"),
+                0,
+                0,
+            ),
+            pane_master: Some(pty.into_master()),
+            predicted_echo: Default::default(),
+            predicted_echo_started_at: None,
             pane_output: Some(pane_output.subscribe()),
             render_frame: Vec::new(),
             outer_terminal: OuterTerminal::resolve(
@@ -118,10 +149,12 @@ mod tests {
             ),
             cursor_style: 0,
             active_pane_geometry: PaneGeometry::new(5, 6, 80, 24),
+            raw_passthrough: false,
             kitty_graphics_passthrough: true,
             sixel_passthrough: false,
             persistent_overlay_state_id: None,
             live_pane: None,
+            render_stream: false,
         };
 
         let frame = render_passthroughs(
@@ -144,7 +177,14 @@ mod tests {
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            _pane_master: pty.into_master(),
+            input_target: PaneTarget::with_window(
+                SessionName::new("alpha").expect("valid session name"),
+                0,
+                0,
+            ),
+            pane_master: Some(pty.into_master()),
+            predicted_echo: Default::default(),
+            predicted_echo_started_at: None,
             pane_output: Some(pane_output.subscribe()),
             render_frame: Vec::new(),
             outer_terminal: OuterTerminal::resolve(
@@ -153,10 +193,12 @@ mod tests {
             ),
             cursor_style: 0,
             active_pane_geometry: PaneGeometry::new(5, 6, 80, 24),
+            raw_passthrough: false,
             kitty_graphics_passthrough: false,
             sixel_passthrough: true,
             persistent_overlay_state_id: None,
             live_pane: None,
+            render_stream: false,
         };
 
         let frame = render_passthroughs(
@@ -167,12 +209,108 @@ mod tests {
     }
 
     #[test]
+    fn render_passthroughs_wraps_raw_payload_at_pane_cursor() {
+        let pty = PtyPair::open().expect("open pty pair");
+        let pane_output = pane_output_channel();
+        let target = OpenAttachTarget {
+            session_name: SessionName::new("alpha").expect("valid session name"),
+            input_target: PaneTarget::with_window(
+                SessionName::new("alpha").expect("valid session name"),
+                0,
+                0,
+            ),
+            pane_master: Some(pty.into_master()),
+            predicted_echo: Default::default(),
+            predicted_echo_started_at: None,
+            pane_output: Some(pane_output.subscribe()),
+            render_frame: Vec::new(),
+            outer_terminal: OuterTerminal::resolve(
+                &OptionStore::default(),
+                OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+            ),
+            cursor_style: 0,
+            active_pane_geometry: PaneGeometry::new(5, 6, 80, 24),
+            raw_passthrough: true,
+            kitty_graphics_passthrough: false,
+            sixel_passthrough: false,
+            persistent_overlay_state_id: None,
+            live_pane: None,
+            render_stream: false,
+        };
+
+        let frame = render_passthroughs(
+            &target,
+            &[TerminalPassthrough::raw(
+                1,
+                2,
+                b"\x1b]52;c;QQ==\x07".to_vec(),
+            )],
+        );
+        assert_eq!(frame, b"\x1b[s\x1b[9;7H\x1b]52;c;QQ==\x07\x1b[u");
+    }
+
+    #[test]
+    fn render_passthroughs_forwards_clipboard_without_cursor_motion() {
+        let mut options = OptionStore::new();
+        options
+            .set(
+                ScopeSelector::Global,
+                OptionName::SetClipboard,
+                "external".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("set-clipboard set succeeds");
+        let pty = PtyPair::open().expect("open pty pair");
+        let pane_output = pane_output_channel();
+        let target = OpenAttachTarget {
+            session_name: SessionName::new("alpha").expect("valid session name"),
+            input_target: PaneTarget::with_window(
+                SessionName::new("alpha").expect("valid session name"),
+                0,
+                0,
+            ),
+            pane_master: Some(pty.into_master()),
+            predicted_echo: Default::default(),
+            predicted_echo_started_at: None,
+            pane_output: Some(pane_output.subscribe()),
+            render_frame: Vec::new(),
+            outer_terminal: OuterTerminal::resolve(
+                &options,
+                OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+            ),
+            cursor_style: 0,
+            active_pane_geometry: PaneGeometry::new(5, 6, 80, 24),
+            raw_passthrough: false,
+            kitty_graphics_passthrough: false,
+            sixel_passthrough: false,
+            persistent_overlay_state_id: None,
+            live_pane: None,
+            render_stream: false,
+        };
+
+        let frame = render_passthroughs(
+            &target,
+            &[TerminalPassthrough::clipboard(
+                b"\x1b]52;c;QQ==\x07".to_vec(),
+            )],
+        );
+        assert_eq!(frame, b"\x1b]52;c;QQ==\x07");
+    }
+
+    #[test]
     fn render_passthroughs_is_empty_when_target_disables_passthrough() {
         let pty = PtyPair::open().expect("open pty pair");
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            _pane_master: pty.into_master(),
+            input_target: PaneTarget::with_window(
+                SessionName::new("alpha").expect("valid session name"),
+                0,
+                0,
+            ),
+            pane_master: Some(pty.into_master()),
+            predicted_echo: Default::default(),
+            predicted_echo_started_at: None,
             pane_output: Some(pane_output.subscribe()),
             render_frame: Vec::new(),
             outer_terminal: OuterTerminal::resolve(
@@ -181,10 +319,12 @@ mod tests {
             ),
             cursor_style: 0,
             active_pane_geometry: PaneGeometry::new(5, 6, 80, 24),
+            raw_passthrough: false,
             kitty_graphics_passthrough: false,
             sixel_passthrough: false,
             persistent_overlay_state_id: None,
             live_pane: None,
+            render_stream: false,
         };
 
         let frame = render_passthroughs(
@@ -204,7 +344,14 @@ mod tests {
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            _pane_master: pty.into_master(),
+            input_target: PaneTarget::with_window(
+                SessionName::new("alpha").expect("valid session name"),
+                0,
+                0,
+            ),
+            pane_master: Some(pty.into_master()),
+            predicted_echo: Default::default(),
+            predicted_echo_started_at: None,
             pane_output: Some(pane_output.subscribe()),
             render_frame: Vec::new(),
             outer_terminal: OuterTerminal::resolve(
@@ -213,10 +360,12 @@ mod tests {
             ),
             cursor_style: 0,
             active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+            raw_passthrough: false,
             kitty_graphics_passthrough: false,
             sixel_passthrough: true,
             persistent_overlay_state_id: None,
             live_pane: None,
+            render_stream: false,
         };
 
         let frame = render_passthroughs(

@@ -4,8 +4,8 @@ use rmux_core::{
     LIST_KEYS_TEMPLATE,
 };
 use rmux_proto::{
-    BindKeyResponse, CommandOutput, ErrorResponse, ListKeysResponse, Response, RmuxError,
-    UnbindKeyResponse,
+    BindKeyResponse, CommandOutput, ErrorResponse, ListKeysResponse, OptionName, Response,
+    RmuxError, UnbindKeyResponse,
 };
 
 use super::{command_output_from_lines, RequestHandler};
@@ -114,6 +114,13 @@ impl RequestHandler {
         request: rmux_proto::ListKeysRequest,
     ) -> Response {
         let state = self.state.lock().await;
+        if let Some(table_name) = request.table_name.as_deref() {
+            if state.key_bindings.table(table_name).is_none() {
+                return Response::Error(ErrorResponse {
+                    error: RmuxError::Server(format!("table {table_name} doesn't exist")),
+                });
+            }
+        }
         let sort_order = match request.sort_order.as_deref() {
             Some(value) => match KeyBindingSortOrder::parse(value) {
                 Some(value) => value,
@@ -151,12 +158,14 @@ impl RequestHandler {
         if request.notes && !request.include_unnoted {
             bindings.retain(|binding| binding.binding().note().is_some());
         }
+        let render_metrics = ListKeysRenderMetrics::from_bindings(&bindings);
+        let notes_key_width = list_keys_notes_key_width(&bindings);
         if request.first_only {
             bindings.truncate(1);
         }
 
-        let render_metrics = ListKeysRenderMetrics::from_bindings(&bindings);
-        let output = render_list_keys_output(&state, &bindings, &request, render_metrics);
+        let output =
+            render_list_keys_output(&state, &bindings, &request, render_metrics, notes_key_width);
         Response::ListKeys(ListKeysResponse {
             match_count: bindings.len(),
             output,
@@ -208,11 +217,27 @@ fn render_list_keys_output(
     bindings: &[KeyBindingDisplay],
     request: &rmux_proto::ListKeysRequest,
     render_metrics: ListKeysRenderMetrics,
+    notes_key_width: usize,
 ) -> CommandOutput {
     let template = request.format.as_deref().unwrap_or(LIST_KEYS_TEMPLATE);
+    let effective_prefix = state
+        .options
+        .global_value(OptionName::Prefix)
+        .or_else(|| state.options.resolve(None, OptionName::Prefix))
+        .unwrap_or("C-b");
+    let note_prefix_width = note_prefix_width(request, effective_prefix);
     let lines = bindings
         .iter()
         .map(|binding| {
+            if request.format.is_none() && request.notes {
+                return render_notes_binding_line(
+                    binding,
+                    request,
+                    effective_prefix,
+                    note_prefix_width,
+                    notes_key_width,
+                );
+            }
             if request.format.is_none() && request.key.is_some() && !request.notes {
                 return render_key_filtered_binding_line(binding, render_metrics);
             }
@@ -225,7 +250,15 @@ fn render_list_keys_output(
                 .with_state(state)
                 .with_named_value("key_repeat", bool_string(binding.binding().repeat()))
                 .with_named_value("key_note", binding.binding().note().unwrap_or_default())
-                .with_named_value("key_prefix", request.prefix.clone().unwrap_or_default())
+                .with_named_value(
+                    "key_prefix",
+                    note_prefix(
+                        binding.table_name(),
+                        request,
+                        effective_prefix,
+                        note_prefix_width,
+                    ),
+                )
                 .with_named_value("key_table", binding.table_name())
                 .with_named_value("key_string", binding.key_string())
                 .with_named_value("key_command", binding.command_string())
@@ -243,6 +276,43 @@ fn render_list_keys_output(
         })
         .collect::<Vec<_>>();
     command_output_from_lines(&lines)
+}
+
+fn render_notes_binding_line(
+    binding: &KeyBindingDisplay,
+    request: &rmux_proto::ListKeysRequest,
+    effective_prefix: &str,
+    note_prefix_width: usize,
+    key_width: usize,
+) -> String {
+    let prefix = note_prefix(
+        binding.table_name(),
+        request,
+        effective_prefix,
+        note_prefix_width,
+    );
+    let key = list_keys_note_key(binding.key_string());
+    format!(
+        "{prefix}{key:<key_width$} {note}",
+        note = binding.binding().note().unwrap_or_default()
+    )
+}
+
+fn list_keys_notes_key_width(bindings: &[KeyBindingDisplay]) -> usize {
+    bindings
+        .iter()
+        .map(|binding| list_keys_note_key(binding.key_string()).len())
+        .max()
+        .unwrap_or(0)
+}
+
+fn list_keys_note_key(key: &str) -> &str {
+    key.strip_prefix('\\')
+        .or_else(|| {
+            key.strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+        })
+        .unwrap_or(key)
 }
 
 fn render_key_filtered_binding_line(
@@ -287,4 +357,31 @@ fn bool_string(value: bool) -> &'static str {
     } else {
         "0"
     }
+}
+
+fn note_prefix_width(request: &rmux_proto::ListKeysRequest, effective_prefix: &str) -> usize {
+    request
+        .prefix
+        .as_deref()
+        .map_or(effective_prefix.len() + 1, str::len)
+}
+
+fn note_prefix(
+    table_name: &str,
+    request: &rmux_proto::ListKeysRequest,
+    effective_prefix: &str,
+    width: usize,
+) -> String {
+    if !request.notes {
+        return request.prefix.clone().unwrap_or_default();
+    }
+
+    if table_name != "prefix" {
+        return " ".repeat(width);
+    }
+
+    request
+        .prefix
+        .clone()
+        .unwrap_or_else(|| format!("{effective_prefix} "))
 }

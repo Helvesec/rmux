@@ -6,8 +6,8 @@ use rmux_core::LifecycleEvent;
 use rmux_proto::{
     ErrorResponse, HookLifecycle, HookName, NewSessionExtRequest, NewSessionRequest,
     NewWindowRequest, OptionName, Request, Response, RmuxError, ScopeSelector, SessionName,
-    SetEnvironmentRequest, SetHookRequest, SetOptionMode, SetOptionRequest, ShowOptionsRequest,
-    TerminalSize,
+    SetEnvironmentRequest, SetHookRequest, SetOptionMode, SetOptionRequest, ShowEnvironmentRequest,
+    ShowOptionsRequest, TerminalSize,
 };
 
 fn session_name(value: &str) -> SessionName {
@@ -637,6 +637,7 @@ async fn after_show_options_runs_without_triggering_nested_notify_hooks() {
                 name: None,
                 value_only: false,
                 include_inherited: true,
+                quiet: false,
             }))
             .await,
         Response::ShowOptions(_)
@@ -786,7 +787,7 @@ async fn hook_commands_do_not_pre_expand_set_buffer_arguments() {
 }
 
 #[tokio::test]
-async fn spawned_pane_environment_contains_rmux_pane_with_percent_prefix() {
+async fn spawned_pane_environment_contains_pane_id_with_percent_prefix() {
     let handler = RequestHandler::new();
     create_session(&handler, "alpha").await;
 
@@ -800,6 +801,7 @@ async fn spawned_pane_environment_contains_rmux_pane_with_percent_prefix() {
         "RMUX_PANE must be set in spawned pane environment"
     );
     let rmux_pane = rmux_pane.expect("RMUX_PANE is set");
+    assert_eq!(pane_zero.environment_value("TMUX_PANE"), Some(rmux_pane));
     assert!(
         rmux_pane.starts_with('%'),
         "RMUX_PANE must start with %: got {rmux_pane}"
@@ -812,7 +814,7 @@ async fn spawned_pane_environment_contains_rmux_pane_with_percent_prefix() {
 }
 
 #[tokio::test]
-async fn spawned_pane_environment_contains_rmux_with_socket_pid_session_format() {
+async fn spawned_pane_environment_contains_mux_socket_pid_session_format() {
     let handler = RequestHandler::new();
     create_session(&handler, "alpha").await;
 
@@ -821,6 +823,7 @@ async fn spawned_pane_environment_contains_rmux_with_socket_pid_session_format()
         .pane_profile(&session_name("alpha"), 0)
         .expect("pane 0 profile exists");
     let rmux_value = pane_zero.environment_value("RMUX").expect("RMUX is set");
+    assert_eq!(pane_zero.environment_value("TMUX"), Some(rmux_value));
     let parts: Vec<_> = rmux_value.split(',').collect();
     assert_eq!(
         parts.len(),
@@ -877,6 +880,20 @@ async fn environment_override_layering_session_then_override_then_rmux_pane() {
     assert_eq!(pane_zero.environment_value("MY_VAR"), Some("override"));
     // RMUX_PANE must still be present despite -e.
     assert!(pane_zero.environment_value("RMUX_PANE").is_some());
+    drop(state);
+
+    let shown = handler
+        .handle(Request::ShowEnvironment(ShowEnvironmentRequest {
+            scope: ScopeSelector::Session(session_name("alpha")),
+            name: Some("MY_VAR".to_owned()),
+            hidden: false,
+            shell_format: false,
+        }))
+        .await;
+    let output = shown
+        .command_output()
+        .expect("show-environment should expose new-session -e");
+    assert_eq!(output.stdout(), b"MY_VAR=override\n");
 }
 
 #[tokio::test]
@@ -928,6 +945,7 @@ async fn new_session_ext_client_environment_respects_tmux_precedence() {
                 "RMUX_CLIENT_ENV_SENTINEL=from-client".to_owned(),
                 "RMUX_CLIENT_ONLY_ENV_SENTINEL=from-client".to_owned(),
             ]),
+            skip_environment_update: false,
         }))
         .await;
 
@@ -957,10 +975,74 @@ async fn new_session_ext_client_environment_respects_tmux_precedence() {
         pane_zero.environment_value("RMUX_CLIENT_ENV_SENTINEL"),
         Some("from-explicit")
     );
-    assert_ne!(
+    assert_eq!(
         pane_zero.environment_value("RMUX_CLIENT_ONLY_ENV_SENTINEL"),
         Some("from-client")
     );
+    drop(state);
+
+    let shown = handler
+        .handle(Request::ShowEnvironment(ShowEnvironmentRequest {
+            scope: ScopeSelector::Session(session.clone()),
+            name: Some("RMUX_CLIENT_ONLY_ENV_SENTINEL".to_owned()),
+            hidden: false,
+            shell_format: false,
+        }))
+        .await;
+    assert!(matches!(shown, Response::Error(_)));
+}
+
+#[tokio::test]
+async fn new_session_ext_skip_environment_update_keeps_client_spawn_environment() {
+    let handler = RequestHandler::new();
+    let session = session_name("skip-client-env");
+
+    let response = handler
+        .handle(Request::NewSessionExt(NewSessionExtRequest {
+            session_name: Some(session.clone()),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: None,
+            process_command: None,
+            client_environment: Some(vec![
+                "PATH=/tmp/rmux-client-bin:/usr/bin".to_owned(),
+                "RMUX_CLIENT_ONLY_ENV_SENTINEL=from-client".to_owned(),
+            ]),
+            skip_environment_update: true,
+        }))
+        .await;
+
+    assert!(matches!(response, Response::NewSession(_)));
+
+    let state = handler.state.lock().await;
+    let pane_zero = state
+        .pane_profile(&session, 0)
+        .expect("pane 0 profile exists");
+    assert_eq!(
+        pane_zero.environment_value("RMUX_CLIENT_ONLY_ENV_SENTINEL"),
+        Some("from-client")
+    );
+    drop(state);
+
+    let shown = handler
+        .handle(Request::ShowEnvironment(ShowEnvironmentRequest {
+            scope: ScopeSelector::Session(session),
+            name: Some("PATH".to_owned()),
+            hidden: false,
+            shell_format: false,
+        }))
+        .await;
+    assert!(matches!(shown, Response::Error(_)));
 }
 
 fn shell_quote_str(value: &str) -> String {

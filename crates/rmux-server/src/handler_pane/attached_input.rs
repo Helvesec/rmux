@@ -9,7 +9,8 @@ use super::super::{
     RequestHandler,
 };
 use super::pane_io_encoding::{
-    encode_key_for_target, prepare_attached_pane_input_writes, write_bytes_to_target_io,
+    encode_key_for_target, encode_mouse_for_target, prepare_attached_pane_input_writes,
+    write_bytes_to_target_io,
 };
 use super::pane_prompt_input::{decode_prompt_input_event, is_extended_key_prefix};
 use super::{io_other, resolve_input_target, AttachedKeyDispatch};
@@ -148,19 +149,31 @@ impl RequestHandler {
         bytes: &[u8],
     ) -> io::Result<()> {
         pending_input.extend_from_slice(bytes);
+        let mut deferred_refresh = false;
 
         loop {
             let Some((event, consumed)) = decode_prompt_input_event(pending_input) else {
+                if deferred_refresh {
+                    self.flush_attached_prompt_refresh(attach_pid)
+                        .await
+                        .map_err(io_other)?;
+                }
                 retain_partial_attached_control_input("prompt input", pending_input)?;
                 return Ok(());
             };
             pending_input.drain(..consumed);
-            self.handle_prompt_event(attach_pid, event)
+            self.handle_prompt_event_deferred_refresh(attach_pid, event, &mut deferred_refresh)
                 .await
                 .map_err(io_other)?;
             if !self.prompt_active(attach_pid).await {
                 break;
             }
+        }
+
+        if deferred_refresh && self.prompt_active(attach_pid).await {
+            self.flush_attached_prompt_refresh(attach_pid)
+                .await
+                .map_err(io_other)?;
         }
 
         if !pending_input.is_empty() {
@@ -333,7 +346,7 @@ impl RequestHandler {
             .map_err(io_other)?
             .or_else(|| Some(Target::Pane(target.clone())));
         let mouse_target = current_target.clone();
-        let _ = self
+        let handled = self
             .dispatch_attached_key_inner(
                 &target,
                 AttachedKeyDispatch {
@@ -347,7 +360,35 @@ impl RequestHandler {
             )
             .await
             .map_err(io_other)?;
+        if !handled {
+            self.forward_attached_mouse_event_to_pane(&target, &classified.event)
+                .await?;
+        }
         Ok(())
+    }
+
+    async fn forward_attached_mouse_event_to_pane(
+        &self,
+        target: &PaneTarget,
+        event: &crate::mouse::AttachedMouseEvent,
+    ) -> io::Result<bool> {
+        let prepared = {
+            let state = self.state.lock().await;
+            let bytes = encode_mouse_for_target(&state, target, event).map_err(io_other)?;
+            if bytes.is_empty() {
+                return Ok(false);
+            }
+            let writes =
+                prepare_attached_pane_input_writes(&state, target, &bytes).map_err(io_other)?;
+            (writes, bytes)
+        };
+
+        for write in prepared.0 {
+            write_bytes_to_target_io(write, prepared.1.clone())
+                .await
+                .map_err(io_other)?;
+        }
+        Ok(true)
     }
 
     async fn write_attached_bytes(&self, attach_pid: u32, bytes: &[u8]) -> io::Result<()> {
@@ -431,6 +472,16 @@ impl RequestHandler {
             .get(&attach_pid)
             .map(|active| active.session_name.clone())
             .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))
+    }
+
+    async fn target_pane_mode(&self, target: &PaneTarget) -> Result<u32, RmuxError> {
+        let state = self.state.lock().await;
+        let transcript = state.transcript_handle(target)?;
+        let mode = transcript
+            .lock()
+            .expect("pane transcript mutex must not be poisoned")
+            .mode();
+        Ok(mode)
     }
 
     pub(in crate::handler) async fn attached_last_mouse_event(

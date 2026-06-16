@@ -182,6 +182,28 @@ pub fn truncate_to_width(value: &str, width: usize, config: &Utf8Config) -> Stri
     output
 }
 
+/// Truncates a string from the left, keeping the rightmost text cells that fit.
+#[must_use]
+pub fn truncate_right_to_width(value: &str, width: usize, config: &Utf8Config) -> String {
+    let cells = fold_text_cells(value, config);
+    let mut used = 0_usize;
+    let mut start = cells.len();
+
+    for (index, cell) in cells.iter().enumerate().rev() {
+        let cell_width = usize::from(cell.width);
+        if cell_width != 0 && used.saturating_add(cell_width) > width {
+            break;
+        }
+        used = used.saturating_add(cell_width);
+        start = index;
+    }
+
+    cells[start..]
+        .iter()
+        .map(|cell| cell.text.as_str())
+        .collect()
+}
+
 pub(crate) fn combine_char(
     previous: Option<(&str, u8)>,
     ch: char,

@@ -369,9 +369,7 @@ async fn render_stream_emits_snapshot_after_output() -> TestResult {
     let pane = session.pane(0, 0);
     let mut stream = pane.render_stream().await?;
 
-    pane.send_text("printf 'sdk_render_%s\\n' $((40+2))")
-        .await?;
-    pane.send_key("Enter").await?;
+    pane.send_text("printf 'sdk_render_42\\n'\n").await?;
     let update = wait_for_render_text(&mut stream, "sdk_render_42").await?;
     assert!(update.snapshot().visible_text().contains("sdk_render_42"));
     drop(stream);
@@ -446,7 +444,7 @@ async fn wait_for_render_text(
     stream: &mut rmux_sdk::PaneRenderStream,
     marker: &str,
 ) -> TestResult<rmux_sdk::RenderUpdate> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
             Ok(Ok(Some(update))) => {

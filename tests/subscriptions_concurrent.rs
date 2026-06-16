@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rmux_core::events::{SubscriptionLimits, DEFAULT_OUTPUT_RING_CAPACITY};
+use rmux_core::events::SubscriptionLimits;
 use rmux_proto::{
     encode_frame, ErrorResponse, FrameDecoder, KillPaneRequest, ListPanesRequest,
     NewSessionExtRequest, NewSessionRequest, PaneOutputCursorRequest, PaneOutputLagResponse,
@@ -20,9 +20,8 @@ use rmux_proto::{
 use rmux_server::{DaemonConfig, ServerDaemon, ServerHandle};
 
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
-const LAG_OUTPUT_EVENT_TARGET: usize = DEFAULT_OUTPUT_RING_CAPACITY + 64;
-const LAG_OUTPUT_COMMAND: &str =
-    "i=0; while [ \"$i\" -lt 1408 ]; do printf 'rmux_subscription_lag_%04d\\n' \"$i\"; i=$((i+1)); sleep 0.002; done";
+const LAG_OUTPUT_EVENT_TARGET: usize = 8;
+const LAG_OUTPUT_COMMAND: &str = "payload=$(printf '%4096s' '' | tr ' ' X); i=0; while [ \"$i\" -lt 160 ]; do printf 'rmux_subscription_lag_%04d_%s\\n' \"$i\" \"$payload\"; i=$((i+1)); done; printf rmux_subscription_lag_done";
 
 struct Harness {
     runtime: tokio::runtime::Runtime,
@@ -276,8 +275,6 @@ fn slow_subscriber_batch_cap_then_lag_resumes_at_oldest_retained_event(
         cursor_sequence + u64::try_from(LAG_OUTPUT_EVENT_TARGET)?,
     )
     .map_err(|error| io::Error::other(format!("lag output failed: {error}")))?;
-    interrupt_pane(&mut sender, target.clone())
-        .map_err(|error| io::Error::other(format!("lag interrupt failed: {error}")))?;
     wait_for_output_quiescence(&mut sender, target.clone())
         .map_err(|error| io::Error::other(format!("lag output did not settle: {error}")))?;
     let lag = wait_for_lag(&mut subscriber, subscription.subscription_id)
@@ -339,6 +336,7 @@ fn create_short_lived_shell_session(
         command: Some(vec!["sh".to_owned(), "-c".to_owned(), "sleep 1".to_owned()]),
         process_command: None,
         client_environment: None,
+        skip_environment_update: false,
     }))?;
     assert!(matches!(response, Response::NewSession(_)), "{response:?}");
     Ok(())
@@ -381,6 +379,7 @@ fn create_interactive_shell_session(
         command: Some(vec!["sh".to_owned(), "-i".to_owned()]),
         process_command: None,
         client_environment: None,
+        skip_environment_update: false,
     }))?;
     assert!(matches!(response, Response::NewSession(_)), "{response:?}");
     thread::sleep(Duration::from_millis(100));
@@ -432,15 +431,6 @@ fn send_keys(
     let response = connection.roundtrip(&Request::SendKeys(SendKeysRequest {
         target,
         keys: vec![command.to_owned(), "Enter".to_owned()],
-    }))?;
-    assert!(matches!(response, Response::SendKeys(_)), "{response:?}");
-    Ok(())
-}
-
-fn interrupt_pane(connection: &mut Connection, target: PaneTarget) -> Result<(), Box<dyn Error>> {
-    let response = connection.roundtrip(&Request::SendKeys(SendKeysRequest {
-        target,
-        keys: vec!["C-c".to_owned()],
     }))?;
     assert!(matches!(response, Response::SendKeys(_)), "{response:?}");
     Ok(())

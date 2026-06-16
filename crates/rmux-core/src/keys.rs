@@ -116,7 +116,7 @@ const KEYC_MOUSE: KeyCode = KEYC_NONE + 49;
 pub const KEYC_DRAGGING: KeyCode = KEYC_NONE + 50;
 
 /// Default `list-keys` template.
-pub const LIST_KEYS_TEMPLATE: &str = "#{?notes_only,#{key_prefix} #{p|#{key_string_width}:key_string} #{?key_note,#{key_note},#{key_command}},bind-key#{?key_has_repeat, #{?key_repeat,-r,  },} -T #{p|#{key_table_width}:key_table} #{p|#{key_string_width}:key_string} #{key_command}}";
+pub const LIST_KEYS_TEMPLATE: &str = "#{?notes_only,#{key_prefix}#{p|#{key_string_width}:key_string} #{?key_note,#{key_note},#{key_command}},bind-key#{?key_has_repeat, #{?key_repeat,-r,  },} -T #{p|#{key_table_width}:key_table} #{p|#{key_string_width}:key_string} #{key_command}}";
 
 /// Returns the key bits used for binding lookup.
 #[must_use]
@@ -157,6 +157,9 @@ pub fn key_string_lookup_string(string: &str) -> Option<KeyCode> {
     if rest.starts_with('^') && rest.len() > 1 {
         if rest.chars().count() == 2 {
             let character = rest.chars().nth(1)?;
+            if let Some(alias) = control_key_alias(character) {
+                return Some(alias);
+            }
             return Some(character.to_ascii_lowercase() as KeyCode | KEYC_CTRL);
         }
         modifiers |= KEYC_CTRL;
@@ -175,6 +178,11 @@ pub fn key_string_lookup_string(string: &str) -> Option<KeyCode> {
             if key < 32 {
                 return None;
             }
+            if modifiers & KEYC_CTRL != 0 {
+                if let Some(alias) = control_key_alias(char::from(bytes[0])) {
+                    return Some(alias | (modifiers & !KEYC_CTRL));
+                }
+            }
             return Some(key | modifiers);
         }
     } else {
@@ -190,6 +198,13 @@ pub fn key_string_lookup_string(string: &str) -> Option<KeyCode> {
         key &= !KEYC_IMPLIED_META;
     }
     Some(key | modifiers)
+}
+
+fn control_key_alias(character: char) -> Option<KeyCode> {
+    match character {
+        '[' => Some(0x1b),
+        _ => None,
+    }
 }
 
 /// Converts a key code into its canonical tmux string.
@@ -288,6 +303,9 @@ pub fn key_code_to_bytes(key: KeyCode) -> Option<Vec<u8>> {
     }
 
     let base = key & KEYC_MASK_KEY;
+    if base == b'\r' as u64 && (key & KEYC_MASK_MODIFIERS) == KEYC_SHIFT {
+        return Some(vec![b'\n']);
+    }
     if key & KEYC_CTRL != 0 {
         if base == b'?' as u64 {
             return Some(vec![0x7f]);

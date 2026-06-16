@@ -24,6 +24,9 @@ pub(super) async fn set_title(pane: &Pane, title: String) -> Result<()> {
             .request(Request::SelectPane(SelectPaneRequest {
                 target: pane.target().into(),
                 title: Some(title),
+                style: None,
+                input_disabled: None,
+                preserve_zoom: false,
             }))
             .await?
     };
@@ -51,6 +54,7 @@ pub(super) async fn get_title(pane: &Pane) -> Result<Option<String>> {
             target: Some(Target::Pane(target.to_proto())),
             print: true,
             message: Some(PANE_TITLE_FORMAT.to_owned()),
+            empty_target_context: false,
         }))
         .await;
 

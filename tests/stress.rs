@@ -18,12 +18,13 @@ use common::{
 use rmux_client::{connect, ClientError};
 use rmux_core::Session;
 use rmux_proto::{
-    CapturePaneRequest, KillSessionRequest, KillSessionResponse, LayoutName, NewSessionRequest,
-    PaneTarget, Request, ResizePaneAdjustment, ResizePaneRequest, Response, SelectLayoutRequest,
-    SelectLayoutResponse, SelectLayoutTarget, SendKeysRequest, SendKeysResponse,
-    SplitWindowRequest, SplitWindowResponse, SplitWindowTarget, Target, TerminalSize,
+    CapturePaneRequest, KillSessionRequest, KillSessionResponse, LayoutName, NewSessionExtRequest,
+    NewSessionRequest, PaneTarget, ProcessCommand, Request, ResizePaneAdjustment,
+    ResizePaneRequest, Response, SelectLayoutRequest, SelectLayoutResponse, SelectLayoutTarget,
+    SendKeysRequest, SendKeysResponse, SplitWindowExtRequest, SplitWindowRequest,
+    SplitWindowResponse, SplitWindowTarget, Target, TerminalSize,
 };
-use rmux_server::{DaemonConfig, ServerDaemon};
+use rmux_server::{DaemonConfig, ServerDaemon, ServerHandle};
 use support::{
     assert_valid_non_overlapping_geometry, runtime, serialize_test_execution, single_new_tty,
     tty_sizes_by_index, unique_session_name, wait_for_tty_size,
@@ -35,6 +36,8 @@ const PANE_COUNT: usize = 20;
 const SECONDARY_PANE_COUNT: u32 = (PANE_COUNT - 1) as u32;
 const MAIN_PANE_WIDTH: u16 = 34;
 const REAP_TIMEOUT: Duration = Duration::from_secs(2);
+const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const STRESS_PANE_COMMAND: &str = "/bin/cat";
 
 fn wait_for_socket_directory_empty(
     socket_path: &Path,
@@ -53,6 +56,20 @@ fn wait_for_socket_directory_empty(
 
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn shutdown_daemon(
+    runtime: &tokio::runtime::Runtime,
+    handle: ServerHandle,
+) -> Result<(), Box<dyn Error>> {
+    runtime.block_on(async {
+        tokio::time::timeout(DAEMON_SHUTDOWN_TIMEOUT, handle.shutdown())
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "daemon shutdown timed out")
+            })??;
+        Ok::<(), Box<dyn Error>>(())
+    })
 }
 
 #[test]
@@ -75,14 +92,27 @@ fn twenty_pane_layout_produces_valid_geometry_and_resizes_all_ptys() -> Result<(
         },
     );
 
-    let created = connection.roundtrip(&Request::NewSession(NewSessionRequest {
-        session_name: session_name.clone(),
+    let created = connection.roundtrip(&Request::NewSessionExt(NewSessionExtRequest {
+        session_name: Some(session_name.clone()),
+        working_directory: None,
         detached: true,
         size: Some(TerminalSize {
             cols: TERMINAL_COLS,
             rows: TERMINAL_ROWS,
         }),
         environment: None,
+        group_target: None,
+        attach_if_exists: false,
+        detach_other_clients: false,
+        kill_other_clients: false,
+        flags: None,
+        window_name: None,
+        print_session_info: false,
+        print_format: None,
+        command: None,
+        process_command: Some(ProcessCommand::Argv(vec![STRESS_PANE_COMMAND.to_owned()])),
+        client_environment: None,
+        skip_environment_update: false,
     }))?;
     assert!(matches!(created, Response::NewSession(_)));
 
@@ -92,11 +122,20 @@ fn twenty_pane_layout_produces_valid_geometry_and_resizes_all_ptys() -> Result<(
     );
 
     for expected_index in 1..PANE_COUNT as u32 {
-        let split = connection.roundtrip(&Request::SplitWindow(SplitWindowRequest {
+        let split = connection.roundtrip(&Request::SplitWindowExt(SplitWindowExtRequest {
             target: SplitWindowTarget::Session(session_name.clone()),
             direction: rmux_proto::SplitDirection::Vertical,
             before: false,
             environment: None,
+            command: None,
+            process_command: Some(ProcessCommand::Argv(vec![STRESS_PANE_COMMAND.to_owned()])),
+            start_directory: None,
+            keep_alive_on_exit: None,
+            detached: false,
+            size: None,
+            preserve_zoom: false,
+            full_size: false,
+            stdin_payload: None,
         }))?;
         assert_eq!(
             split,
@@ -254,7 +293,7 @@ fn twenty_pane_layout_produces_valid_geometry_and_resizes_all_ptys() -> Result<(
     assert!(last_capture.contains(last_marker));
 
     drop(connection);
-    runtime.block_on(handle.shutdown())?;
+    shutdown_daemon(&runtime, handle)?;
     fs::remove_dir_all(tmpdir)?;
     Ok(())
 }
@@ -301,8 +340,8 @@ fn session_name_rewrites_preserve_server_state() -> Result<(), Box<dyn Error>> {
                 "stdout should stay empty for {label}"
             );
             assert!(
-                stderr(&output).contains("invalid session name"),
-                "stderr should report an invalid session name for {label}, got: {}",
+                stderr(&output).contains("invalid session"),
+                "stderr should report an invalid session for {label}, got: {}",
                 stderr(&output)
             );
             assert!(
@@ -333,7 +372,7 @@ fn session_name_rewrites_preserve_server_state() -> Result<(), Box<dyn Error>> {
             ])?);
         } else {
             assert_eq!(live_output.status.code(), Some(1));
-            assert!(stderr(&live_output).contains("invalid session name"));
+            assert!(stderr(&live_output).contains("invalid session"));
         }
         assert_success(&live_harness.run(&["has-session", "-t", stable_session.as_str()])?);
     }
@@ -351,6 +390,7 @@ fn pane_tty_path(
             target: Some(Target::Pane(target)),
             print: true,
             message: Some("#{pane_tty}".to_owned()),
+            empty_target_context: false,
         },
     ))?;
     let output = response

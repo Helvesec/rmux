@@ -27,6 +27,27 @@ fn select_layout_accepts_all_standard_layout_names() {
 }
 
 #[test]
+fn select_layout_accepts_old_layout_flag() {
+    let cli = parse_args(&["select-layout", "-o", "-t", "alpha:0"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::Command::SelectLayout(args) => {
+            assert!(args.old);
+            assert_eq!(args.target.as_ref().expect("target").to_string(), "alpha:0");
+            assert!(args.layout.is_none());
+        }
+        _ => panic!("expected SelectLayout command"),
+    }
+}
+
+#[test]
+fn select_layout_rejects_old_layout_flag_with_layout_argument() {
+    let error = parse_args(&["select-layout", "-o", "tiled"]).unwrap_err();
+
+    assert!(error.to_string().contains("too many arguments"));
+}
+
+#[test]
 fn next_layout_accepts_window_targets() {
     let cli = parse_args(&["next-layout", "-t", "alpha:3"]).unwrap();
 

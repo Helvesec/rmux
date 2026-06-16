@@ -471,6 +471,7 @@ async fn display_message_for_control_client_uses_message_notification() {
             target: Some(Target::Session(alpha)),
             print: false,
             message: Some("hello\t#{session_name}".to_owned()),
+            empty_target_context: false,
         }),
     )
     .await;
@@ -504,6 +505,38 @@ async fn startup_config_errors_are_queued_as_percent_config_error_notifications(
             "%config-error first startup error".to_owned(),
             "%config-error second startup error".to_owned(),
         ]
+    );
+}
+
+#[tokio::test]
+async fn startup_config_errors_do_not_block_first_regular_command() {
+    let handler = RequestHandler::new();
+    handler
+        .startup_config_errors
+        .lock()
+        .await
+        .push(rmux_proto::RmuxError::Server(
+            "startup config failed".to_owned(),
+        ));
+
+    let response = dispatch_as(
+        &handler,
+        711,
+        Request::NewSession(NewSessionRequest {
+            session_name: session_name("alpha"),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }),
+    )
+    .await;
+
+    assert!(matches!(response, Response::NewSession(_)));
+
+    let mut control_rx = register_control_client(&handler, 711, None).await;
+    assert_eq!(
+        drain_control_notifications(&mut control_rx),
+        vec!["%config-error startup config failed".to_owned()]
     );
 }
 
@@ -563,6 +596,7 @@ async fn hook_commands_do_not_emit_nested_control_notifications() {
             name: None,
             value_only: false,
             include_inherited: true,
+            quiet: false,
         }))
         .await;
     assert!(matches!(response, Response::ShowOptions(_)));

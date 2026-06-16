@@ -458,7 +458,7 @@ pub(crate) fn render_formatted_line(frame: &mut Vec<u8>, x: u16, y: u16, line: &
         return;
     }
 
-    frame.extend_from_slice(b"\x1b[s\x1b[0m");
+    frame.extend_from_slice(b"\x1b7\x1b[0m");
     frame.extend_from_slice(cursor_position_bytes(y, x).as_slice());
 
     let mut active_style: Option<Style> = None;
@@ -476,7 +476,7 @@ pub(crate) fn render_formatted_line(frame: &mut Vec<u8>, x: u16, y: u16, line: &
         frame.extend_from_slice(cell.text.as_bytes());
     }
 
-    frame.extend_from_slice(b"\x1b[0m\x1b[u");
+    frame.extend_from_slice(b"\x1b[0m\x1b8");
 }
 
 // ---------------------------------------------------------------------------

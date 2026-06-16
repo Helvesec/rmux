@@ -1,5 +1,81 @@
 use super::*;
 
+#[cfg(unix)]
+#[tokio::test]
+async fn live_attach_direct_fast_path_requires_current_unsynchronized_pane() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let pane_zero = PaneTarget::with_window(alpha.clone(), 0, 0);
+    let pty = rmux_pty::PtyPair::open().expect("open pty pair");
+
+    let direct = handler
+        .try_forward_plain_attached_bytes_to_current_pane_fast(
+            requester_pid,
+            &[],
+            b"x",
+            &pane_zero,
+            pty.master(),
+        )
+        .await
+        .expect("direct fast path should run");
+    assert_eq!(direct, Some(true));
+
+    let direct_batch = handler
+        .try_forward_plain_attached_bytes_to_current_pane_fast(
+            requester_pid,
+            &[],
+            b"abc",
+            &pane_zero,
+            pty.master(),
+        )
+        .await
+        .expect("direct fast path should accept small printable batches");
+    assert_eq!(direct_batch, Some(true));
+
+    let stale_target = PaneTarget::with_window(alpha.clone(), 0, 1);
+    let stale = handler
+        .try_forward_plain_attached_bytes_to_current_pane_fast(
+            requester_pid,
+            &[],
+            b"x",
+            &stale_target,
+            pty.master(),
+        )
+        .await
+        .expect("stale target check should run");
+    assert_eq!(stale, None);
+
+    let set_sync = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+            option: OptionName::SynchronizePanes,
+            value: "on".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(set_sync, Response::SetOption(_)));
+
+    let synchronized = handler
+        .try_forward_plain_attached_bytes_to_current_pane_fast(
+            requester_pid,
+            &[],
+            b"x",
+            &pane_zero,
+            pty.master(),
+        )
+        .await
+        .expect("sync panes check should run");
+    assert_eq!(synchronized, None);
+}
+
 #[tokio::test]
 async fn live_attach_synchronize_panes_writes_to_each_live_pane() {
     let handler = RequestHandler::new();
@@ -21,6 +97,9 @@ async fn live_attach_synchronize_panes_writes_to_each_live_pane() {
         .handle(Request::SelectPane(SelectPaneRequest {
             target: PaneTarget::with_window(alpha.clone(), 0, 0),
             title: None,
+            style: None,
+            input_disabled: None,
+            preserve_zoom: false,
         }))
         .await;
     assert!(matches!(select_first, Response::SelectPane(_)));
@@ -157,6 +236,9 @@ async fn create_synchronized_two_pane_session(
         .handle(Request::SelectPane(SelectPaneRequest {
             target: PaneTarget::with_window(alpha.clone(), 0, 0),
             title: None,
+            style: None,
+            input_disabled: None,
+            preserve_zoom: false,
         }))
         .await;
     assert!(matches!(select_first, Response::SelectPane(_)));

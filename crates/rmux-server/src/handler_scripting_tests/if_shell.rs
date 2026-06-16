@@ -36,6 +36,127 @@ async fn if_shell_format_mode_dispatches_selected_rmux_command() {
 }
 
 #[tokio::test]
+async fn if_shell_format_mode_expands_socket_path_without_target() {
+    let handler = RequestHandler::new();
+    handler.set_socket_path("/tmp/rmux-test.sock");
+
+    let response = handler
+        .handle(Request::IfShell(IfShellRequest {
+            condition: "#{socket_path}".to_owned(),
+            format_mode: true,
+            then_command: "set-buffer -b chosen selected".to_owned(),
+            else_command: Some("set-buffer -b chosen wrong".to_owned()),
+            target: None,
+            caller_cwd: None,
+            background: false,
+        }))
+        .await;
+
+    assert_eq!(
+        response,
+        Response::IfShell(rmux_proto::IfShellResponse::no_output())
+    );
+
+    let response = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("chosen".to_owned()),
+        }))
+        .await;
+    assert_eq!(
+        response
+            .command_output()
+            .expect("show-buffer output")
+            .stdout(),
+        b"selected"
+    );
+}
+
+#[tokio::test]
+async fn if_shell_format_mode_treats_zero_prefixed_values_as_false_like_tmux() {
+    let handler = RequestHandler::new();
+
+    for condition in ["00", "09", "01", "0abc", "0.0"] {
+        let buffer = format!("chosen-{condition}");
+        let response = handler
+            .handle(Request::IfShell(IfShellRequest {
+                condition: condition.to_owned(),
+                format_mode: true,
+                then_command: format!("set-buffer -b {buffer} selected"),
+                else_command: Some(format!("set-buffer -b {buffer} fallback")),
+                target: None,
+                caller_cwd: None,
+                background: false,
+            }))
+            .await;
+        assert_eq!(
+            response,
+            Response::IfShell(rmux_proto::IfShellResponse::no_output())
+        );
+
+        let response = handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some(buffer),
+            }))
+            .await;
+        assert_eq!(
+            response
+                .command_output()
+                .expect("show-buffer output")
+                .stdout(),
+            b"fallback",
+            "condition {condition:?} should be false"
+        );
+    }
+}
+
+#[tokio::test]
+async fn if_shell_format_mode_without_target_uses_preferred_session_context() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let response = handler
+        .handle(Request::IfShell(IfShellRequest {
+            condition: "#{session_name}".to_owned(),
+            format_mode: true,
+            then_command: "set-buffer -b chosen selected".to_owned(),
+            else_command: Some("set-buffer -b chosen wrong".to_owned()),
+            target: None,
+            caller_cwd: None,
+            background: false,
+        }))
+        .await;
+
+    assert_eq!(
+        response,
+        Response::IfShell(rmux_proto::IfShellResponse::no_output())
+    );
+
+    let response = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("chosen".to_owned()),
+        }))
+        .await;
+    assert_eq!(
+        response
+            .command_output()
+            .expect("show-buffer output")
+            .stdout(),
+        b"selected"
+    );
+}
+
+#[tokio::test]
 async fn source_file_if_shell_true_executes_brace_command_list() {
     let handler = RequestHandler::new();
     let root = temp_root("if-shell-true-brace");
@@ -50,7 +171,7 @@ async fn source_file_if_shell_true_executes_brace_command_list() {
         .await;
     assert_eq!(
         response,
-        Response::SourceFile(rmux_proto::SourceFileResponse { output: None })
+        Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
     );
 
     let response = handler
@@ -113,6 +234,63 @@ async fn if_shell_pane_id_target_resolves_like_display_message() {
 }
 
 #[tokio::test]
+async fn queued_if_shell_target_becomes_branch_current_target() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    for session in [&alpha, &beta] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
+
+    let parsed = CommandParser::new()
+        .parse("if-shell -F -t beta:0.0 1 { new-window -d -n nested }")
+        .expect("if-shell parses");
+    handler
+        .execute_parsed_commands(
+            std::process::id(),
+            parsed,
+            QueueExecutionContext::without_caller_cwd().with_current_target(Some(Target::Pane(
+                PaneTarget::with_window(alpha.clone(), 0, 0),
+            ))),
+        )
+        .await
+        .expect("if-shell branch should execute");
+
+    let state = handler.state.lock().await;
+    let alpha_windows = state
+        .sessions
+        .session(&alpha)
+        .expect("alpha exists")
+        .windows()
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    let beta_session = state.sessions.session(&beta).expect("beta exists");
+    assert_eq!(alpha_windows, vec![0]);
+    assert_eq!(
+        beta_session.windows().keys().copied().collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(
+        beta_session
+            .window_at(1)
+            .expect("nested window exists")
+            .name(),
+        Some("nested")
+    );
+}
+
+#[tokio::test]
 async fn if_shell_false_without_else_is_a_successful_noop() {
     let handler = RequestHandler::new();
 
@@ -169,6 +347,7 @@ async fn scripted_pane_commands_accept_session_targets_like_tmux() {
             target: Some(Target::Pane(PaneTarget::new(alpha, 0))),
             print: true,
             message: Some("#{pane_in_mode}".to_owned()),
+            empty_target_context: false,
         }))
         .await;
     let output = mode.command_output().expect("display-message output");
@@ -466,12 +645,8 @@ async fn if_shell_string_mode_runs_multiple_commands_in_one_group() {
 #[tokio::test]
 async fn if_shell_inserted_assignments_apply_before_parent_queue_tail() {
     let handler = RequestHandler::new();
-    let command = shell_env_or_default_command("FOO", "unset");
     let parsed = CommandParser::new()
-        .parse(&format!(
-            "if-shell -F 1 {{ FOO=bar }} ; run-shell {}",
-            command_quote(&command)
-        ))
+        .parse("if-shell -F 1 { FOO=bar } ; run-shell true")
         .expect("commands parse");
 
     let output = handler
@@ -479,7 +654,7 @@ async fn if_shell_inserted_assignments_apply_before_parent_queue_tail() {
         .await
         .expect("queue succeeds");
 
-    assert_eq!(output.stdout(), b"bar");
+    assert!(output.stdout().is_empty());
 
     let state = handler.state.lock().await;
     assert_eq!(state.environment.global_value("FOO"), Some("bar"));

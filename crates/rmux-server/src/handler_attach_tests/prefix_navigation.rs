@@ -22,6 +22,9 @@ async fn attached_prefix_right_dispatches_select_pane_right() {
             .handle(Request::SelectPane(SelectPaneRequest {
                 target: PaneTarget::new(alpha.clone(), 0),
                 title: None,
+                style: None,
+                input_disabled: None,
+                preserve_zoom: false,
             }))
             .await,
         Response::SelectPane(_)

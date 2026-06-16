@@ -24,6 +24,8 @@ async fn move_window_with_d_keeps_the_next_window_active_when_moving_the_current
             renumber: false,
             kill_destination: false,
             detached: true,
+            after: false,
+            before: false,
         }))
         .await;
 
@@ -164,31 +166,57 @@ async fn swap_window_with_d_selects_target_window_within_session() {
 }
 
 #[tokio::test]
-async fn move_window_reindex_rejects_source_when_renumber_is_set() {
+async fn move_window_reindex_with_source_ignores_source_and_preserves_active_window() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     create_session(&handler, "alpha").await;
+    insert_window(&handler, &alpha, 2).await;
 
     let response = handler
         .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha.clone(), 0)),
+            source: Some(WindowTarget::with_window(alpha.clone(), 2)),
             target: MoveWindowTarget::Session(alpha.clone()),
             renumber: true,
             kill_destination: false,
             detached: false,
+            after: false,
+            before: false,
         }))
         .await;
 
-    assert!(matches!(response, Response::Error(_)));
+    assert_eq!(
+        response,
+        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+            session_name: alpha.clone(),
+            target: None,
+        })
+    );
+
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("alpha should exist");
+    assert_eq!(
+        session.windows().keys().copied().collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(session.active_window_index(), 0);
 }
 
 #[tokio::test]
-async fn move_window_across_sessions_rejects_last_window_removal() {
+async fn move_window_across_sessions_removes_source_session_when_moving_its_last_window() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let beta = session_name("beta");
     create_session(&handler, "alpha").await;
     create_session(&handler, "beta").await;
+    let moved_pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&alpha)
+            .expect("alpha exists")
+            .pane_id_in_window(0, 0)
+            .expect("source pane exists")
+    };
 
     let response = handler
         .handle(Request::MoveWindow(MoveWindowRequest {
@@ -197,16 +225,36 @@ async fn move_window_across_sessions_rejects_last_window_removal() {
             renumber: false,
             kill_destination: false,
             detached: false,
+            after: false,
+            before: false,
         }))
         .await;
 
-    assert!(matches!(response, Response::Error(_)));
+    assert_eq!(
+        response,
+        Response::MoveWindow(rmux_proto::MoveWindowResponse {
+            session_name: beta.clone(),
+            target: Some(WindowTarget::with_window(beta.clone(), 5)),
+        })
+    );
 
     let state = handler.state.lock().await;
-    let alpha_session = state.sessions.session(&alpha).expect("alpha should exist");
+    assert!(
+        state.sessions.session(&alpha).is_none(),
+        "tmux removes a source session emptied by move-window"
+    );
+    let beta_session = state.sessions.session(&beta).expect("beta should exist");
     assert_eq!(
-        alpha_session.windows().keys().copied().collect::<Vec<_>>(),
-        vec![0]
+        beta_session.windows().keys().copied().collect::<Vec<_>>(),
+        vec![0, 5]
+    );
+    assert_eq!(beta_session.pane_id_in_window(5, 0), Some(moved_pane_id));
+    state
+        .pane_profile_in_window(&beta, 5, 0)
+        .expect("moved pane terminal should live in the destination session");
+    assert_eq!(
+        state.pane_profile_in_window(&alpha, 0, 0).unwrap_err(),
+        rmux_proto::RmuxError::SessionNotFound("alpha".to_owned())
     );
 }
 

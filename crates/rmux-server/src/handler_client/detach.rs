@@ -104,6 +104,16 @@ impl RequestHandler {
                     .await;
                 }
             }
+            let control_pids = self
+                .detach_control_clients_for_session(session_name, None)
+                .await;
+            for control_pid in control_pids {
+                self.emit(LifecycleEvent::ClientDetached {
+                    session_name: session_name.clone(),
+                    client_name: Some(control_pid.to_string()),
+                })
+                .await;
+            }
             return Response::DetachClient(DetachClientResponse);
         }
 

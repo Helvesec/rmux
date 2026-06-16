@@ -1,4 +1,4 @@
-# Security model - rmux web-share E2EE v4
+# Security model - rmux web-share E2EE protocol v1
 
 This document describes the threat model for web-share end-to-end encryption.
 
@@ -15,9 +15,9 @@ provides forward secrecy beyond the relay TLS connection.
   `ikm = x25519_dh || ml_kem_shared_secret || SHA256(token)`.
 - **Forward secrecy.** A relay that records the TLS-decrypted ciphertext and
   later obtains the share token cannot decrypt past traffic because the
-  per-connection X25519 and ML-KEM secrets have been discarded. In v3, keys were
-  derived from the token alone, so a later token leak could retroactively decrypt
-  recorded traffic.
+  per-connection X25519 and ML-KEM secrets have been discarded. Earlier
+  token-only builds derived keys from the token alone, so a later token leak
+  could retroactively decrypt recorded traffic.
 - **Post-quantum defense.** The channel is hybrid by construction, not
   X25519-only. Recorded traffic remains protected against a future X25519 break
   as long as ML-KEM-768 remains secure and the token secret was not compromised

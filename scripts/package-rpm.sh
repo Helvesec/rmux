@@ -168,23 +168,36 @@ if [ "$configuration" = "release" ]; then
   cargo_args+=(--release)
 fi
 if [ "$skip_build" -eq 0 ]; then
-  cargo "${cargo_args[@]}"
+  cargo "${cargo_args[@]}" --bin rmux
+  cargo "${cargo_args[@]}" --bin rmux-daemon
 fi
 
 target_dir="${CARGO_TARGET_DIR:-target}"
 binary="$target_dir/$target/$profile_dir/rmux"
+daemon_binary="$target_dir/$target/$profile_dir/rmux-daemon"
+completion_cache="${RMUX_COMPLETIONS_DIR:-$target_dir/$target/$profile_dir/completions}"
 [ -x "$binary" ] || die "expected executable binary was not found: $binary"
+[ -x "$daemon_binary" ] || die "expected executable daemon binary was not found: $daemon_binary"
 
 dist_dir="$(mkdir -p "$output_dir" && cd "$output_dir" && pwd)"
 work_dir="$dist_dir/rpmbuild"
 spec_path="$work_dir/SPECS/rmux.spec"
 checksums_path="$dist_dir/SHA256SUMS.txt"
+completion_tmp=""
+cleanup_package_work() {
+  [ -z "$completion_tmp" ] || rm -rf "$completion_tmp"
+  rm -rf "$work_dir"
+}
+trap cleanup_package_work EXIT
 rm -rf "$work_dir"
 mkdir -p "$work_dir/BUILD" "$work_dir/BUILDROOT" "$work_dir/RPMS" "$work_dir/SOURCES" "$work_dir/SPECS" "$work_dir/SRPMS"
 
 binary_abs="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"
+daemon_binary_abs="$(cd "$(dirname "$daemon_binary")" && pwd)/$(basename "$daemon_binary")"
 binary_sha256="$(sha256_file "$binary")"
+daemon_binary_sha256="$(sha256_file "$daemon_binary")"
 binary_bytes="$(wc -c < "$binary" | tr -d ' ')"
+daemon_binary_bytes="$(wc -c < "$daemon_binary" | tr -d ' ')"
 git_commit="$(git rev-parse HEAD)"
 git_dirty=false
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
@@ -205,6 +218,9 @@ cat > "$metadata" <<EOF
   "binary_path": "$(printf '%s' "$binary_abs" | json_escape)",
   "binary_sha256": "$binary_sha256",
   "binary_bytes": $binary_bytes,
+  "daemon_binary_path": "$(printf '%s' "$daemon_binary_abs" | json_escape)",
+  "daemon_binary_sha256": "$daemon_binary_sha256",
+  "daemon_binary_bytes": $daemon_binary_bytes,
   "rmux_version": "$version",
   "git_commit": "$git_commit",
   "git_dirty": $git_dirty,
@@ -225,6 +241,25 @@ cat > "$metadata" <<EOF
 EOF
 
 cp README.md LICENSE-APACHE LICENSE-MIT rmux.1 "$work_dir/SOURCES/"
+completion_tmp="$(mktemp -d "${TMPDIR:-/tmp}/rmux-completions.XXXXXX")"
+if [ "$skip_build" -eq 0 ]; then
+  cargo run --quiet --package xtask -- generate-completions --output-dir "$completion_tmp" >/dev/null
+  rm -rf "$completion_cache"
+  mkdir -p "$completion_cache"
+  cp "$completion_tmp/rmux.bash" "$completion_tmp/_rmux" "$completion_tmp/rmux.fish" \
+    "$completion_tmp/_rmux.ps1" "$completion_tmp/rmux.elv" "$completion_cache/"
+else
+  for completion_file in rmux.bash _rmux rmux.fish _rmux.ps1 rmux.elv; do
+    [ -f "$completion_cache/$completion_file" ] || die "--skip-build requires prebuilt completions in $completion_cache; rerun without --skip-build or set RMUX_COMPLETIONS_DIR"
+    cp "$completion_cache/$completion_file" "$completion_tmp/$completion_file"
+  done
+fi
+mkdir -p "$work_dir/SOURCES/completions"
+install -m 0644 "$completion_tmp/rmux.bash" "$work_dir/SOURCES/completions/rmux.bash"
+install -m 0644 "$completion_tmp/_rmux" "$work_dir/SOURCES/completions/_rmux"
+install -m 0644 "$completion_tmp/rmux.fish" "$work_dir/SOURCES/completions/rmux.fish"
+install -m 0644 "$completion_tmp/_rmux.ps1" "$work_dir/SOURCES/completions/_rmux.ps1"
+install -m 0644 "$completion_tmp/rmux.elv" "$work_dir/SOURCES/completions/rmux.elv"
 
 cat > "$spec_path" <<EOF
 %global debug_package %{nil}
@@ -250,16 +285,28 @@ a daemon runtime, a Rust SDK, and native Windows support.
 %install
 rm -rf %{buildroot}
 install -Dm0755 "$binary_abs" %{buildroot}%{_bindir}/rmux
+install -Dm0755 "$daemon_binary_abs" %{buildroot}%{_bindir}/rmux-daemon
 install -Dm0644 %{_sourcedir}/rmux.1 %{buildroot}%{_mandir}/man1/rmux.1
 install -Dm0644 %{_sourcedir}/artifact-metadata.json %{buildroot}%{_datadir}/rmux/artifact-metadata.json
+install -Dm0644 %{_sourcedir}/completions/rmux.bash %{buildroot}%{_datadir}/bash-completion/completions/rmux
+install -Dm0644 %{_sourcedir}/completions/_rmux %{buildroot}%{_datadir}/zsh/site-functions/_rmux
+install -Dm0644 %{_sourcedir}/completions/rmux.fish %{buildroot}%{_datadir}/fish/vendor_completions.d/rmux.fish
+install -Dm0644 %{_sourcedir}/completions/_rmux.ps1 %{buildroot}%{_datadir}/powershell/Completions/_rmux.ps1
+install -Dm0644 %{_sourcedir}/completions/rmux.elv %{buildroot}%{_datadir}/elvish/lib/rmux.elv
 install -Dm0644 %{_sourcedir}/README.md %{buildroot}%{_docdir}/rmux/README.md
 install -Dm0644 %{_sourcedir}/LICENSE-APACHE %{buildroot}%{_docdir}/rmux/LICENSE-APACHE
 install -Dm0644 %{_sourcedir}/LICENSE-MIT %{buildroot}%{_docdir}/rmux/LICENSE-MIT
 
 %files
 %{_bindir}/rmux
+%{_bindir}/rmux-daemon
 %{_mandir}/man1/rmux.1*
 %{_datadir}/rmux/artifact-metadata.json
+%{_datadir}/bash-completion/completions/rmux
+%{_datadir}/zsh/site-functions/_rmux
+%{_datadir}/fish/vendor_completions.d/rmux.fish
+%{_datadir}/powershell/Completions/_rmux.ps1
+%{_datadir}/elvish/lib/rmux.elv
 %doc %{_docdir}/rmux/README.md
 %license %{_docdir}/rmux/LICENSE-APACHE
 %license %{_docdir}/rmux/LICENSE-MIT
@@ -284,4 +331,5 @@ archive_sha256="$(update_checksums "$checksums_path" "$archive_path")"
 printf 'package=%s\n' "$archive_path"
 printf 'sha256=%s\n' "$archive_sha256"
 printf 'binary_sha256=%s\n' "$binary_sha256"
+printf 'daemon_binary_sha256=%s\n' "$daemon_binary_sha256"
 printf 'release_artifact=%s\n' "$release_artifact"

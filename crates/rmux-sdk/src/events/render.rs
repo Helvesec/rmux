@@ -52,11 +52,12 @@ pub struct PaneRenderStream {
 impl PaneRenderStream {
     pub(crate) async fn open(pane: Pane) -> Result<Self> {
         let output = pane.output_stream().await?;
+        let baseline = pane.snapshot().await?;
         Ok(Self {
             pane,
             output,
             debounce: DEFAULT_RENDER_DEBOUNCE,
-            last_revision: None,
+            last_revision: Some(baseline.revision),
             pending_lag: None,
         })
     }

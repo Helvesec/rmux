@@ -17,7 +17,23 @@ function Fail([string]$Message) {
 }
 
 function Sha256File([string]$Path) {
-    (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+    $getFileHash = Get-Command Get-FileHash -ErrorAction SilentlyContinue
+    if ($getFileHash) {
+        return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+    }
+
+    $stream = [System.IO.File]::OpenRead([System.IO.Path]::GetFullPath($Path))
+    try {
+        $sha256 = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $hashBytes = $sha256.ComputeHash($stream)
+            return ([System.BitConverter]::ToString($hashBytes) -replace "-", "").ToLowerInvariant()
+        } finally {
+            $sha256.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
 }
 
 function WorkspaceVersion {
@@ -44,6 +60,12 @@ function TargetLabel([string]$TargetTriple) {
         default {
             return ($TargetTriple -replace '[^A-Za-z0-9_.-]', '-')
         }
+    }
+}
+
+function ValidatePlatformLabel([string]$Label) {
+    if ([string]::IsNullOrWhiteSpace($Label) -or $Label -notmatch '^[A-Za-z0-9_.-]+$') {
+        Fail "platform label must contain only ASCII letters, digits, '.', '_' or '-'"
     }
 }
 
@@ -116,6 +138,7 @@ $version = WorkspaceVersion
 if ([string]::IsNullOrWhiteSpace($PlatformLabel)) {
     $PlatformLabel = TargetLabel $Target
 }
+ValidatePlatformLabel $PlatformLabel
 
 $profileDir = $Configuration
 $cargoArgs = @("build", "--package", "rmux", "--locked", "--target", $Target)
@@ -124,7 +147,11 @@ if ($Configuration -eq "release") {
 }
 
 if (-not $SkipBuild) {
-    & cargo @cargoArgs
+    & cargo @cargoArgs --bin rmux
+    if ($LASTEXITCODE -ne 0) {
+        Fail "cargo build failed"
+    }
+    & cargo @cargoArgs --bin rmux-daemon
     if ($LASTEXITCODE -ne 0) {
         Fail "cargo build failed"
     }
@@ -132,8 +159,17 @@ if (-not $SkipBuild) {
 
 $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { "target" }
 $binary = Join-Path $targetDir (Join-Path $Target (Join-Path $profileDir "rmux.exe"))
+$daemonBinary = Join-Path $targetDir (Join-Path $Target (Join-Path $profileDir "rmux-daemon.exe"))
+$completionCache = if ($env:RMUX_COMPLETIONS_DIR) {
+    $env:RMUX_COMPLETIONS_DIR
+} else {
+    Join-Path (Split-Path -Parent $binary) "completions"
+}
 if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
     Fail "expected binary was not found: $binary"
+}
+if (-not (Test-Path -LiteralPath $daemonBinary -PathType Leaf)) {
+    Fail "expected daemon binary was not found: $daemonBinary"
 }
 
 $distDir = [System.IO.Path]::GetFullPath($OutputDir)
@@ -144,18 +180,60 @@ $stageDir = Join-Path $distDir $packageName
 $archivePath = Join-Path $distDir "$packageName.zip"
 $checksumsPath = Join-Path $distDir "SHA256SUMS.txt"
 
+try {
 if (Test-Path -LiteralPath $stageDir) {
     Remove-Item -LiteralPath $stageDir -Recurse -Force
 }
 New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "share/rmux") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "share/bash-completion/completions") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "share/zsh/site-functions") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "share/fish/vendor_completions.d") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "share/powershell/Completions") | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "share/elvish/lib") | Out-Null
 
 Copy-Item -LiteralPath $binary -Destination (Join-Path $stageDir "rmux.exe")
+Copy-Item -LiteralPath $daemonBinary -Destination (Join-Path $stageDir "rmux-daemon.exe")
 Copy-Item -LiteralPath "README.md", "LICENSE-APACHE", "LICENSE-MIT", "rmux.1" -Destination $stageDir
+$completionDir = Join-Path ([System.IO.Path]::GetTempPath()) "rmux-completions-$([System.Guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory -Force -Path $completionDir | Out-Null
+try {
+    $completionFiles = @("rmux.bash", "_rmux", "rmux.fish", "_rmux.ps1", "rmux.elv")
+    if (-not $SkipBuild) {
+        cargo run --quiet --package xtask -- generate-completions --output-dir $completionDir | Out-Null
+        if (Test-Path -LiteralPath $completionCache) {
+            Remove-Item -LiteralPath $completionCache -Recurse -Force
+        }
+        New-Item -ItemType Directory -Force -Path $completionCache | Out-Null
+        foreach ($completionFile in $completionFiles) {
+            Copy-Item -LiteralPath (Join-Path $completionDir $completionFile) -Destination (Join-Path $completionCache $completionFile)
+        }
+    } else {
+        foreach ($completionFile in $completionFiles) {
+            $source = Join-Path $completionCache $completionFile
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+                Fail "-SkipBuild requires prebuilt completions in $completionCache; rerun without -SkipBuild or set RMUX_COMPLETIONS_DIR"
+            }
+            Copy-Item -LiteralPath $source -Destination (Join-Path $completionDir $completionFile)
+        }
+    }
+    Copy-Item -LiteralPath (Join-Path $completionDir "rmux.bash") -Destination (Join-Path $stageDir "share/bash-completion/completions/rmux")
+    Copy-Item -LiteralPath (Join-Path $completionDir "_rmux") -Destination (Join-Path $stageDir "share/zsh/site-functions/_rmux")
+    Copy-Item -LiteralPath (Join-Path $completionDir "rmux.fish") -Destination (Join-Path $stageDir "share/fish/vendor_completions.d/rmux.fish")
+    Copy-Item -LiteralPath (Join-Path $completionDir "_rmux.ps1") -Destination (Join-Path $stageDir "share/powershell/Completions/_rmux.ps1")
+    Copy-Item -LiteralPath (Join-Path $completionDir "rmux.elv") -Destination (Join-Path $stageDir "share/elvish/lib/rmux.elv")
+} finally {
+    if (Test-Path -LiteralPath $completionDir) {
+        Remove-Item -LiteralPath $completionDir -Recurse -Force
+    }
+}
 
 $binaryAbs = [System.IO.Path]::GetFullPath($binary)
+$daemonBinaryAbs = [System.IO.Path]::GetFullPath($daemonBinary)
 $binarySha256 = Sha256File $binaryAbs
+$daemonBinarySha256 = Sha256File $daemonBinaryAbs
 $binaryBytes = (Get-Item -LiteralPath $binaryAbs).Length
+$daemonBinaryBytes = (Get-Item -LiteralPath $daemonBinaryAbs).Length
 $gitCommit = GitOutput @("rev-parse", "HEAD")
 $gitStatus = GitOutput @("status", "--porcelain", "--untracked-files=no")
 $gitDirty = -not [string]::IsNullOrWhiteSpace($gitStatus)
@@ -168,6 +246,9 @@ $metadata = [ordered]@{
     binary_path = $binaryAbs
     binary_sha256 = $binarySha256
     binary_bytes = $binaryBytes
+    daemon_binary_path = $daemonBinaryAbs
+    daemon_binary_sha256 = $daemonBinarySha256
+    daemon_binary_bytes = $daemonBinaryBytes
     rmux_version = $version
     git_commit = $gitCommit
     git_dirty = $gitDirty
@@ -200,4 +281,10 @@ WriteAsciiLfFile $checksumsPath @("$archiveSha256  $([System.IO.Path]::GetFileNa
 Write-Output "package=$archivePath"
 Write-Output "sha256=$archiveSha256"
 Write-Output "binary_sha256=$binarySha256"
+Write-Output "daemon_binary_sha256=$daemonBinarySha256"
 Write-Output "release_artifact=$($releaseArtifact.ToString().ToLowerInvariant())"
+} finally {
+    if (Test-Path -LiteralPath $stageDir) {
+        Remove-Item -LiteralPath $stageDir -Recurse -Force
+    }
+}

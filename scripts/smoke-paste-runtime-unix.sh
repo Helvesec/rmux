@@ -12,6 +12,7 @@ SMOKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/rmux-paste-runtime.XXXXXX")"
 SESSION="p4c"
 PANE="$SESSION:0.0"
 export RMUX_TMPDIR="$SMOKE_ROOT/socket"
+mkdir -p "$RMUX_TMPDIR"
 
 log() {
     printf '[paste-smoke] %s\n' "$*"
@@ -81,6 +82,28 @@ write_payload() {
         printf 'RMUX_P4C_END\n'
         printf '\033[201~'
     } >"$payload_file"
+}
+
+write_expected_body() {
+    local payload_file="$1"
+    local expected_file="$2"
+
+    python3 - "$payload_file" "$expected_file" <<'PY'
+import sys
+
+payload_path, expected_path = sys.argv[1:3]
+start = b"\x1b[200~"
+end = b"\x1b[201~"
+
+with open(payload_path, "rb") as payload_file:
+    payload = payload_file.read()
+
+if not payload.startswith(start) or not payload.endswith(end):
+    raise SystemExit("paste smoke fixture lost its bracketed paste wrappers")
+
+with open(expected_path, "wb") as expected_file:
+    expected_file.write(payload[len(start):-len(end)])
+PY
 }
 
 attach_paste_and_detach() {
@@ -167,9 +190,11 @@ require_tool python3
 run cargo build --locked
 
 payload_file="$SMOKE_ROOT/payload.bin"
+expected_file="$SMOKE_ROOT/expected.bin"
 captured_file="$SMOKE_ROOT/captured.bin"
 write_payload "$payload_file"
-expected_sha="$(shasum -a 256 "$payload_file" | awk '{print $1}')"
+write_expected_body "$payload_file" "$expected_file"
+expected_sha="$(shasum -a 256 "$expected_file" | awk '{print $1}')"
 
 run "$RMUX" new-session -d -s "$SESSION"
 
@@ -183,7 +208,7 @@ attach_paste_and_detach "$payload_file"
 wait_until 'capture marker' 5 capture_contains 'RMUX_P4C_CAT_DONE'
 wait_until 'capture sha marker' 5 capture_contains 'RMUX_P4C_SHA'
 
-cmp -s "$payload_file" "$captured_file" || {
+cmp -s "$expected_file" "$captured_file" || {
     log "expected sha: $expected_sha"
     log "actual sha: $(shasum -a 256 "$captured_file" | awk '{print $1}')"
     fail 'captured pane input did not match bracketed paste payload'

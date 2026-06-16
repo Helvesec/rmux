@@ -2,10 +2,10 @@ use std::path::PathBuf;
 
 use rmux_core::{SessionStore, TargetFindContext};
 use rmux_proto::{
-    KillWindowRequest, LastPaneRequest, NewWindowRequest, NextLayoutRequest, PreviousLayoutRequest,
-    RenameWindowRequest, Request, ResizeWindowAdjustment, ResizeWindowRequest,
-    RespawnWindowRequest, RmuxError, RotateWindowDirection, RotateWindowRequest,
-    SelectWindowRequest, WindowTarget,
+    KillWindowRequest, LastPaneRequest, LastWindowRequest, NewWindowRequest, NextLayoutRequest,
+    NextWindowRequest, PreviousLayoutRequest, PreviousWindowRequest, RenameWindowRequest, Request,
+    ResizeWindowAdjustment, ResizeWindowRequest, RespawnWindowRequest, RmuxError,
+    RotateWindowDirection, RotateWindowRequest, SelectWindowRequest, WindowTarget,
 };
 
 use crate::pane_terminals::session_not_found;
@@ -24,6 +24,14 @@ pub(super) use self::links::{
     parse_link_window, parse_move_window, parse_swap_window, parse_unlink_window,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectWindowMode {
+    Select,
+    Last,
+    Next,
+    Previous,
+}
+
 pub(super) fn parse_window_request(
     mut args: CommandTokens,
     command: &str,
@@ -31,6 +39,10 @@ pub(super) fn parse_window_request(
     find_context: &TargetFindContext,
 ) -> Result<Request, RmuxError> {
     let mut target = None;
+    let mut select_window_mode = SelectWindowMode::Select;
+    let mut toggle_last = false;
+    let mut preserve_zoom = false;
+    let mut input_disabled = None;
 
     while let Some(token) = args.peek() {
         match token {
@@ -38,10 +50,39 @@ pub(super) fn parse_window_request(
                 let _ = args.optional();
                 break;
             }
+            "-l" if command == "select-window" => {
+                let _ = args.optional();
+                set_select_window_mode(&mut select_window_mode, SelectWindowMode::Last)?;
+            }
+            "-n" if command == "select-window" => {
+                let _ = args.optional();
+                set_select_window_mode(&mut select_window_mode, SelectWindowMode::Next)?;
+            }
+            "-p" if command == "select-window" => {
+                let _ = args.optional();
+                set_select_window_mode(&mut select_window_mode, SelectWindowMode::Previous)?;
+            }
+            "-T" if command == "select-window" => {
+                let _ = args.optional();
+                toggle_last = true;
+            }
+            "-Z" if command == "last-pane" => {
+                let _ = args.optional();
+                preserve_zoom = true;
+            }
+            "-d" if command == "last-pane" => {
+                let _ = args.optional();
+                set_last_pane_input(&mut input_disabled, true)?;
+            }
+            "-e" if command == "last-pane" => {
+                let _ = args.optional();
+                set_last_pane_input(&mut input_disabled, false)?;
+            }
             "-t" => {
                 let _ = args.optional();
                 target = Some(parse_window_target(command, args.required("-t target")?)?);
             }
+            flag if flag.starts_with('-') => return Err(unsupported_flag(command, flag)),
             _ => break,
         }
     }
@@ -49,13 +90,79 @@ pub(super) fn parse_window_request(
 
     let target = target.unwrap_or(implicit_window_target(sessions, find_context, command)?);
     match command {
-        "select-window" => Ok(Request::SelectWindow(SelectWindowRequest { target })),
-        "last-pane" => Ok(Request::LastPane(LastPaneRequest { target })),
+        "select-window" => select_window_request(
+            select_window_mode,
+            toggle_last,
+            target,
+            sessions,
+            find_context,
+        ),
+        "last-pane" => Ok(Request::LastPane(LastPaneRequest {
+            target,
+            preserve_zoom,
+            input_disabled,
+        })),
         "next-layout" => Ok(Request::NextLayout(NextLayoutRequest { target })),
         "previous-layout" => Ok(Request::PreviousLayout(PreviousLayoutRequest { target })),
         _ => Err(RmuxError::Server(format!(
             "unsupported window request parser command: {command}"
         ))),
+    }
+}
+
+fn set_last_pane_input(current: &mut Option<bool>, disabled: bool) -> Result<(), RmuxError> {
+    if current.is_some() {
+        return Err(RmuxError::Server(
+            "last-pane accepts only one of -d or -e".to_owned(),
+        ));
+    }
+    *current = Some(disabled);
+    Ok(())
+}
+
+fn set_select_window_mode(
+    current: &mut SelectWindowMode,
+    next: SelectWindowMode,
+) -> Result<(), RmuxError> {
+    if *current != SelectWindowMode::Select {
+        return Err(RmuxError::Server(
+            "select-window accepts only one of -l, -n, or -p".to_owned(),
+        ));
+    }
+    *current = next;
+    Ok(())
+}
+
+fn select_window_request(
+    mode: SelectWindowMode,
+    toggle_last: bool,
+    target: WindowTarget,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Result<Request, RmuxError> {
+    let session_name = target.session_name().clone();
+    match mode {
+        SelectWindowMode::Last => Ok(Request::LastWindow(LastWindowRequest {
+            target: session_name,
+        })),
+        SelectWindowMode::Next => Ok(Request::NextWindow(NextWindowRequest {
+            target: session_name,
+            alerts_only: false,
+        })),
+        SelectWindowMode::Previous => Ok(Request::PreviousWindow(PreviousWindowRequest {
+            target: session_name,
+            alerts_only: false,
+        })),
+        SelectWindowMode::Select => {
+            if toggle_last
+                && target == implicit_window_target(sessions, find_context, "select-window")?
+            {
+                return Ok(Request::LastWindow(LastWindowRequest {
+                    target: session_name,
+                }));
+            }
+            Ok(Request::SelectWindow(SelectWindowRequest { target }))
+        }
     }
 }
 
@@ -71,6 +178,7 @@ pub(super) fn parse_new_window(
     let mut detached = false;
     let mut after = false;
     let mut before = false;
+    let mut target_has_signed_window_part = false;
     let mut start_directory = None;
     let mut command_only = false;
 
@@ -99,11 +207,11 @@ pub(super) fn parse_new_window(
             }
             "-t" => {
                 let _ = args.optional();
-                let (session_name, window_index) = parse_new_window_target_argument(
-                    args.required("-t target")?,
-                    sessions,
-                    find_context,
-                )?;
+                let raw_target = args.required("-t target")?;
+                target_has_signed_window_part =
+                    signed_window_target_session_part(&raw_target).is_some();
+                let (session_name, window_index) =
+                    parse_new_window_target_argument(raw_target, sessions, find_context)?;
                 target = Some(session_name);
                 target_window_index = window_index;
             }
@@ -130,7 +238,7 @@ pub(super) fn parse_new_window(
 
     let insert_at_target = after || before;
     if insert_at_target {
-        if target_window_index.is_none() {
+        if target_window_index.is_none() || target_has_signed_window_part {
             let window_target = if let Some(session_name) = target.as_ref() {
                 let window_index = sessions
                     .session(session_name)
@@ -168,6 +276,24 @@ pub(super) fn parse_new_window(
     }))
 }
 
+fn signed_window_target_session_part(raw_target: &str) -> Option<Option<&str>> {
+    if signed_window_index_target(raw_target) {
+        return Some(None);
+    }
+    let (session, window) = raw_target.split_once(':')?;
+    if session.is_empty() || !signed_window_index_target(window) {
+        return None;
+    }
+    Some(Some(session))
+}
+
+fn signed_window_index_target(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix(['+', '-']) else {
+        return false;
+    };
+    rest.is_empty() || rest.bytes().all(|byte| byte.is_ascii_digit())
+}
+
 pub(super) fn parse_rename_window(
     mut args: CommandTokens,
     sessions: &SessionStore,
@@ -201,8 +327,12 @@ pub(super) fn parse_rename_window(
             find_context,
             "rename-window",
         )?),
-        name,
+        name: tmux_rename_window_name(name),
     }))
+}
+
+fn tmux_rename_window_name(name: String) -> String {
+    name.replace('\\', r"\\")
 }
 
 pub(super) fn parse_kill_window(
@@ -354,6 +484,14 @@ pub(super) fn parse_resize_window(mut args: CommandTokens) -> Result<Request, Rm
                 let _ = args.optional();
                 adjustment = Some("R");
             }
+            "-A" => {
+                let _ = args.optional();
+                adjustment = Some("A");
+            }
+            "-a" => {
+                let _ = args.optional();
+                adjustment = Some("a");
+            }
             _ => {
                 if let Some(value) = args.optional() {
                     adjust_amount = Some(value.parse::<u16>().map_err(|_| {
@@ -373,6 +511,8 @@ pub(super) fn parse_resize_window(mut args: CommandTokens) -> Result<Request, Rm
             "U" => ResizeWindowAdjustment::Up(amount),
             "L" => ResizeWindowAdjustment::Left(amount),
             "R" => ResizeWindowAdjustment::Right(amount),
+            "A" => ResizeWindowAdjustment::LargestLinkedSession,
+            "a" => ResizeWindowAdjustment::SmallestLinkedSession,
             _ => unreachable!(),
         }
     });

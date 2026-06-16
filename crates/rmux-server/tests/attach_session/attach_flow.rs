@@ -155,6 +155,9 @@ async fn attach_stream_emits_border_frames_for_multi_pane_sessions() -> Result<(
         &Request::SelectPane(SelectPaneRequest {
             target: PaneTarget::new(alpha.clone(), 2),
             title: None,
+            style: None,
+            input_disabled: None,
+            preserve_zoom: false,
         }),
     )
     .await?;

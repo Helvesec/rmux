@@ -14,30 +14,38 @@ pub(crate) fn render_pane_screen(
     screen: &Screen,
 ) -> Vec<u8> {
     let geometry = StatusGeometry::for_session(session, options);
-    let Some(pane_geometry) = visible_pane_geometry(session, pane, geometry.content_rows) else {
+    let Some(pane_geometry) = visible_pane_geometry(session, options, pane, geometry.content_rows)
+    else {
         return Vec::new();
     };
     if pane_geometry.cols() == 0 || pane_geometry.rows() == 0 {
         return Vec::new();
     }
 
+    let sparse_full_width_clear = pane_geometry.x() == 0
+        && pane_geometry.cols() == session.terminal_size().cols
+        && pane_default_style(session, options, pane).is_none();
     let styled_screen = styled_pane_screen(session, options, pane, screen);
     let rendered = styled_screen.capture_transcript(
         ScreenCaptureRange::default(),
         GridRenderOptions {
             with_sequences: true,
-            include_empty_cells: true,
+            include_empty_cells: !sparse_full_width_clear,
             trim_spaces: false,
             ..GridRenderOptions::default()
         },
     );
     let utf8 = Utf8Config::from_options(options);
-    let mut frame = Vec::new();
+    let rendered_lines = rendered.split(|byte| *byte == b'\n').collect::<Vec<_>>();
+    let mut frame = Vec::with_capacity(
+        rendered
+            .len()
+            .saturating_add(usize::from(pane_geometry.rows()).saturating_mul(20))
+            .saturating_add(32),
+    );
     frame.extend_from_slice(b"\x1b[s\x1b[0m");
-    for (row, line) in rendered.split(|byte| *byte == b'\n').enumerate() {
-        if row >= usize::from(pane_geometry.rows()) {
-            break;
-        }
+    for row in 0..usize::from(pane_geometry.rows()) {
+        let line = rendered_lines.get(row).copied().unwrap_or_default();
         let line = truncate_rendered_pane_line(line, usize::from(pane_geometry.cols()), &utf8);
         frame.extend_from_slice(
             cursor_position_bytes(
@@ -50,6 +58,9 @@ pub(crate) fn render_pane_screen(
             .as_slice(),
         );
         frame.extend_from_slice(&line);
+        if sparse_full_width_clear {
+            frame.extend_from_slice(b"\x1b[0m\x1b[K");
+        }
     }
     frame.extend_from_slice(b"\x1b[0m\x1b[u");
     frame
@@ -76,7 +87,11 @@ pub(crate) fn styled_pane_screen(
     styled_screen
 }
 
-fn pane_default_style(session: &Session, options: &OptionStore, pane: &Pane) -> Option<Style> {
+pub(crate) fn pane_default_style(
+    session: &Session,
+    options: &OptionStore,
+    pane: &Pane,
+) -> Option<Style> {
     let mut style = Style::default();
     let base = StyleCell::default();
     let mut applied = false;

@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use crate::clock_mode::{ClockModeState, CLOCK_MODE_NAME};
 use crate::copy_mode::{CopyModeState, CopyModeSummary};
 use rmux_core::{
-    GridRenderOptions, Screen, ScreenCaptureRange, TerminalPassthrough, TerminalScreen, Utf8Config,
+    style::Style, GridRenderOptions, Screen, ScreenCaptureRange, TerminalPassthrough,
+    TerminalScreen, Utf8Config,
 };
 use rmux_proto::TerminalSize;
 
@@ -32,6 +33,21 @@ pub(crate) struct PaneAppendResult {
     pub(crate) passthroughs: Vec<TerminalPassthrough>,
     pub(crate) dropped_passthrough_count: u64,
     pub(crate) replies: Vec<u8>,
+}
+
+pub(crate) struct PaneTranscriptRenderState {
+    pub(crate) cursor_position: (u32, u32),
+    pub(crate) cursor_style: u32,
+    pub(crate) title: String,
+    pub(crate) path: String,
+    pub(crate) mode: u32,
+    pub(crate) has_selected_cells: bool,
+}
+
+pub(crate) struct PaneVisibleLineCapture {
+    pub(crate) revision: u64,
+    pub(crate) rendered: Option<Vec<u8>>,
+    pub(crate) previous_row: Option<usize>,
 }
 
 impl std::fmt::Debug for PaneTranscript {
@@ -89,6 +105,15 @@ impl PaneTranscript {
         }
     }
 
+    pub(crate) fn reset_terminal_state(&mut self) {
+        self.output_sequence = self.output_sequence.saturating_add(1);
+        self.terminal.feed(b"\x1bc");
+        let _ = self.terminal.take_terminal_passthrough();
+        let _ = self.terminal.take_terminal_passthrough_dropped_count();
+        let _ = self.terminal.take_replies();
+        self.mode = None;
+    }
+
     pub(crate) const fn output_sequence(&self) -> u64 {
         self.output_sequence
     }
@@ -104,6 +129,10 @@ impl PaneTranscript {
         }
     }
 
+    pub(crate) fn set_alternate_screen_enabled(&mut self, enabled: bool) {
+        self.terminal.set_alternate_screen_enabled(enabled);
+    }
+
     pub(crate) fn set_input_buffer_limit(&mut self, limit: usize) {
         self.terminal.set_input_buffer_limit(limit);
     }
@@ -114,6 +143,53 @@ impl PaneTranscript {
         options: GridRenderOptions,
     ) -> Vec<u8> {
         self.terminal.screen().capture_transcript(range, options)
+    }
+
+    pub(crate) fn capture_main_visible_line_changes(
+        &self,
+        rows: usize,
+        options: GridRenderOptions,
+        previous_revisions: Option<&[u64]>,
+        default_style: Option<&Style>,
+    ) -> Vec<PaneVisibleLineCapture> {
+        let screen = self.terminal.screen();
+        let revisions = (0..rows)
+            .map(|row| screen.visible_line_revision(row).unwrap_or(0))
+            .collect::<Vec<_>>();
+        let previous_rows = previous_revisions.and_then(|previous| {
+            visible_revision_reuse_map(previous, &revisions).filter(|map| map.len() == rows)
+        });
+
+        (0..rows)
+            .map(|row| {
+                let previous_row = previous_rows
+                    .as_ref()
+                    .and_then(|rows| rows.get(row))
+                    .and_then(|row| *row);
+                let rendered = if previous_row.is_some() {
+                    None
+                } else {
+                    render_visible_line(screen, row, options, default_style)
+                };
+                PaneVisibleLineCapture {
+                    revision: revisions[row],
+                    rendered,
+                    previous_row,
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn render_state(&self) -> PaneTranscriptRenderState {
+        let screen = self.terminal.screen();
+        PaneTranscriptRenderState {
+            cursor_position: screen.cursor_position(),
+            cursor_style: screen.cursor_style(),
+            title: screen.title().to_owned(),
+            path: screen.path().to_owned(),
+            mode: screen.mode(),
+            has_selected_cells: screen.has_selected_cells(),
+        }
     }
 
     pub(crate) fn capture_saved(
@@ -147,6 +223,14 @@ impl PaneTranscript {
         self.terminal
             .screen_mut()
             .clear_history_and_hyperlinks(reset_hyperlinks);
+    }
+
+    pub(crate) fn trim_below_cursor(&mut self) -> bool {
+        let trimmed = self.terminal.screen_mut().trim_below_cursor();
+        if trimmed {
+            self.output_sequence = self.output_sequence.saturating_add(1);
+        }
+        trimmed
     }
 
     pub(crate) fn mark_clear_on_dead_exit(&mut self) {
@@ -364,9 +448,54 @@ impl PaneTranscript {
     }
 }
 
+fn render_visible_line(
+    screen: &Screen,
+    row: usize,
+    options: GridRenderOptions,
+    default_style: Option<&Style>,
+) -> Option<Vec<u8>> {
+    if let Some(style) = default_style {
+        screen.render_visible_line_independent_with_default_style(row, options, style)
+    } else {
+        screen.render_visible_line_independent(row, options)
+    }
+}
+
+fn visible_revision_reuse_map(previous: &[u64], next: &[u64]) -> Option<Vec<Option<usize>>> {
+    if previous.len() != next.len() {
+        return None;
+    }
+    let rows = next.len();
+    let mut map = vec![None; rows];
+    for (row, entry) in map.iter_mut().enumerate() {
+        if previous[row] == next[row] {
+            *entry = Some(row);
+        }
+    }
+
+    if let Some(scroll_rows) =
+        (1..rows).find(|scroll_rows| previous[*scroll_rows..] == next[..rows - *scroll_rows])
+    {
+        for (row, entry) in map.iter_mut().enumerate().take(rows - scroll_rows) {
+            *entry = Some(row + scroll_rows);
+        }
+        return Some(map);
+    }
+
+    if let Some(scroll_rows) =
+        (1..rows).find(|scroll_rows| previous[..rows - *scroll_rows] == next[*scroll_rows..])
+    {
+        for (row, entry) in map.iter_mut().enumerate().skip(scroll_rows) {
+            *entry = Some(row - scroll_rows);
+        }
+    }
+
+    Some(map)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::PaneTranscript;
+    use super::{visible_revision_reuse_map, PaneTranscript};
     use rmux_core::{GridRenderOptions, ScreenCaptureRange, TerminalScreen};
     use rmux_proto::TerminalSize;
 
@@ -382,6 +511,28 @@ mod tests {
         assert_eq!(
             transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default()),
             b"three\n\n"
+        );
+    }
+
+    #[test]
+    fn visible_line_capture_reuses_shifted_rows_after_scroll_up() {
+        let previous = [10, 11, 12, 13];
+        let next = [11, 12, 13, 14];
+
+        assert_eq!(
+            visible_revision_reuse_map(&previous, &next),
+            Some(vec![Some(1), Some(2), Some(3), None])
+        );
+    }
+
+    #[test]
+    fn visible_line_capture_reuses_shifted_rows_after_scroll_down() {
+        let previous = [10, 11, 12, 13];
+        let next = [9, 10, 11, 12];
+
+        assert_eq!(
+            visible_revision_reuse_map(&previous, &next),
+            Some(vec![None, Some(0), Some(1), Some(2)])
         );
     }
 
@@ -411,6 +562,45 @@ mod tests {
         )
         .expect("capture is utf8");
         assert!(!capture.contains("#0!10~"));
+    }
+
+    #[test]
+    fn append_bytes_reports_dcs_passthrough_without_capturing_text() {
+        let mut transcript = transcript(40, 4, 10);
+        let result =
+            transcript.append_bytes_with_effects(b"\x1b[2;3H\x1bPtmux;\x1b]52;c;QQ==\x07\x1b\\");
+
+        assert_eq!(result.passthroughs.len(), 1);
+        assert_eq!(result.passthroughs[0].payload(), b"\x1b]52;c;QQ==\x07");
+        let capture = String::from_utf8(
+            transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default()),
+        )
+        .expect("capture is utf8");
+        assert!(!capture.contains("52;c"));
+    }
+
+    #[test]
+    fn append_bytes_decodes_dcs_passthrough_doubled_inner_escape() {
+        let mut transcript = transcript(40, 4, 10);
+        let result = transcript
+            .append_bytes_with_effects(b"\x1b[2;3H\x1bPtmux;\x1b\x1b]52;c;QQ==\x07\x1b\\");
+
+        assert_eq!(result.passthroughs.len(), 1);
+        assert_eq!(result.passthroughs[0].payload(), b"\x1b]52;c;QQ==\x07");
+    }
+
+    #[test]
+    fn append_bytes_reports_osc52_clipboard_without_capturing_text() {
+        let mut transcript = transcript(40, 4, 10);
+        let result = transcript.append_bytes_with_effects(b"\x1b]52;c;QQ==\x07");
+
+        assert_eq!(result.passthroughs.len(), 1);
+        assert_eq!(result.passthroughs[0].payload(), b"\x1b]52;c;QQ==\x07");
+        let capture = String::from_utf8(
+            transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default()),
+        )
+        .expect("capture is utf8");
+        assert!(!capture.contains("52;c"));
     }
 
     #[test]
@@ -489,6 +679,22 @@ mod tests {
         .expect("utf8");
         assert!(capture.contains("main"));
         assert!(!capture.contains("alt"));
+    }
+
+    #[test]
+    fn disabled_alternate_screen_keeps_output_on_main_grid() {
+        let mut transcript = transcript(16, 4, 10);
+        transcript.set_alternate_screen_enabled(false);
+
+        transcript.append_bytes(b"\x1b[?1049hALTLINE\r\n\x1b[?1049lMAINLINE\r\n");
+
+        let capture = String::from_utf8(
+            transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default()),
+        )
+        .expect("utf8");
+        assert!(capture.contains("ALTLINE"));
+        assert!(capture.contains("MAINLINE"));
+        assert!(!transcript.is_alternate());
     }
 
     #[test]

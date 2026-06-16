@@ -1,11 +1,14 @@
 //! Opaque RMUX SDK facade handle.
 
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
+use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
 use super::builder::RmuxBuilder;
 use super::owned_session::OwnedSessionBuilder;
+use crate::command::CommandRun;
 use crate::diagnostics::FEATURE_PROTOCOL_CAPABILITIES;
 use crate::transport::{DropGuard, TransportClient};
 use crate::{
@@ -255,6 +258,54 @@ impl Rmux {
         super::session::list_session_names(&client).await
     }
 
+    /// Returns the daemon capabilities negotiated through the SDK handshake.
+    pub async fn capabilities(&self) -> Result<Vec<String>> {
+        let client = self
+            .connect_transport_for_operation(self.resolved_timeout(None))
+            .await?;
+        Ok(crate::capabilities::negotiated_capabilities(&client)
+            .await?
+            .as_ref()
+            .to_vec())
+    }
+
+    /// Checks whether the daemon advertises `capability`.
+    pub async fn has_capability(&self, capability: &str) -> Result<bool> {
+        Ok(self
+            .capabilities()
+            .await?
+            .iter()
+            .any(|advertised| advertised == capability))
+    }
+
+    /// Runs the `rmux` binary against this facade's resolved endpoint.
+    ///
+    /// This is the official SDK escape hatch for commands that are not yet
+    /// represented by typed Rust methods. The SDK injects `-S <endpoint>` before
+    /// caller arguments, so the spawned binary talks to the same daemon the
+    /// facade would use for normal operations. The command is executed directly
+    /// without a shell. Non-zero exits are returned in [`CommandRun`] rather
+    /// than converted into [`RmuxError`].
+    pub async fn cmd<I, S>(&self, args: I) -> Result<CommandRun>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let endpoint = self.resolved_endpoint()?;
+        let args = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_owned())
+            .collect::<Vec<OsString>>();
+        tokio::task::spawn_blocking(move || run_binary_command(endpoint, args))
+            .await
+            .map_err(|error| {
+                RmuxError::transport(
+                    "join rmux command task",
+                    io::Error::other(error.to_string()),
+                )
+            })?
+    }
+
     /// Negotiates daemon capabilities, requests daemon shutdown, and waits for
     /// the SDK transport to close.
     ///
@@ -362,6 +413,33 @@ fn pane_not_found(session_name: &SessionName, pane_id: PaneId) -> RmuxError {
         session_name.clone(),
         pane_id,
     ))
+}
+
+fn run_binary_command(endpoint: RmuxEndpoint, args: Vec<OsString>) -> Result<CommandRun> {
+    let mut command = ProcessCommand::new(connect::daemon_binary());
+    append_endpoint_args(&mut command, endpoint);
+    command.args(args);
+    let output = command
+        .output()
+        .map_err(|error| RmuxError::transport("run rmux command", error))?;
+
+    Ok(CommandRun {
+        stdout: output.stdout,
+        stderr: output.stderr,
+        exit: output.status.code(),
+    })
+}
+
+fn append_endpoint_args(command: &mut ProcessCommand, endpoint: RmuxEndpoint) {
+    command.args(endpoint_args(endpoint));
+}
+
+fn endpoint_args(endpoint: RmuxEndpoint) -> Vec<OsString> {
+    match endpoint {
+        RmuxEndpoint::Default => Vec::new(),
+        RmuxEndpoint::UnixSocket(path) => vec![OsString::from("-S"), path.into_os_string()],
+        RmuxEndpoint::WindowsPipe(pipe) => vec![OsString::from("-S"), pipe.into()],
+    }
 }
 
 fn is_clean_shutdown_close(error: &RmuxError) -> bool {

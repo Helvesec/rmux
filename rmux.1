@@ -1,4 +1,4 @@
-.TH RMUX 1 "2026-06-03" "RMUX 0.5.0" "RMUX Manual"
+.TH RMUX 1 "2026-06-09" "RMUX 0.6.0" "RMUX Manual"
 .SH NAME
 rmux \- tmux-compatible terminal multiplexer CLI
 .SH SYNOPSIS
@@ -16,6 +16,29 @@ server architecture. Unix builds use OS socket credentials; Windows builds use
 same-user named pipes and ConPTY.
 It preserves tmux-compatible command-line behavior while keeping RMUX product
 labels in binary output, help text, and status text.
+.SH TMUX COMPATIBILITY POLICY
+RMUX treats tmux compatibility as a script and workflow contract, not as a
+requirement to copy known parser bugs. Command names, supported flags, target
+resolution, common diagnostics, config loading, and scriptable output should
+match tmux where that behavior is intentional and useful.
+.PP
+When tmux behavior is a known quirk that silently hides errors or leaks an
+internal sentinel, RMUX keeps safer product semantics. For example, RMUX keeps
+n-ary boolean format expressions such as
+.BR "#{&&:1,0,1}" ,
+treats only the empty string and exact
+.B 0
+as false for
+.BR "if-shell -F" ,
+saturates integer format arithmetic instead of returning tmux's overflow
+sentinel, rejects non-numeric
+.B capture-pane
+bounds, and preserves a trailing literal
+.B #
+in format strings.
+.PP
+Very large positive absolute pane sizes may be clamped to the available layout
+space, while zero, negative, non-numeric, and overflowed sizes are rejected.
 .SH TOP-LEVEL OPTIONS
 .TP
 .B -2
@@ -89,7 +112,7 @@ table order.
 can render the compiled default key table without a running server when no
 runtime key-table mutations are available.
 .SH IMPLEMENTED COMMAND SURFACE
-The public CLI dispatches 91 commands:
+The public CLI dispatches 92 commands:
 .nf
 attach-session (attach)
 bind-key (bind)
@@ -182,6 +205,7 @@ unbind-key (unbind)
 unlink-window (unlinkw)
 wait-for (wait)
 web-share
+capabilities
 .fi
 .SH BUILT-IN COMMAND ALIASES
 .TP
