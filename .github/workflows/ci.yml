@@ -366,7 +366,7 @@ jobs:
         run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
 
       - name: rmux binary smoke
-        run: cargo run --package rmux --locked -- -V
+        run: cargo run --package rmux --bin rmux --locked -- -V
 
   windows-cross:
     name: Cross-target Windows build check

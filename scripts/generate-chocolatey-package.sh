@@ -8,7 +8,7 @@ Usage: scripts/generate-chocolatey-package.sh --version <semver> --checksums <SH
 Generate the RMUX Chocolatey package source from GitHub Release checksums.
 
 Options:
-  --version <semver|vsemver>   Release version, for example 0.5.0 or v0.5.0
+  --version <semver|vsemver>   Release version, for example 1.2.3 or v1.2.3
   --checksums <path>           SHA256SUMS file from the GitHub Release
   --output-dir <dir>           Write rmux.nuspec and tools/ scripts here
   --repository <owner/repo>    GitHub repository (default: Helvesec/rmux)
@@ -31,7 +31,7 @@ normalize_version() {
   esac
   case "$version" in
     [0-9]*.[0-9]*.[0-9]*) printf '%s\n' "$version" ;;
-    *) die "version must look like 0.5.0 or v0.5.0, got: $raw" ;;
+    *) die "version must look like 1.2.3 or v1.2.3, got: $raw" ;;
   esac
 }
 

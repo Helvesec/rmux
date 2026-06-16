@@ -482,6 +482,22 @@ fn quiet_attached_command() -> Vec<String> {
         .collect()
 }
 
+#[cfg(windows)]
+fn quiet_attached_command() -> Vec<String> {
+    let system_root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+    let cmd = std::path::PathBuf::from(system_root)
+        .join("System32")
+        .join("cmd.exe");
+    vec![
+        cmd.to_string_lossy().into_owned(),
+        "/d".to_owned(),
+        "/q".to_owned(),
+        "/c".to_owned(),
+        "ping -n 120 127.0.0.1 >NUL".to_owned(),
+    ]
+}
+
 async fn active_panes(handler: &RequestHandler, session: &SessionName) -> String {
     let response = handler
         .handle(Request::ListPanes(ListPanesRequest {

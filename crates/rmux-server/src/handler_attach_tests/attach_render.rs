@@ -109,6 +109,8 @@ async fn attach_session_upgrade_renders_only_the_active_window() {
         Response::SplitWindow(_)
     ));
 
+    let ready_marker = format!("RMUX_ATTACH_ACTIVE_READY_{}", std::process::id());
+    let quiet_command = rmux_proto::ProcessCommand::Argv(quiet_ready_command(&ready_marker));
     let mut state = handler.state.lock().await;
     let pane_id = state.sessions.allocate_pane_id();
     let session = state.sessions.session_mut(&alpha).expect("session exists");
@@ -122,7 +124,7 @@ async fn attach_session_upgrade_renders_only_the_active_window() {
             5,
             crate::pane_terminals::WindowSpawnOptions {
                 start_directory: None,
-                command: None,
+                command: Some(&quiet_command),
                 socket_path: Path::new("/tmp/rmux-test.sock"),
                 spawn_environment: None,
                 environment_overrides: None,
@@ -133,6 +135,13 @@ async fn attach_session_upgrade_renders_only_the_active_window() {
         .expect("window 5 terminal insert succeeds");
     drop(state);
 
+    wait_for_capture_containing(
+        &handler,
+        PaneTarget::with_window(alpha.clone(), 5, 0),
+        &ready_marker,
+        "active window fixture should settle before transcript replacement",
+    )
+    .await;
     replace_transcript_contents(
         &handler,
         &PaneTarget::with_window(alpha.clone(), 5, 0),

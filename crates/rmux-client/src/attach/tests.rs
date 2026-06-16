@@ -329,13 +329,14 @@ fn output_loop_waits_briefly_to_coalesce_render_frames() -> Result<(), Box<dyn s
     server_stream.write_all(&encode_attach_message(&AttachMessage::Render(
         b"initial\n".to_vec(),
     ))?)?;
-    server_stream.write_all(&encode_attach_message(&AttachMessage::Render(
+    let mut replacement_burst = Vec::new();
+    replacement_burst.extend(encode_attach_message(&AttachMessage::Render(
         b"stale\n".to_vec(),
-    ))?)?;
-    std::thread::sleep(Duration::from_millis(2));
-    server_stream.write_all(&encode_attach_message(&AttachMessage::Render(
+    ))?);
+    replacement_burst.extend(encode_attach_message(&AttachMessage::Render(
         b"latest\n".to_vec(),
-    ))?)?;
+    ))?);
+    server_stream.write_all(&replacement_burst)?;
     server_stream.write_all(&encode_attach_message(&AttachMessage::Data(
         b"[detached (from session alpha)]\r\n".to_vec(),
     ))?)?;

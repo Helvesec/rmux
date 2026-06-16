@@ -398,6 +398,7 @@ where
     let mut stop_detector = AttachStopDetector::new(screen_tracker.clone());
     let mut pending_render = None::<Vec<u8>>;
     let mut pending_render_started_at = None::<Instant>;
+    let mut pending_render_drained_after_deadline = false;
     let mut painted_render_frame = false;
 
     loop {
@@ -428,6 +429,7 @@ where
                     }
                     if pending_render.is_none() {
                         pending_render_started_at = Some(Instant::now());
+                        pending_render_drained_after_deadline = false;
                     }
                     pending_render = Some(bytes);
                     if !painted_render_frame
@@ -437,6 +439,7 @@ where
                             &mut pending_render_started_at,
                         )?
                     {
+                        pending_render_drained_after_deadline = false;
                         painted_render_frame = true;
                     }
                 }
@@ -537,11 +540,16 @@ where
             }
         }
 
-        if pending_render.is_some()
-            && !pending_render_expired(pending_render_started_at)
-            && drain_available_attach_stream(&mut stream, &mut decoder, &mut read_buffer)?
-        {
-            continue;
+        if pending_render.is_some() {
+            let pending_expired = pending_render_expired(pending_render_started_at);
+            if (!pending_expired || !pending_render_drained_after_deadline)
+                && drain_available_attach_stream(&mut stream, &mut decoder, &mut read_buffer)?
+            {
+                if pending_expired {
+                    pending_render_drained_after_deadline = true;
+                }
+                continue;
+            }
         }
         if pending_render.is_some() && !pending_render_expired(pending_render_started_at) {
             sleep_until_pending_render_deadline(pending_render_started_at);
@@ -554,6 +562,7 @@ where
             &mut pending_render,
             &mut pending_render_started_at,
         )? {
+            pending_render_drained_after_deadline = false;
             painted_render_frame = true;
         }
 

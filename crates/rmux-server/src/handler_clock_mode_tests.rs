@@ -4,13 +4,18 @@ use std::sync::Arc;
 use super::RequestHandler;
 use crate::control::{ControlModeUpgrade, ControlServerEvent};
 use crate::pane_io::AttachControl;
-use rmux_core::input::mode;
+use rmux_core::{
+    input::{mode, InputParser},
+    GridRenderOptions, Screen, ScreenCaptureRange,
+};
+use rmux_proto::request::NewSessionExtRequest;
 use rmux_proto::{
-    ClockModeRequest, ControlMode, HookLifecycle, HookName, ListPanesRequest, NewSessionRequest,
-    OptionName, PaneTarget, Request, Response, ScopeSelector, SessionName, SetHookRequest,
-    SetOptionMode, SetOptionRequest, ShowBufferRequest, TerminalSize, WindowTarget,
+    ClockModeRequest, ControlMode, HookLifecycle, HookName, ListPanesRequest, OptionName,
+    PaneTarget, Request, Response, ScopeSelector, SessionName, SetHookRequest, SetOptionMode,
+    SetOptionRequest, ShowBufferRequest, TerminalSize, WindowTarget,
 };
 use tokio::sync::{broadcast, mpsc};
+use tokio::time::{timeout, Duration};
 
 fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
@@ -18,16 +23,124 @@ fn session_name(value: &str) -> SessionName {
 
 async fn create_session(handler: &RequestHandler, name: &str, size: TerminalSize) -> PaneTarget {
     let session_name = session_name(name);
+    let ready_marker = "RCREADY";
     let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
+        .handle(Request::NewSessionExt(NewSessionExtRequest {
+            session_name: Some(session_name.clone()),
+            working_directory: None,
             detached: true,
             size: Some(size),
             environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(quiet_clock_command(ready_marker)),
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
         }))
         .await;
     assert!(matches!(response, Response::NewSession(_)));
-    PaneTarget::with_window(session_name, 0, 0)
+    let target = PaneTarget::with_window(session_name, 0, 0);
+    wait_for_transcript_containing(
+        handler,
+        &target,
+        ready_marker,
+        "quiet clock fixture should reach a stable frame",
+    )
+    .await;
+    replace_transcript_contents(handler, &target, size, b"").await;
+    target
+}
+
+#[cfg(windows)]
+fn quiet_clock_command(marker: &str) -> Vec<String> {
+    let system_root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+    let cmd = std::path::PathBuf::from(system_root)
+        .join("System32")
+        .join("cmd.exe");
+    vec![
+        cmd.to_string_lossy().into_owned(),
+        "/d".to_owned(),
+        "/q".to_owned(),
+        "/c".to_owned(),
+        format!("echo {marker} & ping -n 120 127.0.0.1 >NUL"),
+    ]
+}
+
+#[cfg(unix)]
+fn quiet_clock_command(marker: &str) -> Vec<String> {
+    vec![
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        format!("printf '{marker}\\n'; sleep 60"),
+    ]
+}
+
+async fn wait_for_transcript_containing(
+    handler: &RequestHandler,
+    target: &PaneTarget,
+    needle: &str,
+    context: &str,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let capture = capture_transcript(handler, target).await;
+        if capture.contains(needle) {
+            return;
+        }
+
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{context}, got {capture:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn capture_transcript(handler: &RequestHandler, target: &PaneTarget) -> String {
+    let transcript = {
+        let state = handler.state.lock().await;
+        state
+            .transcript_handle(target)
+            .expect("pane transcript exists")
+    };
+    let capture = transcript
+        .lock()
+        .expect("pane transcript mutex must not be poisoned")
+        .capture_main(ScreenCaptureRange::default(), GridRenderOptions::default());
+    String::from_utf8_lossy(&capture).into_owned()
+}
+
+async fn replace_transcript_contents(
+    handler: &RequestHandler,
+    target: &PaneTarget,
+    size: TerminalSize,
+    content: &[u8],
+) {
+    let transcript = {
+        let state = handler.state.lock().await;
+        state
+            .transcript_handle(target)
+            .expect("pane transcript exists")
+    };
+    let history_limit = transcript
+        .lock()
+        .expect("pane transcript mutex must not be poisoned")
+        .history_limit();
+    let mut screen = Screen::new(size, history_limit);
+    let mut parser = InputParser::new();
+    parser.parse(content, &mut screen);
+    transcript
+        .lock()
+        .expect("pane transcript mutex must not be poisoned")
+        .set_screen_for_test(screen);
 }
 
 async fn dispatch_as(handler: &RequestHandler, requester_pid: u32, request: Request) -> Response {
@@ -158,6 +271,29 @@ async fn next_transient_overlay(
         if !frame.persistent {
             return frame;
         }
+    }
+}
+
+async fn next_transient_overlay_matching(
+    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
+    description: &str,
+    mut matches: impl FnMut(&str) -> bool,
+) -> crate::pane_io::OverlayFrame {
+    let mut seen = Vec::new();
+    let result = timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = next_transient_overlay(control_rx).await;
+            let text = String::from_utf8_lossy(&frame.frame);
+            if matches(&text) {
+                return frame;
+            }
+            seen.push(text.into_owned());
+        }
+    })
+    .await;
+    match result {
+        Ok(frame) => frame,
+        Err(_) => panic!("timed out waiting for {description}; seen frames: {seen:?}"),
     }
 }
 
@@ -302,7 +438,12 @@ async fn clock_mode_exit_restores_underlying_hidden_cursor_state() {
         .await
         .expect("attached input succeeds");
 
-    let restore = next_transient_overlay(&mut control_rx).await;
+    let restore = next_transient_overlay_matching(
+        &mut control_rx,
+        "clock mode restore frame with hidden cursor",
+        |frame| frame.contains("\u{1b}[?25l") && !frame.contains("\u{1b}[?25h"),
+    )
+    .await;
     let frame = String::from_utf8(restore.frame).expect("restore frame is utf-8");
     assert!(frame.contains("\u{1b}[?25l"));
     assert!(!frame.contains("\u{1b}[?25h"));
@@ -344,7 +485,12 @@ async fn clock_mode_exit_restores_visible_line_content() {
         .await
         .expect("attached input succeeds");
 
-    let restore = next_transient_overlay(&mut control_rx).await;
+    let restore = next_transient_overlay_matching(
+        &mut control_rx,
+        "clock mode restore frame with visible line content",
+        |frame| frame.contains("red") && frame.contains("more"),
+    )
+    .await;
     let frame = String::from_utf8(restore.frame).expect("restore frame is utf-8");
     assert!(frame.contains("red"));
     assert!(frame.contains("more"));
