@@ -241,11 +241,14 @@ mod imp {
 
         #[test]
         fn delayed_palette_replies_are_captured() {
-            let (mut master, mut slave) = open_pty_pair();
+            let (master, mut slave) = open_pty_pair();
+            let mut responder_master = master.try_clone().expect("clone pty master");
             let reply = palette_reply();
             let responder = thread::spawn(move || {
                 thread::sleep(Duration::from_millis(300));
-                master.write_all(reply.as_bytes()).expect("write reply");
+                responder_master
+                    .write_all(reply.as_bytes())
+                    .expect("write reply");
             });
 
             let theme = capture_from_tty(&mut slave).expect("delayed theme reply");
