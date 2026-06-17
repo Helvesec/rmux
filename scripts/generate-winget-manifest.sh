@@ -5,16 +5,17 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/generate-winget-manifest.sh --version <semver> --checksums <SHA256SUMS> --output <path> [options]
 
-Generate the RMUX WinGet singleton manifest from GitHub Release checksums.
+Generate the RMUX WinGet multi-file manifest from GitHub Release checksums.
 
 Options:
   --version <semver|vsemver>   Release version, for example 1.2.3 or v1.2.3
   --checksums <path>           SHA256SUMS file from the GitHub Release
-  --output <path>              Write Helvesec.RMUX.yaml to this path
+  --output <path>              Write Helvesec.RMUX.yaml to this path and sibling manifest files beside it
   --repository <owner/repo>    GitHub repository (default: Helvesec/rmux)
   --homepage <url>             Package homepage (default: https://rmux.io)
   --publisher <name>           Package publisher (default: Helvesec)
   --identifier <id>            WinGet package id (default: Helvesec.RMUX)
+  --release-date <YYYY-MM-DD>  Release date for the installer manifest (default: today in UTC)
   -h, --help                   Show this help
 USAGE
 }
@@ -52,10 +53,22 @@ asset_sha256() {
       ;;
     *) die "invalid checksum for $asset" ;;
   esac
-  printf '%s\n' "$hash" | tr 'A-F' 'a-f'
+  printf '%s\n' "$hash" | tr 'a-f' 'A-F'
 }
 
-manifest() {
+version_manifest() {
+  cat <<EOF
+# yaml-language-server: \$schema=https://aka.ms/winget-manifest.version.1.12.0.schema.json
+
+PackageIdentifier: $identifier
+PackageVersion: $version
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: 1.12.0
+EOF
+}
+
+installer_manifest() {
   local tag asset sha base_url nested_path
   tag="v$version"
   asset="rmux-$version-windows-x86_64.zip"
@@ -64,35 +77,66 @@ manifest() {
   nested_path="rmux-$version-windows-x86_64\\rmux.exe"
 
   cat <<EOF
-# yaml-language-server: \$schema=https://aka.ms/winget-manifest.singleton.1.10.0.schema.json
-PackageIdentifier: "$identifier"
-PackageVersion: "$version"
-PackageLocale: "en-US"
-Publisher: "$publisher"
-PublisherUrl: "https://github.com/${repository%%/*}"
-PackageName: "RMUX"
-PackageUrl: "$homepage"
-License: "MIT OR Apache-2.0"
-ShortDescription: "Terminal multiplexer with a tmux-style CLI, daemon runtime, and native Windows support."
-Moniker: "rmux"
-Tags:
-  - "terminal"
-  - "multiplexer"
-  - "tmux"
-  - "cli"
-  - "rust"
+# yaml-language-server: \$schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json
+
+PackageIdentifier: $identifier
+PackageVersion: $version
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: $nested_path
+    PortableCommandAlias: rmux
+ReleaseDate: "$release_date"
 Installers:
-  - Architecture: "x64"
-    InstallerType: "zip"
-    NestedInstallerType: "portable"
-    NestedInstallerFiles:
-      - RelativeFilePath: '$nested_path'
-        PortableCommandAlias: "rmux"
-    InstallerUrl: "$base_url/$asset"
-    InstallerSha256: "$sha"
-ManifestType: "singleton"
-ManifestVersion: "1.10.0"
+  - Architecture: x64
+    InstallerUrl: $base_url/$asset
+    InstallerSha256: $sha
+ManifestType: installer
+ManifestVersion: 1.12.0
 EOF
+}
+
+locale_manifest() {
+  local owner
+  owner="${repository%%/*}"
+
+  cat <<EOF
+# yaml-language-server: \$schema=https://aka.ms/winget-manifest.defaultLocale.1.12.0.schema.json
+
+PackageIdentifier: $identifier
+PackageVersion: $version
+PackageLocale: en-US
+Publisher: $publisher
+PublisherUrl: https://github.com/$owner
+PublisherSupportUrl: https://github.com/$repository/issues
+Author: $publisher
+PackageName: RMUX
+PackageUrl: $homepage
+License: MIT OR Apache-2.0
+ShortDescription: Terminal multiplexer with a tmux-style CLI, daemon runtime, and native Windows support.
+Description: |-
+  RMUX is a terminal multiplexer with a tmux-style command line, daemon-backed persistent sessions, native Windows support, and a Rust SDK for automation.
+Moniker: rmux
+Tags:
+  - cli
+  - multiplexer
+  - rust
+  - terminal
+  - tmux
+ReleaseNotesUrl: https://github.com/$repository/releases/tag/v$version
+ManifestType: defaultLocale
+ManifestVersion: 1.12.0
+EOF
+}
+
+write_manifest() {
+  local destination generator tmp
+  destination="$1"
+  generator="$2"
+  tmp="$(mktemp "$(dirname "$destination")/.rmux-winget.XXXXXX")"
+  "$generator" > "$tmp"
+  mv "$tmp" "$destination"
+  chmod 0644 "$destination"
 }
 
 version=""
@@ -102,6 +146,7 @@ repository="${RMUX_GITHUB_REPO:-Helvesec/rmux}"
 homepage="${RMUX_HOMEPAGE:-https://rmux.io}"
 publisher="${RMUX_PACKAGE_PUBLISHER:-Helvesec}"
 identifier="${RMUX_WINGET_IDENTIFIER:-Helvesec.RMUX}"
+release_date="$(date -u +%F)"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -140,6 +185,11 @@ while [ "$#" -gt 0 ]; do
       identifier="$2"
       shift 2
       ;;
+    --release-date)
+      [ "$#" -ge 2 ] || die "--release-date requires a value"
+      release_date="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -167,10 +217,21 @@ case "$identifier" in
   *.*) ;;
   *) die "--identifier must look like Publisher.Package" ;;
 esac
+case "$release_date" in
+  [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) ;;
+  *) die "--release-date must look like YYYY-MM-DD" ;;
+esac
+case "$output" in
+  *.yaml) ;;
+  *) die "--output must end with .yaml" ;;
+esac
 
 out_dir="$(dirname "$output")"
+stem="${output%.yaml}"
+installer_output="$stem.installer.yaml"
+locale_output="$stem.locale.en-US.yaml"
+
 mkdir -p "$out_dir"
-tmp="$(mktemp "$out_dir/.rmux-winget.XXXXXX")"
-manifest > "$tmp"
-mv "$tmp" "$output"
-chmod 0644 "$output"
+write_manifest "$output" version_manifest
+write_manifest "$installer_output" installer_manifest
+write_manifest "$locale_output" locale_manifest

@@ -55,7 +55,16 @@ scripts/generate-chocolatey-package.sh \
 
 ## WinGet
 
-The generated WinGet manifest is a singleton manifest for `Helvesec.RMUX` using:
+The generated WinGet manifest uses the current multi-file WinGet layout:
+
+```text
+target/package-managers/winget/
+  Helvesec.RMUX.yaml
+  Helvesec.RMUX.installer.yaml
+  Helvesec.RMUX.locale.en-US.yaml
+```
+
+The installer manifest pins the GitHub Release zip with:
 
 ```text
 InstallerType: zip
@@ -70,8 +79,8 @@ pwsh ./scripts/validate-winget-manifest.ps1 `
   -Manifest target/package-managers/winget/Helvesec.RMUX.yaml `
   -Version 0.6.1 `
   -Checksums dist/SHA256SUMS.txt
-winget validate target/package-managers/winget/Helvesec.RMUX.yaml
-winget install --manifest target/package-managers/winget/Helvesec.RMUX.yaml
+winget validate --manifest target/package-managers/winget
+winget install --manifest target/package-managers/winget
 rmux -V
 rmux diagnose --json
 ```
@@ -79,7 +88,8 @@ rmux diagnose --json
 GitHub Actions validates the generated WinGet manifest after the release assets
 are published. The release workflow performs a structural check against
 `SHA256SUMS` and runs `winget validate` when WinGet is available on the Windows
-runner.
+runner. Singleton manifests are deprecated by `microsoft/winget-pkgs`; do not
+submit or regenerate them.
 
 WinGet publication is a pull request to `microsoft/winget-pkgs`; there is no
 Chocolatey-style API key. For the first RMUX package, submit manually so the
@@ -87,7 +97,7 @@ publisher, identifier, and CLA are settled:
 
 ```powershell
 winget install wingetcreate
-wingetcreate submit target/package-managers/winget/Helvesec.RMUX.yaml
+wingetcreate submit target/package-managers/winget
 ```
 
 If `wingetcreate` needs a token, use its OAuth/cache flow locally or set

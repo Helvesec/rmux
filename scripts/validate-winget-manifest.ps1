@@ -99,6 +99,19 @@ function DecodeYamlScalar([string]$Value) {
     $trimmed
 }
 
+function UseManifest([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Fail "WinGet manifest not found: $Path"
+    }
+    $script:currentManifest = $Path
+    $script:manifestLines = Get-Content -LiteralPath $Path
+    foreach ($line in $script:manifestLines) {
+        if ($line -match 'singleton') {
+            Fail "singleton WinGet manifests are deprecated: $Path"
+        }
+    }
+}
+
 function ReadManifestValue([string]$Key) {
     $pattern = '^\s*(?:-\s*)?' + [regex]::Escape($Key) + '\s*:\s*(.+?)\s*$'
     foreach ($line in $script:manifestLines) {
@@ -106,13 +119,13 @@ function ReadManifestValue([string]$Key) {
             return (DecodeYamlScalar $Matches[1])
         }
     }
-    Fail "missing WinGet manifest field: $Key"
+    Fail "missing WinGet manifest field in ${script:currentManifest}: $Key"
 }
 
 function AssertManifestValue([string]$Key, [string]$Expected) {
     $actual = ReadManifestValue $Key
     if ($actual -ne $Expected) {
-        Fail "unexpected ${Key}: expected '$(FormatScalarForError $Expected)', got '$(FormatScalarForError $actual)'"
+        Fail "unexpected ${Key} in ${script:currentManifest}: expected '$(FormatScalarForError $Expected)', got '$(FormatScalarForError $actual)'"
     }
 }
 
@@ -139,45 +152,77 @@ function ReadChecksum([string]$ChecksumsPath, [string]$Asset) {
 
 $versionValue = NormalizeVersion $Version
 
-if (-not (Test-Path -LiteralPath $Manifest -PathType Leaf)) {
-    Fail "WinGet manifest not found: $Manifest"
-}
-
 if ($Repository -notmatch '^[^/\s]+/[^/\s]+$') {
     Fail "repository must look like owner/repo: $Repository"
 }
 
-$script:manifestLines = Get-Content -LiteralPath $Manifest
+if (Test-Path -LiteralPath $Manifest -PathType Container) {
+    $versionManifest = Join-Path $Manifest "$Identifier.yaml"
+} else {
+    $versionManifest = $Manifest
+}
+
+if (-not $versionManifest.EndsWith(".yaml", [StringComparison]::OrdinalIgnoreCase)) {
+    Fail "version manifest path must end with .yaml: $versionManifest"
+}
+
+$stem = $versionManifest.Substring(0, $versionManifest.Length - 5)
+$installerManifest = "$stem.installer.yaml"
+$localeManifest = "$stem.locale.en-US.yaml"
+
 $asset = "rmux-$versionValue-windows-x86_64.zip"
 $packageDir = "rmux-$versionValue-windows-x86_64"
 $expectedUrl = "https://github.com/$Repository/releases/download/v$versionValue/$asset"
 $expectedRelativePath = "$packageDir\rmux.exe"
 $expectedSha256 = ReadChecksum $Checksums $asset
+$owner = $Repository.Split('/')[0]
 
+UseManifest $versionManifest
 AssertManifestValue "PackageIdentifier" $Identifier
 AssertManifestValue "PackageVersion" $versionValue
-AssertManifestValue "PackageLocale" "en-US"
-AssertManifestValue "Publisher" $Publisher
-AssertManifestValue "PublisherUrl" "https://github.com/$($Repository.Split('/')[0])"
-AssertManifestValue "PackageName" "RMUX"
-AssertManifestValue "PackageUrl" $Homepage
-AssertManifestValue "License" "MIT OR Apache-2.0"
-AssertManifestValue "Moniker" "rmux"
-AssertManifestValue "Architecture" "x64"
+AssertManifestValue "DefaultLocale" "en-US"
+AssertManifestValue "ManifestType" "version"
+AssertManifestValue "ManifestVersion" "1.12.0"
+
+UseManifest $installerManifest
+AssertManifestValue "PackageIdentifier" $Identifier
+AssertManifestValue "PackageVersion" $versionValue
 AssertManifestValue "InstallerType" "zip"
 AssertManifestValue "NestedInstallerType" "portable"
 AssertManifestValue "RelativeFilePath" $expectedRelativePath
 AssertManifestValue "PortableCommandAlias" "rmux"
+AssertManifestValue "Architecture" "x64"
 AssertManifestValue "InstallerUrl" $expectedUrl
-AssertManifestValue "ManifestType" "singleton"
-AssertManifestValue "ManifestVersion" "1.10.0"
+AssertManifestValue "ManifestType" "installer"
+AssertManifestValue "ManifestVersion" "1.12.0"
+
+$releaseDate = ReadManifestValue "ReleaseDate"
+if ($releaseDate -notmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}$') {
+    Fail "invalid ReleaseDate in ${script:currentManifest}: $releaseDate"
+}
 
 $actualSha256 = ReadManifestValue "InstallerSha256"
 if ($actualSha256 -notmatch '^[0-9a-fA-F]{64}$') {
-    Fail "invalid InstallerSha256: $actualSha256"
+    Fail "invalid InstallerSha256 in ${script:currentManifest}: $actualSha256"
 }
 if (-not [string]::IsNullOrWhiteSpace($expectedSha256) -and $actualSha256.ToLowerInvariant() -ne $expectedSha256) {
     Fail "InstallerSha256 mismatch: expected $expectedSha256, got $actualSha256"
 }
 
-Write-Output "WinGet manifest OK: $Identifier $versionValue"
+UseManifest $localeManifest
+AssertManifestValue "PackageIdentifier" $Identifier
+AssertManifestValue "PackageVersion" $versionValue
+AssertManifestValue "PackageLocale" "en-US"
+AssertManifestValue "Publisher" $Publisher
+AssertManifestValue "PublisherUrl" "https://github.com/$owner"
+AssertManifestValue "PublisherSupportUrl" "https://github.com/$Repository/issues"
+AssertManifestValue "Author" $Publisher
+AssertManifestValue "PackageName" "RMUX"
+AssertManifestValue "PackageUrl" $Homepage
+AssertManifestValue "License" "MIT OR Apache-2.0"
+AssertManifestValue "Moniker" "rmux"
+AssertManifestValue "ReleaseNotesUrl" "https://github.com/$Repository/releases/tag/v$versionValue"
+AssertManifestValue "ManifestType" "defaultLocale"
+AssertManifestValue "ManifestVersion" "1.12.0"
+
+Write-Output "WinGet manifest OK: $Identifier $versionValue multi-file"
