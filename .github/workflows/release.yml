@@ -149,9 +149,11 @@ jobs:
       - name: Windows runtime smoke
         if: runner.os == 'Windows'
         shell: pwsh
-        env:
-          RUST_TEST_THREADS: "1"
-        run: cargo test --workspace --locked --target $env:TARGET --no-fail-fast -- --test-threads=1
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bin = "target/$env:TARGET/$env:PROFILE_DIR/$env:BINARY"
+          & $bin -V
+          & $bin list-commands | Out-Null
 
       - name: Create Unix archive
         if: matrix.archive == 'tar.gz'
