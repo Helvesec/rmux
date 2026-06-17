@@ -24,7 +24,7 @@ jobs:
       RUST_MIN_STACK: "8388608"
       RUST_TEST_THREADS: "1"
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           ref: ${{ env.RELEASE_REF }}
 
@@ -104,7 +104,7 @@ jobs:
           echo "TAG=$RELEASE_REF" >> "$GITHUB_ENV"
           echo "VERSION=${RELEASE_REF#v}" >> "$GITHUB_ENV"
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           ref: ${{ env.RELEASE_REF }}
 
@@ -225,7 +225,7 @@ jobs:
             -RunBinary `
             -RunDaemonSmoke
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: rmux-${{ env.RELEASE_REF }}-${{ matrix.target }}
           path: |
@@ -248,11 +248,11 @@ jobs:
       RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           ref: ${{ env.RELEASE_REF }}
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           path: release-assets
           merge-multiple: true
@@ -359,7 +359,7 @@ jobs:
             -Checksums "release-assets/SHA256SUMS" `
             -Repository $env:GITHUB_REPOSITORY
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: package-manager-metadata-${{ env.RELEASE_REF }}
           path: target/package-managers
@@ -403,7 +403,7 @@ jobs:
           grep -qx 'gpgcheck=1' target/package-repositories/rpm/rmux.repo
           grep -qx 'repo_gpgcheck=1' target/package-repositories/rpm/rmux.repo
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: linux-package-repositories-${{ env.RELEASE_REF }}
           path: target/package-repositories
@@ -529,11 +529,11 @@ jobs:
           }
           "VERSION=$($env:RELEASE_REF.Substring(1))" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
         with:
           ref: ${{ env.RELEASE_REF }}
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: package-manager-metadata-${{ env.RELEASE_REF }}
           path: package-manager-metadata
@@ -591,7 +591,7 @@ jobs:
           }
           "VERSION=$($env:RELEASE_REF.Substring(1))" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           name: package-manager-metadata-${{ env.RELEASE_REF }}
           path: package-manager-metadata
