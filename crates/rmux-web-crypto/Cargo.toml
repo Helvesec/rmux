@@ -26,7 +26,7 @@ hkdf = "0.12"
 # Randomness is passed in explicitly, so no internal RNG / getrandom is pulled
 # into the WASM bundle.
 libcrux-ml-kem = { version = "0.0.9", default-features = false, features = ["mlkem768"] }
-sha2 = { version = "0.10", default-features = false }
+sha2 = { version = "0.11", default-features = false }
 subtle = { version = "2.6", default-features = false }
 wasm-bindgen = { version = "0.2", optional = true }
 x25519-dalek = { version = "2", features = ["zeroize", "getrandom"], optional = true }

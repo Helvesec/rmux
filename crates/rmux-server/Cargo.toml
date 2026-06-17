@@ -28,7 +28,7 @@ zeroize = { version = "1", default-features = false, optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 sha1 = { version = "0.10", optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
 subtle = { version = "2.6", optional = true }
 tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 toml = { version = "0.8", optional = true }
