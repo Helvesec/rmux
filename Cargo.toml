@@ -85,7 +85,7 @@ chrono = { version = "0.4.42", default-features = false, features = ["std"] }
 clap = { version = "=4.5.39", features = ["derive"] }
 libc = "0.2"
 qrcode = { version = "0.14", default-features = false }
-ratatui = { version = "=0.29.0", default-features = false }
+ratatui = { version = "=0.30.1", default-features = false }
 rmux-client = { path = "crates/rmux-client", version = "0.6.1" }
 rmux-core = { path = "crates/rmux-core", version = "0.6.1" }
 rmux-os = { path = "crates/rmux-os", version = "0.6.1" }
