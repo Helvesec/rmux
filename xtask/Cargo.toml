@@ -7,8 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-clap = { version = "=4.5.39", features = ["derive"] }
-clap_complete = "=4.5.55"
+clap = { version = "=4.6.1", features = ["derive"] }
+clap_complete = "=4.6.5"
 rmux-core = { path = "../crates/rmux-core", version = "0.6.1" }
 rmux-proto = { path = "../crates/rmux-proto", version = "0.6.1" }
 
