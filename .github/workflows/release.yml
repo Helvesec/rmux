@@ -320,6 +320,7 @@ jobs:
             --version "$version" \
             --checksums release-assets/SHA256SUMS \
             --output target/package-managers/winget/Helvesec.RMUX.yaml
+          sed -i '/^# yaml-language-server:/d' target/package-managers/winget/Helvesec.RMUX.yaml
           scripts/generate-scoop-manifest.sh \
             --version "$version" \
             --checksums release-assets/SHA256SUMS \
