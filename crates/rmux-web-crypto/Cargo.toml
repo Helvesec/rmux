@@ -33,7 +33,7 @@ x25519-dalek = { version = "2", features = ["zeroize", "getrandom"], optional = 
 zeroize = { version = "1", default-features = false, features = ["derive"] }
 
 [dev-dependencies]
-hex-literal = "0.4"
+hex-literal = "1.1"
 
 [package.metadata.wasm-pack.profile.release]
 # wasm-pack's bundled wasm-opt can lag browser/Rust target features and reject
