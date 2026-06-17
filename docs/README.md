@@ -6,8 +6,11 @@ It includes [installation guides](https://rmux.io/docs/get-started/), [CLI refer
 
 Repository docs:
 
+- [Architecture](ARCHITECTURE.md)
 - [Web Share](web-share.md)
 - [RMUX SDK](scripting-sdk.md)
+- [Roadmap](ROADMAP.md)
+- [Security assurance case](assurance-case.md)
 
 Repository-local guides:
 

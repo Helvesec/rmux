@@ -27,6 +27,18 @@ Changes that affect public behavior should update the relevant README or documen
 
 Do not commit credentials, private machine paths, local logs, or generated artifacts unless they are intentionally part of the repository.
 
+## Developer Certificate of Origin
+
+By contributing to RMUX, you certify that you have the right to submit the work
+under the project license. See [DCO](DCO).
+
+Pull requests for code or documentation must certify this with a `Signed-off-by:`
+line:
+
+```text
+Signed-off-by: Your Name <you@example.com>
+```
+
 ## Platform changes
 
 For Linux, macOS, Windows, terminal, PTY, or shell compatibility changes, mention which platform was tested in the pull request.
