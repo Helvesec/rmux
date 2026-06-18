@@ -208,6 +208,44 @@ cargo add ratatui-rmux
 
 </details>
 
+<a id="install-nix"></a>
+<details>
+<summary><strong>Nix / NixOS install</strong></summary>
+
+RMUX provides a flake (`x86_64`/`aarch64`, Linux and macOS).
+
+#### Run without installing
+
+```sh
+nix run github:helvesec/rmux
+```
+
+#### Install into your profile
+
+```sh
+nix profile install github:helvesec/rmux
+```
+
+#### Add to a flake-based system / Home Manager
+
+```nix
+{
+  inputs.rmux.url = "github:helvesec/rmux";
+  # then add inputs.rmux.packages.${system}.default to your packages
+}
+```
+
+#### Development shell
+
+```sh
+nix develop          # cargo, rustc, clippy, rustfmt, rust-analyzer
+```
+
+The flake derives its version from `Cargo.toml`. Packaging details and the
+maintainer release notes live in [docs/nix-packaging.md](docs/nix-packaging.md).
+
+</details>
+
 SHA256 checksums are published with every GitHub Release. APT, DNF, Homebrew, Scoop, Chocolatey, and WinGet metadata are generated from the same release assets.
 
 ## Documentation
