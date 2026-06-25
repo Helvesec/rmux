@@ -99,12 +99,12 @@ ManifestVersion: 1.10.0
 EOF
 }
 
-locale_manifest() {
+default_locale_manifest() {
   local owner
   owner="${repository%%/*}"
 
   cat <<EOF
-# yaml-language-server: \$schema=https://aka.ms/winget-manifest.locale.1.10.0.schema.json
+# yaml-language-server: \$schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
 
 PackageIdentifier: $identifier
 PackageVersion: $version
@@ -127,7 +127,7 @@ Tags:
   - terminal
   - tmux
 ReleaseNotesUrl: https://github.com/$repository/releases/tag/v$version
-ManifestType: locale
+ManifestType: defaultLocale
 ManifestVersion: 1.10.0
 EOF
 }
@@ -237,4 +237,4 @@ locale_output="$stem.locale.en-US.yaml"
 mkdir -p "$out_dir"
 write_manifest "$output" version_manifest
 write_manifest "$installer_output" installer_manifest
-write_manifest "$locale_output" locale_manifest
+write_manifest "$locale_output" default_locale_manifest

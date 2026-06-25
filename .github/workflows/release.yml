@@ -10,6 +10,11 @@ on:
         description: Git tag to release, for example v1.2.3
         required: true
         type: string
+      skip_external_package_publish:
+        description: Skip Chocolatey and Snap Store publishing for an already-submitted release
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -345,6 +350,7 @@ jobs:
           merge-multiple: true
 
       - name: Generate checksums
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
         shell: bash
         run: |
           cd release-assets
@@ -356,12 +362,27 @@ jobs:
           fi
           printf '%s\0' "${assets[@]}" | sort -z | xargs -0 sha256sum > SHA256SUMS
 
+      - name: Download existing release checksums
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish }}
+        shell: bash
+        run: |
+          rm -rf release-assets
+          mkdir -p release-assets
+          gh release download "$RELEASE_REF" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern SHA256SUMS \
+            --dir release-assets \
+            --clobber
+          test -s release-assets/SHA256SUMS
+
       - name: Install cosign
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6
         with:
           cosign-release: v3.1.1
 
       - name: Sign checksums with Sigstore
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
         shell: bash
         env:
           COSIGN_YES: "true"
@@ -372,6 +393,7 @@ jobs:
             release-assets/SHA256SUMS
 
       - name: Generate build provenance attestations
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32
         with:
           subject-path: |
@@ -384,12 +406,14 @@ jobs:
             release-assets/SHA256SUMS.sigstore.json
 
       - name: Install repository metadata tooling
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y createrepo-c gnupg rpm
 
       - name: Import Linux repository signing keys
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
         shell: bash
         env:
           RMUX_APT_GPG_PRIVATE_KEY: ${{ secrets.RMUX_APT_GPG_PRIVATE_KEY }}
@@ -481,6 +505,7 @@ jobs:
           if-no-files-found: error
 
       - name: Generate Linux package repositories
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
         shell: bash
         env:
           RMUX_APT_GPG_KEY: ${{ secrets.RMUX_APT_GPG_KEY }}
@@ -521,12 +546,14 @@ jobs:
           grep -qx 'repo_gpgcheck=1' target/package-repositories/rpm/rmux.repo
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
         with:
           name: linux-package-repositories-${{ env.RELEASE_REF }}
           path: target/package-repositories
           if-no-files-found: error
 
       - name: Create or update release
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
         shell: bash
         run: |
           tag="$RELEASE_REF"
@@ -556,6 +583,7 @@ jobs:
           gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false
 
       - name: Deploy Linux package repositories
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
         shell: bash
         env:
           RMUX_PACKAGE_REPO_TOKEN: ${{ secrets.RMUX_PACKAGE_REPO_TOKEN }}
@@ -634,6 +662,7 @@ jobs:
 
   publish-snap:
     name: Publish Snap ${{ matrix.snap-arch }} candidate
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
     runs-on: ubuntu-latest
     needs:
       - publish
@@ -755,6 +784,7 @@ jobs:
 
   publish-chocolatey:
     name: Publish Chocolatey package
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
     runs-on: windows-latest
     needs:
       - publish

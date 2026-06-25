@@ -234,7 +234,7 @@ AssertManifestValue "PackageUrl" $Homepage
 AssertManifestValue "License" "MIT OR Apache-2.0"
 AssertManifestValue "Moniker" "rmux"
 AssertManifestValue "ReleaseNotesUrl" "https://github.com/$Repository/releases/tag/v$versionValue"
-AssertManifestValue "ManifestType" "locale"
+AssertManifestValue "ManifestType" "defaultLocale"
 AssertManifestValue "ManifestVersion" "1.10.0"
 
 Write-Output "WinGet manifest OK: $Identifier $versionValue multi-file"
