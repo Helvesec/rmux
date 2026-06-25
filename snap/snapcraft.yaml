@@ -26,9 +26,18 @@ apps:
     command: bin/rmux-daemon
 
 parts:
+  rust-deps:
+    plugin: nil
+    build-packages:
+      - curl
+    override-pull: |
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+
   rmux:
     plugin: rust
     source: .
+    after:
+      - rust-deps
     rust-channel: stable
     rust-path:
       - .
