@@ -189,6 +189,33 @@ fn command_targets_accept_tmux_last_wins_repetition() {
 }
 
 #[test]
+fn new_session_single_value_flags_follow_tmux_last_wins() {
+    let cli = parse_args(&[
+        "new-session",
+        "-d",
+        "-s",
+        "beta",
+        "-s",
+        "gamma",
+        "sleep",
+        "1",
+    ])
+    .unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::NewSession(args) => {
+            assert!(args.detached);
+            assert_eq!(
+                args.session_name.expect("session name").to_string(),
+                "gamma"
+            );
+            assert_eq!(args.command, ["sleep", "1"]);
+        }
+        _ => panic!("expected NewSession command"),
+    }
+}
+
+#[test]
 fn new_session_sanitizes_colon_in_session_name() {
     let cli = parse_args(&["new-session", "-s", "bad:name"]).unwrap();
 

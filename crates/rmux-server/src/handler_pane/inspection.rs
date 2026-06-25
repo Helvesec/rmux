@@ -13,6 +13,13 @@ use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::pane_terminals::{session_not_found, HandlerState};
 use crate::renderer;
 
+#[path = "inspection/list_panes_default.rs"]
+mod list_panes_default;
+
+use list_panes_default::{
+    push_default_list_panes_line, DefaultListPanesFormat, DefaultListPanesLineContext,
+};
+
 impl RequestHandler {
     pub(in crate::handler) async fn handle_display_message(
         &self,
@@ -184,6 +191,11 @@ impl RequestHandler {
             return Response::DisplayMessage(DisplayMessageResponse::no_output());
         };
         let context_target = target.unwrap_or_else(|| Target::Session(session_name.clone()));
+        #[cfg(windows)]
+        if format_references_pane_pid(Some(template)) {
+            self.wait_for_windows_deferred_target_pane_pids(&context_target)
+                .await;
+        }
         let attached_count = self.attached_count(&session_name).await;
 
         let (expanded, overlay_frame, clear_frame, duration) = {
@@ -270,6 +282,14 @@ impl RequestHandler {
             let active_attach = self.active_attach.lock().await;
             active_attach.attached_count(&request.target)
         };
+        #[cfg(windows)]
+        if format_references_pane_pid(request.format.as_deref()) {
+            self.wait_for_windows_deferred_list_pane_pids(
+                &request.target,
+                request.target_window_index,
+            )
+            .await;
+        }
         let mut state = self.state.lock().await;
         if let Err(error) =
             state.refresh_list_panes_exit_statuses(&request.target, request.target_window_index)
@@ -302,6 +322,132 @@ impl RequestHandler {
             ),
         })
     }
+}
+
+#[cfg(windows)]
+const DEFERRED_PANE_PID_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(windows)]
+const DEFERRED_PANE_PID_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+#[cfg(windows)]
+impl RequestHandler {
+    pub(in crate::handler) async fn wait_for_windows_deferred_list_pane_pids(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        target_window_index: Option<u32>,
+    ) {
+        self.wait_for_windows_deferred_pane_pids_until(|| async {
+            let state = self.state.lock().await;
+            list_pane_scope_has_starting_pane(&state, session_name, target_window_index)
+        })
+        .await;
+    }
+
+    pub(in crate::handler) async fn wait_for_windows_deferred_list_session_pane_pids(&self) {
+        self.wait_for_windows_deferred_pane_pids_until(|| async {
+            let state = self.state.lock().await;
+            list_session_scope_has_starting_active_pane(&state)
+        })
+        .await;
+    }
+
+    pub(in crate::handler) async fn wait_for_windows_deferred_all_pane_pids(&self) {
+        self.wait_for_windows_deferred_pane_pids_until(|| async {
+            let state = self.state.lock().await;
+            state_has_starting_pane(&state)
+        })
+        .await;
+    }
+
+    async fn wait_for_windows_deferred_target_pane_pids(&self, target: &Target) {
+        self.wait_for_windows_deferred_pane_pids_until(|| async {
+            let state = self.state.lock().await;
+            target_has_starting_pane(&state, target)
+        })
+        .await;
+    }
+
+    async fn wait_for_windows_deferred_pane_pids_until<F, Fut>(&self, mut has_starting: F)
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
+        let deadline = tokio::time::Instant::now() + DEFERRED_PANE_PID_WAIT;
+        while has_starting().await {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            tokio::time::sleep(DEFERRED_PANE_PID_POLL.min(deadline - now)).await;
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(in crate::handler) fn format_references_pane_pid(format: Option<&str>) -> bool {
+    format.is_some_and(|format| format.contains("pane_pid"))
+}
+
+#[cfg(windows)]
+fn target_has_starting_pane(state: &HandlerState, target: &Target) -> bool {
+    match target {
+        Target::Session(session_name) => {
+            list_pane_scope_has_starting_pane(state, session_name, None)
+        }
+        Target::Window(target) => list_pane_scope_has_starting_pane(
+            state,
+            target.session_name(),
+            Some(target.window_index()),
+        ),
+        Target::Pane(target) => state.pane_is_starting_in_window(
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn list_session_scope_has_starting_active_pane(state: &HandlerState) -> bool {
+    state.sessions.iter().any(|(session_name, session)| {
+        let window_index = session.active_window_index();
+        session.window().active_pane().is_some_and(|pane| {
+            state.pane_is_starting_in_window(session_name, window_index, pane.index())
+        })
+    })
+}
+
+#[cfg(windows)]
+fn state_has_starting_pane(state: &HandlerState) -> bool {
+    state.sessions.iter().any(|(session_name, session)| {
+        session.windows().iter().any(|(window_index, window)| {
+            window.panes().iter().any(|pane| {
+                state.pane_is_starting_in_window(session_name, *window_index, pane.index())
+            })
+        })
+    })
+}
+
+#[cfg(windows)]
+fn list_pane_scope_has_starting_pane(
+    state: &HandlerState,
+    session_name: &rmux_proto::SessionName,
+    target_window_index: Option<u32>,
+) -> bool {
+    let Some(session) = state.sessions.session(session_name) else {
+        return false;
+    };
+    session
+        .windows()
+        .iter()
+        .filter(|(window_index, _)| {
+            target_window_index.is_none_or(|target| target == **window_index)
+        })
+        .any(|(window_index, window)| {
+            window.panes().iter().any(|pane| {
+                state.pane_is_starting_in_window(session_name, *window_index, pane.index())
+            })
+        })
 }
 
 fn display_message_client_is_control_only(error: &RmuxError) -> bool {
@@ -497,6 +643,11 @@ fn collect_list_pane_output(
     } else {
         DEFAULT_LIST_PANES_SESSION_FORMAT
     }));
+    let fast_format = if attached_count == 0 {
+        format.and_then(DefaultListPanesFormat::from_format)
+    } else {
+        None
+    };
 
     let mut stdout = Vec::new();
     for (window_index, window) in session.windows() {
@@ -512,9 +663,28 @@ fn collect_list_pane_output(
                 .with_window(*window_index, window, active, last);
 
         for pane in window.panes() {
-            let context = window_context
-                .clone()
-                .with_pane(pane, pane.index() == window.active_pane_index());
+            let pane_active = pane.index() == window.active_pane_index();
+            if let Some(fast_format) = fast_format {
+                if !stdout.is_empty() {
+                    stdout.push(b'\n');
+                }
+                if push_default_list_panes_line(
+                    &mut stdout,
+                    DefaultListPanesLineContext {
+                        format: fast_format,
+                        state,
+                        session,
+                        attached_count,
+                        window_index: *window_index,
+                        pane,
+                        pane_active,
+                    },
+                ) {
+                    continue;
+                }
+                stdout.pop();
+            }
+            let context = window_context.clone().with_pane(pane, pane_active);
             let mut runtime = RuntimeFormatContext::new(context)
                 .with_state(state)
                 .with_session(session)

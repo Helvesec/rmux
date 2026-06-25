@@ -6,7 +6,7 @@ use super::InputParser;
 
 const WIN32_CONSOLE_INPUT_MODE: i32 = 9001;
 
-pub(super) fn dispatch_sm(parser: &mut InputParser, writer: &mut dyn ScreenWriter) {
+pub(super) fn dispatch_sm<W: ScreenWriter + ?Sized>(parser: &mut InputParser, writer: &mut W) {
     for i in 0..parser.param_list.len() {
         match parser.param_list.get(i, 0, -1) {
             -1 => {}
@@ -17,7 +17,7 @@ pub(super) fn dispatch_sm(parser: &mut InputParser, writer: &mut dyn ScreenWrite
     }
 }
 
-pub(super) fn dispatch_rm(parser: &mut InputParser, writer: &mut dyn ScreenWriter) {
+pub(super) fn dispatch_rm<W: ScreenWriter + ?Sized>(parser: &mut InputParser, writer: &mut W) {
     for i in 0..parser.param_list.len() {
         match parser.param_list.get(i, 0, -1) {
             -1 => {}
@@ -28,7 +28,10 @@ pub(super) fn dispatch_rm(parser: &mut InputParser, writer: &mut dyn ScreenWrite
     }
 }
 
-pub(super) fn dispatch_sm_private(parser: &mut InputParser, writer: &mut dyn ScreenWriter) {
+pub(super) fn dispatch_sm_private<W: ScreenWriter + ?Sized>(
+    parser: &mut InputParser,
+    writer: &mut W,
+) {
     let bg = parser.cell.cell.bg;
     for i in 0..parser.param_list.len() {
         match parser.param_list.get(i, 0, -1) {
@@ -76,7 +79,10 @@ pub(super) fn dispatch_sm_private(parser: &mut InputParser, writer: &mut dyn Scr
     }
 }
 
-pub(super) fn dispatch_rm_private(parser: &mut InputParser, writer: &mut dyn ScreenWriter) {
+pub(super) fn dispatch_rm_private<W: ScreenWriter + ?Sized>(
+    parser: &mut InputParser,
+    writer: &mut W,
+) {
     let bg = parser.cell.cell.bg;
     for i in 0..parser.param_list.len() {
         match parser.param_list.get(i, 0, -1) {
@@ -115,7 +121,7 @@ pub(super) fn dispatch_rm_private(parser: &mut InputParser, writer: &mut dyn Scr
     }
 }
 
-pub(super) fn dispatch_winops(parser: &mut InputParser, writer: &mut dyn ScreenWriter) {
+pub(super) fn dispatch_winops<W: ScreenWriter + ?Sized>(parser: &mut InputParser, writer: &mut W) {
     let sx = writer.screen_size_x();
     let sy = writer.screen_size_y();
     let mut m: u32 = 0;

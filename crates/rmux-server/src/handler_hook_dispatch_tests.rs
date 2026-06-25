@@ -61,7 +61,7 @@ async fn appended_after_new_window_hooks_run_once_in_order() {
     set_after_new_window_hook(&handler, "set-buffer -a -b hook second", true).await;
 
     let response = handler
-        .handle(Request::NewWindow(NewWindowRequest {
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
             target: session_name("alpha"),
             name: None,
             detached: false,
@@ -71,7 +71,7 @@ async fn appended_after_new_window_hooks_run_once_in_order() {
             process_command: None,
             target_window_index: None,
             insert_at_target: false,
-        }))
+        })))
         .await;
     assert!(matches!(response, Response::NewWindow(_)));
 

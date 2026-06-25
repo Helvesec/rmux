@@ -771,24 +771,30 @@ fn resolve_shell_path_uses_shell_env_when_default_shell_is_explicitly_empty() {
 #[test]
 fn resolve_shell_path_uses_stable_windows_default_shell() {
     let options = OptionStore::new();
-    let environment = HashMap::from([(
-        "PATH".to_owned(),
-        std::env::var("COMSPEC")
-            .ok()
-            .and_then(|value| Path::new(&value).parent().map(Path::to_path_buf))
-            .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32"))
-            .to_string_lossy()
-            .into_owned(),
-    )]);
+    let environment = HashMap::from([
+        (
+            "PATH".to_owned(),
+            std::env::var("COMSPEC")
+                .ok()
+                .and_then(|value| Path::new(&value).parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32"))
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "SystemRoot".to_owned(),
+            std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned()),
+        ),
+    ]);
 
     let resolved = super::resolve_shell_path(&options, None, &environment);
     let leaf = super::executable_name(resolved.as_os_str())
         .expect("resolved shell has a leaf")
         .to_ascii_lowercase();
 
-    assert!(
-        matches!(leaf.as_str(), "pwsh.exe" | "pwsh" | "cmd.exe" | "cmd"),
-        "expected Windows default shell to prefer pwsh or cmd, got {resolved:?}"
+    assert_eq!(
+        leaf, "cmd.exe",
+        "expected Windows server fallback shell to prefer COMSPEC/cmd without a client shell hint, got {resolved:?}"
     );
 }
 
@@ -1073,11 +1079,11 @@ fn hook_write_command(path: &Path, text: &str) -> String {
     }
     #[cfg(windows)]
     {
-        format!(
+        crate::test_shell::powershell_encoded_command(&format!(
             "[IO.File]::WriteAllText({}, {})",
             powershell_quote_path(path),
             powershell_quote(text)
-        )
+        ))
     }
 }
 
@@ -1094,13 +1100,13 @@ fn hook_append_command(path: &Path, first: &str, second: &str) -> String {
     }
     #[cfg(windows)]
     {
-        format!(
+        crate::test_shell::powershell_encoded_command(&format!(
             "[IO.File]::WriteAllText({}, {}); [IO.File]::AppendAllText({}, {})",
             powershell_quote_path(path),
             powershell_quote(first),
             powershell_quote_path(path),
             powershell_quote(second)
-        )
+        ))
     }
 }
 

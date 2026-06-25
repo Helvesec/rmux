@@ -1,6 +1,7 @@
 use std::io;
 use std::os::windows::io::RawHandle;
 
+use rmux_proto::AttachedWindowsConsoleKey;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Console::{
     GetConsoleMode, ReadConsoleInputW, INPUT_RECORD, KEY_EVENT, KEY_EVENT_RECORD, LEFT_ALT_PRESSED,
@@ -21,6 +22,36 @@ const HIGH_SURROGATE_END: u16 = 0xdbff;
 const LOW_SURROGATE_START: u16 = 0xdc00;
 const LOW_SURROGATE_END: u16 = 0xdfff;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AttachInput {
+    bytes: Vec<u8>,
+    windows_console_key: Option<AttachedWindowsConsoleKey>,
+}
+
+impl AttachInput {
+    pub(super) fn bytes(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            windows_console_key: None,
+        }
+    }
+
+    pub(super) fn with_windows_console_key(bytes: Vec<u8>, key: AttachedWindowsConsoleKey) -> Self {
+        Self {
+            bytes,
+            windows_console_key: Some(key),
+        }
+    }
+
+    pub(super) fn payload(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(super) fn windows_console_key(&self) -> Option<AttachedWindowsConsoleKey> {
+        self.windows_console_key
+    }
+}
+
 pub(super) struct ConsoleInputReader {
     handle: HANDLE,
     pending_high_surrogate: Option<u16>,
@@ -40,7 +71,7 @@ impl ConsoleInputReader {
         })
     }
 
-    pub(super) fn read_key_bytes(&mut self) -> io::Result<Vec<u8>> {
+    pub(super) fn read_key_inputs(&mut self) -> io::Result<Vec<AttachInput>> {
         let mut records = [INPUT_RECORD::default(); CONSOLE_INPUT_RECORD_BATCH];
         let mut records_read = 0;
         let ok = unsafe {
@@ -57,7 +88,7 @@ impl ConsoleInputReader {
             return Err(io::Error::last_os_error());
         }
 
-        let mut bytes = Vec::new();
+        let mut inputs = Vec::new();
         for record in &records[..records_read as usize] {
             if u32::from(record.EventType) != KEY_EVENT {
                 continue;
@@ -66,12 +97,18 @@ impl ConsoleInputReader {
                 // SAFETY: EventType says this union currently contains a KEY_EVENT_RECORD.
                 record.Event.KeyEvent
             };
-            bytes.extend(encode_key_event(
-                ConsoleKeyEvent::from_win32(event),
-                &mut self.pending_high_surrogate,
-            ));
+            let event = ConsoleKeyEvent::from_win32(event);
+            let bytes = encode_key_event(event, &mut self.pending_high_surrogate);
+            if bytes.is_empty() {
+                continue;
+            }
+            let input = windows_console_key_for_event(event, &bytes).map_or_else(
+                || AttachInput::bytes(bytes.clone()),
+                |key| AttachInput::with_windows_console_key(bytes.clone(), key),
+            );
+            inputs.push(input);
         }
-        Ok(bytes)
+        Ok(inputs)
     }
 }
 
@@ -80,6 +117,7 @@ struct ConsoleKeyEvent {
     key_down: bool,
     repeat_count: u16,
     virtual_key_code: u16,
+    virtual_scan_code: u16,
     unicode_char: u16,
     control_key_state: u32,
 }
@@ -95,10 +133,45 @@ impl ConsoleKeyEvent {
             key_down: event.bKeyDown != 0,
             repeat_count: event.wRepeatCount,
             virtual_key_code: event.wVirtualKeyCode,
+            virtual_scan_code: event.wVirtualScanCode,
             unicode_char,
             control_key_state: event.dwControlKeyState,
         }
     }
+}
+
+fn windows_console_key_for_event(
+    event: ConsoleKeyEvent,
+    encoded_bytes: &[u8],
+) -> Option<AttachedWindowsConsoleKey> {
+    if !event.key_down
+        || encoded_bytes.is_empty()
+        || !ctrl_pressed(event.control_key_state)
+        || alt_gr_pressed(event.control_key_state)
+        || meta_pressed(event.control_key_state)
+    {
+        return None;
+    }
+
+    let unicode_char = if event.unicode_char == 0
+        && encoded_bytes.len() == 1
+        && is_windows_ctrl_key_byte(encoded_bytes[0])
+    {
+        u16::from(encoded_bytes[0])
+    } else {
+        event.unicode_char
+    };
+    Some(AttachedWindowsConsoleKey::new(
+        event.virtual_key_code,
+        event.virtual_scan_code,
+        unicode_char,
+        event.control_key_state,
+        event.repeat_count.max(1),
+    ))
+}
+
+fn is_windows_ctrl_key_byte(byte: u8) -> bool {
+    matches!(byte, 0x00..=0x1a | 0x1c..=0x1f | 0x7f)
 }
 
 fn encode_key_event(event: ConsoleKeyEvent, pending_high_surrogate: &mut Option<u16>) -> Vec<u8> {
@@ -107,7 +180,7 @@ fn encode_key_event(event: ConsoleKeyEvent, pending_high_surrogate: &mut Option<
     }
 
     let repeat_count = usize::from(event.repeat_count.max(1));
-    let mut once = if event.unicode_char != 0 {
+    let mut once = if event.unicode_char != 0 && !virtual_key_requires_modifier_mapping(event) {
         encode_unicode_key_event(event, pending_high_surrogate)
     } else {
         pending_high_surrogate.take();
@@ -124,6 +197,13 @@ fn encode_key_event(event: ConsoleKeyEvent, pending_high_surrogate: &mut Option<
         once.extend_from_slice(&single);
     }
     once
+}
+
+fn virtual_key_requires_modifier_mapping(event: ConsoleKeyEvent) -> bool {
+    matches!(
+        event.virtual_key_code,
+        VK_BACK | VK_ESCAPE | VK_RETURN | VK_TAB
+    )
 }
 
 fn encode_unicode_key_event(
@@ -433,8 +513,8 @@ fn marker_adjusted_end(bytes: &[u8], start: usize, end: usize, marker: &[u8]) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_input_chunks, encode_key_event, ConsoleKeyEvent, ATTACH_INPUT_CHUNK_LIMIT,
-        BRACKETED_PASTE_END, BRACKETED_PASTE_START,
+        attach_input_chunks, encode_key_event, windows_console_key_for_event, ConsoleKeyEvent,
+        ATTACH_INPUT_CHUNK_LIMIT, BRACKETED_PASTE_END, BRACKETED_PASTE_START,
     };
     use windows_sys::Win32::System::Console::{
         LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, RIGHT_ALT_PRESSED, SHIFT_PRESSED,
@@ -507,6 +587,44 @@ mod tests {
         let event = key_event('l' as u16, 0x0c, LEFT_CTRL_PRESSED);
 
         assert_eq!(encode(&event), vec![0x0c]);
+    }
+
+    #[test]
+    fn console_key_events_preserve_ctrl_d_windows_metadata() {
+        let event = key_event('D' as u16, 0x04, LEFT_CTRL_PRESSED);
+        let bytes = encode(&event);
+
+        let key = windows_console_key_for_event(event, &bytes)
+            .expect("Ctrl-D should preserve Windows console metadata");
+
+        assert_eq!(bytes, vec![0x04]);
+        assert_eq!(key.virtual_key_code(), 'D' as u16);
+        assert_eq!(key.virtual_scan_code(), 0x20);
+        assert_eq!(key.unicode_char(), 0x04);
+        assert_eq!(key.control_key_state(), LEFT_CTRL_PRESSED);
+        assert_eq!(key.repeat_count(), 1);
+    }
+
+    #[test]
+    fn console_key_events_preserve_other_ctrl_letter_windows_metadata() {
+        let event = key_event('P' as u16, 0x10, LEFT_CTRL_PRESSED);
+        let bytes = encode(&event);
+
+        let key = windows_console_key_for_event(event, &bytes)
+            .expect("Ctrl-P should preserve Windows console metadata");
+
+        assert_eq!(bytes, vec![0x10]);
+        assert_eq!(key.virtual_key_code(), 'P' as u16);
+        assert_eq!(key.unicode_char(), 0x10);
+    }
+
+    #[test]
+    fn console_key_events_preserve_ctrl_c_windows_metadata() {
+        let event = key_event('C' as u16, 0x03, LEFT_CTRL_PRESSED);
+        let bytes = encode(&event);
+
+        assert_eq!(bytes, vec![0x03]);
+        assert!(windows_console_key_for_event(event, &bytes).is_some());
     }
 
     #[test]
@@ -601,6 +719,28 @@ mod tests {
     }
 
     #[test]
+    fn console_key_events_map_windows_control_unicode_through_virtual_keys() {
+        assert_eq!(encode(&key_event(VK_BACK, 0x08, 0)), b"\x7f");
+        assert_eq!(
+            encode(&key_event(VK_BACK, 0x08, LEFT_CTRL_PRESSED)),
+            b"\x1b[127;5u"
+        );
+        assert_eq!(encode(&key_event(VK_TAB, 0x09, SHIFT_PRESSED)), b"\x1b[Z");
+        assert_eq!(
+            encode(&key_event(VK_TAB, 0x09, LEFT_CTRL_PRESSED)),
+            b"\x1b[9;5u"
+        );
+        assert_eq!(
+            encode(&key_event(VK_RETURN, 0x0d, LEFT_CTRL_PRESSED)),
+            b"\x1b[13;5u"
+        );
+        assert_eq!(
+            encode(&key_event(VK_ESCAPE, 0x1b, LEFT_ALT_PRESSED)),
+            b"\x1b\x1b"
+        );
+    }
+
+    #[test]
     fn console_key_events_repeat_encoded_bytes() {
         let mut event = key_event('x' as u16, 'x' as u16, 0);
         event.repeat_count = 3;
@@ -629,6 +769,7 @@ mod tests {
             key_down: true,
             repeat_count: 1,
             virtual_key_code,
+            virtual_scan_code: 0x20,
             unicode_char,
             control_key_state,
         }

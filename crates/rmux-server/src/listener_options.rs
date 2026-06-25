@@ -12,6 +12,7 @@ pub(crate) struct ServeOptions {
     pub(crate) owner_uid: u32,
     pub(crate) web_frontend: Option<String>,
     pub(crate) web_port: u16,
+    pub(crate) web_port_explicit: bool,
     pub(crate) web_required: bool,
     #[cfg(unix)]
     pub(crate) socket_identity: Option<SocketFileIdentity>,
@@ -30,6 +31,7 @@ impl ServeOptions {
             owner_uid,
             web_frontend: None,
             web_port: 9777,
+            web_port_explicit: false,
             web_required: false,
             #[cfg(unix)]
             socket_identity: None,
@@ -41,10 +43,12 @@ impl ServeOptions {
         port: u16,
         frontend: Option<String>,
         required: bool,
+        port_explicit: bool,
     ) -> Self {
         self.web_port = port;
         self.web_frontend = frontend;
         self.web_required = required;
+        self.web_port_explicit = port_explicit;
         self
     }
 

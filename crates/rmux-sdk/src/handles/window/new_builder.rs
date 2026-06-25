@@ -165,7 +165,7 @@ async fn create_window(
     config: NewWindowConfig,
 ) -> Result<WindowRef> {
     match client
-        .request(Request::NewWindow(NewWindowRequest {
+        .request(Request::NewWindow(Box::new(NewWindowRequest {
             target,
             name: config.name,
             detached: config.detached,
@@ -175,7 +175,7 @@ async fn create_window(
             start_directory: config.start_directory,
             target_window_index: config.target_window_index,
             insert_at_target: config.insert_at_target,
-        }))
+        })))
         .await?
     {
         Response::NewWindow(response) => Ok(response.target.into()),

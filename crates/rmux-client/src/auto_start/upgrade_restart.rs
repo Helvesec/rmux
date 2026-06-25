@@ -2,6 +2,8 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use rmux_proto::DaemonStatusResponse;
 use rmux_proto::{Response, CAPABILITY_WEB_SHARE};
 
 use crate::{connect_or_absent, upgrade, ConnectResult, Connection};
@@ -67,6 +69,37 @@ pub(super) fn ensure_daemon_fresh_or_restart(
             wait_for_connected_server(socket_path, config)
         }
     }
+}
+
+#[cfg(windows)]
+pub(super) fn ensure_daemon_fresh_or_restart_after_windows_readiness(
+    connection: Connection,
+    socket_path: &Path,
+    binary_path: &Path,
+    config: &AutoStartConfig,
+    readiness_status: Option<DaemonStatusResponse>,
+) -> Result<Connection, AutoStartError> {
+    if let Some(status) = readiness_status {
+        match upgrade::daemon_status_matches_current_client(&status) {
+            Ok(true) => {
+                return ensure_required_web_capability_or_restart(
+                    connection,
+                    socket_path,
+                    binary_path,
+                    config,
+                );
+            }
+            Ok(false) => {}
+            Err(incompatible) => {
+                return Err(AutoStartError::IncompatibleDaemon {
+                    socket_path: socket_path.to_path_buf(),
+                    message: upgrade::incompatible_daemon_message(&incompatible),
+                });
+            }
+        }
+    }
+
+    ensure_daemon_fresh_or_restart(connection, socket_path, binary_path, config)
 }
 
 fn ensure_required_web_capability_or_restart(

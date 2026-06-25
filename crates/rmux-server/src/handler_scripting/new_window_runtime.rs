@@ -36,7 +36,7 @@ impl RequestHandler {
         };
         let can_write = self.requester_can_write(requester_pid).await;
         let request_for_hooks = crate::server_access::apply_access_policy(
-            Request::NewWindow(NewWindowRequest {
+            Request::NewWindow(Box::new(NewWindowRequest {
                 target: target.clone(),
                 name: name.clone(),
                 detached,
@@ -46,7 +46,7 @@ impl RequestHandler {
                 start_directory: start_directory.clone(),
                 target_window_index,
                 insert_at_target,
-            }),
+            })),
             can_write,
         )?;
 
@@ -55,6 +55,8 @@ impl RequestHandler {
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
         let attached_count = self.attached_count(&target).await;
+        #[cfg(windows)]
+        self.wait_for_windows_deferred_all_pane_pids().await;
         let (response, inline_hooks) = capture_inline_hooks(async {
             let response = {
                 let mut state = self.state.lock().await;

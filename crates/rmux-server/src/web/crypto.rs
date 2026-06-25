@@ -34,6 +34,7 @@ pub(super) struct EncryptedWebSocketReader {
 pub(super) struct EncryptedWebSocketWriter {
     writer: WebSocketWriter,
     sealer: FrameSealer,
+    seal_scratch: Vec<u8>,
 }
 
 /// Thin newtype around the [`rmux_web_crypto::Opener`] (server-to-client opener
@@ -179,17 +180,24 @@ impl EncryptedWebSocketReader {
 
 impl EncryptedWebSocketWriter {
     pub(super) fn new(writer: WebSocketWriter, sealer: FrameSealer) -> Self {
-        Self { writer, sealer }
+        Self {
+            writer,
+            sealer,
+            seal_scratch: Vec::new(),
+        }
     }
 
     pub(super) async fn write_text(&mut self, text: &str) -> io::Result<()> {
-        let frame = self.sealer.seal_text(text)?;
-        self.writer.write_binary(&frame).await
+        self.seal_scratch.clear();
+        self.sealer.seal_text_into(text, &mut self.seal_scratch)?;
+        self.writer.write_binary(&self.seal_scratch).await
     }
 
     pub(super) async fn write_binary(&mut self, payload: &[u8]) -> io::Result<()> {
-        let frame = self.sealer.seal_binary(payload)?;
-        self.writer.write_binary(&frame).await
+        self.seal_scratch.clear();
+        self.sealer
+            .seal_binary_into(payload, &mut self.seal_scratch)?;
+        self.writer.write_binary(&self.seal_scratch).await
     }
 
     pub(super) async fn write_close(&mut self) -> io::Result<()> {
@@ -219,15 +227,15 @@ impl FrameOpener {
 }
 
 impl FrameSealer {
-    pub(super) fn seal_text(&mut self, text: &str) -> io::Result<Vec<u8>> {
+    pub(super) fn seal_text_into(&mut self, text: &str, dst: &mut Vec<u8>) -> io::Result<()> {
         self.sealer
-            .seal_text(text)
+            .seal_text_into(text, dst)
             .map_err(|_| io::Error::other("e2ee seal failed"))
     }
 
-    pub(super) fn seal_binary(&mut self, payload: &[u8]) -> io::Result<Vec<u8>> {
+    pub(super) fn seal_binary_into(&mut self, payload: &[u8], dst: &mut Vec<u8>) -> io::Result<()> {
         self.sealer
-            .seal_binary(payload)
+            .seal_binary_into(payload, dst)
             .map_err(|_| io::Error::other("e2ee seal failed"))
     }
 }
@@ -268,10 +276,13 @@ struct ClientHelloWire {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_server_crypto, WebSocketMessage};
+    use super::{derive_server_crypto, FrameSealer, WebSocketMessage};
     use crate::web::secrets::SecretHash;
     use base64::Engine;
     use rmux_web_crypto::{derive_client_session, generate_ephemeral};
+    use static_assertions::assert_not_impl_any;
+
+    assert_not_impl_any!(FrameSealer: Clone);
 
     fn b64(bytes: &[u8]) -> String {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -325,10 +336,22 @@ mod tests {
             WebSocketMessage::Text(r#"{"type":"auth"}"#.to_owned())
         );
 
-        let frame = server_seal.seal_binary(&[0x10, b'o', b'k']).expect("seal");
+        let mut frame = Vec::new();
+        server_seal
+            .seal_binary_into(&[0x10, b'o', b'k'], &mut frame)
+            .expect("seal into");
         assert_eq!(
             client_open.open(&frame).expect("open"),
             rmux_web_crypto::Message::Binary(vec![0x10, b'o', b'k'])
+        );
+
+        frame.clear();
+        server_seal
+            .seal_binary_into(&[0x11, b'o', b'k'], &mut frame)
+            .expect("seal into");
+        assert_eq!(
+            client_open.open(&frame).expect("open"),
+            rmux_web_crypto::Message::Binary(vec![0x11, b'o', b'k'])
         );
     }
 

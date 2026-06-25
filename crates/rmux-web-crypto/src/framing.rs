@@ -34,19 +34,37 @@ impl Sealer {
 
     /// Seals a text message into a wire frame.
     pub fn seal_text(&mut self, text: &str) -> Result<Vec<u8>, Error> {
-        self.seal(KIND_TEXT, text.as_bytes())
+        let mut frame = Vec::new();
+        self.seal_text_into(text, &mut frame)?;
+        Ok(frame)
     }
 
     /// Seals a binary message into a wire frame.
     pub fn seal_binary(&mut self, body: &[u8]) -> Result<Vec<u8>, Error> {
-        self.seal(KIND_BINARY, body)
+        let mut frame = Vec::new();
+        self.seal_binary_into(body, &mut frame)?;
+        Ok(frame)
     }
 
-    fn seal(&mut self, kind: u8, body: &[u8]) -> Result<Vec<u8>, Error> {
-        let mut plaintext = Vec::with_capacity(1 + body.len());
-        plaintext.push(kind);
-        plaintext.extend_from_slice(body);
-        self.inner.seal(&plaintext)
+    /// Seals a text message into a caller-owned destination buffer.
+    ///
+    /// On error, `dst` may contain partial encrypted bytes and should be
+    /// cleared before reuse.
+    pub fn seal_text_into(&mut self, text: &str, dst: &mut Vec<u8>) -> Result<(), Error> {
+        self.seal_into(KIND_TEXT, text.as_bytes(), dst)
+    }
+
+    /// Seals a binary message into a caller-owned destination buffer.
+    ///
+    /// On error, `dst` may contain partial encrypted bytes and should be
+    /// cleared before reuse.
+    pub fn seal_binary_into(&mut self, body: &[u8], dst: &mut Vec<u8>) -> Result<(), Error> {
+        self.seal_into(KIND_BINARY, body, dst)
+    }
+
+    fn seal_into(&mut self, kind: u8, body: &[u8], dst: &mut Vec<u8>) -> Result<(), Error> {
+        let kind = [kind];
+        self.inner.seal_parts_into(&[&kind, body], dst)
     }
 }
 
@@ -99,6 +117,36 @@ mod tests {
             .into_server()
             .1;
         (sealer, Opener::new(opener))
+    }
+
+    #[test]
+    fn seal_binary_into_appends_same_frame_as_seal_binary() {
+        let (record_a, _) = raw_c2s_pair();
+        let (record_b, _) = raw_c2s_pair();
+        let mut allocating = Sealer::new(record_a);
+        let mut append = Sealer::new(record_b);
+        let expected = allocating.seal_binary(b"body").unwrap();
+        let mut dst = b"prefix".to_vec();
+
+        append.seal_binary_into(b"body", &mut dst).unwrap();
+
+        assert_eq!(&dst[..6], b"prefix");
+        assert_eq!(&dst[6..], expected.as_slice());
+    }
+
+    #[test]
+    fn seal_text_into_appends_same_frame_as_seal_text() {
+        let (record_a, _) = raw_c2s_pair();
+        let (record_b, _) = raw_c2s_pair();
+        let mut allocating = Sealer::new(record_a);
+        let mut append = Sealer::new(record_b);
+        let expected = allocating.seal_text("hello").unwrap();
+        let mut dst = b"prefix".to_vec();
+
+        append.seal_text_into("hello", &mut dst).unwrap();
+
+        assert_eq!(&dst[..6], b"prefix");
+        assert_eq!(&dst[6..], expected.as_slice());
     }
 
     #[test]

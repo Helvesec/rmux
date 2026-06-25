@@ -138,9 +138,13 @@ fn implemented_surface_matches_the_full_tmux_command_table() {
         .iter()
         .map(rendered_surface_entry)
         .collect::<Vec<_>>();
+    let tmux_command_names = super::super::COMMAND_TABLE
+        .iter()
+        .map(|entry| entry.name)
+        .collect::<BTreeSet<_>>();
     let actual = super::super::implemented_command_surface()
         .iter()
-        .filter(|entry| entry.name != "capabilities")
+        .filter(|entry| tmux_command_names.contains(entry.name))
         .map(|entry| rendered_surface_entry(entry))
         .collect::<Vec<_>>();
 
@@ -156,6 +160,9 @@ fn implemented_surface_matches_the_full_tmux_command_table() {
 
     let top_level_help = parse_args(&["--help"]).unwrap_err().to_string();
     assert!(top_level_help.contains("capabilities"));
+    assert!(top_level_help.contains("claude"));
+    assert!(top_level_help.contains("doctor"));
+    assert!(top_level_help.contains("setup"));
 }
 
 #[test]
@@ -201,7 +208,7 @@ fn supported_commands_do_not_treat_short_h_as_clap_help() {
 
 #[test]
 fn manpage_surface_matches_implemented_commands_and_aliases() {
-    let manpage = repo_file("rmux.1");
+    let manpage = repo_file("docs/man/rmux.1");
     let surface_entries = troff_literal_block(
         &manpage,
         ".SH IMPLEMENTED COMMAND SURFACE",

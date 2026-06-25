@@ -12,9 +12,6 @@ pub(super) struct FormatModifier {
 /// Single-char modifiers that take no arguments when followed by `;` or `:`.
 const SINGLE_NO_ARG: &[u8] = b"labcdnwETSWPL<>";
 
-/// Double-char modifiers that take no arguments.
-const DOUBLE_NO_ARG: &[&str] = &["||", "&&", "!=", "==", "<=", ">="];
-
 /// Single-char modifiers that may take arguments.
 const SINGLE_WITH_ARG: &[u8] = b"mCLNPSst=pReqW";
 
@@ -58,13 +55,8 @@ where
         }
 
         // Double-char modifier with no arguments.
-        if i + 2 <= bytes.len() {
-            let pair = &body[i..i + 2.min(bytes.len() - i)];
-            if pair.len() == 2
-                && DOUBLE_NO_ARG.contains(&pair)
-                && i + 2 < bytes.len()
-                && is_modifier_end(bytes[i + 2])
-            {
+        if let Some(pair) = double_no_arg_at(bytes, i) {
+            if i + 2 < bytes.len() && is_modifier_end(bytes[i + 2]) {
                 modifiers.push(FormatModifier {
                     modifier: pair.to_owned(),
                     argv: Vec::new(),
@@ -156,5 +148,17 @@ where
     } else {
         // No `:` found — no valid modifier chain.
         (Vec::new(), body)
+    }
+}
+
+fn double_no_arg_at(bytes: &[u8], index: usize) -> Option<&'static str> {
+    match bytes.get(index..index + 2)? {
+        b"||" => Some("||"),
+        b"&&" => Some("&&"),
+        b"!=" => Some("!="),
+        b"==" => Some("=="),
+        b"<=" => Some("<="),
+        b">=" => Some(">="),
+        _ => None,
     }
 }

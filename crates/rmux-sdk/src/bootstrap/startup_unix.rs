@@ -23,7 +23,7 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::net::UnixStream;
 use tokio::task;
@@ -34,6 +34,8 @@ use rmux_os::identity::real_user_id;
 
 #[path = "startup_unix/filesystem.rs"]
 mod filesystem;
+#[path = "startup_unix/identity.rs"]
+mod identity;
 #[path = "startup_unix/lock.rs"]
 mod lock;
 
@@ -55,6 +57,7 @@ pub const DEFAULT_STARTUP_DEADLINE: Duration = Duration::from_secs(20);
 /// Default poll interval used while waiting for the daemon to become ready.
 pub const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const CONNECT_PROBE_TIMEOUT: Duration = Duration::from_millis(50);
+const LOW_LATENCY_STARTUP_POLL_WINDOW: Duration = Duration::from_millis(25);
 
 /// Outcome of [`connect_or_start`].
 #[derive(Debug)]
@@ -338,19 +341,25 @@ where
         }
     }
 
-    let lock_path = if empty_socket_path {
+    let prepared_parent = if empty_socket_path {
         None
     } else {
-        Some(startup_lock_path_for_filesystem_socket(
+        Some(prepare_parent_for_filesystem_socket(
             socket_path,
             owner_uid,
         )?)
     };
 
-    let lock_guard = match lock_path.as_deref() {
-        Some(lock_path) => {
-            Some(StartupLock::acquire(lock_path, owner_uid, deadline, poll_interval).await?)
-        }
+    let lock_guard = match prepared_parent.as_ref() {
+        Some(prepared_parent) => Some(
+            StartupLock::acquire(
+                &prepared_parent.lock_path,
+                owner_uid,
+                deadline,
+                poll_interval,
+            )
+            .await?,
+        ),
         None => None,
     };
 
@@ -360,7 +369,19 @@ where
     }
 
     if !empty_socket_path {
+        if let Some(parent) = prepared_parent
+            .as_ref()
+            .and_then(|prepared| prepared.parent_anchor.as_ref())
+        {
+            parent.validate("validate socket parent before stale cleanup")?;
+        }
         prepare_socket_path_safe(socket_path, owner_uid)?;
+        if let Some(parent) = prepared_parent
+            .as_ref()
+            .and_then(|prepared| prepared.parent_anchor.as_ref())
+        {
+            parent.validate("validate socket parent before daemon launcher")?;
+        }
     }
 
     launcher()
@@ -368,14 +389,20 @@ where
         .map_err(|error| StartupError::Launcher { source: error })?;
 
     let stream = wait_for_daemon(socket_path, owner_uid, deadline, poll_interval).await?;
+    if let Some(parent) = prepared_parent
+        .as_ref()
+        .and_then(|prepared| prepared.parent_anchor.as_ref())
+    {
+        parent.validate("validate socket parent after daemon bind")?;
+    }
     drop(lock_guard);
     Ok(StartupOutcome::Started(stream))
 }
 
-fn startup_lock_path_for_filesystem_socket(
+fn prepare_parent_for_filesystem_socket(
     socket_path: &Path,
     owner_uid: u32,
-) -> Result<PathBuf, StartupError> {
+) -> Result<filesystem::PreparedSocketParent, StartupError> {
     let parent = socket_path
         .parent()
         .ok_or_else(|| StartupError::InvalidPath {
@@ -395,7 +422,7 @@ fn startup_lock_path_for_filesystem_socket(
         });
     }
 
-    prepare_socket_parent(socket_path, parent, owner_uid).map(|prepared| prepared.lock_path)
+    prepare_socket_parent(socket_path, parent, owner_uid)
 }
 
 fn can_probe_existing_socket_before_startup_validation(socket_path: &Path) -> bool {
@@ -413,12 +440,12 @@ async fn try_connect_validated(
     owner_uid: u32,
 ) -> Result<Option<UnixStream>, StartupError> {
     if !socket_path.as_os_str().is_empty() {
-        reject_socket_symlink(socket_path)?;
+        reject_socket_symlink(socket_path, owner_uid)?;
     }
     match connect_socket_path(socket_path).await {
         Ok(stream) => {
             if !socket_path.as_os_str().is_empty() {
-                reject_socket_symlink(socket_path)?;
+                reject_socket_symlink(socket_path, owner_uid)?;
             }
             match validate_peer_credentials(&stream, owner_uid, socket_path) {
                 Ok(()) => Ok(Some(stream)),
@@ -491,6 +518,7 @@ async fn wait_for_daemon(
 
     let max_poll = poll_interval.max(MIN_POLL_INTERVAL);
     let mut next_poll = MIN_POLL_INTERVAL.min(max_poll);
+    let started = Instant::now();
     loop {
         match try_connect_validated(socket_path, owner_uid).await {
             Ok(Some(stream)) => return Ok(stream),
@@ -503,8 +531,20 @@ async fn wait_for_daemon(
                 waited: deadline.elapsed(),
             });
         }
-        sleep(deadline.sleep_for(next_poll)).await;
-        next_poll = (next_poll + next_poll).min(max_poll);
+        // Fresh daemon startup is normally sub-25ms; poll tightly there so
+        // macOS does not routinely miss readiness by one exponential step.
+        let low_latency = started.elapsed() < LOW_LATENCY_STARTUP_POLL_WINDOW;
+        let sleep_for = if low_latency {
+            MIN_POLL_INTERVAL
+        } else {
+            next_poll
+        };
+        sleep(deadline.sleep_for(sleep_for)).await;
+        next_poll = if low_latency {
+            MIN_POLL_INTERVAL
+        } else {
+            (next_poll + next_poll).min(max_poll)
+        };
     }
 }
 

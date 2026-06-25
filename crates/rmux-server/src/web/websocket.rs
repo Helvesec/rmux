@@ -159,9 +159,20 @@ async fn read_frame_with_continuation_timeout(
     stream: &mut (impl AsyncRead + Unpin),
     continuation_timeout: Duration,
 ) -> io::Result<WebSocketFrame> {
+    match timeout(continuation_timeout, read_frame_without_timeout(stream)).await {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "websocket frame read timed out",
+        )),
+    }
+}
+
+async fn read_frame_without_timeout(
+    stream: &mut (impl AsyncRead + Unpin),
+) -> io::Result<WebSocketFrame> {
     let mut head = [0u8; 2];
-    read_frame_continuation(stream, &mut head[..1], continuation_timeout).await?;
-    read_frame_continuation(stream, &mut head[1..], continuation_timeout).await?;
+    stream.read_exact(&mut head).await?;
     let fin = head[0] & 0x80 != 0;
     if head[0] & 0x70 != 0 {
         return Err(io::Error::new(
@@ -198,11 +209,11 @@ async fn read_frame_with_continuation_timeout(
     }
     if len == 126 {
         let mut bytes = [0u8; 2];
-        read_frame_continuation(stream, &mut bytes, continuation_timeout).await?;
+        stream.read_exact(&mut bytes).await?;
         len = u64::from(u16::from_be_bytes(bytes));
     } else if len == 127 {
         let mut bytes = [0u8; 8];
-        read_frame_continuation(stream, &mut bytes, continuation_timeout).await?;
+        stream.read_exact(&mut bytes).await?;
         len = u64::from_be_bytes(bytes);
     }
     if len > CLIENT_FRAME_LIMIT {
@@ -218,27 +229,23 @@ async fn read_frame_with_continuation_timeout(
         ));
     }
     let mut mask = [0u8; 4];
-    read_frame_continuation(stream, &mut mask, continuation_timeout).await?;
+    stream.read_exact(&mut mask).await?;
     let mut payload = vec![0u8; len as usize];
-    read_frame_continuation(stream, &mut payload, continuation_timeout).await?;
-    for (index, byte) in payload.iter_mut().enumerate() {
-        *byte ^= mask[index % mask.len()];
-    }
+    stream.read_exact(&mut payload).await?;
+    unmask_payload(&mut payload, mask);
     Ok(WebSocketFrame { opcode, payload })
 }
 
-async fn read_frame_continuation(
-    stream: &mut (impl AsyncRead + Unpin),
-    buffer: &mut [u8],
-    continuation_timeout: Duration,
-) -> io::Result<()> {
-    match timeout(continuation_timeout, stream.read_exact(buffer)).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(error),
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "websocket frame read timed out",
-        )),
+fn unmask_payload(payload: &mut [u8], mask: [u8; 4]) {
+    let mut chunks = payload.chunks_exact_mut(mask.len());
+    for chunk in &mut chunks {
+        chunk[0] ^= mask[0];
+        chunk[1] ^= mask[1];
+        chunk[2] ^= mask[2];
+        chunk[3] ^= mask[3];
+    }
+    for (index, byte) in chunks.into_remainder().iter_mut().enumerate() {
+        *byte ^= mask[index];
     }
 }
 
@@ -298,6 +305,7 @@ pub(crate) fn valid_client_key(key: &str) -> bool {
 pub(crate) fn fuzz_client_frame(data: &[u8]) {
     let mut cursor = std::io::Cursor::new(data);
     let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()
         .expect("fuzz runtime builds");
     let _ = runtime.block_on(read_frame(&mut cursor));
@@ -337,6 +345,12 @@ mod tests {
         assert!(valid_client_key("dGhlIHNhbXBsZSBub25jZQ=="));
         assert!(!valid_client_key("not-base64"));
         assert!(!valid_client_key("Zm9v"));
+    }
+
+    #[cfg(feature = "fuzzing")]
+    #[test]
+    fn fuzz_client_frame_empty_input_does_not_panic() {
+        super::fuzz_client_frame(&[]);
     }
 
     #[tokio::test]
@@ -383,6 +397,16 @@ mod tests {
             error.to_string(),
             "websocket close frame payload is invalid"
         );
+    }
+
+    #[tokio::test]
+    async fn masked_payloads_decode_without_modulo_per_byte() {
+        let mut frame =
+            std::io::Cursor::new(masked_frame(0x80 | OPCODE_TEXT, b"abcdefghijklmnopqrstu"));
+        let frame = read_frame(&mut frame).await.expect("masked frame decodes");
+
+        assert_eq!(frame.opcode, OPCODE_TEXT);
+        assert_eq!(frame.payload, b"abcdefghijklmnopqrstu");
     }
 
     #[tokio::test]

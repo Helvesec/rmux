@@ -18,7 +18,7 @@
 //! the channel core.
 
 use alloc::vec::Vec;
-use chacha20poly1305::aead::{Aead, Payload};
+use chacha20poly1305::aead::{Aead, AeadInPlace, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 
 use crate::error::Error;
@@ -83,33 +83,61 @@ impl RecordSealer {
     /// Fails closed with [`Error::SequenceExhausted`] if the 64-bit counter
     /// would overflow, so a nonce is never reused.
     pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut frame = Vec::new();
+        self.seal_into(plaintext, &mut frame)?;
+        Ok(frame)
+    }
+
+    /// Seals one plaintext record into a caller-owned destination buffer.
+    ///
+    /// The full wire frame is appended to `dst`. Capacity is reserved before
+    /// the sequence is used; if sealing fails after bytes have been appended,
+    /// `dst` must be treated as poisoned by the caller and cleared before
+    /// reuse. The sequence advances only after successful authentication.
+    pub fn seal_into(&mut self, plaintext: &[u8], dst: &mut Vec<u8>) -> Result<(), Error> {
+        self.seal_parts_into(&[plaintext], dst)
+    }
+
+    pub(crate) fn seal_parts_into(
+        &mut self,
+        plaintext_parts: &[&[u8]],
+        dst: &mut Vec<u8>,
+    ) -> Result<(), Error> {
         if self.next_seq == u64::MAX {
             return Err(Error::SequenceExhausted);
         }
+        let plaintext_len = plaintext_parts
+            .iter()
+            .map(|part| part.len())
+            .try_fold(0usize, usize::checked_add)
+            .ok_or(Error::SequenceExhausted)?;
+        dst.reserve(HEADER_LEN + plaintext_len + TAG_LEN);
+
         let seq = self.next_seq;
         let header = make_header(seq);
         let nonce = make_nonce(&self.nonce_prefix, seq);
 
-        let ciphertext = self
+        let start = dst.len();
+        dst.extend_from_slice(&header);
+        for part in plaintext_parts {
+            dst.extend_from_slice(part);
+        }
+
+        let tag = self
             .cipher
-            .encrypt(
+            .encrypt_in_place_detached(
                 Nonce::from_slice(&nonce),
-                Payload {
-                    msg: plaintext,
-                    aad: &header,
-                },
+                &header,
+                &mut dst[start + HEADER_LEN..],
             )
             .map_err(|_| Error::Decrypt)?;
+        dst.extend_from_slice(&tag);
 
         // Advance only after a successful seal. The pre-check above leaves
         // one counter value unused, which avoids doing work with a terminal
         // nonce that cannot be safely advanced.
         self.next_seq += 1;
-
-        let mut frame = Vec::with_capacity(HEADER_LEN + ciphertext.len());
-        frame.extend_from_slice(&header);
-        frame.extend_from_slice(&ciphertext);
-        Ok(frame)
+        Ok(())
     }
 }
 
@@ -192,6 +220,30 @@ mod tests {
 
     fn cipher() -> ChaCha20Poly1305 {
         ChaCha20Poly1305::new((&[9u8; 32]).into())
+    }
+
+    #[test]
+    fn seal_into_appends_same_frame_as_seal() {
+        let mut allocating = RecordSealer::with_seq(cipher(), [1, 2, 3, 4], 0);
+        let mut append = RecordSealer::with_seq(cipher(), [1, 2, 3, 4], 0);
+        let expected = allocating.seal(b"payload").unwrap();
+        let mut dst = b"prefix".to_vec();
+
+        append.seal_into(b"payload", &mut dst).unwrap();
+
+        assert_eq!(&dst[..6], b"prefix");
+        assert_eq!(&dst[6..], expected.as_slice());
+    }
+
+    #[test]
+    fn seal_into_at_max_seq_fails_without_touching_destination() {
+        let mut sealer = RecordSealer::with_seq(cipher(), [1, 2, 3, 4], u64::MAX);
+        let mut dst = b"keep".to_vec();
+
+        let err = sealer.seal_into(b"payload", &mut dst).unwrap_err();
+
+        assert_eq!(err, Error::SequenceExhausted);
+        assert_eq!(dst, b"keep");
     }
 
     #[test]

@@ -78,6 +78,49 @@ pub struct SplitWindowExtRequest {
     pub stdin_payload: Option<Vec<u8>>,
 }
 
+/// Request payload for `split-window` carrying raw tmux target text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SplitWindowTargetActionRequest {
+    /// Optional raw `-t` target. `None` uses the requester's current pane.
+    #[serde(default)]
+    pub target: Option<String>,
+    /// The requested split direction.
+    pub direction: SplitDirection,
+    /// Whether the new pane is inserted before the target.
+    #[serde(default)]
+    pub before: bool,
+    /// Optional per-spawn environment overrides in `NAME=VALUE` form.
+    #[serde(default)]
+    pub environment: Option<Vec<String>>,
+    /// Legacy optional command argv for the new pane.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    /// Explicit process launch mode for the new pane.
+    #[serde(default)]
+    pub process_command: Option<ProcessCommand>,
+    /// Optional working-directory override for the new pane process.
+    #[serde(default)]
+    pub start_directory: Option<PathBuf>,
+    /// Optional pane-local `remain-on-exit` override applied before spawn.
+    #[serde(default)]
+    pub keep_alive_on_exit: Option<bool>,
+    /// Whether pane selection should stay on the original pane after split.
+    #[serde(default)]
+    pub detached: bool,
+    /// Optional tmux `-l` split size expression.
+    #[serde(default)]
+    pub size: Option<String>,
+    /// Whether an existing zoomed window should remain zoomed after split.
+    #[serde(default)]
+    pub preserve_zoom: bool,
+    /// Whether the new pane should split the full window root.
+    #[serde(default)]
+    pub full_size: bool,
+    /// Raw bytes read from client stdin for `split-window -I`.
+    #[serde(default)]
+    pub stdin_payload: Option<Vec<u8>>,
+}
+
 impl<'de> Deserialize<'de> for SplitWindowExtRequest {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -250,6 +293,16 @@ pub struct KillPaneRequest {
 pub struct ResizePaneRequest {
     /// The exact pane target.
     pub target: PaneTarget,
+    /// The semantic resize request.
+    pub adjustment: ResizePaneAdjustment,
+}
+
+/// Request payload for `resize-pane` carrying raw tmux target text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResizePaneTargetActionRequest {
+    /// Optional raw `-t` target. `None` uses the requester's current pane.
+    #[serde(default)]
+    pub target: Option<String>,
     /// The semantic resize request.
     pub adjustment: ResizePaneAdjustment,
 }

@@ -155,7 +155,7 @@ async fn capture_pane_text(
 ) -> Result<String, Box<dyn Error>> {
     let response = common::send_request(
         socket_path,
-        &Request::CapturePane(CapturePaneRequest {
+        &Request::CapturePane(Box::new(CapturePaneRequest {
             target,
             start: None,
             end: None,
@@ -172,7 +172,7 @@ async fn capture_pane_text(
             quiet: false,
             start_is_absolute: false,
             end_is_absolute: false,
-        }),
+        })),
     )
     .await?;
     let output = response
@@ -349,13 +349,13 @@ async fn send_keys_targets_the_correct_pane_in_a_multi_pane_session() -> Result<
     assert!(pane0_output.contains("pane-zero"));
 
     let selected = client
-        .send_request(&Request::SelectPane(SelectPaneRequest {
+        .send_request(&Request::SelectPane(Box::new(SelectPaneRequest {
             target: PaneTarget::new(session_name("beta"), 1),
             title: None,
             style: None,
             input_disabled: None,
             preserve_zoom: false,
-        }))
+        })))
         .await?;
     assert!(matches!(selected, Response::SelectPane(_)));
 

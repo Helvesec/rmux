@@ -250,6 +250,45 @@ fn parse(input: &[u8]) -> (InputParser, RecordingWriter) {
 
 // ─── State machine tests ───────────────────────────────────────────
 
+#[test]
+fn transition_tables_cover_every_state_byte_once() {
+    for state in InputState::ALL {
+        let table = state.transition_table();
+        for byte in u8::MIN..=u8::MAX {
+            let matches = table
+                .iter()
+                .filter(|entry| byte >= entry.first && byte <= entry.last)
+                .count();
+            assert_eq!(
+                matches, 1,
+                "state {state:?} must have exactly one transition for byte {byte:#04x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn transition_lut_matches_linear_tables_for_every_state_byte() {
+    for state in InputState::ALL {
+        let table = state.transition_table();
+        for byte in u8::MIN..=u8::MAX {
+            let linear = table
+                .iter()
+                .find(|entry| byte >= entry.first && byte <= entry.last)
+                .map(|entry| super::states::Transition {
+                    handler: entry.handler,
+                    next_state: entry.next_state,
+                })
+                .expect("coverage test guarantees every byte has a transition");
+            assert_eq!(
+                state.transition_for_byte(byte),
+                linear,
+                "state {state:?} LUT differs for byte {byte:#04x}"
+            );
+        }
+    }
+}
+
 #[path = "tests/state_control.rs"]
 mod state_control;
 

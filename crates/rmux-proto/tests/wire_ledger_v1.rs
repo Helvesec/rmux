@@ -8,7 +8,7 @@
 //!    are inspected and compared against `FrameKind::bincode_tag` for both
 //!    `Request` and `Response` fixtures. A representative cross-section of
 //!    other variants exercises the same invariant.
-//! 2. The seven checked-in ledger fixtures under
+//! 2. The checked-in ledger fixtures under
 //!    `tests/wire-fixtures/ledger-v1-current-wire/`
 //!    decode through both `decode_frame` and `FrameDecoder` using the current
 //!    wire envelope (currently `RMUX_WIRE_VERSION = 2`), asserting stable
@@ -20,24 +20,25 @@ use std::path::{Path, PathBuf};
 use rmux_proto::{
     decode_frame, encode_frame, frame_kind_for_request, frame_kind_for_response, ledger_entry_for,
     AttachSessionExt2Request, AttachSessionExt3Request, BindKeyRequest, CancelSdkWaitRequest,
-    CancelSdkWaitResponse, CapturePaneRequest, ClientTerminalContext, ClockModeRequest,
-    ControlMode, ControlModeRequest, ControlModeResponse, DetachClientRequest,
-    DisplayMessageExtRequest, ErrorResponse, FrameDecoder, FrameDirection, FrameFeature, FrameKind,
-    FrameStatus, HandshakeRequest, HandshakeResponse, HasSessionRequest, HasSessionResponse,
-    HookLifecycle, HookName, KillServerResponse, KillSessionRequest, ListBuffersRequest,
-    NewSessionResponse, OptionName, PaneId, PaneInputRequest, PaneKillRequest, PaneOutputCursor,
-    PaneOutputCursorRequest, PaneOutputCursorResponse, PaneOutputEvent, PaneOutputLagNotice,
-    PaneOutputLagResponse, PaneOutputSubscriptionId, PaneOutputSubscriptionStart, PaneRecentOutput,
-    PaneResizeRequest, PaneRespawnRequest, PaneSelectRequest, PaneSnapshotCursor,
-    PaneSnapshotRefRequest, PaneSnapshotResponse, PaneTarget, PaneTargetRef, Request,
-    ResizePaneAdjustment, ResolveTargetRequest, ResolveTargetType, Response, RmuxError,
-    ScopeSelector, SdkWaitForOutputRefRequest, SdkWaitForOutputRequest, SdkWaitForOutputResponse,
-    SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId, SendKeysExt2Request, SendKeysRequest,
-    SendKeysResponse, SessionName, SetHookRequest, SetOptionMode, SetOptionRequest,
-    SubscribePaneOutputRefRequest, SubscribePaneOutputRequest, SubscribePaneOutputResponse,
-    TerminalSize, UnsubscribePaneOutputRequest, UnsubscribePaneOutputResponse,
-    WebShareConfigRequest, WebShareListener, WebShareRequest, WebShareResponse, WindowTarget,
-    RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION, V1_FRAME_LEDGER,
+    CancelSdkWaitResponse, CapturePaneRequest, CapturePaneTargetActionRequest,
+    ClientTerminalContext, ClockModeRequest, ControlMode, ControlModeRequest, ControlModeResponse,
+    DetachClientRequest, DisplayMessageExtRequest, ErrorResponse, FrameDecoder, FrameDirection,
+    FrameFeature, FrameKind, FrameStatus, HandshakeRequest, HandshakeResponse, HasSessionRequest,
+    HasSessionResponse, HookLifecycle, HookName, KillServerResponse, KillSessionRequest,
+    ListBuffersRequest, NewSessionResponse, OptionName, PaneId, PaneInputRequest, PaneKillRequest,
+    PaneOutputCursor, PaneOutputCursorRequest, PaneOutputCursorResponse, PaneOutputEvent,
+    PaneOutputLagNotice, PaneOutputLagResponse, PaneOutputSubscriptionId,
+    PaneOutputSubscriptionStart, PaneRecentOutput, PaneResizeRequest, PaneRespawnRequest,
+    PaneSelectRequest, PaneSnapshotCursor, PaneSnapshotRefRequest, PaneSnapshotResponse,
+    PaneTarget, PaneTargetRef, Request, ResizePaneAdjustment, ResizePaneTargetActionRequest,
+    ResolveTargetRequest, ResolveTargetType, Response, RmuxError, ScopeSelector,
+    SdkWaitForOutputRefRequest, SdkWaitForOutputRequest, SdkWaitForOutputResponse, SdkWaitId,
+    SdkWaitOutcome, SdkWaitOwnerId, SendKeysExt2Request, SendKeysRequest, SendKeysResponse,
+    SessionName, SetHookRequest, SetOptionMode, SetOptionRequest, SplitDirection,
+    SplitWindowTargetActionRequest, SubscribePaneOutputRefRequest, SubscribePaneOutputRequest,
+    SubscribePaneOutputResponse, TerminalSize, UnsubscribePaneOutputRequest,
+    UnsubscribePaneOutputResponse, WebShareConfigRequest, WebShareListener, WebShareRequest,
+    WebShareResponse, WindowTarget, RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION, V1_FRAME_LEDGER,
 };
 
 fn fixture_root() -> PathBuf {
@@ -89,7 +90,7 @@ fn fixtures() -> Vec<FullFrameFixture> {
         target: pane_alpha_2(),
         keys: vec!["echo".to_owned(), "Enter".to_owned()],
     });
-    let capture_pane = Request::CapturePane(CapturePaneRequest {
+    let capture_pane = Request::CapturePane(Box::new(CapturePaneRequest {
         target: pane_alpha_2(),
         start: Some(-5),
         end: Some(-1),
@@ -106,11 +107,50 @@ fn fixtures() -> Vec<FullFrameFixture> {
         quiet: false,
         start_is_absolute: false,
         end_is_absolute: false,
-    });
+    }));
     let control_mode = Request::ControlMode(ControlModeRequest {
         mode: ControlMode::ControlControl,
         client_terminal: ClientTerminalContext::default(),
     });
+    let split_target_action =
+        Request::SplitWindowTargetAction(Box::new(SplitWindowTargetActionRequest {
+            target: Some("alpha:0.0".to_owned()),
+            direction: SplitDirection::Horizontal,
+            before: false,
+            environment: None,
+            command: Some(vec!["printf".to_owned(), "ready".to_owned()]),
+            process_command: None,
+            start_directory: None,
+            keep_alive_on_exit: None,
+            detached: true,
+            size: None,
+            preserve_zoom: false,
+            full_size: false,
+            stdin_payload: None,
+        }));
+    let resize_target_action = Request::ResizePaneTargetAction(ResizePaneTargetActionRequest {
+        target: Some("alpha:0.0".to_owned()),
+        adjustment: ResizePaneAdjustment::AbsoluteWidth { columns: 100 },
+    });
+    let capture_target_action =
+        Request::CapturePaneTargetAction(Box::new(CapturePaneTargetActionRequest {
+            target: Some("alpha:0.0".to_owned()),
+            start: Some(-10),
+            end: Some(-1),
+            print: true,
+            buffer_name: None,
+            alternate: false,
+            escape_ansi: false,
+            escape_sequences: false,
+            join_wrapped: false,
+            use_mode_screen: false,
+            preserve_trailing_spaces: false,
+            do_not_trim_spaces: false,
+            pending_input: false,
+            quiet: false,
+            start_is_absolute: false,
+            end_is_absolute: false,
+        }));
     let new_session_response = Response::NewSession(NewSessionResponse {
         session_name: alpha(),
         detached: true,
@@ -157,6 +197,27 @@ fn fixtures() -> Vec<FullFrameFixture> {
             encode: Frame::Request(control_mode),
         },
         FullFrameFixture {
+            name: "split_window_target_action_request",
+            kind: frame_kind_for_request(&split_target_action),
+            direction: FrameDirection::ClientToServer,
+            feature: FrameFeature::Panes,
+            encode: Frame::Request(split_target_action),
+        },
+        FullFrameFixture {
+            name: "resize_pane_target_action_request",
+            kind: frame_kind_for_request(&resize_target_action),
+            direction: FrameDirection::ClientToServer,
+            feature: FrameFeature::Panes,
+            encode: Frame::Request(resize_target_action),
+        },
+        FullFrameFixture {
+            name: "capture_pane_target_action_request",
+            kind: frame_kind_for_request(&capture_target_action),
+            direction: FrameDirection::ClientToServer,
+            feature: FrameFeature::Panes,
+            encode: Frame::Request(capture_target_action),
+        },
+        FullFrameFixture {
             name: "new_session_response",
             kind: frame_kind_for_response(&new_session_response),
             direction: FrameDirection::ServerToClient,
@@ -181,11 +242,11 @@ fn encode_fixture(fixture: &FullFrameFixture) -> Vec<u8> {
 }
 
 #[test]
-fn fixture_count_is_seven() {
+fn fixture_count_matches_manifest() {
     assert_eq!(
         fixtures().len(),
-        7,
-        "Milestone 3 mandates seven ledger fixtures"
+        10,
+        "Milestone 3 mandates ten ledger fixtures"
     );
 }
 
@@ -468,7 +529,7 @@ fn cross_section_requests() -> Vec<Request> {
         Request::ClockMode(ClockModeRequest {
             target: Some(pane.clone()),
         }),
-        Request::CapturePane(CapturePaneRequest {
+        Request::CapturePane(Box::new(CapturePaneRequest {
             target: pane.clone(),
             start: None,
             end: None,
@@ -485,14 +546,14 @@ fn cross_section_requests() -> Vec<Request> {
             quiet: false,
             start_is_absolute: false,
             end_is_absolute: false,
-        }),
-        Request::BindKey(BindKeyRequest {
+        })),
+        Request::BindKey(Box::new(BindKeyRequest {
             table_name: "root".to_owned(),
             key: "C-a".to_owned(),
             note: None,
             repeat: false,
             command: Some(vec!["send-prefix".to_owned()]),
-        }),
+        })),
         Request::ResolveTarget(ResolveTargetRequest {
             target: Some("alpha:0.0".to_owned()),
             target_type: ResolveTargetType::Pane,
@@ -546,7 +607,7 @@ fn cross_section_requests() -> Vec<Request> {
             target: pane_ref.clone(),
             kill_all_except: false,
         }),
-        Request::PaneRespawn(PaneRespawnRequest {
+        Request::PaneRespawn(Box::new(PaneRespawnRequest {
             target: pane_ref.clone(),
             kill: true,
             start_directory: Some(std::path::PathBuf::from("/tmp")),
@@ -554,7 +615,7 @@ fn cross_section_requests() -> Vec<Request> {
             command: Some(vec!["printf".to_owned(), "ready".to_owned()]),
             process_command: None,
             keep_alive_on_exit: Some(true),
-        }),
+        })),
         Request::PaneSnapshotRef(PaneSnapshotRefRequest {
             target: pane_ref.clone(),
         }),
@@ -562,15 +623,15 @@ fn cross_section_requests() -> Vec<Request> {
             target: pane_ref,
             title: Some("agent".to_owned()),
         }),
-        Request::WebShare(WebShareRequest::Config(WebShareConfigRequest)),
-        Request::DisplayMessageExt(DisplayMessageExtRequest {
+        Request::WebShare(Box::new(WebShareRequest::Config(WebShareConfigRequest))),
+        Request::DisplayMessageExt(Box::new(DisplayMessageExtRequest {
             target: Some(rmux_proto::Target::Session(alpha.clone())),
             print: true,
             message: Some("#{client_name}".to_owned()),
             target_client: Some("=".to_owned()),
             empty_target_context: false,
-        }),
-        Request::SendKeysExt2(SendKeysExt2Request {
+        })),
+        Request::SendKeysExt2(Box::new(SendKeysExt2Request {
             target: Some(pane.clone()),
             keys: vec!["A".to_owned()],
             expand_formats: false,
@@ -582,8 +643,8 @@ fn cross_section_requests() -> Vec<Request> {
             reset_terminal: false,
             repeat_count: None,
             target_client: Some("=".to_owned()),
-        }),
-        Request::AttachSessionExt3(AttachSessionExt3Request::from_ext2(
+        })),
+        Request::AttachSessionExt3(Box::new(AttachSessionExt3Request::from_ext2(
             AttachSessionExt2Request {
                 target: Some(alpha.clone()),
                 target_spec: Some("alpha:0.0".to_owned()),
@@ -597,7 +658,7 @@ fn cross_section_requests() -> Vec<Request> {
                 client_size: Some(TerminalSize { cols: 80, rows: 24 }),
             },
             vec![rmux_proto::CAPABILITY_ATTACH_RENDER.to_owned()],
-        )),
+        ))),
     ]
 }
 
@@ -642,7 +703,7 @@ fn cross_section_responses() -> Vec<Response> {
             }],
             limited: false,
         }),
-        Response::PaneOutputLag(PaneOutputLagResponse {
+        Response::PaneOutputLag(Box::new(PaneOutputLagResponse {
             subscription_id: PaneOutputSubscriptionId::new(7),
             cursor: PaneOutputCursor {
                 next_sequence: 10,
@@ -659,7 +720,7 @@ fn cross_section_responses() -> Vec<Response> {
                     newest_sequence: Some(12),
                 },
             },
-        }),
+        })),
         Response::SdkWaitForOutput(SdkWaitForOutputResponse {
             wait_id: SdkWaitId::new(4),
             outcome: SdkWaitOutcome::Matched,
@@ -668,7 +729,7 @@ fn cross_section_responses() -> Vec<Response> {
             wait_id: SdkWaitId::new(4),
             removed: true,
         }),
-        Response::WebShare(WebShareResponse::Config(
+        Response::WebShare(Box::new(WebShareResponse::Config(
             rmux_proto::WebShareConfigResponse {
                 listener: WebShareListener {
                     host: "127.0.0.1".to_owned(),
@@ -679,7 +740,7 @@ fn cross_section_responses() -> Vec<Response> {
                     "127.0.0.1:9777 https://share.rmux.io\n",
                 ),
             },
-        )),
+        ))),
     ]
 }
 
@@ -709,7 +770,7 @@ fn pane_snapshot_output_and_lag_response_kinds_stay_lane_scoped() {
         }],
         limited: false,
     });
-    let output_lag = Response::PaneOutputLag(PaneOutputLagResponse {
+    let output_lag = Response::PaneOutputLag(Box::new(PaneOutputLagResponse {
         subscription_id: PaneOutputSubscriptionId::new(7),
         cursor: PaneOutputCursor {
             next_sequence: 10,
@@ -726,7 +787,7 @@ fn pane_snapshot_output_and_lag_response_kinds_stay_lane_scoped() {
                 newest_sequence: Some(12),
             },
         },
-    });
+    }));
 
     assert_eq!(frame_kind_for_response(&snapshot).bincode_tag(), 80);
     assert_eq!(frame_kind_for_response(&output_cursor).bincode_tag(), 83);
@@ -801,8 +862,8 @@ fn ledger_active_size_matches_request_and_response_variant_count() {
         .iter()
         .filter(|entry| matches!(entry.status, FrameStatus::Active))
         .count();
-    // Active entries = 118 Request variants + 94 Response variants.
-    assert_eq!(active_count, 118 + 94, "active ledger size mismatch");
+    // Active entries = 121 Request variants + 94 Response variants.
+    assert_eq!(active_count, 121 + 94, "active ledger size mismatch");
 }
 
 #[test]
@@ -973,6 +1034,21 @@ fn assert_request_semantic_equal(actual: &Request, expected: &Request, label: &s
         }
         (Request::ControlMode(actual), Request::ControlMode(expected)) => {
             assert_eq!(actual.mode, expected.mode, "{label}");
+        }
+        (Request::SplitWindowTargetAction(actual), Request::SplitWindowTargetAction(expected)) => {
+            assert_eq!(actual.target, expected.target, "{label}");
+            assert_eq!(actual.direction, expected.direction, "{label}");
+            assert_eq!(actual.command, expected.command, "{label}");
+        }
+        (Request::ResizePaneTargetAction(actual), Request::ResizePaneTargetAction(expected)) => {
+            assert_eq!(actual.target, expected.target, "{label}");
+            assert_eq!(actual.adjustment, expected.adjustment, "{label}");
+        }
+        (Request::CapturePaneTargetAction(actual), Request::CapturePaneTargetAction(expected)) => {
+            assert_eq!(actual.target, expected.target, "{label}");
+            assert_eq!(actual.start, expected.start, "{label}");
+            assert_eq!(actual.end, expected.end, "{label}");
+            assert_eq!(actual.print, expected.print, "{label}");
         }
         (Request::NewSession(actual), Request::NewSession(expected)) => {
             assert_eq!(
@@ -1364,6 +1440,9 @@ fn fixture_set_kinds_match_manifest_table() {
         ("send_keys_request", 0x0019),
         ("capture_pane_request", 0x002B),
         ("control_mode_request", 0x003F),
+        ("split_window_target_action_request", 0x0076),
+        ("resize_pane_target_action_request", 0x0077),
+        ("capture_pane_target_action_request", 0x0078),
         ("new_session_response", 0x8000),
         ("error_response", 0x801F),
     ];
@@ -1466,7 +1545,7 @@ fn frame_decoder_rejects_payload_exactly_one_byte_over_max() {
     }
 }
 
-/// Regenerates the seven checked-in ledger fixtures.
+/// Regenerates the checked-in ledger fixtures.
 ///
 /// Run via `cargo test -p rmux-proto --test wire_ledger_v1 --
 /// --ignored regenerate_v1_fixtures`. The result must be reviewed and

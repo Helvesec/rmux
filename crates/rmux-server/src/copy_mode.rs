@@ -20,13 +20,16 @@ mod types;
 #[path = "copy_mode/word.rs"]
 mod word;
 
-use text::{classify_word_char, line_char, owner_positions, pattern_looks_like_regex, WordClass};
+use text::{
+    classify_word_char, is_owner_position, line_char, owner_positions, pattern_looks_like_regex,
+    WordClass,
+};
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use transfer::run_pipe_command;
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use types::{
-    CopyBufferTarget, CopyModeCommandContext, CopyModeMouseContext, CopyModePipeCommand,
-    CopyModeSummary, CopyModeTransfer, CopyPosition, ModeKeys,
+    CopyBufferTarget, CopyModeCommandContext, CopyModeCommandOutcome, CopyModeMouseContext,
+    CopyModePipeCommand, CopyModeSummary, CopyModeTransfer, CopyPosition, ModeKeys,
 };
 use types::{JumpState, SearchDirection, SearchMatch, SelectionState};
 
@@ -263,6 +266,9 @@ impl CopyModeState {
 
     fn find_matching_bracket(&self, forward: bool) -> Option<CopyPosition> {
         let current_line = self.line(self.cursor.y);
+        if !is_owner_position(&current_line, self.cursor.x) {
+            return None;
+        }
         let current_char = line_char(&current_line, self.cursor.x)?;
         let (open, close, scan_forward) = match current_char {
             '(' => ('(', ')', true),
@@ -274,40 +280,84 @@ impl CopyModeState {
             _ => return None,
         };
         let scan_forward = if forward { scan_forward } else { !scan_forward };
-        let positions = self.flatten_owner_positions();
-        let index = positions
-            .iter()
-            .position(|position| *position == self.cursor)?;
-        let iter: Box<dyn Iterator<Item = CopyPosition>> = if scan_forward {
-            Box::new(
-                positions
-                    .into_iter()
-                    .skip(index.saturating_add(1))
-                    .take(BRACKET_SCAN_LIMIT),
-            )
-        } else {
-            Box::new(
-                positions
-                    .into_iter()
-                    .take(index)
-                    .rev()
-                    .take(BRACKET_SCAN_LIMIT),
-            )
-        };
         let mut depth = 1usize;
-        for position in iter {
+        let mut found = None;
+        self.scan_matching_bracket_positions(scan_forward, |position| {
             let line = self.line(position.y);
-            let ch = line_char(&line, position.x)?;
-            if ch == open {
-                depth += 1;
+            let Some(ch) = line_char(&line, position.x) else {
+                return false;
+            };
+            if scan_forward {
+                if ch == open {
+                    depth += 1;
+                } else if ch == close {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        found = Some(position);
+                        return true;
+                    }
+                }
             } else if ch == close {
+                depth += 1;
+            } else if ch == open {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
-                    return Some(position);
+                    found = Some(position);
+                    return true;
+                }
+            }
+            false
+        });
+        found
+    }
+
+    fn scan_matching_bracket_positions(
+        &self,
+        scan_forward: bool,
+        mut visit: impl FnMut(CopyPosition) -> bool,
+    ) {
+        let mut visited = 0usize;
+        let total_lines = self.total_lines();
+        if scan_forward {
+            for y in self.cursor.y..total_lines {
+                let line = self.line(y);
+                for x in 0..line.width() {
+                    if y == self.cursor.y && x <= self.cursor.x {
+                        continue;
+                    }
+                    if !is_owner_position(&line, x) {
+                        continue;
+                    }
+                    visited += 1;
+                    if visit(CopyPosition { x, y }) {
+                        return;
+                    }
+                    if visited >= BRACKET_SCAN_LIMIT {
+                        return;
+                    }
+                }
+            }
+            return;
+        }
+
+        for y in (0..=self.cursor.y).rev() {
+            let line = self.line(y);
+            for x in (0..line.width()).rev() {
+                if y == self.cursor.y && x >= self.cursor.x {
+                    continue;
+                }
+                if !is_owner_position(&line, x) {
+                    continue;
+                }
+                visited += 1;
+                if visit(CopyPosition { x, y }) {
+                    return;
+                }
+                if visited >= BRACKET_SCAN_LIMIT {
+                    return;
                 }
             }
         }
-        None
     }
 
     fn line_blank(&self, y: usize) -> bool {

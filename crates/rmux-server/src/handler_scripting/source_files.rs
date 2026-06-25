@@ -265,6 +265,14 @@ pub(super) fn source_inputs_for_path(
     stdin: Option<&str>,
     read_policy: SourceReadPolicy,
 ) -> Result<Vec<SourceInput>, RmuxError> {
+    #[cfg(unix)]
+    if is_unix_null_config_path(path) {
+        return Ok(vec![SourceInput {
+            current_file: path.to_owned(),
+            contents: String::new(),
+        }]);
+    }
+
     #[cfg(windows)]
     if is_windows_null_config_path(path) {
         return Ok(vec![SourceInput {
@@ -456,6 +464,11 @@ fn strip_utf8_bom(mut contents: String) -> String {
         contents.replace_range(..'\u{feff}'.len_utf8(), "");
     }
     contents
+}
+
+#[cfg(unix)]
+fn is_unix_null_config_path(path: &str) -> bool {
+    Path::new(path) == Path::new("/dev/null")
 }
 
 #[cfg(windows)]
@@ -810,6 +823,18 @@ mod tests {
         assert!(super::is_windows_null_config_path(r"\\.\NUL"));
         assert!(!super::is_windows_null_config_path(r"C:\tmp\null.conf"));
         assert!(!super::is_windows_null_config_path(r"C:\tmp\nulled"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_dev_null_config_path_is_empty() {
+        let inputs =
+            source_inputs_for_path("/dev/null", None, false, None, SourceReadPolicy::Strict)
+                .expect("/dev/null should behave like an empty config file");
+
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].current_file, "/dev/null");
+        assert!(inputs[0].contents.is_empty());
     }
 
     fn temp_source_path(label: &str) -> std::path::PathBuf {

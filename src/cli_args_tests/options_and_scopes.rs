@@ -302,6 +302,95 @@ fn resize_pane_accepts_target_only_noop_like_tmux() {
 }
 
 #[test]
+fn resize_pane_valueless_adjustment_groups_follow_tmux_last_wins() {
+    let relative = parse_args(&["resize-pane", "-R", "-L", "-t", "alpha:0.0"]).unwrap();
+    match relative.command.expect("parsed command") {
+        super::super::Command::ResizePane(args) => {
+            assert_eq!(args.left, Some(1));
+            assert_eq!(args.right, None);
+        }
+        _ => panic!("expected ResizePane command"),
+    }
+
+    let absolute = parse_args(&["resize-pane", "-R", "-x", "80", "-t", "alpha:0.0"]).unwrap();
+    match absolute.command.expect("parsed command") {
+        super::super::Command::ResizePane(args) => {
+            assert_eq!(args.right, None);
+            assert!(args.columns.is_some());
+        }
+        _ => panic!("expected ResizePane command"),
+    }
+
+    let zoom = parse_args(&["resize-pane", "-Z", "-R", "-t", "alpha:0.0"]).unwrap();
+    match zoom.command.expect("parsed command") {
+        super::super::Command::ResizePane(args) => {
+            assert!(!args.zoom);
+            assert_eq!(args.right, Some(1));
+        }
+        _ => panic!("expected ResizePane command"),
+    }
+}
+
+#[test]
+fn resize_pane_explicit_last_adjustment_groups_follow_tmux_last_wins() {
+    let relative = parse_args(&["resize-pane", "-t", "alpha:0.0", "-R", "-L", "5"]).unwrap();
+    match relative.command.expect("parsed command") {
+        super::super::Command::ResizePane(args) => {
+            assert_eq!(args.left, Some(5));
+            assert_eq!(args.right, None);
+        }
+        _ => panic!("expected ResizePane command"),
+    }
+
+    let absolute = parse_args(&["resize-pane", "-t", "alpha:0.0", "-x", "80", "-R", "5"]).unwrap();
+    match absolute.command.expect("parsed command") {
+        super::super::Command::ResizePane(args) => {
+            assert_eq!(args.right, Some(5));
+            assert_eq!(args.columns, None);
+        }
+        _ => panic!("expected ResizePane command"),
+    }
+
+    let zoom = parse_args(&["resize-pane", "-t", "alpha:0.0", "-Z", "-R", "5"]).unwrap();
+    match zoom.command.expect("parsed command") {
+        super::super::Command::ResizePane(args) => {
+            assert!(!args.zoom);
+            assert_eq!(args.right, Some(5));
+        }
+        _ => panic!("expected ResizePane command"),
+    }
+}
+
+#[test]
+fn resize_pane_explicit_relative_deltas_still_reject_too_many_arguments_like_tmux() {
+    for args in [
+        ["resize-pane", "-R", "5", "-L", "3", "-t", "alpha:0.0"].as_slice(),
+        ["resize-pane", "-R", "5", "-x", "80", "-t", "alpha:0.0"].as_slice(),
+    ] {
+        let error = parse_args(args).unwrap_err();
+        assert!(
+            error.to_string().contains("too many arguments")
+                || error.to_string().contains("unexpected argument")
+                || error
+                    .to_string()
+                    .contains("accepts only one relative adjustment"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn resize_pane_rejects_attached_relative_delta_like_tmux() {
+    let error = parse_args(&["resize-pane", "-t", "alpha:0.0", "-R5"]).unwrap_err();
+
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    assert!(
+        error.to_string().contains("unknown flag -5"),
+        "resize-pane -R5 should reject the attached delta like tmux, got {error}"
+    );
+}
+
+#[test]
 fn select_layout_accepts_target_only_noop_like_tmux() {
     let cli = parse_args(&["select-layout", "-t", "alpha:0"]).unwrap();
     match cli.command.expect("parsed command") {

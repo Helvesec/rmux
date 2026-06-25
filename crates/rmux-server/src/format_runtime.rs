@@ -167,22 +167,27 @@ impl<'a> RuntimeFormatContext<'a> {
     fn pane_history_size(&self) -> Option<String> {
         let session = self.session?;
         let pane = self.pane?;
-        let stats = self.state?.pane_history_stats(session.name(), pane.id())?;
+        let stats = self
+            .state?
+            .pane_history_size_stats(session.name(), pane.id())?;
         Some(stats.size.to_string())
     }
 
     fn pane_history_limit(&self) -> Option<String> {
         let session = self.session?;
         let pane = self.pane?;
-        let stats = self.state?.pane_history_stats(session.name(), pane.id())?;
+        let stats = self
+            .state?
+            .pane_history_size_stats(session.name(), pane.id())?;
         Some(stats.limit.to_string())
     }
 
     fn pane_history_bytes(&self) -> Option<String> {
         let session = self.session?;
         let pane = self.pane?;
-        let stats = self.state?.pane_history_stats(session.name(), pane.id())?;
-        Some(stats.bytes.to_string())
+        self.state?
+            .pane_history_bytes(session.name(), pane.id())
+            .map(|bytes| bytes.to_string())
     }
 
     fn pane_lifecycle(&self) -> Option<&crate::pane_terminals::PaneLifecycleState> {
@@ -222,8 +227,12 @@ impl<'a> RuntimeFormatContext<'a> {
         let pane = self.pane?;
         self.state?
             .pane_copy_mode_render_screen(session.name(), pane.id())
-            .or_else(|| self.state?.pane_render_screen(session.name(), pane.id()))
             .map(|screen| screen.cursor_position())
+            .or_else(|| {
+                self.state?
+                    .pane_screen_state(session.name(), pane.id())
+                    .map(|state| state.cursor_position)
+            })
     }
 
     fn pane_screen_mode(&self) -> Option<u32> {

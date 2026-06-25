@@ -415,6 +415,43 @@ fn capture_pane_accepts_public_command_name_and_flags() {
 }
 
 #[test]
+fn capture_pane_repeated_flags_follow_tmux_last_wins() {
+    let cli = parse_args(&[
+        "capture-pane",
+        "-p",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "-S",
+        "0",
+        "-S",
+        "1",
+    ])
+    .unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::CapturePane(args) => {
+            assert!(args.print);
+            assert_eq!(args.start.as_deref(), Some("1"));
+        }
+        _ => panic!("expected CapturePane command"),
+    }
+}
+
+#[test]
+fn send_keys_repeated_target_follows_tmux_last_wins() {
+    let cli = parse_args(&["send-keys", "-t", "alpha:0.0", "-t", "alpha:0.1", "Enter"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::SendKeys(args) => {
+            assert_eq!(args.target.expect("target").to_string(), "alpha:0.1");
+            assert_eq!(args.keys, ["Enter"]);
+        }
+        _ => panic!("expected SendKeys command"),
+    }
+}
+
+#[test]
 fn capture_pane_alias_accepts_print_mode() {
     let cli = parse_args(&["capturep", "-p", "-t", "alpha:0.0"]).unwrap();
 

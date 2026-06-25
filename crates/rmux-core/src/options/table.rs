@@ -50,6 +50,10 @@ const STATUS_FORMAT1: &str = "#[align=left range=left #{E:status-left-style}]#[p
 const STATUS_FORMAT2: &str =
     "#[align=centre]#{P:#{?pane_active,#[reverse],}#{pane_index}[#{pane_width}x#{pane_height}]#[default] }";
 const STATUS_FORMAT_DEFAULT: &[&str] = &[STATUS_FORMAT1, STATUS_FORMAT2];
+#[cfg(windows)]
+const STATUS_RIGHT_DEFAULT: &str =
+    "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}\"#{=21:host_short}\" %H:%M %d-%b-%y";
+#[cfg(not(windows))]
 const STATUS_RIGHT_DEFAULT: &str =
     "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}\"#{=21:pane_title}\" %H:%M %d-%b-%y";
 #[cfg(unix)]
@@ -1548,8 +1552,8 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::PaneActiveBorderStyle,
         "pane-active-border-style",
         &[],
-        SHOW_WINDOW,
-        SCOPE_WINDOW,
+        SHOW_WINDOW | SHOW_PANE,
+        SCOPE_WINDOW | SCOPE_PANE,
         GlobalRoot::Window,
         OptionValueType::String,
         DefaultValue::Scalar("#{?pane_in_mode,fg=yellow,#{?synchronize-panes,fg=red,fg=green}}"),
@@ -1626,8 +1630,8 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         OptionName::PaneBorderStyle,
         "pane-border-style",
         &[],
-        SHOW_WINDOW,
-        SCOPE_WINDOW,
+        SHOW_WINDOW | SHOW_PANE,
+        SCOPE_WINDOW | SCOPE_PANE,
         GlobalRoot::Window,
         OptionValueType::String,
         DefaultValue::Scalar("default"),

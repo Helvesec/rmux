@@ -1,15 +1,12 @@
+use super::regex_cache::cached_regex;
 use super::FormatModifier;
-use regex::RegexBuilder;
 
 pub(super) fn format_fnmatch(pattern: &str, text: &str, fm: &FormatModifier) -> bool {
     let flags = fm.argv.first().map(String::as_str).unwrap_or_default();
     let case_insensitive = flags.contains('i');
 
     if flags.contains('r') {
-        return RegexBuilder::new(pattern)
-            .case_insensitive(case_insensitive)
-            .build()
-            .is_ok_and(|regex| regex.is_match(text));
+        return cached_regex(pattern, case_insensitive).is_ok_and(|regex| regex.is_match(text));
     }
     if case_insensitive {
         glob_match(&pattern.to_lowercase(), &text.to_lowercase())

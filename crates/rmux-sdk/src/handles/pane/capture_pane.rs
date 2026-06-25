@@ -151,7 +151,7 @@ impl<'a> PaneCaptureBuilder<'a> {
         match self
             .pane
             .transport()
-            .request(Request::CapturePane(CapturePaneRequest {
+            .request(Request::CapturePane(Box::new(CapturePaneRequest {
                 target,
                 start: self.start,
                 end: self.end,
@@ -168,7 +168,7 @@ impl<'a> PaneCaptureBuilder<'a> {
                 quiet: self.quiet,
                 start_is_absolute: self.start_is_absolute,
                 end_is_absolute: self.end_is_absolute,
-            }))
+            })))
             .await?
         {
             Response::CapturePane(response) => Ok(PaneCapture {

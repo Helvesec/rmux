@@ -39,7 +39,9 @@ mod wire;
 #[cfg(any(unix, windows))]
 use crate::renderer::{PaneRenderDelta, PaneRenderDeltaFrame};
 #[cfg(any(unix, windows))]
-use attach_output_batch::{collect_attach_output_batch, AttachOutputBatch};
+use attach_output_batch::{
+    collect_attach_output_batch, collect_attach_output_batch_metadata, AttachOutputBatch,
+};
 #[cfg(all(any(unix, windows), feature = "web"))]
 pub(crate) use attach_transport::in_process_attach_pair;
 use attach_transport::{AttachTransport, TryAttachRead};
@@ -70,6 +72,8 @@ use persistent_overlay::{
 #[cfg(windows)]
 pub(crate) use reader::spawn_pane_exit_watcher;
 pub(crate) use reader::spawn_pane_output_reader;
+#[cfg(windows)]
+pub(crate) use reader::PaneOutputEofState;
 #[cfg(unix)]
 pub(crate) use reader::PaneOutputReaderTask;
 #[cfg(any(unix, windows))]
@@ -364,24 +368,49 @@ pub(crate) async fn forward_attach(
                 }
                 PendingAttachAction::Write => {}
             }
-            if live_input.handler.request_shutdown_if_pending() {
-                log_attach_exit(
-                    &live_input,
-                    &current_target,
-                    AttachExitReason::PendingServerShutdown,
-                );
-                let _ = emit_attach_stop(&stream, &current_target).await;
-                return Ok(());
-            }
+            let pending_shutdown_requested = live_input.handler.request_shutdown_if_pending();
 
             tokio::select! {
                 biased;
                 result = shutdown.changed() => {
                     let _ = result;
+                    if closing.load(Ordering::SeqCst) {
+                        loop {
+                            match apply_pending_attach_controls(
+                                &mut deferred_controls,
+                                attach_controls.as_mut(),
+                                &control_backlog,
+                                &mut current_target,
+                                &stream,
+                                &mut render_generation,
+                                &mut overlay_generation,
+                                &mut persistent_overlay,
+                                &mut persistent_overlay_visible,
+                                &mut persistent_overlay_state_id,
+                                &mut locked,
+                            )
+                            .await?
+                            {
+                                PendingAttachAction::Exit(reason) => {
+                                    log_attach_exit(&live_input, &current_target, reason);
+                                    return Ok(());
+                                }
+                                PendingAttachAction::Continue { .. }
+                                | PendingAttachAction::InteractiveInput
+                                | PendingAttachAction::Refresh { .. } => continue,
+                                PendingAttachAction::Write => break,
+                            }
+                        }
+                    }
+                    let reason = if pending_shutdown_requested {
+                        AttachExitReason::PendingServerShutdown
+                    } else {
+                        AttachExitReason::ServerShutdown
+                    };
                     log_attach_exit(
                         &live_input,
                         &current_target,
-                        AttachExitReason::ServerShutdown,
+                        reason,
                     );
                     let _ = emit_attach_stop(&stream, &current_target).await;
                     return Ok(());
@@ -411,15 +440,6 @@ pub(crate) async fn forward_attach(
                 }
                 _ = wait_for_refresh_deadline(pane_refresh.deadline()) => {
                     pane_refresh.clear();
-                    if closing.load(Ordering::SeqCst) {
-                        log_attach_exit(
-                            &live_input,
-                            &current_target,
-                            AttachExitReason::AttachClosingFlag,
-                        );
-                        let _ = emit_attach_stop(&stream, &current_target).await;
-                        return Ok(());
-                    }
                     match apply_pending_attach_controls(
                         &mut deferred_controls,
                         attach_controls.as_mut(),
@@ -519,7 +539,7 @@ pub(crate) async fn forward_attach(
                                 refresh_current_attach_client(&live_input).await;
                             } else {
                                 let pending_output =
-                                    collect_pending_attach_output_batch(&mut current_target);
+                                    collect_pending_attach_output_batch_metadata(&mut current_target);
                                 let mut drained_sustained_output = false;
                                 let mut live_passthroughs = Vec::new();
                                 if let Some(batch) = pending_output {
@@ -585,15 +605,6 @@ pub(crate) async fn forward_attach(
                     }
                 }
                 _ = wait_for_refresh_deadline(status_refresh.deadline()) => {
-                    if closing.load(Ordering::SeqCst) {
-                        log_attach_exit(
-                            &live_input,
-                            &current_target,
-                            AttachExitReason::AttachClosingFlag,
-                        );
-                        let _ = emit_attach_stop(&stream, &current_target).await;
-                        return Ok(());
-                    }
                     match apply_pending_attach_controls(
                         &mut deferred_controls,
                         attach_controls.as_mut(),
@@ -671,6 +682,15 @@ pub(crate) async fn forward_attach(
                             continue;
                         }
                         PendingAttachAction::Write => {}
+                    }
+                    if closing.load(Ordering::SeqCst) {
+                        log_attach_exit(
+                            &live_input,
+                            &current_target,
+                            AttachExitReason::AttachClosingFlag,
+                        );
+                        let _ = emit_attach_stop(&stream, &current_target).await;
+                        return Ok(());
                     }
                     let session_name = current_target.session_name.clone();
                     if locked {
@@ -971,6 +991,7 @@ pub(crate) async fn forward_attach(
                     let item = if deferred_controls.is_empty()
                         && control_backlog.load(Ordering::Acquire) == 0
                         && !locked
+                        && !closing.load(Ordering::SeqCst)
                         && !persistent_overlay_visible
                         && persistent_overlay.is_none()
                         && should_treat_attach_output_as_interactive(last_client_input_at)
@@ -985,15 +1006,6 @@ pub(crate) async fn forward_attach(
                                         pane.can_forward_plain_bytes(event.bytes())
                                     }) =>
                             {
-                                if closing.load(Ordering::SeqCst) {
-                                    log_attach_exit(
-                                        &live_input,
-                                        &current_target,
-                                        AttachExitReason::AttachClosingFlag,
-                                    );
-                                    let _ = emit_attach_stop(&stream, &current_target).await;
-                                    return Ok(());
-                                }
                                 let snapshot_synced = current_target
                                     .live_pane
                                     .as_mut()
@@ -1033,16 +1045,7 @@ pub(crate) async fn forward_attach(
                             close_after_render,
                             sustained,
                         } => (bytes, passthroughs, close_after_render, sustained),
-                    };
-                    if closing.load(Ordering::SeqCst) {
-                        log_attach_exit(
-                            &live_input,
-                            &current_target,
-                            AttachExitReason::AttachClosingFlag,
-                        );
-                        let _ = emit_attach_stop(&stream, &current_target).await;
-                        return Ok(());
-                    }
+                        };
                     match apply_pending_attach_controls(
                         &mut deferred_controls,
                         attach_controls.as_mut(),
@@ -1361,12 +1364,15 @@ async fn schedule_attach_render_refresh(
 }
 
 #[cfg(any(unix, windows))]
-fn collect_pending_attach_output_batch(
+fn collect_pending_attach_output_batch_metadata(
     current_target: &mut types::OpenAttachTarget,
 ) -> Option<AttachOutputBatch> {
     let pane_output = current_target.pane_output.as_mut()?;
     let first = pane_output.try_recv()?;
-    Some(collect_attach_output_batch(first, Some(pane_output)))
+    Some(collect_attach_output_batch_metadata(
+        first,
+        Some(pane_output),
+    ))
 }
 
 #[cfg(any(unix, windows))]
@@ -1514,10 +1520,10 @@ async fn process_socket_messages(
                 } else {
                     live_input
                         .handler
-                        .handle_attached_live_input_inner(
+                        .handle_attached_keystroke_input(
                             live_input.attach_pid,
                             pending_input,
-                            keystroke.bytes(),
+                            &keystroke,
                         )
                         .await?
                 };

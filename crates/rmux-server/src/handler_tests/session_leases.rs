@@ -229,14 +229,16 @@ async fn session_destroyed_by_last_pane_exit_clears_stale_lease() {
     assert!(matches!(created_lease, Response::CreateSessionLease(_)));
 
     let respawned = handler
-        .handle(Request::RespawnPane(rmux_proto::RespawnPaneRequest {
-            target: PaneTarget::new(alpha.clone(), 0),
-            kill: true,
-            start_directory: None,
-            environment: None,
-            command: None,
-            process_command: Some(rmux_proto::ProcessCommand::Shell("exit 0".to_owned())),
-        }))
+        .handle(Request::RespawnPane(Box::new(
+            rmux_proto::RespawnPaneRequest {
+                target: PaneTarget::new(alpha.clone(), 0),
+                kill: true,
+                start_directory: None,
+                environment: None,
+                command: None,
+                process_command: Some(rmux_proto::ProcessCommand::Shell("exit 0".to_owned())),
+            },
+        )))
         .await;
     assert!(matches!(respawned, Response::RespawnPane(_)));
     wait_for_session_state(&handler, alpha.clone(), false).await;

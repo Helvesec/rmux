@@ -138,6 +138,11 @@ fn remove_private_shim_dir(dir: &Path) -> std::io::Result<()> {
 #[cfg(unix)]
 fn create_or_replace_shim(shim: &Path, rmux: &Path) -> std::io::Result<()> {
     if let Ok(metadata) = std::fs::symlink_metadata(shim) {
+        if metadata.file_type().is_symlink()
+            && matches!(std::fs::read_link(shim), Ok(target) if target == rmux)
+        {
+            return Ok(());
+        }
         if metadata.file_type().is_symlink() || metadata.is_file() {
             std::fs::remove_file(shim)?;
         } else {
@@ -223,7 +228,7 @@ fn env_flag_enabled(name: &str) -> bool {
 mod tests {
     use super::apply_tmux_shim_environment;
     #[cfg(unix)]
-    use super::{cleanup_tmux_shim, shim_dir};
+    use super::{cleanup_tmux_shim, create_or_replace_shim, shim_dir};
     use std::collections::HashMap;
     use std::path::Path;
 
@@ -274,6 +279,26 @@ mod tests {
             !dir.exists(),
             "cleanup should remove the private shim directory"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_or_replace_shim_keeps_existing_link_to_rmux() {
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("rmux-shim-existing-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+        let rmux = root.join("rmux");
+        let shim = root.join("tmux");
+        std::fs::write(&rmux, b"rmux").expect("create rmux");
+        symlink(&rmux, &shim).expect("create shim symlink");
+
+        create_or_replace_shim(&shim, &rmux).expect("existing link is valid");
+
+        assert_eq!(std::fs::read_link(&shim).expect("read shim link"), rmux);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]

@@ -27,6 +27,8 @@ const WAIT_FOR_NEXT_BYTES_OPERATION: &str = "wait for next pane output bytes";
 const WAIT_FOR_TEXT_NEXT_OPERATION: &str = "wait for next pane output text";
 const WAIT_FOR_EXIT_OPERATION: &str = "wait for pane process exit";
 pub(crate) const TEXT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+#[cfg(windows)]
+const SDK_WAIT_ARM_DISPATCH_SETTLE: Duration = Duration::from_millis(250);
 
 /// A daemon-armed wait for future pane output.
 ///
@@ -248,6 +250,9 @@ async fn arm_sdk_wait(
         wait_client.armed_request(sdk_wait_request_for_pane(pane, owner_id, wait_id, bytes).await?),
     )
     .await?;
+
+    #[cfg(windows)]
+    tokio::time::sleep(SDK_WAIT_ARM_DISPATCH_SETTLE).await;
 
     Ok(ArmedWait::new(
         response,

@@ -1,9 +1,9 @@
-use std::ffi::CStr;
-use std::io::ErrorKind;
 use std::path::Path;
 
 use rmux_client::{default_socket_path, AutoStartError, ClientError, NestedContextError};
 use rmux_proto::RmuxError;
+
+use crate::tmux_error_surface::tmux_client_connect_error_message;
 
 #[derive(Debug)]
 pub(crate) struct ExitFailure {
@@ -79,31 +79,11 @@ impl ExitFailure {
     }
 
     pub(super) fn from_client_connect(socket_path: &Path, error: ClientError) -> Self {
-        if server_is_absent(&error) {
-            if default_socket_path()
-                .ok()
-                .as_deref()
-                .is_some_and(|default_path| default_path == socket_path)
-            {
-                return Self::no_server_running(socket_path);
-            }
-            if let ClientError::Io(io_error) = &error {
-                return Self::new(
-                    1,
-                    format!(
-                        "error connecting to {} ({})",
-                        socket_path.display(),
-                        io_error_message_without_code(io_error)
-                    ),
-                );
-            }
+        if let Some(message) = tmux_client_connect_error_message(socket_path, &error) {
+            return Self::new(1, message);
         }
 
         Self::from_client(error)
-    }
-
-    pub(super) fn no_server_running(socket_path: &Path) -> Self {
-        Self::new(1, format!("no server running on {}", socket_path.display()))
     }
 
     pub(super) fn from_auto_start(error: AutoStartError) -> Self {
@@ -218,35 +198,6 @@ fn normalized_invalid_value_detail(detail: &str) -> Option<String> {
     }
 
     None
-}
-
-fn server_is_absent(error: &ClientError) -> bool {
-    matches!(
-        error,
-        ClientError::Io(io_error)
-            if matches!(
-                io_error.kind(),
-                ErrorKind::NotFound | ErrorKind::ConnectionRefused
-            )
-    )
-}
-
-fn io_error_message_without_code(error: &std::io::Error) -> String {
-    if let Some(errno) = error.raw_os_error() {
-        // tmux reports the strerror text inside "error connecting to ... (...)"
-        // without Rust's additional "(os error N)" suffix.
-        let message = unsafe {
-            // SAFETY: `strerror` returns either null or a pointer to a
-            // NUL-terminated process-owned message for the supplied errno.
-            let ptr = libc::strerror(errno);
-            (!ptr.is_null()).then(|| CStr::from_ptr(ptr).to_string_lossy().into_owned())
-        };
-        if let Some(message) = message {
-            return message;
-        }
-    }
-
-    error.to_string()
 }
 
 impl From<NestedContextError> for ExitFailure {

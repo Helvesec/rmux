@@ -151,7 +151,7 @@ pub(super) fn parse_set_option_invocation(
     }
 
     Ok(ParsedSetOptionCommand::Request(Box::new(
-        Request::SetOptionByName(SetOptionByNameRequest {
+        Request::SetOptionByName(Box::new(SetOptionByNameRequest {
             scope,
             name: option,
             value,
@@ -161,7 +161,7 @@ pub(super) fn parse_set_option_invocation(
             unset_pane_overrides: flags.unset_pane_overrides,
             format: flags.format,
             format_target: flags.format.then_some(effective_target).flatten(),
-        }),
+        })),
     )))
 }
 
@@ -301,14 +301,14 @@ pub(super) fn parse_set_environment(
     };
     args.no_extra("set-environment")?;
 
-    Ok(Request::SetEnvironment(SetEnvironmentRequest {
+    Ok(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
         scope,
         name,
         value,
         mode,
         hidden,
         format,
-    }))
+    })))
 }
 
 pub(super) fn parse_show_options(

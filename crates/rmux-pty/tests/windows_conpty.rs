@@ -4,8 +4,12 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rmux_pty::{ChildCommand, PtyMaster, PtyPair, SpawnedPty, TerminalSize};
+use rmux_pty::{
+    write_windows_console_key, ChildCommand, PtyMaster, PtyPair, SpawnedPty, TerminalSize,
+    WindowsConsoleKeyEvent,
+};
 use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+use windows_sys::Win32::System::Console::LEFT_CTRL_PRESSED;
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_TERMINATE,
@@ -69,6 +73,38 @@ fn conpty_interactive_cmd_accepts_written_input() -> Result<(), Box<dyn std::err
     assert!(
         String::from_utf8_lossy(&output).contains("RMUX_INTERACTIVE_OK"),
         "expected interactive marker in ConPTY output, got {:?}",
+        String::from_utf8_lossy(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn conpty_console_ctrl_d_interrupts_timeout() -> Result<(), Box<dyn std::error::Error>> {
+    let mut spawned = ChildCommand::new("C:\\Windows\\System32\\cmd.exe")
+        .args(["/D", "/K"])
+        .size(TerminalSize::new(100, 30))
+        .spawn()?;
+
+    let io = spawned.master().try_clone_io()?;
+    let _ = read_until_io(&io, b">", Duration::from_secs(2))?;
+    io.write_all(b"prompt RMUX_READY$G\r\n")?;
+    let _ = read_until_io(&io, b"RMUX_READY>", Duration::from_secs(2))?;
+    io.write_all(b"timeout /T 10000\r\n")?;
+    thread::sleep(Duration::from_millis(300));
+
+    write_windows_console_key(
+        spawned.child().pid(),
+        WindowsConsoleKeyEvent::new(b'D' as u16, 0x20, 0x04, LEFT_CTRL_PRESSED, 1),
+    )?;
+
+    let output = read_until_or_kill(&mut spawned, b"RMUX_READY>", Duration::from_secs(4))?;
+
+    spawned.child().terminate_forcefully()?;
+    let _ = spawned.child_mut().wait()?;
+
+    assert!(
+        String::from_utf8_lossy(&output).contains("RMUX_READY>"),
+        "expected Ctrl-D to return to the cmd prompt, got {:?}",
         String::from_utf8_lossy(&output)
     );
     Ok(())

@@ -181,7 +181,7 @@ async fn paste_buffer_to_session_pane_through_real_socket() -> Result<(), Box<dy
 
     let paste_response = send_request(
         harness.socket_path(),
-        &Request::PasteBuffer(PasteBufferRequest {
+        &Request::PasteBuffer(Box::new(PasteBufferRequest {
             name: None,
             target: PaneTarget::new(session_name("alpha"), 0),
             delete_after: false,
@@ -189,7 +189,7 @@ async fn paste_buffer_to_session_pane_through_real_socket() -> Result<(), Box<dy
             linefeed: false,
             raw: false,
             bracketed: false,
-        }),
+        })),
     )
     .await?;
 
@@ -231,7 +231,7 @@ async fn paste_buffer_with_delete_removes_buffer_through_real_socket() -> Result
 
     let paste_response = send_request(
         harness.socket_path(),
-        &Request::PasteBuffer(PasteBufferRequest {
+        &Request::PasteBuffer(Box::new(PasteBufferRequest {
             name: None,
             target: PaneTarget::new(session_name("alpha"), 0),
             delete_after: true,
@@ -239,7 +239,7 @@ async fn paste_buffer_with_delete_removes_buffer_through_real_socket() -> Result
             linefeed: false,
             raw: false,
             bracketed: false,
-        }),
+        })),
     )
     .await?;
     assert!(matches!(paste_response, Response::PasteBuffer(_)));

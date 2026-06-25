@@ -28,6 +28,11 @@ const DEFAULT_SOCKET_LABEL: &str = "default";
 #[cfg(unix)]
 const FALLBACK_SOCKET_ROOT: &str = "/tmp";
 const RMUX_ENV: &str = "RMUX";
+const TMUX_ENV: &str = "TMUX";
+const RMUX_INTERNAL_CLAUDE_MAIN_SOCKET_ENV: &str = "RMUX_INTERNAL_CLAUDE_MAIN_SOCKET";
+const RMUX_INTERNAL_CLAUDE_SWARM_SOCKET_ENV: &str = "RMUX_INTERNAL_CLAUDE_SWARM_SOCKET";
+#[cfg(windows)]
+const CLAUDE_SWARM_SOCKET_PREFIX: &str = "claude-swarm-";
 #[cfg(unix)]
 const RMUX_TMPDIR_ENV: &str = "RMUX_TMPDIR";
 #[cfg(unix)]
@@ -208,6 +213,60 @@ pub fn resolve_endpoint(
     default_endpoint()
 }
 
+fn claude_swarm_socket_redirect(socket_name: &OsStr) -> Option<io::Result<LocalEndpoint>> {
+    let main_socket = std::env::var_os(RMUX_INTERNAL_CLAUDE_MAIN_SOCKET_ENV)?;
+    if main_socket.is_empty() {
+        return None;
+    }
+    let swarm_socket = std::env::var_os(RMUX_INTERNAL_CLAUDE_SWARM_SOCKET_ENV)?;
+    if socket_name == swarm_socket.as_os_str() {
+        return Some(endpoint_for_label(main_socket));
+    }
+    #[cfg(windows)]
+    {
+        // Claude Code derives its external tmux socket from process.pid. On
+        // Unix rmux execs Claude, so the value above is exact. On Windows rmux
+        // must spawn claude.exe, so the child PID is not knowable before
+        // launch. Keep this redirect private to rmux claude by requiring the
+        // internal main-socket env and only matching Claude's socket prefix.
+        if socket_name
+            .to_string_lossy()
+            .starts_with(CLAUDE_SWARM_SOCKET_PREFIX)
+        {
+            return Some(endpoint_for_label(main_socket));
+        }
+    }
+    None
+}
+
+/// Resolves the endpoint for tmux-compatible invocation paths.
+///
+/// Public `rmux` invocations must not consume `$TMUX`; otherwise running RMUX
+/// from inside a real tmux client would try to speak the RMUX protocol to a tmux
+/// socket. The tmux-compatible path is only for shim/symlink invocations whose
+/// caller expects tmux inheritance semantics.
+pub fn resolve_tmux_compatible_endpoint(
+    socket_name: Option<&OsStr>,
+    socket_path: Option<&Path>,
+) -> io::Result<LocalEndpoint> {
+    if let Some(socket_path) = socket_path {
+        return endpoint_for_socket_path(socket_path);
+    }
+    if let Some(socket_name) = socket_name {
+        if let Some(endpoint) = claude_swarm_socket_redirect(socket_name) {
+            return endpoint;
+        }
+        return endpoint_for_label(socket_name);
+    }
+    if let Some(socket_path) = socket_path_from_rmux_env(std::env::var_os(RMUX_ENV).as_deref()) {
+        return Ok(LocalEndpoint::from_path(socket_path));
+    }
+    if let Some(socket_path) = socket_path_from_tmux_env(std::env::var_os(TMUX_ENV).as_deref()) {
+        return Ok(LocalEndpoint::from_path(socket_path));
+    }
+    default_endpoint()
+}
+
 #[cfg(unix)]
 fn endpoint_for_socket_path(socket_path: &Path) -> io::Result<LocalEndpoint> {
     if socket_path.as_os_str().is_empty() {
@@ -222,7 +281,7 @@ fn endpoint_for_socket_path(socket_path: &Path) -> io::Result<LocalEndpoint> {
         return endpoint_for_empty_socket_path();
     }
 
-    if socket_path_is_rmux_owned(socket_path) {
+    if socket_path_is_rmux_owned(socket_path)? {
         return Ok(LocalEndpoint::from_path(socket_path.to_path_buf()));
     }
 
@@ -275,9 +334,8 @@ fn socket_path_from_rmux_env(rmux: Option<&OsStr>) -> Option<PathBuf> {
     socket_path_from_env(rmux)
 }
 
-#[cfg(all(test, unix))]
-fn socket_path_from_mux_env(rmux: Option<&OsStr>) -> Option<PathBuf> {
-    socket_path_from_env(rmux)
+fn socket_path_from_tmux_env(tmux: Option<&OsStr>) -> Option<PathBuf> {
+    socket_path_from_env(tmux)
 }
 
 fn socket_path_from_env(value: Option<&OsStr>) -> Option<PathBuf> {
@@ -302,16 +360,40 @@ fn inherited_socket_path(path: PathBuf) -> Option<PathBuf> {
 
 #[cfg(windows)]
 fn inherited_socket_path(path: PathBuf) -> Option<PathBuf> {
-    socket_path_is_rmux_owned(&path).then_some(path)
+    socket_path_is_rmux_owned(&path)
+        .ok()
+        .filter(|owned| *owned)
+        .map(|_| path)
 }
 
 #[cfg(windows)]
-fn socket_path_is_rmux_owned(path: &Path) -> bool {
+fn socket_path_is_rmux_owned(path: &Path) -> io::Result<bool> {
     let value = path.as_os_str().to_string_lossy();
     let Some(rest) = strip_ascii_prefix(&value, PIPE_PREFIX) else {
-        return false;
+        return Ok(false);
     };
-    rest.starts_with(SOCKET_DIR_PREFIX) && rest[SOCKET_DIR_PREFIX.len()..].starts_with('-')
+    let Some(rest) = rest.strip_prefix(SOCKET_DIR_PREFIX) else {
+        return Ok(false);
+    };
+    let Some(rest) = rest.strip_prefix('-') else {
+        return Ok(false);
+    };
+    let Some((sid, rest)) = rest.split_once("-il-") else {
+        return Ok(false);
+    };
+    let Some((integrity, label)) = rest.split_once('-') else {
+        return Ok(false);
+    };
+    if label.is_empty() {
+        return Ok(false);
+    }
+
+    let identity = IdentityResolver::current()?;
+    let UserIdentity::Sid(current_sid) = identity else {
+        return Ok(false);
+    };
+    let current_sid = pipe_component(OsStr::new(current_sid.as_ref()));
+    Ok(sid == current_sid && integrity == current_integrity_label()?)
 }
 
 #[cfg(windows)]
@@ -366,7 +448,7 @@ fn pipe_component(value: &OsStr) -> String {
 }
 
 #[cfg(windows)]
-fn current_integrity_label() -> io::Result<&'static str> {
+pub(crate) fn current_integrity_label() -> io::Result<&'static str> {
     let token = current_process_token()?;
     let mut needed = 0_u32;
     unsafe {
@@ -484,15 +566,14 @@ fn is_pipe_component_unit(unit: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(unix, windows))]
+    use std::ffi::{OsStr, OsString};
     #[cfg(unix)]
-    use std::ffi::OsStr;
-    #[cfg(unix)]
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Mutex,
-    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(any(unix, windows))]
+    use std::sync::Mutex;
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     static ENV_LOCK: Mutex<()> = Mutex::new(());
     #[cfg(unix)]
     static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -618,7 +699,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn tmux_env_accepts_rmux_owned_socket_endpoint() {
-        let path = socket_path_from_mux_env(Some(OsStr::new("/tmp/rmux-1000/default,123,0")))
+        let path = socket_path_from_tmux_env(Some(OsStr::new("/tmp/rmux-1000/default,123,0")))
             .expect("tmux socket endpoint");
 
         assert_eq!(path, PathBuf::from("/tmp/rmux-1000/default"));
@@ -627,7 +708,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn mux_env_accepts_explicit_unix_socket_endpoint() {
-        let path = socket_path_from_mux_env(Some(OsStr::new("/tmp/custom-rmux.sock,123,0")))
+        let path = socket_path_from_tmux_env(Some(OsStr::new("/tmp/custom-rmux.sock,123,0")))
             .expect("explicit socket endpoint");
 
         assert_eq!(path, PathBuf::from("/tmp/custom-rmux.sock"));
@@ -646,13 +727,118 @@ mod tests {
     #[test]
     fn mux_env_rejects_relative_socket_endpoint() {
         assert_eq!(
-            socket_path_from_mux_env(Some(OsStr::new("relative.sock,123,0"))),
+            socket_path_from_tmux_env(Some(OsStr::new("relative.sock,123,0"))),
             None
         );
         assert_eq!(
             socket_path_from_rmux_env(Some(OsStr::new("relative.sock"))),
             None
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_endpoint_ignores_tmux_env_when_no_cli_endpoint_is_set() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _rmux = EnvGuard::remove(RMUX_ENV);
+        let _tmux = EnvGuard::set(TMUX_ENV, OsStr::new("/tmp/rmux-1000/custom,123,0"));
+
+        let path = resolve_endpoint(None, None)
+            .expect("default endpoint")
+            .into_path();
+
+        assert!(path.ends_with("default"));
+        assert_ne!(path, PathBuf::from("/tmp/rmux-1000/custom"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_compatible_resolve_endpoint_uses_tmux_env_when_no_cli_endpoint_is_set() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _rmux = EnvGuard::remove(RMUX_ENV);
+        let _tmux = EnvGuard::set(TMUX_ENV, OsStr::new("/tmp/rmux-1000/custom,123,0"));
+
+        let path = resolve_tmux_compatible_endpoint(None, None)
+            .expect("tmux env endpoint")
+            .into_path();
+
+        assert_eq!(path, PathBuf::from("/tmp/rmux-1000/custom"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_compatible_resolve_endpoint_prefers_rmux_env_over_tmux_env() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _rmux = EnvGuard::set(RMUX_ENV, OsStr::new("/tmp/rmux-1000/native,123,0"));
+        let _tmux = EnvGuard::set(TMUX_ENV, OsStr::new("/tmp/rmux-1000/tmux,123,0"));
+
+        let path = resolve_tmux_compatible_endpoint(None, None)
+            .expect("rmux env endpoint")
+            .into_path();
+
+        assert_eq!(path, PathBuf::from("/tmp/rmux-1000/native"));
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn tmux_compatible_resolve_endpoint_redirects_claude_swarm_socket_only() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _main = EnvGuard::set(
+            RMUX_INTERNAL_CLAUDE_MAIN_SOCKET_ENV,
+            OsStr::new("rmux-claude-test"),
+        );
+        let _swarm = EnvGuard::set(
+            RMUX_INTERNAL_CLAUDE_SWARM_SOCKET_ENV,
+            OsStr::new("claude-swarm-test"),
+        );
+
+        let redirected =
+            resolve_tmux_compatible_endpoint(Some(OsStr::new("claude-swarm-test")), None)
+                .expect("redirected endpoint")
+                .into_path();
+        let expected = endpoint_for_label("rmux-claude-test")
+            .expect("main endpoint")
+            .into_path();
+        assert_eq!(redirected, expected);
+
+        let native = resolve_endpoint(Some(OsStr::new("claude-swarm-test")), None)
+            .expect("native endpoint")
+            .into_path();
+        let unredirected = endpoint_for_label("claude-swarm-test")
+            .expect("swarm endpoint")
+            .into_path();
+        assert_eq!(native, unredirected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tmux_compatible_resolve_endpoint_redirects_windows_claude_child_pid_socket() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _main = EnvGuard::set(
+            RMUX_INTERNAL_CLAUDE_MAIN_SOCKET_ENV,
+            OsStr::new("rmux-claude-test"),
+        );
+        let _swarm = EnvGuard::set(
+            RMUX_INTERNAL_CLAUDE_SWARM_SOCKET_ENV,
+            OsStr::new("claude-swarm-parent-pid"),
+        );
+
+        let redirected =
+            resolve_tmux_compatible_endpoint(Some(OsStr::new("claude-swarm-child-pid")), None)
+                .expect("redirected endpoint")
+                .into_path();
+        let expected = endpoint_for_label("rmux-claude-test")
+            .expect("main endpoint")
+            .into_path();
+        assert_eq!(redirected, expected);
+
+        let native = resolve_endpoint(Some(OsStr::new("claude-swarm-child-pid")), None)
+            .expect("native endpoint")
+            .into_path();
+        let unredirected = endpoint_for_label("claude-swarm-child-pid")
+            .expect("swarm endpoint")
+            .into_path();
+        assert_eq!(native, unredirected);
     }
 
     #[cfg(unix)]
@@ -669,13 +855,13 @@ mod tests {
         path.parent().and_then(Path::parent)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     struct EnvGuard {
         name: &'static str,
         previous: Option<OsString>,
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl EnvGuard {
         fn set(name: &'static str, value: &OsStr) -> Self {
             let previous = std::env::var_os(name);
@@ -683,6 +869,7 @@ mod tests {
             Self { name, previous }
         }
 
+        #[cfg(unix)]
         fn remove(name: &'static str) -> Self {
             let previous = std::env::var_os(name);
             std::env::remove_var(name);
@@ -690,7 +877,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             if let Some(previous) = &self.previous {
@@ -704,15 +891,24 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn rmux_env_accepts_windows_named_pipe_endpoint() {
-        let path = socket_path_from_rmux_env(Some(OsStr::new(
-            r"\\.\pipe\rmux-S-1-5-21-1000-default,123,0",
-        )))
-        .expect("rmux pipe endpoint");
+        let endpoint = endpoint_for_label("env-current").expect("current endpoint");
+        let env_value = format!("{},123,0", endpoint.as_path().to_string_lossy());
+        let path =
+            socket_path_from_rmux_env(Some(OsStr::new(&env_value))).expect("rmux pipe endpoint");
 
-        assert_eq!(
-            path.to_string_lossy(),
-            r"\\.\pipe\rmux-S-1-5-21-1000-default"
-        );
+        assert_eq!(path, endpoint.into_path());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_socket_path_rejects_foreign_sid_pipe() {
+        let integrity = current_integrity_label().expect("current integrity");
+        let path = format!(r"\\.\pipe\rmux-S-1-0-0-il-{integrity}-default");
+
+        let error = endpoint_for_socket_path(Path::new(&path))
+            .expect_err("foreign SID pipe should be rejected");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[cfg(windows)]

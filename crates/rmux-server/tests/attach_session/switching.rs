@@ -186,13 +186,13 @@ async fn switch_client_to_multi_pane_session_emits_border_frame_before_forwardin
 
     let selected = crate::common::send_request(
         &socket_path,
-        &Request::SelectPane(SelectPaneRequest {
+        &Request::SelectPane(Box::new(SelectPaneRequest {
             target: PaneTarget::new(beta.clone(), 2),
             title: None,
             style: None,
             input_disabled: None,
             preserve_zoom: false,
-        }),
+        })),
     )
     .await?;
     assert!(matches!(selected, Response::SelectPane(_)));

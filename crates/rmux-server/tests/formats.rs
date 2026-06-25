@@ -75,7 +75,7 @@ async fn list_windows_uses_shared_formatter_through_real_socket() -> Result<(), 
 
     let new_window = send_request(
         harness.socket_path(),
-        &Request::NewWindow(NewWindowRequest {
+        &Request::NewWindow(Box::new(NewWindowRequest {
             target: alpha.clone(),
             name: Some("logs".to_owned()),
             detached: false,
@@ -85,7 +85,7 @@ async fn list_windows_uses_shared_formatter_through_real_socket() -> Result<(), 
             process_command: None,
             target_window_index: None,
             insert_at_target: false,
-        }),
+        })),
     )
     .await?;
     assert!(matches!(new_window, Response::NewWindow(_)));
@@ -147,7 +147,7 @@ async fn nested_conditionals_expand_inner_templates_through_real_socket(
 
     let new_window = send_request(
         harness.socket_path(),
-        &Request::NewWindow(NewWindowRequest {
+        &Request::NewWindow(Box::new(NewWindowRequest {
             target: alpha.clone(),
             name: Some("logs".to_owned()),
             detached: false,
@@ -157,7 +157,7 @@ async fn nested_conditionals_expand_inner_templates_through_real_socket(
             process_command: None,
             target_window_index: None,
             insert_at_target: false,
-        }),
+        })),
     )
     .await?;
     assert!(matches!(new_window, Response::NewWindow(_)));

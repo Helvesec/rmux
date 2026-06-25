@@ -1821,14 +1821,15 @@ fn move_window_reindex_without_target_uses_current_session() -> Result<(), Box<d
 }
 
 #[test]
-fn move_window_reindex_with_source_and_window_target_is_tmux_noop() -> Result<(), Box<dyn Error>> {
+fn move_window_reindex_with_source_and_window_target_renumbers_like_tmux(
+) -> Result<(), Box<dyn Error>> {
     let _guard = window_surface_guard();
-    let harness = CliHarness::new("move-window-reindex-window-target-noop")?;
+    let harness = CliHarness::new("move-window-reindex-window-target-renumber")?;
     let mut daemon = harness.start_hidden_daemon()?;
 
     assert_success(&harness.run(&["new-session", "-d", "-s", "s", "-n", "zero"])?);
-    assert_success(&harness.run(&["new-window", "-d", "-t", "s", "-n", "one"])?);
-    assert_success(&harness.run(&["new-window", "-d", "-t", "s", "-n", "two"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "s:2", "-n", "two"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "s:5", "-n", "five"])?);
 
     assert_success(&harness.run(&["move-window", "-r", "-s", "s:2", "-t", "s:5"])?);
 
@@ -1839,7 +1840,7 @@ fn move_window_reindex_with_source_and_window_target_is_tmux_noop() -> Result<()
         "-F",
         "#{window_index}:#{window_name}",
     ])?;
-    assert_eq!(stdout(&windows), "0:zero\n1:one\n2:two\n");
+    assert_eq!(stdout(&windows), "0:zero\n1:two\n2:five\n");
     assert!(stderr(&windows).is_empty());
 
     terminate_child(daemon.child_mut())?;

@@ -5,7 +5,7 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use rmux_ipc::{acquire_named_mutex, NamedMutexAcquire, NamedMutexError};
+use rmux_ipc::{acquire_named_mutex, NamedMutexAcquire, NamedMutexError, NamedMutexGuard};
 
 use super::StartupError;
 use crate::bootstrap::deadline::StartupDeadline;
@@ -107,6 +107,17 @@ pub(super) async fn acquire_startup_mutex(
             Err(map_named_mutex_error(error, pipe_name, deadline))
         }
     }
+}
+
+pub(super) fn acquire_startup_mutex_blocking(
+    pipe_name: &Path,
+    mutex_name: &OsStr,
+    deadline: StartupDeadline,
+) -> Result<NamedMutexGuard, StartupError> {
+    let mutex_wait = deadline.requested_timeout().unwrap_or(Duration::MAX);
+    acquire_named_mutex(mutex_name, mutex_wait)
+        .map(NamedMutexAcquire::into_guard)
+        .map_err(|error| map_named_mutex_error(error, pipe_name, deadline))
 }
 
 fn map_named_mutex_error(

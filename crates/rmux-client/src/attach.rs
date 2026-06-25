@@ -400,9 +400,36 @@ where
     let mut pending_render_started_at = None::<Instant>;
     let mut pending_render_drained_after_deadline = false;
     let mut painted_render_frame = false;
+    let mut data_scratch = [0_u8; READ_BUFFER_SIZE];
 
     loop {
-        while let Some(message) = decoder.next_message().map_err(ClientError::from)? {
+        loop {
+            while let Some(bytes) = decoder
+                .next_data_payload_into(&mut data_scratch)
+                .map_err(ClientError::from)?
+            {
+                flush_pending_render_state(
+                    &mut output,
+                    &mut pending_render,
+                    &mut pending_render_started_at,
+                )?;
+                if matches!(
+                    handle_attach_data_payload(
+                        &mut output,
+                        &locked,
+                        &closed,
+                        &mut stop_detector,
+                        bytes,
+                    )?,
+                    AttachDataPayloadOutcome::Stop
+                ) {
+                    return Ok(());
+                }
+            }
+
+            let Some(message) = decoder.next_message().map_err(ClientError::from)? else {
+                break;
+            };
             match message {
                 AttachMessage::Data(bytes) => {
                     flush_pending_render_state(

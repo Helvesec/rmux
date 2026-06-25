@@ -4,8 +4,8 @@ use rmux_proto::{
     PreviousWindowRequest, RenameWindowRequest, Request, Response, RotateWindowDirection,
     RotateWindowRequest, SelectCustomLayoutRequest, SelectLayoutRequest, SelectLayoutTarget,
     SelectOldLayoutRequest, SelectWindowRequest, SessionName, SplitDirection,
-    SplitWindowExtRequest, SplitWindowRequest, SplitWindowTarget, SpreadLayoutRequest,
-    SwapWindowRequest, UnlinkWindowRequest, WindowTarget,
+    SplitWindowExtRequest, SplitWindowRequest, SplitWindowTarget, SplitWindowTargetActionRequest,
+    SpreadLayoutRequest, SwapWindowRequest, UnlinkWindowRequest, WindowTarget,
 };
 
 use crate::{connection::Connection, ClientError};
@@ -72,7 +72,7 @@ impl Connection {
         command: Option<Vec<String>>,
         insert_at_target: bool,
     ) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::NewWindow(NewWindowRequest {
+        self.roundtrip(&Request::NewWindow(Box::new(NewWindowRequest {
             target,
             name,
             detached,
@@ -82,7 +82,7 @@ impl Connection {
             process_command: None,
             target_window_index,
             insert_at_target,
-        }))
+        })))
     }
 
     /// Sends a `kill-window` request over the detached RPC channel.
@@ -298,13 +298,15 @@ impl Connection {
         start_directory: Option<std::path::PathBuf>,
         command: Option<Vec<String>>,
     ) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::RespawnWindow(rmux_proto::RespawnWindowRequest {
-            target,
-            kill,
-            start_directory,
-            environment,
-            command,
-        }))
+        self.roundtrip(&Request::RespawnWindow(Box::new(
+            rmux_proto::RespawnWindowRequest {
+                target,
+                kill,
+                start_directory,
+                environment,
+                command,
+            },
+        )))
     }
 
     /// Sends a `split-window` request over the detached RPC channel.
@@ -358,7 +360,7 @@ impl Connection {
         command: Option<Vec<String>>,
     ) -> Result<Response, ClientError> {
         if command.is_some() || start_directory.is_some() {
-            return self.roundtrip(&Request::SplitWindowExt(SplitWindowExtRequest {
+            return self.roundtrip(&Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
                 target,
                 direction,
                 before: false,
@@ -372,7 +374,7 @@ impl Connection {
                 preserve_zoom: false,
                 full_size: false,
                 stdin_payload: None,
-            }));
+            })));
         }
         self.split_window_with_options(SplitWindowOptions {
             target,
@@ -396,7 +398,7 @@ impl Connection {
             command,
         } = options;
         if command.is_some() {
-            return self.roundtrip(&Request::SplitWindowExt(SplitWindowExtRequest {
+            return self.roundtrip(&Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
                 target,
                 direction,
                 before,
@@ -410,7 +412,7 @@ impl Connection {
                 preserve_zoom: false,
                 full_size: false,
                 stdin_payload: None,
-            }));
+            })));
         }
         self.roundtrip(&Request::SplitWindow(SplitWindowRequest {
             target,
@@ -418,6 +420,14 @@ impl Connection {
             before,
             environment,
         }))
+    }
+
+    /// Sends a `split-window` request with server-side target resolution.
+    pub fn split_window_target_action(
+        &mut self,
+        request: SplitWindowTargetActionRequest,
+    ) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::SplitWindowTargetAction(Box::new(request)))
     }
 
     /// Sends a `select-layout` request over the detached RPC channel.

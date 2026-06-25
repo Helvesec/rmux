@@ -27,6 +27,26 @@ scrollback, process state, and session metadata stay on the local machine. Local
 clients send typed requests through the local IPC transport and receive typed
 responses or rendered output.
 
+## CLI Package Layout
+
+Release packages may install `rmux` as a tiny dispatcher for hot detached
+commands. The tiny binary parses a narrow allowlist of tmux-compatible command
+forms and sends one direct IPC request to the daemon. Complex command forms fall
+back to the canonical full CLI helper installed under `libexec/rmux/rmux` on
+Unix and `libexec/rmux/rmux.exe` on Windows.
+
+The helper remains the source of truth for the complete CLI surface, config
+loading, attached terminal setup, command queues, hooks, formats, and long-lived
+streaming commands. Packagers must ship the public tiny binary and the private
+helper together. Setting `RMUX_DISABLE_TINY_CLI=1` forces the public binary to
+exec the full helper and is the supported operational kill switch for debugging
+tiny-path compatibility issues.
+
+Windows packages for `0.7.0` use the same public tiny/private helper split:
+`rmux.exe` is the public tiny dispatcher, `libexec/rmux/rmux.exe` is the private
+full helper, and `rmux-daemon.exe` is the daemon. See
+`docs/windows-package-managers.md` for the Windows package-manager checklist.
+
 Platform-specific behavior is kept behind crate boundaries:
 
 - `rmux-pty` owns PTY and process handling.

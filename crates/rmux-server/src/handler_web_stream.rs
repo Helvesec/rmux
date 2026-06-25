@@ -36,6 +36,7 @@ pub(crate) struct WebSessionStream {
     pub(crate) snapshot: WebSessionSnapshot,
     pub(crate) writer: WriteHalf<DuplexStream>,
     pub(crate) reader: Option<WebSessionAttachReader>,
+    pub(crate) selected_window_index: Option<u32>,
 }
 
 pub(crate) struct WebSessionAttachReader {
@@ -236,6 +237,14 @@ impl WebSessionStream {
 
     pub(crate) const fn size(&self) -> TerminalSize {
         self.snapshot.size
+    }
+
+    pub(crate) const fn selected_window_index(&self) -> Option<u32> {
+        self.selected_window_index
+    }
+
+    pub(crate) fn select_window_for_view(&mut self, window_index: u32) {
+        self.selected_window_index = Some(window_index);
     }
 
     pub(crate) fn terminal_palette(&self) -> Option<&WebTerminalPalette> {

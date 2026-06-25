@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.7.0
+
+- Added the tiny public CLI package layout for hot detached commands, with the
+  full canonical CLI installed as a private libexec helper for complex paths.
+- Added direct tiny CLI paths for common operations including session creation,
+  split/resize, capture, display-message, send-keys, source-file, list-sessions,
+  and kill-server, while preserving helper fallback for unsupported forms.
+- Added `RMUX_DISABLE_TINY_CLI=1` as an operational kill switch for reverting to
+  the full CLI helper when diagnosing tiny-path compatibility issues.
+- Improved detached command performance and release benchmarking discipline with
+  baseline metadata, perf-diff tooling, and release-review smoke gates for the
+  tiny package layout.
+- Added additive protocol variants and capabilities for target-action and
+  capture fast paths while keeping legacy wire variants available.
+- Hardened tmux compatibility for repeated short flags, queue separators, tiny
+  error surfaces, source-file exit status, and mutating target-action retry
+  safety.
+- Updated release packaging, snap metadata, manpage/version surfaces, and
+  localized download references for `v0.7.0`.
+
+## 0.6.5
+
+- Added release artifacts for `linux-aarch64` alongside the existing Linux,
+  macOS, and Windows archives.
+- Added Sigstore keyless signing for `SHA256SUMS` and GitHub build provenance
+  attestations for release assets. The documented provenance level is SLSA Build
+  Level 2.
+- Updated release documentation, direct-download filenames, and package-manager
+  examples for `v0.6.5`.
+- Added APT repository metadata for both `amd64` and `arm64` Debian packages.
+- Declared the Microsoft Visual C++ runtime dependency in Windows package
+  manager metadata for MSVC release builds.
+- Hardened incomplete terminal parser input and SDK line-stream buffering
+  against unbounded growth.
+
+## 0.6.1
+
+- Published the first patch release in the 0.6 line with the 0.6.0 feature set
+  and release packaging/documentation fixes.
+
 ## 0.6.0
 
 - Added the typed Rust SDK surface for session, window, pane, snapshot, locator,

@@ -3,6 +3,8 @@ use rmux_proto::{
     ErrorResponse, OptionName, PaneTarget, Response, RmuxError, SendKeysResponse, SessionName,
 };
 use rmux_pty::PtyMaster;
+#[cfg(windows)]
+use rmux_pty::{ProcessId, WindowsConsoleKeyEvent};
 
 use crate::input_keys::{encode_key, encode_mouse_event, ExtendedKeyFormat};
 use crate::keys::parse_key_code;
@@ -27,12 +29,31 @@ impl PaneInputWrite {
 enum PaneInputSink {
     Pty(PtyMaster),
     Disabled,
+    #[cfg(windows)]
+    QueuedStarting,
+    #[cfg(test)]
+    CapturedForTest,
+}
+
+#[cfg(windows)]
+pub(super) struct PaneConsoleInputWrite {
+    session_name: SessionName,
+    window_index: u32,
+    pane_index: u32,
+    sink: PaneConsoleInputSink,
+}
+
+#[cfg(windows)]
+enum PaneConsoleInputSink {
+    ConsolePid(ProcessId),
+    Disabled,
+    QueuedStarting,
     #[cfg(test)]
     CapturedForTest,
 }
 
 pub(super) fn prepare_pane_input_write(
-    state: &HandlerState,
+    state: &mut HandlerState,
     target: &PaneTarget,
     bytes: &[u8],
 ) -> Result<PaneInputWrite, RmuxError> {
@@ -50,9 +71,6 @@ pub(super) fn prepare_pane_input_write(
             sink: PaneInputSink::Disabled,
         });
     }
-    let master = state.pane_master_in_window(&session_name, window_index, pane_index)?;
-    #[cfg(not(test))]
-    let _ = bytes;
     #[cfg(test)]
     if state.append_pane_input_capture_for_test(target, bytes) {
         return Ok(PaneInputWrite {
@@ -62,6 +80,18 @@ pub(super) fn prepare_pane_input_write(
             sink: PaneInputSink::CapturedForTest,
         });
     }
+    #[cfg(windows)]
+    if state.queue_starting_pane_input(&session_name, window_index, pane_index, bytes)? {
+        return Ok(PaneInputWrite {
+            session_name,
+            window_index,
+            pane_index,
+            sink: PaneInputSink::QueuedStarting,
+        });
+    }
+    let master = state.pane_master_in_window(&session_name, window_index, pane_index)?;
+    #[cfg(not(any(test, windows)))]
+    let _ = bytes;
     Ok(PaneInputWrite {
         session_name,
         window_index,
@@ -71,15 +101,73 @@ pub(super) fn prepare_pane_input_write(
 }
 
 pub(super) fn prepare_attached_pane_input_writes(
-    state: &HandlerState,
+    state: &mut HandlerState,
     target: &PaneTarget,
     bytes: &[u8],
 ) -> Result<Vec<PaneInputWrite>, RmuxError> {
     prepare_synchronized_pane_input_writes(state, target, bytes)
 }
 
+#[cfg(windows)]
+pub(super) fn prepare_attached_pane_console_input_writes(
+    state: &mut HandlerState,
+    target: &PaneTarget,
+    bytes: &[u8],
+) -> Result<Vec<PaneConsoleInputWrite>, RmuxError> {
+    synchronized_input_targets(state, target)?
+        .into_iter()
+        .map(|target| prepare_pane_console_input_write(state, &target, bytes))
+        .collect()
+}
+
+#[cfg(windows)]
+fn prepare_pane_console_input_write(
+    state: &mut HandlerState,
+    target: &PaneTarget,
+    bytes: &[u8],
+) -> Result<PaneConsoleInputWrite, RmuxError> {
+    let session_name = target.session_name().clone();
+    let window_index = target.window_index();
+    let pane_index = target.pane_index();
+    let pane_id = pane_id_for_input_target(state, target)?;
+    if state.pane_input_is_disabled(pane_id) {
+        let _ = bytes;
+        return Ok(PaneConsoleInputWrite {
+            session_name,
+            window_index,
+            pane_index,
+            sink: PaneConsoleInputSink::Disabled,
+        });
+    }
+    #[cfg(test)]
+    if state.append_pane_input_capture_for_test(target, bytes) {
+        return Ok(PaneConsoleInputWrite {
+            session_name,
+            window_index,
+            pane_index,
+            sink: PaneConsoleInputSink::CapturedForTest,
+        });
+    }
+    if state.queue_starting_pane_input(&session_name, window_index, pane_index, bytes)? {
+        return Ok(PaneConsoleInputWrite {
+            session_name,
+            window_index,
+            pane_index,
+            sink: PaneConsoleInputSink::QueuedStarting,
+        });
+    }
+    let raw_pid = state.pane_pid_in_window(&session_name, window_index, pane_index)?;
+    let pid = ProcessId::new(raw_pid).map_err(|error| RmuxError::Server(error.to_string()))?;
+    Ok(PaneConsoleInputWrite {
+        session_name,
+        window_index,
+        pane_index,
+        sink: PaneConsoleInputSink::ConsolePid(pid),
+    })
+}
+
 pub(super) fn prepare_synchronized_pane_input_writes(
-    state: &HandlerState,
+    state: &mut HandlerState,
     target: &PaneTarget,
     bytes: &[u8],
 ) -> Result<Vec<PaneInputWrite>, RmuxError> {
@@ -179,6 +267,8 @@ pub(super) async fn write_bytes_to_target_io(
     } = write;
     match sink {
         PaneInputSink::Disabled => Ok(()),
+        #[cfg(windows)]
+        PaneInputSink::QueuedStarting => Ok(()),
         PaneInputSink::Pty(master) => write_pane_bytes(master, bytes).await.map_err(|error| {
             RmuxError::Server(format!(
                 "failed to write to pane {}:{}.{}: {}",
@@ -190,7 +280,39 @@ pub(super) async fn write_bytes_to_target_io(
     }
 }
 
-fn pane_id_for_input_target(
+#[cfg(windows)]
+pub(super) async fn write_windows_console_key_to_target_io(
+    write: PaneConsoleInputWrite,
+    key: WindowsConsoleKeyEvent,
+) -> Result<(), RmuxError> {
+    let PaneConsoleInputWrite {
+        session_name,
+        window_index,
+        pane_index,
+        sink,
+    } = write;
+    match sink {
+        PaneConsoleInputSink::Disabled => Ok(()),
+        PaneConsoleInputSink::QueuedStarting => Ok(()),
+        PaneConsoleInputSink::ConsolePid(pid) => {
+            tokio::task::spawn_blocking(move || rmux_pty::write_windows_console_key(pid, key))
+                .await
+                .map_err(|error| {
+                    RmuxError::Server(format!("pane console input task failed: {error}"))
+                })?
+                .map_err(|error| {
+                    RmuxError::Server(format!(
+                        "failed to write console input to pane {}:{}.{}: {}",
+                        session_name, window_index, pane_index, error
+                    ))
+                })
+        }
+        #[cfg(test)]
+        PaneConsoleInputSink::CapturedForTest => Ok(()),
+    }
+}
+
+pub(super) fn pane_id_for_input_target(
     state: &HandlerState,
     target: &PaneTarget,
 ) -> Result<rmux_core::PaneId, RmuxError> {

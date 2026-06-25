@@ -1,0 +1,3 @@
+{"kind":"resize","cols":80,"rows":24}
+{"kind":"resize","cols":200,"rows":60}
+{"kind":"resize","cols":65535,"rows":65535,"expect":"reject"}

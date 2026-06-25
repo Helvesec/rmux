@@ -1,5 +1,6 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,7 +15,8 @@ use rmux_proto::{
 use tokio::sync::{mpsc, watch};
 
 use super::attach_support::{
-    attach_render_target_for_session, attach_target_for_session, AttachRegistration, ClientFlags,
+    attach_render_target_for_session_window, attach_target_for_session, AttachRegistration,
+    ClientFlags, ATTACH_CONTROL_BACKLOG_LIMIT,
 };
 use super::pane_support::resolve_pane_target_ref;
 use super::RequestHandler;
@@ -53,8 +55,12 @@ impl RequestHandler {
         self.open_web_share_token_id(&token_id, pin).await
     }
 
-    pub(crate) fn web_listener(&self) -> rmux_proto::WebShareListener {
-        self.web_shares.listener()
+    pub(crate) fn web_settings(&self) -> crate::web::WebShareSettings {
+        self.web_shares.settings()
+    }
+
+    pub(crate) fn update_web_listener_port(&self, port: u16) {
+        self.web_shares.update_listener_port(port);
     }
 
     pub(crate) fn mark_web_listener_available(&self) {
@@ -120,7 +126,7 @@ impl RequestHandler {
             other => self.web_shares.handle(other),
         };
         match response {
-            Ok(response) => Response::WebShare(response),
+            Ok(response) => Response::WebShare(Box::new(response)),
             Err(error) => Response::Error(ErrorResponse { error }),
         }
     }
@@ -214,6 +220,7 @@ impl RequestHandler {
                 &state,
                 &current_target,
                 target.render_frame.clone(),
+                None,
                 &HashMap::new(),
             )?;
             (current_target.clone(), target, snapshot)
@@ -273,12 +280,14 @@ impl RequestHandler {
             snapshot,
             writer,
             reader: Some(WebSessionAttachReader::new(reader)),
+            selected_window_index: None,
         })
     }
 
     pub(crate) async fn web_session_snapshot_with_scrolls(
         &self,
         session_target: &WebSessionTarget,
+        selected_window_index: Option<u32>,
         scrolls: &HashMap<PaneId, usize>,
     ) -> Result<WebSessionSnapshot, RmuxError> {
         let session_target = self.current_web_session_target(session_target).await?;
@@ -289,18 +298,33 @@ impl RequestHandler {
             .attached_count(session_target.name());
         let terminal_context = OuterTerminalContext::default();
         let state = self.state.lock().await;
+        let _lock_span = crate::perf_instrument::span("state_lock_hold")
+            .with_str("site", "web_session_snapshot");
         let session = state
             .sessions
             .session_by_id(session_target.id())
             .ok_or_else(|| session_not_found_web(session_target.name()))?;
-        let target = attach_render_target_for_session(
+        let selected_window_index =
+            selected_web_session_window_index(session, selected_window_index);
+        let target = attach_render_target_for_session_window(
             &state,
             session.name(),
+            selected_window_index,
             attached_count,
             &terminal_context,
             &self.socket_path(),
         )?;
-        web_session_snapshot_from_state(&state, &session_target, target.render_frame, scrolls)
+        let _render_span = crate::perf_instrument::span("render_compose")
+            .with_str("site", "web_session_snapshot")
+            .with_str("session", session.name().as_str())
+            .with_usize("scroll_count", scrolls.len());
+        web_session_snapshot_from_state(
+            &state,
+            &session_target,
+            target.render_frame,
+            selected_window_index,
+            scrolls,
+        )
     }
 
     #[cfg(test)]
@@ -308,7 +332,7 @@ impl RequestHandler {
         &self,
         session_target: &WebSessionTarget,
     ) -> Result<WebSessionSnapshot, RmuxError> {
-        self.web_session_snapshot_with_scrolls(session_target, &HashMap::new())
+        self.web_session_snapshot_with_scrolls(session_target, None, &HashMap::new())
             .await
     }
 
@@ -316,17 +340,17 @@ impl RequestHandler {
         &self,
         session_target: &WebSessionTarget,
         pane_id: PaneId,
-        scroll_offset: usize,
+        top_line: usize,
+        selected_window_index: Option<u32>,
     ) -> Result<Option<WebSessionPaneFrame>, RmuxError> {
-        if scroll_offset == 0 {
-            return Ok(None);
-        }
         let session_target = self.current_web_session_target(session_target).await?;
         let state = self.state.lock().await;
         let session = state
             .sessions
             .session_by_id(session_target.id())
             .ok_or_else(|| session_not_found_web(session_target.name()))?;
+        let session = web_session_view_session(session, selected_window_index);
+        let session = session.as_ref();
         let window = session.window();
         let active_pane = window.active_pane_index();
         let panes = if window.is_zoomed() {
@@ -340,7 +364,8 @@ impl RequestHandler {
         let Some(geometry) = session_content_geometry(pane.geometry(), window.size()) else {
             return Ok(None);
         };
-        let Some(scrollback) = state.pane_scrollback_view(session.name(), pane.id(), scroll_offset)
+        let Some(scrollback) =
+            state.pane_scrollback_view_from_top_line(session.name(), pane.id(), top_line)
         else {
             return Err(RmuxError::Server(format!(
                 "missing pane transcript: {}",
@@ -351,8 +376,10 @@ impl RequestHandler {
             return Ok(None);
         }
         let mouse_on = state
-            .pane_render_screen(session.name(), pane.id())
-            .is_some_and(|screen| screen.mode() & mode::ALL_MOUSE_MODES != 0);
+            .with_pane_screen(session.name(), pane.id(), |screen| {
+                screen.mode() & mode::ALL_MOUSE_MODES != 0
+            })
+            .unwrap_or(false);
         let mut frame = Vec::new();
         overlay_pane_lines(&mut frame, geometry, &scrollback.ansi_lines);
         let pane = WebSessionPaneView::new(
@@ -387,7 +414,7 @@ impl RequestHandler {
                 Ok(transcript) => transcript,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            let screen = transcript.clone_screen();
+            let screen = transcript.screen();
             let size = screen.size();
             let (cursor_col, cursor_row) = screen.cursor_position();
             let (scroll_top, scroll_bottom) = screen.scroll_region();
@@ -395,7 +422,7 @@ impl RequestHandler {
                 cols: size.cols,
                 rows: size.rows,
                 output_sequence: 0,
-                ansi_lines: snapshot_ansi_lines(&screen),
+                ansi_lines: snapshot_ansi_lines(screen),
                 cursor_row: cursor_row.min(u32::from(size.rows.saturating_sub(1))) as u16,
                 cursor_col: cursor_col.min(u32::from(size.cols.saturating_sub(1))) as u16,
                 cursor_visible: screen.mode() & mode::MODE_CURSOR != 0,
@@ -449,6 +476,8 @@ impl RequestHandler {
         session_target: &WebSessionTarget,
     ) -> Result<(), RmuxError> {
         let session_target = self.current_web_session_target(session_target).await?;
+        #[cfg(windows)]
+        self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
             .handle_kill_session(KillSessionRequest {
                 target: session_target.name().clone(),
@@ -465,6 +494,8 @@ impl RequestHandler {
         pane_id: PaneId,
     ) -> Result<(), RmuxError> {
         let session_target = self.current_web_session_target(session_target).await?;
+        #[cfg(windows)]
+        self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
             .handle_pane_select_ref(PaneSelectRequest {
                 target: PaneTargetRef::by_id(session_target.name().clone(), pane_id),
@@ -481,6 +512,8 @@ impl RequestHandler {
         adjustment: ResizePaneAdjustment,
     ) -> Result<(), RmuxError> {
         let session_target = self.current_web_session_target(session_target).await?;
+        #[cfg(windows)]
+        self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
             .handle_pane_resize_ref(PaneResizeRequest {
                 target: PaneTargetRef::by_id(session_target.name().clone(), pane_id),
@@ -497,6 +530,8 @@ impl RequestHandler {
         direction: SplitDirection,
     ) -> Result<(), RmuxError> {
         let session_target = self.current_web_session_target(session_target).await?;
+        #[cfg(windows)]
+        self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
             .handle_split_window(
                 requester_pid,
@@ -517,6 +552,8 @@ impl RequestHandler {
         requester_pid: u32,
     ) -> Result<(), RmuxError> {
         let session_target = self.current_web_session_target(session_target).await?;
+        #[cfg(windows)]
+        self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
             .handle_new_window(
                 requester_pid,
@@ -541,6 +578,8 @@ impl RequestHandler {
         session_target: &WebSessionTarget,
     ) -> Result<(), RmuxError> {
         let target = self.web_session_active_pane_target(session_target).await?;
+        #[cfg(windows)]
+        self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
             .handle_kill_pane(KillPaneRequest {
                 target,
@@ -556,12 +595,92 @@ impl RequestHandler {
         window_index: u32,
     ) -> Result<(), RmuxError> {
         let session_target = self.current_web_session_target(session_target).await?;
+        #[cfg(windows)]
+        self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
             .handle_select_window(SelectWindowRequest {
                 target: WindowTarget::with_window(session_target.name().clone(), window_index),
             })
             .await;
         response_to_result(response)
+    }
+
+    pub(crate) async fn web_session_select_window_for_view(
+        &self,
+        session_target: &WebSessionTarget,
+        attach_pid: u32,
+        window_index: u32,
+    ) -> Result<bool, RmuxError> {
+        let session_target = self.current_web_session_target(session_target).await?;
+        let (attached_count, terminal_context) = {
+            let active_attach = self.active_attach.lock().await;
+            let active = active_attach
+                .by_pid
+                .get(&attach_pid)
+                .ok_or_else(|| RmuxError::Server("web session attach disappeared".to_owned()))?;
+            (
+                active_attach.attached_count(session_target.name()),
+                active.terminal_context.clone(),
+            )
+        };
+        let target = {
+            let state = self.state.lock().await;
+            let session = state
+                .sessions
+                .session_by_id(session_target.id())
+                .ok_or_else(|| session_not_found_web(session_target.name()))?;
+            if !session.windows().contains_key(&window_index) {
+                return Ok(false);
+            }
+            attach_render_target_for_session_window(
+                &state,
+                session.name(),
+                Some(window_index),
+                attached_count,
+                &terminal_context,
+                &self.socket_path(),
+            )?
+        };
+
+        let mut active_attach = self.active_attach.lock().await;
+        let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
+            return Err(RmuxError::Server(
+                "web session attach disappeared".to_owned(),
+            ));
+        };
+        if &active.session_name != session_target.name() {
+            return Err(RmuxError::Server(
+                "web session attach changed sessions".to_owned(),
+            ));
+        }
+        if active.control_backlog.load(Ordering::Acquire) >= ATTACH_CONTROL_BACKLOG_LIMIT {
+            let _ = active.control_tx.send(AttachControl::Detach);
+            active.closing.store(true, Ordering::SeqCst);
+            active_attach.by_pid.remove(&attach_pid);
+            return Err(RmuxError::Server(
+                "web session attach is not draining updates".to_owned(),
+            ));
+        }
+        active.render_generation = active.render_generation.saturating_add(1);
+        active.render_refresh_pending = false;
+        active.control_backlog.fetch_add(1, Ordering::AcqRel);
+        if active
+            .control_tx
+            .send(AttachControl::switch(target))
+            .is_err()
+        {
+            let _ =
+                active
+                    .control_backlog
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                        value.checked_sub(1)
+                    });
+            active_attach.by_pid.remove(&attach_pid);
+            return Err(RmuxError::Server(
+                "web session attach disappeared".to_owned(),
+            ));
+        }
+        Ok(true)
     }
 
     pub(crate) async fn web_session_rename_window(
@@ -571,6 +690,8 @@ impl RequestHandler {
         name: String,
     ) -> Result<(), RmuxError> {
         let session_target = self.current_web_session_target(session_target).await?;
+        #[cfg(windows)]
+        self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
             .handle_rename_window(RenameWindowRequest {
                 target: WindowTarget::with_window(session_target.name().clone(), window_index),
@@ -586,6 +707,8 @@ impl RequestHandler {
         window_index: u32,
     ) -> Result<(), RmuxError> {
         let session_target = self.current_web_session_target(session_target).await?;
+        #[cfg(windows)]
+        self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
             .handle_kill_window(KillWindowRequest {
                 target: WindowTarget::with_window(session_target.name().clone(), window_index),
@@ -793,12 +916,15 @@ fn web_session_snapshot_from_state(
     state: &crate::pane_terminals::HandlerState,
     session_target: &WebSessionTarget,
     mut frame: Vec<u8>,
+    selected_window_index: Option<u32>,
     scrolls: &HashMap<PaneId, usize>,
 ) -> Result<WebSessionSnapshot, RmuxError> {
     let session = state
         .sessions
         .session_by_id(session_target.id())
         .ok_or_else(|| session_not_found_web(session_target.name()))?;
+    let session = web_session_view_session(session, selected_window_index);
+    let session = session.as_ref();
     let window = session.window();
     let mut view = WebSessionView::new(window.size());
     let active_window = session.active_window_index();
@@ -818,25 +944,24 @@ fn web_session_snapshot_from_state(
     let mut active_cursor_style = 0u32;
 
     for pane in panes {
-        let mode_bits = state
-            .pane_render_screen(session.name(), pane.id())
-            .map(|screen| {
-                if pane.index() == active_pane {
-                    active_mode_bits = screen.mode();
-                    active_cursor_style = screen.cursor_style();
-                }
-                screen.mode()
-            });
+        let screen_state = state.pane_screen_state(session.name(), pane.id());
+        let mode_bits = screen_state.as_ref().map(|screen| {
+            if pane.index() == active_pane {
+                active_mode_bits = screen.mode;
+                active_cursor_style = screen.cursor_style;
+            }
+            screen.mode
+        });
         let Some(geometry) = session_content_geometry(pane.geometry(), window.size()) else {
             continue;
         };
-        let scrollback = state
-            .pane_scrollback_view(
-                session.name(),
-                pane.id(),
-                scrolls.get(&pane.id()).copied().unwrap_or_default(),
-            )
-            .ok_or_else(|| RmuxError::Server(format!("missing pane transcript: {}", pane.id())))?;
+        let scrollback = match scrolls.get(&pane.id()).copied() {
+            Some(top_line) => {
+                state.pane_scrollback_view_from_top_line(session.name(), pane.id(), top_line)
+            }
+            None => state.pane_scrollback_view(session.name(), pane.id(), 0),
+        }
+        .ok_or_else(|| RmuxError::Server(format!("missing pane transcript: {}", pane.id())))?;
         if scrollback.scroll_offset > 0 {
             overlay_pane_lines(&mut frame, geometry, &scrollback.ansi_lines);
         }
@@ -858,6 +983,32 @@ fn web_session_snapshot_from_state(
         active_mode_bits,
         active_cursor_style,
     ))
+}
+
+fn web_session_view_session(
+    session: &rmux_core::Session,
+    selected_window_index: Option<u32>,
+) -> Cow<'_, rmux_core::Session> {
+    let Some(window_index) = selected_web_session_window_index(session, selected_window_index)
+    else {
+        return Cow::Borrowed(session);
+    };
+    if session.active_window_index() == window_index {
+        return Cow::Borrowed(session);
+    }
+
+    let mut selected = session.clone();
+    selected
+        .select_window(window_index)
+        .expect("selected web session window was validated above");
+    Cow::Owned(selected)
+}
+
+fn selected_web_session_window_index(
+    session: &rmux_core::Session,
+    selected_window_index: Option<u32>,
+) -> Option<u32> {
+    selected_window_index.filter(|window_index| session.windows().contains_key(window_index))
 }
 
 #[cfg(test)]

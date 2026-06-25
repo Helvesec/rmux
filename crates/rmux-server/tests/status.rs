@@ -270,13 +270,13 @@ async fn attached_client_pid(
 ) -> Result<String, Box<dyn Error>> {
     match common::send_request(
         socket_path,
-        &Request::ListClients(ListClientsRequest {
+        &Request::ListClients(Box::new(ListClientsRequest {
             format: Some("#{client_pid}".to_owned()),
             filter: None,
             sort_order: None,
             reversed: false,
             target_session: Some(session_name.clone()),
-        }),
+        })),
     )
     .await?
     {

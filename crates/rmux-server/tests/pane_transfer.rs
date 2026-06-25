@@ -10,13 +10,349 @@ mod common;
 
 use common::{session_name, start_server, ClientConnection, TestHarness, PTY_TEST_LOCK};
 use rmux_proto::{
-    BreakPaneRequest, JoinPaneRequest, KillPaneRequest, LastPaneRequest, NewSessionRequest,
-    NewWindowRequest, PaneTarget, Request, Response, SelectPaneRequest, SendKeysRequest,
-    SplitDirection, SplitWindowRequest, SplitWindowTarget, SwapPaneRequest, TerminalSize,
-    WindowTarget,
+    BreakPaneRequest, JoinPaneRequest, KillPaneRequest, LastPaneRequest, ListPanesRequest,
+    ListSessionsRequest, NewSessionExtRequest, NewSessionRequest, NewWindowRequest, PaneTarget,
+    Request, Response, SelectPaneRequest, SendKeysRequest, SplitDirection, SplitWindowRequest,
+    SplitWindowTarget, SwapPaneRequest, TerminalSize, WindowTarget,
 };
 
 const FILE_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[tokio::test]
+async fn break_pane_last_source_window_to_other_session_removes_source_session(
+) -> Result<(), Box<dyn Error>> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let harness = TestHarness::new("break-pane-last-source-to-other-session");
+    let socket_path = harness.socket_path().to_path_buf();
+    let _handle = start_server(&harness).await?;
+    let mut client = ClientConnection::connect(&socket_path).await?;
+    let source = session_name("src");
+    let hidden = session_name("hidden");
+
+    for session in [&source, &hidden] {
+        assert!(matches!(
+            client
+                .send_request(&Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize {
+                        cols: 120,
+                        rows: 40
+                    }),
+                    environment: None,
+                }))
+                .await?,
+            Response::NewSession(_)
+        ));
+    }
+
+    assert_eq!(
+        client
+            .send_request(&Request::BreakPane(Box::new(BreakPaneRequest {
+                source: PaneTarget::new(source.clone(), 0),
+                target: Some(WindowTarget::with_window(hidden.clone(), 1)),
+                name: None,
+                detached: true,
+                after: false,
+                before: false,
+                print_target: false,
+                format: None,
+            })))
+            .await?,
+        Response::BreakPane(rmux_proto::BreakPaneResponse {
+            target: PaneTarget::with_window(hidden.clone(), 1, 0),
+            output: None,
+        })
+    );
+
+    let sessions = client
+        .send_request(&Request::ListSessions(ListSessionsRequest {
+            format: Some("#{session_name}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        }))
+        .await?;
+    let Response::ListSessions(sessions) = sessions else {
+        panic!("expected list-sessions response");
+    };
+    let sessions = String::from_utf8(sessions.output.stdout)?;
+    assert!(!sessions.lines().any(|line| line == source.as_str()));
+    assert!(sessions.lines().any(|line| line == hidden.as_str()));
+
+    let panes = client
+        .send_request(&Request::ListPanes(ListPanesRequest {
+            target: hidden.clone(),
+            target_window_index: None,
+            format: Some("#{window_index}.#{pane_index}:#{pane_id}".to_owned()),
+        }))
+        .await?;
+    let Response::ListPanes(panes) = panes else {
+        panic!("expected list-panes response");
+    };
+    let panes = String::from_utf8(panes.output.stdout)?;
+    assert!(panes.lines().any(|line| line.starts_with("0.0:%")));
+    assert!(panes.lines().any(|line| line.starts_with("1.0:%")));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn break_pane_last_grouped_source_removes_entire_source_group() -> Result<(), Box<dyn Error>>
+{
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let harness = TestHarness::new("break-pane-last-grouped-source-removes-group");
+    let socket_path = harness.socket_path().to_path_buf();
+    let _handle = start_server(&harness).await?;
+    let mut client = ClientConnection::connect(&socket_path).await?;
+    let source = session_name("src");
+    let grouped = session_name("src-peer");
+    let hidden = session_name("hidden");
+
+    for session in [&source, &hidden] {
+        assert!(matches!(
+            client
+                .send_request(&Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize {
+                        cols: 120,
+                        rows: 40
+                    }),
+                    environment: None,
+                }))
+                .await?,
+            Response::NewSession(_)
+        ));
+    }
+    assert!(matches!(
+        client
+            .send_request(&Request::NewSessionExt(Box::new(NewSessionExtRequest {
+                session_name: Some(grouped.clone()),
+                working_directory: None,
+                detached: true,
+                size: Some(TerminalSize {
+                    cols: 120,
+                    rows: 40
+                }),
+                environment: None,
+                group_target: Some(source.clone()),
+                attach_if_exists: false,
+                detach_other_clients: false,
+                kill_other_clients: false,
+                flags: None,
+                window_name: None,
+                print_session_info: false,
+                print_format: None,
+                command: None,
+                process_command: None,
+                client_environment: None,
+                skip_environment_update: false,
+            })))
+            .await?,
+        Response::NewSession(_)
+    ));
+
+    assert!(matches!(
+        client
+            .send_request(&Request::BreakPane(Box::new(BreakPaneRequest {
+                source: PaneTarget::new(source.clone(), 0),
+                target: Some(WindowTarget::with_window(hidden.clone(), 1)),
+                name: None,
+                detached: true,
+                after: false,
+                before: false,
+                print_target: false,
+                format: None,
+            })))
+            .await?,
+        Response::BreakPane(_)
+    ));
+
+    let Response::ListSessions(sessions) = client
+        .send_request(&Request::ListSessions(ListSessionsRequest {
+            format: Some("#{session_name}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        }))
+        .await?
+    else {
+        panic!("expected list-sessions response");
+    };
+    let sessions = String::from_utf8(sessions.output.stdout)?;
+    assert!(!sessions.lines().any(|line| line == source.as_str()));
+    assert!(!sessions.lines().any(|line| line == grouped.as_str()));
+    assert!(sessions.lines().any(|line| line == hidden.as_str()));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn join_pane_last_source_window_to_other_session_removes_source_session(
+) -> Result<(), Box<dyn Error>> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let harness = TestHarness::new("join-pane-last-source-to-other-session");
+    let socket_path = harness.socket_path().to_path_buf();
+    let _handle = start_server(&harness).await?;
+    let mut client = ClientConnection::connect(&socket_path).await?;
+    let source = session_name("src");
+    let hidden = session_name("hidden");
+
+    for session in [&source, &hidden] {
+        assert!(matches!(
+            client
+                .send_request(&Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize {
+                        cols: 120,
+                        rows: 40
+                    }),
+                    environment: None,
+                }))
+                .await?,
+            Response::NewSession(_)
+        ));
+    }
+
+    assert_eq!(
+        client
+            .send_request(&Request::JoinPane(JoinPaneRequest {
+                source: PaneTarget::new(source.clone(), 0),
+                target: PaneTarget::new(hidden.clone(), 0),
+                direction: SplitDirection::Vertical,
+                detached: true,
+                before: false,
+                full_size: false,
+                size: None,
+            }))
+            .await?,
+        Response::JoinPane(rmux_proto::JoinPaneResponse {
+            target: PaneTarget::with_window(hidden.clone(), 0, 1),
+        })
+    );
+
+    let sessions = client
+        .send_request(&Request::ListSessions(ListSessionsRequest {
+            format: Some("#{session_name}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        }))
+        .await?;
+    let Response::ListSessions(sessions) = sessions else {
+        panic!("expected list-sessions response");
+    };
+    let sessions = String::from_utf8(sessions.output.stdout)?;
+    assert!(!sessions.lines().any(|line| line == source.as_str()));
+    assert!(sessions.lines().any(|line| line == hidden.as_str()));
+
+    let panes = client
+        .send_request(&Request::ListPanes(ListPanesRequest {
+            target: hidden.clone(),
+            target_window_index: None,
+            format: Some("#{window_index}.#{pane_index}:#{pane_id}".to_owned()),
+        }))
+        .await?;
+    let Response::ListPanes(panes) = panes else {
+        panic!("expected list-panes response");
+    };
+    let panes = String::from_utf8(panes.output.stdout)?;
+    assert!(panes.lines().any(|line| line.starts_with("0.0:%")));
+    assert!(panes.lines().any(|line| line.starts_with("0.1:%")));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn join_pane_last_grouped_source_removes_entire_source_group() -> Result<(), Box<dyn Error>> {
+    let _guard = PTY_TEST_LOCK.lock().await;
+    let harness = TestHarness::new("join-pane-last-grouped-source-removes-group");
+    let socket_path = harness.socket_path().to_path_buf();
+    let _handle = start_server(&harness).await?;
+    let mut client = ClientConnection::connect(&socket_path).await?;
+    let source = session_name("src");
+    let grouped = session_name("src-peer");
+    let hidden = session_name("hidden");
+
+    for session in [&source, &hidden] {
+        assert!(matches!(
+            client
+                .send_request(&Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize {
+                        cols: 120,
+                        rows: 40
+                    }),
+                    environment: None,
+                }))
+                .await?,
+            Response::NewSession(_)
+        ));
+    }
+    assert!(matches!(
+        client
+            .send_request(&Request::NewSessionExt(Box::new(NewSessionExtRequest {
+                session_name: Some(grouped.clone()),
+                working_directory: None,
+                detached: true,
+                size: Some(TerminalSize {
+                    cols: 120,
+                    rows: 40
+                }),
+                environment: None,
+                group_target: Some(source.clone()),
+                attach_if_exists: false,
+                detach_other_clients: false,
+                kill_other_clients: false,
+                flags: None,
+                window_name: None,
+                print_session_info: false,
+                print_format: None,
+                command: None,
+                process_command: None,
+                client_environment: None,
+                skip_environment_update: false,
+            })))
+            .await?,
+        Response::NewSession(_)
+    ));
+
+    assert!(matches!(
+        client
+            .send_request(&Request::JoinPane(JoinPaneRequest {
+                source: PaneTarget::new(source.clone(), 0),
+                target: PaneTarget::new(hidden.clone(), 0),
+                direction: SplitDirection::Vertical,
+                detached: true,
+                before: false,
+                full_size: false,
+                size: None,
+            }))
+            .await?,
+        Response::JoinPane(_)
+    ));
+
+    let Response::ListSessions(sessions) = client
+        .send_request(&Request::ListSessions(ListSessionsRequest {
+            format: Some("#{session_name}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        }))
+        .await?
+    else {
+        panic!("expected list-sessions response");
+    };
+    let sessions = String::from_utf8(sessions.output.stdout)?;
+    assert!(!sessions.lines().any(|line| line == source.as_str()));
+    assert!(!sessions.lines().any(|line| line == grouped.as_str()));
+    assert!(sessions.lines().any(|line| line == hidden.as_str()));
+
+    Ok(())
+}
 
 #[tokio::test]
 async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), Box<dyn Error>> {
@@ -64,13 +400,13 @@ async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), B
     );
     assert_eq!(
         client
-            .send_request(&Request::SelectPane(SelectPaneRequest {
+            .send_request(&Request::SelectPane(Box::new(SelectPaneRequest {
                 target: PaneTarget::new(session.clone(), 1),
                 title: None,
                 style: None,
                 input_disabled: None,
                 preserve_zoom: false,
-            }))
+            })))
             .await?,
         Response::SelectPane(rmux_proto::SelectPaneResponse {
             target: PaneTarget::new(session.clone(), 1),
@@ -78,13 +414,13 @@ async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), B
     );
     assert_eq!(
         client
-            .send_request(&Request::SelectPane(SelectPaneRequest {
+            .send_request(&Request::SelectPane(Box::new(SelectPaneRequest {
                 target: PaneTarget::new(session.clone(), 0),
                 title: None,
                 style: None,
                 input_disabled: None,
                 preserve_zoom: false,
-            }))
+            })))
             .await?,
         Response::SelectPane(rmux_proto::SelectPaneResponse {
             target: PaneTarget::new(session.clone(), 0),
@@ -118,7 +454,7 @@ async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), B
 
     assert_eq!(
         client
-            .send_request(&Request::NewWindow(NewWindowRequest {
+            .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
                 target: session.clone(),
                 name: Some("dest".to_owned()),
                 detached: true,
@@ -128,7 +464,7 @@ async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), B
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await?,
         Response::NewWindow(rmux_proto::NewWindowResponse {
             target: WindowTarget::with_window(session.clone(), 1),
@@ -166,7 +502,7 @@ async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), B
 
     assert_eq!(
         client
-            .send_request(&Request::BreakPane(BreakPaneRequest {
+            .send_request(&Request::BreakPane(Box::new(BreakPaneRequest {
                 source: PaneTarget::with_window(session.clone(), 1, 1),
                 target: Some(WindowTarget::with_window(session.clone(), 2)),
                 name: Some("broken".to_owned()),
@@ -175,7 +511,7 @@ async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), B
                 before: false,
                 print_target: false,
                 format: None,
-            }))
+            })))
             .await?,
         Response::BreakPane(rmux_proto::BreakPaneResponse {
             target: PaneTarget::with_window(session.clone(), 2, 0),
@@ -198,7 +534,7 @@ async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), B
 
     assert!(matches!(
         client
-            .send_request(&Request::NewWindow(NewWindowRequest {
+            .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
                 target: session.clone(),
                 name: Some("swap".to_owned()),
                 detached: true,
@@ -208,7 +544,7 @@ async fn pane_transfer_commands_move_live_ptys_between_windows() -> Result<(), B
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await?,
         Response::NewWindow(_)
     ));

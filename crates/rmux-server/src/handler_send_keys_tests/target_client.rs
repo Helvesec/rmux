@@ -10,19 +10,21 @@ async fn send_keys_target_client_uses_that_clients_current_pane() {
     let capture = RawPaneInputProbe::start(&handler, &alpha, "target-client", 1).await;
 
     let response = handler
-        .handle(Request::SendKeysExt2(rmux_proto::SendKeysExt2Request {
-            target: None,
-            keys: vec!["A".to_owned()],
-            expand_formats: false,
-            hex: false,
-            literal: true,
-            dispatch_key_table: false,
-            copy_mode_command: false,
-            forward_mouse_event: false,
-            reset_terminal: false,
-            repeat_count: None,
-            target_client: Some("77".to_owned()),
-        }))
+        .handle(Request::SendKeysExt2(Box::new(
+            rmux_proto::SendKeysExt2Request {
+                target: None,
+                keys: vec!["A".to_owned()],
+                expand_formats: false,
+                hex: false,
+                literal: true,
+                dispatch_key_table: false,
+                copy_mode_command: false,
+                forward_mouse_event: false,
+                reset_terminal: false,
+                repeat_count: None,
+                target_client: Some("77".to_owned()),
+            },
+        )))
         .await;
 
     assert_eq!(
@@ -40,19 +42,21 @@ async fn send_keys_missing_target_client_is_successful_noop() {
     let capture = RawPaneInputProbe::start(&handler, &alpha, "target-client-missing", 0).await;
 
     let response = handler
-        .handle(Request::SendKeysExt2(rmux_proto::SendKeysExt2Request {
-            target: Some(PaneTarget::new(alpha, 0)),
-            keys: vec!["A".to_owned()],
-            expand_formats: false,
-            hex: false,
-            literal: true,
-            dispatch_key_table: false,
-            copy_mode_command: false,
-            forward_mouse_event: false,
-            reset_terminal: false,
-            repeat_count: None,
-            target_client: Some("999999".to_owned()),
-        }))
+        .handle(Request::SendKeysExt2(Box::new(
+            rmux_proto::SendKeysExt2Request {
+                target: Some(PaneTarget::new(alpha, 0)),
+                keys: vec!["A".to_owned()],
+                expand_formats: false,
+                hex: false,
+                literal: true,
+                dispatch_key_table: false,
+                copy_mode_command: false,
+                forward_mouse_event: false,
+                reset_terminal: false,
+                repeat_count: None,
+                target_client: Some("999999".to_owned()),
+            },
+        )))
         .await;
 
     assert_eq!(
@@ -74,7 +78,7 @@ async fn send_keys_target_client_key_dispatch_uses_target_client_context() {
     handler.register_attach(77, alpha.clone(), control_tx).await;
 
     let bound = handler
-        .handle(Request::BindKey(BindKeyRequest {
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
             table_name: "prefix".to_owned(),
             key: "x".to_owned(),
             note: Some("target-client-context".to_owned()),
@@ -84,24 +88,26 @@ async fn send_keys_target_client_key_dispatch_uses_target_client_context() {
                 "-t".to_owned(),
                 beta.to_string(),
             ]),
-        }))
+        })))
         .await;
     assert!(matches!(bound, Response::BindKey(_)));
 
     let response = handler
-        .handle(Request::SendKeysExt2(rmux_proto::SendKeysExt2Request {
-            target: None,
-            keys: vec!["C-b".to_owned(), "x".to_owned()],
-            expand_formats: false,
-            hex: false,
-            literal: false,
-            dispatch_key_table: true,
-            copy_mode_command: false,
-            forward_mouse_event: false,
-            reset_terminal: false,
-            repeat_count: None,
-            target_client: Some("77".to_owned()),
-        }))
+        .handle(Request::SendKeysExt2(Box::new(
+            rmux_proto::SendKeysExt2Request {
+                target: None,
+                keys: vec!["C-b".to_owned(), "x".to_owned()],
+                expand_formats: false,
+                hex: false,
+                literal: false,
+                dispatch_key_table: true,
+                copy_mode_command: false,
+                forward_mouse_event: false,
+                reset_terminal: false,
+                repeat_count: None,
+                target_client: Some("77".to_owned()),
+            },
+        )))
         .await;
 
     assert_eq!(

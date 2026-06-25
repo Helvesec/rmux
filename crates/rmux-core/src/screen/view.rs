@@ -1,6 +1,83 @@
 use crate::grid::{GridLine, GridLineFlags};
+use crate::input::{Colour, COLOUR_DEFAULT};
 
 use super::Screen;
+
+/// Borrowed read-only view of one rendered screen cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenCellRef<'a> {
+    text: &'a str,
+    width: u8,
+    padding: bool,
+    attr: u16,
+    fg: Colour,
+    bg: Colour,
+    us: Colour,
+    link: u32,
+}
+
+impl<'a> ScreenCellRef<'a> {
+    /// Returns the stored cell text.
+    #[must_use]
+    pub const fn text(&self) -> &'a str {
+        self.text
+    }
+
+    /// Returns the display width of the cell.
+    #[must_use]
+    pub const fn width(&self) -> u8 {
+        self.width
+    }
+
+    /// Returns whether this cell is padding for a wide glyph.
+    #[must_use]
+    pub const fn is_padding(&self) -> bool {
+        self.padding
+    }
+
+    /// Returns the cell attributes.
+    #[must_use]
+    pub const fn attr(&self) -> u16 {
+        self.attr
+    }
+
+    /// Returns the foreground colour.
+    #[must_use]
+    pub const fn fg(&self) -> Colour {
+        self.fg
+    }
+
+    /// Returns the background colour.
+    #[must_use]
+    pub const fn bg(&self) -> Colour {
+        self.bg
+    }
+
+    /// Returns the underline colour.
+    #[must_use]
+    pub const fn us(&self) -> Colour {
+        self.us
+    }
+
+    /// Returns the hyperlink inner ID for the cell.
+    #[must_use]
+    pub const fn link(&self) -> u32 {
+        self.link
+    }
+}
+
+fn blank_cell_ref() -> ScreenCellRef<'static> {
+    ScreenCellRef {
+        text: " ",
+        width: 1,
+        padding: false,
+        attr: 0,
+        fg: COLOUR_DEFAULT,
+        bg: COLOUR_DEFAULT,
+        us: COLOUR_DEFAULT,
+        link: 0,
+    }
+}
 
 /// Read-only copy of one rendered screen cell for copy-mode consumers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +226,64 @@ impl ScreenLineView {
 }
 
 impl Screen {
+    /// Visits borrowed cells for one visible row, padding to `cols` cells.
+    ///
+    /// Returns `false` when `row` is outside the visible viewport. Plain ASCII
+    /// compact rows are visited directly from their compact text storage, so
+    /// callers that only need the visible viewport can avoid the owned
+    /// [`ScreenLineView`] allocation path.
+    pub fn visit_visible_line_cells(
+        &self,
+        row: usize,
+        cols: usize,
+        mut visit: impl FnMut(ScreenCellRef<'_>),
+    ) -> bool {
+        let Some(line) = self
+            .grid
+            .visible_line(u32::try_from(row).unwrap_or(u32::MAX))
+        else {
+            return false;
+        };
+        if let Some(text) = line.plain_text() {
+            let text_cols = text.len().min(cols);
+            for col in 0..text_cols {
+                visit(ScreenCellRef {
+                    text: &text[col..col + 1],
+                    width: 1,
+                    padding: false,
+                    attr: 0,
+                    fg: COLOUR_DEFAULT,
+                    bg: COLOUR_DEFAULT,
+                    us: COLOUR_DEFAULT,
+                    link: 0,
+                });
+            }
+            for _ in text_cols..cols {
+                visit(blank_cell_ref());
+            }
+            return true;
+        }
+
+        let mut emitted = 0_usize;
+        for cell in line.cells().iter().take(cols) {
+            visit(ScreenCellRef {
+                text: cell.text(),
+                width: cell.width(),
+                padding: cell.is_padding(),
+                attr: cell.attr(),
+                fg: cell.fg(),
+                bg: cell.bg(),
+                us: cell.us(),
+                link: cell.link(),
+            });
+            emitted += 1;
+        }
+        for _ in emitted..cols {
+            visit(blank_cell_ref());
+        }
+        true
+    }
+
     /// Returns a read-only copy of one absolute line.
     #[must_use]
     pub fn absolute_line_view(&self, absolute_y: usize) -> Option<ScreenLineView> {

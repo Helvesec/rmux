@@ -127,14 +127,14 @@ async fn set_environment_round_trips_and_requires_existing_sessions() -> Result<
 
     let global = send_request(
         &socket_path,
-        &Request::SetEnvironment(SetEnvironmentRequest {
+        &Request::SetEnvironment(Box::new(SetEnvironmentRequest {
             scope: ScopeSelector::Global,
             name: "TERM".to_owned(),
             value: "screen".to_owned(),
             mode: None,
             hidden: false,
             format: false,
-        }),
+        })),
     )
     .await?;
     assert_eq!(
@@ -147,14 +147,14 @@ async fn set_environment_round_trips_and_requires_existing_sessions() -> Result<
 
     let session = send_request(
         &socket_path,
-        &Request::SetEnvironment(SetEnvironmentRequest {
+        &Request::SetEnvironment(Box::new(SetEnvironmentRequest {
             scope: ScopeSelector::Session(session_name("alpha")),
             name: "TERM".to_owned(),
             value: "tmux-256color".to_owned(),
             mode: None,
             hidden: false,
             format: false,
-        }),
+        })),
     )
     .await?;
     assert_eq!(
@@ -167,14 +167,14 @@ async fn set_environment_round_trips_and_requires_existing_sessions() -> Result<
 
     let missing_session = send_request(
         &socket_path,
-        &Request::SetEnvironment(SetEnvironmentRequest {
+        &Request::SetEnvironment(Box::new(SetEnvironmentRequest {
             scope: ScopeSelector::Session(session_name("missing")),
             name: "TERM".to_owned(),
             value: "screen".to_owned(),
             mode: None,
             hidden: false,
             format: false,
-        }),
+        })),
     )
     .await?;
     assert_eq!(

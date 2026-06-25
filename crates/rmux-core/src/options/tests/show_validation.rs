@@ -227,6 +227,48 @@ fn style_options_with_format_expansions_skip_eager_literal_validation() {
 }
 
 #[test]
+fn pane_border_styles_are_visible_in_pane_show_scope() {
+    let mut store = OptionStore::new();
+    let alpha = session_name("alpha");
+    let pane = PaneTarget::with_window(alpha, 0, 0);
+
+    store
+        .set(
+            ScopeSelector::Pane(pane.clone()),
+            OptionName::PaneBorderStyle,
+            "fg=red".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("pane border style set succeeds");
+    store
+        .set(
+            ScopeSelector::Pane(pane.clone()),
+            OptionName::PaneActiveBorderStyle,
+            "fg=green".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("pane active border style set succeeds");
+
+    let border = store
+        .show_options_lines_filtered(
+            &OptionScopeSelector::Pane(pane.clone()),
+            Some("pane-border-style"),
+            true,
+        )
+        .expect("pane border show succeeds");
+    let active = store
+        .show_options_lines_filtered(
+            &OptionScopeSelector::Pane(pane),
+            Some("pane-active-border-style"),
+            true,
+        )
+        .expect("pane active border show succeeds");
+
+    assert_eq!(border, vec!["fg=red".to_owned()]);
+    assert_eq!(active, vec!["fg=green".to_owned()]);
+}
+
+#[test]
 fn colour_options_canonicalize_bare_decimal_palette_indices() {
     let mut store = OptionStore::new();
 

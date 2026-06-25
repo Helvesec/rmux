@@ -2,15 +2,19 @@ use std::path::Path;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
-use rmux_client::{
-    connect, connect_or_absent, ClientError, ConnectResult, Connection, StartServerError,
-};
-use rmux_proto::{ListSessionsRequest, RmuxError};
+use rmux_client::{connect, ClientError, Connection, StartServerError};
+#[cfg(not(windows))]
+use rmux_client::{connect_or_absent, ConnectResult};
+use rmux_proto::ListSessionsRequest;
+#[cfg(not(windows))]
+use rmux_proto::RmuxError;
 
 use super::{
-    expect_command_output, expect_command_success, resolve_session_target_or_current, run_command,
-    run_command_resolved, run_payload_command, write_command_output, ExitFailure, StartupOptions,
+    expect_command_output, resolve_session_target_or_current, run_command, run_command_resolved,
+    run_payload_command, ExitFailure, StartupOptions,
 };
+#[cfg(not(windows))]
+use super::{expect_command_success, write_command_output};
 use crate::cli_args::{ClientTargetArgs, ServerAccessArgs, SessionTargetArgs};
 
 #[cfg(unix)]
@@ -45,6 +49,18 @@ pub(super) fn run_start_server(
     Ok(0)
 }
 
+#[cfg(windows)]
+pub(super) fn run_kill_server(socket_path: &Path) -> Result<i32, ExitFailure> {
+    let mut connection = connect(socket_path)
+        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    match connection.kill_server_after_write() {
+        Ok(()) => Ok(0),
+        Err(error) if kill_server_connection_closed(&error) => Ok(0),
+        Err(error) => Err(ExitFailure::from_client(error)),
+    }
+}
+
+#[cfg(not(windows))]
 pub(super) fn run_kill_server(socket_path: &Path) -> Result<i32, ExitFailure> {
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
@@ -69,6 +85,7 @@ pub(super) fn run_kill_server(socket_path: &Path) -> Result<i32, ExitFailure> {
     }
 }
 
+#[cfg(not(windows))]
 fn run_legacy_wire_v1_kill_server(socket_path: &Path) -> Result<i32, ExitFailure> {
     let mut connection = match connect_or_absent(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?
@@ -103,7 +120,7 @@ fn wait_for_killed_server_socket_cleanup(socket_path: &Path) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn wait_for_killed_server_socket_cleanup(_socket_path: &Path) {}
 
 pub(super) fn run_server_access(
@@ -164,6 +181,7 @@ fn kill_server_connection_closed(error: &ClientError) -> bool {
         )
 }
 
+#[cfg(not(windows))]
 fn unsupported_wire_version(error: &ClientError) -> bool {
     matches!(
         error,

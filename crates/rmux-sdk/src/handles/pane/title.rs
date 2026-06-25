@@ -21,13 +21,13 @@ pub(super) async fn set_title(pane: &Pane, title: String) -> Result<()> {
             .await?
     } else {
         pane.transport()
-            .request(Request::SelectPane(SelectPaneRequest {
+            .request(Request::SelectPane(Box::new(SelectPaneRequest {
                 target: pane.target().into(),
                 title: Some(title),
                 style: None,
                 input_disabled: None,
                 preserve_zoom: false,
-            }))
+            })))
             .await?
     };
 

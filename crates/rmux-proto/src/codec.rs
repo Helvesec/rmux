@@ -146,7 +146,14 @@ impl FrameDecoder {
             self.buffer.clear();
             return Err(RmuxError::BadFrameMagic(magic));
         }
-        let Some((version, version_len)) = decode_varint_u32(&self.buffer[1..])? else {
+        let version = match decode_varint_u32(&self.buffer[1..]) {
+            Ok(version) => version,
+            Err(error) => {
+                self.buffer.clear();
+                return Err(error);
+            }
+        };
+        let Some((version, version_len)) = version else {
             return Ok(None);
         };
         if let Err(error) = ensure_supported_version(version) {
@@ -177,16 +184,16 @@ impl FrameDecoder {
             return Ok(None);
         }
 
-        let frame: Vec<u8> = self.buffer.drain(..required).collect();
-        decode_payload(&frame[header_start + 4..])
-            .map(Some)
-            .map_err(|error| match error {
-                RmuxError::Decode(_) => {
-                    self.buffer.clear();
-                    error
-                }
-                _ => error,
-            })
+        let decoded = match decode_payload(&self.buffer[header_start + 4..required]) {
+            Ok(decoded) => decoded,
+            Err(error @ RmuxError::Decode(_)) => {
+                self.buffer.clear();
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.buffer.drain(..required);
+        Ok(Some(decoded))
     }
 
     /// Returns any bytes remaining in the internal buffer after the last

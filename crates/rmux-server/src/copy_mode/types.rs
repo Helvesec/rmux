@@ -67,7 +67,7 @@ pub(crate) struct CopyModeCommandOutcome {
 }
 
 impl CopyModeCommandOutcome {
-    pub(super) fn nothing() -> Self {
+    pub(crate) fn nothing() -> Self {
         Self {
             cancel: false,
             transfer: None,

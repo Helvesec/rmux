@@ -1,4 +1,12 @@
 use super::*;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+use crate::control::{ControlModeUpgrade, ControlServerEvent};
+use crate::handler::ControlRegistration;
+use crate::outer_terminal::OuterTerminalContext;
+use rmux_os::identity::UserIdentity;
+use tokio::sync::mpsc;
 
 #[tokio::test]
 async fn parsed_queue_assignments_apply_before_following_commands() {
@@ -16,6 +24,97 @@ async fn parsed_queue_assignments_apply_before_following_commands() {
 
     let state = handler.state.lock().await;
     assert_eq!(state.environment.global_value("FOO"), Some("bar"));
+}
+
+#[tokio::test]
+async fn read_only_control_rejects_parse_time_assignments() {
+    let handler = RequestHandler::new();
+    let requester_pid = 42_001;
+    register_read_only_control_client(&handler, requester_pid).await;
+    let parsed = CommandParser::new()
+        .parse("FOO=bar list-sessions")
+        .expect("commands parse");
+
+    let result = handler
+        .execute_control_commands(requester_pid, parsed)
+        .await;
+
+    assert_eq!(
+        result
+            .error
+            .expect("read-only assignment is rejected")
+            .to_string(),
+        "server error: client is read-only"
+    );
+    let state = handler.state.lock().await;
+    assert_eq!(state.environment.global_value("FOO"), None);
+}
+
+#[tokio::test]
+async fn read_only_control_rejects_inserted_parse_time_assignments() {
+    let handler = RequestHandler::new();
+    let requester_pid = 42_002;
+    register_read_only_control_client(&handler, requester_pid).await;
+    let parsed = CommandParser::new()
+        .parse("if-shell -F 1 { FOO=bar list-sessions }")
+        .expect("commands parse");
+
+    let result = handler
+        .execute_control_commands(requester_pid, parsed)
+        .await;
+
+    assert_eq!(
+        result
+            .error
+            .expect("inserted read-only assignment is rejected")
+            .to_string(),
+        "server error: client is read-only"
+    );
+    let state = handler.state.lock().await;
+    assert_eq!(state.environment.global_value("FOO"), None);
+}
+
+#[tokio::test]
+async fn read_only_control_rejects_special_queue_invocations() {
+    let handler = RequestHandler::new();
+    let requester_pid = 42_003;
+    register_read_only_control_client(&handler, requester_pid).await;
+
+    for command in [
+        "if-shell -F 1 { list-sessions }",
+        "source-file /definitely/missing-rmux.conf",
+        "clear-prompt-history",
+    ] {
+        let parsed = CommandParser::new().parse(command).expect("commands parse");
+
+        let result = handler
+            .execute_control_commands(requester_pid, parsed)
+            .await;
+
+        assert_eq!(
+            result
+                .error
+                .unwrap_or_else(|| panic!("{command} should be rejected"))
+                .to_string(),
+            "server error: client is read-only"
+        );
+    }
+}
+
+#[tokio::test]
+async fn read_only_control_allows_list_panes_all_observation() {
+    let handler = RequestHandler::new();
+    let requester_pid = 42_004;
+    register_read_only_control_client(&handler, requester_pid).await;
+    let parsed = CommandParser::new()
+        .parse("list-panes -a")
+        .expect("commands parse");
+
+    let result = handler
+        .execute_control_commands(requester_pid, parsed)
+        .await;
+
+    assert_eq!(result.error, None);
 }
 
 #[tokio::test]
@@ -48,6 +147,26 @@ async fn parsed_queue_lock_client_defaults_to_current_client() {
         .expect("queue succeeds");
 
     assert!(output.stdout().is_empty());
+}
+
+async fn register_read_only_control_client(handler: &RequestHandler, requester_pid: u32) {
+    let (event_tx, _event_rx) = mpsc::unbounded_channel::<ControlServerEvent>();
+    handler
+        .register_control_with_access(
+            requester_pid,
+            ControlModeUpgrade {
+                mode: rmux_proto::ControlMode::Plain,
+                terminal_context: OuterTerminalContext::default(),
+            },
+            ControlRegistration {
+                event_tx,
+                closing: Arc::new(AtomicBool::new(false)),
+                uid: 1000,
+                user: UserIdentity::Uid(1000),
+                can_write: false,
+            },
+        )
+        .await;
 }
 
 #[tokio::test]
@@ -217,7 +336,7 @@ async fn if_shell_string_mode_newlines_share_one_abort_group() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::IfShell(IfShellRequest {
+        .handle(Request::IfShell(Box::new(IfShellRequest {
             condition: "1".to_owned(),
             format_mode: true,
             then_command: "show-buffer -b missing\nset-buffer -b skipped no".to_owned(),
@@ -225,7 +344,7 @@ async fn if_shell_string_mode_newlines_share_one_abort_group() {
             target: None,
             caller_cwd: None,
             background: false,
-        }))
+        })))
         .await;
 
     assert!(matches!(response, Response::Error(_)));
@@ -256,7 +375,7 @@ async fn parsed_queue_resolves_unresolved_window_targets_before_protocol_dispatc
     ));
     assert!(matches!(
         handler
-            .handle(Request::NewWindow(NewWindowRequest {
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
                 target: alpha.clone(),
                 name: Some("logs".to_owned()),
                 detached: true,
@@ -266,7 +385,7 @@ async fn parsed_queue_resolves_unresolved_window_targets_before_protocol_dispatc
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await,
         Response::NewWindow(_)
     ));

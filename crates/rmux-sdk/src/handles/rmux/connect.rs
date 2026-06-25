@@ -23,6 +23,8 @@ use windows_sys::Win32::Foundation::{
 const INTERNAL_DAEMON_FLAG: &str = "--__internal-daemon";
 #[cfg(windows)]
 const WINDOWS_CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(windows)]
+const WINDOWS_STARTUP_READY_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[cfg(unix)]
 pub(super) async fn connect_transport(
@@ -183,6 +185,8 @@ fn spawn_hidden_daemon_with_binary(
     binary: &OsStr,
     allow_job_breakaway: bool,
 ) -> io::Result<()> {
+    #[cfg(windows)]
+    let ready = rmux_os::daemon::StartupReadyEvent::new()?;
     let mut command = Command::new(binary);
     command
         .arg(INTERNAL_DAEMON_FLAG)
@@ -190,9 +194,15 @@ fn spawn_hidden_daemon_with_binary(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    #[cfg(windows)]
+    command.arg("--startup-ready-event").arg(ready.name());
     rmux_os::daemon::configure_hidden_daemon_command(&mut command, allow_job_breakaway);
     let child = rmux_os::daemon::spawn_hidden_daemon_command(&mut command)?;
     drop(child);
+    #[cfg(windows)]
+    {
+        let _ = ready.wait(WINDOWS_STARTUP_READY_EVENT_TIMEOUT);
+    }
     Ok(())
 }
 

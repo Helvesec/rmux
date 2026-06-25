@@ -706,7 +706,7 @@ async fn move_window_reindex_with_source_ignores_source_and_renumbers_target_ses
 }
 
 #[tokio::test]
-async fn move_window_reindex_with_source_and_window_target_is_noop() {
+async fn move_window_reindex_with_window_target_renumbers_target_session() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     create_session(&handler, "alpha").await;
@@ -715,7 +715,7 @@ async fn move_window_reindex_with_source_and_window_target_is_noop() {
 
     let response = handler
         .handle(Request::MoveWindow(MoveWindowRequest {
-            source: Some(WindowTarget::with_window(alpha.clone(), 5)),
+            source: None,
             target: MoveWindowTarget::Window(WindowTarget::with_window(alpha.clone(), 9)),
             renumber: true,
             kill_destination: false,
@@ -737,22 +737,25 @@ async fn move_window_reindex_with_source_and_window_target_is_noop() {
     let session = state.sessions.session(&alpha).expect("alpha should exist");
     assert_eq!(
         session.windows().keys().copied().collect::<Vec<_>>(),
-        vec![0, 5, 9]
+        vec![0, 1, 2]
     );
 }
 
 #[tokio::test]
-async fn move_window_reindex_with_source_and_missing_window_target_is_noop() {
+async fn move_window_reindex_with_source_and_window_target_ignores_source() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
+    let beta = session_name("beta");
     create_session(&handler, "alpha").await;
+    create_session(&handler, "beta").await;
     insert_window(&handler, &alpha, 2).await;
     insert_window(&handler, &alpha, 5).await;
+    insert_window(&handler, &beta, 4).await;
 
     let response = handler
         .handle(Request::MoveWindow(MoveWindowRequest {
             source: Some(WindowTarget::with_window(alpha.clone(), 5)),
-            target: MoveWindowTarget::Window(WindowTarget::with_window(alpha.clone(), 9)),
+            target: MoveWindowTarget::Window(WindowTarget::with_window(beta.clone(), 4)),
             renumber: true,
             kill_destination: false,
             detached: true,
@@ -764,16 +767,21 @@ async fn move_window_reindex_with_source_and_missing_window_target_is_noop() {
     assert_eq!(
         response,
         Response::MoveWindow(rmux_proto::MoveWindowResponse {
-            session_name: alpha.clone(),
+            session_name: beta.clone(),
             target: None,
         })
     );
 
     let state = handler.state.lock().await;
-    let session = state.sessions.session(&alpha).expect("alpha should exist");
+    let alpha_session = state.sessions.session(&alpha).expect("alpha should exist");
     assert_eq!(
-        session.windows().keys().copied().collect::<Vec<_>>(),
+        alpha_session.windows().keys().copied().collect::<Vec<_>>(),
         vec![0, 2, 5]
+    );
+    let beta_session = state.sessions.session(&beta).expect("beta should exist");
+    assert_eq!(
+        beta_session.windows().keys().copied().collect::<Vec<_>>(),
+        vec![0, 1]
     );
 }
 

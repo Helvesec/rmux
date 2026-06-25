@@ -1,0 +1,16 @@
+<svg width="400" height="30" viewBox="60 0 340 30" fill="none" xmlns="http://www.w3.org/2000/svg">
+<style>
+  .item { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; font-size: 20px; fill: #0969da; }
+  .new { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; font-size: 15px; font-weight: 800; fill: #5f1b7a; }
+</style>
+<circle cx="162" cy="15" r="3.5" fill="#59636e" />
+<text x="178" y="22" class="item">Claude Agents</text>
+<g transform="rotate(-6 347 15)">
+  <path d="M325 8.5 L316 11 L325 14.5 Z" fill="#fbf0ff" stroke="#9f54d6" stroke-width="2" stroke-linejoin="round" />
+  <rect x="323" y="3.5" width="67" height="22" rx="6" fill="#fbf0ff" stroke="#9f54d6" stroke-width="2" />
+  <text x="333" y="20" class="new">NEW !</text>
+</g>
+<path d="M393 5 L397 -4" stroke="#d97706" stroke-width="2.2" stroke-linecap="round" />
+<path d="M393 13 L399 9" stroke="#d97706" stroke-width="2.2" stroke-linecap="round" />
+<path d="M393 22 L399 24" stroke="#d97706" stroke-width="2.2" stroke-linecap="round" />
+</svg>

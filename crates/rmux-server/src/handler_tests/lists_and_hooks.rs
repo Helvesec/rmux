@@ -67,7 +67,7 @@ async fn list_sessions_format_uses_each_sessions_active_pane_context() {
 
     for (name, path) in [("alpha", &alpha_dir), ("beta", &beta_dir)] {
         let created = handler
-            .handle(Request::NewSessionExt(NewSessionExtRequest {
+            .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
                 session_name: Some(session_name(name)),
                 working_directory: Some(path.to_string_lossy().into_owned()),
                 detached: true,
@@ -85,7 +85,7 @@ async fn list_sessions_format_uses_each_sessions_active_pane_context() {
                 process_command: None,
                 client_environment: None,
                 skip_environment_update: false,
-            }))
+            })))
             .await;
         assert!(matches!(created, Response::NewSession(_)));
     }

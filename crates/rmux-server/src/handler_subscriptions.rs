@@ -321,11 +321,11 @@ impl RequestHandler {
                     });
                 }
                 OutputCursorItem::Gap(gap) => {
-                    return Response::PaneOutputLag(PaneOutputLagResponse {
+                    return Response::PaneOutputLag(Box::new(PaneOutputLagResponse {
                         subscription_id: request.subscription_id,
                         cursor,
                         lag: lag_dto(&gap),
-                    });
+                    }));
                 }
             }
         }

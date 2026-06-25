@@ -25,8 +25,8 @@ impl RequestHandler {
     ) -> Response {
         let key_count = request.keys.len();
         let (prepared, mut failures) = {
-            let state = self.state.lock().await;
-            prepare_broadcast_writes(&state, &request)
+            let mut state = self.state.lock().await;
+            prepare_broadcast_writes(&mut state, &request)
         };
 
         let mut successes = Vec::new();
@@ -54,7 +54,7 @@ impl RequestHandler {
 }
 
 fn prepare_broadcast_writes(
-    state: &HandlerState,
+    state: &mut HandlerState,
     request: &rmux_proto::PaneBroadcastInputRequest,
 ) -> (Vec<PreparedBroadcastWrite>, Vec<PaneBroadcastInputFailure>) {
     let mut prepared = Vec::new();
@@ -76,7 +76,7 @@ fn prepare_broadcast_writes(
 }
 
 fn prepare_one_broadcast_write(
-    state: &HandlerState,
+    state: &mut HandlerState,
     target_index: u32,
     target: &PaneTargetRef,
     request: &rmux_proto::PaneBroadcastInputRequest,

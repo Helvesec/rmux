@@ -2,9 +2,9 @@ use super::RequestHandler;
 use rmux_core::Utf8Config;
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
-    ErrorResponse, NewSessionRequest, OptionName, Request, Response, RmuxError, ScopeSelector,
-    SessionName, SetOptionByNameRequest, SetOptionMode, SetOptionRequest, TerminalSize,
-    WindowTarget,
+    ErrorResponse, NewSessionRequest, OptionName, PaneTarget, Request, Response, RmuxError,
+    ScopeSelector, SessionName, SetOptionByNameRequest, SetOptionMode, SetOptionRequest,
+    TerminalSize, WindowTarget,
 };
 
 fn session_name(value: &str) -> SessionName {
@@ -170,7 +170,7 @@ async fn set_option_by_name_refreshes_existing_transcripts_for_server_utf8_optio
 
     assert_eq!(
         handler
-            .handle(Request::SetOptionByName(SetOptionByNameRequest {
+            .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
                 scope: OptionScopeSelector::ServerGlobal,
                 name: "variation-selector-always-wide".to_owned(),
                 value: Some("off".to_owned()),
@@ -180,7 +180,7 @@ async fn set_option_by_name_refreshes_existing_transcripts_for_server_utf8_optio
                 unset_pane_overrides: false,
                 format: false,
                 format_target: None,
-            }))
+            })))
             .await,
         Response::SetOptionByName(rmux_proto::SetOptionByNameResponse {
             scope: OptionScopeSelector::ServerGlobal,
@@ -205,6 +205,7 @@ async fn pane_style_options_resolve_session_then_global_for_supported_variants()
     create_session(&handler, "alpha").await;
     create_session(&handler, "beta").await;
     let alpha_window = WindowTarget::with_window(session_name("alpha"), 0);
+    let alpha_pane = PaneTarget::with_window(session_name("alpha"), 0, 0);
 
     assert!(matches!(
         handler
@@ -239,6 +240,28 @@ async fn pane_style_options_resolve_session_then_global_for_supported_variants()
             .await,
         Response::SetOption(_)
     ));
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Pane(alpha_pane.clone()),
+                option: OptionName::PaneBorderStyle,
+                value: "fg=colour4".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Pane(alpha_pane),
+                option: OptionName::PaneActiveBorderStyle,
+                value: "fg=colour5".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
 
     let state = handler.state.lock().await;
     assert_eq!(
@@ -246,6 +269,21 @@ async fn pane_style_options_resolve_session_then_global_for_supported_variants()
             .options
             .resolve_for_window(&session_name("alpha"), 0, OptionName::PaneBorderStyle,),
         Some("fg=colour3")
+    );
+    assert_eq!(
+        state
+            .options
+            .resolve_for_pane(&session_name("alpha"), 0, 0, OptionName::PaneBorderStyle),
+        Some("fg=colour4")
+    );
+    assert_eq!(
+        state.options.resolve_for_pane(
+            &session_name("alpha"),
+            0,
+            0,
+            OptionName::PaneActiveBorderStyle,
+        ),
+        Some("fg=colour5")
     );
     assert_eq!(
         state.options.resolve_for_window(

@@ -65,17 +65,17 @@ pub(crate) fn queue_snapshot(
     socket: &WebSocketOutbound,
     snapshot: &WebPaneSnapshot,
 ) -> OutboundQueueResult {
-    socket.queue_snapshot(binary_payload(WS_SNAPSHOT_FULL, &snapshot.ansi_bytes()))
+    socket.queue_snapshot(pane_snapshot_payload(snapshot))
 }
 
 pub(crate) fn queue_session_view(
     socket: &WebSocketOutbound,
     snapshot: &WebSessionSnapshot,
 ) -> OutboundQueueResult {
-    let Ok(view) = serde_json::to_vec(&snapshot.view) else {
+    let Ok(frame) = session_view_payload(snapshot) else {
         return OutboundQueueResult::Closed;
     };
-    socket.queue_frame(binary_payload(WS_SESSION_VIEW, &view))
+    socket.queue_frame(frame)
 }
 
 pub(crate) fn queue_session_keyframe(
@@ -180,16 +180,30 @@ fn resize_payload(size: TerminalSize) -> Vec<u8> {
     )
 }
 
+fn pane_snapshot_payload(snapshot: &WebPaneSnapshot) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(1);
+    frame.push(WS_SNAPSHOT_FULL);
+    snapshot.append_ansi_bytes(&mut frame);
+    frame
+}
+
 fn session_snapshot_payload(snapshot: &WebSessionSnapshot) -> Vec<u8> {
-    binary_payload(WS_SNAPSHOT_FULL, &snapshot.ansi_bytes())
+    let mut frame = Vec::with_capacity(1);
+    frame.push(WS_SNAPSHOT_FULL);
+    snapshot.append_ansi_bytes(&mut frame);
+    frame
 }
 
 fn session_view_payload(snapshot: &WebSessionSnapshot) -> serde_json::Result<Vec<u8>> {
-    serde_json::to_vec(&snapshot.view).map(|view| binary_payload(WS_SESSION_VIEW, &view))
+    let mut frame = Vec::with_capacity(1);
+    frame.push(WS_SESSION_VIEW);
+    serde_json::to_writer(&mut frame, &snapshot.view)?;
+    Ok(frame)
 }
 
 fn session_pane_frame_payload(frame: &WebSessionPaneFrame) -> Vec<u8> {
-    let mut body = Vec::with_capacity(24 + frame.frame.len());
+    let mut body = Vec::with_capacity(25 + frame.frame.len());
+    body.push(WS_SESSION_PANE_FRAME);
     body.extend_from_slice(&frame.pane.id.to_be_bytes());
     body.extend_from_slice(&frame.size.cols.to_be_bytes());
     body.extend_from_slice(&frame.size.rows.to_be_bytes());
@@ -200,7 +214,7 @@ fn session_pane_frame_payload(frame: &WebSessionPaneFrame) -> Vec<u8> {
     body.extend_from_slice(&saturating_u32(frame.pane.scroll_offset).to_be_bytes());
     body.extend_from_slice(&saturating_u32(frame.pane.history_size).to_be_bytes());
     body.extend_from_slice(&frame.frame);
-    binary_payload(WS_SESSION_PANE_FRAME, &body)
+    body
 }
 
 fn session_keyframe_payloads(
@@ -229,13 +243,103 @@ fn ttl_remaining_seconds(expires_at: Option<SystemTime>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use rmux_proto::TerminalSize;
+    use serde_json::json;
 
     use super::{
-        session_keyframe_payloads, session_pane_frame_payload, WebSessionPaneFrame,
-        WebSessionSnapshot, WS_RESIZE_NOTIFY, WS_SESSION_PANE_FRAME, WS_SESSION_VIEW,
-        WS_SNAPSHOT_FULL,
+        session_keyframe_payloads, session_pane_frame_payload, PaneSize, ServerMessage,
+        WebSessionPaneFrame, WebSessionSnapshot, SERVER_CAPABILITIES, WEB_SHARE_PROTOCOL_VERSION,
+        WS_RESIZE_NOTIFY, WS_SESSION_PANE_FRAME, WS_SESSION_VIEW, WS_SNAPSHOT_FULL,
     };
     use crate::handler::{TestWebSessionView, WebSessionPaneView};
+    use crate::web::protocol::PANE_FRAME_CAPABILITY;
+    use crate::web::{WebShareConnectionCounts, WebShareRevokeReason};
+
+    #[test]
+    fn ready_message_wire_shape_is_v1_and_capability_gated() {
+        let payload = ServerMessage::Ready {
+            protocol_version: WEB_SHARE_PROTOCOL_VERSION,
+            capabilities: SERVER_CAPABILITIES,
+            pane_size: PaneSize { cols: 80, rows: 24 },
+            scope: "session",
+            share_id: "share-1",
+            session_name: Some("dev"),
+            role: "operator",
+            operator: true,
+            operator_access: true,
+            spectator_access: false,
+            controls: true,
+            show_viewers: true,
+            spectator_pairing_code: None,
+            ttl_remaining_seconds: Some(30),
+            connection_counts: WebShareConnectionCounts::new(2, Some(5), 1, Some(1)),
+            terminal_palette: None,
+        };
+
+        let encoded = serde_json::to_value(payload).expect("ready payload serializes");
+
+        assert_eq!(WEB_SHARE_PROTOCOL_VERSION, 1);
+        assert_eq!(
+            encoded,
+            json!({
+                "type": "ready",
+                "protocol_version": 1,
+                "capabilities": ["e2ee-token-auth", "terminal-palette-v1", PANE_FRAME_CAPABILITY],
+                "pane_size": { "cols": 80, "rows": 24 },
+                "scope": "session",
+                "share_id": "share-1",
+                "session_name": "dev",
+                "role": "operator",
+                "operator": true,
+                "operator_access": true,
+                "spectator_access": false,
+                "controls": true,
+                "show_viewers": true,
+                "ttl_remaining_seconds": 30,
+                "spectators_active": 2,
+                "spectators_max": 5,
+                "operators_active": 1,
+                "operators_max": 1,
+                "viewers_connected": 3
+            })
+        );
+    }
+
+    #[test]
+    fn viewer_count_message_wire_shape_is_stable() {
+        let payload = ServerMessage::ViewerCount {
+            connection_counts: WebShareConnectionCounts::new(1, None, 2, Some(3)),
+        };
+
+        let encoded = serde_json::to_value(payload).expect("viewer count payload serializes");
+
+        assert_eq!(
+            encoded,
+            json!({
+                "type": "viewer_count",
+                "spectators_active": 1,
+                "operators_active": 2,
+                "operators_max": 3,
+                "viewers_connected": 3
+            })
+        );
+    }
+
+    #[test]
+    fn share_revoked_message_wire_shape_is_stable() {
+        let payload = ServerMessage::ShareRevoked {
+            reason: WebShareRevokeReason::TtlExpired.as_str(),
+        };
+
+        let encoded = serde_json::to_value(payload).expect("revoked payload serializes");
+
+        assert_eq!(
+            encoded,
+            json!({
+                "type": "share_revoked",
+                "reason": "ttl_expired"
+            })
+        );
+    }
 
     #[test]
     fn session_keyframe_keeps_resize_snapshot_and_view_atomic_order() {

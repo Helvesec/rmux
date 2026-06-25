@@ -16,6 +16,7 @@ const LOCK_SHELL_COMMAND_TAG: u8 = 10;
 const DETACH_EXEC_SHELL_COMMAND_TAG: u8 = 11;
 const RESIZE_GEOMETRY_TAG: u8 = 12;
 const RENDER_TAG: u8 = 13;
+const WINDOWS_CONSOLE_KEYSTROKE_TAG: u8 = 14;
 const DATA_HEADER_LEN: usize = 5;
 const RESIZE_FRAME_LEN: usize = 5;
 const SINGLE_TAG_FRAME_LEN: usize = 1;
@@ -24,22 +25,118 @@ const SINGLE_TAG_FRAME_LEN: usize = 1;
 pub const ATTACH_DATA_HEADER_LEN: usize = DATA_HEADER_LEN;
 
 /// Typed attach-stream input captured from an attached client.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachedKeystroke {
     bytes: Vec<u8>,
+    windows_console_key: Option<AttachedWindowsConsoleKey>,
 }
 
 impl AttachedKeystroke {
     /// Creates a typed keystroke from the terminal byte sequence read by the client.
     #[must_use]
     pub fn new(bytes: Vec<u8>) -> Self {
-        Self { bytes }
+        Self {
+            bytes,
+            windows_console_key: None,
+        }
+    }
+
+    /// Attaches the original Windows console key event that produced this byte sequence.
+    #[must_use]
+    pub fn with_windows_console_key(mut self, key: AttachedWindowsConsoleKey) -> Self {
+        self.windows_console_key = Some(key);
+        self
     }
 
     /// Returns the terminal byte sequence carried by this typed keystroke.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Returns the original Windows console key event when the client captured one.
+    #[must_use]
+    pub fn windows_console_key(&self) -> Option<AttachedWindowsConsoleKey> {
+        self.windows_console_key
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AttachedWindowsConsoleKeystroke {
+    bytes: Vec<u8>,
+    windows_console_key: AttachedWindowsConsoleKey,
+}
+
+impl AttachedWindowsConsoleKeystroke {
+    fn from_keystroke(keystroke: &AttachedKeystroke, key: AttachedWindowsConsoleKey) -> Self {
+        Self {
+            bytes: keystroke.bytes.clone(),
+            windows_console_key: key,
+        }
+    }
+
+    fn into_keystroke(self) -> AttachedKeystroke {
+        AttachedKeystroke::new(self.bytes).with_windows_console_key(self.windows_console_key)
+    }
+}
+
+/// Original Windows console key data for attach clients running on ConPTY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachedWindowsConsoleKey {
+    virtual_key_code: u16,
+    virtual_scan_code: u16,
+    unicode_char: u16,
+    control_key_state: u32,
+    repeat_count: u16,
+}
+
+impl AttachedWindowsConsoleKey {
+    /// Creates structured Windows console key data from a KEY_EVENT_RECORD.
+    #[must_use]
+    pub const fn new(
+        virtual_key_code: u16,
+        virtual_scan_code: u16,
+        unicode_char: u16,
+        control_key_state: u32,
+        repeat_count: u16,
+    ) -> Self {
+        Self {
+            virtual_key_code,
+            virtual_scan_code,
+            unicode_char,
+            control_key_state,
+            repeat_count,
+        }
+    }
+
+    /// Returns the Windows virtual-key code.
+    #[must_use]
+    pub const fn virtual_key_code(self) -> u16 {
+        self.virtual_key_code
+    }
+
+    /// Returns the Windows virtual scan code.
+    #[must_use]
+    pub const fn virtual_scan_code(self) -> u16 {
+        self.virtual_scan_code
+    }
+
+    /// Returns the UTF-16 character reported by the key event.
+    #[must_use]
+    pub const fn unicode_char(self) -> u16 {
+        self.unicode_char
+    }
+
+    /// Returns the Windows control-key-state bitset.
+    #[must_use]
+    pub const fn control_key_state(self) -> u32 {
+        self.control_key_state
+    }
+
+    /// Returns the Windows key repeat count.
+    #[must_use]
+    pub const fn repeat_count(self) -> u16 {
+        self.repeat_count
     }
 }
 
@@ -158,7 +255,7 @@ pub fn encode_attach_message(message: &AttachMessage) -> Result<Vec<u8>, RmuxErr
     match message {
         AttachMessage::Data(bytes) => encode_data_message(bytes),
         AttachMessage::Render(bytes) => encode_data_like_message(RENDER_TAG, bytes),
-        AttachMessage::Keystroke(keystroke) => encode_structured_message(KEYSTROKE_TAG, keystroke),
+        AttachMessage::Keystroke(keystroke) => encode_keystroke_message(keystroke),
         AttachMessage::KeyDispatched(response) => {
             encode_structured_message(KEY_DISPATCHED_TAG, response)
         }
@@ -313,6 +410,7 @@ impl AttachFrameDecoder {
             DETACH_EXEC_SHELL_COMMAND_TAG => self.next_detach_exec_shell_command_message(),
             RESIZE_GEOMETRY_TAG => self.next_resize_geometry_message(),
             RENDER_TAG => self.next_render_message(),
+            WINDOWS_CONSOLE_KEYSTROKE_TAG => self.next_windows_console_keystroke_message(),
             other => {
                 self.buffer.clear();
                 Err(RmuxError::Decode(format!(
@@ -492,8 +590,20 @@ impl AttachFrameDecoder {
     }
 
     fn next_keystroke_message(&mut self) -> Result<Option<AttachMessage>, RmuxError> {
-        self.next_structured_message(KEYSTROKE_TAG)
-            .map(|message| message.map(AttachMessage::Keystroke))
+        self.next_structured_message(KEYSTROKE_TAG).map(|message| {
+            message.map(|bytes| AttachMessage::Keystroke(AttachedKeystroke::new(bytes)))
+        })
+    }
+
+    fn next_windows_console_keystroke_message(
+        &mut self,
+    ) -> Result<Option<AttachMessage>, RmuxError> {
+        self.next_structured_message::<AttachedWindowsConsoleKeystroke>(
+            WINDOWS_CONSOLE_KEYSTROKE_TAG,
+        )
+        .map(|message| {
+            message.map(|keystroke| AttachMessage::Keystroke(keystroke.into_keystroke()))
+        })
     }
 
     fn next_key_dispatched_message(&mut self) -> Result<Option<AttachMessage>, RmuxError> {
@@ -614,6 +724,17 @@ where
     let bytes = bincode::serialize(message)
         .map_err(|error| RmuxError::Encode(format!("invalid attach structured frame: {error}")))?;
     encode_data_like_message(tag, &bytes)
+}
+
+fn encode_keystroke_message(keystroke: &AttachedKeystroke) -> Result<Vec<u8>, RmuxError> {
+    if let Some(key) = keystroke.windows_console_key() {
+        return encode_structured_message(
+            WINDOWS_CONSOLE_KEYSTROKE_TAG,
+            &AttachedWindowsConsoleKeystroke::from_keystroke(keystroke, key),
+        );
+    }
+
+    encode_structured_message(KEYSTROKE_TAG, &keystroke.bytes)
 }
 
 fn encode_resize_message(size: TerminalSize) -> Vec<u8> {

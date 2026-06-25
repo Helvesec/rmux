@@ -93,13 +93,13 @@ async fn attached_prefix_x_during_display_panes_opens_kill_pane_prompt() {
     ));
     assert!(matches!(
         handler
-            .handle(Request::SelectPane(SelectPaneRequest {
+            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
                 target: PaneTarget::new(alpha.clone(), 1),
                 title: None,
                 style: None,
                 input_disabled: None,
                 preserve_zoom: false,
-            }))
+            })))
             .await,
         Response::SelectPane(_)
     ));
@@ -201,13 +201,13 @@ async fn display_panes_input_uses_visible_pane_base_index_labels() {
     ));
     assert!(matches!(
         handler
-            .handle(Request::SelectPane(SelectPaneRequest {
+            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
                 target: PaneTarget::with_window(alpha.clone(), 0, 0),
                 title: None,
                 style: None,
                 input_disabled: None,
                 preserve_zoom: false,
-            }))
+            })))
             .await,
         Response::SelectPane(_)
     ));
@@ -403,7 +403,7 @@ async fn attached_prefix_q_inside_choose_tree_restores_the_tree_overlay_without_
     }
     assert!(matches!(
         handler
-            .handle(Request::NewWindow(NewWindowRequest {
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
                 target: alpha.clone(),
                 name: Some("w1".to_owned()),
                 detached: true,
@@ -413,7 +413,7 @@ async fn attached_prefix_q_inside_choose_tree_restores_the_tree_overlay_without_
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await,
         Response::NewWindow(_)
     ));

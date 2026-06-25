@@ -5,6 +5,7 @@ use crate::copy_mode::{
     run_pipe_command, CopyBufferTarget, CopyModeCommandContext, CopyModePipeCommand, CopyModeState,
     CopyModeTransfer, ModeKeys,
 };
+use crate::limits::bounded_repeat_count;
 use crate::mouse::copy_mode_mouse_context;
 use crate::pane_terminals::HandlerState;
 use rmux_core::LifecycleEvent;
@@ -199,7 +200,7 @@ impl RequestHandler {
             });
         };
         let args = tokens.get(1..).unwrap_or(&[]);
-        let repeat_count = request.repeat_count.unwrap_or(1).max(1);
+        let repeat_count = bounded_repeat_count(request.repeat_count);
 
         match self
             .execute_copy_mode_command(requester_pid, target, command, args, repeat_count)
@@ -309,9 +310,27 @@ impl RequestHandler {
             copy_mode_context(&state, &target, refresh_screen, attached_mouse)
         };
 
+        let repeat_count = crate::limits::clamp_repeat_count(repeat_count);
         let mut mode_changed = false;
         for _ in 0..repeat_count {
-            let outcome = {
+            let search_off_lock = if CopyModeState::command_runs_search(command) {
+                let transcript = target_transcript
+                    .lock()
+                    .expect("pane transcript mutex must not be poisoned");
+                let Some(mode) = transcript.copy_mode_state() else {
+                    return Err(RmuxError::Server("pane is not in copy mode".to_owned()));
+                };
+                mode.search_should_run_off_lock(args)
+            } else {
+                false
+            };
+
+            let (outcome, stop_repeats) = if search_off_lock {
+                let result = self
+                    .execute_copy_mode_search_command(&target_transcript, command, args, &context)
+                    .await?;
+                (result.outcome, result.stop_repeats)
+            } else {
                 let mut transcript = target_transcript
                     .lock()
                     .expect("pane transcript mutex must not be poisoned");
@@ -323,7 +342,7 @@ impl RequestHandler {
                         if outcome.cancel && transcript.clear_copy_mode() {
                             mode_changed = true;
                         }
-                        outcome
+                        (outcome, false)
                     }
                     Err(error) => return Err(error),
                 }
@@ -331,7 +350,7 @@ impl RequestHandler {
             if let Some(transfer) = outcome.transfer {
                 self.apply_copy_mode_transfer(&context, transfer).await?;
             }
-            if outcome.cancel {
+            if outcome.cancel || stop_repeats {
                 break;
             }
         }

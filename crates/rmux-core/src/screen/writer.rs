@@ -3,7 +3,11 @@ use crate::input::mode;
 use crate::input::{CellState, InputEndType, ScreenWriter, COLOUR_DEFAULT};
 use crate::TerminalPassthrough;
 
-use super::{SavedGrid, Screen};
+use super::{SavedGrid, Screen, TITLE_STACK_MAX};
+
+fn cursor_backward_tab_steps(n: u32, current: u32) -> u32 {
+    n.max(1).min(current.saturating_add(1))
+}
 
 impl ScreenWriter for Screen {
     fn collect_add(&mut self, ch: char, cell: &CellState) {
@@ -178,27 +182,7 @@ impl ScreenWriter for Screen {
         let count = n.max(1).min(sx.saturating_sub(x));
         let blank = self.blank_cell(bg);
         if let Some(line) = self.current_line_mut() {
-            line.materialize_for_cell_mutation();
-            let cells = line
-                .cells()
-                .iter()
-                .cloned()
-                .enumerate()
-                .map(|(index, cell)| (index as u32, cell))
-                .collect::<Vec<_>>();
-            for (index, cell) in cells.into_iter().rev() {
-                if index < x || index + count >= sx {
-                    continue;
-                }
-                if let Some(target) = line.cell_mut(index + count) {
-                    *target = cell;
-                }
-            }
-            for index in x..x + count {
-                if let Some(target) = line.cell_mut(index) {
-                    *target = blank.clone();
-                }
-            }
+            line.insert_cells(x, count, &blank);
             Self::repair_wide_cells_on_line(line, sx, bg);
             line.touch();
         }
@@ -212,16 +196,7 @@ impl ScreenWriter for Screen {
         let count = n.max(1).min(sx.saturating_sub(x));
         let blank = self.blank_cell(bg);
         if let Some(line) = self.current_line_mut() {
-            line.materialize_for_cell_mutation();
-            let cells = line.cells().to_vec();
-            for index in x..sx {
-                if let Some(target) = line.cell_mut(index) {
-                    *target = cells
-                        .get((index + count) as usize)
-                        .cloned()
-                        .unwrap_or_else(|| blank.clone());
-                }
-            }
+            line.delete_cells(x, count, &blank);
             Self::repair_wide_cells_on_line(line, sx, bg);
             line.touch();
         }
@@ -240,7 +215,7 @@ impl ScreenWriter for Screen {
     fn clear_end_of_screen(&mut self, bg: i32) {
         if self.cursor_y == 0 && self.cursor_column() == 0 {
             self.clear_selected_cells();
-            self.grid.clear_visible_to_history(bg);
+            self.grid.clear_visible_to_history(COLOUR_DEFAULT);
             return;
         }
         let x = self.cursor_column();
@@ -248,20 +223,24 @@ impl ScreenWriter for Screen {
             self.clear_line_range(self.cursor_y, x, self.grid.sx().saturating_sub(1), bg);
         }
         if self.cursor_y + 1 < self.grid.sy() {
-            self.clear_screen_region(self.cursor_y + 1, self.grid.sy().saturating_sub(1), bg);
+            self.clear_screen_region(
+                self.cursor_y + 1,
+                self.grid.sy().saturating_sub(1),
+                COLOUR_DEFAULT,
+            );
         }
     }
 
     fn clear_start_of_screen(&mut self, bg: i32) {
         if self.cursor_y > 0 {
-            self.clear_screen_region(0, self.cursor_y - 1, bg);
+            self.clear_screen_region(0, self.cursor_y - 1, COLOUR_DEFAULT);
         }
         self.clear_line_range(self.cursor_y, 0, self.cursor_column(), bg);
     }
 
-    fn clear_screen(&mut self, bg: i32) {
+    fn clear_screen(&mut self, _bg: i32) {
         self.clear_selected_cells();
-        self.grid.clear_visible_to_history(bg);
+        self.grid.clear_visible_to_history(COLOUR_DEFAULT);
     }
 
     fn clear_history(&mut self) {
@@ -361,14 +340,23 @@ impl ScreenWriter for Screen {
         };
 
         let current_size = self.grid.size();
-        self.grid
-            .resize_width(u32::from(saved.grid.size().cols), COLOUR_DEFAULT);
-        self.grid.resize_height(
-            u32::from(saved.grid.size().rows),
-            &mut self.cursor_y,
-            COLOUR_DEFAULT,
-        );
-        self.grid.replace_visible(saved.grid.visible_lines());
+        let saved_size = saved.grid.size();
+        if current_size.rows == saved_size.rows {
+            self.grid.replace_visible_resized_width_only(
+                saved_size,
+                saved.grid.visible_lines(),
+                COLOUR_DEFAULT,
+            );
+        } else {
+            self.grid
+                .resize_width(u32::from(saved_size.cols), COLOUR_DEFAULT);
+            self.grid.resize_height(
+                u32::from(saved_size.rows),
+                &mut self.cursor_y,
+                COLOUR_DEFAULT,
+            );
+            self.grid.replace_visible(saved.grid.visible_lines());
+        }
         self.grid.set_history_enabled(saved.history_enabled);
         self.resize(current_size);
         if let Some((x, y, pending_wrap)) = saved_cursor {
@@ -391,7 +379,10 @@ impl ScreenWriter for Screen {
     fn cursor_backward_tab(&mut self, n: u32) {
         self.clear_pending_wrap();
         let mut current = self.cursor_column();
-        for _ in 0..n.max(1) {
+        for _ in 0..cursor_backward_tab_steps(n, current) {
+            if current == 0 {
+                break;
+            }
             let previous = (0..current as usize)
                 .rev()
                 .find(|index| self.tabs[*index])
@@ -421,11 +412,15 @@ impl ScreenWriter for Screen {
     }
 
     fn set_title(&mut self, title: &str) {
-        Screen::set_title(self, title);
+        if self.title_rename_enabled {
+            Screen::set_title(self, title);
+        }
     }
 
     fn set_window_name(&mut self, name: &str) {
-        self.window_name = name.to_owned();
+        if self.title_rename_enabled {
+            self.window_name = name.to_owned();
+        }
     }
 
     fn set_path(&mut self, path: &str) {
@@ -559,10 +554,20 @@ impl ScreenWriter for Screen {
     }
 
     fn push_title(&mut self) {
+        if !self.title_rename_enabled {
+            return;
+        }
+        if self.title_stack.len() >= TITLE_STACK_MAX {
+            let excess = self.title_stack.len() + 1 - TITLE_STACK_MAX;
+            self.title_stack.drain(0..excess);
+        }
         self.title_stack.push(self.title.clone());
     }
 
     fn pop_title(&mut self) {
+        if !self.title_rename_enabled {
+            return;
+        }
         if let Some(title) = self.title_stack.pop() {
             self.title = title;
         }
@@ -588,4 +593,14 @@ impl ScreenWriter for Screen {
     fn osc_reset_bg(&mut self) {}
     fn osc_reset_cursor(&mut self) {}
     fn osc_shell_integration(&mut self, _data: &str) {}
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cursor_backward_tab_steps_are_bounded_by_cursor_column() {
+        assert_eq!(super::cursor_backward_tab_steps(0, 0), 1);
+        assert_eq!(super::cursor_backward_tab_steps(1, 7), 1);
+        assert_eq!(super::cursor_backward_tab_steps(u32::MAX, 7), 8);
+    }
 }

@@ -15,6 +15,7 @@ The zip contains:
 ```text
 rmux-<semver>-windows-x86_64/
   rmux.exe
+  libexec/rmux/rmux.exe
   rmux-daemon.exe
   README.md
   LICENSE-APACHE
@@ -23,6 +24,50 @@ rmux-<semver>-windows-x86_64/
   SHA256SUMS.txt
   share/rmux/artifact-metadata.json
 ```
+
+For `0.7.0`, `rmux.exe` is the public tiny dispatcher. The full CLI helper is
+private package content at `libexec/rmux/rmux.exe`; package-manager shims should
+only expose `rmux.exe` and `rmux-daemon.exe`.
+
+## Tiny CLI Contract
+
+The Windows tiny CLI package layout is:
+
+```text
+rmux-<semver>-windows-x86_64/
+  rmux.exe                 public tiny dispatcher
+  libexec/rmux/rmux.exe    private full CLI helper
+  rmux-daemon.exe          daemon
+```
+
+Required invariants:
+
+- `rmux.exe` must fall back to `libexec/rmux/rmux.exe` for every command form
+  outside the tiny allowlist.
+- Setting `RMUX_DISABLE_TINY_CLI=1` must force `rmux.exe` to delegate to
+  `libexec/rmux/rmux.exe`.
+- Missing, stale, or mismatched helpers must fail closed with a clear error;
+  they must not silently skip tmux-compatible behavior.
+- Direct tiny paths must be enabled command-by-command. Detached list, capture,
+  resize, and kill paths may be safer to enable before attach or console paths.
+- The full helper remains authoritative for config loading, formats, command
+  queues, attach console setup, long-lived streams, and any ambiguous parser
+  surface.
+
+Acceptance checklist for the Windows implementation:
+
+- `package-windows.ps1` builds the full helper and tiny `rmux.exe`.
+- `verify-package-windows.ps1` requires `libexec/rmux/rmux.exe`, validates
+  checksums, and verifies `rmux.exe -V` with `RMUX_DISABLE_TINY_CLI=1` set.
+- Native Windows named-pipe IPC smoke passes through both the tiny direct path
+  and the helper fallback path.
+- Native Windows attach/ConPTY smoke passes with the attach-related tiny path
+  enabled.
+- Native Windows benchmarks compare full CLI, tiny CLI, and the previous release
+  before release notes mention Windows tiny-CLI performance.
+- WinGet, Scoop, and Chocolatey dry runs install the tiny package and execute
+  `rmux -V`, `rmux -V` with `RMUX_DISABLE_TINY_CLI=1` set,
+  `rmux diagnose --json`, and the daemon smoke.
 
 GitHub Actions builds and verifies the zip with the same scripts that work under
 Windows PowerShell 5.1 (`powershell.exe`) and PowerShell 7 (`pwsh`):
@@ -37,7 +82,7 @@ For a local package-manager dry run, use the `dist/SHA256SUMS.txt` produced by
 the downloaded release checksum file instead.
 
 ```sh
-version=0.6.1
+version=0.7.0
 checksums=dist/SHA256SUMS.txt
 scripts/generate-winget-manifest.sh \
   --version "$version" \
@@ -77,7 +122,7 @@ Validate and test on Windows before submission:
 ```powershell
 pwsh ./scripts/validate-winget-manifest.ps1 `
   -Manifest target/package-managers/winget/Helvesec.RMUX.yaml `
-  -Version 0.6.1 `
+  -Version 0.7.0 `
   -Checksums dist/SHA256SUMS.txt
 winget validate --manifest target/package-managers/winget
 winget install --manifest target/package-managers/winget

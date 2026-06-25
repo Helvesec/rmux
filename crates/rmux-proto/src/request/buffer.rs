@@ -151,6 +151,55 @@ pub struct CapturePaneRequest {
     pub end_is_absolute: bool,
 }
 
+/// Request payload for `capture-pane` carrying raw tmux target text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapturePaneTargetActionRequest {
+    /// Optional raw `-t` target. `None` uses the requester's current pane.
+    #[serde(default)]
+    pub target: Option<String>,
+    /// The optional inclusive start line.
+    pub start: Option<i64>,
+    /// The optional inclusive end line.
+    pub end: Option<i64>,
+    /// Whether to print captured bytes to stdout instead of writing a buffer.
+    pub print: bool,
+    /// The optional destination buffer name for non-printing captures.
+    pub buffer_name: Option<String>,
+    /// Whether the saved alternate-screen copy should be captured.
+    #[serde(default)]
+    pub alternate: bool,
+    /// Whether ANSI SGR and hyperlink sequences should be preserved.
+    #[serde(default)]
+    pub escape_ansi: bool,
+    /// Whether control sequences should be octal-escaped.
+    #[serde(default)]
+    pub escape_sequences: bool,
+    /// Whether wrapped rows should be joined without intervening newlines.
+    #[serde(default)]
+    pub join_wrapped: bool,
+    /// Whether the copy-mode screen should be captured when present.
+    #[serde(default)]
+    pub use_mode_screen: bool,
+    /// Whether trailing spaces should be preserved.
+    #[serde(default)]
+    pub preserve_trailing_spaces: bool,
+    /// Whether trailing spaces should not be trimmed.
+    #[serde(default)]
+    pub do_not_trim_spaces: bool,
+    /// Whether pending parser bytes should be captured instead of the screen grid.
+    #[serde(default)]
+    pub pending_input: bool,
+    /// Whether missing alternate-screen content should be silenced.
+    #[serde(default)]
+    pub quiet: bool,
+    /// Whether `-S -` was used.
+    #[serde(default)]
+    pub start_is_absolute: bool,
+    /// Whether `-E -` was used.
+    #[serde(default)]
+    pub end_is_absolute: bool,
+}
+
 /// Request payload for `clear-history`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClearHistoryRequest {

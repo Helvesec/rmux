@@ -1,7 +1,7 @@
 //! Process inspection helpers.
 
 use std::collections::HashMap;
-#[cfg(target_os = "macos")]
+#[cfg(all(unix, target_os = "macos"))]
 use std::ffi::CStr;
 #[cfg(any(unix, windows))]
 use std::ffi::OsString;

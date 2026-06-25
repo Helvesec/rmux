@@ -195,13 +195,13 @@ pub(super) fn parse_select_pane(
             title,
         }))
     } else {
-        Ok(Request::SelectPane(SelectPaneRequest {
+        Ok(Request::SelectPane(Box::new(SelectPaneRequest {
             target,
             title,
             style,
             input_disabled,
             preserve_zoom,
-        }))
+        })))
     }
 }
 
@@ -334,7 +334,7 @@ fn parse_split_window_command(
         || full_size
         || preserve_zoom
     {
-        Request::SplitWindowExt(SplitWindowExtRequest {
+        Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
             target,
             direction,
             before,
@@ -348,7 +348,7 @@ fn parse_split_window_command(
             preserve_zoom,
             full_size,
             stdin_payload: None,
-        })
+        }))
     } else {
         Request::SplitWindow(SplitWindowRequest {
             target,
@@ -514,7 +514,7 @@ pub(super) fn parse_break_pane(
     }
     args.no_extra("break-pane")?;
 
-    Ok(Request::BreakPane(BreakPaneRequest {
+    Ok(Request::BreakPane(Box::new(BreakPaneRequest {
         source: source.unwrap_or(implicit_pane_target(sessions, find_context, "break-pane")?),
         target,
         name,
@@ -523,7 +523,7 @@ pub(super) fn parse_break_pane(
         before,
         print_target,
         format,
-    }))
+    })))
 }
 
 pub(super) fn parse_pipe_pane(mut args: CommandTokens) -> Result<Request, RmuxError> {
@@ -616,7 +616,7 @@ pub(super) fn parse_respawn_pane(
         (!remaining.is_empty()).then_some(remaining)
     };
 
-    Ok(Request::RespawnPane(RespawnPaneRequest {
+    Ok(Request::RespawnPane(Box::new(RespawnPaneRequest {
         target: target.unwrap_or(implicit_pane_target(
             sessions,
             find_context,
@@ -627,5 +627,5 @@ pub(super) fn parse_respawn_pane(
         environment: (!environment.is_empty()).then_some(environment),
         command,
         process_command: None,
-    }))
+    })))
 }

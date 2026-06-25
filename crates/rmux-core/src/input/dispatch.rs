@@ -13,7 +13,7 @@ use super::{InputParser, INPUT_LAST};
 
 // ─── C0 dispatch ───────────────────────────────────────────────────
 
-pub(crate) fn dispatch_c0(parser: &mut InputParser, writer: &mut dyn ScreenWriter) {
+pub(crate) fn dispatch_c0<W: ScreenWriter + ?Sized>(parser: &mut InputParser, writer: &mut W) {
     match parser.ch {
         0x00 => {} // NUL
         0x07 => {
@@ -54,7 +54,7 @@ pub(crate) fn dispatch_c0(parser: &mut InputParser, writer: &mut dyn ScreenWrite
 
 // ─── ESC dispatch ──────────────────────────────────────────────────
 
-pub(crate) fn dispatch_esc(parser: &mut InputParser, writer: &mut dyn ScreenWriter) {
+pub(crate) fn dispatch_esc<W: ScreenWriter + ?Sized>(parser: &mut InputParser, writer: &mut W) {
     let cmd = match tables::lookup_esc(parser.ch, parser.interm_str()) {
         Some(cmd) => cmd,
         None => return,
@@ -127,7 +127,7 @@ pub(crate) fn dispatch_esc(parser: &mut InputParser, writer: &mut dyn ScreenWrit
 
 // ─── CSI dispatch ──────────────────────────────────────────────────
 
-pub(crate) fn dispatch_csi(parser: &mut InputParser, writer: &mut dyn ScreenWriter) {
+pub(crate) fn dispatch_csi<W: ScreenWriter + ?Sized>(parser: &mut InputParser, writer: &mut W) {
     if !parser.param_list.split(&parser.param_buf, parser.param_len) {
         return;
     }
@@ -469,7 +469,7 @@ pub(crate) fn dispatch_csi(parser: &mut InputParser, writer: &mut dyn ScreenWrit
 
 // ─── OSC dispatch ──────────────────────────────────────────────────
 
-pub(crate) fn dispatch_osc(parser: &mut InputParser, writer: &mut dyn ScreenWriter) {
+pub(crate) fn dispatch_osc<W: ScreenWriter + ?Sized>(parser: &mut InputParser, writer: &mut W) {
     let buf = &parser.input_buf;
     if buf.is_empty() {
         return;
@@ -521,7 +521,7 @@ pub(crate) fn dispatch_osc(parser: &mut InputParser, writer: &mut dyn ScreenWrit
 
 // ─── DCS dispatch ──────────────────────────────────────────────────
 
-pub(crate) fn dispatch_dcs(parser: &mut InputParser, writer: &mut dyn ScreenWriter) {
+pub(crate) fn dispatch_dcs<W: ScreenWriter + ?Sized>(parser: &mut InputParser, writer: &mut W) {
     let buf = &parser.input_buf;
 
     // DECRQSS: intermediate '$', first byte 'q'.

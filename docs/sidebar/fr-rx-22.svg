@@ -1,0 +1,10 @@
+<svg width="500" height="30" viewBox="60 0 500 30" fill="none" xmlns="http://www.w3.org/2000/svg">
+<style>
+  .title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; font-size: 20px; font-weight: 600; fill: #1f2328; }
+  .item { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; font-size: 16px; fill: #0969da; }
+</style>
+<rect x="110" y="0" width="1" height="30" fill="#d0d7de" shape-rendering="crispEdges"/>
+<line x1="118" y1="0" x2="118" y2="100%" stroke="#30363d" stroke-width="1"/>
+<circle cx="162" cy="15" r="3.5" fill="#59636e" />
+<text x="178" y="22" class="item">SDK Python RMUX</text>
+</svg>

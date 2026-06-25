@@ -1,49 +1,106 @@
+<picture><img align="left" width="99" height="650" alt="" src="docs/sidebar/readme-left-spacer.svg"></picture>
+<div>
+<picture><img align="right" width="340" height="16" alt="" src="docs/sidebar/readme-left-spacer.svg"></picture>
+<picture><source media="(prefers-color-scheme: dark)" srcset="docs/sidebar/rx-01.svg"><img align="right" width="340" alt="Overview" src="docs/sidebar/rx-02.svg"></picture><a href="#what-is-rmux"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/sidebar/rx-31.svg"><img align="right" width="340" alt="What is RMUX?" src="docs/sidebar/rx-32.svg"></picture></a><a href="#features"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/sidebar/rx-17.svg"><img align="right" width="340" alt="Features" src="docs/sidebar/rx-18.svg"></picture></a><a href="#quick-start"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/sidebar/rx-23.svg"><img align="right" width="340" alt="Quick Start" src="docs/sidebar/rx-24.svg"></picture></a><a href="#demos"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/sidebar/rx-25.svg"><img align="right" width="340" alt="Demos" src="docs/sidebar/rx-26.svg"></picture></a><picture><source media="(prefers-color-scheme: dark)" srcset="docs/sidebar/rx-35.svg"><img align="right" width="340" alt="" src="docs/sidebar/rx-36.svg"></picture><picture><source media="(prefers-color-scheme: dark)" srcset="docs/sidebar/readme-sidebar-heading-usage-menu-dark.svg"><img align="right" width="340" alt="Usage" src="docs/sidebar/readme-sidebar-heading-usage-menu-light.svg"></picture><a href="#installation"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/sidebar/rx-19.svg"><img align="right" width="340" alt="Installation" src="docs/sidebar/rx-20.svg"></picture></a><a href="#web-sharing"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/sidebar/rx-29.svg"><img align="right" width="340" alt="Web Sharing" src="docs/sidebar/rx-30.svg"></picture></a><a href="#claude-teammate-mode"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/sidebar/readme-sidebar-item-claude-agents-wide-menu-dark.svg"><img align="right" width="340" alt="Claude Agents" src="docs/sidebar/readme-sidebar-item-claude-agents-wide-menu-light.svg"></picture></a><a href="https://pypi.org/project/librmux/"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/sidebar/readme-sidebar-item-python-sdk-menu-dark.svg"><img align="right" width="340" alt="Python SDK" src="docs/sidebar/readme-sidebar-item-python-sdk-menu-light.svg"></picture></a><a href="https://www.npmjs.com/package/@rmux/sdk"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/sidebar/readme-sidebar-item-typescript-sdk-menu-dark.svg"><img align="right" width="340" alt="TypeScript SDK" src="docs/sidebar/readme-sidebar-item-typescript-sdk-menu-light.svg"></picture></a><picture><source media="(prefers-color-scheme: dark)" srcset="docs/sidebar/rx-39.svg"><img align="right" width="340" alt="" src="docs/sidebar/rx-40.svg"></picture><picture><source media="(prefers-color-scheme: dark)" srcset="docs/sidebar/rx-03.svg"><img align="right" width="340" alt="Resources" src="docs/sidebar/rx-04.svg"></picture><a href="#documentation"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/sidebar/rx-11.svg"><img align="right" width="340" alt="Documentation" src="docs/sidebar/rx-12.svg"></picture></a><a href="docs/benchmarks.md"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/sidebar/readme-sidebar-item-benchmarks-menu-dark.svg"><img align="right" width="340" alt="Benchmarks" src="docs/sidebar/readme-sidebar-item-benchmarks-menu-light.svg"></picture></a><a href="https://rmux.io/docs/examples/"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/sidebar/rx-13.svg"><img align="right" width="340" alt="Examples" src="docs/sidebar/rx-14.svg"></picture></a><a href="https://rmux.io/docs/faq/"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/sidebar/rx-15.svg"><img align="right" width="340" alt="FAQ" src="docs/sidebar/rx-16.svg"></picture></a><a href="CONTRIBUTING.md"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/sidebar/rx-09.svg"><img align="right" width="340" alt="Contributing" src="docs/sidebar/rx-10.svg"></picture></a><picture><img align="right" width="340" height="160" alt="" src="docs/sidebar/readme-left-spacer.svg"></picture>
+</div>
+
 <div align="center">
 
-<a href="https://rmux.io">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://rmux.io/rmux-header-dark.svg">
-    <img src="https://rmux.io/rmux-header.svg" alt="RMUX" width="500">
-  </picture>
-</a>
+<p align="center">
+  <a href="https://rmux.io/">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/rmux-logo-dark.svg">
+      <img src="docs/rmux-logo-light.svg" width="238" alt="RMUX logo">
+    </picture>
+  </a>
+</p>
 
-**A modern Rust terminal multiplexer for local shells, long-running agents, typed automation, and browser-shared terminal sessions.**
+<p align="center">
+  <a href="https://rmux.io/">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/rmux-wordmark-dark.svg">
+      <img src="docs/rmux-wordmark-light.svg" width="276" alt="RMUX">
+    </picture>
+  </a>
+</p>
 
-English · [Français](README.fr.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md)
+<p align="center"><small><strong>The Universal Multiplexer Engine.</strong></small></p>
 
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
-[![CI](https://img.shields.io/github/actions/workflow/status/Helvesec/rmux/ci.yml?branch=main&event=push&label=CI)](https://github.com/Helvesec/rmux/actions/workflows/ci.yml?query=branch%3Amain)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13290/badge)](https://www.bestpractices.dev/projects/13290)
-[![rmux 0.6.1](https://img.shields.io/badge/rmux-0.6.1-informational.svg)](#install)
-[![Platform: Linux | macOS | Windows](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#platform-support)
-[![Unsafe policy](https://img.shields.io/badge/unsafe-restricted-success.svg)](#verification)
+<p align="center">
+  <picture><source media="(prefers-color-scheme: dark)" srcset="docs/readme-hero-native-dark.svg"><img src="docs/readme-hero-native-light.svg" width="340" alt="Native on Windows, Linux, and macOS"></picture>
+</p>
 
-<br />
-<a href="https://rmux.io">
-  <img src="https://rmux.io/rmux-terminal-demo.gif" width="500" alt="RMUX terminal session demo" />
-</a>
+<p align="center">
+  <picture><source media="(prefers-color-scheme: dark)" srcset="docs/readme-hero-rule-dark.svg"><img src="docs/readme-hero-rule-light.svg" width="340" alt=""></picture>
+</p>
+
+<p align="center"><small>English · <a href="docs/i18n/README.fr.md">Français</a> · <a href="docs/i18n/README.zh-CN.md">简体中文</a> · <a href="docs/i18n/README.ja.md">日本語</a></small></p>
+
+<p align="center">
+  <a href="#verification"><img src="https://img.shields.io/badge/unsafe-restricted-success.svg" alt="Unsafe policy"></a>
+  <a href="https://github.com/Helvesec/rmux/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/Helvesec/rmux/ci.yml?branch=main&amp;event=push&amp;label=CI" alt="CI"></a>
+  <a href="https://www.bestpractices.dev/projects/13290"><img src="https://www.bestpractices.dev/projects/13290/badge" alt="OpenSSF Best Practices"></a>
+  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/rmux-0.7.0-informational.svg" alt="rmux 0.7.0"></a>
+</p>
 
 </div>
 
+<br clear="all">
+
 > [!NOTE]
-> RMUX now includes hybrid post-quantum end-to-end encrypted web multiplexing through a static frontend. [Learn more in the repository Web Share docs](docs/web-share.md).
+> RMUX now has an E2E web multiplexing feature. [Learn more in the docs.](docs/web-share.md)
 >
-> RMUX now provides an official Python SDK: [librmux](https://github.com/Helvesec/rmux-python/).
+> RMUX now provides Python and TypeScript SDKs: [librmux](https://pypi.org/project/librmux/), [@rmux/sdk](https://www.npmjs.com/package/@rmux/sdk).
 >
 > If you have a feature request or want to report anything, please [file an issue](https://github.com/Helvesec/rmux/issues).
 
-## RMUX
-A modern, async typed Rust <strong>multiplexer</strong> with 90+ tmux commands natively across macOS, Linux, and Windows, with no WSL needed.
+<p align="center">
+  <a href="https://rmux.io/docs/web-share/">
+    <img width="700" src="https://rmux.io/web-share-browser.gif" alt="RMUX web share">
+  </a>
+</p>
 
-It ships with a public Rust SDK and native Ratatui integration.
+<a id="what-is-rmux"></a>
 
-Use it from the CLI, share sessions in a browser, or drive it from Rust.
+## 🧭 What is RMUX?
 
-## Demos
+RMUX is an async, typed terminal multiplexer engine written in Rust. It implements 90+ `tmux` commands and runs natively on Linux, macOS, and Windows with no WSL required.
 
-Short examples of what RMUX can be used for.
+Use it as a standalone CLI, embed it in Rust terminal apps, or drive it through typed SDKs for Rust, Python, and TypeScript.
 
-<table>
+<a id="features"></a>
+
+## ✨ Features
+
+- **Universal engine:** typed SDKs for Rust, Python, and TypeScript.
+- **Native cross-platform runtime:** Linux, macOS, and Windows backends.
+- **tmux-compatible command surface:** 90+ commands covered by focused compatibility tests.
+- **Web Share:** browser-shared sessions with hybrid post-quantum end-to-end encryption.
+- **Ratatui widget:** render live RMUX panes inside Rust terminal applications.
+- **Local daemon architecture:** shells, panes, windows, sessions, and scrollback stay on your machine.
+
+<a id="quick-start"></a>
+
+## 🚀 Quick Start
+
+```sh
+rmux list-commands
+rmux new-session --help
+rmux split-window --help
+rmux web-share --help
+rmux diagnose --human
+```
+
+Use `rmux -V` for the installed version.
+
+<a id="demos"></a>
+<a id="screenshots"></a>
+
+## 🎬 Demos
+
+<div align="center">
+
+<table align="center">
   <tr>
     <td align="center" width="25%"><a href="https://rmux.io/#demo-orchestration"><img src="https://rmux.io/demos/demo-orchestration.png" width="150" alt="Multi Agents Orchestration demo preview"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/demo-orchestration"><strong>Multi Agents Orchestration</strong></a></sub><br><sub>≃ 514 lines</sub></td>
     <td align="center" width="25%"><a href="https://rmux.io/#demo-broadcast"><img src="https://rmux.io/demos/demo-broadcast.png" width="150" alt="Agent Broadcast Arena demo preview"></a><br><sub><a href="https://github.com/Helvesec/rmux-demos/tree/main/broadcast-demo"><strong>Agent Broadcast Arena</strong></a></sub><br><sub>≃ 2,171 lines</sub></td>
@@ -52,341 +109,151 @@ Short examples of what RMUX can be used for.
   </tr>
 </table>
 
+</div>
 
+<a id="installation"></a>
 
-## Web Multiplex (Web Share)
+## 📦 Installation
+
+| Platform / manager | Command |
+| :--- | :--- |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/apple.svg"><img src="docs/install/apple-light.svg" width="28" alt="macOS"></picture> / Homebrew | `brew install rmux` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/windows.svg"><img src="docs/install/windows-light.svg" width="28" alt="Windows"></picture> / installer | `irm https://rmux.io/install.ps1 \| iex` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/windows.svg"><img src="docs/install/windows-light.svg" width="28" alt="Windows"></picture> / WinGet | `winget install rmux` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/windows.svg"><img src="docs/install/windows-light.svg" width="28" alt="Windows"></picture> / Scoop | `scoop bucket add rmux https://github.com/Helvesec/scoop-rmux && scoop install rmux` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/windows.svg"><img src="docs/install/windows-light.svg" width="28" alt="Windows"></picture> / Chocolatey | `choco install rmux` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/linux.svg"><img src="docs/install/linux-light.svg" width="28" alt="Linux"></picture> / APT | See the [APT setup guide](https://rmux.io/docs/get-started/) |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/linux.svg"><img src="docs/install/linux-light.svg" width="28" alt="Linux"></picture> / DNF | See the [DNF setup guide](https://rmux.io/docs/get-started/) |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/linux.svg"><img src="docs/install/linux-light.svg" width="28" alt="Linux"></picture> <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/apple.svg"><img src="docs/install/apple-light.svg" width="28" alt="macOS"></picture> / Nix | `nix profile install github:Helvesec/rmux` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/rust.svg"><img src="docs/install/rust-light.svg" width="28" alt="Rust"></picture> / Cargo | `cargo install rmux --locked` |
+
+Direct downloads (`.tar.gz`, `.deb`, `.rpm`, `.zip`) are available from the [v0.7.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.7.0).
+
+Release packages may use a tiny public CLI for hot detached commands and a
+private full CLI helper for complex tmux-compatible command forms. Windows
+packages ship `rmux.exe` as the tiny dispatcher and keep the full CLI under
+`libexec/rmux/rmux.exe`. Set `RMUX_DISABLE_TINY_CLI=1` to force the full helper
+while diagnosing CLI compatibility issues.
+
+<a id="claude-teammate-mode"></a>
+
+## 🤝 Claude Teammate Mode
+
+Run Claude Code inside a local RMUX workspace with
+[tmux teammate mode](https://code.claude.com/docs/en/agent-teams) enabled.
 
 <p align="center">
-<a href="https://rmux.io/docs/web-share/">
-  <img src="https://rmux.io/web-share-browser.gif" width="500" alt="RMUX web share" />
-</a>
+  <img src="docs/teammate.jpg" alt="Claude teammate mode in RMUX" width="900">
 </p>
 
-RMUX can share a pane or session in a browser, create panes, resize splits, and keep terminal execution local.
+```bash
+rmux claude [args]
+# e.g., rmux claude --dangerously-skip-permissions
+```
 
+RMUX opens an attached session and automatically passes `--teammate-mode tmux`
+along with your `[args]` straight to Claude.
+
+How it works under the hood: to route commands properly, RMUX prepends a
+private `tmux` shim to Claude's `PATH`. This is strictly scoped to the Claude
+process and will not conflict with your system `tmux` installation.
+
+Note: Requires `claude` to be installed on your machine.
+
+<a id="configuration"></a>
+
+## ⚙️ Configuration
+
+RMUX reads `.rmux.conf` from standard system and user locations.
+
+On Linux and macOS:
+
+```text
+/etc/rmux.conf
+~/.rmux.conf
+$XDG_CONFIG_HOME/rmux/rmux.conf
+~/.config/rmux/rmux.conf
+```
+
+On Windows:
+
+```text
+%XDG_CONFIG_HOME%\rmux\rmux.conf
+%USERPROFILE%\.rmux.conf
+%APPDATA%\rmux\rmux.conf
+%RMUX_CONFIG_FILE%
+```
+
+If no RMUX config is found, RMUX can parse standard `tmux.conf` paths on a best-effort basis. Unsupported plugin lines are reported without aborting startup. Disable this fallback with `RMUX_DISABLE_TMUX_FALLBACK=1`.
+
+<a id="web-sharing"></a>
+
+## 🌐 Web Sharing
+
+Share a pane or session in a browser while terminal execution remains local.
 
 ```sh
-# Start a local Web Share over loopback
 rmux web-share
-
-# Share a named session
 rmux new-session -d -s work
 rmux web-share -t work
-
-# Share beyond localhost
 rmux web-share --tunnel-provider localhost-run
 ```
 
-Use a tunnel provider, bring your own ingress, or host the static frontend on your own domain.
-
-Useful entry points:
+Web Share uses hybrid post-quantum end-to-end encryption and can run over loopback, a tunnel provider, or your own ingress.
 
 - [Repository Web Share overview](docs/web-share.md)
 - [Web Share docs](https://rmux.io/docs/web-share/)
 - [Security model](https://rmux.io/docs/web-share/#/security)
 - [Tunnel providers](https://rmux.io/docs/web-share/#/tunnels)
 
-## Install
+<a id="scripting-api"></a>
 
-<a id="install-linux"></a>
-<details>
-<summary><strong>Linux install</strong></summary>
+## 🧰 Scripting & API
 
-#### Portable installer
-
-```sh
-curl -fsSL https://rmux.io/install.sh | sh
-```
-
-#### APT
-
-```sh
-sudo install -d -m 0755 /etc/apt/keyrings
-curl -fsSL https://packages.rmux.io/debian/rmux.asc | sudo tee /etc/apt/keyrings/rmux.asc >/dev/null
-echo "deb [signed-by=/etc/apt/keyrings/rmux.asc] https://packages.rmux.io/debian stable main" | sudo tee /etc/apt/sources.list.d/rmux.list >/dev/null
-sudo apt update
-sudo apt install rmux
-```
-
-#### DNF
-
-```sh
-sudo curl -fsSL https://packages.rmux.io/rpm/rmux.repo -o /etc/yum.repos.d/rmux.repo
-sudo dnf install rmux
-```
-
-Direct downloads are available from the [v0.6.1 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.6.1):
-
-- `rmux-0.6.1-linux-x86_64.tar.gz`
-- `rmux_0.6.1_amd64.deb`
-- `rmux-0.6.1-1.x86_64.rpm`
-
-</details>
-
-<a id="install-macos"></a>
-<details>
-<summary><strong>macOS install</strong></summary>
-
-#### Portable installer
-
-```sh
-curl -fsSL https://rmux.io/install.sh | sh
-```
-
-#### Homebrew
-
-```sh
-brew install rmux
-```
-
-Direct downloads are available from the [v0.6.1 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.6.1):
-
-- `rmux-0.6.1-macos-aarch64.tar.gz`
-- `rmux-0.6.1-macos-x86_64.tar.gz`
-
-</details>
-
-<a id="install-windows"></a>
-<details>
-<summary><strong>Windows install</strong></summary>
-
-#### PowerShell installer
-
-```powershell
-irm https://rmux.io/install.ps1 | iex
-```
-
-#### Scoop
-
-```powershell
-scoop bucket add rmux https://github.com/Helvesec/scoop-rmux
-scoop install rmux
-```
-
-#### WinGet
-
-```powershell
-winget install rmux
-```
-
-#### Chocolatey
-
-```powershell
-choco install rmux
-```
-
-Direct downloads are available from the [v0.6.1 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.6.1):
-
-- `rmux-0.6.1-windows-x86_64.zip`
-
-</details>
-
-<a id="install-cargo"></a>
-<details>
-<summary><strong>Rust / Cargo install</strong></summary>
-
-This path works on Linux, macOS, and Windows.
-
-#### Install Rust
-
-```sh
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-#### Install RMUX
-
-```sh
-cargo install rmux --locked
-```
-
-#### Rust applications
+The SDKs connect to the local RMUX daemon and expose sessions, panes, streams, waits, and snapshots for automation.
 
 ```sh
 cargo add rmux-sdk
-cargo add ratatui-rmux
+pip install librmux
+npm install @rmux/sdk
 ```
 
-</details>
+- Rust SDK: [`rmux-sdk`](https://crates.io/crates/rmux-sdk)
+- Python SDK: [`librmux`](https://pypi.org/project/librmux/)
+- TypeScript SDK: [`@rmux/sdk`](https://www.npmjs.com/package/@rmux/sdk)
+- [API reference](https://rmux.io/docs/api/)
+- [Examples](https://rmux.io/docs/examples/)
+- [Repository SDK overview](docs/scripting-sdk.md)
 
-SHA256 checksums are published with every GitHub Release. APT, DNF, Homebrew, Scoop, Chocolatey, and WinGet metadata are generated from the same release assets.
+<a id="documentation"></a>
 
-## Documentation
+## 📚 Documentation
 
-The full RMUX documentation is available at [rmux.io/docs](https://rmux.io/docs/).
-
-It includes:
+The full documentation is available at [rmux.io/docs](https://rmux.io/docs/).
 
 - [Installation guides](https://rmux.io/docs/get-started/)
 - [CLI reference](https://rmux.io/docs/cli/)
 - [Examples](https://rmux.io/docs/examples/)
 - [API reference](https://rmux.io/docs/api/)
-- [Repository SDK overview](docs/scripting-sdk.md)
+- [Human-friendly config](docs/human-friendly-config.md)
+- [Nix packaging](docs/nix-packaging.md)
 - [Web Share](https://rmux.io/docs/web-share/)
 
-For an ergonomic, human-oriented profile that keeps native terminal selection intuitive while adding easier split bindings and clipboard integration, see [docs/human-friendly-config.md](docs/human-friendly-config.md).
-
-## CLI Quickstart
-
-```sh
-rmux new-session -d -s work
-rmux split-window -h -t work
-rmux send-keys -t work 'echo "hello from rmux"' Enter
-rmux attach-session -t work
-```
-
-Use command help locally:
-
-```sh
-rmux list-commands
-rmux new-session --help
-rmux split-window --help
-rmux web-share --help
-```
-
-Use `rmux -V` for the RMUX package version. For build and support details, use `rmux diagnose --human` or `rmux diagnose --json`.
-
-## SDK Quickstart
-
-```toml
-[dependencies]
-rmux-sdk = "0.6"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-```
-
-```rust
-use std::time::Duration;
-
-use rmux_sdk::{
-    EnsureSession, EnsureSessionPolicy, Rmux, SessionName, TerminalSizeSpec,
-};
-
-#[tokio::main]
-async fn main() -> rmux_sdk::Result<()> {
-    let rmux = Rmux::builder()
-        .default_timeout(Duration::from_secs(5))
-        .connect_or_start()
-        .await?;
-
-    let session_name = SessionName::new("work").expect("valid session name");
-    let session = rmux
-        .ensure_session(
-            EnsureSession::named(session_name)
-                .policy(EnsureSessionPolicy::CreateOrReuse)
-                .detached(true)
-                .size(TerminalSizeSpec::new(120, 32)),
-        )
-        .await?;
-
-    let pane = session.pane(0, 0);
-    pane.send_text("printf 'ready\\n' && sleep 1\n").await?;
-
-    pane.wait_for_text("ready").await?;
-    let snapshot = pane.snapshot().await?;
-    println!("{}x{}", snapshot.cols, snapshot.rows);
-
-    Ok(())
-}
-```
-
-## Ratatui Widget
-
-```rust
-use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
-use ratatui_rmux::{PaneState, PaneWidget};
-use rmux_sdk::PaneSnapshot;
-
-fn render(snapshot: PaneSnapshot, area: Rect, buffer: &mut Buffer) {
-    let state = PaneState::from_snapshot(snapshot);
-    PaneWidget::new(&state).render(area, buffer);
-}
-```
-
-## Architecture
+## 🏗️ Architecture
 
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://rmux.io/rmux-architecture-dark.png?v=0.6.1-web-share">
-  <source media="(prefers-color-scheme: light)" srcset="https://rmux.io/rmux-architecture-light.png?v=0.6.1-web-share">
-  <img src="https://rmux.io/rmux-architecture-dark.png?v=0.6.1-web-share" alt="RMUX runtime architecture" width="800">
+  <source media="(prefers-color-scheme: dark)" srcset="https://rmux.io/rmux-architecture-dark.png?v=0.7.0-web-share">
+  <source media="(prefers-color-scheme: light)" srcset="https://rmux.io/rmux-architecture-light.png?v=0.7.0-web-share">
+  <img src="https://rmux.io/rmux-architecture-dark.png?v=0.7.0-web-share" alt="RMUX runtime architecture" width="800">
 </picture>
 
 </div>
 
-`rmux` keeps shells, sessions, windows, panes, and PTY processes inside the local daemon. Local clients use IPC. Web Share is explicit browser access: the daemon exposes a selected pane or session through an end-to-end encrypted WebSocket, while execution stays on your machine.
+RMUX keeps shells, sessions, windows, panes, and PTY processes inside the local daemon. Local clients attach via IPC. Web Share exposes only the selected pane or session through an end-to-end encrypted WebSocket.
 
-## Workspace
-
-| Crate | Role | Publication |
-| :--- | :--- | :--- |
-| `rmux-types` | Shared platform-neutral value types | public |
-| `rmux-proto` | Detached IPC DTOs, framing, wire-safe errors | public |
-| `rmux-os` | Small OS boundary helpers | public |
-| `rmux-ipc` | Local IPC endpoints and transports | public |
-| `rmux-sdk` | Daemon-backed Rust SDK | public |
-| `ratatui-rmux` | Ratatui integration widget | public |
-| `rmux-web-crypto` | Web Share E2EE core and WASM crypto boundary | public |
-| `rmux-pty` | PTY allocation, resize, child process control | support crate |
-| `rmux-core` | Sessions, panes, layouts, formats, hooks, buffers | support crate |
-| `rmux-server` | Tokio daemon and request dispatch | support crate |
-| `rmux-client` | Local IPC client and attach plumbing | support crate |
-| `rmux` | CLI and hidden daemon entrypoint | public binary |
-| `rmux-render-core` | Shared snapshot rendering core | workspace-internal |
-
-## Platform Support
-
-| Platform | PTY backend | IPC backend | Default endpoint |
-| :--- | :--- | :--- | :--- |
-| Linux | Unix PTY | Unix socket | `/tmp/rmux-{uid}/default` |
-| macOS | Unix PTY | Unix socket | `/tmp/rmux-{uid}/default` |
-| Windows | ConPTY | Named pipe | per-user named pipe |
-
-## Configuration
-
-On Linux and macOS, RMUX reads `.rmux.conf` from the standard system and user locations:
-
-1. `/etc/rmux.conf`
-2. `~/.rmux.conf`
-3. `$XDG_CONFIG_HOME/rmux/rmux.conf`
-4. `~/.config/rmux/rmux.conf`
-
-On Windows, RMUX reads `.rmux.conf` from:
-
-1. `%XDG_CONFIG_HOME%\rmux\rmux.conf`
-2. `%USERPROFILE%\.rmux.conf`
-3. `%APPDATA%\rmux\rmux.conf`
-4. `%RMUX_CONFIG_FILE%`
-
-### `tmux.conf` compatibility
-
-When RMUX starts with the default config search and no RMUX config file is loaded, it also checks standard `tmux.conf` locations. Explicit `-f` config files do not trigger this fallback.
-
-Fallback files use the tmux-compatible source parser and load best-effort. Supported commands are applied; unsupported plugin lines are reported without aborting startup. Set `RMUX_DISABLE_TMUX_FALLBACK=1` to disable autoload.
-
-On Unix, RMUX also provides a private per-socket `tmux` shim in command environments so common plugin scripts route back to RMUX. Set `RMUX_DISABLE_TMUX_SHIM=1` to disable it.
-
-## Terminal Compatibility Notes
-
-RMUX works with shells that query terminal capabilities, including fish. It answers terminal device-attribute probes and handles Escape-key timing so fish prompts and key sequences behave normally inside RMUX panes.
-
-Graphics passthrough is available for outer terminals that support Kitty graphics or SIXEL. RMUX detects Kitty graphics for Kitty, Ghostty, and WezTerm, and detects SIXEL for terminals such as foot, mintty, mlterm, and WezTerm. It is opt-in:
-
-```tmux
-set -g allow-passthrough on
-```
-
-The tmux value `all` is accepted for configuration compatibility. RMUX renders the attached pane, so `all` currently behaves like `on` rather than adding passthrough for unattached panes.
-
-If your terminal supports either protocol but is not detected automatically, add a terminal feature override:
-
-```tmux
-set -as terminal-features 'xterm-kitty:kitty-graphics'
-set -as terminal-features 'xterm*:sixel'
-```
-
-SIXEL passthrough is covered by the automated Unix PTY attach regression suite. On Windows, RMUX enables modern ConPTY passthrough when the OS supports it, but SIXEL display still depends on the outer terminal. Set `RMUX_CONPTY_NO_PASSTHROUGH=1` to disable that backend mode for troubleshooting.
-
-## Verification
+## 🧪 Verification
 
 The workspace is designed to be checked from source with locked dependencies:
 
@@ -394,41 +261,12 @@ The workspace is designed to be checked from source with locked dependencies:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked --no-fail-fast
-```
-
-Additional local checks:
-
-```sh
-scripts/cfg-check.sh
 scripts/unsafe-check.sh
-scripts/no-network-in-runtime.sh
-scripts/check-platform-neutrality.sh
-scripts/ratatui-rmux-budget.sh
-scripts/verify-package.sh
 ```
 
-Release artifact checks are driven by:
+`#![forbid(unsafe_code)]` is used in the upper-level crates. OS and terminal boundary code is isolated in lower-level runtime crates.
 
-```sh
-scripts/release-local.sh
-scripts/package-unix.sh
-scripts/package-debian.sh
-scripts/verify-debian-package.sh
-scripts/package-rpm.sh
-scripts/verify-rpm-package.sh
-scripts/package-windows.ps1
-scripts/verify-package-windows.ps1
-scripts/generate-apt-repository.sh
-scripts/generate-rpm-repository.sh
-scripts/generate-homebrew-formula.sh
-scripts/generate-winget-manifest.sh
-scripts/generate-scoop-manifest.sh
-scripts/generate-chocolatey-package.sh
-```
-
-`#![forbid(unsafe_code)]` is used in the upper-level crates. OS and terminal boundary code is isolated in the lower-level runtime crates.
-
-## License
+## ⚖️ License
 
 RMUX is dual-licensed under either:
 

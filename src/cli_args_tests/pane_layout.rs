@@ -84,6 +84,81 @@ fn split_window_accepts_horizontal_direction() {
 }
 
 #[test]
+fn split_window_direction_flags_follow_tmux_last_wins() {
+    let vertical = parse_args(&["split-window", "-h", "-v", "-t", "alpha"]).unwrap();
+    match vertical.command.expect("parsed command") {
+        super::super::Command::SplitWindow(args) => {
+            assert!(matches!(
+                args.direction(),
+                rmux_proto::SplitDirection::Vertical
+            ));
+        }
+        _ => panic!("expected SplitWindow command"),
+    }
+
+    let horizontal = parse_args(&["split-window", "-v", "-h", "-t", "alpha"]).unwrap();
+    match horizontal.command.expect("parsed command") {
+        super::super::Command::SplitWindow(args) => {
+            assert!(matches!(
+                args.direction(),
+                rmux_proto::SplitDirection::Horizontal
+            ));
+        }
+        _ => panic!("expected SplitWindow command"),
+    }
+}
+
+#[test]
+fn split_window_attached_cluster_values_preserve_target_and_size() {
+    let cli = parse_args(&["split-window", "-htalpha:0", "sleep", "1"]).unwrap();
+    match cli.command.expect("parsed command") {
+        super::super::Command::SplitWindow(args) => {
+            assert_eq!(args.direction(), rmux_proto::SplitDirection::Horizontal);
+            assert_eq!(args.target.as_ref().expect("target").to_string(), "alpha:0");
+            assert_eq!(args.command, ["sleep".to_owned(), "1".to_owned()]);
+        }
+        _ => panic!("expected SplitWindow command"),
+    }
+
+    let cells = parse_args(&["split-window", "-hl10", "-t", "alpha"]).unwrap();
+    match cells.command.expect("parsed command") {
+        super::super::Command::SplitWindow(args) => {
+            assert_eq!(args.direction(), rmux_proto::SplitDirection::Horizontal);
+            assert_eq!(args.size_spec().as_deref(), Some("10"));
+        }
+        _ => panic!("expected SplitWindow command"),
+    }
+
+    let percentage = parse_args(&["split-window", "-hp50", "-t", "alpha"]).unwrap();
+    match percentage.command.expect("parsed command") {
+        super::super::Command::SplitWindow(args) => {
+            assert_eq!(args.direction(), rmux_proto::SplitDirection::Horizontal);
+            assert_eq!(args.size_spec().as_deref(), Some("50%"));
+        }
+        _ => panic!("expected SplitWindow command"),
+    }
+}
+
+#[test]
+fn split_window_size_flags_follow_tmux_last_wins() {
+    let percentage = parse_args(&["split-window", "-l", "5", "-p", "50", "-t", "alpha"]).unwrap();
+    match percentage.command.expect("parsed command") {
+        super::super::Command::SplitWindow(args) => {
+            assert_eq!(args.size_spec().as_deref(), Some("50%"));
+        }
+        _ => panic!("expected SplitWindow command"),
+    }
+
+    let cells = parse_args(&["split-window", "-p", "50", "-l", "5", "-t", "alpha"]).unwrap();
+    match cells.command.expect("parsed command") {
+        super::super::Command::SplitWindow(args) => {
+            assert_eq!(args.size_spec().as_deref(), Some("5"));
+        }
+        _ => panic!("expected SplitWindow command"),
+    }
+}
+
+#[test]
 fn split_window_accepts_trailing_command_argv() {
     let cli = parse_args(&[
         "split-window",

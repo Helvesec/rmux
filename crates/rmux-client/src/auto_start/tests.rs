@@ -9,7 +9,8 @@ use std::time::Duration;
 use super::{
     ensure_server_running_with_probe, hidden_daemon_binary_path,
     hidden_daemon_binary_path_for_config, incompatible_daemon_kill_server_command,
-    probe_connected_server, AutoStartConfig, AutoStartError,
+    probe_connected_server, startup_readiness_poll_sleep, AutoStartConfig, AutoStartError,
+    STARTUP_POLL_INTERVAL,
 };
 use crate::{ClientError, ConnectResult, Connection};
 use rmux_proto::{
@@ -20,6 +21,40 @@ use rmux_proto::{
 const POLL_SUCCESS_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
 static AUTO_START_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[test]
+fn unix_startup_readiness_poll_uses_short_backoff() {
+    let mut attempt = 0;
+    let remaining = Duration::from_secs(1);
+
+    let sleeps = (0..8)
+        .map(|_| startup_readiness_poll_sleep(&mut attempt, remaining))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        sleeps,
+        [
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            Duration::from_millis(4),
+            Duration::from_millis(8),
+            Duration::from_millis(16),
+            STARTUP_POLL_INTERVAL,
+            STARTUP_POLL_INTERVAL,
+            STARTUP_POLL_INTERVAL,
+        ]
+    );
+}
+
+#[test]
+fn unix_startup_readiness_poll_respects_remaining_deadline() {
+    let mut attempt = 6;
+
+    assert_eq!(
+        startup_readiness_poll_sleep(&mut attempt, Duration::from_millis(7)),
+        Duration::from_millis(7)
+    );
+}
 
 #[test]
 fn auto_start_prefers_installed_hidden_daemon_sibling() {

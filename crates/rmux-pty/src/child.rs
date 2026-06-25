@@ -316,6 +316,8 @@ fn spawn_child(command: ChildCommand) -> Result<SpawnedPty> {
     };
     let (master, slave) = pair.into_split();
     let raw_master_fd = master.raw_fd();
+    let startup_slave = slave.try_clone()?.into_owned_fd();
+    let master = master.with_startup_slave(startup_slave);
 
     let stdin = File::from(slave.try_clone()?.into_owned_fd());
     let stdout = File::from(slave.try_clone()?.into_owned_fd());

@@ -1,5 +1,6 @@
 use regex::RegexBuilder;
 use rmux_proto::RmuxError;
+use std::borrow::Cow;
 
 use super::args::parse_single_argument;
 use super::text::{
@@ -10,7 +11,37 @@ use super::types::{
 };
 use super::CopyModeState;
 
+const SEARCH_REGEX_SIZE_LIMIT: usize = 1_000_000;
+const SEARCH_REGEX_DFA_SIZE_LIMIT: usize = 1_000_000;
+const SEARCH_OFF_LOCK_LINE_THRESHOLD: usize = 10_000;
+const SEARCH_OFF_LOCK_ARG_BYTES_THRESHOLD: usize = 4096;
+
 impl CopyModeState {
+    pub(crate) fn command_runs_search(command: &str) -> bool {
+        matches!(
+            command,
+            "search-again"
+                | "search-backward"
+                | "search-backward-text"
+                | "search-backward-incremental"
+                | "search-forward"
+                | "search-forward-text"
+                | "search-forward-incremental"
+                | "search-reverse"
+        )
+    }
+
+    pub(crate) fn mark_search_timed_out(&mut self) {
+        self.search_timed_out = true;
+        self.search_count_partial = true;
+    }
+
+    pub(crate) fn search_should_run_off_lock(&self, args: &[String]) -> bool {
+        let arg_bytes = args.iter().map(String::len).sum::<usize>();
+        self.total_lines() > SEARCH_OFF_LOCK_LINE_THRESHOLD
+            || arg_bytes > SEARCH_OFF_LOCK_ARG_BYTES_THRESHOLD
+    }
+
     pub(super) fn search_with_arg(
         &mut self,
         args: &[String],
@@ -140,6 +171,32 @@ impl CopyModeState {
             self.search_current = None;
             return;
         }
+        let case_insensitive = self
+            .search_pattern
+            .chars()
+            .all(|ch| !ch.is_ascii_uppercase());
+        let plain_needle = plain_text.then(|| {
+            if case_insensitive {
+                Cow::Owned(self.search_pattern.to_lowercase())
+            } else {
+                Cow::Borrowed(self.search_pattern.as_str())
+            }
+        });
+        let regex = if plain_text {
+            None
+        } else {
+            let mut builder = RegexBuilder::new(&self.search_pattern);
+            builder.case_insensitive(case_insensitive);
+            builder.size_limit(SEARCH_REGEX_SIZE_LIMIT);
+            builder.dfa_size_limit(SEARCH_REGEX_DFA_SIZE_LIMIT);
+            match builder.build() {
+                Ok(regex) => Some(regex),
+                Err(_) => {
+                    self.search_count_partial = true;
+                    return;
+                }
+            }
+        };
         for y in 0..self.total_lines() {
             let line = self.line(y);
             let map = LineTextMap::new(&line);
@@ -147,22 +204,17 @@ impl CopyModeState {
                 continue;
             }
             if plain_text {
-                let case_insensitive = self
-                    .search_pattern
-                    .chars()
-                    .all(|ch| !ch.is_ascii_uppercase());
+                let needle = plain_needle
+                    .as_ref()
+                    .expect("plain search needle must be initialized");
+                let needle = needle.as_ref();
                 let haystack = if case_insensitive {
-                    map.text.to_lowercase()
+                    Cow::Owned(map.text.to_lowercase())
                 } else {
-                    map.text.clone()
-                };
-                let needle = if case_insensitive {
-                    self.search_pattern.to_lowercase()
-                } else {
-                    self.search_pattern.clone()
+                    Cow::Borrowed(map.text.as_str())
                 };
                 let mut offset = 0;
-                while let Some(found) = haystack[offset..].find(&needle) {
+                while let Some(found) = haystack[offset..].find(needle) {
                     let start = offset + found;
                     let end = start + needle.len();
                     if let Some(result) = map.match_range(y, start..end) {
@@ -174,13 +226,7 @@ impl CopyModeState {
                     }
                 }
             } else {
-                let mut builder = RegexBuilder::new(&self.search_pattern);
-                builder.case_insensitive(
-                    self.search_pattern
-                        .chars()
-                        .all(|ch| !ch.is_ascii_uppercase()),
-                );
-                if let Ok(regex) = builder.build() {
+                if let Some(regex) = &regex {
                     for matched in regex.find_iter(&map.text) {
                         if let Some(result) = map.match_range(y, matched.start()..matched.end()) {
                             self.search_results.push(result);

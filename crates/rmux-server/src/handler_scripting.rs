@@ -171,7 +171,8 @@ impl RequestHandler {
             return Ok(false);
         }
 
-        self.apply_parse_time_assignments(commands).await;
+        self.apply_parse_time_assignments(requester_pid, commands)
+            .await?;
         let command = commands
             .commands()
             .first()
@@ -229,7 +230,16 @@ impl RequestHandler {
         context: QueueExecutionContext,
         mode: QueueMode,
     ) -> ControlCommandResult {
-        self.apply_parse_time_assignments(&commands).await;
+        if let Err(error) = self
+            .apply_parse_time_assignments(requester_pid, &commands)
+            .await
+        {
+            return ControlCommandResult {
+                stdout: Vec::new(),
+                error: Some(error),
+                exit_status: Some(1),
+            };
+        }
         let mut queue = CommandQueue::from_parsed(commands);
         let mut contexts = VecDeque::from(vec![context; queue.len()]);
         let mut stdout = Vec::new();
@@ -285,7 +295,14 @@ impl RequestHandler {
                         errors.push(error);
                     }
                     for (commands, context) in batches.into_iter().rev() {
-                        self.apply_parse_time_assignments(&commands).await;
+                        if let Err(error) = self
+                            .apply_parse_time_assignments(requester_pid, &commands)
+                            .await
+                        {
+                            errors.push(error);
+                            exit_status = Some(1);
+                            continue;
+                        }
                         let inserted = commands.commands().len();
                         queue.insert_after_current(commands);
                         for _ in 0..inserted {
@@ -381,6 +398,10 @@ impl RequestHandler {
                 ));
             }
         };
+        let can_write = self.requester_can_write(requester_pid).await;
+        if !can_write && !queue_invocation_allowed_for_read_only(&invocation) {
+            return Err(RmuxError::Server("client is read-only".to_owned()));
+        }
         let request_invocation = matches!(
             &invocation,
             QueueInvocation::Request(_)
@@ -395,7 +416,6 @@ impl RequestHandler {
                 exit_status: None,
             }),
             QueueInvocation::Request(request) => {
-                let can_write = self.requester_can_write(requester_pid).await;
                 let request = apply_queue_context_to_request(request, context);
                 let request = crate::server_access::apply_access_policy(request, can_write)?;
                 let request_for_hooks = request.clone();
@@ -488,9 +508,16 @@ impl RequestHandler {
         result.map_err(|error| source_file_context_error(error, &command_for_hooks, context))
     }
 
-    async fn apply_parse_time_assignments(&self, commands: &ParsedCommands) {
+    async fn apply_parse_time_assignments(
+        &self,
+        requester_pid: u32,
+        commands: &ParsedCommands,
+    ) -> Result<(), RmuxError> {
         if commands.assignments().is_empty() {
-            return;
+            return Ok(());
+        }
+        if !self.requester_can_write(requester_pid).await {
+            return Err(RmuxError::Server("client is read-only".to_owned()));
         }
 
         let mut state = self.state.lock().await;
@@ -506,6 +533,7 @@ impl RequestHandler {
                 },
             );
         }
+        Ok(())
     }
 
     async fn execute_queued_list_panes_all(
@@ -551,6 +579,18 @@ impl RequestHandler {
             exit_status: None,
         })
     }
+}
+
+fn queue_invocation_allowed_for_read_only(invocation: &QueueInvocation) -> bool {
+    matches!(
+        invocation,
+        QueueInvocation::Request(_)
+            | QueueInvocation::NoOp
+            | QueueInvocation::StartServer
+            | QueueInvocation::NewWindow(_)
+            | QueueInvocation::ListPanesAll(_)
+            | QueueInvocation::SplitWindow(_)
+    )
 }
 
 fn aggregate_rmux_errors(errors: Vec<RmuxError>) -> Option<RmuxError> {

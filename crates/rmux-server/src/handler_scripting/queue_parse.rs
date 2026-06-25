@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use rmux_core::{
     command_parser::{CommandArgument, ParsedCommand},
-    SessionStore, TargetFindContext,
+    SessionStore, TargetFindContext, TargetFindFlags, TargetFindType, UnresolvedTarget,
 };
 use rmux_proto::{RmuxError, SessionName, Target, WindowTarget};
 
@@ -235,6 +235,22 @@ fn parse_queued_if_shell_target(
     parse_target_arg("if-shell", value)
 }
 
+fn parse_queued_if_shell_attached_target(
+    raw_target: String,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Result<Target, RmuxError> {
+    if matches!(raw_target.as_str(), "=" | "{mouse}") && find_context.mouse_target().is_none() {
+        return sessions.resolve_unresolved_target(
+            &UnresolvedTarget::none(),
+            TargetFindType::Pane,
+            TargetFindFlags::CANFAIL,
+            find_context,
+        );
+    }
+    parse_queued_if_shell_target(raw_target, sessions, find_context)
+}
+
 pub(super) fn parse_queued_if_shell(
     command: ParsedCommand,
     caller_cwd: Option<&Path>,
@@ -276,17 +292,16 @@ pub(super) fn parse_queued_if_shell(
                 background |= cluster.background;
                 format_mode |= cluster.format_mode;
                 if let Some(target_flag) = cluster.target {
-                    let raw_target = match target_flag {
-                        IfShellTargetFlag::NextArgument => {
-                            pop_string_argument(&mut args, "-t target")?
+                    target = Some(match target_flag {
+                        IfShellTargetFlag::NextArgument => parse_queued_if_shell_target(
+                            pop_string_argument(&mut args, "-t target")?,
+                            sessions,
+                            find_context,
+                        )?,
+                        IfShellTargetFlag::Attached(value) => {
+                            parse_queued_if_shell_attached_target(value, sessions, find_context)?
                         }
-                        IfShellTargetFlag::Attached(value) => value,
-                    };
-                    target = Some(parse_queued_if_shell_target(
-                        raw_target,
-                        sessions,
-                        find_context,
-                    )?);
+                    });
                 }
             }
         }

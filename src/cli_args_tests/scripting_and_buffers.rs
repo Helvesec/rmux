@@ -23,6 +23,29 @@ fn display_message_accepts_print_target_and_hyphen_prefixed_format_text_after_se
 }
 
 #[test]
+fn display_message_single_value_flags_follow_tmux_last_wins() {
+    let cli = parse_args(&[
+        "display-message",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "-F",
+        "#{pane_id}",
+        "-F",
+        "#{session_name}",
+    ])
+    .unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::DisplayMessage(args) => {
+            assert!(args.print);
+            assert_eq!(args.format.as_deref(), Some("#{session_name}"));
+        }
+        _ => panic!("expected DisplayMessage command"),
+    }
+}
+
+#[test]
 fn display_message_accepts_target_client_without_treating_it_as_message() {
     let cli = parse_args(&["display-message", "-c", "123", "-p", "hello"]).unwrap();
 

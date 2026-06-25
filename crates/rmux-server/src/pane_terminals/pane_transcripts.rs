@@ -1,4 +1,4 @@
-use rmux_core::{input::mode, GridRenderOptions, PaneId, ScreenCaptureRange, Utf8Config};
+use rmux_core::{input::mode, GridRenderOptions, PaneId, Screen, ScreenCaptureRange, Utf8Config};
 use rmux_proto::{
     OptionName, OptionScopeSelector, PaneTarget, RmuxError, ScopeSelector, SessionName,
 };
@@ -9,12 +9,10 @@ use crate::pane_transcript::SharedPaneTranscript;
 
 use super::HandlerState;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PaneHistoryStats {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaneHistorySizeStats {
     pub(crate) limit: usize,
     pub(crate) size: usize,
-    pub(crate) bytes: usize,
-    pub(crate) all_bytes: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +203,9 @@ impl HandlerState {
             OptionName::AlternateScreen => {
                 self.refresh_transcript_alternate_screen_for_legacy_scope(scope);
             }
+            OptionName::AllowSetTitle => {
+                self.refresh_transcript_title_rename_for_legacy_scope(scope);
+            }
             _ => {}
         }
     }
@@ -226,6 +227,23 @@ impl HandlerState {
         self.refresh_transcript_alternate_screen_for_targets(targets);
     }
 
+    pub(crate) fn refresh_transcript_title_rename_for_option_scope(
+        &mut self,
+        scope: &OptionScopeSelector,
+    ) {
+        let targets = match scope {
+            OptionScopeSelector::ServerGlobal
+            | OptionScopeSelector::SessionGlobal
+            | OptionScopeSelector::WindowGlobal => self.all_pane_targets(),
+            OptionScopeSelector::Session(session_name) => self.session_pane_targets(session_name),
+            OptionScopeSelector::Window(target) => {
+                self.window_pane_targets(target.session_name(), target.window_index())
+            }
+            OptionScopeSelector::Pane(target) => vec![target.clone()],
+        };
+        self.refresh_transcript_title_rename_for_targets(targets);
+    }
+
     fn refresh_transcript_alternate_screen_for_legacy_scope(&mut self, scope: &ScopeSelector) {
         let targets = match scope {
             ScopeSelector::Global => self.all_pane_targets(),
@@ -238,27 +256,73 @@ impl HandlerState {
         self.refresh_transcript_alternate_screen_for_targets(targets);
     }
 
-    pub(crate) fn pane_history_stats(
+    fn refresh_transcript_title_rename_for_legacy_scope(&mut self, scope: &ScopeSelector) {
+        let targets = match scope {
+            ScopeSelector::Global => self.all_pane_targets(),
+            ScopeSelector::Session(session_name) => self.session_pane_targets(session_name),
+            ScopeSelector::Window(target) => {
+                self.window_pane_targets(target.session_name(), target.window_index())
+            }
+            ScopeSelector::Pane(target) => vec![target.clone()],
+        };
+        self.refresh_transcript_title_rename_for_targets(targets);
+    }
+
+    pub(crate) fn pane_history_size_stats(
         &self,
         session_name: &SessionName,
         pane_id: PaneId,
-    ) -> Option<PaneHistoryStats> {
+    ) -> Option<PaneHistorySizeStats> {
+        let transcript = self.pane_transcript_for_id(session_name, pane_id)?;
+        let transcript = transcript
+            .lock()
+            .expect("pane transcript mutex must not be poisoned");
+
+        Some(PaneHistorySizeStats {
+            limit: transcript.history_limit(),
+            size: transcript.history_size(),
+        })
+    }
+
+    pub(crate) fn pane_history_bytes(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> Option<usize> {
+        let transcript = self.pane_transcript_for_id(session_name, pane_id)?;
+        Some(
+            transcript
+                .lock()
+                .expect("pane transcript mutex must not be poisoned")
+                .tmux_history_bytes(),
+        )
+    }
+
+    pub(crate) fn pane_history_all_bytes(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> Option<String> {
+        let transcript = self.pane_transcript_for_id(session_name, pane_id)?;
+        Some(
+            transcript
+                .lock()
+                .expect("pane transcript mutex must not be poisoned")
+                .tmux_history_all_bytes(),
+        )
+    }
+
+    fn pane_transcript_for_id(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> Option<&SharedPaneTranscript> {
         let window_index = self
             .sessions
             .session(session_name)?
             .window_index_for_pane_id(pane_id)?;
         let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        let transcript = self.transcripts.get(&runtime_session_name)?.get(&pane_id)?;
-        let transcript = transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned");
-
-        Some(PaneHistoryStats {
-            limit: transcript.history_limit(),
-            size: transcript.history_size(),
-            bytes: transcript.tmux_history_bytes(),
-            all_bytes: transcript.tmux_history_all_bytes(),
-        })
+        self.transcripts.get(&runtime_session_name)?.get(&pane_id)
     }
 
     pub(crate) fn pane_output_sequence(
@@ -304,6 +368,7 @@ impl HandlerState {
             alternate_on: transcript.is_alternate(),
             title: transcript.title().to_owned(),
             path: transcript.path().to_owned(),
+            cursor_position: transcript.cursor_position(),
             cursor_style: transcript.cursor_style(),
         })
     }
@@ -342,11 +407,29 @@ impl HandlerState {
             .copy_mode_render_screen()
     }
 
-    pub(crate) fn pane_render_screen(
+    pub(crate) fn with_pane_screen<R>(
         &self,
         session_name: &SessionName,
         pane_id: PaneId,
-    ) -> Option<rmux_core::Screen> {
+        render: impl FnOnce(&Screen) -> R,
+    ) -> Option<R> {
+        let window_index = self
+            .sessions
+            .session(session_name)?
+            .window_index_for_pane_id(pane_id)?;
+        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
+        let transcript = self.transcripts.get(&runtime_session_name)?.get(&pane_id)?;
+        let transcript = transcript
+            .lock()
+            .expect("pane transcript mutex must not be poisoned");
+        Some(render(transcript.screen()))
+    }
+
+    pub(crate) fn pane_screen(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> Option<Screen> {
         let window_index = self
             .sessions
             .session(session_name)?
@@ -357,7 +440,8 @@ impl HandlerState {
             transcript
                 .lock()
                 .expect("pane transcript mutex must not be poisoned")
-                .clone_screen(),
+                .screen()
+                .clone(),
         )
     }
 
@@ -572,6 +656,22 @@ impl HandlerState {
         }
     }
 
+    fn refresh_transcript_title_rename_for_targets(&mut self, targets: Vec<PaneTarget>) {
+        for target in targets {
+            let enabled = self.title_rename_enabled_for_pane(
+                target.session_name(),
+                target.window_index(),
+                target.pane_index(),
+            );
+            if let Ok(transcript) = self.transcript_handle(&target) {
+                transcript
+                    .lock()
+                    .expect("pane transcript mutex must not be poisoned")
+                    .set_title_rename_enabled(enabled);
+            }
+        }
+    }
+
     pub(in crate::pane_terminals) fn alternate_screen_enabled_for_pane_id(
         &self,
         session_name: &SessionName,
@@ -593,6 +693,27 @@ impl HandlerState {
         self.alternate_screen_enabled_for_pane(session_name, window_index, pane_index)
     }
 
+    pub(in crate::pane_terminals) fn title_rename_enabled_for_pane_id(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> bool {
+        let Some(session) = self.sessions.session(session_name) else {
+            return false;
+        };
+        let Some(window_index) = session.window_index_for_pane_id(pane_id) else {
+            return false;
+        };
+        let Some(pane_index) = session
+            .window_at(window_index)
+            .and_then(|window| window.panes().iter().find(|pane| pane.id() == pane_id))
+            .map(|pane| pane.index())
+        else {
+            return false;
+        };
+        self.title_rename_enabled_for_pane(session_name, window_index, pane_index)
+    }
+
     fn alternate_screen_enabled_for_pane(
         &self,
         session_name: &SessionName,
@@ -607,6 +728,20 @@ impl HandlerState {
                 OptionName::AlternateScreen,
             )
             .is_none_or(|value| value != "off")
+    }
+
+    fn title_rename_enabled_for_pane(
+        &self,
+        session_name: &SessionName,
+        window_index: u32,
+        pane_index: u32,
+    ) -> bool {
+        self.options.resolve_for_pane(
+            session_name,
+            window_index,
+            pane_index,
+            OptionName::AllowSetTitle,
+        ) == Some("on")
     }
 
     fn all_pane_targets(&self) -> Vec<PaneTarget> {

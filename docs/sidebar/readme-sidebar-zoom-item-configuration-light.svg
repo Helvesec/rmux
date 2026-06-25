@@ -1,0 +1,8 @@
+<svg width="400" height="22" viewBox="60 0 340 22" fill="none" xmlns="http://www.w3.org/2000/svg">
+<style>
+  .title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; font-size: 22px; font-weight: 600; fill: #1f2328; }
+  .item { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; font-size: 15px; fill: #0969da; }
+</style>
+<circle cx="162" cy="10" r="2.8" fill="#59636e" />
+<text x="178" y="15" class="item">Configuration</text>
+</svg>

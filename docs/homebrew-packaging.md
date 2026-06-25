@@ -18,7 +18,7 @@ installer, or Cargo.
 Generate `Formula/rmux.rb` for the official tap:
 
 ```sh
-tag=v0.6.1
+tag=v0.7.0
 version="${tag#v}"
 curl -fsSL "https://github.com/Helvesec/rmux/releases/download/$tag/SHA256SUMS" -o /tmp/rmux-SHA256SUMS
 scripts/generate-homebrew-formula.sh \

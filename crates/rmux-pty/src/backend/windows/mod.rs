@@ -3,6 +3,7 @@ mod command_line;
 mod dsr;
 mod flags;
 mod io;
+mod perf;
 mod pty;
 mod spawn;
 mod version;

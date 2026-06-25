@@ -81,13 +81,13 @@ async fn parsed_queue_select_pane_title_sets_target_title_without_selecting_it()
     ));
     assert!(matches!(
         handler
-            .handle(Request::SelectPane(SelectPaneRequest {
+            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
                 target: PaneTarget::with_window(alpha.clone(), 0, 0),
                 title: None,
                 style: None,
                 input_disabled: None,
                 preserve_zoom: false,
-            }))
+            })))
             .await,
         Response::SelectPane(_)
     ));
@@ -201,7 +201,7 @@ async fn parsed_queue_resolves_move_window_renumber_target_as_session() {
     ));
     assert!(matches!(
         handler
-            .handle(Request::NewWindow(NewWindowRequest {
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
                 target: alpha.clone(),
                 name: Some("logs".to_owned()),
                 detached: true,
@@ -211,7 +211,7 @@ async fn parsed_queue_resolves_move_window_renumber_target_as_session() {
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await,
         Response::NewWindow(_)
     ));
@@ -242,7 +242,7 @@ async fn parsed_queue_uses_current_target_for_move_window_renumber_without_t() {
     ));
     assert!(matches!(
         handler
-            .handle(Request::NewWindow(NewWindowRequest {
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
                 target: alpha.clone(),
                 name: Some("logs".to_owned()),
                 detached: true,
@@ -252,7 +252,7 @@ async fn parsed_queue_uses_current_target_for_move_window_renumber_without_t() {
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await,
         Response::NewWindow(_)
     ));
@@ -289,7 +289,7 @@ async fn parsed_queue_move_window_after_inserts_before_unlinking_source() {
     for name in ["b", "c"] {
         assert!(matches!(
             handler
-                .handle(Request::NewWindow(NewWindowRequest {
+                .handle(Request::NewWindow(Box::new(NewWindowRequest {
                     target: alpha.clone(),
                     name: Some(name.to_owned()),
                     detached: true,
@@ -299,7 +299,7 @@ async fn parsed_queue_move_window_after_inserts_before_unlinking_source() {
                     process_command: None,
                     target_window_index: None,
                     insert_at_target: false,
-                }))
+                })))
                 .await,
             Response::NewWindow(_)
         ));

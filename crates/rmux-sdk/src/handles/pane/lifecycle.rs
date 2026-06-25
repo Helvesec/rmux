@@ -56,7 +56,7 @@ pub(super) async fn respawn_pane(pane: &Pane, options: PaneRespawnOptions) -> Re
     let response = if pane.stable_id.is_some() {
         crate::capabilities::require(pane.transport(), &[CAPABILITY_SDK_PANE_BY_ID]).await?;
         pane.transport()
-            .request(Request::PaneRespawn(PaneRespawnRequest {
+            .request(Request::PaneRespawn(Box::new(PaneRespawnRequest {
                 target: pane.proto_target_ref(),
                 kill: options.kill,
                 start_directory: options.start_directory,
@@ -64,21 +64,21 @@ pub(super) async fn respawn_pane(pane: &Pane, options: PaneRespawnOptions) -> Re
                 command,
                 process_command,
                 keep_alive_on_exit: options.keep_alive_on_exit,
-            }))
+            })))
             .await?
     } else {
         if let Some(keep_alive) = options.keep_alive_on_exit {
             set_slot_keep_alive_on_exit(pane, keep_alive).await?;
         }
         pane.transport()
-            .request(Request::RespawnPane(RespawnPaneRequest {
+            .request(Request::RespawnPane(Box::new(RespawnPaneRequest {
                 target: pane.target().into(),
                 kill: options.kill,
                 start_directory: options.start_directory,
                 environment,
                 command,
                 process_command,
-            }))
+            })))
             .await?
     };
 

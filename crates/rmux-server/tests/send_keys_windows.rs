@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+#[path = "../../../tests/support/windows_cargo_build.rs"]
+mod windows_cargo_build;
 #[path = "../../../tests/support/windows_cli_serial.rs"]
 mod windows_cli_serial;
 
@@ -185,6 +187,7 @@ fn resolve_rmux_binary() -> TestResult<PathBuf> {
 
     let target_dir = target_dir()?;
     let candidate = target_dir.join("debug").join("rmux.exe");
+    let _cargo_build_guard = windows_cargo_build::acquire()?;
     let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
         .arg("build")
         .arg("--bin")

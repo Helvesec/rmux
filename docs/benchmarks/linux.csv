@@ -1,0 +1,406 @@
+platform,commit,operation,scenario,tool,sample_index,sample_ms,p50_ms,p95_ms
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,0,7.419,3.398,7.419
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,1,7.348,3.398,7.419
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,2,3.294,3.398,7.419
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,3,3.398,3.398,7.419
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,4,3.43,3.398,7.419
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,5,3.365,3.398,7.419
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,6,3.426,3.398,7.419
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,7,3.267,3.398,7.419
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,8,3.445,3.398,7.419
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,9,3.365,3.398,7.419
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,10,3.368,3.398,7.419
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,11,3.498,3.398,7.419
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,12,3.348,3.398,7.419
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,13,3.447,3.398,7.419
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,14,3.354,3.398,7.419
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,0,15.575,15.614,16.28
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,1,15.502,15.614,16.28
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,2,15.543,15.614,16.28
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,3,15.614,15.614,16.28
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,4,15.648,15.614,16.28
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,5,16.125,15.614,16.28
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,6,9.287,15.614,16.28
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,7,15.908,15.614,16.28
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,8,8.011,15.614,16.28
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,9,16.28,15.614,16.28
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,10,8.849,15.614,16.28
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,11,15.506,15.614,16.28
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,12,16.036,15.614,16.28
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,13,15.904,15.614,16.28
+linux,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,14,15.845,15.614,16.28
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,0,3.287,1.306,3.322
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,1,1.309,1.306,3.322
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,2,3.322,1.306,3.322
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,3,1.309,1.306,3.322
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,4,1.218,1.306,3.322
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,5,1.306,1.306,3.322
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,6,1.29,1.306,3.322
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,7,1.313,1.306,3.322
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,8,1.265,1.306,3.322
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,9,1.256,1.306,3.322
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,10,1.267,1.306,3.322
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,11,1.32,1.306,3.322
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,12,1.307,1.306,3.322
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,13,1.231,1.306,3.322
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,14,1.258,1.306,3.322
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,0,7.402,3.361,7.402
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,1,3.488,3.361,7.402
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,2,3.461,3.361,7.402
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,3,3.309,3.361,7.402
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,4,3.341,3.361,7.402
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,5,3.329,3.361,7.402
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,6,3.349,3.361,7.402
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,7,3.339,3.361,7.402
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,8,3.361,3.361,7.402
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,9,2.432,3.361,7.402
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,10,3.371,3.361,7.402
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,11,1.875,3.361,7.402
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,12,3.489,3.361,7.402
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,13,4.718,3.361,7.402
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,14,4.077,3.361,7.402
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,0,16.282,16.152,16.427
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,1,16.152,16.152,16.427
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,2,15.915,16.152,16.427
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,3,16.025,16.152,16.427
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,4,16.386,16.152,16.427
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,5,16.427,16.152,16.427
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,6,16.398,16.152,16.427
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,7,15.911,16.152,16.427
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,8,16.366,16.152,16.427
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,9,16.364,16.152,16.427
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,10,15.501,16.152,16.427
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,11,16.126,16.152,16.427
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,12,16.018,16.152,16.427
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,13,16.201,16.152,16.427
+linux,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,14,15.528,16.152,16.427
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,0,3.335,3.338,3.46
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,1,3.379,3.338,3.46
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,2,3.281,3.338,3.46
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,3,3.377,3.338,3.46
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,4,3.338,3.338,3.46
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,5,3.346,3.338,3.46
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,6,3.339,3.338,3.46
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,7,3.316,3.338,3.46
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,8,3.347,3.338,3.46
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,9,3.46,3.338,3.46
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,10,1.974,3.338,3.46
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,11,3.334,3.338,3.46
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,12,3.317,3.338,3.46
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,13,3.324,3.338,3.46
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,14,3.339,3.338,3.46
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,0,15.647,7.75,31.932
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,1,7.442,7.75,31.932
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,2,7.414,7.75,31.932
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,3,7.449,7.75,31.932
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,4,7.452,7.75,31.932
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,5,17.295,7.75,31.932
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,6,7.44,7.75,31.932
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,7,31.932,7.75,31.932
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,8,15.516,7.75,31.932
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,9,7.4,7.75,31.932
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,10,7.75,7.75,31.932
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,11,7.423,7.75,31.932
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,12,8.027,7.75,31.932
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,13,15.478,7.75,31.932
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,14,16.328,7.75,31.932
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,0,32.235,32.073,64.388
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,1,31.542,32.073,64.388
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,2,32.205,32.073,64.388
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,3,33.201,32.073,64.388
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,4,32.073,32.073,64.388
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,5,32.521,32.073,64.388
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,6,31.619,32.073,64.388
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,7,31.851,32.073,64.388
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,8,64.388,32.073,64.388
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,9,31.922,32.073,64.388
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,10,33.232,32.073,64.388
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,11,31.614,32.073,64.388
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,12,31.991,32.073,64.388
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,13,32.333,32.073,64.388
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,14,31.491,32.073,64.388
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,0,3.322,3.322,3.559
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,1,3.559,3.322,3.559
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,2,3.327,3.322,3.559
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,3,2.4,3.322,3.559
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,4,1.856,3.322,3.559
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,5,3.332,3.322,3.559
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,6,1.732,3.322,3.559
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,7,2.003,3.322,3.559
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,8,2.097,3.322,3.559
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,9,3.359,3.322,3.559
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,10,3.364,3.322,3.559
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,11,3.359,3.322,3.559
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,12,3.352,3.322,3.559
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,13,3.312,3.322,3.559
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,14,3.256,3.322,3.559
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,0,16.124,7.642,16.908
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,1,8.049,7.642,16.908
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,2,16.377,7.642,16.908
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,3,8.146,7.642,16.908
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,4,7.395,7.642,16.908
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,5,7.457,7.642,16.908
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,6,7.587,7.642,16.908
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,7,15.548,7.642,16.908
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,8,7.455,7.642,16.908
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,9,7.396,7.642,16.908
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,10,7.642,7.642,16.908
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,11,7.479,7.642,16.908
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,12,16.908,7.642,16.908
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,13,7.441,7.642,16.908
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,14,16.625,7.642,16.908
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,0,32.917,32.002,32.917
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,1,31.747,32.002,32.917
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,2,31.833,32.002,32.917
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,3,31.676,32.002,32.917
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,4,32.349,32.002,32.917
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,5,31.91,32.002,32.917
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,6,31.986,32.002,32.917
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,7,32.865,32.002,32.917
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,8,32.767,32.002,32.917
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,9,32.395,32.002,32.917
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,10,31.986,32.002,32.917
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,11,32.444,32.002,32.917
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,12,31.529,32.002,32.917
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,13,32.002,32.002,32.917
+linux,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,14,32.096,32.002,32.917
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,0,1.348,1.249,1.348
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,1,1.255,1.249,1.348
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,2,1.303,1.249,1.348
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,3,1.289,1.249,1.348
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,4,1.278,1.249,1.348
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,5,1.223,1.249,1.348
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,6,1.235,1.249,1.348
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,7,1.239,1.249,1.348
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,8,1.233,1.249,1.348
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,9,1.249,1.249,1.348
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,10,1.228,1.249,1.348
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,11,1.27,1.249,1.348
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,12,1.262,1.249,1.348
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,13,1.225,1.249,1.348
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,14,1.239,1.249,1.348
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,0,3.313,3.363,4.369
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,1,3.369,3.363,4.369
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,2,4.119,3.363,4.369
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,3,3.365,3.363,4.369
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,4,3.334,3.363,4.369
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,5,3.974,3.363,4.369
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,6,3.626,3.363,4.369
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,7,3.362,3.363,4.369
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,8,3.342,3.363,4.369
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,9,3.336,3.363,4.369
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,10,3.366,3.363,4.369
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,11,1.952,3.363,4.369
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,12,2.092,3.363,4.369
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,13,4.369,3.363,4.369
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,14,3.363,3.363,4.369
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,0,15.956,15.91,16.952
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,1,15.687,15.91,16.952
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,2,15.773,15.91,16.952
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,3,15.448,15.91,16.952
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,4,15.871,15.91,16.952
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,5,16.346,15.91,16.952
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,6,15.871,15.91,16.952
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,7,16.952,15.91,16.952
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,8,15.575,15.91,16.952
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,9,16.348,15.91,16.952
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,10,15.921,15.91,16.952
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,11,15.943,15.91,16.952
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,12,15.91,15.91,16.952
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,13,16.03,15.91,16.952
+linux,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,14,15.599,15.91,16.952
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,0,1.279,1.279,1.407
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,1,1.234,1.279,1.407
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,2,1.225,1.279,1.407
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,3,1.252,1.279,1.407
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,4,1.27,1.279,1.407
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,5,1.407,1.279,1.407
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,6,1.241,1.279,1.407
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,7,1.336,1.279,1.407
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,8,1.396,1.279,1.407
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,9,1.294,1.279,1.407
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,10,1.291,1.279,1.407
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,11,1.276,1.279,1.407
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,12,1.185,1.279,1.407
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,13,1.307,1.279,1.407
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,14,1.381,1.279,1.407
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,0,3.481,3.362,3.788
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,1,3.788,3.362,3.788
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,2,3.436,3.362,3.788
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,3,3.457,3.362,3.788
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,4,3.362,3.362,3.788
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,5,3.32,3.362,3.788
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,6,2.348,3.362,3.788
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,7,3.393,3.362,3.788
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,8,3.331,3.362,3.788
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,9,3.544,3.362,3.788
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,10,3.32,3.362,3.788
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,11,3.328,3.362,3.788
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,12,3.335,3.362,3.788
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,13,3.357,3.362,3.788
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,14,3.384,3.362,3.788
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,0,63.816,16.077,64.44
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,1,64.44,16.077,64.44
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,2,15.799,16.077,64.44
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,3,16.088,16.077,64.44
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,4,16.077,16.077,64.44
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,5,15.778,16.077,64.44
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,6,16.113,16.077,64.44
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,7,16.068,16.077,64.44
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,8,15.477,16.077,64.44
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,9,16.0,16.077,64.44
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,10,16.001,16.077,64.44
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,11,16.052,16.077,64.44
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,12,16.341,16.077,64.44
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,13,16.49,16.077,64.44
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,14,16.108,16.077,64.44
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,0,3.279,3.365,3.841
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,1,3.283,3.365,3.841
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,2,3.43,3.365,3.841
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,3,3.371,3.365,3.841
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,4,3.385,3.365,3.841
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,5,3.841,3.365,3.841
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,6,3.377,3.365,3.841
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,7,3.326,3.365,3.841
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,8,3.423,3.365,3.841
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,9,3.341,3.365,3.841
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,10,1.904,3.365,3.841
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,11,3.365,3.365,3.841
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,12,1.241,3.365,3.841
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,13,3.316,3.365,3.841
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,14,3.449,3.365,3.841
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,0,7.376,7.387,7.606
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,1,7.434,7.387,7.606
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,2,7.387,7.387,7.606
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,3,7.495,7.387,7.606
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,4,7.424,7.387,7.606
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,5,3.901,7.387,7.606
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,6,7.453,7.387,7.606
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,7,7.358,7.387,7.606
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,8,3.549,7.387,7.606
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,9,7.606,7.387,7.606
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,10,4.388,7.387,7.606
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,11,3.483,7.387,7.606
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,12,3.348,7.387,7.606
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,13,7.469,7.387,7.606
+linux,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,14,7.407,7.387,7.606
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,0,2.891,3.799,6.71
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,1,3.863,3.799,6.71
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,2,3.886,3.799,6.71
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,3,1.653,3.799,6.71
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,4,1.413,3.799,6.71
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,5,3.673,3.799,6.71
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,6,3.799,3.799,6.71
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,7,4.279,3.799,6.71
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,8,4.099,3.799,6.71
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,9,3.908,3.799,6.71
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,10,1.55,3.799,6.71
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,11,2.143,3.799,6.71
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,12,5.592,3.799,6.71
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,13,6.71,3.799,6.71
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,14,1.965,3.799,6.71
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,0,3.529,3.571,7.682
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,1,3.669,3.571,7.682
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,2,4.314,3.571,7.682
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,3,3.508,3.571,7.682
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,4,3.994,3.571,7.682
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,5,7.61,3.571,7.682
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,6,3.542,3.571,7.682
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,7,7.682,3.571,7.682
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,8,3.571,3.571,7.682
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,9,3.562,3.571,7.682
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,10,3.66,3.571,7.682
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,11,3.557,3.571,7.682
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,12,3.502,3.571,7.682
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,13,3.584,3.571,7.682
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,14,3.569,3.571,7.682
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,0,15.794,15.635,17.265
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,1,17.265,15.635,17.265
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,2,15.844,15.635,17.265
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,3,15.595,15.635,17.265
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,4,15.703,15.635,17.265
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,5,17.134,15.635,17.265
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,6,15.554,15.635,17.265
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,7,15.7,15.635,17.265
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,8,15.596,15.635,17.265
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,9,15.535,15.635,17.265
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,10,15.554,15.635,17.265
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,11,15.487,15.635,17.265
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,12,16.116,15.635,17.265
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,13,15.635,15.635,17.265
+linux,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,14,15.569,15.635,17.265
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,0,1.376,1.257,3.4
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,1,3.338,1.257,3.4
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,2,3.4,1.257,3.4
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,3,1.253,1.257,3.4
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,4,1.286,1.257,3.4
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,5,1.254,1.257,3.4
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,6,1.263,1.257,3.4
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,7,1.286,1.257,3.4
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,8,1.246,1.257,3.4
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,9,1.211,1.257,3.4
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,10,1.257,1.257,3.4
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,11,1.277,1.257,3.4
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,12,1.248,1.257,3.4
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,13,1.249,1.257,3.4
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,14,1.235,1.257,3.4
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,0,4.232,3.36,4.232
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,1,3.716,3.36,4.232
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,2,3.324,3.36,4.232
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,3,3.856,3.36,4.232
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,4,3.36,3.36,4.232
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,5,3.375,3.36,4.232
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,6,3.867,3.36,4.232
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,7,3.637,3.36,4.232
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,8,3.344,3.36,4.232
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,9,3.348,3.36,4.232
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,10,3.344,3.36,4.232
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,11,3.329,3.36,4.232
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,12,3.335,3.36,4.232
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,13,3.321,3.36,4.232
+linux,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,14,3.381,3.36,4.232
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,0,3.341,3.333,3.427
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,1,3.296,3.333,3.427
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,2,3.359,3.333,3.427
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,3,3.31,3.333,3.427
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,4,3.421,3.333,3.427
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,5,3.28,3.333,3.427
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,6,3.26,3.333,3.427
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,7,3.427,3.333,3.427
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,8,3.347,3.333,3.427
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,9,3.314,3.333,3.427
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,10,3.333,3.333,3.427
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,11,3.42,3.333,3.427
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,12,3.282,3.333,3.427
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,13,3.265,3.333,3.427
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,14,3.371,3.333,3.427
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,0,3.367,3.343,3.961
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,1,3.331,3.343,3.961
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,2,3.348,3.343,3.961
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,3,3.343,3.343,3.961
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,4,3.338,3.343,3.961
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,5,3.961,3.343,3.961
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,6,3.333,3.343,3.961
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,7,3.374,3.343,3.961
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,8,3.387,3.343,3.961
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,9,3.329,3.343,3.961
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,10,3.307,3.343,3.961
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,11,3.336,3.343,3.961
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,12,3.354,3.343,3.961
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,13,3.359,3.343,3.961
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,14,3.315,3.343,3.961
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,0,15.969,15.88,16.973
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,1,16.973,15.88,16.973
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,2,15.521,15.88,16.973
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,3,15.747,15.88,16.973
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,4,15.481,15.88,16.973
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,5,16.098,15.88,16.973
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,6,15.565,15.88,16.973
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,7,15.622,15.88,16.973
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,8,16.008,15.88,16.973
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,9,8.372,15.88,16.973
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,10,15.691,15.88,16.973
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,11,15.88,15.88,16.973
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,12,15.984,15.88,16.973
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,13,16.833,15.88,16.973
+linux,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,14,16.443,15.88,16.973

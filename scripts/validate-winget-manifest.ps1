@@ -129,6 +129,15 @@ function AssertManifestValue([string]$Key, [string]$Expected) {
     }
 }
 
+function AssertManifestLine([string]$Expected) {
+    foreach ($line in $script:manifestLines) {
+        if ($line.Trim() -eq $Expected) {
+            return
+        }
+    }
+    Fail "missing line in ${script:currentManifest}: $Expected"
+}
+
 function ReadChecksum([string]$ChecksumsPath, [string]$Asset) {
     if ([string]::IsNullOrWhiteSpace($ChecksumsPath)) {
         return ""
@@ -191,6 +200,9 @@ AssertManifestValue "InstallerType" "zip"
 AssertManifestValue "NestedInstallerType" "portable"
 AssertManifestValue "RelativeFilePath" $expectedRelativePath
 AssertManifestValue "PortableCommandAlias" "rmux"
+AssertManifestLine "Dependencies:"
+AssertManifestLine "PackageDependencies:"
+AssertManifestLine "- PackageIdentifier: Microsoft.VCRedist.2015+.x64"
 AssertManifestValue "Architecture" "x64"
 AssertManifestValue "InstallerUrl" $expectedUrl
 AssertManifestValue "ManifestType" "installer"

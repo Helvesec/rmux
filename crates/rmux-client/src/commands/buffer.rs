@@ -1,7 +1,7 @@
 use rmux_proto::{
-    CapturePaneRequest, ClearHistoryRequest, DeleteBufferRequest, ListBuffersRequest,
-    LoadBufferRequest, PaneTarget, PasteBufferRequest, Request, Response, SaveBufferRequest,
-    SetBufferRequest, ShowBufferRequest,
+    CapturePaneRequest, CapturePaneTargetActionRequest, ClearHistoryRequest, DeleteBufferRequest,
+    ListBuffersRequest, LoadBufferRequest, PaneTarget, PasteBufferRequest, Request, Response,
+    SaveBufferRequest, SetBufferRequest, ShowBufferRequest,
 };
 use std::path::{Path, PathBuf};
 
@@ -43,7 +43,7 @@ impl Connection {
         raw: bool,
         bracketed: bool,
     ) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::PasteBuffer(PasteBufferRequest {
+        self.roundtrip(&Request::PasteBuffer(Box::new(PasteBufferRequest {
             name,
             target,
             delete_after,
@@ -51,7 +51,7 @@ impl Connection {
             linefeed,
             raw,
             bracketed,
-        }))
+        })))
     }
 
     /// Sends a `list-buffers` request over the detached RPC channel.
@@ -109,7 +109,15 @@ impl Connection {
 
     /// Sends a `capture-pane` request over the detached RPC channel.
     pub fn capture_pane(&mut self, request: CapturePaneRequest) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::CapturePane(request))
+        self.roundtrip(&Request::CapturePane(Box::new(request)))
+    }
+
+    /// Sends a `capture-pane` request with server-side target resolution.
+    pub fn capture_pane_target_action(
+        &mut self,
+        request: CapturePaneTargetActionRequest,
+    ) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::CapturePaneTargetAction(Box::new(request)))
     }
 
     /// Sends a `clear-history` request over the detached RPC channel.

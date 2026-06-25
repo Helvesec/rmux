@@ -97,8 +97,12 @@ pub(super) fn position_ge(left: CopyPosition, right: CopyPosition) -> bool {
 
 pub(super) fn owner_positions(line: &ScreenLineView) -> Vec<u32> {
     (0..line.width())
-        .filter(|x| line.cell(*x).is_none_or(|cell| !cell.is_padding()))
+        .filter(|x| is_owner_position(line, *x))
         .collect()
+}
+
+pub(super) fn is_owner_position(line: &ScreenLineView, x: u32) -> bool {
+    x < line.width() && line.cell(x).is_none_or(|cell| !cell.is_padding())
 }
 
 pub(super) fn line_char(line: &ScreenLineView, x: u32) -> Option<char> {

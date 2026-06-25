@@ -1,5 +1,6 @@
 use clap::{ArgAction, Args};
 
+use super::automation::{parse_duration, SendKeysWaitMode};
 use super::{parse_target_spec, TargetSpec};
 
 #[derive(Debug, Clone, Args)]
@@ -26,8 +27,76 @@ pub(crate) struct SendKeysArgs {
     pub(crate) client_target: Option<String>,
     #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
+    #[arg(long = "wait", value_parser = parse_send_keys_wait_mode)]
+    pub(crate) wait: Option<SendKeysWaitMode>,
+    #[arg(long = "wait-text")]
+    pub(crate) wait_text: Option<String>,
+    #[arg(long = "wait-visible-text")]
+    pub(crate) wait_visible_text: Option<String>,
+    #[arg(long = "wait-next-text")]
+    pub(crate) wait_next_text: Option<String>,
+    #[arg(long = "wait-pane-exit", action = ArgAction::SetTrue)]
+    pub(crate) wait_pane_exit: bool,
+    #[arg(long = "stable-for", value_parser = parse_duration)]
+    pub(crate) stable_for: Option<std::time::Duration>,
+    #[arg(long = "timeout", value_parser = parse_duration)]
+    pub(crate) timeout: Option<std::time::Duration>,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     pub(crate) keys: Vec<String>,
+}
+
+impl SendKeysArgs {
+    pub(crate) fn has_wait(&self) -> bool {
+        self.wait.is_some()
+            || self.wait_text.is_some()
+            || self.wait_visible_text.is_some()
+            || self.wait_next_text.is_some()
+            || self.wait_pane_exit
+    }
+
+    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
+        let waits = [
+            self.wait.is_some(),
+            self.wait_text.is_some(),
+            self.wait_visible_text.is_some(),
+            self.wait_next_text.is_some(),
+            self.wait_pane_exit,
+        ]
+        .into_iter()
+        .filter(|selected| *selected)
+        .count();
+        let has_wait = waits > 0;
+        if waits > 1 {
+            return Err(value_error(
+                "send-keys",
+                "only one --wait condition may be selected",
+            ));
+        }
+        if self.timeout.is_some() && !has_wait {
+            return Err(value_error(
+                "send-keys",
+                "--timeout is valid only with a --wait condition",
+            ));
+        }
+        reject_empty("send-keys", "--wait-text", self.wait_text.as_deref())?;
+        reject_empty(
+            "send-keys",
+            "--wait-visible-text",
+            self.wait_visible_text.as_deref(),
+        )?;
+        reject_empty(
+            "send-keys",
+            "--wait-next-text",
+            self.wait_next_text.as_deref(),
+        )?;
+        if self.stable_for.is_some() && self.wait != Some(SendKeysWaitMode::Quiet) {
+            return Err(value_error(
+                "send-keys",
+                "--stable-for is valid only with --wait quiet",
+            ));
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -133,5 +202,29 @@ fn unknown_flag_error(command_name: &str, flag: &str) -> clap::Error {
     clap::Error::raw(
         clap::error::ErrorKind::UnknownArgument,
         format!("command {command_name}: unknown flag {flag}"),
+    )
+}
+
+fn parse_send_keys_wait_mode(value: &str) -> Result<SendKeysWaitMode, String> {
+    match value {
+        "quiet" => Ok(SendKeysWaitMode::Quiet),
+        _ => Err("supported wait modes: quiet".to_owned()),
+    }
+}
+
+fn reject_empty(command_name: &str, flag: &str, value: Option<&str>) -> Result<(), clap::Error> {
+    if value.is_some_and(str::is_empty) {
+        return Err(value_error(
+            command_name,
+            format!("{flag} must not be empty"),
+        ));
+    }
+    Ok(())
+}
+
+fn value_error(command_name: &str, message: impl std::fmt::Display) -> clap::Error {
+    clap::Error::raw(
+        clap::error::ErrorKind::ValueValidation,
+        format!("command {command_name}: {message}"),
     )
 }

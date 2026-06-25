@@ -100,6 +100,32 @@ impl OverlayCommandTokens {
     }
 }
 
+fn split_attached_short_flag(token: String) -> (String, Option<String>) {
+    let mut chars = token.chars();
+    if chars.next() != Some('-') || chars.as_str().starts_with('-') {
+        return (token, None);
+    }
+    let Some(flag) = chars.next() else {
+        return (token, None);
+    };
+    let attached = chars.as_str();
+    (
+        format!("-{flag}"),
+        (!attached.is_empty()).then(|| attached.to_owned()),
+    )
+}
+
+fn pop_flag_value(
+    args: &mut OverlayCommandTokens,
+    attached: Option<String>,
+    description: &str,
+) -> Result<String, RmuxError> {
+    match attached {
+        Some(value) => Ok(value),
+        None => args.pop(description),
+    }
+}
+
 pub(super) fn parse_display_menu(
     arguments: Vec<String>,
 ) -> Result<ParsedDisplayMenuCommand, RmuxError> {
@@ -126,14 +152,15 @@ pub(super) fn parse_display_menu(
             break;
         }
         let token = args.pop("display-menu flag")?;
-        match token.as_str() {
+        let (flag, attached) = split_attached_short_flag(token);
+        match flag.as_str() {
             "-b" => {
-                let value = args.pop("-b border-lines")?;
+                let value = pop_flag_value(&mut args, attached, "-b border-lines")?;
                 border_lines = Some(BoxLines::parse(Some(value.as_str())));
             }
-            "-c" => target_client = Some(args.pop("-c target-client")?),
+            "-c" => target_client = Some(pop_flag_value(&mut args, attached, "-c target-client")?),
             "-C" => {
-                let value = args.pop("-C starting-choice")?;
+                let value = pop_flag_value(&mut args, attached, "-C starting-choice")?;
                 starting_choice = Some(if value == "-" {
                     None
                 } else {
@@ -142,20 +169,20 @@ pub(super) fn parse_display_menu(
                     })?)
                 });
             }
-            "-H" => selected_style = Some(args.pop("-H style")?),
-            "-M" => force_mouse = true,
-            "-O" => stay_open = true,
-            "-s" => style = Some(args.pop("-s style")?),
-            "-S" => border_style = Some(args.pop("-S style")?),
+            "-H" => selected_style = Some(pop_flag_value(&mut args, attached, "-H style")?),
+            "-M" if attached.is_none() => force_mouse = true,
+            "-O" if attached.is_none() => stay_open = true,
+            "-s" => style = Some(pop_flag_value(&mut args, attached, "-s style")?),
+            "-S" => border_style = Some(pop_flag_value(&mut args, attached, "-S style")?),
             "-t" => {
                 target_pane = Some(parse_overlay_pane_target(
                     "display-menu",
-                    args.pop("-t target")?,
+                    pop_flag_value(&mut args, attached, "-t target")?,
                 )?)
             }
-            "-T" => title = args.pop("-T title")?,
-            "-x" => x = Some(args.pop("-x position")?),
-            "-y" => y = Some(args.pop("-y position")?),
+            "-T" => title = pop_flag_value(&mut args, attached, "-T title")?,
+            "-x" => x = Some(pop_flag_value(&mut args, attached, "-x position")?),
+            "-y" => y = Some(pop_flag_value(&mut args, attached, "-y position")?),
             flag => {
                 return Err(RmuxError::Server(format!(
                     "unsupported flag '{flag}' for display-menu"
@@ -233,20 +260,24 @@ pub(super) fn parse_display_popup(
             close_on_zero_exit = true;
             continue;
         }
-        match token.as_str() {
-            "-B" => border_lines = Some(BoxLines::None),
+        let (flag, attached) = split_attached_short_flag(token);
+        match flag.as_str() {
+            "-B" if attached.is_none() => border_lines = Some(BoxLines::None),
             "-b" => {
-                let value = args.pop("-b border-lines")?;
+                let value = pop_flag_value(&mut args, attached, "-b border-lines")?;
                 border_lines = Some(BoxLines::parse(Some(value.as_str())));
             }
-            "-C" => close_existing = true,
-            "-c" => target_client = Some(args.pop("-c target-client")?),
-            "-d" => start_directory = Some(PathBuf::from(args.pop("-d start-directory")?)),
-            "-e" => environment.push(args.pop("-e name=value")?),
-            flag if flag.starts_with("-e") && flag.len() > 2 => {
-                environment.push(flag[2..].to_owned());
+            "-C" if attached.is_none() => close_existing = true,
+            "-c" => target_client = Some(pop_flag_value(&mut args, attached, "-c target-client")?),
+            "-d" => {
+                start_directory = Some(PathBuf::from(pop_flag_value(
+                    &mut args,
+                    attached,
+                    "-d start-directory",
+                )?));
             }
-            "-E" => {
+            "-e" => environment.push(pop_flag_value(&mut args, attached, "-e name=value")?),
+            "-E" if attached.is_none() => {
                 if args.peek() == Some("-E") {
                     let _ = args.optional();
                     close_on_zero_exit = true;
@@ -254,24 +285,34 @@ pub(super) fn parse_display_popup(
                     close_on_exit = true;
                 }
             }
-            "-h" => height = Some(parse_popup_size_spec(&args.pop("-h height")?)?),
-            "-k" => {
+            "-h" => {
+                height = Some(parse_popup_size_spec(&pop_flag_value(
+                    &mut args,
+                    attached,
+                    "-h height",
+                )?)?)
+            }
+            "-k" if attached.is_none() => {
                 close_any_key = true;
                 no_job = true;
             }
-            "-N" => no_job = true,
-            "-s" => style = Some(args.pop("-s style")?),
-            "-S" => border_style = Some(args.pop("-S style")?),
+            "-N" if attached.is_none() => no_job = true,
+            "-s" => style = Some(pop_flag_value(&mut args, attached, "-s style")?),
+            "-S" => border_style = Some(pop_flag_value(&mut args, attached, "-S style")?),
             "-t" => {
                 target_pane = Some(parse_overlay_pane_target(
                     "display-popup",
-                    args.pop("-t target")?,
+                    pop_flag_value(&mut args, attached, "-t target")?,
                 )?)
             }
-            "-T" => title = args.pop("-T title")?,
-            "-w" => width = Some(parse_popup_size_spec(&args.pop("-w width")?)?),
-            "-x" => x = Some(args.pop("-x position")?),
-            "-y" => y = Some(args.pop("-y position")?),
+            "-T" => title = pop_flag_value(&mut args, attached, "-T title")?,
+            "-w" => {
+                width = Some(parse_popup_size_spec(&pop_flag_value(
+                    &mut args, attached, "-w width",
+                )?)?)
+            }
+            "-x" => x = Some(pop_flag_value(&mut args, attached, "-x position")?),
+            "-y" => y = Some(pop_flag_value(&mut args, attached, "-y position")?),
             flag => {
                 return Err(RmuxError::Server(format!(
                     "unsupported flag '{flag}' for display-popup"

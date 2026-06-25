@@ -8,7 +8,7 @@ use rmux_core::command_parser::COMMAND_TABLE;
 
 #[test]
 fn rmux_manpage_renders_with_system_formatter() -> Result<(), Box<dyn Error>> {
-    let manpage = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rmux.1");
+    let manpage = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs/man/rmux.1");
     let rendered = render_manpage(&manpage)?;
     let rendered = strip_backspace_overstrikes(&rendered);
 

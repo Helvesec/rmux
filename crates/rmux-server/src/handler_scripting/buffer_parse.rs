@@ -98,19 +98,21 @@ pub(super) fn parse_paste_buffer(
         }
     }
 
-    Ok(Request::PasteBuffer(rmux_proto::PasteBufferRequest {
-        name,
-        target: target.unwrap_or(implicit_pane_target(
-            sessions,
-            find_context,
-            "paste-buffer",
-        )?),
-        delete_after,
-        separator,
-        linefeed,
-        raw,
-        bracketed,
-    }))
+    Ok(Request::PasteBuffer(Box::new(
+        rmux_proto::PasteBufferRequest {
+            name,
+            target: target.unwrap_or(implicit_pane_target(
+                sessions,
+                find_context,
+                "paste-buffer",
+            )?),
+            delete_after,
+            separator,
+            linefeed,
+            raw,
+            bracketed,
+        },
+    )))
 }
 
 pub(super) fn parse_list_buffers(mut args: CommandTokens) -> Result<Request, RmuxError> {

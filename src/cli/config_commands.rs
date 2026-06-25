@@ -39,17 +39,19 @@ pub(crate) fn run_set_option(
     };
 
     let response = connection
-        .roundtrip(&Request::SetOptionByName(SetOptionByNameRequest {
-            scope: request.scope,
-            name: request.option,
-            value: request.value,
-            mode: request.mode,
-            only_if_unset: request.only_if_unset,
-            unset: request.unset,
-            unset_pane_overrides: request.unset_pane_overrides,
-            format: request.format,
-            format_target: request.format_target,
-        }))
+        .roundtrip(&Request::SetOptionByName(Box::new(
+            SetOptionByNameRequest {
+                scope: request.scope,
+                name: request.option,
+                value: request.value,
+                mode: request.mode,
+                only_if_unset: request.only_if_unset,
+                unset: request.unset,
+                unset_pane_overrides: request.unset_pane_overrides,
+                format: request.format,
+                format_target: request.format_target,
+            },
+        )))
         .map_err(ExitFailure::from_client)?;
     match response {
         response if quiet && quiet_option_response(&response) => Ok(0),

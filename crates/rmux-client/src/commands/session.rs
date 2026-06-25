@@ -1,12 +1,14 @@
 use rmux_proto::request::{
     AttachSessionExt2Request, AttachSessionExt3Request, AttachSessionExtRequest,
-    DetachClientExtRequest, ListClientsRequest, NewSessionExtRequest, RefreshClientRequest,
-    Request, SuspendClientRequest, SwitchClientExt2Request, SwitchClientExt3Request,
+    CreateSessionLeaseRequest, DetachClientExtRequest, ListClientsRequest, NewSessionExtRequest,
+    RefreshClientRequest, ReleaseSessionLeaseRequest, RenewSessionLeaseRequest, Request,
+    SuspendClientRequest, SwitchClientExt2Request, SwitchClientExt3Request,
 };
 use rmux_proto::{
     AttachSessionRequest, DetachClientRequest, HasSessionRequest, KillSessionRequest,
     ListPanesRequest, ListSessionsRequest, NewSessionRequest, RenameSessionRequest, Response,
     SessionName, SwitchClientExtRequest, SwitchClientRequest, TerminalSize,
+    CAPABILITY_SDK_SESSION_LEASE,
 };
 
 use crate::{
@@ -46,7 +48,7 @@ impl Connection {
         &mut self,
         request: NewSessionExtRequest,
     ) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::NewSessionExt(request))
+        self.roundtrip(&Request::NewSessionExt(Box::new(request)))
     }
 
     /// Sends a `has-session` request over the detached RPC channel.
@@ -68,6 +70,52 @@ impl Connection {
         self.roundtrip(&Request::RenameSession(RenameSessionRequest {
             target,
             new_name,
+        }))
+    }
+
+    /// Creates an SDK-owned session lease.
+    pub fn create_session_lease(
+        &mut self,
+        session_name: SessionName,
+        ttl_millis: u64,
+    ) -> Result<Response, ClientError> {
+        if !self.supports_capability(CAPABILITY_SDK_SESSION_LEASE)? {
+            return Err(ClientError::Protocol(
+                rmux_proto::RmuxError::UnsupportedCapability {
+                    feature: CAPABILITY_SDK_SESSION_LEASE.to_owned(),
+                    supported: Vec::new(),
+                },
+            ));
+        }
+        self.roundtrip(&Request::CreateSessionLease(CreateSessionLeaseRequest {
+            session_name,
+            ttl_millis,
+        }))
+    }
+
+    /// Renews an SDK-owned session lease.
+    pub fn renew_session_lease(
+        &mut self,
+        session_name: SessionName,
+        token: u64,
+        ttl_millis: u64,
+    ) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::RenewSessionLease(RenewSessionLeaseRequest {
+            session_name,
+            token,
+            ttl_millis,
+        }))
+    }
+
+    /// Releases an SDK-owned session lease.
+    pub fn release_session_lease(
+        &mut self,
+        session_name: SessionName,
+        token: u64,
+    ) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::ReleaseSessionLease(ReleaseSessionLeaseRequest {
+            session_name,
+            token,
         }))
     }
 
@@ -121,7 +169,7 @@ impl Connection {
         &mut self,
         request: SwitchClientExt2Request,
     ) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::SwitchClientExt2(request))
+        self.roundtrip(&Request::SwitchClientExt2(Box::new(request)))
     }
 
     /// Sends the most recent `switch-client` request shape over the detached RPC channel.
@@ -129,7 +177,7 @@ impl Connection {
         &mut self,
         request: SwitchClientExt3Request,
     ) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::SwitchClientExt3(request))
+        self.roundtrip(&Request::SwitchClientExt3(Box::new(request)))
     }
 
     /// Sends a `detach-client` request over the detached RPC channel.
@@ -150,12 +198,12 @@ impl Connection {
         &mut self,
         request: RefreshClientRequest,
     ) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::RefreshClient(request))
+        self.roundtrip(&Request::RefreshClient(Box::new(request)))
     }
 
     /// Sends a `list-clients` request over the detached RPC channel.
     pub fn list_clients(&mut self, request: ListClientsRequest) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::ListClients(request))
+        self.roundtrip(&Request::ListClients(Box::new(request)))
     }
 
     /// Sends a `suspend-client` request over the detached RPC channel.
@@ -203,7 +251,7 @@ impl Connection {
         mut self,
         request: AttachSessionExt2Request,
     ) -> Result<AttachTransition, ClientError> {
-        self.write_request(&Request::AttachSessionExt2(request))?;
+        self.write_request(&Request::AttachSessionExt2(Box::new(request)))?;
         let response = self.read_response()?;
 
         match response {
@@ -219,7 +267,7 @@ impl Connection {
         mut self,
         request: AttachSessionExt3Request,
     ) -> Result<AttachTransition, ClientError> {
-        self.write_request(&Request::AttachSessionExt3(request))?;
+        self.write_request(&Request::AttachSessionExt3(Box::new(request)))?;
         let response = self.read_response()?;
 
         match response {
@@ -235,6 +283,6 @@ impl Connection {
         &mut self,
         request: AttachSessionExt2Request,
     ) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::AttachSessionExt2(request))
+        self.roundtrip(&Request::AttachSessionExt2(Box::new(request)))
     }
 }

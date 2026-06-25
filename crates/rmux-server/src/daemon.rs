@@ -1,8 +1,12 @@
+#[cfg(windows)]
+use std::ffi::{OsStr, OsString};
 #[cfg(all(test, unix))]
 use std::fs;
 use std::io;
 #[cfg(windows)]
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(windows)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 #[cfg(windows)]
@@ -75,7 +79,11 @@ pub struct DaemonConfig {
     subscription_limits: SubscriptionLimits,
     web_frontend: Option<String>,
     web_port: u16,
+    web_port_explicit: bool,
     web_required: bool,
+    startup_ready_fd: Option<i32>,
+    #[cfg(windows)]
+    startup_ready_event: Option<OsString>,
 }
 
 impl DaemonConfig {
@@ -88,7 +96,11 @@ impl DaemonConfig {
             subscription_limits: SubscriptionLimits::default(),
             web_frontend: None,
             web_port: DEFAULT_WEB_PORT,
+            web_port_explicit: false,
             web_required: false,
+            startup_ready_fd: None,
+            #[cfg(windows)]
+            startup_ready_event: None,
         }
     }
 
@@ -119,6 +131,12 @@ impl DaemonConfig {
     #[must_use]
     pub const fn web_port(&self) -> u16 {
         self.web_port
+    }
+
+    /// Returns whether the web-share listener port was explicitly configured.
+    #[must_use]
+    pub const fn web_port_explicit(&self) -> bool {
+        self.web_port_explicit
     }
 
     /// Returns whether this daemon startup requires the web listener to bind.
@@ -155,6 +173,7 @@ impl DaemonConfig {
     #[must_use]
     pub const fn with_web_port(mut self, port: u16) -> Self {
         self.web_port = port;
+        self.web_port_explicit = true;
         self.web_required = true;
         self
     }
@@ -181,6 +200,32 @@ impl DaemonConfig {
             cwd,
         };
         self
+    }
+
+    /// Signals this inherited Linux eventfd after the daemon listener is bound.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub const fn with_startup_ready_fd(mut self, ready_fd: i32) -> Self {
+        self.startup_ready_fd = Some(ready_fd);
+        self
+    }
+
+    #[cfg(unix)]
+    const fn startup_ready_fd(&self) -> Option<i32> {
+        self.startup_ready_fd
+    }
+
+    /// Signals this named Win32 event after the daemon listener is bound.
+    #[cfg(windows)]
+    #[must_use]
+    pub fn with_startup_ready_event(mut self, ready_event: OsString) -> Self {
+        self.startup_ready_event = Some(ready_event);
+        self
+    }
+
+    #[cfg(windows)]
+    fn startup_ready_event(&self) -> Option<&OsStr> {
+        self.startup_ready_event.as_deref()
     }
 }
 
@@ -287,6 +332,7 @@ impl ServerDaemon {
                 self.config.web_port(),
                 self.config.web_frontend().map(str::to_owned),
                 self.config.web_required(),
+                self.config.web_port_explicit(),
             )
             .with_socket_identity(bound_listener.identity)
             .with_server_signals(signal_watcher);
@@ -298,6 +344,9 @@ impl ServerDaemon {
                 shutdown_receiver,
                 serve_options,
             ));
+            if let Some(ready_fd) = self.config.startup_ready_fd() {
+                signal_startup_ready_fd(ready_fd);
+            }
 
             Ok(ServerHandle {
                 socket_path,
@@ -322,6 +371,7 @@ impl ServerDaemon {
                 self.config.web_port(),
                 self.config.web_frontend().map(str::to_owned),
                 self.config.web_required(),
+                self.config.web_port_explicit(),
             );
 
             let task = tokio::spawn(listener::serve(
@@ -331,6 +381,9 @@ impl ServerDaemon {
                 shutdown_receiver,
                 serve_options,
             ));
+            if let Some(ready_event) = self.config.startup_ready_event() {
+                signal_startup_ready_event(ready_event);
+            }
 
             Ok(ServerHandle {
                 socket_path,
@@ -339,6 +392,19 @@ impl ServerDaemon {
             })
         }
     }
+}
+
+#[cfg(unix)]
+fn signal_startup_ready_fd(_ready_fd: i32) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = rmux_os::daemon::signal_startup_ready_fd(_ready_fd);
+    }
+}
+
+#[cfg(windows)]
+fn signal_startup_ready_event(ready_event: &OsStr) {
+    let _ = rmux_os::daemon::signal_startup_ready_event(ready_event);
 }
 
 #[cfg(windows)]

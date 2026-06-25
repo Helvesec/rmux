@@ -43,7 +43,7 @@ async fn window_management_requests_round_trip_through_the_socket() -> Result<()
     assert!(matches!(created, Response::NewSession(_)));
 
     let new_window = client
-        .send_request(&Request::NewWindow(NewWindowRequest {
+        .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
             target: session.clone(),
             name: Some("logs".to_owned()),
             detached: true,
@@ -53,7 +53,7 @@ async fn window_management_requests_round_trip_through_the_socket() -> Result<()
             process_command: None,
             target_window_index: None,
             insert_at_target: false,
-        }))
+        })))
         .await?;
     assert_eq!(
         new_window,
@@ -128,7 +128,7 @@ async fn kill_window_all_others_cleans_up_removed_window_ptys() -> Result<(), Bo
 
     assert!(matches!(
         client
-            .send_request(&Request::NewWindow(NewWindowRequest {
+            .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
                 target: session.clone(),
                 name: None,
                 detached: true,
@@ -138,7 +138,7 @@ async fn kill_window_all_others_cleans_up_removed_window_ptys() -> Result<(), Bo
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await?,
         Response::NewWindow(_)
     ));
@@ -165,7 +165,7 @@ async fn kill_window_all_others_cleans_up_removed_window_ptys() -> Result<(), Bo
     );
     assert!(matches!(
         client
-            .send_request(&Request::NewWindow(NewWindowRequest {
+            .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
                 target: session.clone(),
                 name: None,
                 detached: true,
@@ -175,7 +175,7 @@ async fn kill_window_all_others_cleans_up_removed_window_ptys() -> Result<(), Bo
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await?,
         Response::NewWindow(_)
     ));
@@ -236,7 +236,7 @@ async fn window_navigation_and_listing_requests_round_trip_through_the_socket(
 
     assert!(matches!(
         client
-            .send_request(&Request::NewWindow(NewWindowRequest {
+            .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
                 target: session.clone(),
                 name: Some("logs".to_owned()),
                 detached: true,
@@ -246,13 +246,13 @@ async fn window_navigation_and_listing_requests_round_trip_through_the_socket(
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await?,
         Response::NewWindow(_)
     ));
     assert!(matches!(
         client
-            .send_request(&Request::NewWindow(NewWindowRequest {
+            .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
                 target: session.clone(),
                 name: Some("shell".to_owned()),
                 detached: true,
@@ -262,7 +262,7 @@ async fn window_navigation_and_listing_requests_round_trip_through_the_socket(
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await?,
         Response::NewWindow(_)
     ));
@@ -398,7 +398,7 @@ async fn window_move_swap_and_rotate_requests_round_trip_through_the_socket(
 
     assert!(matches!(
         client
-            .send_request(&Request::NewWindow(NewWindowRequest {
+            .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
                 target: alpha.clone(),
                 name: Some("logs".to_owned()),
                 detached: true,
@@ -408,13 +408,13 @@ async fn window_move_swap_and_rotate_requests_round_trip_through_the_socket(
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await?,
         Response::NewWindow(_)
     ));
     assert!(matches!(
         client
-            .send_request(&Request::NewWindow(NewWindowRequest {
+            .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
                 target: alpha.clone(),
                 name: Some("scratch".to_owned()),
                 detached: true,
@@ -424,7 +424,7 @@ async fn window_move_swap_and_rotate_requests_round_trip_through_the_socket(
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await?,
         Response::NewWindow(_)
     ));

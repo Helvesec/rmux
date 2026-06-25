@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::Child;
 use std::process::Stdio;
+#[cfg(windows)]
+use std::sync::Mutex as StdMutex;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -212,6 +214,8 @@ impl PanePipeStore {
 pub(crate) struct ActivePanePipe {
     stop_tx: watch::Sender<bool>,
     stop_flag: Arc<AtomicBool>,
+    #[cfg(windows)]
+    output_abort: Arc<StdMutex<Option<tokio::task::AbortHandle>>>,
 }
 
 impl std::fmt::Debug for ActivePanePipe {
@@ -262,6 +266,10 @@ impl ActivePanePipe {
         let pipe_stop_flag = stop_flag.clone();
         let stderr_master = stderr.as_ref().and_then(|_| pane_master.try_clone().ok());
         let pane_output_rx = stdin.as_ref().map(|_| pane_output.subscribe());
+        #[cfg(windows)]
+        let output_abort = Arc::new(StdMutex::new(None));
+        #[cfg(windows)]
+        let output_abort_for_task = output_abort.clone();
 
         tokio::spawn(async move {
             let mut async_tasks = Vec::new();
@@ -274,12 +282,17 @@ impl ActivePanePipe {
                     stop_flag.clone(),
                     move |stop_flag| forward_pane_bytes_to_pipe(pipe_rx, stdin, stop_flag),
                 );
-                async_tasks.push(tokio::spawn(forward_pane_output_to_pipe(
+                let output_task = tokio::spawn(forward_pane_output_to_pipe(
                     stop_rx.clone(),
                     stop_flag.clone(),
                     pane_output_rx.expect("stdin pipe must have a pane output subscriber"),
                     pipe_tx,
-                )));
+                ));
+                #[cfg(windows)]
+                if let Ok(mut output_abort) = output_abort_for_task.lock() {
+                    *output_abort = Some(output_task.abort_handle());
+                }
+                async_tasks.push(output_task);
             }
             if let Some(stdout) = stdout {
                 spawn_pipe_thread(
@@ -328,11 +341,19 @@ impl ActivePanePipe {
         Ok(Self {
             stop_tx,
             stop_flag: pipe_stop_flag,
+            #[cfg(windows)]
+            output_abort,
         })
     }
 
     pub(crate) fn stop(self) {
         self.stop_flag.store(true, Ordering::SeqCst);
+        #[cfg(windows)]
+        if let Ok(mut output_abort) = self.output_abort.lock() {
+            if let Some(output_abort) = output_abort.take() {
+                output_abort.abort();
+            }
+        }
         let _ = self.stop_tx.send(true);
     }
 }

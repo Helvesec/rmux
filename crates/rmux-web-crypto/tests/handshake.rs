@@ -111,7 +111,7 @@ fn hybrid_x25519_ml_kem_round_trip_and_depends_on_the_kem_secret() {
     let ek = kem.encapsulation_key();
     let (ct, server_ss) = ml_kem::encapsulate(&ek, [6u8; ml_kem::ENCAPS_RANDOMNESS_LEN]).unwrap();
     let client_ss = kem.decapsulate(&ct);
-    assert_eq!(client_ss, server_ss, "ML-KEM both sides agree");
+    assert_eq!(&*client_ss, &server_ss, "ML-KEM both sides agree");
 
     // Hybrid session: the same DH + the matching ML-KEM secret. On the wire ek/ct
     // ride in HELLO/CHALLENGE so the transcript binds them; here they stand in.

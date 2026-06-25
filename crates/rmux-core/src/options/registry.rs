@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{OptionName, RmuxError};
 
@@ -104,6 +107,14 @@ pub struct OptionQuery {
 #[path = "table.rs"]
 mod table;
 use table::OPTIONS;
+
+static OPTION_LOOKUP: OnceLock<OptionLookup> = OnceLock::new();
+
+struct OptionLookup {
+    by_option: HashMap<OptionName, &'static OptionMetadata>,
+    by_name: HashMap<&'static str, &'static OptionMetadata>,
+    by_alias: HashMap<&'static str, &'static OptionMetadata>,
+}
 
 impl OptionMetadata {
     pub(crate) fn option(&self) -> OptionName {
@@ -231,15 +242,17 @@ pub(crate) fn registry() -> &'static [OptionMetadata] {
 }
 
 pub(crate) fn option_metadata(option: OptionName) -> &'static OptionMetadata {
-    OPTIONS
-        .iter()
-        .find(|metadata| metadata.option == option)
+    option_lookup()
+        .by_option
+        .get(&option)
+        .copied()
         .expect("every OptionName variant must have registry metadata")
 }
 
 /// Resolves a known option name using tmux-style aliasing and prefix matching.
 pub fn resolve_option_name(name: &str) -> Result<OptionQuery, RmuxError> {
     let (base_name, index) = split_array_index(name)?;
+    let lookup = option_lookup();
 
     if base_name.starts_with('@') {
         if index.is_some() {
@@ -254,7 +267,7 @@ pub fn resolve_option_name(name: &str) -> Result<OptionQuery, RmuxError> {
         });
     }
 
-    if let Some(metadata) = OPTIONS.iter().find(|metadata| metadata.name == base_name) {
+    if let Some(metadata) = lookup.by_name.get(base_name).copied() {
         return Ok(OptionQuery {
             name: metadata.name().to_owned(),
             metadata: Some(metadata),
@@ -262,10 +275,7 @@ pub fn resolve_option_name(name: &str) -> Result<OptionQuery, RmuxError> {
         });
     }
 
-    if let Some(metadata) = OPTIONS
-        .iter()
-        .find(|metadata| metadata.aliases().contains(&base_name))
-    {
+    if let Some(metadata) = lookup.by_alias.get(base_name).copied() {
         return Ok(OptionQuery {
             name: metadata.name().to_owned(),
             metadata: Some(metadata),
@@ -299,6 +309,7 @@ pub fn resolve_option_name(name: &str) -> Result<OptionQuery, RmuxError> {
 /// Resolves a known option name using only exact canonical names and aliases.
 pub(crate) fn resolve_exact_option_name(name: &str) -> Result<OptionQuery, RmuxError> {
     let (base_name, index) = split_array_index(name)?;
+    let lookup = option_lookup();
 
     if base_name.starts_with('@') {
         if index.is_some() {
@@ -313,7 +324,7 @@ pub(crate) fn resolve_exact_option_name(name: &str) -> Result<OptionQuery, RmuxE
         });
     }
 
-    if let Some(metadata) = OPTIONS.iter().find(|metadata| metadata.name == base_name) {
+    if let Some(metadata) = lookup.by_name.get(base_name).copied() {
         return Ok(OptionQuery {
             name: metadata.name().to_owned(),
             metadata: Some(metadata),
@@ -321,10 +332,7 @@ pub(crate) fn resolve_exact_option_name(name: &str) -> Result<OptionQuery, RmuxE
         });
     }
 
-    if let Some(metadata) = OPTIONS
-        .iter()
-        .find(|metadata| metadata.aliases().contains(&base_name))
-    {
+    if let Some(metadata) = lookup.by_alias.get(base_name).copied() {
         return Ok(OptionQuery {
             name: metadata.name().to_owned(),
             metadata: Some(metadata),
@@ -361,6 +369,32 @@ pub fn option_affects_rendering(option: OptionName) -> bool {
 #[must_use]
 pub fn option_affects_alerts(option: OptionName) -> bool {
     option_metadata(option).effects().affects_alerts()
+}
+
+fn option_lookup() -> &'static OptionLookup {
+    OPTION_LOOKUP.get_or_init(|| {
+        let mut by_option = HashMap::with_capacity(OPTIONS.len());
+        let mut by_name = HashMap::with_capacity(OPTIONS.len());
+        let alias_count = OPTIONS
+            .iter()
+            .map(|metadata| metadata.aliases().len())
+            .sum();
+        let mut by_alias = HashMap::with_capacity(alias_count);
+
+        for metadata in OPTIONS {
+            by_option.insert(metadata.option(), metadata);
+            by_name.insert(metadata.name(), metadata);
+            for alias in metadata.aliases() {
+                by_alias.insert(*alias, metadata);
+            }
+        }
+
+        OptionLookup {
+            by_option,
+            by_name,
+            by_alias,
+        }
+    })
 }
 
 fn split_array_index(name: &str) -> Result<(&str, Option<u32>), RmuxError> {

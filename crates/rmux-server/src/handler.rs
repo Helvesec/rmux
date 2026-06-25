@@ -62,6 +62,8 @@ mod session_support;
 mod shutdown_support;
 #[path = "handler_subscriptions.rs"]
 mod subscription_support;
+#[path = "handler_target_actions.rs"]
+mod target_action_support;
 #[path = "handler_targets.rs"]
 mod target_support;
 #[path = "handler_waits.rs"]
@@ -553,6 +555,26 @@ impl RequestHandler {
             .lock()
             .ok()
             .and_then(|server_access| server_access.mode_for_identity(&peer.user))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_access_mode_for_uid(
+        &self,
+        uid: u32,
+        mode: AccessMode,
+    ) -> Result<(), RmuxError> {
+        self.server_access
+            .lock()
+            .expect("server access mutex must not be poisoned")
+            .set_mode(uid, mode)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_test_access_for_uid(&self, uid: u32) -> Result<(), RmuxError> {
+        self.server_access
+            .lock()
+            .expect("server access mutex must not be poisoned")
+            .remove_uid(uid)
     }
 
     #[cfg(test)]

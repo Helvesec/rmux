@@ -370,8 +370,4 @@ pub const COMMAND_TABLE: &[CommandEntry] = &[
         name: "wait-for",
         alias: Some("wait"),
     },
-    CommandEntry {
-        name: "web-share",
-        alias: None,
-    },
 ];

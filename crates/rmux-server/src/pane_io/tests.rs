@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -851,6 +851,62 @@ async fn read_attach_data_until(peer: &mut tokio::net::UnixStream, needle: &[u8]
     })
     .await
     .expect("timed out waiting for attach data")
+}
+
+#[tokio::test]
+async fn forward_attach_exited_control_wins_over_closing_shutdown() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name = SessionName::new("alpha").expect("valid session name");
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let live_input = LiveAttachInputContext {
+        handler,
+        attach_pid: std::process::id(),
+    };
+
+    let attach_task = tokio::spawn(forward_attach(
+        stream,
+        test_attach_target(&session_name, b"BASE-0", None),
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::clone(&closing),
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+        false,
+    ));
+
+    let initial = read_attach_data_until(&mut peer, b"BASE-0").await;
+    assert!(
+        String::from_utf8_lossy(&initial).contains("BASE-0"),
+        "initial attach should render the base pane"
+    );
+
+    control_tx
+        .send(AttachControl::Refresh)
+        .expect("queue non-terminal control");
+    control_tx
+        .send(AttachControl::Exited)
+        .expect("send exited control");
+    closing.store(true, Ordering::SeqCst);
+    shutdown_tx.send(()).expect("request attach shutdown");
+
+    let exited = read_attach_data_until(&mut peer, b"[exited]\r\n").await;
+    assert!(
+        exited
+            .windows(b"[exited]\r\n".len())
+            .any(|window| window == b"[exited]\r\n"),
+        "exited control must win over the closing shutdown race"
+    );
+
+    let result = attach_task.await.expect("attach task join");
+    assert!(
+        result.is_ok(),
+        "forward_attach should exit cleanly: {result:?}"
+    );
 }
 
 #[tokio::test]

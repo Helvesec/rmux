@@ -67,6 +67,7 @@ where
         action_tx,
         mut action_completion_rx,
         locked,
+        windows_console_key_enabled,
     } = channels;
     let mut decoder = AttachFrameDecoder::new();
     decoder.push_bytes(&initial_bytes);
@@ -91,18 +92,30 @@ where
         )?;
 
         tokio::select! {
-            bytes = input_rx.recv(), if input_open => {
-                let Some(bytes) = bytes else {
+            input = input_rx.recv(), if input_open => {
+                let Some(input) = input else {
                     input_open = false;
                     continue;
                 };
                 if locked.is_locked() {
                     continue;
                 }
-                for chunk in super::input::attach_input_chunks(&bytes) {
+                let input_bytes = input.payload();
+                let windows_console_key = if windows_console_key_enabled {
+                    input.windows_console_key()
+                } else {
+                    None
+                };
+                for chunk in super::input::attach_input_chunks(input_bytes) {
+                    let mut keystroke = AttachedKeystroke::new(chunk.to_vec());
+                    if chunk.len() == input_bytes.len() {
+                        if let Some(key) = windows_console_key {
+                            keystroke = keystroke.with_windows_console_key(key);
+                        }
+                    }
                     write_async_attach_message(
                         &mut writer,
-                        AttachMessage::Keystroke(AttachedKeystroke::new(chunk.to_vec())),
+                        AttachMessage::Keystroke(keystroke),
                     ).await?;
                 }
             }
@@ -257,23 +270,25 @@ where
 }
 
 pub(super) struct AttachAsyncChannels {
-    input_rx: mpsc::Receiver<Vec<u8>>,
+    input_rx: mpsc::Receiver<super::input::AttachInput>,
     resize_rx: mpsc::UnboundedReceiver<TerminalSize>,
     action_tx: std_mpsc::Sender<AttachAction>,
     action_completion_rx:
         mpsc::UnboundedReceiver<std::result::Result<AttachActionOutcome, ClientError>>,
     locked: Arc<AttachLockState>,
+    windows_console_key_enabled: bool,
 }
 
 impl AttachAsyncChannels {
     pub(super) const fn new(
-        input_rx: mpsc::Receiver<Vec<u8>>,
+        input_rx: mpsc::Receiver<super::input::AttachInput>,
         resize_rx: mpsc::UnboundedReceiver<TerminalSize>,
         action_tx: std_mpsc::Sender<AttachAction>,
         action_completion_rx: mpsc::UnboundedReceiver<
             std::result::Result<AttachActionOutcome, ClientError>,
         >,
         locked: Arc<AttachLockState>,
+        windows_console_key_enabled: bool,
     ) -> Self {
         Self {
             input_rx,
@@ -281,6 +296,7 @@ impl AttachAsyncChannels {
             action_tx,
             action_completion_rx,
             locked,
+            windows_console_key_enabled,
         }
     }
 }

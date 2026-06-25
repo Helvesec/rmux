@@ -112,6 +112,47 @@ pub(crate) struct PaneExitEvent {
     pub(crate) session_name: rmux_proto::SessionName,
     pub(crate) pane_id: PaneId,
     pub(crate) generation: Option<u64>,
+    output_state: PaneExitOutputState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneExitOutputState {
+    EofPublished,
+    #[cfg(windows)]
+    EofPending,
+}
+
+impl PaneExitEvent {
+    pub(crate) fn eof_published(
+        session_name: rmux_proto::SessionName,
+        pane_id: PaneId,
+        generation: Option<u64>,
+    ) -> Self {
+        Self {
+            session_name,
+            pane_id,
+            generation,
+            output_state: PaneExitOutputState::EofPublished,
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn eof_pending(
+        session_name: rmux_proto::SessionName,
+        pane_id: PaneId,
+        generation: Option<u64>,
+    ) -> Self {
+        Self {
+            session_name,
+            pane_id,
+            generation,
+            output_state: PaneExitOutputState::EofPending,
+        }
+    }
+
+    pub(crate) fn output_eof_published(&self) -> bool {
+        matches!(self.output_state, PaneExitOutputState::EofPublished)
+    }
 }
 
 pub(crate) type PaneExitCallback = Arc<dyn Fn(PaneExitEvent) + Send + Sync>;

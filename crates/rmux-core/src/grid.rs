@@ -314,6 +314,24 @@ impl Grid {
         }
     }
 
+    pub(crate) fn replace_visible_resized_width_only(
+        &mut self,
+        source_size: TerminalSize,
+        lines: Vec<GridLine>,
+        bg: Colour,
+    ) {
+        debug_assert_eq!(
+            u32::from(source_size.rows.max(1)),
+            self.sy,
+            "width-only visible restore must not change row policy"
+        );
+        let target_width = self.sx;
+        let mut viewport = Grid::new(source_size, 0);
+        viewport.replace_visible(lines);
+        viewport.resize_width(target_width, bg);
+        self.visible = viewport.visible;
+    }
+
     /// Captures the grid as rendered lines. Wrapped rows are optionally joined.
     #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
@@ -474,6 +492,17 @@ impl Grid {
             return;
         }
 
+        if self.can_resize_width_without_reflow(sx) {
+            for line in &mut self.history {
+                line.resize_width_preserving_wrap(sx, bg);
+            }
+            for line in &mut self.visible {
+                line.resize_width_preserving_wrap(sx, bg);
+            }
+            self.sx = sx;
+            return;
+        }
+
         let visible_rows = self.sy as usize;
         let lines = self
             .history
@@ -498,6 +527,12 @@ impl Grid {
         self.visible = visible.into();
         self.hscrolled = self.history.len();
         self.sx = sx;
+    }
+
+    fn can_resize_width_without_reflow(&self, sx: u32) -> bool {
+        self.history.iter().chain(self.visible.iter()).all(|line| {
+            !line.flags.contains(GridLineFlags::WRAPPED) && line.used_end() <= sx as usize
+        })
     }
 
     pub(crate) fn resize_height(&mut self, sy: u32, cursor_y: &mut u32, bg: Colour) {
@@ -607,6 +642,7 @@ fn compacted_history(lines: Vec<GridLine>) -> VecDeque<GridLine> {
 fn reflow_wrapped_lines(lines: Vec<GridLine>, width: u32, bg: Colour) -> Vec<GridLine> {
     let mut output = Vec::new();
     let mut logical_cells = Vec::new();
+    let mut logical_plain_text: Option<String> = None;
     let mut logical_flags = None;
 
     for line in lines {
@@ -615,6 +651,7 @@ fn reflow_wrapped_lines(lines: Vec<GridLine>, width: u32, bg: Colour) -> Vec<Gri
             let mut flags = line.flags;
             flags.remove(GridLineFlags::WRAPPED);
             logical_flags = Some(flags);
+            logical_plain_text = (bg == COLOUR_DEFAULT).then(String::new);
         }
 
         let end = if wrapped {
@@ -622,43 +659,87 @@ fn reflow_wrapped_lines(lines: Vec<GridLine>, width: u32, bg: Colour) -> Vec<Gri
         } else {
             line.used_end()
         };
-        if let Some(text) = line.plain_text() {
-            logical_cells.extend(
+        if let (Some(logical_text), Some(text)) = (logical_plain_text.as_mut(), line.plain_text()) {
+            logical_text.extend(
                 text.bytes()
                     .chain(std::iter::repeat(b' '))
                     .take(end)
-                    .map(GridCell::from_plain_ascii),
+                    .map(char::from),
             );
         } else {
-            logical_cells.extend(
-                line.cells
-                    .iter()
-                    .take(end)
-                    .filter(|cell| !cell.is_padding())
-                    .cloned(),
-            );
+            if let Some(text) = logical_plain_text.take() {
+                extend_plain_ascii_cells(&mut logical_cells, text.bytes());
+            }
+            if let Some(text) = line.plain_text() {
+                extend_plain_ascii_cells(
+                    &mut logical_cells,
+                    text.bytes().chain(std::iter::repeat(b' ')).take(end),
+                );
+            } else {
+                logical_cells.extend(
+                    line.cells
+                        .iter()
+                        .take(end)
+                        .filter(|cell| !cell.is_padding())
+                        .cloned(),
+                );
+            }
         }
 
         if !wrapped {
-            output.extend(reflow_logical_line(
-                &logical_cells,
-                logical_flags.take().unwrap_or_default(),
-                width,
-                bg,
-            ));
+            let flags = logical_flags.take().unwrap_or_default();
+            if let Some(text) = logical_plain_text.take() {
+                output.extend(reflow_plain_ascii_line(&text, flags, width, bg));
+            } else {
+                output.extend(reflow_logical_line(&logical_cells, flags, width, bg));
+            }
             logical_cells.clear();
         }
     }
 
-    if logical_flags.is_some() || !logical_cells.is_empty() {
-        output.extend(reflow_logical_line(
-            &logical_cells,
-            logical_flags.unwrap_or_default(),
-            width,
-            bg,
-        ));
+    if logical_flags.is_some() || !logical_cells.is_empty() || logical_plain_text.is_some() {
+        let flags = logical_flags.unwrap_or_default();
+        if let Some(text) = logical_plain_text {
+            output.extend(reflow_plain_ascii_line(&text, flags, width, bg));
+        } else {
+            output.extend(reflow_logical_line(&logical_cells, flags, width, bg));
+        }
     }
 
+    output
+}
+
+fn extend_plain_ascii_cells(cells: &mut Vec<GridCell>, bytes: impl IntoIterator<Item = u8>) {
+    cells.extend(bytes.into_iter().map(GridCell::from_plain_ascii));
+}
+
+fn reflow_plain_ascii_line(
+    text: &str,
+    first_flags: GridLineFlags,
+    width: u32,
+    bg: Colour,
+) -> Vec<GridLine> {
+    if text.is_empty() || bg != COLOUR_DEFAULT {
+        let mut line = GridLine::blank_with_bg(width, bg);
+        line.flags = first_flags;
+        return vec![line];
+    }
+
+    let width = width.max(1);
+    let width_usize = width as usize;
+    let mut output = Vec::with_capacity(text.len().div_ceil(width_usize));
+    let mut start = 0;
+    let mut flags = first_flags;
+    while start < text.len() {
+        let end = (start + width_usize).min(text.len());
+        let mut line = GridLine::from_plain_ascii_text(width, flags, text[start..end].to_owned());
+        if end < text.len() {
+            line.set_wrapped(true);
+        }
+        output.push(line);
+        flags = GridLineFlags::default();
+        start = end;
+    }
     output
 }
 

@@ -102,6 +102,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "castaway"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dec551ab6e7578819132c713a93c022a05d60159dc86e7a7050223577484c55a"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -174,6 +183,20 @@ dependencies = [
  "crypto-common",
  "inout",
  "zeroize",
+]
+
+[[package]]
+name = "compact_str"
+version = "0.8.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fd622ebbb56a5b2ccb651b32b911cdeb2a9b4b11776b2473bf26a26a286244e"
+dependencies = [
+ "castaway",
+ "cfg-if",
+ "itoa",
+ "rustversion",
+ "ryu",
+ "static_assertions",
 ]
 
 [[package]]
@@ -827,9 +850,10 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rmux-core"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "chrono",
+ "compact_str",
  "regex",
  "rmux-proto",
  "unicode-width",
@@ -845,7 +869,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-ipc"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "libc",
  "rmux-os",
@@ -857,7 +881,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-os"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "libc",
  "rmux-types",
@@ -867,7 +891,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-proto"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "bincode",
  "rmux-types",
@@ -877,7 +901,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-pty"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "libc",
  "rmux-os",
@@ -889,7 +913,7 @@ dependencies = [
 
 [[package]]
 name = "rmux-server"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "async-recursion",
  "base64",
@@ -910,7 +934,6 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
- "signal-hook",
  "subtle",
  "tokio",
  "toml",
@@ -920,14 +943,14 @@ dependencies = [
 
 [[package]]
 name = "rmux-types"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "rmux-web-crypto"
-version = "0.5.0"
+version = "0.7.0"
 dependencies = [
  "chacha20poly1305",
  "hkdf",
@@ -965,6 +988,12 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+
+[[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "semver"
@@ -1053,16 +1082,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
-name = "signal-hook"
-version = "0.3.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
-dependencies = [
- "libc",
- "signal-hook-registry",
-]
-
-[[package]]
 name = "signal-hook-registry"
 version = "1.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1087,6 +1106,12 @@ dependencies = [
  "libc",
  "windows-sys",
 ]
+
+[[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "subtle"

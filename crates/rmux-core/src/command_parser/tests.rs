@@ -16,7 +16,7 @@ fn command_names(input: &str) -> Vec<String> {
 
 #[test]
 fn frozen_command_inventory_has_expected_entries_and_aliases() {
-    assert_eq!(COMMAND_TABLE.len(), 91);
+    assert_eq!(COMMAND_TABLE.len(), 90);
     assert_eq!(lookup_command("new").unwrap().name, "new-session");
     assert_eq!(lookup_command("ls").unwrap().name, "list-sessions");
     assert_eq!(lookup_command("splitw").unwrap().name, "split-window");
@@ -39,6 +39,18 @@ fn lookup_rejects_unknown_commands_with_tmux_diagnostic() {
         lookup_command("bogus").unwrap_err().to_string(),
         "unknown command: bogus"
     );
+    assert_eq!(
+        lookup_command("wait-pane").unwrap_err().to_string(),
+        "unknown command: wait-pane"
+    );
+}
+
+#[test]
+fn tmux_parser_rejects_client_only_rmux_extensions() {
+    let error = CommandParser::new()
+        .parse("wait-pane --pane-exit")
+        .expect_err("client-only extension must not parse in tmux/source-file parser");
+    assert_eq!(error.to_string(), "unknown command: wait-pane");
 }
 
 #[test]

@@ -18,6 +18,36 @@ impl HandlerState {
         pane_id: PaneId,
         scroll_offset: usize,
     ) -> Option<PaneScrollbackView> {
+        self.pane_scrollback_view_with(session_name, pane_id, |history_size, alternate_on| {
+            if alternate_on {
+                0
+            } else {
+                scroll_offset.min(history_size)
+            }
+        })
+    }
+
+    pub(crate) fn pane_scrollback_view_from_top_line(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+        top_line: usize,
+    ) -> Option<PaneScrollbackView> {
+        self.pane_scrollback_view_with(session_name, pane_id, |history_size, alternate_on| {
+            if alternate_on {
+                0
+            } else {
+                history_size.saturating_sub(top_line.min(history_size))
+            }
+        })
+    }
+
+    fn pane_scrollback_view_with(
+        &self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+        scroll_offset_for: impl FnOnce(usize, bool) -> usize,
+    ) -> Option<PaneScrollbackView> {
         let window_index = self
             .sessions
             .session(session_name)?
@@ -27,14 +57,10 @@ impl HandlerState {
         let transcript = transcript
             .lock()
             .expect("pane transcript mutex must not be poisoned");
-        let screen = transcript.clone_screen();
+        let screen = transcript.screen();
         let history_size = screen.history_size();
         let alternate_on = screen.is_alternate();
-        let scroll_offset = if alternate_on {
-            0
-        } else {
-            scroll_offset.min(history_size)
-        };
+        let scroll_offset = scroll_offset_for(history_size, alternate_on);
         let ansi_lines = if scroll_offset == 0 {
             Vec::new()
         } else {

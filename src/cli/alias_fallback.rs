@@ -1,12 +1,15 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use super::command_runner::run_queued_server_command;
+use rmux_client::Connection;
+
+use super::command_runner::run_queued_server_command_with_connection;
 use super::ExitFailure;
 
 pub(super) fn run_unknown_command_through_server_aliases(
     args: &[OsString],
     socket_path: &Path,
+    connection: &mut Connection,
 ) -> Result<i32, ExitFailure> {
     let command_args = command_arguments(args)
         .ok_or_else(|| ExitFailure::new(1, "invalid UTF-8 in command arguments".to_owned()))?;
@@ -18,7 +21,7 @@ pub(super) fn run_unknown_command_through_server_aliases(
         .map(|argument| tmux_quote_argument(argument))
         .collect::<Vec<_>>()
         .join(" ");
-    run_queued_server_command(socket_path, "source-file", queue_command)
+    run_queued_server_command_with_connection(connection, socket_path, "source-file", queue_command)
         .map_err(normalize_alias_fallback_error)
 }
 

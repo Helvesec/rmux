@@ -11,7 +11,9 @@ Repository docs:
 - [RMUX SDK](scripting-sdk.md)
 - [Roadmap](ROADMAP.md)
 - [Security assurance case](assurance-case.md)
+- [tmux compatibility decisions](tmux-compat-decisions.md)
 
 Repository-local guides:
 
 - [Human-friendly starter config](human-friendly-config.md)
+- [Snap packaging](snap-packaging.md)

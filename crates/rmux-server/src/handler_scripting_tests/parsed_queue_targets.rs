@@ -17,7 +17,7 @@ async fn parsed_queue_uses_current_target_for_rename_window_session_and_last_win
     ));
     assert!(matches!(
         handler
-            .handle(Request::NewWindow(NewWindowRequest {
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
                 target: alpha.clone(),
                 name: Some("w1".to_owned()),
                 detached: true,
@@ -27,7 +27,7 @@ async fn parsed_queue_uses_current_target_for_rename_window_session_and_last_win
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await,
         Response::NewWindow(_)
     ));
@@ -94,7 +94,7 @@ async fn parsed_queue_select_window_navigation_flags_use_window_session() {
     ));
     assert!(matches!(
         handler
-            .handle(Request::NewWindow(NewWindowRequest {
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
                 target: alpha.clone(),
                 name: Some("w1".to_owned()),
                 detached: true,
@@ -104,7 +104,7 @@ async fn parsed_queue_select_window_navigation_flags_use_window_session() {
                 process_command: None,
                 target_window_index: Some(1),
                 insert_at_target: false,
-            }))
+            })))
             .await,
         Response::NewWindow(_)
     ));
@@ -198,7 +198,7 @@ async fn parsed_queue_list_panes_resolves_bare_window_name_in_current_session() 
     ));
     assert!(matches!(
         handler
-            .handle(Request::NewWindow(NewWindowRequest {
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
                 target: alpha.clone(),
                 name: Some("editor".to_owned()),
                 detached: true,
@@ -208,7 +208,7 @@ async fn parsed_queue_list_panes_resolves_bare_window_name_in_current_session() 
                 process_command: None,
                 target_window_index: Some(1),
                 insert_at_target: false,
-            }))
+            })))
             .await,
         Response::NewWindow(_)
     ));
@@ -283,7 +283,7 @@ async fn parsed_queue_uses_current_target_for_more_default_targeted_commands() {
         (
             "break-pane",
             vec!["-d".to_owned()],
-            Request::BreakPane(BreakPaneRequest {
+            Request::BreakPane(Box::new(BreakPaneRequest {
                 source: current_pane.clone(),
                 target: None,
                 name: None,
@@ -292,7 +292,7 @@ async fn parsed_queue_uses_current_target_for_more_default_targeted_commands() {
                 before: false,
                 print_target: false,
                 format: None,
-            }),
+            })),
         ),
         (
             "respawn-window",
@@ -302,13 +302,13 @@ async fn parsed_queue_uses_current_target_for_more_default_targeted_commands() {
                 "printf".to_owned(),
                 "hello".to_owned(),
             ],
-            Request::RespawnWindow(RespawnWindowRequest {
+            Request::RespawnWindow(Box::new(RespawnWindowRequest {
                 target: current_window.clone(),
                 kill: true,
                 environment: None,
                 command: Some(vec!["printf".to_owned(), "hello".to_owned()]),
                 start_directory: None,
-            }),
+            })),
         ),
         (
             "respawn-pane",
@@ -318,14 +318,14 @@ async fn parsed_queue_uses_current_target_for_more_default_targeted_commands() {
                 "printf".to_owned(),
                 "hello".to_owned(),
             ],
-            Request::RespawnPane(RespawnPaneRequest {
+            Request::RespawnPane(Box::new(RespawnPaneRequest {
                 target: current_pane.clone(),
                 kill: true,
                 environment: None,
                 command: Some(vec!["printf".to_owned(), "hello".to_owned()]),
                 process_command: None,
                 start_directory: None,
-            }),
+            })),
         ),
         (
             "swap-pane",
@@ -553,7 +553,7 @@ async fn parsed_queue_uses_marked_pane_window_as_default_swap_window_source() {
     ));
     assert!(matches!(
         handler
-            .handle(Request::NewWindow(NewWindowRequest {
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
                 target: alpha.clone(),
                 name: Some("marked-window".to_owned()),
                 detached: true,
@@ -563,7 +563,7 @@ async fn parsed_queue_uses_marked_pane_window_as_default_swap_window_source() {
                 process_command: None,
                 target_window_index: Some(1),
                 insert_at_target: false,
-            }))
+            })))
             .await,
         Response::NewWindow(_)
     ));

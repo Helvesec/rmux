@@ -58,7 +58,7 @@ pub enum OutputCursorItem {
     /// A retained output event.
     Event(OutputEvent),
     /// The cursor fell behind the oldest retained event.
-    Gap(OutputGap),
+    Gap(Box<OutputGap>),
 }
 
 /// Explicit report for output events that no longer fit in the ring.
@@ -129,6 +129,15 @@ impl OutputGap {
 mod tests {
     use super::{OutputCursor, OutputCursorItem};
     use crate::events::OutputRing;
+
+    #[test]
+    fn output_cursor_item_size_stays_bounded() {
+        assert!(
+            std::mem::size_of::<OutputCursorItem>() <= 48,
+            "OutputCursorItem should stay compact for batched cursor vectors, got {}",
+            std::mem::size_of::<OutputCursorItem>()
+        );
+    }
 
     #[test]
     fn cursor_advances_independently_through_retained_events() {

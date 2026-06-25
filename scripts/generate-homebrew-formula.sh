@@ -93,6 +93,7 @@ class Rmux < Formula
   def install
     bin.install "bin/rmux"
     bin.install "bin/rmux-daemon" if File.exist?("bin/rmux-daemon")
+    libexec.install "libexec/rmux" if File.exist?("libexec/rmux")
     man1.install "share/man/man1/rmux.1"
     bash_completion.install "share/bash-completion/completions/rmux" if File.exist?("share/bash-completion/completions/rmux")
     zsh_completion.install "share/zsh/site-functions/_rmux" if File.exist?("share/zsh/site-functions/_rmux")

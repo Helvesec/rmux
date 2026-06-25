@@ -1,7 +1,7 @@
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
-    CommandOutput, ErrorResponse, HookName, Response, ScopeSelector, SessionId, Target,
-    WindowTarget,
+    CommandOutput, ErrorResponse, HookName, Response, ScopeSelector, SessionId, SessionName,
+    Target, WindowTarget,
 };
 
 use super::super::{
@@ -26,20 +26,20 @@ struct UnlinkedWindowSnapshot {
     window_name: String,
 }
 
-struct SplitWindowParts {
-    target: rmux_proto::SplitWindowTarget,
-    direction: rmux_proto::SplitDirection,
-    before: bool,
-    environment_overrides: Option<Vec<String>>,
-    command: Option<Vec<String>>,
-    process_command: Option<rmux_proto::ProcessCommand>,
-    start_directory: Option<std::path::PathBuf>,
-    keep_alive_on_exit: Option<bool>,
-    detached: bool,
-    size: Option<String>,
-    preserve_zoom: bool,
-    full_size: bool,
-    stdin_payload: Option<Vec<u8>>,
+pub(in crate::handler) struct SplitWindowParts {
+    pub(in crate::handler) target: rmux_proto::SplitWindowTarget,
+    pub(in crate::handler) direction: rmux_proto::SplitDirection,
+    pub(in crate::handler) before: bool,
+    pub(in crate::handler) environment_overrides: Option<Vec<String>>,
+    pub(in crate::handler) command: Option<Vec<String>>,
+    pub(in crate::handler) process_command: Option<rmux_proto::ProcessCommand>,
+    pub(in crate::handler) start_directory: Option<std::path::PathBuf>,
+    pub(in crate::handler) keep_alive_on_exit: Option<bool>,
+    pub(in crate::handler) detached: bool,
+    pub(in crate::handler) size: Option<String>,
+    pub(in crate::handler) preserve_zoom: bool,
+    pub(in crate::handler) full_size: bool,
+    pub(in crate::handler) stdin_payload: Option<Vec<u8>>,
 }
 
 impl RequestHandler {
@@ -91,13 +91,17 @@ impl RequestHandler {
             WindowTarget::with_window(source_session_name.clone(), request.source.window_index());
         let target_window =
             WindowTarget::with_window(target_session_name.clone(), request.target.window_index());
-        let (response, source_window_unlinked) = {
+        let (response, source_window_unlinked, removed_source_sessions) = {
             let mut state = self.state.lock().await;
+            let source_group_members = state.sessions.session_group_members(&source_session_name);
             let source_window_unlinked = join_pane_unlinked_window_snapshot(&state, &request);
-            match state.join_pane(request) {
-                Ok(response) => (Response::JoinPane(response), source_window_unlinked),
-                Err(error) => (Response::Error(ErrorResponse { error }), None),
-            }
+            let response = match state.join_pane(request) {
+                Ok(response) => Response::JoinPane(response),
+                Err(error) => Response::Error(ErrorResponse { error }),
+            };
+            let removed_source_sessions =
+                removed_sessions_after_pane_transfer(&state, &response, source_group_members);
+            (response, source_window_unlinked, removed_source_sessions)
         };
 
         if matches!(response, Response::JoinPane(_)) {
@@ -124,7 +128,11 @@ impl RequestHandler {
                 })
                 .await;
             }
-            self.refresh_attached_session(&source_session_name).await;
+            self.exit_removed_source_sessions(&removed_source_sessions)
+                .await;
+            if !removed_source_sessions.contains(&source_session_name) {
+                self.refresh_attached_session(&source_session_name).await;
+            }
             if source_session_name != target_session_name {
                 self.refresh_attached_session(&target_session_name).await;
             }
@@ -209,12 +217,16 @@ impl RequestHandler {
         );
         let print_target = request.print_target;
         let print_format = request.format.clone();
-        let response = {
+        let (response, removed_source_sessions) = {
             let mut state = self.state.lock().await;
-            match state.break_pane(request) {
+            let source_group_members = state.sessions.session_group_members(&source_session_name);
+            let response = match state.break_pane(request) {
                 Ok(response) => Response::BreakPane(response),
                 Err(error) => Response::Error(ErrorResponse { error }),
-            }
+            };
+            let removed_source_sessions =
+                removed_sessions_after_pane_transfer(&state, &response, source_group_members);
+            (response, removed_source_sessions)
         };
 
         if matches!(response, Response::BreakPane(_)) {
@@ -243,7 +255,11 @@ impl RequestHandler {
                     .await;
                 }
             }
-            self.refresh_attached_session(&source_session_name).await;
+            self.exit_removed_source_sessions(&removed_source_sessions)
+                .await;
+            if !removed_source_sessions.contains(&source_session_name) {
+                self.refresh_attached_session(&source_session_name).await;
+            }
             if source_session_name != target_session_name {
                 self.refresh_attached_session(&target_session_name).await;
             }
@@ -277,6 +293,12 @@ impl RequestHandler {
         }
 
         response
+    }
+
+    async fn exit_removed_source_sessions(&self, removed_sessions: &[SessionName]) {
+        for session_name in removed_sessions {
+            self.exit_attached_session(session_name).await;
+        }
     }
 
     pub(in crate::handler) async fn handle_split_window(
@@ -331,7 +353,7 @@ impl RequestHandler {
         .await
     }
 
-    async fn handle_split_window_parts(
+    pub(in crate::handler) async fn handle_split_window_parts(
         &self,
         requester_pid: u32,
         parts: SplitWindowParts,
@@ -605,6 +627,20 @@ impl RequestHandler {
                 ));
         }
     }
+}
+
+fn removed_sessions_after_pane_transfer(
+    state: &HandlerState,
+    response: &Response,
+    source_group_members: Vec<SessionName>,
+) -> Vec<SessionName> {
+    if !matches!(response, Response::JoinPane(_) | Response::BreakPane(_)) {
+        return Vec::new();
+    }
+    source_group_members
+        .into_iter()
+        .filter(|session_name| state.sessions.session(session_name).is_none())
+        .collect()
 }
 
 fn inject_split_window_stdin_output(

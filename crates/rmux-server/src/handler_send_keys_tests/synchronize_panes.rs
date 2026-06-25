@@ -94,13 +94,13 @@ async fn live_attach_synchronize_panes_writes_to_each_live_pane() {
     assert!(matches!(split, Response::SplitWindow(_)));
 
     let select_first = handler
-        .handle(Request::SelectPane(SelectPaneRequest {
+        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
             target: PaneTarget::with_window(alpha.clone(), 0, 0),
             title: None,
             style: None,
             input_disabled: None,
             preserve_zoom: false,
-        }))
+        })))
         .await;
     assert!(matches!(select_first, Response::SelectPane(_)));
 
@@ -233,13 +233,13 @@ async fn create_synchronized_two_pane_session(
     assert!(matches!(split, Response::SplitWindow(_)));
 
     let select_first = handler
-        .handle(Request::SelectPane(SelectPaneRequest {
+        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
             target: PaneTarget::with_window(alpha.clone(), 0, 0),
             title: None,
             style: None,
             input_disabled: None,
             preserve_zoom: false,
-        }))
+        })))
         .await;
     assert!(matches!(select_first, Response::SelectPane(_)));
 

@@ -22,8 +22,8 @@ use common::{
 use rmux_client::INTERNAL_DAEMON_FLAG;
 use rmux_core::command_parser::COMMAND_TABLE;
 use rmux_proto::{
-    encode_frame, ErrorResponse, Response, RmuxError, CONTROL_CONTROL_END, CONTROL_CONTROL_START,
-    RMUX_WIRE_VERSION,
+    encode_frame, ErrorResponse, FrameDecoder, Request, Response, RmuxError, CONTROL_CONTROL_END,
+    CONTROL_CONTROL_START, RMUX_WIRE_VERSION,
 };
 use rmux_pty::TerminalSize;
 
@@ -35,7 +35,7 @@ type SharedPipeBuffer = Arc<Mutex<Vec<u8>>>;
 type PipeCollector = JoinHandle<io::Result<Vec<u8>>>;
 const TOP_LEVEL_USAGE: &str = "usage: rmux [-2CDhlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n";
 const LONG_OPTION_USAGE: &str = "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n";
-const LONG_OPTION_HELP: &str = "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n\nRMUX extensions:\n  capabilities [--human|--json]\n  diagnose [--human|--json]\n  web-share [flags]\n  web-share list|lookup|stop|disconnect|off|config\n\nUse `rmux list-commands` for the tmux-compatible command surface.\n";
+const LONG_OPTION_HELP: &str = "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n\nRMUX extensions:\n  capabilities [--human|--json]\n  claude [claude-args...]\n  diagnose [--human|--json]\n  doctor tmux-dropin\n  setup tmux-shim\n  wait-pane [flags]\n  pane-snapshot [flags]\n  stream-pane [--raw|--lines]\n  collect-pane-output --until-pane-exit --max-bytes bytes\n  locator|expect-pane [flags]\n  find-panes|find-sessions [flags]\n  broadcast-keys -t target... -- key ...\n  with-session session-name -- command ...\n  web-share [flags]\n  web-share list|lookup|stop|disconnect|off|config\n\nUse `rmux list-commands` for the tmux-compatible command surface.\n";
 
 fn assert_nested_switch_client_error(output: &Output) {
     let stderr = stderr(output);
@@ -73,13 +73,25 @@ fn spawn_incompatible_wire_server(socket_path: &Path) -> io::Result<JoinHandle<i
     let listener = UnixListener::bind(socket_path)?;
     let handle = thread::spawn(move || {
         let (mut stream, _) = listener.accept()?;
+        let mut decoder = FrameDecoder::new();
         let mut buffer = [0_u8; 1024];
-        let bytes_read = stream.read(&mut buffer)?;
-        if bytes_read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "client closed before sending request",
-            ));
+        loop {
+            match decoder.next_frame::<Request>() {
+                Ok(Some(_)) => break,
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, error));
+                }
+            }
+
+            let bytes_read = stream.read(&mut buffer)?;
+            if bytes_read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "client closed before sending request",
+                ));
+            }
+            decoder.push_bytes(&buffer[..bytes_read]);
         }
 
         write_legacy_incompatible_wire_response(&mut stream)
@@ -110,26 +122,7 @@ fn write_legacy_incompatible_wire_response(stream: &mut impl Write) -> io::Resul
 fn spawn_alias_fallback_incompatible_wire_server(
     socket_path: &Path,
 ) -> io::Result<JoinHandle<io::Result<()>>> {
-    if let Some(parent) = socket_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let _ = fs::remove_file(socket_path);
-    let listener = UnixListener::bind(socket_path)?;
-    let handle = thread::spawn(move || {
-        let (_probe, _) = listener.accept()?;
-        let (mut stream, _) = listener.accept()?;
-        let mut buffer = [0_u8; 1024];
-        let bytes_read = stream.read(&mut buffer)?;
-        if bytes_read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "client closed before sending alias fallback request",
-            ));
-        }
-
-        write_legacy_incompatible_wire_response(&mut stream)
-    });
-    Ok(handle)
+    spawn_incompatible_wire_server(socket_path)
 }
 
 #[test]
@@ -538,7 +531,23 @@ fn help_and_list_commands_cover_the_full_tmux_command_table() -> Result<(), Box<
     // RMUX extensions even though they stay in the command inventory for help.
     // Keep this in sync with RMUX_EXTENSION_COMMANDS in
     // src/cli/command_inventory.rs.
-    const RMUX_EXTENSION_COMMANDS: &[&str] = &["capabilities", "web-share"];
+    const RMUX_EXTENSION_COMMANDS: &[&str] = &[
+        "capabilities",
+        "claude",
+        "doctor",
+        "setup",
+        "wait-pane",
+        "pane-snapshot",
+        "stream-pane",
+        "collect-pane-output",
+        "locator",
+        "expect-pane",
+        "find-panes",
+        "find-sessions",
+        "broadcast-keys",
+        "with-session",
+        "web-share",
+    ];
     let expected = COMMAND_TABLE
         .iter()
         .map(|entry| entry.name.to_owned())
@@ -558,6 +567,16 @@ fn help_and_list_commands_cover_the_full_tmux_command_table() -> Result<(), Box<
         vec!["web-share".to_owned()]
     );
     assert!(stderr(&explicit).is_empty());
+
+    let doctor = harness.run(&["list-commands", "doctor"])?;
+    assert_eq!(doctor.status.code(), Some(0));
+    assert_eq!(stdout(&doctor), "doctor tmux-dropin\n");
+    assert!(stderr(&doctor).is_empty());
+
+    let setup = harness.run(&["list-commands", "setup"])?;
+    assert_eq!(setup.status.code(), Some(0));
+    assert_eq!(stdout(&setup), "setup tmux-shim\n");
+    assert!(stderr(&setup).is_empty());
 
     assert!(!harness.socket_path().exists());
     Ok(())
@@ -2004,6 +2023,50 @@ fn attach_session_inside_tmux_uses_switch_client_semantics() -> Result<(), Box<d
     assert_eq!(output.status.code(), Some(1));
     assert_nested_switch_client_error(&output);
     assert!(!stderr(&output).contains("attach error"));
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn nested_attach_session_with_different_socket_name_uses_requested_server(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("attach-session-nested-other-socket")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let created_other = harness.run_with(
+        &["-L", "other", "new-session", "-d", "-s", "beta"],
+        |command| {
+            command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        },
+    )?;
+    assert_success(&created_other);
+
+    let rmux_env = format!("{},1,0", harness.socket_path().display());
+    let output = harness.run_with(
+        &["-L", "other", "attach-session", "-t", "beta"],
+        |command| {
+            command.env("RMUX", &rmux_env);
+            command.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        },
+    )?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        !stderr(&output).contains("no current client"),
+        "attach-session -L other must not be rewritten to switch-client on inherited socket: {}",
+        stderr(&output)
+    );
+    assert!(
+        !stderr(&output).contains("switch-client requires an attached client"),
+        "attach-session -L other must use requested socket instead of nested switch-client: {}",
+        stderr(&output)
+    );
+    let listed_other = harness.run(&["-L", "other", "list-sessions", "-F", "#{session_name}"])?;
+    assert_eq!(stdout(&listed_other), "beta\n");
+
+    let _ = harness.run(&["-L", "other", "kill-server"]);
     terminate_child(daemon.child_mut())?;
     Ok(())
 }

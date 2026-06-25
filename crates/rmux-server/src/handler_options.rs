@@ -181,6 +181,9 @@ impl RequestHandler {
                                 &request.scope,
                             );
                         }
+                        if option == OptionName::AllowSetTitle {
+                            state.refresh_transcript_title_rename_for_option_scope(&request.scope);
+                        }
                         if option == OptionName::MessageLimit {
                             state.trim_message_log();
                         }

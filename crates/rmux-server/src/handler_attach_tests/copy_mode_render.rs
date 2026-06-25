@@ -36,7 +36,7 @@ async fn attached_copy_mode_u_attach_render_matches_mode_capture_source() {
     let frame = take_render_frame(control_rx.try_recv().expect("copy-mode -u refresh"));
     let mode_capture = {
         let response = handler
-            .handle(Request::CapturePane(CapturePaneRequest {
+            .handle(Request::CapturePane(Box::new(CapturePaneRequest {
                 target,
                 start: None,
                 end: None,
@@ -53,7 +53,7 @@ async fn attached_copy_mode_u_attach_render_matches_mode_capture_source() {
                 quiet: false,
                 start_is_absolute: false,
                 end_is_absolute: false,
-            }))
+            })))
             .await;
         let output = response
             .command_output()
@@ -142,7 +142,7 @@ async fn attached_mouse_drag_copy_mode_refresh_keeps_prompt_visible() {
     let frame = take_render_frame(control_rx.try_recv().expect("copy-mode mouse refresh"));
     let mode_capture = {
         let response = handler
-            .handle(Request::CapturePane(CapturePaneRequest {
+            .handle(Request::CapturePane(Box::new(CapturePaneRequest {
                 target,
                 start: None,
                 end: None,
@@ -159,7 +159,7 @@ async fn attached_mouse_drag_copy_mode_refresh_keeps_prompt_visible() {
                 quiet: false,
                 start_is_absolute: false,
                 end_is_absolute: false,
-            }))
+            })))
             .await;
         let output = response
             .command_output()
@@ -207,13 +207,13 @@ async fn attached_copy_mode_unhandled_key_falls_back_to_prefix_table() {
     ));
     assert!(matches!(
         handler
-            .handle(Request::SelectPane(SelectPaneRequest {
+            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
                 target: PaneTarget::new(alpha.clone(), 0),
                 title: None,
                 style: None,
                 input_disabled: None,
                 preserve_zoom: false,
-            }))
+            })))
             .await,
         Response::SelectPane(_)
     ));

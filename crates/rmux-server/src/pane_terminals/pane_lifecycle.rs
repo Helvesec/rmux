@@ -82,14 +82,14 @@ impl HandlerState {
         let runtime_window_name = profile.runtime_window_name(spawn.command);
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
-        let terminal = open_pane_terminal(
+        let mut terminal = open_pane_terminal(
             pane_geometry,
             profile,
             runtime_window_name.clone(),
             spawn.command,
         )?;
         let pid = terminal.pid();
-        let output_reader = clone_terminal_for_output_reader(&terminal, session_name, pane.id)?;
+        let output_reader = clone_terminal_for_output_reader(&mut terminal, session_name, pane.id)?;
         #[cfg(windows)]
         let exit_watcher = clone_terminal_for_exit_watcher(&terminal, session_name, pane.id)?;
 
@@ -219,7 +219,7 @@ impl HandlerState {
                     window_index,
                     pane.geometry(),
                 ),
-                session.cwd(),
+                session.cwd().map(Path::to_path_buf),
             )
         };
         let captured_base_environment =
@@ -239,20 +239,20 @@ impl HandlerState {
             spawn
                 .start_directory
                 .filter(|path| !path.as_os_str().is_empty())
-                .or(requested_cwd),
+                .or(requested_cwd.as_deref()),
         )?;
         let automatic_window_name = profile.automatic_window_name(spawn.command);
         let runtime_window_name = profile.runtime_window_name(spawn.command);
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
-        let terminal = open_pane_terminal(
+        let mut terminal = open_pane_terminal(
             pane_geometry,
             profile,
             runtime_window_name.clone(),
             spawn.command,
         )?;
         let pid = terminal.pid();
-        let output_reader = clone_terminal_for_output_reader(&terminal, session_name, pane_id)?;
+        let output_reader = clone_terminal_for_output_reader(&mut terminal, session_name, pane_id)?;
         #[cfg(windows)]
         let exit_watcher = clone_terminal_for_exit_watcher(&terminal, session_name, pane_id)?;
 
@@ -519,18 +519,38 @@ impl HandlerState {
                     window_index,
                     pane.geometry(),
                 ),
-                session.cwd(),
+                session.cwd().map(Path::to_path_buf),
             )
         };
 
-        let pane_was_alive = self.terminals.pane_is_alive(
-            &runtime_session_name,
-            pane_id,
-            window_index,
-            pane_index,
-        )?;
-        if pane_was_alive && !kill {
+        #[cfg(windows)]
+        let pane_was_starting =
+            self.pane_is_starting_in_window(&session_name, window_index, pane_index);
+        #[cfg(not(windows))]
+        let pane_was_starting = false;
+
+        let pane_was_alive = !pane_was_starting
+            && self.terminals.pane_is_alive(
+                &runtime_session_name,
+                pane_id,
+                window_index,
+                pane_index,
+            )?;
+        if (pane_was_starting || pane_was_alive) && !kill {
             return Err(RmuxError::ProcessStillRunning);
+        }
+        #[cfg(windows)]
+        if pane_was_starting {
+            let _ = self.cancel_starting_pane(&runtime_session_name, pane_id);
+            on_replaced_active_pane(
+                self,
+                &KilledPaneHookContext {
+                    target: target.clone(),
+                    pane_id: pane_id.as_u32(),
+                    window_id: window_id.as_u32(),
+                    window_name: window_name.clone(),
+                },
+            );
         }
 
         let base_environment = self.session_base_environment_for_pane_target(&target);
@@ -545,20 +565,21 @@ impl HandlerState {
             true,
             environment.as_deref(),
             Some(pane_id),
-            start_directory.as_deref().or(requested_cwd),
+            start_directory.as_deref().or(requested_cwd.as_deref()),
         )?;
         let automatic_window_name = profile.automatic_window_name(process_command.as_ref());
         let runtime_window_name = profile.runtime_window_name(process_command.as_ref());
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
-        let terminal = open_pane_terminal(
+        let mut terminal = open_pane_terminal(
             pane_geometry,
             profile,
             runtime_window_name.clone(),
             process_command.as_ref(),
         )?;
         let pid = terminal.pid();
-        let output_reader = clone_terminal_for_output_reader(&terminal, &session_name, pane_id)?;
+        let output_reader =
+            clone_terminal_for_output_reader(&mut terminal, &session_name, pane_id)?;
         #[cfg(windows)]
         let exit_watcher = clone_terminal_for_exit_watcher(&terminal, &session_name, pane_id)?;
 
@@ -574,7 +595,7 @@ impl HandlerState {
                         target: target.clone(),
                         pane_id: pane_id.as_u32(),
                         window_id: window_id.as_u32(),
-                        window_name,
+                        window_name: window_name.clone(),
                     },
                 );
             }
@@ -628,12 +649,12 @@ fn terminate_removed_terminals(
     }
 }
 
-fn clone_terminal_for_output_reader(
-    terminal: &PaneTerminal,
+pub(in crate::pane_terminals) fn clone_terminal_for_output_reader(
+    terminal: &mut PaneTerminal,
     session_name: &SessionName,
     pane_id: PaneId,
 ) -> Result<PtyMaster, RmuxError> {
-    terminal.clone_master().map_err(|error| {
+    terminal.clone_master_for_output_reader().map_err(|error| {
         RmuxError::Server(format!(
             "failed to clone pane output reader for pane id {} in session {}: {error}",
             pane_id.as_u32(),
@@ -643,7 +664,7 @@ fn clone_terminal_for_output_reader(
 }
 
 #[cfg(windows)]
-fn clone_terminal_for_exit_watcher(
+pub(in crate::pane_terminals) fn clone_terminal_for_exit_watcher(
     terminal: &PaneTerminal,
     session_name: &SessionName,
     pane_id: PaneId,

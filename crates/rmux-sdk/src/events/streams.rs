@@ -34,11 +34,10 @@
 //! * **Partial-line buffering.** The line stream splits on the LF byte
 //!   `b'\n'` only. Carriage returns and any other bytes are preserved
 //!   inside the line. Bytes that are not yet terminated by an LF stay in
-//!   an internal buffer and are not yielded; the buffer is flushed only
-//!   when the next LF arrives. A trailing partial line that the daemon
-//!   never terminates with LF is dropped when the stream ends or lag
-//!   fires, because the next sequence's bytes may not begin at a line
-//!   boundary.
+//!   an internal buffer and are not yielded unless the buffer reaches its
+//!   hard safety limit. A trailing partial line that the daemon never
+//!   terminates with LF is dropped when the stream ends or lag fires,
+//!   because the next sequence's bytes may not begin at a line boundary.
 //!
 //! On a [`PaneOutputChunk::Lag`] the line stream drops the partial-line
 //! buffer (the next sequence may be discontinuous with the buffered
@@ -82,6 +81,7 @@ use crate::{Result, RmuxError};
 const PANE_OUTPUT_BATCH_SIZE: u16 = 256;
 const POLL_INITIAL_DELAY: Duration = Duration::from_millis(2);
 const POLL_MAX_DELAY: Duration = Duration::from_millis(50);
+const LINE_BUFFER_MAX: usize = 1_048_576;
 
 /// Where a pane-output stream should anchor its cursor at subscription time.
 ///
@@ -224,6 +224,7 @@ pub struct PaneOutputStream {
 pub struct PaneLineStream {
     inner: PaneOutputStream,
     line_buffer: Vec<u8>,
+    line_buffer_force_flushed: bool,
     pending: VecDeque<PaneLineItem>,
 }
 
@@ -443,6 +444,7 @@ impl PaneLineStream {
         Self {
             inner,
             line_buffer: Vec::new(),
+            line_buffer_force_flushed: false,
             pending: VecDeque::new(),
         }
     }
@@ -461,7 +463,12 @@ impl PaneLineStream {
             }
             match self.inner.next().await? {
                 Some(PaneOutputChunk::Bytes { bytes, .. }) => {
-                    split_lines(&mut self.line_buffer, &bytes, &mut self.pending);
+                    split_lines_bounded(
+                        &mut self.line_buffer,
+                        &mut self.line_buffer_force_flushed,
+                        &bytes,
+                        &mut self.pending,
+                    );
                 }
                 Some(PaneOutputChunk::Lag(notice)) => {
                     // Drop partial-line buffer because the byte stream is
@@ -469,6 +476,7 @@ impl PaneLineStream {
                     // begin at a line boundary, so concatenating them
                     // would produce a synthetic line.
                     self.line_buffer.clear();
+                    self.line_buffer_force_flushed = false;
                     self.pending.push_back(PaneLineItem::Lag(notice));
                 }
                 None => return Ok(None),
@@ -477,17 +485,42 @@ impl PaneLineStream {
     }
 }
 
+#[cfg(test)]
 fn split_lines(buffer: &mut Vec<u8>, bytes: &[u8], out: &mut VecDeque<PaneLineItem>) {
+    let mut force_flushed = false;
+    split_lines_bounded(buffer, &mut force_flushed, bytes, out);
+}
+
+fn split_lines_bounded(
+    buffer: &mut Vec<u8>,
+    force_flushed: &mut bool,
+    bytes: &[u8],
+    out: &mut VecDeque<PaneLineItem>,
+) {
     for byte in bytes {
         if *byte == b'\n' {
-            let line_bytes = std::mem::take(buffer);
-            out.push_back(PaneLineItem::Line {
-                text: String::from_utf8_lossy(&line_bytes).into_owned(),
-            });
+            if buffer.is_empty() && *force_flushed {
+                *force_flushed = false;
+                continue;
+            }
+            push_line(buffer, out);
+            *force_flushed = false;
         } else {
             buffer.push(*byte);
+            *force_flushed = false;
+            if buffer.len() >= LINE_BUFFER_MAX {
+                push_line(buffer, out);
+                *force_flushed = true;
+            }
         }
     }
+}
+
+fn push_line(buffer: &mut Vec<u8>, out: &mut VecDeque<PaneLineItem>) {
+    let line_bytes = std::mem::take(buffer);
+    out.push_back(PaneLineItem::Line {
+        text: String::from_utf8_lossy(&line_bytes).into_owned(),
+    });
 }
 
 impl std::fmt::Debug for PaneOutputStream {

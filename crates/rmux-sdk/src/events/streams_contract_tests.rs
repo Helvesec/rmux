@@ -241,11 +241,11 @@ async fn drive_cursor_with_lag(stream: &mut DuplexStream, lag: PaneOutputLagNoti
     }
     write_response(
         stream,
-        &Response::PaneOutputLag(PaneOutputLagResponse {
+        &Response::PaneOutputLag(Box::new(PaneOutputLagResponse {
             subscription_id: subscription_id(),
             cursor: cursor_zero(),
             lag,
-        }),
+        })),
     )
     .await;
 }
@@ -297,7 +297,7 @@ async fn drive_lag_with_mismatched_subscription(stream: &mut DuplexStream) {
     }
     write_response(
         stream,
-        &Response::PaneOutputLag(PaneOutputLagResponse {
+        &Response::PaneOutputLag(Box::new(PaneOutputLagResponse {
             subscription_id: other_subscription_id(),
             cursor: cursor_zero(),
             lag: PaneOutputLagNotice {
@@ -311,7 +311,7 @@ async fn drive_lag_with_mismatched_subscription(stream: &mut DuplexStream) {
                     newest_sequence: Some(2),
                 },
             },
-        }),
+        })),
     )
     .await;
 }

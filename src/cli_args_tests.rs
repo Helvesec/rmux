@@ -89,6 +89,9 @@ mod pane_layout;
 #[path = "cli_args_tests/pane_io.rs"]
 mod pane_io;
 
+#[path = "cli_args_tests/automation.rs"]
+mod automation;
+
 #[path = "cli_args_tests/scripting_and_buffers.rs"]
 mod scripting_and_buffers;
 

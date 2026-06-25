@@ -166,10 +166,33 @@ async fn attach_session_upgrade_renders_only_the_active_window() {
         render_frame.contains("visible-active-pane"),
         "attach must replay the active pane screen, got {render_frame:?}"
     );
-    assert!(
-        render_frame.contains("\"pane-host\""),
-        "attach status must render the active pane title, got {render_frame:?}"
-    );
+    #[cfg(windows)]
+    {
+        let host_short = crate::host_name::local_hostname()
+            .and_then(|host| {
+                host.split('.')
+                    .next()
+                    .filter(|part| !part.is_empty())
+                    .map(ToOwned::to_owned)
+            })
+            .expect("host name");
+        let status_host: String = host_short.chars().take(21).collect();
+        assert!(
+            render_frame.contains(&format!("\"{status_host}\"")),
+            "attach status must render the host name, got {render_frame:?}"
+        );
+        assert!(
+            !render_frame.contains("\"pane-host\""),
+            "attach status must not render the pane title in status-right, got {render_frame:?}"
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        assert!(
+            render_frame.contains("\"pane-host\""),
+            "attach status must render the pane title in status-right, got {render_frame:?}"
+        );
+    }
     assert!(!render_frame.contains('┬'));
     assert!(!render_frame.contains('┴'));
     assert!(!render_frame.contains('│'));
@@ -252,7 +275,7 @@ async fn attach_session_replays_all_visible_pane_screens() {
     create_session_with_command(&handler, &alpha, quiet_ready_command(top_ready)).await;
     assert!(matches!(
         handler
-            .handle(Request::SplitWindowExt(SplitWindowExtRequest {
+            .handle(Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
                 target: SplitWindowTarget::Session(alpha.clone()),
                 direction: rmux_proto::SplitDirection::Vertical,
                 before: false,
@@ -266,7 +289,7 @@ async fn attach_session_replays_all_visible_pane_screens() {
                 preserve_zoom: false,
                 full_size: false,
                 stdin_payload: None,
-            }))
+            })))
             .await,
         Response::SplitWindow(_)
     ));
@@ -343,7 +366,7 @@ async fn attach_session_uses_client_size_before_first_frame() {
     let outcome = handler
         .dispatch(
             std::process::id(),
-            Request::AttachSessionExt2(AttachSessionExt2Request {
+            Request::AttachSessionExt2(Box::new(AttachSessionExt2Request {
                 target: Some(alpha.clone()),
                 target_spec: Some(alpha.to_string()),
                 detach_other_clients: false,
@@ -354,7 +377,7 @@ async fn attach_session_uses_client_size_before_first_frame() {
                 working_directory: None,
                 client_terminal: rmux_proto::ClientTerminalContext::default(),
                 client_size: Some(TerminalSize { cols: 80, rows: 24 }),
-            }),
+            })),
         )
         .await;
 
@@ -392,7 +415,7 @@ async fn attach_session_target_spec_selects_requested_window_and_pane_before_att
     ));
     assert!(matches!(
         handler
-            .handle(Request::NewWindow(rmux_proto::NewWindowRequest {
+            .handle(Request::NewWindow(Box::new(rmux_proto::NewWindowRequest {
                 target: alpha.clone(),
                 name: Some("w1".to_owned()),
                 detached: true,
@@ -402,7 +425,7 @@ async fn attach_session_target_spec_selects_requested_window_and_pane_before_att
                 start_directory: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await,
         Response::NewWindow(_)
     ));
@@ -421,7 +444,7 @@ async fn attach_session_target_spec_selects_requested_window_and_pane_before_att
     let outcome = handler
         .dispatch(
             std::process::id(),
-            Request::AttachSessionExt2(AttachSessionExt2Request {
+            Request::AttachSessionExt2(Box::new(AttachSessionExt2Request {
                 target: Some(alpha.clone()),
                 target_spec: Some("alpha:1.1".to_owned()),
                 detach_other_clients: false,
@@ -432,7 +455,7 @@ async fn attach_session_target_spec_selects_requested_window_and_pane_before_att
                 working_directory: None,
                 client_terminal: rmux_proto::ClientTerminalContext::default(),
                 client_size: Some(TerminalSize { cols: 80, rows: 24 }),
-            }),
+            })),
         )
         .await;
 
@@ -469,7 +492,7 @@ async fn legacy_attach_request_disables_render_stream_frames() {
     let outcome = handler
         .dispatch(
             std::process::id(),
-            Request::AttachSessionExt2(AttachSessionExt2Request {
+            Request::AttachSessionExt2(Box::new(AttachSessionExt2Request {
                 target: Some(alpha.clone()),
                 target_spec: Some(alpha.to_string()),
                 detach_other_clients: false,
@@ -480,7 +503,7 @@ async fn legacy_attach_request_disables_render_stream_frames() {
                 working_directory: None,
                 client_terminal: rmux_proto::ClientTerminalContext::default(),
                 client_size: Some(TerminalSize { cols: 80, rows: 24 }),
-            }),
+            })),
         )
         .await;
 
@@ -524,7 +547,10 @@ async fn attach_render_capability_enables_render_stream_frames() {
         vec![CAPABILITY_ATTACH_RENDER.to_owned()],
     );
     let outcome = handler
-        .dispatch(std::process::id(), Request::AttachSessionExt3(request))
+        .dispatch(
+            std::process::id(),
+            Request::AttachSessionExt3(Box::new(request)),
+        )
         .await;
 
     assert!(matches!(outcome.response, Response::AttachSession(_)));

@@ -263,7 +263,7 @@ pub(super) fn parse_new_window(
         }
     }
 
-    Ok(Request::NewWindow(NewWindowRequest {
+    Ok(Request::NewWindow(Box::new(NewWindowRequest {
         target: target.unwrap_or(implicit_session_name(sessions, find_context, "new-window")?),
         name,
         detached,
@@ -273,7 +273,7 @@ pub(super) fn parse_new_window(
         process_command: None,
         target_window_index,
         insert_at_target,
-    }))
+    })))
 }
 
 fn signed_window_target_session_part(raw_target: &str) -> Option<Option<&str>> {
@@ -581,7 +581,7 @@ pub(super) fn parse_respawn_window(
         Some(environment)
     };
 
-    Ok(Request::RespawnWindow(RespawnWindowRequest {
+    Ok(Request::RespawnWindow(Box::new(RespawnWindowRequest {
         target: target.unwrap_or(implicit_window_target(
             sessions,
             find_context,
@@ -591,5 +591,5 @@ pub(super) fn parse_respawn_window(
         start_directory,
         environment,
         command,
-    }))
+    })))
 }

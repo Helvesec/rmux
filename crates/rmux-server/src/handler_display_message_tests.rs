@@ -27,57 +27,11 @@ fn default_shell_window_name() -> String {
 
 #[cfg(windows)]
 fn default_shell_window_name() -> String {
-    if windows_command_path("pwsh.exe").is_some() {
-        return "pwsh.exe".to_owned();
-    }
-    if windows_powershell_path().is_some_and(|path| path.is_file()) {
-        return "powershell.exe".to_owned();
-    }
     std::env::var_os("COMSPEC")
         .and_then(|shell| Path::new(&shell).file_name().map(|name| name.to_owned()))
         .map(|name| name.to_string_lossy().trim_start_matches('-').to_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "cmd.exe".to_owned())
-}
-
-#[cfg(windows)]
-fn windows_command_path(command: &str) -> Option<std::path::PathBuf> {
-    let path_value = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_value).find_map(|directory| {
-        let candidate = directory.join(command);
-        if candidate.is_file() && windows_shell_candidate_is_usable(&candidate) {
-            Some(candidate)
-        } else {
-            None
-        }
-    })
-}
-
-#[cfg(windows)]
-fn windows_shell_candidate_is_usable(path: &Path) -> bool {
-    !windows_shell_candidate_is_windowsapps_alias(path)
-}
-
-#[cfg(windows)]
-fn windows_shell_candidate_is_windowsapps_alias(path: &Path) -> bool {
-    let components = path
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>();
-    components.windows(2).any(|window| {
-        window[0].eq_ignore_ascii_case("Microsoft") && window[1].eq_ignore_ascii_case("WindowsApps")
-    })
-}
-
-#[cfg(windows)]
-fn windows_powershell_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("SystemRoot").map(|root| {
-        std::path::PathBuf::from(root)
-            .join("System32")
-            .join("WindowsPowerShell")
-            .join("v1.0")
-            .join("powershell.exe")
-    })
 }
 
 async fn recv_overlay_control(
@@ -147,7 +101,7 @@ async fn display_message_last_window_index_is_highest_session_window_index() {
     ));
     assert!(matches!(
         handler
-            .handle(Request::NewWindow(NewWindowRequest {
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
                 target: alpha.clone(),
                 name: Some("detached".to_owned()),
                 detached: true,
@@ -157,7 +111,7 @@ async fn display_message_last_window_index_is_highest_session_window_index() {
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await,
         Response::NewWindow(_)
     ));
@@ -200,7 +154,7 @@ async fn display_message_reports_session_and_window_stack_order() {
     for index in 1..=2 {
         assert!(matches!(
             handler
-                .handle(Request::NewWindow(NewWindowRequest {
+                .handle(Request::NewWindow(Box::new(NewWindowRequest {
                     target: alpha.clone(),
                     name: Some(format!("w{index}")),
                     detached: true,
@@ -210,7 +164,7 @@ async fn display_message_reports_session_and_window_stack_order() {
                     process_command: None,
                     target_window_index: Some(index),
                     insert_at_target: false,
-                }))
+                })))
                 .await,
             Response::NewWindow(_)
         ));
@@ -764,7 +718,7 @@ async fn display_message_name_exists_modifier_checks_window_names_not_window_cou
     ));
     assert!(matches!(
         handler
-            .handle(Request::NewWindow(NewWindowRequest {
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
                 target: alpha.clone(),
                 name: Some("w1".to_owned()),
                 detached: true,
@@ -774,7 +728,7 @@ async fn display_message_name_exists_modifier_checks_window_names_not_window_cou
                 start_directory: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await,
         Response::NewWindow(_)
     ));
@@ -931,13 +885,15 @@ async fn display_message_target_client_delivers_only_to_that_client() {
     handler.register_attach(43, alpha, second_tx).await;
 
     let response = handler
-        .handle(Request::DisplayMessageExt(DisplayMessageExtRequest {
-            target: None,
-            print: false,
-            message: Some("for second".to_owned()),
-            target_client: Some("43".to_owned()),
-            empty_target_context: false,
-        }))
+        .handle(Request::DisplayMessageExt(Box::new(
+            DisplayMessageExtRequest {
+                target: None,
+                print: false,
+                message: Some("for second".to_owned()),
+                target_client: Some("43".to_owned()),
+                empty_target_context: false,
+            },
+        )))
         .await;
 
     assert_eq!(
@@ -971,13 +927,15 @@ async fn display_message_missing_target_client_is_noop_unless_printing() {
     ));
 
     let response = handler
-        .handle(Request::DisplayMessageExt(DisplayMessageExtRequest {
-            target: None,
-            print: false,
-            message: Some("hidden".to_owned()),
-            target_client: Some("999999".to_owned()),
-            empty_target_context: false,
-        }))
+        .handle(Request::DisplayMessageExt(Box::new(
+            DisplayMessageExtRequest {
+                target: None,
+                print: false,
+                message: Some("hidden".to_owned()),
+                target_client: Some("999999".to_owned()),
+                empty_target_context: false,
+            },
+        )))
         .await;
     assert_eq!(
         response,
@@ -985,13 +943,15 @@ async fn display_message_missing_target_client_is_noop_unless_printing() {
     );
 
     let response = handler
-        .handle(Request::DisplayMessageExt(DisplayMessageExtRequest {
-            target: None,
-            print: true,
-            message: Some("hello".to_owned()),
-            target_client: Some("999999".to_owned()),
-            empty_target_context: false,
-        }))
+        .handle(Request::DisplayMessageExt(Box::new(
+            DisplayMessageExtRequest {
+                target: None,
+                print: true,
+                message: Some("hello".to_owned()),
+                target_client: Some("999999".to_owned()),
+                empty_target_context: false,
+            },
+        )))
         .await;
     assert_eq!(
         response.command_output().map(|output| output.stdout()),
@@ -1022,13 +982,15 @@ async fn display_message_target_client_uses_client_session_for_overlay_delivery(
     handler.register_attach(42, alpha, control_tx).await;
 
     let response = handler
-        .handle(Request::DisplayMessageExt(DisplayMessageExtRequest {
-            target: Some(Target::Session(beta)),
-            print: false,
-            message: Some("format #{session_name}".to_owned()),
-            target_client: Some("42".to_owned()),
-            empty_target_context: false,
-        }))
+        .handle(Request::DisplayMessageExt(Box::new(
+            DisplayMessageExtRequest {
+                target: Some(Target::Session(beta)),
+                print: false,
+                message: Some("format #{session_name}".to_owned()),
+                target_client: Some("42".to_owned()),
+                empty_target_context: false,
+            },
+        )))
         .await;
 
     assert_eq!(

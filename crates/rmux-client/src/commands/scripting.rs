@@ -20,7 +20,7 @@ impl Connection {
         start_directory: Option<PathBuf>,
         target: Option<rmux_proto::PaneTarget>,
     ) -> Result<Response, ClientError> {
-        self.roundtrip_without_read_timeout(&Request::RunShell(RunShellRequest {
+        self.roundtrip_without_read_timeout(&Request::RunShell(Box::new(RunShellRequest {
             command,
             background,
             as_commands,
@@ -29,7 +29,7 @@ impl Connection {
             start_directory,
             target,
             source_depth: None,
-        }))
+        })))
     }
 
     /// Sends an `if-shell` request over the detached RPC channel without a
@@ -43,7 +43,7 @@ impl Connection {
         target: Option<Target>,
         background: bool,
     ) -> Result<Response, ClientError> {
-        self.roundtrip_without_read_timeout(&Request::IfShell(IfShellRequest {
+        self.roundtrip_without_read_timeout(&Request::IfShell(Box::new(IfShellRequest {
             condition,
             format_mode,
             then_command,
@@ -51,7 +51,7 @@ impl Connection {
             target,
             caller_cwd: current_working_directory(),
             background,
-        }))
+        })))
     }
 
     /// Sends a `wait-for` request over the detached RPC channel without a

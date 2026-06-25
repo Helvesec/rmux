@@ -146,13 +146,6 @@ impl Session {
                 .and_then(|pane_index| window.pane(pane_index).map(Pane::id))
         });
 
-        if source_window.pane_count() == 1 && source_session.windows.len() == 1 {
-            return Err(RmuxError::Server(format!(
-                "cannot kill the only window in session {}",
-                source_session.name
-            )));
-        }
-
         let target_window = self
             .window_at_mut(target.window_index)
             .expect("target window must exist");
@@ -205,7 +198,7 @@ impl Session {
         }
 
         if source_window.pane_count() == 0 {
-            source_session.remove_window(source.window_index)?;
+            source_session.remove_window_allowing_empty(source.window_index)?;
         }
 
         Ok(())
@@ -237,14 +230,7 @@ impl Session {
         )?;
 
         if source_window.pane_count() == 1 {
-            if self.windows.len() == 1 {
-                return Err(RmuxError::Server(format!(
-                    "cannot kill the only window in session {}",
-                    self.name
-                )));
-            }
-
-            let mut moved_window = self.remove_window(source.window_index)?;
+            let mut moved_window = self.remove_window_allowing_empty(source.window_index)?;
             moved_window.renumber_single_pane_to_zero();
             destination_session.insert_existing_window(destination_index, moved_window)?;
             if let Some(name) = options.name {

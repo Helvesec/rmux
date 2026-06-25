@@ -76,6 +76,23 @@ fn default_store_loads_prefix_root_and_copy_tables() {
 }
 
 #[test]
+fn default_store_keeps_prefix_meta_layout_bindings() {
+    let store = KeyBindingStore::default();
+    for (key, expected) in [
+        ("M-1", "select-layout even-horizontal"),
+        ("M-2", "select-layout even-vertical"),
+        ("M-3", "select-layout main-horizontal"),
+        ("M-4", "select-layout main-vertical"),
+        ("M-5", "select-layout tiled"),
+    ] {
+        let binding = store
+            .get_binding("prefix", key_string_lookup_string(key).expect("key parses"))
+            .unwrap_or_else(|| panic!("missing default prefix binding for {key}"));
+        assert_eq!(binding.commands().to_tmux_string(), expected);
+    }
+}
+
+#[test]
 fn reset_restores_defaults_from_snapshot() {
     let mut store = KeyBindingStore::default();
     let original = store

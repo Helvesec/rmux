@@ -319,25 +319,26 @@ fn create_short_lived_shell_session(
     session_name: SessionName,
 ) -> Result<(), Box<dyn Error>> {
     let mut connection = harness.connect()?;
-    let response = connection.roundtrip(&Request::NewSessionExt(NewSessionExtRequest {
-        session_name: Some(session_name),
-        working_directory: None,
-        detached: true,
-        size: Some(TerminalSize { cols: 80, rows: 24 }),
-        environment: None,
-        group_target: None,
-        attach_if_exists: false,
-        detach_other_clients: false,
-        kill_other_clients: false,
-        flags: None,
-        window_name: None,
-        print_session_info: false,
-        print_format: None,
-        command: Some(vec!["sh".to_owned(), "-c".to_owned(), "sleep 1".to_owned()]),
-        process_command: None,
-        client_environment: None,
-        skip_environment_update: false,
-    }))?;
+    let response =
+        connection.roundtrip(&Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(session_name),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(vec!["sh".to_owned(), "-c".to_owned(), "sleep 1".to_owned()]),
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))?;
     assert!(matches!(response, Response::NewSession(_)), "{response:?}");
     Ok(())
 }
@@ -359,28 +360,29 @@ fn create_interactive_shell_session(
     session_name: SessionName,
 ) -> Result<(), Box<dyn Error>> {
     let mut connection = harness.connect()?;
-    let response = connection.roundtrip(&Request::NewSessionExt(NewSessionExtRequest {
-        session_name: Some(session_name),
-        working_directory: None,
-        detached: true,
-        size: Some(TerminalSize {
-            cols: 100,
-            rows: 30,
-        }),
-        environment: None,
-        group_target: None,
-        attach_if_exists: false,
-        detach_other_clients: false,
-        kill_other_clients: false,
-        flags: None,
-        window_name: None,
-        print_session_info: false,
-        print_format: None,
-        command: Some(vec!["sh".to_owned(), "-i".to_owned()]),
-        process_command: None,
-        client_environment: None,
-        skip_environment_update: false,
-    }))?;
+    let response =
+        connection.roundtrip(&Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(session_name),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize {
+                cols: 100,
+                rows: 30,
+            }),
+            environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(vec!["sh".to_owned(), "-i".to_owned()]),
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))?;
     assert!(matches!(response, Response::NewSession(_)), "{response:?}");
     thread::sleep(Duration::from_millis(100));
     Ok(())
@@ -529,7 +531,7 @@ fn wait_for_lag(
             Response::PaneOutputLag(lag) => {
                 assert_eq!(lag.cursor.next_sequence, lag.lag.resume_sequence);
                 assert_eq!(lag.cursor.missed_events, lag.lag.missed_events);
-                return Ok(lag);
+                return Ok(*lag);
             }
             Response::PaneOutputCursor(cursor) => {
                 assert!(cursor.events.len() <= 1);

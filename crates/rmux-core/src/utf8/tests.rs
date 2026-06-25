@@ -164,6 +164,25 @@ fn text_width_and_truncation_follow_display_width() {
 }
 
 #[test]
+fn ascii_width_and_truncation_use_identity_fast_path() {
+    let config = Utf8Config::default();
+
+    assert_eq!(text_width("abcdef", &config), 6);
+    assert_eq!(truncate_to_width("abcdef", 3, &config), "abc");
+    assert_eq!(truncate_right_to_width("abcdef", 3, &config), "def");
+}
+
+#[test]
+fn ascii_width_override_disables_identity_fast_path() {
+    let config = utf8_config_with(&["A=2"], true);
+
+    assert_eq!(text_width("AB", &config), 3);
+    assert_eq!(truncate_to_width("AB", 1, &config), "");
+    assert_eq!(truncate_to_width("AB", 2, &config), "A");
+    assert_eq!(truncate_right_to_width("AB", 1, &config), "B");
+}
+
+#[test]
 fn right_truncation_keeps_display_cells_from_the_end() {
     let config = Utf8Config::default();
 

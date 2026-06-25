@@ -65,6 +65,18 @@ pub fn resolve_socket_path(
         .map_err(ClientError::Io)
 }
 
+/// Resolves a socket path for a tmux-compatible shim invocation.
+///
+/// This path may consume `$TMUX`; the native RMUX path intentionally does not.
+pub fn resolve_tmux_compatible_socket_path(
+    socket_name: Option<&OsStr>,
+    socket_path: Option<&Path>,
+) -> Result<PathBuf, ClientError> {
+    rmux_ipc::resolve_tmux_compatible_endpoint(socket_name, socket_path)
+        .map(LocalEndpoint::into_path)
+        .map_err(ClientError::Io)
+}
+
 /// Result of attempting to connect to the RMUX server.
 // Keep the successful path as an owned public `Connection`; boxing would add an
 // unnecessary API wrinkle around the small absent-server control-flow case.
@@ -255,8 +267,50 @@ impl Connection {
         let previous_timeout = read_timeout(&self.stream).map_err(ClientError::Io)?;
         set_read_timeout(&self.stream, None).map_err(ClientError::Io)?;
         let result = self.roundtrip(request);
-        set_read_timeout(&self.stream, previous_timeout).map_err(ClientError::Io)?;
-        result
+        let restore_result =
+            set_read_timeout(&self.stream, previous_timeout).map_err(ClientError::Io);
+
+        match (result, restore_result) {
+            (Err(error), _) => Err(error),
+            (Ok(response), Ok(())) => Ok(response),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    /// Reads the next detached response without a response read timeout.
+    ///
+    /// This is used for already-armed long-running requests where another
+    /// connection may cancel the server-side wait on timeout.
+    pub fn read_response_without_read_timeout(&mut self) -> Result<Response, ClientError> {
+        let previous_timeout = read_timeout(&self.stream).map_err(ClientError::Io)?;
+        set_read_timeout(&self.stream, None).map_err(ClientError::Io)?;
+        let result = self.read_response();
+        let restore_result =
+            set_read_timeout(&self.stream, previous_timeout).map_err(ClientError::Io);
+
+        match (result, restore_result) {
+            (Err(error), _) => Err(error),
+            (Ok(response), Ok(())) => Ok(response),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    /// Reads the next detached response with a caller-provided read timeout.
+    pub fn read_response_with_read_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Response, ClientError> {
+        let previous_timeout = read_timeout(&self.stream).map_err(ClientError::Io)?;
+        set_read_timeout(&self.stream, Some(timeout)).map_err(ClientError::Io)?;
+        let result = self.read_response();
+        let restore_result =
+            set_read_timeout(&self.stream, previous_timeout).map_err(ClientError::Io);
+
+        match (result, restore_result) {
+            (Err(error), _) => Err(error),
+            (Ok(response), Ok(())) => Ok(response),
+            (Ok(_), Err(error)) => Err(error),
+        }
     }
 
     pub(crate) fn write_request(&mut self, request: &Request) -> Result<(), ClientError> {

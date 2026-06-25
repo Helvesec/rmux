@@ -82,7 +82,7 @@ pub(super) fn parse_run_shell(mut args: CommandTokens) -> Result<Request, RmuxEr
         rebuild_shell_command(command_parts)
     };
 
-    Ok(Request::RunShell(RunShellRequest {
+    Ok(Request::RunShell(Box::new(RunShellRequest {
         command,
         background,
         as_commands,
@@ -91,7 +91,7 @@ pub(super) fn parse_run_shell(mut args: CommandTokens) -> Result<Request, RmuxEr
         start_directory,
         target,
         source_depth: None,
-    }))
+    })))
 }
 
 pub(super) fn parse_if_shell(
@@ -124,7 +124,7 @@ pub(super) fn parse_if_shell(
         }
     }
 
-    let request = Request::IfShell(IfShellRequest {
+    let request = Request::IfShell(Box::new(IfShellRequest {
         condition: args.required("if-shell condition")?,
         format_mode,
         then_command: args.required("if-shell then command")?,
@@ -132,7 +132,7 @@ pub(super) fn parse_if_shell(
         target,
         caller_cwd: caller_cwd.map(Path::to_path_buf),
         background,
-    });
+    }));
     args.no_extra("if-shell")?;
     Ok(request)
 }

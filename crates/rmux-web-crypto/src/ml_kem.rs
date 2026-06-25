@@ -10,6 +10,7 @@
 //! long as either primitive holds.
 
 use libcrux_ml_kem::mlkem768::{self, MlKem768Ciphertext, MlKem768PublicKey};
+use zeroize::Zeroizing;
 
 /// Randomness consumed by [`KeyPair::generate`].
 pub const KEYGEN_RANDOMNESS_LEN: usize = 64;
@@ -47,9 +48,12 @@ impl KeyPair {
 
     /// Decapsulates a peer ciphertext into the hybrid shared secret.
     #[must_use]
-    pub fn decapsulate(&self, ciphertext: &[u8; CIPHERTEXT_LEN]) -> [u8; SHARED_SECRET_LEN] {
+    pub fn decapsulate(
+        &self,
+        ciphertext: &[u8; CIPHERTEXT_LEN],
+    ) -> Zeroizing<[u8; SHARED_SECRET_LEN]> {
         let ciphertext = MlKem768Ciphertext::from(ciphertext);
-        mlkem768::decapsulate(self.inner.private_key(), &ciphertext)
+        Zeroizing::new(mlkem768::decapsulate(self.inner.private_key(), &ciphertext))
     }
 }
 
@@ -88,11 +92,12 @@ mod tests {
         assert_eq!(ciphertext.len(), CIPHERTEXT_LEN);
 
         let client_secret = keypair.decapsulate(&ciphertext);
+        assert_zeroizing_secret(&client_secret);
         assert_eq!(
-            client_secret, server_secret,
+            &*client_secret, &server_secret,
             "both sides derive the same secret"
         );
-        assert_ne!(client_secret, [0u8; SHARED_SECRET_LEN]);
+        assert_ne!(*client_secret, [0u8; SHARED_SECRET_LEN]);
     }
 
     #[test]
@@ -114,4 +119,6 @@ mod tests {
         let (_, second) = encapsulate(&ek, [3u8; ENCAPS_RANDOMNESS_LEN]).expect("valid ek");
         assert_ne!(first, second);
     }
+
+    fn assert_zeroizing_secret(_: &Zeroizing<[u8; SHARED_SECRET_LEN]>) {}
 }

@@ -52,6 +52,9 @@ fn local_datetime(epoch: i64) -> Option<DateTime<Local>> {
 
 /// Expands strftime tokens in a tmux format template without panicking on invalid literals.
 pub fn expand_time_tokens(template: &str) -> String {
+    if !template.contains('%') {
+        return template.to_owned();
+    }
     format_strftime(&Local::now(), template)
 }
 

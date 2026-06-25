@@ -5,9 +5,15 @@ use super::{CommandEntry, CommandParseError, COMMAND_TABLE};
 pub(super) fn lookup_command_at(
     name: &str,
     line: usize,
+    exact_commands: &'static [CommandEntry],
 ) -> Result<&'static CommandEntry, CommandParseError> {
     for entry in COMMAND_TABLE {
         if entry.alias == Some(name) {
+            return Ok(entry);
+        }
+    }
+    for entry in exact_commands {
+        if entry.alias == Some(name) || entry.name == name {
             return Ok(entry);
         }
     }

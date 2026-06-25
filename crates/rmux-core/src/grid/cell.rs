@@ -393,6 +393,18 @@ impl GridLine {
         }
     }
 
+    pub(super) fn from_plain_ascii_text(width: u32, flags: GridLineFlags, text: String) -> Self {
+        debug_assert!(text.is_ascii());
+        Self {
+            cells: Vec::new(),
+            plain_text: Some(CompactString::from(text)),
+            width,
+            flags,
+            time: 0,
+            revision: next_line_revision(),
+        }
+    }
+
     /// Returns all cells in the line.
     #[must_use]
     pub fn cells(&self) -> &[GridCell] {
@@ -417,6 +429,39 @@ impl GridLine {
     pub(crate) fn materialize_for_cell_mutation(&mut self) {
         if self.plain_text.is_some() {
             self.materialize_plain_text(self.width as usize);
+        }
+    }
+
+    pub(crate) fn insert_cells(&mut self, start: u32, count: u32, blank: &GridCell) {
+        self.materialize_for_cell_mutation();
+        let start = start as usize;
+        if start >= self.cells.len() {
+            return;
+        }
+        let count = (count as usize).min(self.cells.len() - start);
+        if count == 0 {
+            return;
+        }
+        self.cells[start..].rotate_right(count);
+        for cell in &mut self.cells[start..start + count] {
+            *cell = blank.clone();
+        }
+    }
+
+    pub(crate) fn delete_cells(&mut self, start: u32, count: u32, blank: &GridCell) {
+        self.materialize_for_cell_mutation();
+        let start = start as usize;
+        if start >= self.cells.len() {
+            return;
+        }
+        let count = (count as usize).min(self.cells.len() - start);
+        if count == 0 {
+            return;
+        }
+        self.cells[start..].rotate_left(count);
+        let fill_start = self.cells.len() - count;
+        for cell in &mut self.cells[fill_start..] {
+            *cell = blank.clone();
         }
     }
 

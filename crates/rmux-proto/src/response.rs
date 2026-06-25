@@ -246,7 +246,7 @@ pub enum Response {
     /// Success payload for daemon-backed pane output cursor polling.
     PaneOutputCursor(PaneOutputCursorResponse),
     /// Lag notice for daemon-backed pane output cursor polling.
-    PaneOutputLag(PaneOutputLagResponse),
+    PaneOutputLag(Box<PaneOutputLagResponse>),
     /// Success payload for a daemon-backed SDK byte wait.
     SdkWaitForOutput(SdkWaitForOutputResponse),
     /// Success payload for daemon-backed SDK wait cancellation.
@@ -264,7 +264,7 @@ pub enum Response {
     /// Success payload for internal idle-only daemon shutdown.
     ShutdownIfIdle(ShutdownIfIdleResponse),
     /// Success payload for browser-visible pane sharing.
-    WebShare(WebShareResponse),
+    WebShare(Box<WebShareResponse>),
 }
 
 impl Response {
@@ -884,8 +884,9 @@ pub struct ErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OptionScopeSelector, SetOptionMode};
+    use crate::{OptionScopeSelector, PaneOutputSubscriptionId, SetOptionMode};
     use serde::Serialize;
+    use std::mem::size_of;
 
     #[derive(Serialize)]
     struct OldRunShellResponse {
@@ -954,5 +955,72 @@ mod tests {
             Response::WaitFor(WaitForResponse).command_name(),
             "wait-for"
         );
+    }
+
+    #[test]
+    fn pr6g_response_boxing_keeps_response_size_bounded() {
+        assert_eq!(size_of::<Box<WebShareResponse>>(), 8);
+        assert_eq!(size_of::<Box<PaneOutputLagResponse>>(), 8);
+        assert_eq!(
+            size_of::<Response>(),
+            72,
+            "Response should stay compact after boxing the two largest payload variants"
+        );
+        assert!(
+            size_of::<WebShareResponse>() > size_of::<Response>(),
+            "WebShareResponse must remain boxed while it is larger than Response"
+        );
+        assert!(
+            size_of::<PaneOutputLagResponse>() > size_of::<Response>(),
+            "PaneOutputLagResponse must remain boxed while it is larger than Response"
+        );
+    }
+
+    #[test]
+    fn pr6g_boxed_response_payloads_are_bincode_transparent() {
+        fn assert_transparent<T>(response: Response, payload: &T)
+        where
+            T: Serialize,
+        {
+            let mut expected = crate::frame_kind_for_response(&response)
+                .bincode_tag()
+                .to_le_bytes()
+                .to_vec();
+            expected.extend(bincode::serialize(payload).expect("payload encodes"));
+            assert_eq!(
+                bincode::serialize(&response).expect("response encodes"),
+                expected
+            );
+        }
+
+        let lag = PaneOutputLagResponse {
+            subscription_id: PaneOutputSubscriptionId::new(7),
+            cursor: PaneOutputCursor {
+                next_sequence: 10,
+                missed_events: 4,
+            },
+            lag: PaneOutputLagNotice {
+                expected_sequence: 6,
+                resume_sequence: 10,
+                missed_events: 4,
+                newest_sequence: 12,
+                recent: PaneRecentOutput {
+                    bytes: b"recent".to_vec(),
+                    oldest_sequence: Some(10),
+                    newest_sequence: Some(12),
+                },
+            },
+        };
+        assert_transparent(Response::PaneOutputLag(Box::new(lag.clone())), &lag);
+
+        let web_share = WebShareResponse::Config(WebShareConfigResponse {
+            listener: WebShareListener {
+                host: "127.0.0.1".to_owned(),
+                port: 9777,
+                frontend_origin: "https://share.rmux.io".to_owned(),
+            },
+            output: CommandOutput::from_stdout("127.0.0.1:9777 https://share.rmux.io\n"),
+        });
+        assert_transparent(Response::WebShare(Box::new(web_share.clone())), &web_share);
     }
 }

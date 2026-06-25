@@ -151,7 +151,7 @@ pub(crate) fn layout_for_session(
                         OptionName::PaneScrollbarsStyle,
                     ));
                 let history_size = state
-                    .pane_history_stats(session_name, pane.id())
+                    .pane_history_size_stats(session_name, pane.id())
                     .map(|stats| stats.size)
                     .unwrap_or_default();
                 let alternate_on = state

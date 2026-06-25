@@ -82,18 +82,20 @@ pub(super) fn parse_switch_client(mut args: CommandTokens) -> Result<Request, Rm
         ));
     }
 
-    Ok(Request::SwitchClientExt3(SwitchClientExt3Request {
-        target_client,
-        target,
-        key_table,
-        last_session,
-        next_session,
-        previous_session,
-        toggle_read_only,
-        sort_order,
-        skip_environment_update,
-        zoom,
-    }))
+    Ok(Request::SwitchClientExt3(Box::new(
+        SwitchClientExt3Request {
+            target_client,
+            target,
+            key_table,
+            last_session,
+            next_session,
+            previous_session,
+            toggle_read_only,
+            sort_order,
+            skip_environment_update,
+            zoom,
+        },
+    )))
 }
 
 pub(super) fn parse_detach_client(mut args: CommandTokens) -> Result<Request, RmuxError> {
@@ -231,7 +233,7 @@ pub(super) fn parse_refresh_client(mut args: CommandTokens) -> Result<Request, R
         .transpose()?;
     args.no_extra("refresh-client")?;
 
-    Ok(Request::RefreshClient(RefreshClientRequest {
+    Ok(Request::RefreshClient(Box::new(RefreshClientRequest {
         target_client,
         adjustment,
         clear_pan,
@@ -247,7 +249,7 @@ pub(super) fn parse_refresh_client(mut args: CommandTokens) -> Result<Request, R
         subscriptions_format,
         control_size,
         colour_report: None,
-    }))
+    })))
 }
 
 pub(super) fn parse_list_clients(mut args: CommandTokens) -> Result<Request, RmuxError> {
@@ -286,13 +288,13 @@ pub(super) fn parse_list_clients(mut args: CommandTokens) -> Result<Request, Rmu
         }
     }
     args.no_extra("list-clients")?;
-    Ok(Request::ListClients(ListClientsRequest {
+    Ok(Request::ListClients(Box::new(ListClientsRequest {
         format,
         filter,
         sort_order,
         reversed,
         target_session,
-    }))
+    })))
 }
 
 pub(super) fn parse_suspend_client(mut args: CommandTokens) -> Result<Request, RmuxError> {

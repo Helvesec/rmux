@@ -146,6 +146,11 @@ impl HandlerState {
             .session(&target_session_name)
             .cloned()
             .ok_or_else(|| session_not_found(&target_session_name))?;
+        let current_runtime_owner = self.sessions.runtime_owner(&source_session_name);
+        let next_runtime_owner = self
+            .sessions
+            .runtime_owner_transfer_target(&source_session_name);
+        let source_group_members_before = self.sessions.session_group_members(&source_session_name);
         let source_pane_id = pane_id_for_target(&previous_source_session, &request.source)?;
         self.ensure_panes_exist(&source_session_name, &[source_pane_id])?;
 
@@ -172,7 +177,14 @@ impl HandlerState {
                 ),
             )
         };
-        self.sessions.insert_existing_session(source_session)?;
+        let source_session_will_be_removed =
+            mutation_result.is_ok() && source_session.windows().is_empty();
+        let empty_source_session = if source_session_will_be_removed {
+            Some(source_session)
+        } else {
+            self.sessions.insert_existing_session(source_session)?;
+            None
+        };
         if let Err(error) = mutation_result {
             self.restore_cross_session_snapshots(
                 &source_session_name,
@@ -215,7 +227,12 @@ impl HandlerState {
             return Err(error);
         }
 
-        if let Err(error) = resize_two_sessions(self, &source_session_name, &target_session_name) {
+        let resize_result = if source_session_will_be_removed {
+            self.resize_terminals(&target_session_name)
+        } else {
+            resize_two_sessions(self, &source_session_name, &target_session_name)
+        };
+        if let Err(error) = resize_result {
             self.terminals.move_panes_between_sessions(
                 &target_session_name,
                 &source_session_name,
@@ -226,22 +243,53 @@ impl HandlerState {
                 &source_session_name,
                 &[source_pane_id],
             )?;
-            restore_two_sessions_after_resize_error(
-                self,
-                &source_session_name,
-                previous_source_session,
-                &target_session_name,
-                previous_target_session,
-                &error,
-            )?;
+            if source_session_will_be_removed {
+                self.sessions
+                    .insert_existing_session(previous_source_session)?;
+                self.replace_session(&target_session_name, previous_target_session)?;
+                resize_two_sessions(self, &source_session_name, &target_session_name).map_err(
+                    |rollback_error| {
+                        RmuxError::Server(format!(
+                            "failed to roll back sessions {source_session_name} and {target_session_name} after {error}: {rollback_error}"
+                        ))
+                    },
+                )?;
+            } else {
+                restore_two_sessions_after_resize_error(
+                    self,
+                    &source_session_name,
+                    previous_source_session,
+                    &target_session_name,
+                    previous_target_session,
+                    &error,
+                )?;
+            }
             return Err(error);
         }
 
-        self.synchronize_session_group_from(&source_session_name)?;
+        if source_session_will_be_removed {
+            if source_group_members_before.len() > 1 {
+                if let Some(source_session) = empty_source_session {
+                    self.sessions.insert_existing_session(source_session)?;
+                }
+                self.remove_empty_source_session_group(source_group_members_before)?;
+            } else {
+                let _ = self.options.remove_session(&source_session_name);
+                let _ = self.environment.remove_session(&source_session_name);
+                let _ = self.hooks.remove_session(&source_session_name);
+                self.remove_session_terminals(
+                    &source_session_name,
+                    current_runtime_owner.as_ref(),
+                    next_runtime_owner.as_ref(),
+                )?;
+            }
+        } else {
+            self.synchronize_session_group_from(&source_session_name)?;
+            self.sync_pane_lifecycle_dimensions_for_session(&source_session_name);
+        }
         if source_session_name != target_session_name {
             self.synchronize_session_group_from(&target_session_name)?;
         }
-        self.sync_pane_lifecycle_dimensions_for_session(&source_session_name);
         if source_session_name != target_session_name {
             self.sync_pane_lifecycle_dimensions_for_session(&target_session_name);
         }
@@ -281,6 +329,11 @@ impl HandlerState {
             .session(&destination_session_name)
             .cloned()
             .ok_or_else(|| session_not_found(&destination_session_name))?;
+        let current_runtime_owner = self.sessions.runtime_owner(&source_session_name);
+        let next_runtime_owner = self
+            .sessions
+            .runtime_owner_transfer_target(&source_session_name);
+        let source_group_members_before = self.sessions.session_group_members(&source_session_name);
         let source_pane_id = pane_id_for_target(&previous_source_session, &request.source)?;
         self.ensure_panes_exist(&source_session_name, &[source_pane_id])?;
 
@@ -305,7 +358,14 @@ impl HandlerState {
                 ),
             )
         };
-        self.sessions.insert_existing_session(source_session)?;
+        let source_session_will_be_removed =
+            destination_index.is_ok() && source_session.windows().is_empty();
+        let empty_source_session = if source_session_will_be_removed {
+            Some(source_session)
+        } else {
+            self.sessions.insert_existing_session(source_session)?;
+            None
+        };
         let destination_index = match destination_index {
             Ok(destination_index) => destination_index,
             Err(error) => {
@@ -351,9 +411,12 @@ impl HandlerState {
             return Err(error);
         }
 
-        if let Err(error) =
+        let resize_result = if source_session_will_be_removed {
+            self.resize_terminals(&destination_session_name)
+        } else {
             resize_two_sessions(self, &source_session_name, &destination_session_name)
-        {
+        };
+        if let Err(error) = resize_result {
             self.terminals.move_panes_between_sessions(
                 &destination_session_name,
                 &source_session_name,
@@ -364,22 +427,52 @@ impl HandlerState {
                 &source_session_name,
                 &[source_pane_id],
             )?;
-            restore_two_sessions_after_resize_error(
-                self,
-                &source_session_name,
-                previous_source_session,
-                &destination_session_name,
-                previous_destination_session,
-                &error,
-            )?;
+            if source_session_will_be_removed {
+                self.sessions
+                    .insert_existing_session(previous_source_session)?;
+                self.replace_session(&destination_session_name, previous_destination_session)?;
+                resize_two_sessions(self, &source_session_name, &destination_session_name)
+                    .map_err(|rollback_error| {
+                        RmuxError::Server(format!(
+                            "failed to roll back sessions {source_session_name} and {destination_session_name} after {error}: {rollback_error}"
+                        ))
+                    })?;
+            } else {
+                restore_two_sessions_after_resize_error(
+                    self,
+                    &source_session_name,
+                    previous_source_session,
+                    &destination_session_name,
+                    previous_destination_session,
+                    &error,
+                )?;
+            }
             return Err(error);
         }
 
-        self.synchronize_session_group_from(&source_session_name)?;
+        if source_session_will_be_removed {
+            if source_group_members_before.len() > 1 {
+                if let Some(source_session) = empty_source_session {
+                    self.sessions.insert_existing_session(source_session)?;
+                }
+                self.remove_empty_source_session_group(source_group_members_before)?;
+            } else {
+                let _ = self.options.remove_session(&source_session_name);
+                let _ = self.environment.remove_session(&source_session_name);
+                let _ = self.hooks.remove_session(&source_session_name);
+                self.remove_session_terminals(
+                    &source_session_name,
+                    current_runtime_owner.as_ref(),
+                    next_runtime_owner.as_ref(),
+                )?;
+            }
+        } else {
+            self.synchronize_session_group_from(&source_session_name)?;
+            self.sync_pane_lifecycle_dimensions_for_session(&source_session_name);
+        }
         if source_session_name != destination_session_name {
             self.synchronize_session_group_from(&destination_session_name)?;
         }
-        self.sync_pane_lifecycle_dimensions_for_session(&source_session_name);
         if source_session_name != destination_session_name {
             self.sync_pane_lifecycle_dimensions_for_session(&destination_session_name);
         }
@@ -397,8 +490,20 @@ impl HandlerState {
         target_session_name: &SessionName,
         previous_target_session: Session,
     ) -> Result<(), RmuxError> {
-        self.replace_session(source_session_name, previous_source_session)?;
-        self.replace_session(target_session_name, previous_target_session)
+        self.restore_cross_session_snapshot(source_session_name, previous_source_session)?;
+        self.restore_cross_session_snapshot(target_session_name, previous_target_session)
+    }
+
+    fn restore_cross_session_snapshot(
+        &mut self,
+        session_name: &SessionName,
+        previous_session: Session,
+    ) -> Result<(), RmuxError> {
+        if self.sessions.contains_session(session_name) {
+            self.replace_session(session_name, previous_session)
+        } else {
+            self.sessions.insert_existing_session(previous_session)
+        }
     }
 }
 

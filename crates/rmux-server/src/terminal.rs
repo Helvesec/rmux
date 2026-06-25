@@ -195,7 +195,7 @@ impl TerminalProfile {
     fn from_resolved_environment(
         mut resolved: HashMap<String, String>,
         raw_base_environment: Option<&[(OsString, OsString)]>,
-        suppressed_raw_names: HashSet<String>,
+        mut suppressed_raw_names: HashSet<String>,
         options: &OptionStore,
         session_name: &SessionName,
         session_id: u32,
@@ -225,6 +225,7 @@ impl TerminalProfile {
         } else {
             remove_environment_value(&mut resolved, "TERM_PROGRAM");
             remove_environment_value(&mut resolved, "TERM_PROGRAM_VERSION");
+            suppress_terminal_program_environment(&mut suppressed_raw_names);
         }
 
         let mux_socket_path = mux_environment_socket_path(socket_path);
@@ -326,6 +327,9 @@ impl TerminalProfile {
         remove_environment_value(&mut resolved, "RMUX_PANE");
         remove_environment_value(&mut resolved, "TMUX_PANE");
 
+        let mut suppressed = environment
+            .suppressed_process_environment_names(session_name, include_implicit_globals);
+
         if include_terminal_defaults {
             if let Some(default_terminal) = session_name
                 .and_then(|session_name| {
@@ -345,6 +349,10 @@ impl TerminalProfile {
                 "TERM_PROGRAM_VERSION".to_owned(),
                 env!("CARGO_PKG_VERSION").to_owned(),
             );
+        } else {
+            remove_environment_value(&mut resolved, "TERM_PROGRAM");
+            remove_environment_value(&mut resolved, "TERM_PROGRAM_VERSION");
+            suppress_terminal_program_environment(&mut suppressed);
         }
 
         let mux_session_id = session_id.map_or(0_i32, |id| i32::try_from(id).unwrap_or(i32::MAX));
@@ -381,8 +389,6 @@ impl TerminalProfile {
             cwd.to_string_lossy().into_owned(),
         );
 
-        let mut suppressed = environment
-            .suppressed_process_environment_names(session_name, include_implicit_globals);
         suppressed.insert("RMUX_PANE".to_owned());
         suppressed.insert("TMUX_PANE".to_owned());
         #[cfg(windows)]
@@ -531,6 +537,11 @@ fn suppress_client_shell_environment(
     suppressed_raw_names: HashSet<String>,
 ) -> HashSet<String> {
     suppressed_raw_names
+}
+
+fn suppress_terminal_program_environment(suppressed_raw_names: &mut HashSet<String>) {
+    suppressed_raw_names.insert("TERM_PROGRAM".to_owned());
+    suppressed_raw_names.insert("TERM_PROGRAM_VERSION".to_owned());
 }
 
 pub(crate) fn base_process_environment() -> HashMap<String, String> {

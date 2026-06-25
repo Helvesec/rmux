@@ -168,15 +168,13 @@ impl RequestHandler {
         if matches!(command, AttachControl::Switch(_)) {
             active.render_generation = active.render_generation.saturating_add(1);
         }
-        if matches!(
+        let closing_control = matches!(
             command,
             AttachControl::Detach
                 | AttachControl::Exited
                 | AttachControl::DetachKill
                 | AttachControl::DetachExecShellCommand(_)
-        ) {
-            active.closing.store(true, Ordering::SeqCst);
-        }
+        );
         let render_stream_switch_refresh = active.render_stream
             && matches!(
                 &command,
@@ -206,8 +204,8 @@ impl RequestHandler {
         if tracked_control
             && active.control_backlog.load(Ordering::Acquire) >= ATTACH_CONTROL_BACKLOG_LIMIT
         {
-            active.closing.store(true, Ordering::SeqCst);
             let _ = active.control_tx.send(AttachControl::Detach);
+            active.closing.store(true, Ordering::SeqCst);
             active_attach.by_pid.remove(&attach_pid);
             return Err(rmux_proto::RmuxError::Server(
                 "attached client is not draining updates".to_owned(),
@@ -226,6 +224,9 @@ impl RequestHandler {
             }
             active_attach.by_pid.remove(&attach_pid);
             return Err(attached_client_required(command_name));
+        }
+        if closing_control {
+            active.closing.store(true, Ordering::SeqCst);
         }
         if let Some(session_name) = next_session_name {
             if session_name != active.session_name {
@@ -267,8 +268,8 @@ impl RequestHandler {
             }
 
             overlay_jobs.push(active.overlay.take());
-            active.closing.store(true, Ordering::SeqCst);
             let _ = active.control_tx.send(control());
+            active.closing.store(true, Ordering::SeqCst);
             false
         });
         drop(active_attach);
@@ -404,6 +405,7 @@ pub(super) fn attach_target_for_session(
             key_table: None,
             terminal_context,
             render_size: None,
+            window_index: None,
             master: AttachTargetMaster::Clone,
             socket_path,
         },
@@ -427,6 +429,32 @@ pub(super) fn attach_render_target_for_session(
             key_table: None,
             terminal_context,
             render_size: None,
+            window_index: None,
+            master: AttachTargetMaster::Omit,
+            socket_path,
+        },
+    )
+}
+
+#[cfg(feature = "web")]
+pub(super) fn attach_render_target_for_session_window(
+    state: &HandlerState,
+    session_name: &rmux_proto::SessionName,
+    window_index: Option<u32>,
+    attached_count: usize,
+    terminal_context: &OuterTerminalContext,
+    socket_path: &Path,
+) -> Result<AttachTarget, rmux_proto::RmuxError> {
+    attach_target_for_session_with_prompt(
+        state,
+        session_name,
+        attached_count,
+        AttachTargetRenderOptions {
+            prompt: None,
+            key_table: None,
+            terminal_context,
+            render_size: None,
+            window_index,
             master: AttachTargetMaster::Omit,
             socket_path,
         },
@@ -448,6 +476,7 @@ pub(super) fn attach_render_target_for_session_with_prompt(
             key_table: request.key_table,
             terminal_context: request.terminal_context,
             render_size: request.render_size,
+            window_index: None,
             master: AttachTargetMaster::Omit,
             socket_path: request.socket_path,
         },
@@ -473,6 +502,7 @@ struct AttachTargetRenderOptions<'a> {
     key_table: Option<&'a str>,
     terminal_context: &'a OuterTerminalContext,
     render_size: Option<TerminalSize>,
+    window_index: Option<u32>,
     master: AttachTargetMaster,
     socket_path: &'a Path,
 }
@@ -487,14 +517,19 @@ fn attach_target_for_session_with_prompt(
         .sessions
         .session(session_name)
         .ok_or_else(|| session_not_found(session_name))?;
-    let session = sized_session(canonical_session, options.render_size);
+    let session =
+        attach_render_session(canonical_session, options.render_size, options.window_index);
     let session = session.as_ref();
     let outer_terminal = OuterTerminal::resolve_for_session(
         &state.options,
         Some(session_name),
         options.terminal_context.clone(),
     );
-    let pane_output = state.active_pane_output(session_name)?;
+    let pane_output = state.pane_output_for_target(
+        session_name,
+        session.active_window_index(),
+        session.active_pane_index(),
+    )?;
     let (pane_output_start_sequence, ()) = pane_output.capture_with_next_sequence(|| ());
     let active_pane = session.window().active_pane().cloned();
     let pane_state = session
@@ -533,10 +568,11 @@ fn attach_target_for_session_with_prompt(
     );
     for pane in session.window().panes() {
         let copy_screen = state.pane_copy_mode_render_screen(session_name, pane.id());
-        let screen = copy_screen
-            .clone()
-            .or_else(|| state.pane_render_screen(session_name, pane.id()));
-        if let Some(screen) = screen {
+        if let Some(screen) = copy_screen.as_ref() {
+            render_frame.extend_from_slice(
+                renderer::render_pane_screen(session, &state.options, pane, screen).as_slice(),
+            );
+        } else if let Some(screen) = state.pane_screen(session_name, pane.id()) {
             render_frame.extend_from_slice(
                 renderer::render_pane_screen(session, &state.options, pane, &screen).as_slice(),
             );
@@ -544,7 +580,7 @@ fn attach_target_for_session_with_prompt(
         if pane.index() == session.active_pane_index() && copy_screen.is_some() {
             if let (Some(summary), Some(stats)) = (
                 state.pane_copy_mode_summary(session_name, pane.id()),
-                state.pane_history_stats(session_name, pane.id()),
+                state.pane_history_size_stats(session_name, pane.id()),
             ) {
                 render_frame.extend_from_slice(
                     renderer::render_copy_mode_position(
@@ -567,12 +603,15 @@ fn attach_target_for_session_with_prompt(
         live_pane_render_for_target(state, session, &state.options, session_name, options.prompt);
     if options.prompt.is_none() {
         if let Some(active_pane) = active_pane.clone() {
-            let active_screen = state
-                .pane_copy_mode_render_screen(session_name, active_pane.id())
-                .or_else(|| state.pane_render_screen(session_name, active_pane.id()));
-            if let Some(screen) = active_screen.as_ref() {
+            if let Some(screen) = state.pane_copy_mode_render_screen(session_name, active_pane.id())
+            {
                 render_frame.extend_from_slice(
-                    renderer::render_pane_cursor(session, &state.options, &active_pane, screen)
+                    renderer::render_pane_cursor(session, &state.options, &active_pane, &screen)
+                        .as_slice(),
+                );
+            } else if let Some(screen) = state.pane_screen(session_name, active_pane.id()) {
+                render_frame.extend_from_slice(
+                    renderer::render_pane_cursor(session, &state.options, &active_pane, &screen)
                         .as_slice(),
                 );
             }
@@ -586,10 +625,21 @@ fn attach_target_for_session_with_prompt(
                 .unwrap_or_else(|| rmux_core::PaneGeometry::new(0, 0, 0, 0))
         },
     );
-    let terminal_passthrough_allowed = active_pane.as_ref().is_some_and(|pane| {
-        !state.pane_in_mode(session_name, pane.id())
-            && pane_passthrough_enabled(session, &state.options, pane)
-    });
+    let active_pane_is_starting = {
+        #[cfg(windows)]
+        {
+            state.active_pane_is_starting(session_name)
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    };
+    let terminal_passthrough_allowed = !active_pane_is_starting
+        && active_pane.as_ref().is_some_and(|pane| {
+            !state.pane_in_mode(session_name, pane.id())
+                && pane_passthrough_enabled(session, &state.options, pane)
+        });
     let kitty_graphics_passthrough =
         terminal_passthrough_allowed && outer_terminal.supports_kitty_graphics();
     let sixel_passthrough = terminal_passthrough_allowed && outer_terminal.supports_sixel();
@@ -604,8 +654,10 @@ fn attach_target_for_session_with_prompt(
         session_name: session_name.clone(),
         input_target,
         pane_master: match options.master {
-            AttachTargetMaster::Clone => Some(state.active_pane_master(session_name)?),
-            AttachTargetMaster::Omit => None,
+            AttachTargetMaster::Clone if !active_pane_is_starting => {
+                Some(state.active_pane_master(session_name)?)
+            }
+            AttachTargetMaster::Clone | AttachTargetMaster::Omit => None,
         },
         pane_output,
         pane_output_start_sequence,
@@ -634,6 +686,26 @@ pub(super) fn sized_session(
     let mut resized = session.clone();
     resized.resize_terminal(size);
     Cow::Owned(resized)
+}
+
+fn attach_render_session(
+    session: &rmux_core::Session,
+    size: Option<TerminalSize>,
+    window_index: Option<u32>,
+) -> Cow<'_, rmux_core::Session> {
+    let sized = sized_session(session, size);
+    let Some(window_index) = window_index else {
+        return sized;
+    };
+    if sized.active_window_index() == window_index || !sized.windows().contains_key(&window_index) {
+        return sized;
+    }
+
+    let mut selected = sized.into_owned();
+    selected
+        .select_window(window_index)
+        .expect("selected web render window was validated above");
+    Cow::Owned(selected)
 }
 
 fn pane_passthrough_enabled(
@@ -666,14 +738,13 @@ fn live_pane_render_for_target(
     if state.pane_in_mode(session_name, pane.id()) {
         return None;
     }
-    let screen = state.pane_render_screen(session_name, pane.id())?;
     let target = PaneTarget::with_window(
         session_name.clone(),
         session.active_window_index(),
         pane.index(),
     );
     let transcript = state.transcript_handle(&target).ok()?;
-    LivePaneRender::new(transcript, session.clone(), options.clone(), pane, &screen)
+    LivePaneRender::new_from_transcript(transcript, session.clone(), options.clone(), pane)
 }
 
 pub(super) fn option_affects_attached_rendering(option: rmux_proto::OptionName) -> bool {

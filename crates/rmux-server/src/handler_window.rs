@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use rmux_core::{LifecycleEvent, PaneId};
 use rmux_proto::{ErrorResponse, HookName, PaneTarget, Response, ScopeSelector, Target};
 
+#[cfg(windows)]
+use super::pane_support::format_references_pane_pid;
 use super::{
     client_environment_snapshot, client_spawn_environment,
     scripting_support::render_start_directory_template, RequestHandler,
@@ -38,6 +40,10 @@ impl RequestHandler {
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
         let attached_count = self.attached_count(&session_name).await;
+        #[cfg(windows)]
+        if !request.detached {
+            self.wait_for_windows_deferred_all_pane_pids().await;
+        }
         let response = {
             let mut state = self.state.lock().await;
             let start_directory = match render_start_directory_template(
@@ -324,6 +330,10 @@ impl RequestHandler {
             let active_attach = self.active_attach.lock().await;
             active_attach.attached_count(&request.target)
         };
+        #[cfg(windows)]
+        if format_references_pane_pid(request.format.as_deref()) {
+            self.wait_for_windows_deferred_all_pane_pids().await;
+        }
         let state = self.state.lock().await;
         match state.list_windows(&request.target, request.format.as_deref(), attached_count) {
             Ok(response) => Response::ListWindows(response),

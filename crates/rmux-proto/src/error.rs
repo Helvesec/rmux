@@ -166,6 +166,7 @@ impl RmuxError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::size_of;
 
     fn bincode_tag(error: &RmuxError) -> u32 {
         let encoded = bincode::serialize(error).expect("error encodes");
@@ -360,5 +361,17 @@ mod tests {
             )),
             20
         );
+    }
+
+    #[test]
+    fn pr6g_error_size_stays_bounded_without_boxing_named_variants() {
+        assert_eq!(
+            size_of::<RmuxError>(),
+            56,
+            "RmuxError is below the PR6G response-size bound; keep named variants unboxed here"
+        );
+        assert_eq!(size_of::<Box<String>>(), 8);
+        assert!(size_of::<SessionName>() <= size_of::<RmuxError>());
+        assert!(size_of::<PaneId>() < size_of::<RmuxError>());
     }
 }

@@ -154,14 +154,14 @@ async fn show_environment_returns_sorted_exact_scope_command_output() {
     ] {
         assert!(matches!(
             handler
-                .handle(Request::SetEnvironment(SetEnvironmentRequest {
+                .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
                     scope,
                     name: name.to_owned(),
                     value: value.to_owned(),
                     mode: None,
                     hidden: false,
                     format: false,
-                }))
+                })))
                 .await,
             Response::SetEnvironment(_)
         ));
@@ -220,7 +220,7 @@ async fn base_index_controls_future_window_allocation() {
     ));
 
     let response = handler
-        .handle(Request::NewWindow(rmux_proto::NewWindowRequest {
+        .handle(Request::NewWindow(Box::new(rmux_proto::NewWindowRequest {
             target: session_name("alpha"),
             name: None,
             detached: true,
@@ -230,7 +230,7 @@ async fn base_index_controls_future_window_allocation() {
             process_command: None,
             target_window_index: None,
             insert_at_target: false,
-        }))
+        })))
         .await;
 
     assert!(matches!(
@@ -478,7 +478,7 @@ async fn kill_window_removes_window_and_pane_option_overrides() {
     // Create a second window so kill-window doesn't fail (need at least 1)
     assert!(matches!(
         handler
-            .handle(Request::NewWindow(rmux_proto::NewWindowRequest {
+            .handle(Request::NewWindow(Box::new(rmux_proto::NewWindowRequest {
                 target: session_name("alpha"),
                 name: None,
                 detached: true,
@@ -488,7 +488,7 @@ async fn kill_window_removes_window_and_pane_option_overrides() {
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await,
         Response::NewWindow(_)
     ));
@@ -607,14 +607,14 @@ async fn show_environment_shell_format_escapes_special_characters() {
 
     assert!(matches!(
         handler
-            .handle(Request::SetEnvironment(SetEnvironmentRequest {
+            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
                 scope: ScopeSelector::Global,
                 name: "TRICKY".to_owned(),
                 value: r#"$HOME "quoted" `cmd` back\slash"#.to_owned(),
                 mode: None,
                 hidden: false,
                 format: false,
-            }))
+            })))
             .await,
         Response::SetEnvironment(_)
     ));
@@ -644,27 +644,27 @@ async fn show_environment_shell_format_cleared_entry_prints_unset() {
 
     assert!(matches!(
         handler
-            .handle(Request::SetEnvironment(SetEnvironmentRequest {
+            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
                 scope: ScopeSelector::Global,
                 name: "STALE".to_owned(),
                 value: "old".to_owned(),
                 mode: None,
                 hidden: false,
                 format: false,
-            }))
+            })))
             .await,
         Response::SetEnvironment(_)
     ));
     assert!(matches!(
         handler
-            .handle(Request::SetEnvironment(SetEnvironmentRequest {
+            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
                 scope: ScopeSelector::Global,
                 name: "STALE".to_owned(),
                 value: String::new(),
                 mode: Some(SetEnvironmentMode::Clear),
                 hidden: false,
                 format: false,
-            }))
+            })))
             .await,
         Response::SetEnvironment(_)
     ));
@@ -693,14 +693,14 @@ async fn show_environment_hidden_variable_round_trip() {
     // Set a hidden variable.
     assert!(matches!(
         handler
-            .handle(Request::SetEnvironment(SetEnvironmentRequest {
+            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
                 scope: ScopeSelector::Session(session_name("alpha")),
                 name: "SECRET".to_owned(),
                 value: "classified".to_owned(),
                 mode: Some(SetEnvironmentMode::Set),
                 hidden: true,
                 format: false,
-            }))
+            })))
             .await,
         Response::SetEnvironment(_)
     ));
@@ -746,14 +746,14 @@ async fn set_environment_clear_and_unset_validation() {
     // -r rejects a value.
     assert_eq!(
         handler
-            .handle(Request::SetEnvironment(SetEnvironmentRequest {
+            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
                 scope: ScopeSelector::Global,
                 name: "FOO".to_owned(),
                 value: "bar".to_owned(),
                 mode: Some(SetEnvironmentMode::Clear),
                 hidden: false,
                 format: false,
-            }))
+            })))
             .await,
         Response::Error(ErrorResponse {
             error: RmuxError::Server("can't specify a value with -r".to_owned()),
@@ -763,14 +763,14 @@ async fn set_environment_clear_and_unset_validation() {
     // -u rejects a value.
     assert_eq!(
         handler
-            .handle(Request::SetEnvironment(SetEnvironmentRequest {
+            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
                 scope: ScopeSelector::Global,
                 name: "FOO".to_owned(),
                 value: "bar".to_owned(),
                 mode: Some(SetEnvironmentMode::Unset),
                 hidden: false,
                 format: false,
-            }))
+            })))
             .await,
         Response::Error(ErrorResponse {
             error: RmuxError::Server("can't specify a value with -u".to_owned()),
@@ -780,14 +780,14 @@ async fn set_environment_clear_and_unset_validation() {
     // Empty name is rejected.
     assert_eq!(
         handler
-            .handle(Request::SetEnvironment(SetEnvironmentRequest {
+            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
                 scope: ScopeSelector::Global,
                 name: String::new(),
                 value: "value".to_owned(),
                 mode: None,
                 hidden: false,
                 format: false,
-            }))
+            })))
             .await,
         Response::Error(ErrorResponse {
             error: RmuxError::Server("empty variable name".to_owned()),
@@ -797,14 +797,14 @@ async fn set_environment_clear_and_unset_validation() {
     // Name containing = is rejected.
     assert_eq!(
         handler
-            .handle(Request::SetEnvironment(SetEnvironmentRequest {
+            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
                 scope: ScopeSelector::Global,
                 name: "FOO=BAR".to_owned(),
                 value: "value".to_owned(),
                 mode: None,
                 hidden: false,
                 format: false,
-            }))
+            })))
             .await,
         Response::Error(ErrorResponse {
             error: RmuxError::Server("variable name contains =".to_owned()),

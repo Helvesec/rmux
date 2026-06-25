@@ -3,6 +3,8 @@ use std::io;
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Mutex;
 
 use crate::backend;
 #[cfg(all(not(unix), not(windows)))]
@@ -55,6 +57,8 @@ impl AsRawFd for PtySlave {
 pub struct PtyIo {
     #[cfg(unix)]
     fd: Arc<OwnedFd>,
+    #[cfg(unix)]
+    startup_slave: Mutex<Option<OwnedFd>>,
     #[cfg(windows)]
     pty: Arc<backend::WindowsPty>,
 }
@@ -62,7 +66,10 @@ pub struct PtyIo {
 impl PtyIo {
     #[cfg(unix)]
     pub(crate) fn new(fd: OwnedFd) -> Self {
-        Self { fd: Arc::new(fd) }
+        Self {
+            fd: Arc::new(fd),
+            startup_slave: Mutex::new(None),
+        }
     }
 
     #[cfg(windows)]
@@ -141,6 +148,7 @@ impl PtyIo {
         {
             Ok(Self {
                 fd: Arc::clone(&self.fd),
+                startup_slave: Mutex::new(None),
             })
         }
 
@@ -250,6 +258,16 @@ impl PtyIo {
     pub(crate) fn raw_fd(&self) -> RawFd {
         self.fd.as_ref().as_raw_fd()
     }
+
+    /// Releases the one-shot Unix startup slave guard, if this endpoint owns
+    /// one for a pane output reader.
+    #[cfg(unix)]
+    pub fn release_startup_slave_guard(&self) {
+        let Ok(mut guard) = self.startup_slave.lock() else {
+            return;
+        };
+        let _ = guard.take();
+    }
 }
 
 #[cfg(unix)]
@@ -270,12 +288,23 @@ impl AsRawFd for PtyIo {
 #[derive(Debug)]
 pub struct PtyMaster {
     io: PtyIo,
+    #[cfg(unix)]
+    startup_slave: Option<OwnedFd>,
 }
 
 impl PtyMaster {
     #[cfg(unix)]
     pub(crate) fn new(fd: OwnedFd) -> Self {
-        Self { io: PtyIo::new(fd) }
+        Self {
+            io: PtyIo::new(fd),
+            startup_slave: None,
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_startup_slave(mut self, slave: OwnedFd) -> Self {
+        self.startup_slave = Some(slave);
+        self
     }
 
     #[cfg(windows)]
@@ -304,6 +333,18 @@ impl PtyMaster {
     pub fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             io: self.io.try_clone()?,
+            #[cfg(unix)]
+            startup_slave: None,
+        })
+    }
+
+    /// Clones the master handle for the pane output reader and transfers the
+    /// one-shot Unix startup slave guard, if present.
+    pub fn try_clone_for_startup_reader(&mut self) -> Result<Self> {
+        Ok(Self {
+            io: self.io.try_clone()?,
+            #[cfg(unix)]
+            startup_slave: self.startup_slave.take(),
         })
     }
 
@@ -315,6 +356,14 @@ impl PtyMaster {
     /// Consumes this master handle into its I/O endpoint.
     #[must_use]
     pub fn into_io(self) -> PtyIo {
+        #[cfg(unix)]
+        if let Some(slave) = self.startup_slave {
+            self.io
+                .startup_slave
+                .lock()
+                .expect("PTY startup slave guard mutex must not be poisoned")
+                .replace(slave);
+        }
         self.io
     }
 
@@ -404,9 +453,20 @@ impl PtyPair {
 
     /// Allocates a PTY pair and applies an initial window size.
     pub fn open_with_size(size: TerminalSize) -> Result<Self> {
-        let pair = Self::open()?;
-        pair.master.resize(size)?;
-        Ok(pair)
+        #[cfg(windows)]
+        {
+            let master = backend::open_pty_pair(size)?;
+            Ok(Self {
+                master: PtyMaster::new(master),
+            })
+        }
+
+        #[cfg(not(windows))]
+        {
+            let pair = Self::open()?;
+            pair.master.resize(size)?;
+            Ok(pair)
+        }
     }
 
     /// Returns the master endpoint.
@@ -433,5 +493,53 @@ impl PtyPair {
     #[must_use]
     pub fn into_master(self) -> PtyMaster {
         self.master
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::PtyPair;
+
+    #[test]
+    fn startup_slave_guard_transfers_only_to_reader_clone() {
+        let pair = PtyPair::open().expect("pty pair");
+        let (master, slave) = pair.into_split();
+        let startup_slave = slave
+            .try_clone()
+            .expect("startup slave clone")
+            .into_owned_fd();
+        let mut master = master.with_startup_slave(startup_slave);
+
+        let regular = master.try_clone().expect("regular master clone");
+        assert!(
+            regular.startup_slave.is_none(),
+            "regular clones must not keep the slave side open"
+        );
+
+        let reader = master
+            .try_clone_for_startup_reader()
+            .expect("reader master clone");
+        assert!(master.startup_slave.is_none(), "startup guard is one-shot");
+        assert!(
+            reader.startup_slave.is_some(),
+            "reader clone should receive the startup guard"
+        );
+
+        let io = reader.into_io();
+        assert!(
+            io.startup_slave
+                .lock()
+                .expect("startup guard mutex")
+                .is_some(),
+            "reader io keeps the guard until its first read attempt"
+        );
+        io.release_startup_slave_guard();
+        assert!(
+            io.startup_slave
+                .lock()
+                .expect("startup guard mutex")
+                .is_none(),
+            "reader releases the guard explicitly after startup"
+        );
     }
 }

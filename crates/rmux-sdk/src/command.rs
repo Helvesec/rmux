@@ -95,10 +95,10 @@ impl From<RmuxCommandKind> for rmux_proto::Request {
     fn from(value: RmuxCommandKind) -> Self {
         match value {
             RmuxCommandKind::Request(request) => request,
-            RmuxCommandKind::NewSession(spec) => Self::NewSessionExt(spec.into()),
-            RmuxCommandKind::AttachSession(spec) => Self::AttachSessionExt2(spec.into()),
-            RmuxCommandKind::SplitWindow(spec) => Self::SplitWindowExt(spec.into()),
-            RmuxCommandKind::RefreshClient(spec) => Self::RefreshClient(spec.into()),
+            RmuxCommandKind::NewSession(spec) => Self::NewSessionExt(Box::new(spec.into())),
+            RmuxCommandKind::AttachSession(spec) => Self::AttachSessionExt2(Box::new(spec.into())),
+            RmuxCommandKind::SplitWindow(spec) => Self::SplitWindowExt(Box::new(spec.into())),
+            RmuxCommandKind::RefreshClient(spec) => Self::RefreshClient(Box::new(spec.into())),
         }
     }
 }

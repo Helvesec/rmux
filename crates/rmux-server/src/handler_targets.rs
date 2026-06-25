@@ -42,6 +42,20 @@ impl RequestHandler {
         requester_pid: u32,
         request: rmux_proto::ResolveTargetRequest,
     ) -> Response {
+        match self
+            .resolve_target_for_requester(requester_pid, request)
+            .await
+        {
+            Ok(target) => Response::ResolveTarget(ResolveTargetResponse { target }),
+            Err(error) => Response::Error(ErrorResponse { error }),
+        }
+    }
+
+    pub(in crate::handler) async fn resolve_target_for_requester(
+        &self,
+        requester_pid: u32,
+        request: rmux_proto::ResolveTargetRequest,
+    ) -> Result<Target, RmuxError> {
         let needs_current_target = request
             .target
             .as_deref()
@@ -96,13 +110,9 @@ impl RequestHandler {
             &state.sessions,
             &state.options,
         );
-        match state
+        state
             .sessions
             .resolve_unresolved_target(&unresolved, find_type, flags, &context)
-        {
-            Ok(target) => Response::ResolveTarget(ResolveTargetResponse { target }),
-            Err(error) => Response::Error(ErrorResponse { error }),
-        }
     }
 }
 
@@ -110,33 +120,48 @@ pub(in crate::handler) fn requester_environment_pane_id(
     requester_pid: u32,
     server_socket_path: &Path,
 ) -> Option<u32> {
-    if requester_pid == std::process::id() {
-        return None;
-    }
-
-    let environment = rmux_os::process::environment(requester_pid)?;
-    if !environment_rmux_socket_matches(&environment, server_socket_path) {
-        return None;
-    }
-    let pane = environment
-        .get("RMUX_PANE")
-        .or_else(|| environment.get("TMUX_PANE"))?;
-    pane.strip_prefix('%')?.parse::<u32>().ok()
+    requester_environment_context(requester_pid, server_socket_path).pane_id
 }
 
-pub(in crate::handler) fn requester_environment_source_depth(
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(in crate::handler) struct RequesterEnvironmentContext {
+    pub pane_id: Option<u32>,
+    pub source_depth: Option<usize>,
+}
+
+pub(in crate::handler) fn requester_environment_context(
     requester_pid: u32,
     server_socket_path: &Path,
-) -> Option<usize> {
+) -> RequesterEnvironmentContext {
     if requester_pid == std::process::id() {
-        return None;
+        return RequesterEnvironmentContext::default();
     }
 
-    let environment = rmux_os::process::environment(requester_pid)?;
-    if !environment_rmux_socket_matches(&environment, server_socket_path) {
-        return None;
+    let Some(environment) = rmux_os::process::environment(requester_pid) else {
+        return RequesterEnvironmentContext::default();
+    };
+    requester_environment_context_from_map(&environment, server_socket_path)
+}
+
+fn requester_environment_context_from_map(
+    environment: &HashMap<String, String>,
+    server_socket_path: &Path,
+) -> RequesterEnvironmentContext {
+    if !environment_rmux_socket_matches(environment, server_socket_path) {
+        return RequesterEnvironmentContext::default();
     }
-    environment.get("RMUX_SOURCE_DEPTH")?.parse::<usize>().ok()
+    let pane_id = environment
+        .get("RMUX_PANE")
+        .or_else(|| environment.get("TMUX_PANE"))
+        .and_then(|pane| pane.strip_prefix('%'))
+        .and_then(|pane| pane.parse::<u32>().ok());
+    let source_depth = environment
+        .get("RMUX_SOURCE_DEPTH")
+        .and_then(|depth| depth.parse::<usize>().ok());
+    RequesterEnvironmentContext {
+        pane_id,
+        source_depth,
+    }
 }
 
 pub(in crate::handler) fn pane_id_target(sessions: &SessionStore, pane_id: u32) -> Option<Target> {
@@ -282,13 +307,13 @@ mod tests {
         ));
         assert!(matches!(
             handler
-                .handle(Request::SelectPane(SelectPaneRequest {
+                .handle(Request::SelectPane(Box::new(SelectPaneRequest {
                     target: PaneTarget::with_window(alpha.clone(), 0, 1),
                     title: None,
                     style: None,
                     input_disabled: None,
                     preserve_zoom: false,
-                }))
+                })))
                 .await,
             Response::SelectPane(_)
         ));
@@ -316,19 +341,48 @@ mod tests {
         );
         assert!(matches!(
             handler
-                .handle(Request::SelectPane(SelectPaneRequest {
+                .handle(Request::SelectPane(Box::new(SelectPaneRequest {
                     target: PaneTarget::with_window(alpha.clone(), 0, 0),
                     title: None,
                     style: None,
                     input_disabled: None,
                     preserve_zoom: false,
-                }))
+                })))
                 .await,
             Response::SelectPane(_)
         ));
         assert_eq!(
             resolve_pane(&handler, "{down-of}").await,
             Target::Pane(PaneTarget::with_window(alpha, 0, 1))
+        );
+    }
+
+    #[test]
+    fn requester_environment_context_requires_matching_socket() {
+        let socket_path = std::env::temp_dir().join(format!(
+            "rmux-requester-context-{}.sock",
+            std::process::id()
+        ));
+        let mut environment = HashMap::new();
+        environment.insert(
+            "RMUX".to_owned(),
+            format!("{},123,0", socket_path.display()),
+        );
+        environment.insert("RMUX_PANE".to_owned(), "%42".to_owned());
+        environment.insert("RMUX_SOURCE_DEPTH".to_owned(), "3".to_owned());
+
+        assert_eq!(
+            requester_environment_context_from_map(&environment, &socket_path),
+            RequesterEnvironmentContext {
+                pane_id: Some(42),
+                source_depth: Some(3),
+            }
+        );
+
+        let other_socket = socket_path.with_file_name("rmux-requester-context-other.sock");
+        assert_eq!(
+            requester_environment_context_from_map(&environment, &other_socket),
+            RequesterEnvironmentContext::default()
         );
     }
 }

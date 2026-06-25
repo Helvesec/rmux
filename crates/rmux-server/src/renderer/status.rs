@@ -337,7 +337,11 @@ fn render_status_template_jobs(
     runtime: &RuntimeFormatContext<'_>,
     cache_ttl: Duration,
 ) -> String {
-    let profile = runtime.status_job_profile();
+    let profile = if template.contains("#(") {
+        runtime.status_job_profile()
+    } else {
+        None
+    };
     render_status_template_jobs_with_profile(template, runtime, profile.as_ref(), cache_ttl)
 }
 

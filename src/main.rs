@@ -7,24 +7,46 @@
 //!   through `rmux-client`, and
 //! - the hidden internal daemon mode used by tmux-style start-server commands.
 //!
-//! Keeping the hidden daemon re-exec path here is why the root package depends
-//! directly on `rmux-server` and Tokio without introducing an extra crate.
+//! Optimized package builds can alternatively enable `tiny-cli`, making this
+//! public binary a small dispatcher for hot detached commands while complex
+//! commands exec the private full `rmux` helper installed under libexec.
 
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod cli;
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod cli_args;
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod cli_response;
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod os_string;
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod process_locale;
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod server_runtime;
+#[cfg(all(feature = "tiny-cli", any(not(debug_assertions), test)))]
+mod tiny_main;
+mod tmux_error_surface;
 
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 use std::env;
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 use std::ffi::OsString;
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 use std::io::{self, ErrorKind, Write};
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 use std::path::PathBuf;
 
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 use rmux_client::INTERNAL_DAEMON_FLAG;
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 use rmux_server::{ConfigFileSelection as ServerConfigFileSelection, DaemonConfig, ServerDaemon};
 
+#[cfg(all(feature = "tiny-cli", not(debug_assertions)))]
+fn main() {
+    tiny_main::main();
+}
+
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 fn main() {
     match process_locale::initialize_process_locale()
         .map_err(|error| cli::ExitFailure::new(1, error))
@@ -40,6 +62,7 @@ fn main() {
     }
 }
 
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 fn write_exit_message(message: &str, stderr: bool) -> io::Result<()> {
     if stderr {
         match writeln!(io::stderr().lock(), "{message}") {
@@ -56,6 +79,7 @@ fn write_exit_message(message: &str, stderr: bool) -> io::Result<()> {
     }
 }
 
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 fn try_main<I>(args: I) -> Result<i32, cli::ExitFailure>
 where
     I: IntoIterator<Item = OsString>,
@@ -75,6 +99,7 @@ where
     }
 }
 
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InternalDaemonArgs {
     socket_path: Option<PathBuf>,
@@ -83,8 +108,11 @@ struct InternalDaemonArgs {
     config_cwd: Option<PathBuf>,
     web_frontend: Option<String>,
     web_port: Option<u16>,
+    startup_ready_fd: Option<i32>,
+    startup_ready_event: Option<OsString>,
 }
 
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 #[cfg(test)]
 fn parse_internal_socket_path<I>(args: I) -> Result<Option<PathBuf>, String>
 where
@@ -93,6 +121,7 @@ where
     parse_internal_daemon_args(args).map(|args| args.socket_path)
 }
 
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 fn parse_internal_daemon_args<I>(mut args: I) -> Result<InternalDaemonArgs, String>
 where
     I: Iterator<Item = OsString>,
@@ -103,6 +132,8 @@ where
     let mut config_cwd = None;
     let mut web_frontend = None;
     let mut web_port = None;
+    let mut startup_ready_fd = None;
+    let mut startup_ready_event = None;
 
     if let Some(first) = args.next() {
         if os_string::os_str_bytes(first.as_os_str()).starts_with(b"--") {
@@ -114,6 +145,8 @@ where
                 &mut config_cwd,
                 &mut web_frontend,
                 &mut web_port,
+                &mut startup_ready_fd,
+                &mut startup_ready_event,
             )?;
         } else {
             socket_path = Some(PathBuf::from(first));
@@ -132,6 +165,8 @@ where
             &mut config_cwd,
             &mut web_frontend,
             &mut web_port,
+            &mut startup_ready_fd,
+            &mut startup_ready_event,
         )?;
     }
 
@@ -142,9 +177,13 @@ where
         config_cwd,
         web_frontend,
         web_port,
+        startup_ready_fd,
+        startup_ready_event,
     })
 }
 
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
+#[allow(clippy::too_many_arguments)]
 fn parse_internal_flag<I>(
     argument: OsString,
     args: &mut I,
@@ -153,6 +192,8 @@ fn parse_internal_flag<I>(
     config_cwd: &mut Option<PathBuf>,
     web_frontend: &mut Option<String>,
     web_port: &mut Option<u16>,
+    startup_ready_fd: &mut Option<i32>,
+    startup_ready_event: &mut Option<OsString>,
 ) -> Result<(), String>
 where
     I: Iterator<Item = OsString>,
@@ -208,6 +249,26 @@ where
                 .ok_or_else(|| "invalid UTF-8 in --frontend-url".to_owned())?;
             *web_frontend = Some(frontend.to_owned());
         }
+        Some("--startup-ready-fd") => {
+            let fd = args
+                .next()
+                .ok_or_else(|| "--startup-ready-fd requires a file descriptor".to_owned())?;
+            let fd = fd
+                .to_str()
+                .ok_or_else(|| "invalid UTF-8 in --startup-ready-fd".to_owned())?
+                .parse::<i32>()
+                .map_err(|_| "--startup-ready-fd requires an integer file descriptor".to_owned())?;
+            if fd < 0 {
+                return Err("--startup-ready-fd requires a non-negative file descriptor".to_owned());
+            }
+            *startup_ready_fd = Some(fd);
+        }
+        Some("--startup-ready-event") => {
+            let event = args
+                .next()
+                .ok_or_else(|| "--startup-ready-event requires an event name".to_owned())?;
+            *startup_ready_event = Some(event);
+        }
         Some(other) => {
             return Err(format!("unexpected hidden daemon argument '{other}'"));
         }
@@ -217,6 +278,7 @@ where
     Ok(())
 }
 
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 fn run_hidden_daemon(args: InternalDaemonArgs) -> io::Result<()> {
     reject_unsupported_web_args(&args)?;
 
@@ -239,6 +301,14 @@ fn run_hidden_daemon(args: InternalDaemonArgs) -> io::Result<()> {
     if let Some(frontend) = args.web_frontend {
         config = config.with_web_frontend(frontend);
     }
+    #[cfg(target_os = "linux")]
+    if let Some(ready_fd) = args.startup_ready_fd {
+        config = config.with_startup_ready_fd(ready_fd);
+    }
+    #[cfg(windows)]
+    if let Some(ready_event) = args.startup_ready_event {
+        config = config.with_startup_ready_event(ready_event);
+    }
     rmux_os::memory::configure_daemon_allocator();
     let runtime = server_runtime::build_daemon_runtime()?;
 
@@ -248,6 +318,7 @@ fn run_hidden_daemon(args: InternalDaemonArgs) -> io::Result<()> {
     })
 }
 
+#[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 fn reject_unsupported_web_args(args: &InternalDaemonArgs) -> io::Result<()> {
     #[cfg(not(feature = "web"))]
     if args.web_port.is_some() || args.web_frontend.is_some() {
@@ -265,7 +336,7 @@ fn reject_unsupported_web_args(args: &InternalDaemonArgs) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(not(feature = "tiny-cli"), debug_assertions)))]
 mod tests {
     use super::{parse_internal_daemon_args, parse_internal_socket_path, try_main};
     use rmux_client::INTERNAL_DAEMON_FLAG;

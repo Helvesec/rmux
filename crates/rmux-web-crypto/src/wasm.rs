@@ -45,7 +45,8 @@ impl MlKemKeyPair {
         let ciphertext: [u8; ml_kem::CIPHERTEXT_LEN] = ciphertext
             .try_into()
             .map_err(|_| JsValue::from_str("ml-kem ciphertext must be 1088 bytes"))?;
-        Ok(self.inner.decapsulate(&ciphertext).to_vec())
+        let shared_secret = self.inner.decapsulate(&ciphertext);
+        Ok(shared_secret.to_vec())
     }
 }
 

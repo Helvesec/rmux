@@ -53,7 +53,7 @@ where
 
 /// Looks up a frozen tmux command using exact alias then unique name prefix.
 pub fn lookup_command(name: &str) -> Result<&'static CommandEntry, CommandParseError> {
-    lookup_command_at(name, 0)
+    lookup_command_at(name, 0, &[])
 }
 
 /// Parser output for one command list.
@@ -293,6 +293,7 @@ pub struct CommandParser {
     home_dir: Option<String>,
     user_home_dirs: Vec<(String, String)>,
     command_aliases: Vec<CommandAlias>,
+    exact_commands: &'static [CommandEntry],
     max_command_bytes: usize,
 }
 
@@ -304,6 +305,7 @@ impl Default for CommandParser {
             home_dir: None,
             user_home_dirs: Vec::new(),
             command_aliases: Vec::new(),
+            exact_commands: &[],
             max_command_bytes: DEFAULT_MAX_COMMAND_BYTES,
         }
     }
@@ -391,6 +393,17 @@ impl CommandParser {
         self.command_aliases.clear();
         self.command_aliases
             .extend(definitions.into_iter().filter_map(CommandAlias::parse));
+        self
+    }
+
+    /// Adds exact-only command names to this parser.
+    ///
+    /// These entries are intentionally excluded from tmux-style prefix lookup.
+    /// Use this for client-side RMUX extensions; server-side `source-file`
+    /// parsing should keep the frozen tmux command table.
+    #[must_use]
+    pub fn with_exact_commands(mut self, commands: &'static [CommandEntry]) -> Self {
+        self.exact_commands = commands;
         self
     }
 
@@ -520,7 +533,7 @@ impl CommandParser {
                 }
             }
 
-            let entry = lookup_command_at(&command.name, command.line)?;
+            let entry = lookup_command_at(&command.name, command.line, self.exact_commands)?;
             command.name = entry.name.to_owned();
             output.push_command(command);
         }

@@ -43,6 +43,13 @@ function AssertSuccess([string]$Binary, [string[]]$Arguments) {
     $output
 }
 
+function AssertSuccessNoCapture([string]$Binary, [string[]]$Arguments) {
+    & $Binary @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        Fail "command failed: $Binary $($Arguments -join ' ')"
+    }
+}
+
 function VerifyChecksumManifest([string]$Root, [string]$Manifest) {
     $rootFull = [System.IO.Path]::GetFullPath($Root)
     foreach ($line in Get-Content -LiteralPath $Manifest) {
@@ -111,7 +118,7 @@ try {
         Fail "archive root directory is missing: $([System.IO.Path]::GetFileNameWithoutExtension($archiveName))"
     }
 
-    foreach ($required in @("rmux.exe", "rmux-daemon.exe", "SHA256SUMS.txt", "share/rmux/artifact-metadata.json", "README.md", "LICENSE-APACHE", "LICENSE-MIT", "rmux.1")) {
+    foreach ($required in @("rmux.exe", "libexec/rmux/rmux.exe", "rmux-daemon.exe", "SHA256SUMS.txt", "share/rmux/artifact-metadata.json", "README.md", "LICENSE-APACHE", "LICENSE-MIT", "rmux.1")) {
         if (-not (Test-Path -LiteralPath (Join-Path $packageRoot $required))) {
             Fail "missing package file: $required"
         }
@@ -125,8 +132,8 @@ try {
     if ($metadata.artifact_kind -ne "windows-package-binary") {
         Fail "metadata artifact_kind is not windows-package-binary"
     }
-    if ($metadata.package_layout -ne "rmux-windows-package-v1") {
-        Fail "metadata package_layout is not rmux-windows-package-v1"
+    if ($metadata.package_layout -ne "rmux-windows-package-v2") {
+        Fail "metadata package_layout is not rmux-windows-package-v2"
     }
     if ($RequireReleaseArtifact) {
         if (-not ($metadata.PSObject.Properties.Name -contains "release_artifact") -or
@@ -138,6 +145,11 @@ try {
     if ($metadata.binary_sha256.ToLowerInvariant() -ne $packagedBinaryHash) {
         Fail "metadata binary_sha256 does not match packaged binary"
     }
+    $helperBinary = Join-Path $packageRoot "libexec/rmux/rmux.exe"
+    $packagedHelperHash = Sha256File $helperBinary
+    if ($metadata.helper_binary_sha256.ToLowerInvariant() -ne $packagedHelperHash) {
+        Fail "metadata helper_binary_sha256 does not match packaged helper binary"
+    }
     $daemonBinary = Join-Path $packageRoot "rmux-daemon.exe"
     $packagedDaemonHash = Sha256File $daemonBinary
     if ($metadata.daemon_binary_sha256.ToLowerInvariant() -ne $packagedDaemonHash) {
@@ -147,12 +159,24 @@ try {
     if ($RunBinary) {
         AssertSuccess $binary @("-V") | Out-Null
         AssertSuccess $binary @("diagnose", "--json") | Out-Null
+        $previousDisableTiny = $env:RMUX_DISABLE_TINY_CLI
+        try {
+            $env:RMUX_DISABLE_TINY_CLI = "1"
+            AssertSuccess $binary @("-V") | Out-Null
+            AssertSuccess $binary @("diagnose", "--json") | Out-Null
+        } finally {
+            if ($null -eq $previousDisableTiny) {
+                Remove-Item Env:\RMUX_DISABLE_TINY_CLI -ErrorAction SilentlyContinue
+            } else {
+                $env:RMUX_DISABLE_TINY_CLI = $previousDisableTiny
+            }
+        }
     }
 
     if ($RunDaemonSmoke) {
         $label = "package-smoke-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
         try {
-            AssertSuccess $binary @("-L", $label, "new-session", "-d", "-s", "package_smoke", "cmd.exe", "/d", "/q") | Out-Null
+            AssertSuccessNoCapture $binary @("-L", $label, "new-session", "-d", "-s", "package_smoke", "cmd.exe", "/d", "/q", "/k")
             $sessions = AssertSuccess $binary @("-L", $label, "list-sessions", "-F", "#{session_name}")
             if (($sessions -join "`n") -notmatch 'package_smoke') {
                 Fail "daemon smoke did not list package_smoke session"
@@ -160,11 +184,30 @@ try {
         } finally {
             & $binary "-L" $label "kill-server" | Out-Null
         }
+
+        $fallbackLabel = "package-fallback-smoke-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+        $previousDisableTiny = $env:RMUX_DISABLE_TINY_CLI
+        try {
+            $env:RMUX_DISABLE_TINY_CLI = "1"
+            AssertSuccessNoCapture $binary @("-L", $fallbackLabel, "new-session", "-d", "-s", "package_fallback_smoke", "cmd.exe", "/d", "/q", "/k")
+            $sessions = AssertSuccess $binary @("-L", $fallbackLabel, "list-sessions", "-F", "#{session_name}")
+            if (($sessions -join "`n") -notmatch 'package_fallback_smoke') {
+                Fail "fallback daemon smoke did not list package_fallback_smoke session"
+            }
+        } finally {
+            if ($null -eq $previousDisableTiny) {
+                Remove-Item Env:\RMUX_DISABLE_TINY_CLI -ErrorAction SilentlyContinue
+            } else {
+                $env:RMUX_DISABLE_TINY_CLI = $previousDisableTiny
+            }
+            & $binary "-L" $fallbackLabel "kill-server" | Out-Null
+        }
     }
 
     Write-Output "archive=$archiveFull"
     Write-Output "sha256=$actualHash"
     Write-Output "binary_sha256=$packagedBinaryHash"
+    Write-Output "helper_binary_sha256=$packagedHelperHash"
     Write-Output "daemon_binary_sha256=$packagedDaemonHash"
     Write-Output "run_binary=$($RunBinary.ToString().ToLowerInvariant())"
     Write-Output "run_daemon_smoke=$($RunDaemonSmoke.ToString().ToLowerInvariant())"

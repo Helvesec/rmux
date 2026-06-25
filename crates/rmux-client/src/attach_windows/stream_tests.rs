@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rmux_proto::{
-    encode_attach_message, AttachFrameDecoder, AttachMessage, AttachShellCommand, AttachedKeystroke,
+    encode_attach_message, AttachFrameDecoder, AttachMessage, AttachShellCommand,
+    AttachedKeystroke, AttachedWindowsConsoleKey,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -177,7 +178,7 @@ async fn keystrokes_received_while_locked_are_dropped_after_unlock(
         .wait_for_call("lock:pause", Duration::from_secs(1))
         .await?;
     input_tx
-        .send(b"secret".to_vec())
+        .send(super::super::input::AttachInput::bytes(b"secret".to_vec()))
         .await
         .expect("send locked input");
 
@@ -186,13 +187,65 @@ async fn keystrokes_received_while_locked_are_dropped_after_unlock(
         AttachMessage::Unlock
     );
     input_tx
-        .send(b"visible".to_vec())
+        .send(super::super::input::AttachInput::bytes(b"visible".to_vec()))
         .await
         .expect("send unlocked input");
 
     assert_eq!(
         read_client_message(&mut server).await?,
         AttachMessage::Keystroke(AttachedKeystroke::new(b"visible".to_vec()))
+    );
+
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    scenario.join().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn windows_console_key_metadata_is_sent_with_single_chunk_input(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut scenario = AttachScenario::new(RecordingActions::default());
+    let mut server = scenario.take_server();
+    let input_tx = scenario.input_tx();
+    let key = AttachedWindowsConsoleKey::new(0x44, 0x20, 0x04, 0x0008, 1);
+
+    input_tx
+        .send(super::super::input::AttachInput::with_windows_console_key(
+            vec![0x04],
+            key,
+        ))
+        .await
+        .expect("send Ctrl-D input");
+
+    assert_eq!(
+        read_client_message(&mut server).await?,
+        AttachMessage::Keystroke(AttachedKeystroke::new(vec![0x04]).with_windows_console_key(key))
+    );
+
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    scenario.join().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn windows_console_key_metadata_is_not_sent_when_capability_is_disabled(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut scenario = AttachScenario::with_windows_console_key(RecordingActions::default(), false);
+    let mut server = scenario.take_server();
+    let input_tx = scenario.input_tx();
+    let key = AttachedWindowsConsoleKey::new(0x44, 0x20, 0x04, 0x0008, 1);
+
+    input_tx
+        .send(super::super::input::AttachInput::with_windows_console_key(
+            vec![0x04],
+            key,
+        ))
+        .await
+        .expect("send Ctrl-D input");
+
+    assert_eq!(
+        read_client_message(&mut server).await?,
+        AttachMessage::Keystroke(AttachedKeystroke::new(vec![0x04]))
     );
 
     write_server_message(&mut server, AttachMessage::DetachKill).await?;
@@ -295,11 +348,18 @@ struct AttachScenario {
     actions: RecordingActions,
     output: SharedOutput,
     server: Option<tokio::io::DuplexStream>,
-    input_tx: Option<mpsc::Sender<Vec<u8>>>,
+    input_tx: Option<mpsc::Sender<super::super::input::AttachInput>>,
 }
 
 impl AttachScenario {
     fn new(actions: RecordingActions) -> Self {
+        Self::with_windows_console_key(actions, true)
+    }
+
+    fn with_windows_console_key(
+        actions: RecordingActions,
+        windows_console_key_enabled: bool,
+    ) -> Self {
         let (client_stream, server) = tokio::io::duplex(4096);
         let (reader, writer) = tokio::io::split(client_stream);
         let (input_tx, input_rx) = mpsc::channel(8);
@@ -329,7 +389,14 @@ impl AttachScenario {
                 Vec::new(),
                 client_output,
                 AttachScreenTracker::default(),
-                AttachAsyncChannels::new(input_rx, resize_rx, action_tx, completion_rx, locked),
+                AttachAsyncChannels::new(
+                    input_rx,
+                    resize_rx,
+                    action_tx,
+                    completion_rx,
+                    locked,
+                    windows_console_key_enabled,
+                ),
             )
             .await
         });
@@ -348,7 +415,7 @@ impl AttachScenario {
         self.server.take().expect("server stream should be present")
     }
 
-    fn input_tx(&self) -> mpsc::Sender<Vec<u8>> {
+    fn input_tx(&self) -> mpsc::Sender<super::super::input::AttachInput> {
         self.input_tx
             .as_ref()
             .expect("input sender should be present")

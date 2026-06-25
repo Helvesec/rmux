@@ -139,6 +139,13 @@ impl Utf8Config {
         }
         fallback_width(ch)
     }
+
+    fn ascii_is_identity_width(&self) -> bool {
+        !self
+            .overrides
+            .iter()
+            .any(|override_| override_.start <= 0x7f && override_.end >= 0x01)
+    }
 }
 
 impl WidthOverride {
@@ -158,6 +165,9 @@ impl WidthOverride {
 /// Returns the tmux-style display width of a string.
 #[must_use]
 pub fn text_width(value: &str, config: &Utf8Config) -> usize {
+    if value.is_ascii() && config.ascii_is_identity_width() {
+        return value.len();
+    }
     fold_text_cells(value, config)
         .iter()
         .map(|cell| usize::from(cell.width))
@@ -167,6 +177,9 @@ pub fn text_width(value: &str, config: &Utf8Config) -> usize {
 /// Truncates a string to the requested display width.
 #[must_use]
 pub fn truncate_to_width(value: &str, width: usize, config: &Utf8Config) -> String {
+    if value.is_ascii() && config.ascii_is_identity_width() {
+        return value[..value.len().min(width)].to_owned();
+    }
     let mut output = String::new();
     let mut used = 0_usize;
 
@@ -185,6 +198,9 @@ pub fn truncate_to_width(value: &str, width: usize, config: &Utf8Config) -> Stri
 /// Truncates a string from the left, keeping the rightmost text cells that fit.
 #[must_use]
 pub fn truncate_right_to_width(value: &str, width: usize, config: &Utf8Config) -> String {
+    if value.is_ascii() && config.ascii_is_identity_width() {
+        return value[value.len().saturating_sub(width)..].to_owned();
+    }
     let cells = fold_text_cells(value, config);
     let mut used = 0_usize;
     let mut start = cells.len();

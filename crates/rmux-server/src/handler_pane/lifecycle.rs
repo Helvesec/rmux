@@ -63,7 +63,10 @@ impl ExitedPaneOutput {
         Self { receiver, sender }
     }
 
-    async fn ensure_eof(self, generation: Option<u64>) {
+    async fn ensure_eof(self, generation: Option<u64>, output_eof_published: bool) {
+        if output_eof_published {
+            return;
+        }
         if wait_for_pane_output_eof(self.receiver).await {
             return;
         }
@@ -284,12 +287,15 @@ impl RequestHandler {
                 pane_event,
                 output,
             } => {
-                output.ensure_eof(event.generation).await;
+                output
+                    .ensure_eof(event.generation, event.output_eof_published())
+                    .await;
                 if prepare_dead {
                     self.prepare_kept_dead_pane_transcript(
                         &runtime_session_name,
                         event.pane_id,
                         &target,
+                        event.output_eof_published(),
                     )
                     .await;
                 }
@@ -330,7 +336,9 @@ impl RequestHandler {
                     &target,
                     &output,
                 );
-                output.ensure_eof(event.generation).await;
+                output
+                    .ensure_eof(event.generation, event.output_eof_published())
+                    .await;
                 self.forget_pane_snapshot_coalescers(&removed_pane_ids);
                 self.cleanup_exited_pane_output_subscription(&runtime_session_name, event.pane_id)
                     .await;
@@ -366,7 +374,9 @@ impl RequestHandler {
                     &output,
                 );
                 self.remove_session_leases(std::slice::from_ref(&session_name));
-                output.ensure_eof(event.generation).await;
+                output
+                    .ensure_eof(event.generation, event.output_eof_published())
+                    .await;
                 self.forget_pane_snapshot_coalescers(&removed_pane_ids);
                 self.cleanup_exited_pane_output_subscription(&runtime_session_name, event.pane_id)
                     .await;
@@ -410,46 +420,27 @@ impl RequestHandler {
         runtime_session_name: &rmux_proto::SessionName,
         pane_id: rmux_core::PaneId,
         target: &PaneTarget,
+        output_eof_published: bool,
     ) {
         let (retry_strip, output_rx) = {
             let mut state = self.state.lock().await;
-            let cleared_respawned_transcript = match state
-                .clear_runtime_pane_transcript_for_dead_exit_if_marked(
-                    runtime_session_name,
-                    pane_id,
-                ) {
-                Ok(cleared) => cleared,
+            let output_rx = state.subscribe_runtime_pane_output(runtime_session_name, pane_id);
+            let stripped = match state.strip_attached_submitted_line(runtime_session_name, pane_id)
+            {
+                Ok(stripped) => stripped,
                 Err(error) => {
                     warn!(
                         session = %runtime_session_name,
                         pane_id = pane_id.as_u32(),
-                        "failed to prepare dead pane transcript: {error}"
+                        "failed to strip attached submitted line for dead pane: {error}"
                     );
                     false
                 }
             };
-            let output_rx = (!cleared_respawned_transcript)
-                .then(|| state.subscribe_runtime_pane_output(runtime_session_name, pane_id))
-                .flatten();
-            let stripped = if cleared_respawned_transcript {
-                false
-            } else {
-                match state.strip_attached_submitted_line(runtime_session_name, pane_id) {
-                    Ok(stripped) => stripped,
-                    Err(error) => {
-                        warn!(
-                            session = %runtime_session_name,
-                            pane_id = pane_id.as_u32(),
-                            "failed to strip attached submitted line for dead pane: {error}"
-                        );
-                        false
-                    }
-                }
-            };
-            (!cleared_respawned_transcript && !stripped, output_rx)
+            (!stripped, output_rx)
         };
 
-        if retry_strip {
+        if retry_strip && !output_eof_published {
             // On Windows the child-exit watcher can beat the ConPTY reader.
             // Wait for the reader's EOF marker so a final echoed command can be
             // stripped before the dead-pane message is appended.
@@ -646,4 +637,31 @@ fn apply_dead_pane_automatic_window_name(
     Ok(state
         .synchronize_session_group_from(target.session_name())
         .unwrap_or_else(|_| vec![target.session_name().clone()]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ensure_eof_skips_timeout_when_exit_event_already_published_eof() {
+        let sender = crate::pane_io::pane_output_channel();
+        let generation = None;
+        sender
+            .send_for_generation(generation, Vec::new())
+            .expect("matching generation should accept EOF marker");
+
+        let receiver = sender.subscribe();
+        let output = ExitedPaneOutput {
+            receiver: Some(receiver),
+            sender: Some(sender),
+        };
+
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            output.ensure_eof(generation, true),
+        )
+        .await
+        .expect("published EOF should not wait for the drain timeout");
+    }
 }

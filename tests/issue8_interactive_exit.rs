@@ -106,6 +106,69 @@ fn fresh_pane_title_starts_as_host_short_before_shell_updates_it() -> Result<(),
 }
 
 #[test]
+fn osc_title_rename_is_ignored_when_allow_set_title_is_off() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("issue8-allow-set-title-off")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&[
+        "set-option",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "allow-set-title",
+        "off",
+    ])?);
+    assert_success(&harness.run(&[
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "printf '\\033]0;CLAUDETITLE\\007'",
+        "Enter",
+    ])?);
+    thread::sleep(Duration::from_millis(500));
+
+    let title = pane_title_and_host_short(&harness, "alpha:0.0")?;
+    let (pane_title, host_short) = title.trim().split_once('|').expect("format separator");
+    assert_eq!(pane_title, host_short);
+    assert_ne!(pane_title, "CLAUDETITLE");
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn osc_title_rename_is_applied_when_allow_set_title_is_on() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("issue8-allow-set-title-on")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&[
+        "set-option",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "allow-set-title",
+        "on",
+    ])?);
+    assert_success(&harness.run(&[
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        "printf '\\033]0;CLAUDETITLE\\007'",
+        "Enter",
+    ])?);
+    thread::sleep(Duration::from_millis(500));
+
+    let title = pane_title_and_host_short(&harness, "alpha:0.0")?;
+    let (pane_title, _host_short) = title.trim().split_once('|').expect("format separator");
+    assert_eq!(pane_title, "CLAUDETITLE");
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
 fn rapid_command_prompt_after_split_keeps_first_typed_byte() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("issue8-rapid-command-prompt")?;
     let mut daemon = harness.start_hidden_daemon()?;
@@ -160,6 +223,17 @@ fn rapid_confirm_before_accept_after_split_reaches_prompt() -> Result<(), Box<dy
 
     terminate_child(daemon.child_mut())?;
     Ok(())
+}
+
+fn pane_title_and_host_short(harness: &CliHarness, target: &str) -> Result<String, Box<dyn Error>> {
+    let output = harness.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        target,
+        "#{pane_title}|#{host_short}",
+    ])?;
+    Ok(common::stdout(&output))
 }
 
 fn send_prompt_command(attach: &mut AttachedSession, command: &str) -> Result<(), Box<dyn Error>> {

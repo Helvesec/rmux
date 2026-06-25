@@ -17,6 +17,9 @@ use rmux_sdk::{
 use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout, Instant};
 
+#[path = "../../../../tests/support/windows_cargo_build.rs"]
+mod windows_cargo_build;
+
 pub type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 // Windows CI can be slow to start ConPTY-backed shells while the workspace
@@ -283,6 +286,7 @@ fn resolve_rmux_binary() -> TestResult<PathBuf> {
     let target_dir = target_dir()?;
     let candidate = target_dir.join("debug").join("rmux.exe");
 
+    let _cargo_build_guard = windows_cargo_build::acquire()?;
     let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
         .arg("build")
         .arg("--bin")

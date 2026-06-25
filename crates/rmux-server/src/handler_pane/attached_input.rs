@@ -1,8 +1,11 @@
 use std::io;
+use std::marker::PhantomData;
 use std::time::Instant;
 
 use rmux_core::{key_code_lookup_bits, key_code_to_bytes, key_string_lookup_string};
 use rmux_proto::{OptionName, PaneTarget, RmuxError, Target, DEFAULT_MAX_FRAME_LENGTH};
+#[cfg(windows)]
+use rmux_pty::WindowsConsoleKeyEvent;
 
 use super::super::{
     prompt_support::{decode_prompt_key, PromptInputEvent},
@@ -10,10 +13,16 @@ use super::super::{
 };
 use super::pane_io_encoding::{
     encode_key_for_target, encode_mouse_for_target, prepare_attached_pane_input_writes,
-    write_bytes_to_target_io,
+    write_bytes_to_target_io, PaneInputWrite,
+};
+#[cfg(windows)]
+use super::pane_io_encoding::{
+    prepare_attached_pane_console_input_writes, write_windows_console_key_to_target_io,
+    PaneConsoleInputWrite,
 };
 use super::pane_prompt_input::{decode_prompt_input_event, is_extended_key_prefix};
 use super::{io_other, resolve_input_target, AttachedKeyDispatch};
+use crate::client_flags::ClientFlags;
 use crate::input_keys::{decode_extended_key, decode_mouse, ExtendedKeyDecode, MouseDecode};
 use crate::key_table::{decode_attached_key, AttachedKeyDecode};
 use crate::mouse::{classify_mouse_event, layout_for_session};
@@ -29,6 +38,27 @@ mod live;
 mod terminal_response;
 
 const MAX_RETAINED_ATTACHED_CONTROL_INPUT: usize = DEFAULT_MAX_FRAME_LENGTH;
+
+enum AttachedPaneForward<'a> {
+    EncodedKey(PhantomData<&'a ()>),
+    #[cfg(windows)]
+    WindowsConsoleKey {
+        key: WindowsConsoleKeyEvent,
+        bytes: &'a [u8],
+    },
+}
+
+enum PreparedAttachedPaneForward {
+    EncodedKey {
+        writes: Vec<PaneInputWrite>,
+        bytes: Vec<u8>,
+    },
+    #[cfg(windows)]
+    WindowsConsoleKey {
+        writes: Vec<PaneConsoleInputWrite>,
+        key: WindowsConsoleKeyEvent,
+    },
+}
 
 pub(in crate::handler) fn retain_partial_attached_control_input(
     context: &str,
@@ -89,6 +119,23 @@ impl RequestHandler {
         attach_pid: u32,
         key: rmux_core::KeyCode,
     ) -> io::Result<bool> {
+        self.handle_attached_live_key_inner(
+            attach_pid,
+            key,
+            AttachedPaneForward::EncodedKey(PhantomData),
+        )
+        .await
+    }
+
+    async fn handle_attached_live_key_inner(
+        &self,
+        attach_pid: u32,
+        key: rmux_core::KeyCode,
+        forward: AttachedPaneForward<'_>,
+    ) -> io::Result<bool> {
+        if self.attached_client_input_is_read_only(attach_pid).await? {
+            return Ok(false);
+        }
         if self.mode_tree_active(attach_pid).await {
             self.handle_attached_mode_tree_key_or_prefix(attach_pid, key, decode_prompt_key(key))
                 .await?;
@@ -124,20 +171,46 @@ impl RequestHandler {
         }
 
         let prepared = {
-            let state = self.state.lock().await;
-            let Some(encoded) =
-                encode_attached_key_for_target(&state, &target, key).map_err(io_other)?
-            else {
-                return Ok(false);
-            };
-            let writes =
-                prepare_attached_pane_input_writes(&state, &target, &encoded).map_err(io_other)?;
-            (writes, encoded)
+            let mut state = self.state.lock().await;
+            match forward {
+                AttachedPaneForward::EncodedKey(_) => {
+                    let Some(encoded) =
+                        encode_attached_key_for_target(&state, &target, key).map_err(io_other)?
+                    else {
+                        return Ok(false);
+                    };
+                    let writes = prepare_attached_pane_input_writes(&mut state, &target, &encoded)
+                        .map_err(io_other)?;
+                    PreparedAttachedPaneForward::EncodedKey {
+                        writes,
+                        bytes: encoded,
+                    }
+                }
+                #[cfg(windows)]
+                AttachedPaneForward::WindowsConsoleKey { key, bytes } => {
+                    let writes =
+                        prepare_attached_pane_console_input_writes(&mut state, &target, bytes)
+                            .map_err(io_other)?;
+                    PreparedAttachedPaneForward::WindowsConsoleKey { writes, key }
+                }
+            }
         };
-        for write in prepared.0 {
-            write_bytes_to_target_io(write, prepared.1.clone())
-                .await
-                .map_err(io_other)?;
+        match prepared {
+            PreparedAttachedPaneForward::EncodedKey { writes, bytes } => {
+                for write in writes {
+                    write_bytes_to_target_io(write, bytes.clone())
+                        .await
+                        .map_err(io_other)?;
+                }
+            }
+            #[cfg(windows)]
+            PreparedAttachedPaneForward::WindowsConsoleKey { writes, key } => {
+                for write in writes {
+                    write_windows_console_key_to_target_io(write, key)
+                        .await
+                        .map_err(io_other)?;
+                }
+            }
         }
         Ok(false)
     }
@@ -304,6 +377,9 @@ impl RequestHandler {
         attach_pid: u32,
         raw: crate::input_keys::MouseForwardEvent,
     ) -> io::Result<()> {
+        if self.attached_client_input_is_read_only(attach_pid).await? {
+            return Ok(());
+        }
         if self.mode_tree_active(attach_pid).await {
             let _ = self
                 .handle_mode_tree_mouse_event(attach_pid, raw)
@@ -374,13 +450,13 @@ impl RequestHandler {
         event: &crate::mouse::AttachedMouseEvent,
     ) -> io::Result<bool> {
         let prepared = {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             let bytes = encode_mouse_for_target(&state, target, event).map_err(io_other)?;
             if bytes.is_empty() {
                 return Ok(false);
             }
             let writes =
-                prepare_attached_pane_input_writes(&state, target, &bytes).map_err(io_other)?;
+                prepare_attached_pane_input_writes(&mut state, target, &bytes).map_err(io_other)?;
             (writes, bytes)
         };
 
@@ -393,16 +469,8 @@ impl RequestHandler {
     }
 
     async fn write_attached_bytes(&self, attach_pid: u32, bytes: &[u8]) -> io::Result<()> {
-        {
-            let active_attach = self.active_attach.lock().await;
-            if active_attach.by_pid.get(&attach_pid).is_some_and(|active| {
-                !active.can_write
-                    || active
-                        .flags
-                        .contains(super::super::attach_support::ClientFlags::READONLY)
-            }) {
-                return Ok(());
-            }
+        if self.attached_client_input_is_read_only(attach_pid).await? {
+            return Ok(());
         }
 
         let target = self
@@ -410,8 +478,8 @@ impl RequestHandler {
             .await
             .map_err(io_other)?;
         let writes = {
-            let state = self.state.lock().await;
-            prepare_attached_pane_input_writes(&state, &target, bytes).map_err(io_other)?
+            let mut state = self.state.lock().await;
+            prepare_attached_pane_input_writes(&mut state, &target, bytes).map_err(io_other)?
         };
         for write in writes {
             write_bytes_to_target_io(write, bytes.to_vec())
@@ -419,6 +487,15 @@ impl RequestHandler {
                 .map_err(io_other)?;
         }
         Ok(())
+    }
+
+    async fn attached_client_input_is_read_only(&self, attach_pid: u32) -> io::Result<bool> {
+        let active_attach = self.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&attach_pid)
+            .ok_or_else(|| io_other(RmuxError::Server("attached client disappeared".to_owned())))?;
+        Ok(!active.can_write || active.flags.contains(ClientFlags::READONLY))
     }
 
     pub(crate) async fn flush_attached_pending_escape_input(

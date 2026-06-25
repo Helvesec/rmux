@@ -180,7 +180,7 @@ async fn switch_client_last_session_recalls_the_previous_session() {
     let switched = handler
         .dispatch(
             requester_pid,
-            Request::SwitchClientExt2(SwitchClientExt2Request {
+            Request::SwitchClientExt2(Box::new(SwitchClientExt2Request {
                 target: Some(beta.clone()),
                 key_table: None,
                 last_session: false,
@@ -190,7 +190,7 @@ async fn switch_client_last_session_recalls_the_previous_session() {
                 flags: None,
                 sort_order: None,
                 skip_environment_update: false,
-            }),
+            })),
         )
         .await
         .response;
@@ -208,7 +208,7 @@ async fn switch_client_last_session_recalls_the_previous_session() {
     let switched_back = handler
         .dispatch(
             requester_pid,
-            Request::SwitchClientExt2(SwitchClientExt2Request {
+            Request::SwitchClientExt2(Box::new(SwitchClientExt2Request {
                 target: None,
                 key_table: None,
                 last_session: true,
@@ -218,7 +218,7 @@ async fn switch_client_last_session_recalls_the_previous_session() {
                 flags: None,
                 sort_order: None,
                 skip_environment_update: false,
-            }),
+            })),
         )
         .await
         .response;
@@ -261,7 +261,7 @@ async fn kill_session_clears_attached_last_session_references() {
     let switched = handler
         .dispatch(
             requester_pid,
-            Request::SwitchClientExt2(SwitchClientExt2Request {
+            Request::SwitchClientExt2(Box::new(SwitchClientExt2Request {
                 target: Some(beta.clone()),
                 key_table: None,
                 last_session: false,
@@ -271,7 +271,7 @@ async fn kill_session_clears_attached_last_session_references() {
                 flags: None,
                 sort_order: None,
                 skip_environment_update: false,
-            }),
+            })),
         )
         .await
         .response;

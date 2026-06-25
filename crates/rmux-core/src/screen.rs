@@ -22,9 +22,10 @@ mod view;
 #[path = "screen/writer.rs"]
 mod writer;
 
-pub use view::{ScreenCellView, ScreenLineView};
+pub use view::{ScreenCellRef, ScreenCellView, ScreenLineView};
 
 pub(crate) const MAX_TERMINAL_PASSTHROUGH_EVENTS: usize = 256;
+const TITLE_STACK_MAX: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SavedGrid {
@@ -53,6 +54,7 @@ pub struct Screen {
     window_name: String,
     path: String,
     title_stack: Vec<String>,
+    title_rename_enabled: bool,
     tabs: Vec<bool>,
     hyperlinks: Hyperlinks,
     active_hyperlink: u32,
@@ -88,6 +90,7 @@ impl Screen {
             window_name: String::new(),
             path: String::new(),
             title_stack: Vec::new(),
+            title_rename_enabled: true,
             tabs: Vec::new(),
             hyperlinks: Hyperlinks::new(),
             active_hyperlink: 0,
@@ -143,6 +146,11 @@ impl Screen {
     /// Sets the current screen title.
     pub fn set_title(&mut self, title: impl Into<String>) {
         self.title = title.into();
+    }
+
+    /// Enables or disables title changes requested by pane output.
+    pub fn set_title_rename_enabled(&mut self, enabled: bool) {
+        self.title_rename_enabled = enabled;
     }
 
     /// Enables or disables DEC alternate-screen entry for this screen.

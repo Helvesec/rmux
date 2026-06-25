@@ -1,0 +1,8 @@
+rmux-copy-mode-search-alpha
+rmux-copy-mode-search-beta
+rmux-copy-mode-search-gamma
+rmux-copy-mode-search-delta
+RMUX-COPY-MODE-SEARCH-MIXED
+rmux-copy-mode-search-cjk-漢字
+rmux-copy-mode-search-combining-é
+rmux-copy-mode-search-wide-ＷＩＤＥ

@@ -152,13 +152,13 @@ async fn attach_stream_emits_border_frames_for_multi_pane_sessions() -> Result<(
 
     let selected = crate::common::send_request(
         &socket_path,
-        &Request::SelectPane(SelectPaneRequest {
+        &Request::SelectPane(Box::new(SelectPaneRequest {
             target: PaneTarget::new(alpha.clone(), 2),
             title: None,
             style: None,
             input_disabled: None,
             preserve_zoom: false,
-        }),
+        })),
     )
     .await?;
     assert!(matches!(selected, Response::SelectPane(_)));

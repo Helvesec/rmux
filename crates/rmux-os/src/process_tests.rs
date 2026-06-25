@@ -184,7 +184,7 @@ fn parses_raw_nul_separated_environment_without_utf8_filtering() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(unix, target_os = "macos"))]
 #[test]
 fn parses_macos_procargs_environment() {
     let mut buffer = Vec::new();

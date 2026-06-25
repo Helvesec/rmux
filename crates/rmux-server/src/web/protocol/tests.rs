@@ -107,6 +107,8 @@ fn resize_request_wire_uses_big_endian_size() {
     );
     assert_eq!(parse_resize_body(&[0x00, 0x00, 0x00, 0x28]), None);
     assert_eq!(parse_resize_body(&[0x00, 0x64]), None);
+    assert_eq!(parse_resize_body(&[0x10, 0x01, 0x00, 0x28]), None);
+    assert_eq!(parse_resize_body(&[0x04, 0x00, 0x04, 0x00]), None);
 }
 
 #[test]

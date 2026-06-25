@@ -12,7 +12,10 @@ mod stream;
 #[cfg(windows)]
 mod windows_mutex;
 
-pub use endpoint::{default_endpoint, endpoint_for_label, resolve_endpoint, LocalEndpoint};
+pub use endpoint::{
+    default_endpoint, endpoint_for_label, resolve_endpoint, resolve_tmux_compatible_endpoint,
+    LocalEndpoint,
+};
 pub use listener::LocalListener;
 pub use stream::{
     connect_blocking, is_peer_disconnect, wait_for_peer_close, BlockingLocalStream, LocalStream,
