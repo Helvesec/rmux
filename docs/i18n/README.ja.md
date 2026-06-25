@@ -4,7 +4,7 @@
   <a href="https://rmux.io/">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="../rmux-logo-dark.svg">
-      <img src="../rmux-logo-light.svg" width="260" alt="RMUX logo">
+      <img src="../rmux-logo-light.svg" width="238" alt="RMUX logo">
     </picture>
   </a>
 </p>
@@ -13,51 +13,32 @@
   <a href="https://rmux.io/">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="../rmux-wordmark-dark.svg">
-      <img src="../rmux-wordmark-light.svg" width="300" alt="RMUX">
+      <img src="../rmux-wordmark-light.svg" width="276" alt="RMUX">
     </picture>
   </a>
 </p>
 
-<p align="center"><strong>ユニバーサルなマルチプレクサエンジン。</strong></p>
-
-[English](../../README.md) · [Français](README.fr.md) · [简体中文](README.zh-CN.md) · 日本語
+<p align="center"><small><strong>ユニバーサルなマルチプレクサエンジン。</strong></small></p>
 
 <p align="center">
-  <a href="../../LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License: MIT OR Apache-2.0"></a>
-  <a href="https://github.com/Helvesec/rmux/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/Helvesec/rmux/ci.yml?branch=main&amp;event=push&amp;label=CI" alt="CI"></a><br>
+  <picture><source media="(prefers-color-scheme: dark)" srcset="../readme-hero-native-dark.svg"><img src="../readme-hero-native-light.svg" width="340" alt="Native on Windows, Linux, and macOS"></picture>
+</p>
+
+<p align="center">
+  <picture><source media="(prefers-color-scheme: dark)" srcset="../readme-hero-rule-dark.svg"><img src="../readme-hero-rule-light.svg" width="340" alt=""></picture>
+</p>
+
+<p align="center"><small><a href="../../README.md">English</a> · <a href="README.fr.md">Français</a> · <a href="README.zh-CN.md">简体中文</a> · 日本語</small></p>
+
+<p align="center">
+  <a href="#verification"><img src="https://img.shields.io/badge/unsafe-restricted-success.svg" alt="Unsafe policy"></a>
+  <a href="https://github.com/Helvesec/rmux/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/Helvesec/rmux/ci.yml?branch=main&amp;event=push&amp;label=CI" alt="CI"></a>
   <a href="https://www.bestpractices.dev/projects/13290"><img src="https://www.bestpractices.dev/projects/13290/badge" alt="OpenSSF Best Practices"></a>
-  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/rmux-0.7.0-informational.svg" alt="rmux 0.7.0"></a><br>
-  <a href="#installation"><img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg" alt="Platform: Linux | macOS | Windows"></a>
-  <a href="#verification"><img src="https://img.shields.io/badge/unsafe-restricted-success.svg" alt="Unsafe policy"></a><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/readme-mobile-toc-ja-title-adaptive-v4.svg"><img alt="" src="../sidebar/readme-desktop-inline-spacer.svg"></picture><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/ja-rx-01-adaptive-v4.svg"><img alt="" src="../sidebar/readme-desktop-inline-spacer.svg"></picture><a href="#what-is-rmux"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/ja-rx-31-adaptive-v4.svg"><img alt="RMUX とは？" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="#features"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/ja-rx-17-adaptive-v4.svg"><img alt="機能" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="#quick-start"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/ja-rx-23-adaptive-v4.svg"><img alt="クイックスタート" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="#demos"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/ja-rx-25-adaptive-v4.svg"><img alt="デモ" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/readme-mobile-toc-rule-adaptive-v4.svg"><img alt="" src="../sidebar/readme-desktop-inline-spacer.svg"></picture><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/ja-rx-05-adaptive-v4.svg"><img alt="" src="../sidebar/readme-desktop-inline-spacer.svg"></picture><a href="#installation"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/ja-rx-19-adaptive-v4.svg"><img alt="インストール" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="#web-sharing"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/ja-rx-29-adaptive-v4.svg"><img alt="Web 共有" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="#claude-teammate-mode"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/readme-mobile-toc-item-claude-agents-new-v2-adaptive-v4.svg"><img alt="Claude Agents" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="https://pypi.org/project/librmux/"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/ja-rx-21-adaptive-v4.svg"><img alt="Python SDK" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="https://www.npmjs.com/package/@rmux/sdk"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/readme-mobile-toc-item-typescript-sdk-adaptive-v4.svg"><img alt="TypeScript SDK" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/readme-mobile-toc-rule-adaptive-v4.svg"><img alt="" src="../sidebar/readme-desktop-inline-spacer.svg"></picture><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/ja-rx-03-adaptive-v4.svg"><img alt="" src="../sidebar/readme-desktop-inline-spacer.svg"></picture><a href="#documentation"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/ja-rx-11-adaptive-v4.svg"><img alt="ドキュメント" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="../benchmarks.md"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/readme-mobile-toc-item-benchmarks-new-v2-adaptive-v4.svg"><img alt="Benchmarks" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="https://rmux.io/docs/examples/"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/ja-rx-13-adaptive-v4.svg"><img alt="例" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="https://rmux.io/docs/faq/"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/ja-rx-15-adaptive-v4.svg"><img alt="FAQ" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="../../CONTRIBUTING.md"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/ja-rx-09-adaptive-v4.svg"><img alt="貢献" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a>
-</p>
-
-<p align="center">
-  <strong>概要</strong><br>
-  <a href="#what-is-rmux">RMUX とは？</a> ·
-  <a href="#features">機能</a> ·
-  <a href="#quick-start">クイックスタート</a> ·
-  <a href="#demos">デモ</a>
-</p>
-
-<p align="center">
-  <strong>RMUX を使う</strong><br>
-  <a href="#installation">インストール</a> ·
-  <a href="#web-sharing">Web 共有</a> ·
-  <a href="#claude-teammate-mode">Claude Agents</a> ·
-  <a href="https://pypi.org/project/librmux/">Python SDK</a> ·
-  <a href="https://www.npmjs.com/package/@rmux/sdk">TypeScript SDK</a>
-</p>
-
-<p align="center">
-  <strong>リソース</strong><br>
-  <a href="#documentation">ドキュメント</a> ·
-  <a href="../benchmarks.md">Benchmarks</a> ·
-  <a href="https://rmux.io/docs/examples/">例</a> ·
-  <a href="https://rmux.io/docs/faq/">FAQ</a> ·
-  <a href="../../CONTRIBUTING.md">貢献</a>
+  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/rmux-0.7.0-informational.svg" alt="rmux 0.7.0"></a>
 </p>
 
 </div>
+
 
 > [!NOTE]
 > RMUX には E2E Web 多重化機能があります。[詳しくはドキュメントを参照してください。](../web-share.md)
@@ -107,7 +88,7 @@ rmux split-window --help
 rmux web-share --help
 ```
 
-RMUX パッケージバージョンは `rmux -V` で確認できます。ビルドとサポートの詳細は `rmux diagnose --human` または `rmux diagnose --json` を使ってください。
+`rmux -V` でインストール済みのバージョンを確認できます。
 
 <a id="demos"></a>
 <a id="screenshots"></a>
@@ -130,127 +111,26 @@ RMUX を何に使えるかを示す短い例です。
 </div>
 
 <a id="installation"></a>
-<a id="install"></a>
 
 ## 📦 インストール
 
-<a id="install-linux"></a>
-<details>
-<summary><strong>Linux インストール</strong></summary>
+| プラットフォーム / マネージャー | コマンド |
+| :--- | :--- |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/apple.svg"><img src="../install/apple-light.svg" width="28" alt="macOS"></picture> / Homebrew | `brew install rmux` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / installer | `irm https://rmux.io/install.ps1 \| iex` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / WinGet | `winget install rmux` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / Scoop | `scoop bucket add rmux https://github.com/Helvesec/scoop-rmux && scoop install rmux` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / Chocolatey | `choco install rmux` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/linux.svg"><img src="../install/linux-light.svg" width="28" alt="Linux"></picture> / APT | [APT セットアップガイド](https://rmux.io/docs/get-started/)を参照 |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/linux.svg"><img src="../install/linux-light.svg" width="28" alt="Linux"></picture> / DNF | [DNF セットアップガイド](https://rmux.io/docs/get-started/)を参照 |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/linux.svg"><img src="../install/linux-light.svg" width="28" alt="Linux"></picture> <picture><source media="(prefers-color-scheme: dark)" srcset="../install/apple.svg"><img src="../install/apple-light.svg" width="28" alt="macOS"></picture> / Nix | `nix profile install github:Helvesec/rmux` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/rust.svg"><img src="../install/rust-light.svg" width="28" alt="Rust"></picture> / Cargo | `cargo install rmux --locked` |
 
-#### ポータブルインストーラ
+直接ダウンロード（`.tar.gz`、`.deb`、`.rpm`、`.zip`）は [v0.7.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.7.0) から利用できます。
 
-```sh
-curl -fsSL https://rmux.io/install.sh | sh
-```
+パッケージマネージャはレジストリ審査中に遅れることがあります。直接ダウンロードと rmux.io インストーラは現在の GitHub Release に追従します。
 
-#### APT
-
-```sh
-sudo install -d -m 0755 /etc/apt/keyrings
-curl -fsSL https://packages.rmux.io/debian/rmux.asc | sudo tee /etc/apt/keyrings/rmux.asc >/dev/null
-echo "deb [signed-by=/etc/apt/keyrings/rmux.asc] https://packages.rmux.io/debian stable main" | sudo tee /etc/apt/sources.list.d/rmux.list >/dev/null
-sudo apt update
-sudo apt install rmux
-```
-
-#### DNF
-
-```sh
-sudo curl -fsSL https://packages.rmux.io/rpm/rmux.repo -o /etc/yum.repos.d/rmux.repo
-sudo dnf install rmux
-```
-
-直接ダウンロードは [v0.7.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.7.0) で利用できます：
-
-- `rmux-0.7.0-linux-x86_64.tar.gz`
-- `rmux-0.7.0-linux-aarch64.tar.gz`
-- `rmux_0.7.0_amd64.deb`
-- `rmux_0.7.0_arm64.deb`
-- `rmux-0.7.0-1.x86_64.rpm`
-- `rmux-0.7.0-1.aarch64.rpm`
-
-</details>
-
-<a id="install-macos"></a>
-<details>
-<summary><strong>macOS インストール</strong></summary>
-
-#### ポータブルインストーラ
-
-```sh
-curl -fsSL https://rmux.io/install.sh | sh
-```
-
-#### Homebrew
-
-```sh
-brew install rmux
-```
-
-直接ダウンロードは [v0.7.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.7.0) で利用できます：
-
-- `rmux-0.7.0-macos-aarch64.tar.gz`
-- `rmux-0.7.0-macos-x86_64.tar.gz`
-
-</details>
-
-<a id="install-windows"></a>
-<details>
-<summary><strong>Windows インストール</strong></summary>
-
-#### PowerShell インストーラ
-
-```powershell
-irm https://rmux.io/install.ps1 | iex
-```
-
-#### Scoop
-
-```powershell
-scoop bucket add rmux https://github.com/Helvesec/scoop-rmux
-scoop install rmux
-```
-
-#### WinGet
-
-```powershell
-winget install rmux
-```
-
-#### Chocolatey
-
-```powershell
-choco install rmux
-```
-
-直接ダウンロードは [v0.7.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.7.0) で利用できます：
-
-- `rmux-0.7.0-windows-x86_64.zip`
-
-</details>
-
-<a id="install-cargo"></a>
-<details>
-<summary><strong>Rust / Cargo インストール</strong></summary>
-
-この方法は Linux、macOS、Windows で使えます。
-
-#### Rust をインストール
-
-```sh
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-#### RMUX をインストール
-
-```sh
-cargo install rmux --locked
-```
-
-</details>
-
-SHA256 チェックサムはすべての GitHub Release で公開されます。APT、DNF、Homebrew、Scoop、Chocolatey、WinGet のメタデータは同じ release asset から生成されます。
+リリースパッケージでは、高速な detached コマンドに小さな公開 CLI を使い、複雑な tmux 互換コマンド形式には非公開の完全 CLI helper を使う場合があります。Windows パッケージでは `rmux.exe` が軽量 dispatcher になり、完全 CLI は `libexec/rmux/rmux.exe` に配置されます。CLI 互換性の診断中に完全 helper を強制するには `RMUX_DISABLE_TINY_CLI=1` を設定してください。
 
 <a id="claude-teammate-mode"></a>
 
@@ -290,13 +170,9 @@ Linux と macOS では、RMUX は標準の system / user locations から `.rmux
 
 Windows では、RMUX は次の場所から `.rmux.conf` を読み込みます：
 
-1. `%XDG_CONFIG_HOME%
-mux
-mux.conf`
+1. `%XDG_CONFIG_HOME%\rmux\rmux.conf`
 2. `%USERPROFILE%\.rmux.conf`
-3. `%APPDATA%
-mux
-mux.conf`
+3. `%APPDATA%\rmux\rmux.conf`
 4. `%RMUX_CONFIG_FILE%`
 
 ### `tmux.conf` 互換性

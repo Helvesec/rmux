@@ -4,7 +4,7 @@
   <a href="https://rmux.io/">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="../rmux-logo-dark.svg">
-      <img src="../rmux-logo-light.svg" width="260" alt="RMUX logo">
+      <img src="../rmux-logo-light.svg" width="238" alt="RMUX logo">
     </picture>
   </a>
 </p>
@@ -13,51 +13,32 @@
   <a href="https://rmux.io/">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="../rmux-wordmark-dark.svg">
-      <img src="../rmux-wordmark-light.svg" width="300" alt="RMUX">
+      <img src="../rmux-wordmark-light.svg" width="276" alt="RMUX">
     </picture>
   </a>
 </p>
 
-<p align="center"><strong>通用多路复用引擎。</strong></p>
-
-[English](../../README.md) · [Français](README.fr.md) · 简体中文 · [日本語](README.ja.md)
+<p align="center"><small><strong>通用多路复用引擎。</strong></small></p>
 
 <p align="center">
-  <a href="../../LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License: MIT OR Apache-2.0"></a>
-  <a href="https://github.com/Helvesec/rmux/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/Helvesec/rmux/ci.yml?branch=main&amp;event=push&amp;label=CI" alt="CI"></a><br>
+  <picture><source media="(prefers-color-scheme: dark)" srcset="../readme-hero-native-dark.svg"><img src="../readme-hero-native-light.svg" width="340" alt="Native on Windows, Linux, and macOS"></picture>
+</p>
+
+<p align="center">
+  <picture><source media="(prefers-color-scheme: dark)" srcset="../readme-hero-rule-dark.svg"><img src="../readme-hero-rule-light.svg" width="340" alt=""></picture>
+</p>
+
+<p align="center"><small><a href="../../README.md">English</a> · <a href="README.fr.md">Français</a> · 简体中文 · <a href="README.ja.md">日本語</a></small></p>
+
+<p align="center">
+  <a href="#verification"><img src="https://img.shields.io/badge/unsafe-restricted-success.svg" alt="Unsafe policy"></a>
+  <a href="https://github.com/Helvesec/rmux/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/Helvesec/rmux/ci.yml?branch=main&amp;event=push&amp;label=CI" alt="CI"></a>
   <a href="https://www.bestpractices.dev/projects/13290"><img src="https://www.bestpractices.dev/projects/13290/badge" alt="OpenSSF Best Practices"></a>
-  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/rmux-0.7.0-informational.svg" alt="rmux 0.7.0"></a><br>
-  <a href="#installation"><img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg" alt="Platform: Linux | macOS | Windows"></a>
-  <a href="#verification"><img src="https://img.shields.io/badge/unsafe-restricted-success.svg" alt="Unsafe policy"></a><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/readme-mobile-toc-zh-title-adaptive-v4.svg"><img alt="" src="../sidebar/readme-desktop-inline-spacer.svg"></picture><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/zh-rx-01-adaptive-v4.svg"><img alt="" src="../sidebar/readme-desktop-inline-spacer.svg"></picture><a href="#what-is-rmux"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/zh-rx-31-adaptive-v4.svg"><img alt="RMUX 是什么？" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="#features"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/zh-rx-17-adaptive-v4.svg"><img alt="功能" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="#quick-start"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/zh-rx-23-adaptive-v4.svg"><img alt="快速开始" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="#demos"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/zh-rx-25-adaptive-v4.svg"><img alt="演示" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/readme-mobile-toc-rule-adaptive-v4.svg"><img alt="" src="../sidebar/readme-desktop-inline-spacer.svg"></picture><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/zh-rx-05-adaptive-v4.svg"><img alt="" src="../sidebar/readme-desktop-inline-spacer.svg"></picture><a href="#installation"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/zh-rx-19-adaptive-v4.svg"><img alt="安装" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="#web-sharing"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/zh-rx-29-adaptive-v4.svg"><img alt="Web 分享" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="#claude-teammate-mode"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/readme-mobile-toc-item-claude-agents-new-v2-adaptive-v4.svg"><img alt="Claude Agents" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="https://pypi.org/project/librmux/"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/zh-rx-21-adaptive-v4.svg"><img alt="Python SDK" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="https://www.npmjs.com/package/@rmux/sdk"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/readme-mobile-toc-item-typescript-sdk-adaptive-v4.svg"><img alt="TypeScript SDK" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/readme-mobile-toc-rule-adaptive-v4.svg"><img alt="" src="../sidebar/readme-desktop-inline-spacer.svg"></picture><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/zh-rx-03-adaptive-v4.svg"><img alt="" src="../sidebar/readme-desktop-inline-spacer.svg"></picture><a href="#documentation"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/zh-rx-11-adaptive-v4.svg"><img alt="文档" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="../benchmarks.md"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/readme-mobile-toc-item-benchmarks-new-v2-adaptive-v4.svg"><img alt="Benchmarks" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="https://rmux.io/docs/examples/"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/zh-rx-13-adaptive-v4.svg"><img alt="示例" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="https://rmux.io/docs/faq/"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/zh-rx-15-adaptive-v4.svg"><img alt="FAQ" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a><a href="../../CONTRIBUTING.md"><picture><source media="(max-width: 767px) and (hover: none) and (pointer: coarse)" srcset="../sidebar/zh-rx-09-adaptive-v4.svg"><img alt="贡献" src="../sidebar/readme-desktop-inline-spacer.svg"></picture></a>
-</p>
-
-<p align="center">
-  <strong>概览</strong><br>
-  <a href="#what-is-rmux">RMUX 是什么？</a> ·
-  <a href="#features">功能</a> ·
-  <a href="#quick-start">快速开始</a> ·
-  <a href="#demos">演示</a>
-</p>
-
-<p align="center">
-  <strong>使用 RMUX</strong><br>
-  <a href="#installation">安装</a> ·
-  <a href="#web-sharing">Web 分享</a> ·
-  <a href="#claude-teammate-mode">Claude Agents</a> ·
-  <a href="https://pypi.org/project/librmux/">Python SDK</a> ·
-  <a href="https://www.npmjs.com/package/@rmux/sdk">TypeScript SDK</a>
-</p>
-
-<p align="center">
-  <strong>资源</strong><br>
-  <a href="#documentation">文档</a> ·
-  <a href="../benchmarks.md">Benchmarks</a> ·
-  <a href="https://rmux.io/docs/examples/">示例</a> ·
-  <a href="https://rmux.io/docs/faq/">FAQ</a> ·
-  <a href="../../CONTRIBUTING.md">贡献</a>
+  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/rmux-0.7.0-informational.svg" alt="rmux 0.7.0"></a>
 </p>
 
 </div>
+
 
 > [!NOTE]
 > RMUX 现在具备 E2E Web 复用功能。[在文档中了解更多。](../web-share.md)
@@ -107,7 +88,7 @@ rmux split-window --help
 rmux web-share --help
 ```
 
-使用 `rmux -V` 查看 RMUX 包版本。构建和支持详情可使用 `rmux diagnose --human` 或 `rmux diagnose --json`。
+使用 `rmux -V` 查看已安装版本。
 
 <a id="demos"></a>
 <a id="screenshots"></a>
@@ -130,127 +111,26 @@ rmux web-share --help
 </div>
 
 <a id="installation"></a>
-<a id="install"></a>
 
 ## 📦 安装
 
-<a id="install-linux"></a>
-<details>
-<summary><strong>Linux 安装</strong></summary>
+| 平台 / 管理器 | 命令 |
+| :--- | :--- |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/apple.svg"><img src="../install/apple-light.svg" width="28" alt="macOS"></picture> / Homebrew | `brew install rmux` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / installer | `irm https://rmux.io/install.ps1 \| iex` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / WinGet | `winget install rmux` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / Scoop | `scoop bucket add rmux https://github.com/Helvesec/scoop-rmux && scoop install rmux` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / Chocolatey | `choco install rmux` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/linux.svg"><img src="../install/linux-light.svg" width="28" alt="Linux"></picture> / APT | 参见 [APT 设置指南](https://rmux.io/docs/get-started/) |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/linux.svg"><img src="../install/linux-light.svg" width="28" alt="Linux"></picture> / DNF | 参见 [DNF 设置指南](https://rmux.io/docs/get-started/) |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/linux.svg"><img src="../install/linux-light.svg" width="28" alt="Linux"></picture> <picture><source media="(prefers-color-scheme: dark)" srcset="../install/apple.svg"><img src="../install/apple-light.svg" width="28" alt="macOS"></picture> / Nix | `nix profile install github:Helvesec/rmux` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/rust.svg"><img src="../install/rust-light.svg" width="28" alt="Rust"></picture> / Cargo | `cargo install rmux --locked` |
 
-#### 便携安装器
+直接下载（`.tar.gz`、`.deb`、`.rpm`、`.zip`）可在 [v0.7.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.7.0) 获取。
 
-```sh
-curl -fsSL https://rmux.io/install.sh | sh
-```
+包管理器在注册表审核新版本时可能会滞后；直接下载和 rmux.io 安装器会跟随当前 GitHub Release。
 
-#### APT
-
-```sh
-sudo install -d -m 0755 /etc/apt/keyrings
-curl -fsSL https://packages.rmux.io/debian/rmux.asc | sudo tee /etc/apt/keyrings/rmux.asc >/dev/null
-echo "deb [signed-by=/etc/apt/keyrings/rmux.asc] https://packages.rmux.io/debian stable main" | sudo tee /etc/apt/sources.list.d/rmux.list >/dev/null
-sudo apt update
-sudo apt install rmux
-```
-
-#### DNF
-
-```sh
-sudo curl -fsSL https://packages.rmux.io/rpm/rmux.repo -o /etc/yum.repos.d/rmux.repo
-sudo dnf install rmux
-```
-
-直接下载可在 [v0.7.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.7.0) 获取：
-
-- `rmux-0.7.0-linux-x86_64.tar.gz`
-- `rmux-0.7.0-linux-aarch64.tar.gz`
-- `rmux_0.7.0_amd64.deb`
-- `rmux_0.7.0_arm64.deb`
-- `rmux-0.7.0-1.x86_64.rpm`
-- `rmux-0.7.0-1.aarch64.rpm`
-
-</details>
-
-<a id="install-macos"></a>
-<details>
-<summary><strong>macOS 安装</strong></summary>
-
-#### 便携安装器
-
-```sh
-curl -fsSL https://rmux.io/install.sh | sh
-```
-
-#### Homebrew
-
-```sh
-brew install rmux
-```
-
-直接下载可在 [v0.7.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.7.0) 获取：
-
-- `rmux-0.7.0-macos-aarch64.tar.gz`
-- `rmux-0.7.0-macos-x86_64.tar.gz`
-
-</details>
-
-<a id="install-windows"></a>
-<details>
-<summary><strong>Windows 安装</strong></summary>
-
-#### PowerShell 安装器
-
-```powershell
-irm https://rmux.io/install.ps1 | iex
-```
-
-#### Scoop
-
-```powershell
-scoop bucket add rmux https://github.com/Helvesec/scoop-rmux
-scoop install rmux
-```
-
-#### WinGet
-
-```powershell
-winget install rmux
-```
-
-#### Chocolatey
-
-```powershell
-choco install rmux
-```
-
-直接下载可在 [v0.7.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.7.0) 获取：
-
-- `rmux-0.7.0-windows-x86_64.zip`
-
-</details>
-
-<a id="install-cargo"></a>
-<details>
-<summary><strong>Rust / Cargo 安装</strong></summary>
-
-此路径适用于 Linux、macOS 和 Windows。
-
-#### 安装 Rust
-
-```sh
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-#### 安装 RMUX
-
-```sh
-cargo install rmux --locked
-```
-
-</details>
-
-每个 GitHub Release 都会发布 SHA256 校验和。APT、DNF、Homebrew、Scoop、Chocolatey 和 WinGet 元数据都从同一组 release assets 生成。
+发布包可能会为常用的 detached 命令使用轻量公开 CLI，并为复杂的 tmux 兼容命令形式使用私有完整 CLI helper。Windows 包将 `rmux.exe` 作为轻量 dispatcher，并把完整 CLI 放在 `libexec/rmux/rmux.exe` 下。诊断 CLI 兼容性问题时，可设置 `RMUX_DISABLE_TINY_CLI=1` 强制使用完整 helper。
 
 <a id="claude-teammate-mode"></a>
 
@@ -290,13 +170,9 @@ Claude 的 `PATH` 最前面。它严格限定在 Claude 进程内，不会与你
 
 在 Windows 上，RMUX 会从以下位置读取 `.rmux.conf`：
 
-1. `%XDG_CONFIG_HOME%
-mux
-mux.conf`
+1. `%XDG_CONFIG_HOME%\rmux\rmux.conf`
 2. `%USERPROFILE%\.rmux.conf`
-3. `%APPDATA%
-mux
-mux.conf`
+3. `%APPDATA%\rmux\rmux.conf`
 4. `%RMUX_CONFIG_FILE%`
 
 ### `tmux.conf` 兼容性
