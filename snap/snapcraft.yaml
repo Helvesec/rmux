@@ -38,7 +38,6 @@ parts:
     source: .
     after:
       - rust-deps
-    rust-channel: stable
     rust-path:
       - .
     override-build: |
