@@ -141,13 +141,13 @@ async fn pane_management_requests_round_trip_through_the_socket() -> Result<(), 
     );
 
     let selected = client
-        .send_request(&Request::SelectPane(SelectPaneRequest {
+        .send_request(&Request::SelectPane(Box::new(SelectPaneRequest {
             target: PaneTarget::new(session, 2),
             title: None,
             style: None,
             input_disabled: None,
             preserve_zoom: false,
-        }))
+        })))
         .await?;
     assert_eq!(
         selected,
@@ -455,7 +455,7 @@ async fn killing_the_last_pane_destroys_the_window_and_session_targets_fall_back
     assert!(matches!(created, Response::NewSession(_)));
 
     let created_window = client
-        .send_request(&Request::NewWindow(NewWindowRequest {
+        .send_request(&Request::NewWindow(Box::new(NewWindowRequest {
             target: session.clone(),
             name: Some("scratch".to_owned()),
             detached: true,
@@ -465,7 +465,7 @@ async fn killing_the_last_pane_destroys_the_window_and_session_targets_fall_back
             process_command: None,
             target_window_index: None,
             insert_at_target: false,
-        }))
+        })))
         .await?;
     assert_eq!(
         created_window,

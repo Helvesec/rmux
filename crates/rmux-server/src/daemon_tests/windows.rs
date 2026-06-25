@@ -152,13 +152,13 @@ async fn windows_daemon_empty_listing_requests_succeed() -> io::Result<()> {
                 target_window_index: None,
                 format: None,
             }),
-            Request::ListClients(ListClientsRequest {
+            Request::ListClients(Box::new(ListClientsRequest {
                 format: None,
                 filter: None,
                 sort_order: None,
                 reversed: false,
                 target_session: None,
-            }),
+            })),
         ];
 
         requests

@@ -114,6 +114,7 @@ dpkg-deb -x "$archive_abs" "$tmpdir/root"
 
 for required in \
   usr/bin/rmux \
+  usr/libexec/rmux/rmux \
   usr/bin/rmux-daemon \
   usr/share/man/man1/rmux.1.gz \
   usr/share/doc/rmux/README.md \
@@ -124,11 +125,12 @@ do
   [ -e "$tmpdir/root/$required" ] || die "missing package file: $required"
 done
 [ -x "$tmpdir/root/usr/bin/rmux" ] || die "packaged rmux is not executable"
+[ -x "$tmpdir/root/usr/libexec/rmux/rmux" ] || die "packaged private helper is not executable"
 [ -x "$tmpdir/root/usr/bin/rmux-daemon" ] || die "packaged rmux-daemon is not executable"
 
 metadata="$tmpdir/root/usr/share/rmux/artifact-metadata.json"
 grep -q '"artifact_kind"[[:space:]]*:[[:space:]]*"debian-package-binary"' "$metadata" || die "metadata artifact_kind is not debian-package-binary"
-grep -q '"package_layout"[[:space:]]*:[[:space:]]*"rmux-debian-package-v1"' "$metadata" || die "metadata package_layout is not rmux-debian-package-v1"
+grep -q '"package_layout"[[:space:]]*:[[:space:]]*"rmux-debian-package-v2"' "$metadata" || die "metadata package_layout is not rmux-debian-package-v2"
 if [ "$require_release_artifact" -eq 1 ]; then
   grep -q '"release_artifact"[[:space:]]*:[[:space:]]*true' "$metadata" || die "metadata release_artifact is not true"
 fi
@@ -136,6 +138,10 @@ metadata_binary_hash="$(sed -n 's/.*"binary_sha256"[[:space:]]*:[[:space:]]*"\([
 [ -n "$metadata_binary_hash" ] || die "metadata binary_sha256 is missing or invalid"
 packaged_binary_hash="$(sha256_file "$tmpdir/root/usr/bin/rmux")"
 [ "$metadata_binary_hash" = "$packaged_binary_hash" ] || die "metadata binary_sha256 does not match packaged binary"
+metadata_helper_hash="$(sed -n 's/.*"helper_binary_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$metadata" | head -n 1 | tr 'A-F' 'a-f')"
+[ -n "$metadata_helper_hash" ] || die "metadata helper_binary_sha256 is missing or invalid"
+packaged_helper_hash="$(sha256_file "$tmpdir/root/usr/libexec/rmux/rmux")"
+[ "$metadata_helper_hash" = "$packaged_helper_hash" ] || die "metadata helper_binary_sha256 does not match packaged private helper"
 metadata_daemon_hash="$(sed -n 's/.*"daemon_binary_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$metadata" | head -n 1 | tr 'A-F' 'a-f')"
 [ -n "$metadata_daemon_hash" ] || die "metadata daemon_binary_sha256 is missing or invalid"
 packaged_daemon_hash="$(sha256_file "$tmpdir/root/usr/bin/rmux-daemon")"
@@ -150,5 +156,6 @@ fi
 printf 'package=%s\n' "$archive_abs"
 printf 'sha256=%s\n' "$actual_hash"
 printf 'binary_sha256=%s\n' "$packaged_binary_hash"
+printf 'helper_binary_sha256=%s\n' "$packaged_helper_hash"
 printf 'daemon_binary_sha256=%s\n' "$packaged_daemon_hash"
 printf 'run_binary=%s\n' "$([ "$run_binary" -eq 1 ] && printf true || printf false)"

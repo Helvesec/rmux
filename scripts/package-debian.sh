@@ -81,6 +81,16 @@ update_checksums() {
   printf '%s\n' "$hash"
 }
 
+strip_linux_tiny_binary() {
+  local binary_path
+  binary_path="$1"
+
+  [ "$configuration" = "release" ] || return 0
+  [ "${RMUX_PACKAGE_STRIP_TINY:-1}" = "1" ] || return 0
+  command -v strip >/dev/null 2>&1 || return 0
+  strip -s "$binary_path" || die "failed to strip package binary: $binary_path"
+}
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 configuration="release"
 target="x86_64-unknown-linux-gnu"
@@ -167,16 +177,20 @@ cargo_args=(build --package rmux --locked --target "$target")
 if [ "$configuration" = "release" ]; then
   cargo_args+=(--release)
 fi
-if [ "$skip_build" -eq 0 ]; then
-  cargo "${cargo_args[@]}" --bin rmux
-  cargo "${cargo_args[@]}" --bin rmux-daemon
-fi
 
 target_dir="${CARGO_TARGET_DIR:-target}"
 binary="$target_dir/$target/$profile_dir/rmux"
+helper_binary="$target_dir/$target/$profile_dir/rmux-full"
 daemon_binary="$target_dir/$target/$profile_dir/rmux-daemon"
 completion_cache="${RMUX_COMPLETIONS_DIR:-$target_dir/$target/$profile_dir/completions}"
+if [ "$skip_build" -eq 0 ]; then
+  cargo "${cargo_args[@]}" --bin rmux
+  cp "$binary" "$helper_binary"
+  cargo "${cargo_args[@]}" --features tiny-cli --bin rmux
+  cargo "${cargo_args[@]}" --bin rmux-daemon
+fi
 [ -x "$binary" ] || die "expected executable binary was not found: $binary"
+[ -x "$helper_binary" ] || die "expected executable private helper binary was not found: $helper_binary"
 [ -x "$daemon_binary" ] || die "expected executable daemon binary was not found: $daemon_binary"
 
 dist_dir="$(mkdir -p "$output_dir" && cd "$output_dir" && pwd)"
@@ -195,6 +209,7 @@ rm -rf "$stage_dir"
 mkdir -p \
   "$stage_dir/DEBIAN" \
   "$stage_dir/usr/bin" \
+  "$stage_dir/usr/libexec/rmux" \
   "$stage_dir/usr/share/doc/rmux" \
   "$stage_dir/usr/share/bash-completion/completions" \
   "$stage_dir/usr/share/zsh/site-functions" \
@@ -205,8 +220,10 @@ mkdir -p \
   "$stage_dir/usr/share/rmux"
 
 install -m 0755 "$binary" "$stage_dir/usr/bin/rmux"
+install -m 0755 "$helper_binary" "$stage_dir/usr/libexec/rmux/rmux"
 install -m 0755 "$daemon_binary" "$stage_dir/usr/bin/rmux-daemon"
-gzip -n -c rmux.1 > "$stage_dir/usr/share/man/man1/rmux.1.gz"
+strip_linux_tiny_binary "$stage_dir/usr/bin/rmux"
+gzip -n -c docs/man/rmux.1 > "$stage_dir/usr/share/man/man1/rmux.1.gz"
 completion_tmp="$(mktemp -d "${TMPDIR:-/tmp}/rmux-completions.XXXXXX")"
 if [ "$skip_build" -eq 0 ]; then
   cargo run --quiet --package xtask -- generate-completions --output-dir "$completion_tmp" >/dev/null
@@ -228,12 +245,18 @@ install -m 0644 "$completion_tmp/rmux.elv" "$stage_dir/usr/share/elvish/lib/rmux
 install -m 0644 README.md "$stage_dir/usr/share/doc/rmux/README.md"
 install -m 0644 LICENSE-APACHE LICENSE-MIT "$stage_dir/usr/share/doc/rmux/"
 
-binary_abs="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"
-daemon_binary_abs="$(cd "$(dirname "$daemon_binary")" && pwd)/$(basename "$daemon_binary")"
-binary_sha256="$(sha256_file "$binary")"
-daemon_binary_sha256="$(sha256_file "$daemon_binary")"
-binary_bytes="$(wc -c < "$binary" | tr -d ' ')"
-daemon_binary_bytes="$(wc -c < "$daemon_binary" | tr -d ' ')"
+packaged_binary="$stage_dir/usr/bin/rmux"
+packaged_helper="$stage_dir/usr/libexec/rmux/rmux"
+packaged_daemon="$stage_dir/usr/bin/rmux-daemon"
+binary_abs="$(cd "$(dirname "$packaged_binary")" && pwd)/$(basename "$packaged_binary")"
+helper_binary_abs="$(cd "$(dirname "$packaged_helper")" && pwd)/$(basename "$packaged_helper")"
+daemon_binary_abs="$(cd "$(dirname "$packaged_daemon")" && pwd)/$(basename "$packaged_daemon")"
+binary_sha256="$(sha256_file "$packaged_binary")"
+helper_binary_sha256="$(sha256_file "$packaged_helper")"
+daemon_binary_sha256="$(sha256_file "$packaged_daemon")"
+binary_bytes="$(wc -c < "$packaged_binary" | tr -d ' ')"
+helper_binary_bytes="$(wc -c < "$packaged_helper" | tr -d ' ')"
+daemon_binary_bytes="$(wc -c < "$packaged_daemon" | tr -d ' ')"
 git_commit="$(git rev-parse HEAD)"
 git_dirty=false
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
@@ -252,6 +275,9 @@ cat > "$stage_dir/usr/share/rmux/artifact-metadata.json" <<EOF
   "binary_path": "$(printf '%s' "$binary_abs" | json_escape)",
   "binary_sha256": "$binary_sha256",
   "binary_bytes": $binary_bytes,
+  "helper_binary_path": "$(printf '%s' "$helper_binary_abs" | json_escape)",
+  "helper_binary_sha256": "$helper_binary_sha256",
+  "helper_binary_bytes": $helper_binary_bytes,
   "daemon_binary_path": "$(printf '%s' "$daemon_binary_abs" | json_escape)",
   "daemon_binary_sha256": "$daemon_binary_sha256",
   "daemon_binary_bytes": $daemon_binary_bytes,
@@ -265,7 +291,7 @@ cat > "$stage_dir/usr/share/rmux/artifact-metadata.json" <<EOF
   "package_name": "$package_name",
   "package_target": "$target",
   "package_target_label": "$platform_label",
-  "package_layout": "rmux-debian-package-v1",
+  "package_layout": "rmux-debian-package-v2",
   "archive_format": "deb",
   "skip_build": $([ "$skip_build" -eq 1 ] && printf true || printf false),
   "reuse_release_binary": $([ "$reuse_release_binary" -eq 1 ] && printf true || printf false),
@@ -313,5 +339,6 @@ archive_sha256="$(update_checksums "$checksums_path" "$archive_path")"
 printf 'package=%s\n' "$archive_path"
 printf 'sha256=%s\n' "$archive_sha256"
 printf 'binary_sha256=%s\n' "$binary_sha256"
+printf 'helper_binary_sha256=%s\n' "$helper_binary_sha256"
 printf 'daemon_binary_sha256=%s\n' "$daemon_binary_sha256"
 printf 'release_artifact=%s\n' "$release_artifact"

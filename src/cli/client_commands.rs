@@ -1,17 +1,24 @@
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
+use rmux_client::attach_terminal_with_initial_bytes;
+#[cfg(unix)]
 use rmux_client::attach_terminal_with_initial_bytes_and_resize_geometry;
+#[cfg(windows)]
+use rmux_client::attach_terminal_with_initial_bytes_and_windows_console_key;
 #[cfg(unix)]
 use rmux_client::AttachError;
 use rmux_client::{
-    attach_terminal_with_initial_bytes, connect, detect_context, drive_control_mode,
-    AttachTransition, ClientContext, ClientError, Connection, ControlTransition,
+    connect, detect_context, drive_control_mode, AttachTransition, ClientContext, ClientError,
+    Connection, ControlTransition,
 };
 use rmux_proto::request::{
     AttachSessionExt2Request, AttachSessionExt3Request, DetachClientExtRequest, ListClientsRequest,
     RefreshClientRequest, SuspendClientRequest, SwitchClientExt3Request,
 };
+#[cfg(windows)]
+use rmux_proto::CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY;
 use rmux_proto::{
     ClientTerminalContext, ControlMode, ErrorResponse, Response, CAPABILITY_ATTACH_RENDER,
     CAPABILITY_ATTACH_RESIZE_GEOMETRY,
@@ -82,7 +89,8 @@ pub(super) fn run_attach_session(
     startup: StartupOptions,
     client_terminal: ClientTerminalContext,
 ) -> Result<i32, ExitFailure> {
-    let nested_context = detect_context() == ClientContext::Nested;
+    let nested_context =
+        detect_context() == ClientContext::Nested && inherited_rmux_socket_matches(socket_path);
     if nested_context {
         validate_nested_attach_session(&args)?;
     }
@@ -132,6 +140,51 @@ pub(super) fn run_attach_session(
     }
 
     attach_with_connection(connection, request)
+}
+
+fn inherited_rmux_socket_matches(socket_path: &Path) -> bool {
+    inherited_rmux_socket_matches_from_env(std::env::var_os("RMUX").as_deref(), socket_path)
+}
+
+fn inherited_rmux_socket_matches_from_env(rmux: Option<&OsStr>, socket_path: &Path) -> bool {
+    let Some(inherited_socket) = rmux.and_then(rmux_socket_path_from_env) else {
+        return false;
+    };
+    socket_paths_match(&inherited_socket, socket_path)
+}
+
+fn rmux_socket_path_from_env(value: &OsStr) -> Option<PathBuf> {
+    let value = value.to_string_lossy();
+    let path = value
+        .split_once(',')
+        .map_or(value.as_ref(), |(path, _)| path);
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+fn socket_paths_match(left: &Path, right: &Path) -> bool {
+    let left = canonical_socket_path(left);
+    let right = canonical_socket_path(right);
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn canonical_socket_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(file_name)) => std::fs::canonicalize(parent)
+            .map(|canonical_parent| canonical_parent.join(file_name))
+            .unwrap_or_else(|_| path.to_path_buf()),
+        _ => path.to_path_buf(),
+    }
 }
 
 fn validate_nested_attach_session(args: &AttachSessionArgs) -> Result<(), ExitFailure> {
@@ -354,6 +407,10 @@ pub(super) fn attach_with_connection(
     let attach_render = connection
         .supports_capability(CAPABILITY_ATTACH_RENDER)
         .map_err(ExitFailure::from_client)?;
+    #[cfg(windows)]
+    let attach_windows_console_key = connection
+        .supports_capability(CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY)
+        .map_err(ExitFailure::from_client)?;
     let transition = if attach_render {
         connection
             .begin_attach_with_capabilities(AttachSessionExt3Request::from_ext2(
@@ -382,8 +439,12 @@ pub(super) fn attach_with_connection(
             #[cfg(windows)]
             {
                 let _ = attach_resize_geometry;
-                attach_terminal_with_initial_bytes(stream, initial_bytes)
-                    .map_err(attach_terminal_exit_failure)?;
+                attach_terminal_with_initial_bytes_and_windows_console_key(
+                    stream,
+                    initial_bytes,
+                    attach_windows_console_key,
+                )
+                .map_err(attach_terminal_exit_failure)?;
             }
             Ok(0)
         }
@@ -420,22 +481,44 @@ pub(super) fn optional_client_flags(flags: Vec<String>) -> Option<Vec<String>> {
     (!flags.is_empty()).then_some(flags)
 }
 
-#[cfg(all(test, windows))]
+#[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    #[cfg(windows)]
     use rmux_proto::ClientTerminalContext;
 
-    use super::apply_windows_terminal_features;
+    use super::inherited_rmux_socket_matches_from_env;
 
+    #[test]
+    fn nested_attach_only_rewrites_when_inherited_rmux_socket_matches() {
+        assert!(inherited_rmux_socket_matches_from_env(
+            Some(OsStr::new("/tmp/rmux-1000/default,123,0")),
+            Path::new("/tmp/rmux-1000/default"),
+        ));
+        assert!(!inherited_rmux_socket_matches_from_env(
+            Some(OsStr::new("/tmp/rmux-1000/default,123,0")),
+            Path::new("/tmp/rmux-1000/other"),
+        ));
+        assert!(!inherited_rmux_socket_matches_from_env(
+            None,
+            Path::new("/tmp/rmux-1000/default"),
+        ));
+    }
+
+    #[cfg(windows)]
     #[test]
     fn windows_terminal_features_are_sent_by_client_context() {
         let mut context = ClientTerminalContext::default();
 
-        apply_windows_terminal_features(&mut context);
+        super::apply_windows_terminal_features(&mut context);
 
         assert!(context.utf8);
         assert_eq!(context.terminal_features, vec!["sync", "bpaste", "mouse"]);
     }
 
+    #[cfg(windows)]
     #[test]
     fn detected_windows_terminal_features_are_not_duplicated() {
         let mut context = ClientTerminalContext {
@@ -443,7 +526,7 @@ mod tests {
             utf8: false,
         };
 
-        apply_windows_terminal_features(&mut context);
+        super::apply_windows_terminal_features(&mut context);
 
         assert!(context.utf8);
         assert_eq!(context.terminal_features, vec!["SYNC", "BPASTE", "MOUSE"]);

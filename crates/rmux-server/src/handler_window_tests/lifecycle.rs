@@ -7,7 +7,7 @@ async fn new_window_detached_leaves_the_active_window_unchanged() {
     create_session(&handler, "alpha").await;
 
     let response = handler
-        .handle(Request::NewWindow(NewWindowRequest {
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
             target: alpha.clone(),
             name: None,
             detached: true,
@@ -17,7 +17,7 @@ async fn new_window_detached_leaves_the_active_window_unchanged() {
             process_command: None,
             target_window_index: None,
             insert_at_target: false,
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -47,7 +47,7 @@ async fn named_new_window_disables_automatic_rename_option() {
     create_session(&handler, "alpha-named-new-window").await;
 
     let response = handler
-        .handle(Request::NewWindow(NewWindowRequest {
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
             target: alpha.clone(),
             name: Some("logs".to_owned()),
             detached: true,
@@ -57,7 +57,7 @@ async fn named_new_window_disables_automatic_rename_option() {
             process_command: None,
             target_window_index: Some(1),
             insert_at_target: false,
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -458,7 +458,7 @@ async fn new_window_reuses_the_lowest_available_index_after_kill() {
 
     assert_eq!(
         handler
-            .handle(Request::NewWindow(NewWindowRequest {
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
                 target: alpha.clone(),
                 name: None,
                 detached: true,
@@ -468,7 +468,7 @@ async fn new_window_reuses_the_lowest_available_index_after_kill() {
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await,
         Response::NewWindow(rmux_proto::NewWindowResponse {
             target: WindowTarget::with_window(alpha.clone(), 1),
@@ -488,7 +488,7 @@ async fn new_window_reuses_the_lowest_available_index_after_kill() {
     );
 
     let response = handler
-        .handle(Request::NewWindow(NewWindowRequest {
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
             target: alpha.clone(),
             name: Some("reused".to_owned()),
             detached: true,
@@ -498,7 +498,7 @@ async fn new_window_reuses_the_lowest_available_index_after_kill() {
             process_command: None,
             target_window_index: None,
             insert_at_target: false,
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -544,7 +544,7 @@ async fn new_window_does_not_mutate_the_session_when_existing_terminals_are_miss
     };
 
     let response = handler
-        .handle(Request::NewWindow(NewWindowRequest {
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
             target: alpha.clone(),
             name: None,
             detached: true,
@@ -554,7 +554,7 @@ async fn new_window_does_not_mutate_the_session_when_existing_terminals_are_miss
             process_command: None,
             target_window_index: None,
             insert_at_target: false,
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -681,7 +681,7 @@ async fn kill_window_cleans_grouped_member_window_metadata_before_synchronizing(
     insert_window(&handler, &alpha, 1).await;
 
     let grouped = handler
-        .handle(Request::NewSessionExt(NewSessionExtRequest {
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: Some(beta.clone()),
             working_directory: None,
             detached: true,
@@ -702,7 +702,7 @@ async fn kill_window_cleans_grouped_member_window_metadata_before_synchronizing(
             process_command: None,
             client_environment: None,
             skip_environment_update: false,
-        }))
+        })))
         .await;
     assert!(matches!(grouped, Response::NewSession(_)));
 

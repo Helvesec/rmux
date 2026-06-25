@@ -191,7 +191,7 @@ fn killing_the_last_pane_destroys_the_window_and_session_targets_fall_back(
     assert!(matches!(created, Response::NewSession(_)));
 
     assert_eq!(
-        connection.roundtrip(&Request::NewWindow(NewWindowRequest {
+        connection.roundtrip(&Request::NewWindow(Box::new(NewWindowRequest {
             target: session.clone(),
             name: Some("scratch".to_owned()),
             detached: true,
@@ -201,7 +201,7 @@ fn killing_the_last_pane_destroys_the_window_and_session_targets_fall_back(
             process_command: None,
             target_window_index: None,
             insert_at_target: false,
-        }))?,
+        })))?,
         Response::NewWindow(NewWindowResponse {
             target: WindowTarget::with_window(session.clone(), 1),
         })

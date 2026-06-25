@@ -35,25 +35,11 @@ where
             break;
         }
         if bytes[i] != b'#' {
-            // Copy one UTF-8 character. `#` is ASCII so all multi-byte
-            // sequences are guaranteed not to contain it.
             let start = i;
-            if bytes[i] < 0x80 {
-                out.push(bytes[i] as char);
+            while i < bytes.len() && bytes[i] != b'#' {
                 i += 1;
-            } else {
-                // Determine UTF-8 character length from the leading byte.
-                let char_len = if bytes[i] & 0xE0 == 0xC0 {
-                    2
-                } else if bytes[i] & 0xF0 == 0xE0 {
-                    3
-                } else {
-                    4
-                };
-                let end = (start + char_len).min(bytes.len());
-                out.push_str(&fmt[start..end]);
-                i = end;
             }
+            out.push_str(&fmt[start..i]);
             continue;
         }
 

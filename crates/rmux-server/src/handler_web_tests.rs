@@ -16,14 +16,15 @@ async fn web_share_create_starts_lazy_listener() {
     let session_name = new_session(&handler, "lazy-start").await;
 
     let response = handler
-        .handle(Request::WebShare(WebShareRequest::Create(share_request(
-            WebShareScope::Session(session_name),
+        .handle(Request::WebShare(Box::new(WebShareRequest::Create(
+            share_request(WebShareScope::Session(session_name)),
         ))))
         .await;
 
     assert!(matches!(
         response,
-        Response::WebShare(rmux_proto::WebShareResponse::Created(_))
+        Response::WebShare(response)
+            if matches!(response.as_ref(), rmux_proto::WebShareResponse::Created(_))
     ));
 }
 
@@ -33,15 +34,43 @@ async fn web_share_config_starts_lazy_listener() {
     let handler = handler_with_web_port(port);
 
     let response = handler
-        .handle(Request::WebShare(WebShareRequest::Config(
+        .handle(Request::WebShare(Box::new(WebShareRequest::Config(
             rmux_proto::WebShareConfigRequest,
-        )))
+        ))))
         .await;
 
-    let Response::WebShare(rmux_proto::WebShareResponse::Config(config)) = response else {
+    let Response::WebShare(response) = response else {
+        panic!("expected web-share config response");
+    };
+    let rmux_proto::WebShareResponse::Config(config) = *response else {
         panic!("expected web-share config response");
     };
     assert_eq!(config.listener.port, port);
+}
+
+#[tokio::test]
+async fn implicit_web_share_port_falls_back_when_default_is_busy() {
+    let blocker = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind blocker");
+    let blocked_port = blocker.local_addr().expect("blocker addr").port();
+    let handler = handler_with_web_settings(
+        crate::web::WebShareSettings::from_options_with_port_explicit(blocked_port, None, false)
+            .expect("web settings"),
+    );
+
+    let response = handler
+        .handle(Request::WebShare(Box::new(WebShareRequest::Config(
+            rmux_proto::WebShareConfigRequest,
+        ))))
+        .await;
+
+    let Response::WebShare(response) = response else {
+        panic!("expected web-share config response");
+    };
+    let rmux_proto::WebShareResponse::Config(config) = *response else {
+        panic!("expected web-share config response");
+    };
+    assert_eq!(config.listener.host, "127.0.0.1");
+    assert_ne!(config.listener.port, blocked_port);
 }
 
 #[tokio::test]
@@ -53,21 +82,23 @@ async fn concurrent_web_share_create_waits_for_lazy_listener_start() {
     let left_handler = handler.clone();
     let right_handler = handler.clone();
     let (left, right) = tokio::join!(
-        left_handler.handle(Request::WebShare(WebShareRequest::Create(share_request(
-            WebShareScope::Session(alpha),
+        left_handler.handle(Request::WebShare(Box::new(WebShareRequest::Create(
+            share_request(WebShareScope::Session(alpha),)
         )))),
-        right_handler.handle(Request::WebShare(WebShareRequest::Create(share_request(
-            WebShareScope::Session(beta),
+        right_handler.handle(Request::WebShare(Box::new(WebShareRequest::Create(
+            share_request(WebShareScope::Session(beta),)
         )))),
     );
 
     assert!(matches!(
         left,
-        Response::WebShare(rmux_proto::WebShareResponse::Created(_))
+        Response::WebShare(response)
+            if matches!(response.as_ref(), rmux_proto::WebShareResponse::Created(_))
     ));
     assert!(matches!(
         right,
-        Response::WebShare(rmux_proto::WebShareResponse::Created(_))
+        Response::WebShare(response)
+            if matches!(response.as_ref(), rmux_proto::WebShareResponse::Created(_))
     ));
     assert_eq!(list_shares(&handler).await.len(), 2);
 }
@@ -80,8 +111,8 @@ async fn failed_lazy_listener_start_does_not_create_share() {
     let session_name = new_session(&handler, "lazy-bind-failure").await;
 
     let response = handler
-        .handle(Request::WebShare(WebShareRequest::Create(share_request(
-            WebShareScope::Session(session_name),
+        .handle(Request::WebShare(Box::new(WebShareRequest::Create(
+            share_request(WebShareScope::Session(session_name)),
         ))))
         .await;
 
@@ -580,9 +611,14 @@ async fn create_share(
 ) -> WebShareCreatedResponse {
     handler.mark_web_listener_available();
     let response = handler
-        .handle(Request::WebShare(WebShareRequest::Create(request)))
+        .handle(Request::WebShare(Box::new(WebShareRequest::Create(
+            request,
+        ))))
         .await;
-    let Response::WebShare(rmux_proto::WebShareResponse::Created(created)) = response else {
+    let Response::WebShare(response) = response else {
+        panic!("expected created web-share response");
+    };
+    let rmux_proto::WebShareResponse::Created(created) = *response else {
         panic!("expected created web-share response");
     };
     created
@@ -611,10 +647,16 @@ fn share_request(scope: WebShareScope) -> CreateWebShareRequest {
 }
 
 fn handler_with_web_port(port: u16) -> RequestHandler {
+    handler_with_web_settings(
+        crate::web::WebShareSettings::from_options(port, None).expect("web settings"),
+    )
+}
+
+fn handler_with_web_settings(settings: crate::web::WebShareSettings) -> RequestHandler {
     RequestHandler::with_owner_uid_subscription_limits_and_web_settings(
         current_owner_uid(),
         SubscriptionLimits::default(),
-        crate::web::WebShareSettings::from_options(port, None).expect("web settings"),
+        settings,
     )
 }
 
@@ -625,11 +667,14 @@ fn unused_web_port() -> u16 {
 
 async fn list_shares(handler: &RequestHandler) -> Vec<rmux_proto::WebShareSummary> {
     let response = handler
-        .handle(Request::WebShare(WebShareRequest::List(
+        .handle(Request::WebShare(Box::new(WebShareRequest::List(
             ListWebSharesRequest,
-        )))
+        ))))
         .await;
-    let Response::WebShare(rmux_proto::WebShareResponse::List(listed)) = response else {
+    let Response::WebShare(response) = response else {
+        panic!("expected listed web-share response");
+    };
+    let rmux_proto::WebShareResponse::List(listed) = *response else {
         panic!("expected listed web-share response");
     };
     listed.shares

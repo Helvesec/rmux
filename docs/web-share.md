@@ -9,14 +9,16 @@
 
 **Browser sharing for RMUX terminal panes and sessions.**
 
-[![rmux 0.6.1](https://img.shields.io/badge/rmux-0.6.1-informational.svg)](https://github.com/Helvesec/rmux/releases/tag/v0.6.1)
+[![rmux 0.7.0](https://img.shields.io/badge/rmux-0.7.0-informational.svg)](https://github.com/Helvesec/rmux/releases/tag/v0.7.0)
 [![E2EE](https://img.shields.io/badge/E2EE-ChaCha20--Poly1305-success.svg)](#cryptography)
 [![Hybrid Post-Quantum](https://img.shields.io/badge/Hybrid%20Post--Quantum-X25519%20%2B%20ML--KEM--768-blue.svg)](#cryptography)
 [![Frontend](https://img.shields.io/badge/frontend-decoupled-lightgrey.svg)](#architecture)
 
 </div>
 
-## Web Multiplex
+<a id="web-multiplex"></a>
+
+## 🌐 Web Multiplex
 
 <p align="center">
   <img src="https://rmux.io/web-share-browser.gif" width="700" alt="RMUX browser terminal">
@@ -39,7 +41,9 @@ rmux web-share -t work
 rmux web-share --tunnel-provider localhost-run
 ```
 
-## Architecture
+<a id="architecture"></a>
+
+## 🏗️ Architecture
 
 RMUX separates three responsibilities that are often bundled together:
 
@@ -49,7 +53,9 @@ RMUX separates three responsibilities that are often bundled together:
 
 That split keeps deployment flexible. You can use the public frontend, pin your own static build, or route traffic through a tunnel provider without giving that provider terminal plaintext.
 
-## Key Features
+<a id="key-features"></a>
+
+## ✨ Key Features
 
 - **Multiplexer first**: share an existing RMUX pane or session instead of launching a one-off shell wrapper.
 - **Blind relay model**: tunnel providers forward encrypted frames and cannot read terminal payloads.
@@ -59,7 +65,9 @@ That split keeps deployment flexible. You can use the public frontend, pin your 
 - **Decoupled frontend**: `share.rmux.io` is just the default static client; `--frontend-url` lets you bring your own.
 - **Scoped access**: Operator links can send input; Spectator links are read-only.
 
-## Cryptography
+<a id="cryptography"></a>
+
+## 🔐 Cryptography
 
 <div align="center">
 
@@ -75,11 +83,13 @@ Each browser session negotiates fresh symmetric keys using a hybrid key exchange
 
 - Ephemeral **X25519** key agreement.
 - **ML-KEM-768** post-quantum key encapsulation.
-- Transcript binding to the URL token and session handshake.
+- Transcript binding for the handshake messages, with the URL token mixed into key derivation as a PSK.
 
 All terminal frames are encrypted with **ChaCha20-Poly1305** directly between the browser and the local daemon.
 
-## Comparison
+<a id="comparison"></a>
+
+## ⚖️ Comparison
 
 RMUX combines blind relay, authenticated encryption, forward secrecy, Hybrid Post-Quantum key agreement, a decoupled frontend, and a real terminal multiplexer.
 
@@ -97,7 +107,9 @@ RMUX combines blind relay, authenticated encryption, forward secrecy, Hybrid Pos
 
 References for the non-RMUX rows: [sshx](https://github.com/ekzhang/sshx), [sshx-server](https://docs.rs/crate/sshx-server/latest), [tmate](https://github.com/tmate-io/tmate), [ttyd](https://github.com/tsl0922/ttyd), [GoTTY](https://github.com/sorenisanerd/gotty), and [Upterm](https://upterm.dev/docs/upterm.html).
 
-## Access Control
+<a id="access-control"></a>
+
+## 🛂 Access Control
 
 | Role | Keyboard Input | Default Use Case |
 | :--- | :---: | :--- |
@@ -128,7 +140,9 @@ Web Share uses these browser-visible close codes:
 
 `4008` is only used after the share token is valid. Bad links, expired shares, missing roles, wrong PINs, and authenticated capacity failures stay on the generic `4000` path so the browser does not become a token, PIN, or capacity oracle.
 
-## Tunnels & Custom Domains
+<a id="tunnels-custom-domains"></a>
+
+## 🌉 Tunnels & Custom Domains
 
 You can share over loopback, a private network, or the public internet:
 
@@ -156,7 +170,9 @@ rmux web-share -t demo --spectator-only --max-spectators 150 --tunnel-url https:
 
 Account-less Cloudflare Quick Tunnels (`trycloudflare.com`) are intentionally not shipped as a built-in provider. They are useful for casual experiments, but their hostnames can take an unpredictable amount of time to become reachable and Cloudflare does not provide uptime guarantees for them. For a demo or Show HN, use a named tunnel or your own ingress and pass its stable URL with `--tunnel-url`.
 
-## CLI Commands
+<a id="cli-commands"></a>
+
+## 🧰 CLI Commands
 
 ```sh
 # List active shares
@@ -175,13 +191,17 @@ rmux web-share off
 rmux web-share config
 ```
 
-## Security Model & Threat Boundaries
+<a id="security-model-threat-boundaries"></a>
+
+## 🛡️ Security Model & Threat Boundaries
 
 - **End-to-end encryption**: hosts and tunnel providers cannot read terminal payloads.
 - **URL fragment tokens**: access tokens live in the URL fragment (`#t=...`), which browsers do not send to the static frontend host in HTTP requests.
 - **Supply-chain control**: if you want full ownership of the browser asset path, self-host the static frontend and pass `--frontend-url`.
 - **Operator safety**: treat operator URLs as shell credentials; they grant active input control over your local terminal.
 
-## GitHub Docs
+<a id="full-documentation"></a>
+
+## 📚 Full Documentation
 
 [Read the full Web Share documentation](https://rmux.io/docs/web-share/).

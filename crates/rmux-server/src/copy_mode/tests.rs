@@ -182,6 +182,25 @@ fn search_again_advances_to_next_match() {
 }
 
 #[test]
+fn oversized_regex_search_marks_partial_without_matches() {
+    let screen = build_screen(80, 3, &"a".repeat(1000));
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = test_context();
+
+    state
+        .execute_command(
+            "search-forward",
+            &["--".to_owned(), "a{50000}".to_owned()],
+            &ctx,
+        )
+        .unwrap();
+
+    let summary = state.summary();
+    assert!(summary.search_count_partial);
+    assert_eq!(summary.search_count, 0);
+}
+
+#[test]
 fn search_again_respects_wrap_search_off() {
     let screen = build_screen(30, 3, "foo bar foo baz foo");
     let mut context = test_context();
@@ -418,6 +437,101 @@ fn copy_cursor_word_uses_the_next_word_from_separators_like_tmux() {
 
     state.cursor = CopyPosition { x: 1, y: 4 };
     assert_eq!(state.summary().copy_cursor_word, "");
+}
+
+#[test]
+fn matching_brackets_match_naive_ascii_oracle() {
+    let text = "a(b[c{d}e]f) z";
+    let screen = build_screen(30, 3, text);
+    let mut state = CopyModeState::for_test(screen);
+
+    state
+        .execute_command("history-top", &[], &test_context())
+        .unwrap();
+    for cursor_x in [1, 3, 5, 7, 9, 11] {
+        state.cursor = CopyPosition { x: cursor_x, y: 0 };
+        for forward in [true, false] {
+            let expected =
+                naive_matching_bracket(text, cursor_x, forward).map(|x| CopyPosition { x, y: 0 });
+            assert_eq!(
+                state.find_matching_bracket(forward),
+                expected,
+                "cursor_x={cursor_x}, forward={forward}"
+            );
+        }
+    }
+}
+
+#[test]
+fn matching_brackets_scan_across_lines_without_flattening_buffer() {
+    let screen = build_screen(10, 6, "(\r\n[\r\n]\r\n)");
+    let mut state = CopyModeState::for_test(screen);
+    state
+        .execute_command("history-top", &[], &test_context())
+        .unwrap();
+
+    state.cursor = CopyPosition { x: 0, y: 0 };
+    assert_eq!(
+        state.find_matching_bracket(true),
+        Some(CopyPosition { x: 0, y: 3 })
+    );
+
+    state.cursor = CopyPosition { x: 0, y: 3 };
+    assert_eq!(
+        state.find_matching_bracket(true),
+        Some(CopyPosition { x: 0, y: 0 })
+    );
+}
+
+fn naive_matching_bracket(text: &str, cursor_x: u32, forward: bool) -> Option<u32> {
+    let chars = text.chars().collect::<Vec<_>>();
+    let current = *chars.get(cursor_x as usize)?;
+    let (open, close, scan_forward) = match current {
+        '(' => ('(', ')', true),
+        '[' => ('[', ']', true),
+        '{' => ('{', '}', true),
+        ')' => ('(', ')', false),
+        ']' => ('[', ']', false),
+        '}' => ('{', '}', false),
+        _ => return None,
+    };
+    let scan_forward = if forward { scan_forward } else { !scan_forward };
+    let mut depth = 1usize;
+    if scan_forward {
+        for (index, ch) in chars
+            .iter()
+            .copied()
+            .enumerate()
+            .skip(cursor_x as usize + 1)
+        {
+            if ch == open {
+                depth += 1;
+            } else if ch == close {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(index as u32);
+                }
+            }
+        }
+    } else {
+        for (index, ch) in chars
+            .iter()
+            .copied()
+            .enumerate()
+            .take(cursor_x as usize)
+            .rev()
+        {
+            if ch == close {
+                depth += 1;
+            } else if ch == open {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(index as u32);
+                }
+            }
+        }
+    }
+    None
 }
 
 #[test]

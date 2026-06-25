@@ -540,13 +540,13 @@ impl RequestHandler {
                             .dispatch_for_connection(
                                 attach_pid,
                                 u64::from(attach_pid),
-                                Request::SelectPane(SelectPaneRequest {
+                                Request::SelectPane(Box::new(SelectPaneRequest {
                                     target,
                                     title: None,
                                     style: None,
                                     input_disabled: None,
                                     preserve_zoom: false,
-                                }),
+                                })),
                             )
                             .await;
                         match outcome.response {

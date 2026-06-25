@@ -127,6 +127,16 @@ fn completion_subcommand(entry: &'static CommandEntry) -> clap::Command {
         "select-pane" => completion_typed_subcommand::<SelectPaneArgs>(entry.name),
         "copy-mode" => completion_typed_subcommand::<CopyModeArgs>(entry.name),
         "clock-mode" => completion_typed_subcommand::<ClockModeArgs>(entry.name),
+        "wait-pane" => completion_typed_subcommand::<WaitPaneArgs>(entry.name),
+        "pane-snapshot" => completion_typed_subcommand::<PaneSnapshotArgs>(entry.name),
+        "stream-pane" => completion_typed_subcommand::<StreamPaneArgs>(entry.name),
+        "collect-pane-output" => completion_typed_subcommand::<CollectPaneOutputArgs>(entry.name),
+        "locator" => completion_typed_subcommand::<LocatorArgs>(entry.name),
+        "expect-pane" => completion_typed_subcommand::<ExpectPaneArgs>(entry.name),
+        "find-panes" => completion_typed_subcommand::<FindPanesArgs>(entry.name),
+        "find-sessions" => completion_typed_subcommand::<FindSessionsArgs>(entry.name),
+        "broadcast-keys" => completion_typed_subcommand::<BroadcastKeysArgs>(entry.name),
+        "with-session" => completion_typed_subcommand::<WithSessionArgs>(entry.name),
         "send-keys" => completion_typed_subcommand::<SendKeysArgs>(entry.name),
         "bind-key" => completion_typed_subcommand::<BindKeyArgs>(entry.name),
         "unbind-key" => completion_typed_subcommand::<UnbindKeyArgs>(entry.name),
@@ -190,6 +200,22 @@ fn completion_subcommand(entry: &'static CommandEntry) -> clap::Command {
                     .long("json")
                     .action(ArgAction::SetTrue),
             ),
+        "claude" => completion_empty_subcommand(entry.name).arg(
+            clap::Arg::new("claude-args")
+                .num_args(0..)
+                .allow_hyphen_values(true)
+                .trailing_var_arg(true),
+        ),
+        "doctor" => completion_empty_subcommand(entry.name).arg(
+            clap::Arg::new("check")
+                .value_name("tmux-dropin")
+                .value_parser(["tmux-dropin"]),
+        ),
+        "setup" => completion_empty_subcommand(entry.name).arg(
+            clap::Arg::new("action")
+                .value_name("tmux-shim")
+                .value_parser(["tmux-shim"]),
+        ),
         missing => panic!("completion tree missing command mapping for {missing}"),
     };
     if let Some(alias) = entry.alias {

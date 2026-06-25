@@ -15,6 +15,7 @@ use super::flags::{
     conpty_flags_without_passthrough, selected_conpty_flags, standard_conpty_flags, ConptyFlags,
 };
 use super::io::{create_pipe, PipePair};
+use super::perf;
 use super::DsrBootstrap;
 
 #[derive(Debug)]
@@ -147,6 +148,7 @@ impl WindowsPty {
 }
 
 pub(crate) fn open_pty_pair(size: TerminalSize) -> Result<WindowsPty> {
+    let _span = perf::span("conpty_open_pty_pair");
     tracing::debug!(
         target: "rmux::conpty",
         cols = size.cols,
@@ -249,9 +251,14 @@ fn create_pty_state_with_fallback(
 }
 
 fn create_pty_state(size: TerminalSize, flags: ConptyFlags) -> Result<WindowsPtyState> {
-    let input = create_pipe(64 * 1024)?;
-    let output = create_pipe(64 * 1024)?;
-    let hpc = create_pseudo_console(size, &input, &output, flags)?;
+    let (input, output) = {
+        let _span = perf::span("conpty_create_pipes");
+        (create_pipe(64 * 1024)?, create_pipe(64 * 1024)?)
+    };
+    let hpc = {
+        let _span = perf::span("conpty_create_pseudoconsole");
+        create_pseudo_console(size, &input, &output, flags)?
+    };
     drop(input.read);
     drop(output.write);
     Ok(WindowsPtyState {
@@ -294,6 +301,13 @@ fn create_pseudo_console(
 }
 
 fn coord_from_size(size: TerminalSize) -> Result<COORD> {
+    if size.cols == 0 || size.rows == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "terminal size must be at least 1x1",
+        )
+        .into());
+    }
     let cols = i16::try_from(size.cols).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -380,6 +394,26 @@ mod tests {
         assert!(is_benign_resize_after_exit(hresult_from_win32(
             ERROR_INVALID_PARAMETER
         )));
+    }
+
+    #[test]
+    fn coord_from_size_rejects_zero_dimensions() {
+        let error = coord_from_size_error(TerminalSize { cols: 0, rows: 24 });
+        assert!(error
+            .to_string()
+            .contains("terminal size must be at least 1x1"));
+
+        let error = coord_from_size_error(TerminalSize { cols: 80, rows: 0 });
+        assert!(error
+            .to_string()
+            .contains("terminal size must be at least 1x1"));
+    }
+
+    fn coord_from_size_error(size: TerminalSize) -> crate::PtyError {
+        match coord_from_size(size) {
+            Ok(_) => panic!("zero terminal dimensions should be rejected"),
+            Err(error) => error,
+        }
     }
 
     #[test]

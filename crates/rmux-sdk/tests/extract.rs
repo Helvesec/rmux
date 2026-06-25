@@ -200,7 +200,7 @@ async fn collect_output_until_exit_caps_raw_bytes_and_records_lag() -> TestResul
         expect_info_probe(&mut peer, running_details_line()).await?;
 
         expect_cursor(&mut peer, subscription_id).await?;
-        peer.write_response(Response::PaneOutputLag(PaneOutputLagResponse {
+        peer.write_response(Response::PaneOutputLag(Box::new(PaneOutputLagResponse {
             subscription_id,
             cursor: PaneOutputCursor {
                 next_sequence: 9,
@@ -217,7 +217,7 @@ async fn collect_output_until_exit_caps_raw_bytes_and_records_lag() -> TestResul
                     newest_sequence: Some(8),
                 },
             },
-        }))
+        })))
         .await?;
 
         expect_info_probe(&mut peer, running_details_line()).await?;

@@ -155,7 +155,7 @@ async fn refresh_client_control_size_resizes_real_control_session() {
     let response = handler
         .dispatch(
             requester_pid,
-            Request::RefreshClient(rmux_proto::request::RefreshClientRequest {
+            Request::RefreshClient(Box::new(rmux_proto::request::RefreshClientRequest {
                 target_client: None,
                 adjustment: None,
                 clear_pan: false,
@@ -171,7 +171,7 @@ async fn refresh_client_control_size_resizes_real_control_session() {
                 subscriptions_format: Vec::new(),
                 control_size: Some("100x30".to_owned()),
                 colour_report: None,
-            }),
+            })),
         )
         .await
         .response;
@@ -392,13 +392,17 @@ async fn list_clients_exposes_pid_and_tty_format_variables_for_attached_clients(
         .await;
 
     let response = handler
-        .handle(Request::ListClients(rmux_proto::ListClientsRequest {
-            format: Some("#{client_name}|#{client_pid}|#{client_tty}|#{client_session}".to_owned()),
-            target_session: None,
-            filter: None,
-            sort_order: None,
-            reversed: false,
-        }))
+        .handle(Request::ListClients(Box::new(
+            rmux_proto::ListClientsRequest {
+                format: Some(
+                    "#{client_name}|#{client_pid}|#{client_tty}|#{client_session}".to_owned(),
+                ),
+                target_session: None,
+                filter: None,
+                sort_order: None,
+                reversed: false,
+            },
+        )))
         .await;
     let Response::ListClients(response) = response else {
         panic!("expected list-clients response");
@@ -460,13 +464,15 @@ async fn list_clients_exposes_attached_key_table_and_prefix_state() {
 
 async fn list_client_prefix_state(handler: &RequestHandler) -> String {
     let response = handler
-        .handle(Request::ListClients(rmux_proto::ListClientsRequest {
-            format: Some("#{client_prefix}|#{client_key_table}".to_owned()),
-            target_session: None,
-            filter: None,
-            sort_order: None,
-            reversed: false,
-        }))
+        .handle(Request::ListClients(Box::new(
+            rmux_proto::ListClientsRequest {
+                format: Some("#{client_prefix}|#{client_key_table}".to_owned()),
+                target_session: None,
+                filter: None,
+                sort_order: None,
+                reversed: false,
+            },
+        )))
         .await;
     let Response::ListClients(response) = response else {
         panic!("expected list-clients response");

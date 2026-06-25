@@ -184,7 +184,7 @@ async fn handler_with_three_windows(name: &str) -> (RequestHandler, SessionName)
     for window_name in ["b", "c"] {
         assert!(matches!(
             handler
-                .handle(Request::NewWindow(NewWindowRequest {
+                .handle(Request::NewWindow(Box::new(NewWindowRequest {
                     target: session.clone(),
                     name: Some(window_name.to_owned()),
                     detached: true,
@@ -194,7 +194,7 @@ async fn handler_with_three_windows(name: &str) -> (RequestHandler, SessionName)
                     process_command: None,
                     target_window_index: None,
                     insert_at_target: false,
-                }))
+                })))
                 .await,
             Response::NewWindow(_)
         ));

@@ -470,7 +470,7 @@ async fn raw_kill_pane(socket_path: &Path, target: PaneTarget) -> TestResult {
 async fn raw_new_window(socket_path: &Path, target: SessionName, index: u32) -> TestResult {
     match framed_request(
         socket_path,
-        Request::NewWindow(NewWindowRequest {
+        Request::NewWindow(Box::new(NewWindowRequest {
             target: target.clone(),
             name: None,
             detached: true,
@@ -480,7 +480,7 @@ async fn raw_new_window(socket_path: &Path, target: SessionName, index: u32) -> 
             start_directory: None,
             target_window_index: Some(index),
             insert_at_target: false,
-        }),
+        })),
     )
     .await?
     {

@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use rmux_core::events::OutputCursorItem;
 use rmux_core::PaneId;
-use tokio::time::{sleep, Instant, Sleep};
+use tokio::time::{sleep, Instant, MissedTickBehavior, Sleep};
 use tracing::{debug, info};
 
 use super::rate_limit::OperatorRateLimiter;
@@ -46,6 +46,7 @@ pub(super) async fn serve_pane_loop(
     let mut rate_limiter = OperatorRateLimiter::new();
     let mut last_connection_counts = pane.connection_counts();
     let mut alive_tick = tokio::time::interval(Duration::from_millis(500));
+    alive_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let snapshot_sleep = sleep(Duration::from_secs(365 * 24 * 60 * 60));
     tokio::pin!(snapshot_sleep);
     let mut snapshot_pending = false;
@@ -199,6 +200,7 @@ pub(super) async fn serve_session_loop(
     let mut rate_limiter = OperatorRateLimiter::new();
     let mut last_connection_counts = session.connection_counts();
     let mut alive_tick = tokio::time::interval(Duration::from_millis(500));
+    alive_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let ttl_delay = session
         .expires_at()
         .map(duration_until)
@@ -268,7 +270,7 @@ pub(super) async fn serve_session_loop(
                         ).await? {
                             SessionClientTextOutcome::None => {}
                             SessionClientTextOutcome::Scroll(request) => {
-                                apply_session_scroll(&mut scrolls, request);
+                                apply_session_scroll(&mut scrolls, request, &session.snapshot);
                                 if !snapshot_pending && !view_pending {
                                     match queue_session_scroll_patch(
                                         handler.as_ref(),
@@ -485,7 +487,11 @@ async fn queue_fresh_session_snapshot(
     scrolls: &mut HashMap<PaneId, usize>,
 ) -> io::Result<OutboundQueueResult> {
     let next = handler
-        .web_session_snapshot_with_scrolls(session.target(), scrolls)
+        .web_session_snapshot_with_scrolls(
+            session.target(),
+            session.selected_window_index(),
+            scrolls,
+        )
         .await
         .map_err(|error| io::Error::other(error.to_string()))?;
     normalize_session_scrolls(scrolls, &next);
@@ -507,14 +513,19 @@ async fn queue_session_scroll_patch(
     if !supports_session_pane_frame {
         return Ok(None);
     }
-    let Some((&pane_id, &scroll_offset)) = scrolls.iter().next() else {
+    let Some((&pane_id, &top_line)) = scrolls.iter().next() else {
         return Ok(None);
     };
-    if scrolls.len() != 1 || scroll_offset == 0 {
+    if scrolls.len() != 1 {
         return Ok(None);
     }
     let Some(frame) = handler
-        .web_session_pane_scroll_frame(session.target(), pane_id, scroll_offset)
+        .web_session_pane_scroll_frame(
+            session.target(),
+            pane_id,
+            top_line,
+            session.selected_window_index(),
+        )
         .await
         .map_err(|error| io::Error::other(error.to_string()))?
     else {
@@ -569,7 +580,10 @@ fn normalize_session_scroll_from_pane_frame(
     if frame.pane.scroll_offset == 0 {
         scrolls.remove(&pane_id);
     } else {
-        scrolls.insert(pane_id, frame.pane.scroll_offset);
+        scrolls.insert(
+            pane_id,
+            pane_top_line(frame.pane.history_size, frame.pane.scroll_offset),
+        );
     }
 }
 
@@ -581,7 +595,11 @@ async fn queue_fresh_session_view(
     scrolls: &mut HashMap<PaneId, usize>,
 ) -> io::Result<OutboundQueueResult> {
     let next = handler
-        .web_session_snapshot_with_scrolls(session.target(), scrolls)
+        .web_session_snapshot_with_scrolls(
+            session.target(),
+            session.selected_window_index(),
+            scrolls,
+        )
         .await
         .map_err(|error| io::Error::other(error.to_string()))?;
     normalize_session_scrolls(scrolls, &next);
@@ -629,18 +647,39 @@ fn is_recoverable_session_queue_pressure(result: OutboundQueueResult) -> bool {
     )
 }
 
-fn apply_session_scroll(scrolls: &mut HashMap<PaneId, usize>, request: SessionScrollRequest) {
+fn apply_session_scroll(
+    scrolls: &mut HashMap<PaneId, usize>,
+    request: SessionScrollRequest,
+    snapshot: &WebSessionSnapshot,
+) {
     let pane_id = PaneId::new(request.pane_id);
-    let current = scrolls.get(&pane_id).copied().unwrap_or_default();
-    let next = if request.delta < 0 {
-        current.saturating_add(request.delta.unsigned_abs() as usize)
-    } else {
-        current.saturating_sub(request.delta as usize)
+    let Some(pane) = snapshot
+        .view
+        .panes
+        .iter()
+        .find(|pane| pane.id == request.pane_id)
+    else {
+        scrolls.remove(&pane_id);
+        return;
     };
-    if next == 0 {
+    if pane.history_size == 0 || pane.alternate_on {
+        scrolls.remove(&pane_id);
+        return;
+    }
+
+    let current_top = scrolls
+        .get(&pane_id)
+        .copied()
+        .unwrap_or_else(|| pane_top_line(pane.history_size, pane.scroll_offset));
+    let next_top = if request.delta < 0 {
+        current_top.saturating_sub(request.delta.unsigned_abs() as usize)
+    } else {
+        current_top.saturating_add(request.delta as usize)
+    };
+    if next_top >= pane.history_size {
         scrolls.remove(&pane_id);
     } else {
-        scrolls.insert(pane_id, next);
+        scrolls.insert(pane_id, next_top);
     }
 }
 
@@ -649,15 +688,22 @@ fn normalize_session_scrolls(scrolls: &mut HashMap<PaneId, usize>, snapshot: &We
         .view
         .panes
         .iter()
-        .map(|pane| (PaneId::new(pane.id), pane.scroll_offset))
+        .map(|pane| (PaneId::new(pane.id), (pane.history_size, pane.alternate_on)))
         .collect::<HashMap<_, _>>();
-    scrolls.retain(|pane_id, offset| {
-        let Some(clamped) = current.get(pane_id).copied() else {
+    scrolls.retain(|pane_id, top_line| {
+        let Some((history_size, alternate_on)) = current.get(pane_id).copied() else {
             return false;
         };
-        *offset = clamped;
-        clamped > 0
+        if alternate_on || history_size == 0 {
+            return false;
+        }
+        *top_line = (*top_line).min(history_size);
+        *top_line < history_size
     });
+}
+
+fn pane_top_line(history_size: usize, scroll_offset: usize) -> usize {
+    history_size.saturating_sub(scroll_offset.min(history_size))
 }
 
 async fn send_viewer_count_if_changed(
@@ -760,12 +806,14 @@ mod tests {
     use rmux_core::PaneId;
     use rmux_proto::TerminalSize;
 
-    use crate::handler::{WebSessionPaneFrame, WebSessionPaneView};
+    use crate::handler::{
+        TestWebSessionView, WebSessionPaneFrame, WebSessionPaneView, WebSessionSnapshot,
+    };
     use crate::web::outbound::OutboundQueueResult;
 
     use super::{
-        is_recoverable_session_queue_pressure, next_session_refresh_deadline,
-        normalize_session_scroll_from_pane_frame,
+        apply_session_scroll, is_recoverable_session_queue_pressure, next_session_refresh_deadline,
+        normalize_session_scroll_from_pane_frame, normalize_session_scrolls,
     };
 
     #[test]
@@ -840,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn pane_frame_scroll_normalization_keeps_clamped_offset() {
+    fn pane_frame_scroll_normalization_keeps_stable_top_line() {
         let pane_id = PaneId::new(7);
         let mut scrolls = HashMap::from([(pane_id, 10_000)]);
         let frame = WebSessionPaneFrame::new(
@@ -862,7 +910,7 @@ mod tests {
 
         normalize_session_scroll_from_pane_frame(&mut scrolls, &frame);
 
-        assert_eq!(scrolls.get(&pane_id), Some(&37));
+        assert_eq!(scrolls.get(&pane_id), Some(&83));
     }
 
     #[test]
@@ -889,5 +937,76 @@ mod tests {
         normalize_session_scroll_from_pane_frame(&mut scrolls, &frame);
 
         assert!(!scrolls.contains_key(&pane_id));
+    }
+
+    #[test]
+    fn session_scroll_anchor_survives_history_growth() {
+        let pane_id = PaneId::new(7);
+        let mut scrolls = HashMap::from([(pane_id, 83)]);
+        let snapshot = WebSessionSnapshot::new(
+            TerminalSize { cols: 80, rows: 24 },
+            Vec::new(),
+            TestWebSessionView {
+                size: TerminalSize { cols: 80, rows: 24 },
+                windows: Vec::new(),
+                panes: vec![WebSessionPaneView {
+                    id: pane_id.as_u32(),
+                    x: 0,
+                    y: 0,
+                    cols: 80,
+                    rows: 23,
+                    active: true,
+                    history_size: 220,
+                    scroll_offset: 137,
+                    alternate_on: false,
+                    mouse_on: false,
+                }],
+            },
+            0,
+            0,
+        );
+
+        normalize_session_scrolls(&mut scrolls, &snapshot);
+
+        assert_eq!(scrolls.get(&pane_id), Some(&83));
+    }
+
+    #[test]
+    fn session_scroll_delta_uses_snapshot_top_line() {
+        let pane_id = PaneId::new(7);
+        let mut scrolls = HashMap::new();
+        let snapshot = WebSessionSnapshot::new(
+            TerminalSize { cols: 80, rows: 24 },
+            Vec::new(),
+            TestWebSessionView {
+                size: TerminalSize { cols: 80, rows: 24 },
+                windows: Vec::new(),
+                panes: vec![WebSessionPaneView {
+                    id: pane_id.as_u32(),
+                    x: 0,
+                    y: 0,
+                    cols: 80,
+                    rows: 23,
+                    active: true,
+                    history_size: 120,
+                    scroll_offset: 0,
+                    alternate_on: false,
+                    mouse_on: false,
+                }],
+            },
+            0,
+            0,
+        );
+
+        apply_session_scroll(
+            &mut scrolls,
+            crate::web::protocol::SessionScrollRequest {
+                pane_id: pane_id.as_u32(),
+                delta: -20,
+            },
+            &snapshot,
+        );
+
+        assert_eq!(scrolls.get(&pane_id), Some(&100));
     }
 }

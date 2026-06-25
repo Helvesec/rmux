@@ -42,14 +42,14 @@ async fn global_environment_applies_to_initial_panes_created_after_mutation() {
 
     assert_eq!(
         handler
-            .handle(Request::SetEnvironment(SetEnvironmentRequest {
+            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
                 scope: ScopeSelector::Global,
                 name: variable_name.to_owned(),
                 value: "screen".to_owned(),
                 mode: None,
                 hidden: false,
                 format: false,
-            }))
+            })))
             .await,
         Response::SetEnvironment(rmux_proto::SetEnvironmentResponse {
             scope: ScopeSelector::Global,
@@ -98,14 +98,14 @@ async fn default_terminal_applies_to_initial_panes_and_yields_to_explicit_term()
 
     assert_eq!(
         handler
-            .handle(Request::SetEnvironment(SetEnvironmentRequest {
+            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
                 scope: ScopeSelector::Session(session_name("alpha")),
                 name: "TERM".to_owned(),
                 value: "screen-256color".to_owned(),
                 mode: None,
                 hidden: false,
                 format: false,
-            }))
+            })))
             .await,
         Response::SetEnvironment(rmux_proto::SetEnvironmentResponse {
             scope: ScopeSelector::Session(session_name("alpha")),
@@ -163,14 +163,14 @@ async fn environment_mutations_apply_only_to_future_panes_and_session_values_win
 
     assert_eq!(
         handler
-            .handle(Request::SetEnvironment(SetEnvironmentRequest {
+            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
                 scope: ScopeSelector::Global,
                 name: variable_name.to_owned(),
                 value: "screen".to_owned(),
                 mode: None,
                 hidden: false,
                 format: false,
-            }))
+            })))
             .await,
         Response::SetEnvironment(rmux_proto::SetEnvironmentResponse {
             scope: ScopeSelector::Global,
@@ -210,14 +210,14 @@ async fn environment_mutations_apply_only_to_future_panes_and_session_values_win
 
     assert_eq!(
         handler
-            .handle(Request::SetEnvironment(SetEnvironmentRequest {
+            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
                 scope: ScopeSelector::Session(session_name("alpha")),
                 name: variable_name.to_owned(),
                 value: "tmux-256color".to_owned(),
                 mode: None,
                 hidden: false,
                 format: false,
-            }))
+            })))
             .await,
         Response::SetEnvironment(rmux_proto::SetEnvironmentResponse {
             scope: ScopeSelector::Session(session_name("alpha")),
@@ -425,7 +425,7 @@ async fn window_unlinked_hooks_keep_removed_window_name_and_id() {
     create_session(&handler, "alpha").await;
 
     let response = handler
-        .handle(Request::NewWindow(NewWindowRequest {
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
             target: session_name("alpha"),
             name: Some("logs".to_owned()),
             detached: true,
@@ -435,7 +435,7 @@ async fn window_unlinked_hooks_keep_removed_window_name_and_id() {
             process_command: None,
             target_window_index: None,
             insert_at_target: false,
-        }))
+        })))
         .await;
     let Response::NewWindow(success) = response else {
         panic!("new-window should succeed");
@@ -529,14 +529,14 @@ async fn session_scoped_mutations_require_live_sessions_and_are_cleared_on_kill(
     let handler = RequestHandler::new();
 
     let missing_environment = handler
-        .handle(Request::SetEnvironment(SetEnvironmentRequest {
+        .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
             scope: ScopeSelector::Session(session_name("missing")),
             name: "TERM".to_owned(),
             value: "screen".to_owned(),
             mode: None,
             hidden: false,
             format: false,
-        }))
+        })))
         .await;
     assert_eq!(
         missing_environment,
@@ -559,14 +559,14 @@ async fn session_scoped_mutations_require_live_sessions_and_are_cleared_on_kill(
     ));
     assert!(matches!(
         handler
-            .handle(Request::SetEnvironment(SetEnvironmentRequest {
+            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
                 scope: ScopeSelector::Session(session_name("alpha")),
                 name: "TERM".to_owned(),
                 value: "screen".to_owned(),
                 mode: None,
                 hidden: false,
                 format: false,
-            }))
+            })))
             .await,
         Response::SetEnvironment(_)
     ));
@@ -709,7 +709,7 @@ async fn window_linked_hooks_receive_session_and_window_format_context() {
     ));
 
     let response = handler
-        .handle(Request::NewWindow(NewWindowRequest {
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
             target: session_name("alpha"),
             name: None,
             detached: false,
@@ -719,7 +719,7 @@ async fn window_linked_hooks_receive_session_and_window_format_context() {
             process_command: None,
             target_window_index: None,
             insert_at_target: false,
-        }))
+        })))
         .await;
     let Response::NewWindow(success) = response else {
         panic!("new-window should succeed");
@@ -760,7 +760,7 @@ async fn hook_commands_do_not_pre_expand_set_buffer_arguments() {
 
     assert!(matches!(
         handler
-            .handle(Request::NewWindow(NewWindowRequest {
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
                 target: session_name("alpha"),
                 name: Some("hooked".to_owned()),
                 detached: false,
@@ -770,7 +770,7 @@ async fn hook_commands_do_not_pre_expand_set_buffer_arguments() {
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await,
         Response::NewWindow(_)
     ));
@@ -848,14 +848,14 @@ async fn environment_override_layering_session_then_override_then_rmux_pane() {
 
     assert!(matches!(
         handler
-            .handle(Request::SetEnvironment(SetEnvironmentRequest {
+            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
                 scope: ScopeSelector::Global,
                 name: "MY_VAR".to_owned(),
                 value: "global".to_owned(),
                 mode: None,
                 hidden: false,
                 format: false,
-            }))
+            })))
             .await,
         Response::SetEnvironment(_)
     ));
@@ -904,21 +904,21 @@ async fn new_session_ext_client_environment_respects_tmux_precedence() {
     for name in ["RMUX_GLOBAL_ENV_SENTINEL", "RMUX_OVERRIDE_ENV_SENTINEL"] {
         assert!(matches!(
             handler
-                .handle(Request::SetEnvironment(SetEnvironmentRequest {
+                .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
                     scope: ScopeSelector::Global,
                     name: name.to_owned(),
                     value: "from-server".to_owned(),
                     mode: None,
                     hidden: false,
                     format: false,
-                }))
+                })))
                 .await,
             Response::SetEnvironment(_)
         ));
     }
 
     let response = handler
-        .handle(Request::NewSessionExt(NewSessionExtRequest {
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: Some(session.clone()),
             working_directory: None,
             detached: true,
@@ -946,7 +946,7 @@ async fn new_session_ext_client_environment_respects_tmux_precedence() {
                 "RMUX_CLIENT_ONLY_ENV_SENTINEL=from-client".to_owned(),
             ]),
             skip_environment_update: false,
-        }))
+        })))
         .await;
 
     assert!(matches!(response, Response::NewSession(_)));
@@ -998,7 +998,7 @@ async fn new_session_ext_skip_environment_update_keeps_client_spawn_environment(
     let session = session_name("skip-client-env");
 
     let response = handler
-        .handle(Request::NewSessionExt(NewSessionExtRequest {
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: Some(session.clone()),
             working_directory: None,
             detached: true,
@@ -1019,7 +1019,7 @@ async fn new_session_ext_skip_environment_update_keeps_client_spawn_environment(
                 "RMUX_CLIENT_ONLY_ENV_SENTINEL=from-client".to_owned(),
             ]),
             skip_environment_update: true,
-        }))
+        })))
         .await;
 
     assert!(matches!(response, Response::NewSession(_)));

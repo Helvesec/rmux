@@ -229,11 +229,45 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ("unbind-key", "(unbind) [-anq] [-T key-table] key"),
     ("unlink-window", "(unlinkw) [-k] [-t target-window]"),
     ("wait-for", "(wait) [-L|-S|-U] channel"),
+    ("capabilities", "[--human|--json]"),
+    ("claude", "[claude-args...]"),
+    ("doctor", "tmux-dropin"),
+    ("setup", "tmux-shim"),
+    (
+        "wait-pane",
+        "[-t target-pane] [--text text|--next-text text|--visible-text text|--quiet|--pane-exit|--get-by-text text] [--stable-for duration] [--timeout duration] [--json]",
+    ),
+    (
+        "pane-snapshot",
+        "[-t target-pane] [--json] [--style] [--region row,col,rows,cols]",
+    ),
+    ("stream-pane", "[-t target-pane] [--raw|--lines]"),
+    (
+        "collect-pane-output",
+        "[-t target-pane] --until-pane-exit --max-bytes bytes [--json]",
+    ),
+    ("locator", "[-t target-pane] --get-by-text text [--json]"),
+    (
+        "expect-pane",
+        "[-t target-pane] --get-by-text text [--visible|--hidden|--count count] [--json]",
+    ),
+    (
+        "find-panes",
+        "[--title title] [--title-prefix prefix] [--current-command command] [--cwd path] [--json]",
+    ),
+    (
+        "find-sessions",
+        "[--name name] [--name-prefix prefix] [--json]",
+    ),
+    ("broadcast-keys", "-t target-pane... [-l] -- key ..."),
+    (
+        "with-session",
+        "session-name [--kill-on-owner-exit] [--ttl duration] -- command ...",
+    ),
     (
         "web-share",
         "[-lX] [-K share-id] [disconnect share-id] [--config] [--lookup share-id] [--operator-only|--spectator-only] [--ttl seconds|--expires-at RFC3339] [--kill-session-on-expire] [--max-operators count] [--max-spectators count] [--frontend-url url] [--tunnel-url url|--tunnel-provider provider] [--no-navbar] [--no-disclaimer] [--hide-viewers] [--theme user|light|dark] [--no-pin] [-t pane|session]",
     ),
-    ("capabilities", "[--human|--json]"),
 ];
 
 /// Commands that are RMUX extensions rather than part of the tmux command
@@ -242,7 +276,23 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
 /// `list-commands` listing, which is byte-compared against tmux via
 /// `#{command_list_name}`. They remain reachable by explicit name
 /// (`list-commands web-share`).
-const RMUX_EXTENSION_COMMANDS: &[&str] = &["capabilities", "web-share"];
+const RMUX_EXTENSION_COMMANDS: &[&str] = &[
+    "broadcast-keys",
+    "capabilities",
+    "claude",
+    "collect-pane-output",
+    "doctor",
+    "expect-pane",
+    "find-panes",
+    "find-sessions",
+    "locator",
+    "pane-snapshot",
+    "setup",
+    "stream-pane",
+    "wait-pane",
+    "web-share",
+    "with-session",
+];
 
 fn is_rmux_extension(name: &str) -> bool {
     RMUX_EXTENSION_COMMANDS.contains(&name)
@@ -291,6 +341,7 @@ fn resolve_list_commands_target(name: &str) -> Result<&'static str, ExitFailure>
 
     let matches = implemented_command_surface()
         .iter()
+        .filter(|entry| !is_rmux_extension(entry.name))
         .filter(|entry| {
             entry.name.starts_with(name) || entry.alias.is_some_and(|alias| alias.starts_with(name))
         })
@@ -427,6 +478,14 @@ mod tests {
             surface.contains(&"web-share"),
             "RMUX extensions stay in the help/dispatch surface"
         );
+        assert!(
+            surface.contains(&"doctor"),
+            "RMUX extensions stay in the help/dispatch surface"
+        );
+        assert!(
+            surface.contains(&"setup"),
+            "RMUX extensions stay in the help/dispatch surface"
+        );
 
         // The bare listing (no explicit command requested) drops extensions only.
         let listed: Vec<&str> = implemented_command_surface()
@@ -440,6 +499,14 @@ mod tests {
         );
         assert!(
             !listed.contains(&"web-share"),
+            "bare list-commands must omit RMUX extensions for tmux byte-parity"
+        );
+        assert!(
+            !listed.contains(&"doctor"),
+            "bare list-commands must omit RMUX extensions for tmux byte-parity"
+        );
+        assert!(
+            !listed.contains(&"setup"),
             "bare list-commands must omit RMUX extensions for tmux byte-parity"
         );
         assert_eq!(listed.len(), surface.len() - RMUX_EXTENSION_COMMANDS.len());
@@ -516,6 +583,18 @@ mod tests {
             resolve_list_commands_target("web-share").expect("web-share resolves"),
             "web-share"
         );
+        assert_eq!(
+            resolve_list_commands_target("doctor").expect("doctor resolves"),
+            "doctor"
+        );
+        assert_eq!(
+            resolve_list_commands_target("setup").expect("setup resolves"),
+            "setup"
+        );
+        assert_eq!(
+            resolve_list_commands_target("wait-pane").expect("wait-pane resolves"),
+            "wait-pane"
+        );
     }
 
     #[test]
@@ -530,6 +609,8 @@ mod tests {
         );
         assert!(resolve_list_commands_target("nosuch").is_err());
         assert!(resolve_list_commands_target("list").is_err());
+        assert!(resolve_list_commands_target("wait-p").is_err());
+        assert!(resolve_list_commands_target("pane-s").is_err());
     }
 
     #[test]

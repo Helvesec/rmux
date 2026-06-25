@@ -11,6 +11,26 @@ Do not open a public issue for a security bug. Public issues are for normal bugs
 
 In your report, include what you found, the steps to reproduce it, and the version you tested. A proof of concept helps.
 
+## Verifying releases
+
+Releases starting with `v0.6.5` include `SHA256SUMS`, `SHA256SUMS.sigstore.json`, and GitHub build provenance attestations. The provenance is SLSA Build Level 2. Earlier releases are checksums-only.
+
+Verify an asset attestation with:
+
+```sh
+gh attestation verify <asset> --repo Helvesec/rmux
+```
+
+Verify the signed checksums with:
+
+```sh
+cosign verify-blob \
+  --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp 'https://github.com/Helvesec/rmux/.github/workflows/release.yml@refs/tags/v0\.(6|7)\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+```
+
 ## In scope
 
 - The rmux daemon and the CLI.
@@ -19,6 +39,12 @@ In your report, include what you found, the steps to reproduce it, and the versi
 - The local IPC surface (the Unix socket and the Windows named pipe).
 - The install scripts at https://rmux.io/install.sh and https://rmux.io/install.ps1.
 - The release artifacts and their signatures.
+
+## Web-share authentication errors
+
+The normative web-share E2EE protocol specification lives in [docs/specs/web-share-e2ee-protocol-v1.md](docs/specs/web-share-e2ee-protocol-v1.md).
+
+Pre-ready authentication failures use `(4000, "handshake_rejected")` after a uniform delay. A token-authenticated client that omits a required pairing PIN receives `(4008, "pin_required")`; wrong PINs remain on the generic `4000` path.
 
 ## Out of scope
 

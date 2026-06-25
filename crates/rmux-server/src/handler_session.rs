@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::time::Duration;
 
 use rmux_core::{
     formats::{is_truthy, render_list_sessions_line, FormatContext},
@@ -14,6 +16,8 @@ use rmux_proto::{
 
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::pane_terminals::InitialPaneSpawnOptions;
+#[cfg(windows)]
+use crate::pane_terminals::{CompletedDeferredInitialPane, DeferredInitialPaneSpawn, HandlerState};
 use crate::terminal::{parse_environment_assignments, validate_process_command};
 
 #[path = "handler_session/client_environment.rs"]
@@ -29,6 +33,11 @@ mod options;
 #[path = "handler_session/output.rs"]
 mod output;
 
+#[cfg(windows)]
+const DEFERRED_INITIAL_PANE_READY_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(windows)]
+const DEFERRED_INITIAL_PANE_READY_SETTLE: Duration = Duration::from_millis(100);
+
 use client_environment::{
     new_session_client_environment, new_session_raw_client_environment,
     raw_environment_from_assignments,
@@ -36,6 +45,8 @@ use client_environment::{
 use list::{sort_list_sessions, ListSessionSnapshot};
 use options::resolve_session_creation_options;
 
+#[cfg(windows)]
+use super::pane_support::format_references_pane_pid;
 use super::scripting_support::format_context_for_target;
 use super::target_support::{pane_id_target, requester_environment_pane_id};
 use super::{
@@ -227,6 +238,8 @@ impl RequestHandler {
             .or_else(|| crate::legacy_command::from_legacy_command(command.as_deref()));
         let requested_name = request.session_name;
         let socket_path = self.socket_path();
+        #[cfg(windows)]
+        let mut deferred_initial_spawn = None;
         let response = {
             let mut state = self.state.lock().await;
             let creation_options = resolve_session_creation_options(
@@ -354,22 +367,43 @@ impl RequestHandler {
                 .map(|created| created.template_session.is_none())
                 .unwrap_or(true);
             if needs_terminal {
-                match state.insert_initial_session_terminal(
-                    &session_name,
-                    InitialPaneSpawnOptions {
-                        socket_path: &socket_path,
-                        spawn_environment: spawn_environment.as_ref(),
-                        raw_spawn_environment: raw_spawn_environment.as_deref(),
-                        environment_overrides: environment_overrides.as_deref(),
-                        command: process_command.as_ref(),
-                        pane_alert_callback: Some(self.pane_alert_callback()),
-                        pane_exit_callback: Some(self.pane_exit_callback()),
-                    },
-                ) {
-                    Ok(()) => {}
-                    Err(error) => {
-                        let _removed = state.sessions.remove_session(&session_name);
-                        return Response::Error(ErrorResponse { error });
+                let defer_initial_terminal = should_defer_windows_initial_pane(
+                    detached,
+                    request.print_session_info,
+                    created_group.is_some(),
+                    process_command.is_some(),
+                );
+                let spawn_options = InitialPaneSpawnOptions {
+                    socket_path: &socket_path,
+                    spawn_environment: spawn_environment.as_ref(),
+                    raw_spawn_environment: raw_spawn_environment.as_deref(),
+                    environment_overrides: environment_overrides.as_deref(),
+                    command: process_command.as_ref(),
+                    pane_alert_callback: Some(self.pane_alert_callback()),
+                    pane_exit_callback: Some(self.pane_exit_callback()),
+                };
+                if defer_initial_terminal {
+                    #[cfg(windows)]
+                    {
+                        match state
+                            .prepare_deferred_initial_session_terminal(&session_name, spawn_options)
+                        {
+                            Ok(spawn) => {
+                                deferred_initial_spawn = Some(spawn);
+                            }
+                            Err(error) => {
+                                let _removed = state.sessions.remove_session(&session_name);
+                                return Response::Error(ErrorResponse { error });
+                            }
+                        }
+                    }
+                } else {
+                    match state.insert_initial_session_terminal(&session_name, spawn_options) {
+                        Ok(()) => {}
+                        Err(error) => {
+                            let _removed = state.sessions.remove_session(&session_name);
+                            return Response::Error(ErrorResponse { error });
+                        }
                     }
                 }
             }
@@ -396,6 +430,10 @@ impl RequestHandler {
             return response;
         };
         let session_name = success.session_name.clone();
+        #[cfg(windows)]
+        if let Some(spawn) = deferred_initial_spawn {
+            self.spawn_deferred_initial_pane(spawn);
+        }
         if !detached && (request.detach_other_clients || request.kill_other_clients) {
             self.detach_other_attach_clients_for_session(
                 &session_name,
@@ -422,6 +460,190 @@ impl RequestHandler {
             }),
             Err(error) => Response::Error(ErrorResponse { error }),
         }
+    }
+
+    #[cfg(windows)]
+    fn spawn_deferred_initial_pane(&self, job: DeferredInitialPaneSpawn) {
+        let handler = self.clone();
+        let task = async move {
+            handler.run_deferred_initial_pane_spawn(job).await;
+        };
+        if let Some(runtime) = self.server_task_runtime() {
+            runtime.spawn(task);
+        } else {
+            tokio::spawn(task);
+        }
+    }
+
+    #[cfg(windows)]
+    async fn run_deferred_initial_pane_spawn(&self, job: DeferredInitialPaneSpawn) {
+        let open_job = job.clone();
+        let opened = tokio::task::spawn_blocking(move || {
+            HandlerState::open_deferred_initial_pane_terminal(&open_job)
+        })
+        .await;
+        let terminal = match opened {
+            Ok(Ok(terminal)) => terminal,
+            Ok(Err(error)) => {
+                self.fail_deferred_initial_pane_spawn(job, error).await;
+                return;
+            }
+            Err(error) => {
+                self.fail_deferred_initial_pane_spawn(
+                    job,
+                    RmuxError::Server(format!("deferred pane spawn task failed: {error}")),
+                )
+                .await;
+                return;
+            }
+        };
+
+        let completed = {
+            let mut state = self.state.lock().await;
+            state.complete_deferred_initial_pane_spawn(job.clone(), terminal)
+        };
+        match completed {
+            Ok(Some(completed)) => {
+                self.finish_deferred_initial_pane_spawn(completed).await;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.fail_deferred_initial_pane_spawn(job, error).await;
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    async fn finish_deferred_initial_pane_spawn(&self, completed: CompletedDeferredInitialPane) {
+        let session_name = completed.visible_session_name.clone();
+        let runtime_session_name = completed.runtime_session_name.clone();
+        let pane_id = completed.pane_id;
+        let mut pending = completed.input_writer.map(|input_writer| {
+            crate::pane_terminals::DeferredInitialPaneInputFlush {
+                input_writer,
+                queued_input: completed.queued_input,
+            }
+        });
+
+        self.wait_for_deferred_initial_pane_ready(&runtime_session_name, pane_id)
+            .await;
+
+        loop {
+            if let Some(flush) = pending {
+                let write_result = Self::flush_deferred_initial_pane_input(flush).await;
+                if let Err(error) = write_result {
+                    let mut state = self.state.lock().await;
+                    state.add_message(error.to_string());
+                    state.finish_deferred_initial_pane_input_after_error(
+                        &runtime_session_name,
+                        pane_id,
+                    );
+                    break;
+                }
+            }
+
+            let drained = {
+                let mut state = self.state.lock().await;
+                state.drain_or_finish_deferred_initial_pane_input(&runtime_session_name, pane_id)
+            };
+            match drained {
+                Ok(Some(next)) => {
+                    pending = Some(next);
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    let mut state = self.state.lock().await;
+                    state.add_message(error.to_string());
+                    state.finish_deferred_initial_pane_input_after_error(
+                        &runtime_session_name,
+                        pane_id,
+                    );
+                    break;
+                }
+            }
+        }
+
+        self.refresh_attached_session(&session_name).await;
+        self.refresh_control_session(&session_name).await;
+    }
+
+    #[cfg(windows)]
+    async fn wait_for_deferred_initial_pane_ready(
+        &self,
+        runtime_session_name: &SessionName,
+        pane_id: PaneId,
+    ) {
+        let Some(mut receiver) = ({
+            let state = self.state.lock().await;
+            state.subscribe_runtime_pane_output_from_oldest(runtime_session_name, pane_id)
+        }) else {
+            return;
+        };
+
+        let deadline = tokio::time::Instant::now() + DEFERRED_INITIAL_PANE_READY_TIMEOUT;
+        loop {
+            while let Some(item) = receiver.try_recv() {
+                if deferred_initial_pane_ready_item(&item) {
+                    tokio::time::sleep(DEFERRED_INITIAL_PANE_READY_SETTLE).await;
+                    return;
+                }
+            }
+
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return;
+            }
+
+            match tokio::time::timeout(deadline - now, receiver.recv()).await {
+                Ok(item) if deferred_initial_pane_ready_item(&item) => {
+                    tokio::time::sleep(DEFERRED_INITIAL_PANE_READY_SETTLE).await;
+                    return;
+                }
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    async fn flush_deferred_initial_pane_input(
+        flush: crate::pane_terminals::DeferredInitialPaneInputFlush,
+    ) -> Result<(), RmuxError> {
+        if flush.queued_input.is_empty() {
+            return Ok(());
+        }
+        tokio::task::spawn_blocking(move || {
+            for bytes in flush.queued_input {
+                flush.input_writer.write_all(&bytes)?;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(|error| RmuxError::Server(format!("deferred pane input task failed: {error}")))?
+        .map_err(|error| RmuxError::Server(format!("failed to flush deferred pane input: {error}")))
+    }
+
+    #[cfg(windows)]
+    async fn fail_deferred_initial_pane_spawn(
+        &self,
+        job: DeferredInitialPaneSpawn,
+        error: RmuxError,
+    ) {
+        let (exit_callback, exit_event) = {
+            let mut state = self.state.lock().await;
+            let exit_event = state.fail_deferred_initial_pane_spawn(&job, &error);
+            let exit_callback = exit_event
+                .as_ref()
+                .and_then(|_| job.pane_exit_callback.clone());
+            (exit_callback, exit_event)
+        };
+        if let (Some(callback), Some(event)) = (exit_callback, exit_event) {
+            callback(event);
+        }
+        self.refresh_attached_session(&job.visible_session_name)
+            .await;
+        self.refresh_control_session(&job.visible_session_name)
+            .await;
     }
 
     pub(in crate::handler) async fn handle_kill_session(
@@ -630,7 +852,6 @@ impl RequestHandler {
         &self,
         request: rmux_proto::ListSessionsRequest,
     ) -> Response {
-        let state = self.state.lock().await;
         let sort_order = match parse_session_sort_order(request.sort_order.as_deref()) {
             Some(sort_order) => sort_order,
             None if request.sort_order.is_some() => {
@@ -641,6 +862,14 @@ impl RequestHandler {
             }
             None => SessionSortOrder::Name,
         };
+        #[cfg(windows)]
+        if format_references_pane_pid(request.format.as_deref())
+            || format_references_pane_pid(request.filter.as_deref())
+        {
+            self.wait_for_windows_deferred_list_session_pane_pids()
+                .await;
+        }
+        let state = self.state.lock().await;
         let mut sessions = state
             .sessions
             .iter()
@@ -722,6 +951,11 @@ impl RequestHandler {
     }
 }
 
+#[cfg(windows)]
+fn deferred_initial_pane_ready_item(item: &rmux_core::events::OutputCursorItem) -> bool {
+    matches!(item, rmux_core::events::OutputCursorItem::Event(event) if !event.bytes().is_empty())
+}
+
 fn destroy_unattached_candidate_sessions(
     state: &crate::pane_terminals::HandlerState,
     scope: &OptionScopeSelector,
@@ -746,4 +980,37 @@ fn session_pane_ids(session: &rmux_core::Session) -> Vec<PaneId> {
         .values()
         .flat_map(|window| window.panes().iter().map(|pane| pane.id()))
         .collect()
+}
+
+fn should_defer_windows_initial_pane(
+    detached: bool,
+    print_session_info: bool,
+    grouped: bool,
+    has_command: bool,
+) -> bool {
+    #[cfg(windows)]
+    {
+        detached
+            && !print_session_info
+            && !grouped
+            && !has_command
+            && windows_deferred_initial_pane_enabled()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (detached, print_session_info, grouped, has_command);
+        false
+    }
+}
+
+#[cfg(windows)]
+fn windows_deferred_initial_pane_enabled() -> bool {
+    std::env::var("RMUX_WINDOWS_DEFER_CONPTY")
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true)
 }

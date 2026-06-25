@@ -17,7 +17,7 @@ impl RequestHandler {
     ) -> Response {
         let key_count = request.keys.len();
         let prepared = {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             let target = match resolve_pane_target_ref(&state, &request.target) {
                 Ok(target) => target,
                 Err(error) => return Response::Error(ErrorResponse { error }),
@@ -34,7 +34,7 @@ impl RequestHandler {
                     Err(error) => return Response::Error(ErrorResponse { error }),
                 }
             };
-            let write = match prepare_pane_input_write(&state, &target, &bytes) {
+            let write = match prepare_pane_input_write(&mut state, &target, &bytes) {
                 Ok(write) => write,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
@@ -283,12 +283,18 @@ impl RequestHandler {
         &self,
         request: rmux_proto::PaneSnapshotRefRequest,
     ) -> Response {
-        let state = self.state.lock().await;
-        let target = match resolve_pane_target_ref(&state, &request.target) {
-            Ok(target) => target,
-            Err(error) => return Response::Error(ErrorResponse { error }),
+        let inputs = {
+            let state = self.state.lock().await;
+            let target = match resolve_pane_target_ref(&state, &request.target) {
+                Ok(target) => target,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
+            match self.resolve_pane_snapshot_inputs(&state, &target) {
+                Ok(inputs) => inputs,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            }
         };
-        self.handle_resolved_pane_snapshot(&state, &target)
+        self.handle_pane_snapshot_inputs(inputs)
     }
 
     pub(in crate::handler) async fn handle_pane_select_ref(

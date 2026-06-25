@@ -117,6 +117,11 @@ impl TerminalParser {
         self.screen.set_alternate_screen_enabled(enabled);
     }
 
+    /// Enables or disables title changes requested by pane output.
+    pub(crate) fn set_title_rename_enabled(&mut self, enabled: bool) {
+        self.screen.set_title_rename_enabled(enabled);
+    }
+
     /// Updates the tmux `input-buffer-size` parser limit.
     pub(crate) fn set_input_buffer_limit(&mut self, limit: usize) {
         self.parser.set_input_buffer_limit(limit);

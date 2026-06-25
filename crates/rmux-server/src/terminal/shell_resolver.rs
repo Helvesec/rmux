@@ -199,8 +199,7 @@ fn default_shell_path() -> PathBuf {
 
 #[cfg(windows)]
 fn default_shell_path(environment: &HashMap<String, String>) -> PathBuf {
-    search_path(Path::new("pwsh.exe"), environment)
-        .or_else(|| cmd_shell_path(environment))
+    cmd_shell_path(environment)
         .or_else(|| windows_powershell_path(environment))
         .unwrap_or_else(|| PathBuf::from("cmd.exe"))
 }

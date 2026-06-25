@@ -6,10 +6,10 @@ use crate::web::protocol::{AUTH_FRAME_TIMEOUT, WEB_SHARE_PROTOCOL_VERSION};
 use crate::web::SecretHashForCrypto;
 use base64::Engine;
 use rmux_proto::{
-    CreateWebShareRequest, KillSessionRequest, ListSessionsRequest, NewSessionRequest, PaneTarget,
-    Request, Response, SessionName, SplitDirection, SplitWindowRequest, SplitWindowTarget,
-    StopWebShareRequest, TerminalSize, WebShareCreatedResponse, WebShareRequest, WebShareResponse,
-    WebShareScope,
+    CreateWebShareRequest, KillSessionRequest, ListSessionsRequest, ListWindowsRequest,
+    NewSessionRequest, NewWindowRequest, PaneTarget, Request, Response, SessionName,
+    SplitDirection, SplitWindowRequest, SplitWindowTarget, StopWebShareRequest, TerminalSize,
+    WebShareCreatedResponse, WebShareRequest, WebShareResponse, WebShareScope,
 };
 use rmux_web_crypto::{derive_client_session, generate_ephemeral, Message, Opener, Sealer};
 use serde_json::Value;
@@ -224,15 +224,15 @@ async fn share_websocket_auth_ready_snapshot_operator_and_revoke_loop() {
 
     client.send_binary(&[0x80, b'p', b'w', b'd', b'\n']).await;
     let stopped = handler
-        .handle(Request::WebShare(WebShareRequest::Stop(
+        .handle(Request::WebShare(Box::new(WebShareRequest::Stop(
             StopWebShareRequest {
                 share_id: created.share_id,
             },
-        )))
+        ))))
         .await;
     assert!(matches!(
         stopped,
-        Response::WebShare(WebShareResponse::Stopped(_))
+        Response::WebShare(response) if matches!(response.as_ref(), WebShareResponse::Stopped(_))
     ));
 
     let revoked = client.read_json().await;
@@ -488,7 +488,7 @@ async fn session_share_streams_attach_output_without_replacing_snapshot() {
     let session_name = create_session(&handler, "websocket-session-snapshot").await;
     let created = create_share(
         &handler,
-        share_request(WebShareScope::Session(session_name)),
+        share_request(WebShareScope::Session(session_name.clone())),
     )
     .await;
     let mut client = TestWebSocket::connect(
@@ -743,6 +743,74 @@ async fn session_operator_can_run_typed_window_actions() {
 }
 
 #[tokio::test]
+async fn session_spectator_can_select_windows_without_operator_access() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name = create_session(&handler, "websocket-spectator-window-select").await;
+    assert!(matches!(
+        handler
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                target: session_name.clone(),
+                name: Some("logs".to_owned()),
+                detached: true,
+                environment: None,
+                command: None,
+                start_directory: None,
+                target_window_index: None,
+                insert_at_target: false,
+                process_command: None,
+            })))
+            .await,
+        Response::NewWindow(_)
+    ));
+    let created = create_share(
+        &handler,
+        share_request(WebShareScope::Session(session_name.clone())),
+    )
+    .await;
+    let mut client = TestWebSocket::connect(
+        Arc::clone(&handler),
+        &token_from_url(created.spectator_url.as_deref().expect("spectator URL")),
+    )
+    .await;
+    let ready = client.read_json().await;
+    assert_eq!(ready["scope"], "session");
+    assert_eq!(ready["role"], "spectator");
+
+    client.read_binary_with_prefix(0x10, "snapshot").await;
+    read_session_view_until(&mut client, "initial spectator session view", |view| {
+        window_count(view) == 2 && active_window_index(view) == Some(0)
+    })
+    .await;
+
+    client
+        .send_json(r#"{"type":"select_window","window_index":1}"#)
+        .await;
+    read_session_view_until(&mut client, "spectator selected window view", |view| {
+        active_window_index(view) == Some(1)
+    })
+    .await;
+    let Response::ListWindows(listed) = handler
+        .handle(Request::ListWindows(ListWindowsRequest {
+            target: session_name,
+            format: None,
+        }))
+        .await
+    else {
+        panic!("expected list-windows response");
+    };
+    assert!(listed
+        .windows
+        .iter()
+        .any(|window| window.target.window_index() == 0 && window.active));
+    assert!(listed
+        .windows
+        .iter()
+        .any(|window| window.target.window_index() == 1 && !window.active));
+
+    client.close().await;
+}
+
+#[tokio::test]
 async fn handshake_rejects_unknown_token_with_collapsed_close() {
     // An unknown token_id has no registered share, so the pre-ready token lookup
     // returns None and the server collapses to the single wire pair BEFORE it
@@ -985,9 +1053,14 @@ async fn create_share(
 ) -> WebShareCreatedResponse {
     handler.mark_web_listener_available();
     let response = handler
-        .handle(Request::WebShare(WebShareRequest::Create(request)))
+        .handle(Request::WebShare(Box::new(WebShareRequest::Create(
+            request,
+        ))))
         .await;
-    let Response::WebShare(WebShareResponse::Created(created)) = response else {
+    let Response::WebShare(response) = response else {
+        panic!("expected web share creation");
+    };
+    let WebShareResponse::Created(created) = *response else {
         panic!("expected web share creation");
     };
     created

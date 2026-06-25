@@ -36,13 +36,13 @@ async fn split_window_routes_session_and_pane_targets_to_the_expected_panes() {
     );
 
     let selected = handler
-        .handle(Request::SelectPane(SelectPaneRequest {
+        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
             target: PaneTarget::new(alpha.clone(), 1),
             title: None,
             style: None,
             input_disabled: None,
             preserve_zoom: false,
-        }))
+        })))
         .await;
     assert_eq!(
         selected,
@@ -99,6 +99,64 @@ async fn split_window_routes_session_and_pane_targets_to_the_expected_panes() {
 }
 
 #[tokio::test]
+async fn target_action_split_and_resize_resolve_raw_targets_server_side() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+
+    let split = handler
+        .handle(Request::SplitWindowTargetAction(Box::new(
+            SplitWindowTargetActionRequest {
+                target: Some("alpha:0.0".to_owned()),
+                direction: rmux_proto::SplitDirection::Vertical,
+                before: false,
+                environment: None,
+                command: None,
+                process_command: None,
+                start_directory: None,
+                keep_alive_on_exit: None,
+                detached: false,
+                size: None,
+                preserve_zoom: false,
+                full_size: false,
+                stdin_payload: None,
+            },
+        )))
+        .await;
+    assert_eq!(
+        split,
+        Response::SplitWindow(rmux_proto::SplitWindowResponse {
+            pane: PaneTarget::new(alpha.clone(), 1),
+        })
+    );
+
+    let resized = handler
+        .handle(Request::ResizePaneTargetAction(
+            ResizePaneTargetActionRequest {
+                target: Some("alpha:0.1".to_owned()),
+                adjustment: ResizePaneAdjustment::Right { cells: 3 },
+            },
+        ))
+        .await;
+    assert_eq!(
+        resized,
+        Response::ResizePane(rmux_proto::ResizePaneResponse {
+            target: PaneTarget::new(alpha, 1),
+            adjustment: ResizePaneAdjustment::Right { cells: 3 },
+        })
+    );
+}
+
+#[tokio::test]
 async fn select_pane_style_sets_pane_style_and_format_colours() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -128,13 +186,13 @@ async fn select_pane_style_sets_pane_style_and_format_colours() {
     ));
 
     let response = handler
-        .handle(Request::SelectPane(SelectPaneRequest {
+        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
             target: target.clone(),
             title: None,
             style: Some("fg=blue,bg=red".to_owned()),
             input_disabled: None,
             preserve_zoom: false,
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -318,25 +376,25 @@ async fn kill_pane_removes_the_terminal_and_uses_last_pane_fallback() {
     ));
     assert!(matches!(
         handler
-            .handle(Request::SelectPane(SelectPaneRequest {
+            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
                 target: PaneTarget::new(alpha.clone(), 1),
                 title: None,
                 style: None,
                 input_disabled: None,
                 preserve_zoom: false,
-            }))
+            })))
             .await,
         Response::SelectPane(_)
     ));
     assert!(matches!(
         handler
-            .handle(Request::SelectPane(SelectPaneRequest {
+            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
                 target: PaneTarget::new(alpha.clone(), 0),
                 title: None,
                 style: None,
                 input_disabled: None,
                 preserve_zoom: false,
-            }))
+            })))
             .await,
         Response::SelectPane(_)
     ));

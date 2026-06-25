@@ -75,7 +75,7 @@ pub(super) fn parse_capture_pane(mut args: CommandTokens) -> Result<Request, Rmu
         }
     }
 
-    Ok(Request::CapturePane(CapturePaneRequest {
+    Ok(Request::CapturePane(Box::new(CapturePaneRequest {
         target: target.ok_or_else(|| missing_argument("capture-pane", "-t target"))?,
         start,
         end,
@@ -92,7 +92,7 @@ pub(super) fn parse_capture_pane(mut args: CommandTokens) -> Result<Request, Rmu
         quiet,
         start_is_absolute,
         end_is_absolute,
-    }))
+    })))
 }
 
 fn parse_capture_pane_bound(flag: &str, value: &str) -> Result<i64, RmuxError> {
@@ -431,13 +431,13 @@ fn display_message_request(
     empty_target_context: bool,
 ) -> Request {
     if target_client.is_some() {
-        return Request::DisplayMessageExt(DisplayMessageExtRequest {
+        return Request::DisplayMessageExt(Box::new(DisplayMessageExtRequest {
             target,
             print,
             message,
             target_client,
             empty_target_context,
-        });
+        }));
     }
 
     Request::DisplayMessage(DisplayMessageRequest {

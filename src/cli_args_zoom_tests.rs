@@ -28,10 +28,17 @@ fn resize_pane_accepts_zoom_without_columns() {
 }
 
 #[test]
-fn resize_pane_rejects_columns_with_zoom() {
-    let error = parse_args(&["resize-pane", "-t", "alpha:0.1", "-x", "34", "-Z"]).unwrap_err();
+fn resize_pane_zoom_after_columns_follows_tmux_last_wins() {
+    let cli = parse_args(&["resize-pane", "-t", "alpha:0.1", "-x", "34", "-Z"]).unwrap();
 
-    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    match cli.command.expect("parsed command") {
+        Command::ResizePane(args) => {
+            assert_eq!(target_text(&args.target), "alpha:0.1");
+            assert!(args.zoom);
+            assert_eq!(args.columns, None);
+        }
+        _ => panic!("expected ResizePane command"),
+    }
 }
 
 #[test]

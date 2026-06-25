@@ -1,0 +1,9 @@
+<svg width="500" height="55" viewBox="0 0 500 55" fill="none" xmlns="http://www.w3.org/2000/svg">
+<style>
+  .title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; font-size: 20px; font-weight: 600; fill: #1f2328; }
+</style>
+<rect x="110" y="0" width="1" height="55" fill="#d0d7de" shape-rendering="crispEdges"/>
+<g transform="translate(-37.5 0) scale(1.25)">
+<text x="154" y="32" class="title">Quick links</text>
+</g>
+</svg>

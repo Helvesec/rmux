@@ -72,6 +72,19 @@ fn ground_timer_expired_clears_since_ground_buffer() {
     assert!(parser.take_since_ground().is_empty());
 }
 
+#[test]
+fn since_ground_is_bounded_for_unterminated_strings() {
+    let mut parser = InputParser::new();
+    let mut writer = RecordingWriter::new(80, 24);
+    parser.set_input_buffer_limit(INPUT_BUF_START);
+    parser.parse(b"\x1b]", &mut writer);
+    let flood = vec![b'a'; INPUT_BUF_START * 4];
+    parser.parse(&flood, &mut writer);
+
+    assert_eq!(parser.state(), InputState::OscString);
+    assert_eq!(parser.take_since_ground().len(), INPUT_BUF_START);
+}
+
 // ─── Hardening: parameter overflow discard ─────────────────────────
 
 #[test]

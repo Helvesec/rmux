@@ -4,8 +4,15 @@ use rmux_core::PaneId;
 #[cfg(windows)]
 use rmux_pty::PtyChild;
 use rmux_pty::{PtyIo, PtyMaster};
+#[cfg(windows)]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 #[cfg(unix)]
 use std::sync::{Mutex, OnceLock};
+#[cfg(windows)]
+use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 use tracing::warn;
@@ -45,6 +52,41 @@ const PANE_SUSTAINED_READ_MIN_BATCHES: u8 = 64;
 const PANE_SUSTAINED_READ_MIN_DURATION: Duration = Duration::from_millis(500);
 #[cfg(unix)]
 const PANE_ACTIVITY_ALERT_MIN_INTERVAL: Duration = Duration::from_millis(200);
+#[cfg(windows)]
+const WINDOWS_PANE_EOF_PUBLISHED_GRACE: Duration = Duration::from_millis(25);
+#[cfg(windows)]
+const WINDOWS_PANE_EOF_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PaneOutputEofState {
+    published: Arc<AtomicBool>,
+}
+
+#[cfg(windows)]
+impl PaneOutputEofState {
+    fn mark_published(&self) {
+        self.published.store(true, Ordering::Release);
+    }
+
+    fn is_published(&self) -> bool {
+        self.published.load(Ordering::Acquire)
+    }
+
+    fn wait_until_published(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.is_published() {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return self.is_published();
+            }
+            std::thread::sleep((deadline - now).min(WINDOWS_PANE_EOF_POLL_INTERVAL));
+        }
+    }
+}
 
 #[cfg(unix)]
 #[derive(Debug, Default)]
@@ -265,6 +307,7 @@ pub(crate) fn spawn_pane_exit_watcher(
     pane_id: PaneId,
     mut child: PtyChild,
     generation: Option<u64>,
+    eof_state: PaneOutputEofState,
     pane_exit_callback: Option<PaneExitCallback>,
 ) {
     let Some(pane_exit_callback) = pane_exit_callback else {
@@ -277,11 +320,14 @@ pub(crate) fn spawn_pane_exit_watcher(
         .spawn(move || {
             let _ = child.wait();
             child.close_pseudoconsole();
-            pane_exit_callback(PaneExitEvent {
+            if eof_state.wait_until_published(WINDOWS_PANE_EOF_PUBLISHED_GRACE) {
+                return;
+            }
+            pane_exit_callback(PaneExitEvent::eof_pending(
                 session_name,
                 pane_id,
                 generation,
-            });
+            ));
         })
     {
         warn!(
@@ -302,6 +348,7 @@ pub(crate) fn spawn_pane_output_reader(
     transcript: SharedPaneTranscript,
     pane_output: PaneOutputSender,
     generation: Option<u64>,
+    eof_state: PaneOutputEofState,
     pane_alert_callback: Option<PaneAlertCallback>,
     pane_exit_callback: Option<PaneExitCallback>,
 ) {
@@ -312,6 +359,7 @@ pub(crate) fn spawn_pane_output_reader(
         transcript,
         pane_output,
         generation,
+        eof_state,
         pane_alert_callback,
         pane_exit_callback,
     );
@@ -350,11 +398,11 @@ async fn read_pane_output(
             }
             let _ = pane_output.send_for_generation(generation, Vec::new());
             if let Some(callback) = &pane_exit_callback {
-                callback(PaneExitEvent {
-                    session_name: session_name.clone(),
+                callback(PaneExitEvent::eof_published(
+                    session_name.clone(),
                     pane_id,
                     generation,
-                });
+                ));
             }
             return Ok(());
         }
@@ -437,8 +485,9 @@ fn read_pane_output_blocking(
     transcript: SharedPaneTranscript,
     pane_output: PaneOutputSender,
     generation: Option<u64>,
+    eof_state: PaneOutputEofState,
     pane_alert_callback: Option<PaneAlertCallback>,
-    _pane_exit_callback: Option<PaneExitCallback>,
+    pane_exit_callback: Option<PaneExitCallback>,
 ) -> io::Result<()> {
     let pane_reader = pane_master.into_io();
     let mut buffer = vec![0_u8; READ_BUFFER_SIZE];
@@ -451,6 +500,14 @@ fn read_pane_output_blocking(
         };
         if bytes_read == 0 {
             let _ = pane_output.send_for_generation(generation, Vec::new());
+            eof_state.mark_published();
+            if let Some(callback) = &pane_exit_callback {
+                callback(PaneExitEvent::eof_published(
+                    session_name.clone(),
+                    pane_id,
+                    generation,
+                ));
+            }
             return Ok(());
         }
 
@@ -597,6 +654,7 @@ fn spawn_blocking_pane_output_reader_inner(
     transcript: SharedPaneTranscript,
     pane_output: PaneOutputSender,
     generation: Option<u64>,
+    eof_state: PaneOutputEofState,
     pane_alert_callback: Option<PaneAlertCallback>,
     pane_exit_callback: Option<PaneExitCallback>,
 ) {
@@ -612,6 +670,7 @@ fn spawn_blocking_pane_output_reader_inner(
                 transcript,
                 pane_output,
                 generation,
+                eof_state,
                 pane_alert_callback,
                 pane_exit_callback,
             ) {
@@ -886,13 +945,14 @@ finally:
 #[cfg(all(test, windows))]
 mod tests {
     use std::error::Error;
+    use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};
 
     use rmux_core::{GridRenderOptions, PaneId, ScreenCaptureRange};
     use rmux_proto::{SessionName, TerminalSize};
     use rmux_pty::{ChildCommand, TerminalSize as PtyTerminalSize};
 
-    use super::spawn_pane_output_reader;
+    use super::{spawn_pane_output_reader, PaneOutputEofState};
     use crate::pane_io::pane_output_channel;
     use crate::pane_transcript::PaneTranscript;
 
@@ -921,6 +981,7 @@ mod tests {
             transcript.clone(),
             pane_output,
             None,
+            PaneOutputEofState::default(),
             None,
             None,
         );
@@ -934,6 +995,52 @@ mod tests {
         assert!(
             captured.contains("RMUX_READER_OK"),
             "expected marker in transcript, got {captured:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn windows_output_reader_publishes_eof_exit_event_after_child_exit(
+    ) -> Result<(), Box<dyn Error>> {
+        let mut spawned = ChildCommand::new("C:\\Windows\\System32\\cmd.exe")
+            .args(["/D", "/K"])
+            .size(PtyTerminalSize::new(100, 30))
+            .spawn()?;
+        let output_reader = spawned.master().try_clone()?;
+        let writer = spawned.master().try_clone_io()?;
+        let transcript = PaneTranscript::shared(
+            2_000,
+            TerminalSize {
+                cols: 100,
+                rows: 30,
+            },
+        );
+        let pane_output = pane_output_channel();
+        let (tx, rx) = mpsc::channel();
+        let callback: crate::pane_io::PaneExitCallback = Arc::new(move |event| {
+            let _ = tx.send(event.output_eof_published());
+        });
+
+        spawn_pane_output_reader(
+            SessionName::new("alpha").expect("valid session name"),
+            PaneId::new(1),
+            output_reader,
+            transcript,
+            pane_output,
+            Some(7),
+            PaneOutputEofState::default(),
+            None,
+            Some(callback),
+        );
+
+        writer.write_all(b"exit\r\n")?;
+        let _ = spawned.child_mut().wait()?;
+        spawned.child().close_pseudoconsole();
+
+        let published = rx.recv_timeout(Duration::from_secs(2))?;
+        assert!(
+            published,
+            "Windows reader must report EOF as already published"
         );
         Ok(())
     }

@@ -34,7 +34,7 @@ fn wait_for(channel: &str, mode: WaitForMode) -> Request {
 }
 
 fn run_shell(command: &str, background: bool) -> Request {
-    Request::RunShell(RunShellRequest {
+    Request::RunShell(Box::new(RunShellRequest {
         command: command.to_owned(),
         background,
 
@@ -44,11 +44,11 @@ fn run_shell(command: &str, background: bool) -> Request {
         start_directory: None,
         target: None,
         source_depth: None,
-    })
+    }))
 }
 
 fn source_file_request(paths: Vec<String>, cwd: Option<PathBuf>) -> Request {
-    Request::SourceFile(SourceFileRequest {
+    Request::SourceFile(Box::new(SourceFileRequest {
         paths,
         quiet: false,
         parse_only: false,
@@ -57,7 +57,7 @@ fn source_file_request(paths: Vec<String>, cwd: Option<PathBuf>) -> Request {
         target: None,
         caller_cwd: cwd,
         stdin: None,
-    })
+    }))
 }
 
 fn temp_root(label: &str) -> PathBuf {

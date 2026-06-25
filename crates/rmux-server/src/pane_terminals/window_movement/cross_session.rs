@@ -715,42 +715,6 @@ impl HandlerState {
         )
     }
 
-    fn remove_empty_source_session_group(
-        &mut self,
-        mut group_members: Vec<SessionName>,
-    ) -> Result<(), RmuxError> {
-        group_members.sort_by(|left, right| {
-            let left_is_owner = self.sessions.runtime_owner(left).as_ref() == Some(left);
-            let right_is_owner = self.sessions.runtime_owner(right).as_ref() == Some(right);
-            left_is_owner
-                .cmp(&right_is_owner)
-                .then_with(|| left.as_str().cmp(right.as_str()))
-        });
-
-        for session_name in group_members {
-            if self.sessions.session(&session_name).is_none() {
-                continue;
-            }
-            let current_runtime_owner = self.sessions.runtime_owner(&session_name);
-            let next_runtime_owner = if current_runtime_owner.as_ref() == Some(&session_name) {
-                None
-            } else {
-                self.sessions.runtime_owner_transfer_target(&session_name)
-            };
-            let _ = self.sessions.remove_session(&session_name)?;
-            let _ = self.options.remove_session(&session_name);
-            let _ = self.environment.remove_session(&session_name);
-            let _ = self.hooks.remove_session(&session_name);
-            self.remove_session_terminals(
-                &session_name,
-                current_runtime_owner.as_ref(),
-                next_runtime_owner.as_ref(),
-            )?;
-        }
-
-        Ok(())
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn move_linked_window_across_sessions(
         &mut self,

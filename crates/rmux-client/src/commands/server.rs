@@ -30,6 +30,16 @@ impl Connection {
         self.roundtrip(&Request::KillServer(KillServerRequest))
     }
 
+    /// Sends a `kill-server` request and returns after the frame is written.
+    ///
+    /// Windows package clients use this for the tmux-style fire-and-forget
+    /// shutdown path, where waiting for the daemon's final cleanup dominates
+    /// the command latency and the named pipe does not need client-side socket
+    /// removal.
+    pub fn kill_server_after_write(&mut self) -> Result<(), ClientError> {
+        self.write_request(&Request::KillServer(KillServerRequest))
+    }
+
     /// Sends a legacy wire-v1 `kill-server` request for pre-0.6 daemon cleanup.
     pub fn kill_server_legacy_wire_v1(&mut self) -> Result<(), ClientError> {
         self.write_legacy_wire_v1_request(&Request::KillServer(KillServerRequest))

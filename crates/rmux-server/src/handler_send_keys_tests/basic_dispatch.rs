@@ -47,10 +47,16 @@ async fn send_keys_marks_attached_session_input_as_interactive() {
         response,
         Response::SendKeys(SendKeysResponse { key_count: 1 })
     );
-    assert!(matches!(
-        control_rx.try_recv(),
-        Ok(crate::pane_io::AttachControl::InteractiveInput)
-    ));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(control) = control_rx.recv().await {
+            if matches!(control, crate::pane_io::AttachControl::InteractiveInput) {
+                return;
+            }
+        }
+        panic!("attach control channel should remain open");
+    })
+    .await
+    .expect("interactive input control should arrive");
 }
 
 #[tokio::test]
@@ -340,18 +346,18 @@ async fn bind_key_and_list_keys_round_trip_through_the_handler() {
     let handler = RequestHandler::new();
 
     let bound = handler
-        .handle(Request::BindKey(BindKeyRequest {
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
             table_name: "root".to_owned(),
             key: "C-a".to_owned(),
             note: Some("test note".to_owned()),
             repeat: true,
             command: Some(vec!["display-message".to_owned(), "hello".to_owned()]),
-        }))
+        })))
         .await;
     assert!(matches!(bound, Response::BindKey(_)));
 
     let listed = handler
-        .handle(Request::ListKeys(ListKeysRequest {
+        .handle(Request::ListKeys(Box::new(ListKeysRequest {
             table_name: Some("root".to_owned()),
             first_only: false,
             notes: false,
@@ -361,7 +367,7 @@ async fn bind_key_and_list_keys_round_trip_through_the_handler() {
             sort_order: None,
             prefix: None,
             key: Some("C-a".to_owned()),
-        }))
+        })))
         .await;
 
     let Response::ListKeys(response) = listed else {
@@ -394,7 +400,7 @@ async fn send_keys_k_dispatches_prefix_table_bindings() {
         .await;
 
     let bound = handler
-        .handle(Request::BindKey(BindKeyRequest {
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
             table_name: "prefix".to_owned(),
             key: "x".to_owned(),
             note: Some("prefix-hit".to_owned()),
@@ -405,7 +411,7 @@ async fn send_keys_k_dispatches_prefix_table_bindings() {
                 "prefix-hit".to_owned(),
                 "yes".to_owned(),
             ]),
-        }))
+        })))
         .await;
     assert!(matches!(bound, Response::BindKey(_)));
 
@@ -461,7 +467,7 @@ async fn switch_client_t_sets_custom_key_table_for_next_k_dispatch() {
         .await;
 
     let bound = handler
-        .handle(Request::BindKey(BindKeyRequest {
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
             table_name: "my-table".to_owned(),
             key: "j".to_owned(),
             note: Some("custom".to_owned()),
@@ -472,7 +478,7 @@ async fn switch_client_t_sets_custom_key_table_for_next_k_dispatch() {
                 "custom-hit".to_owned(),
                 "ok".to_owned(),
             ]),
-        }))
+        })))
         .await;
     assert!(matches!(bound, Response::BindKey(_)));
 
@@ -538,7 +544,7 @@ async fn send_keys_k_uses_copy_mode_bindings_until_copy_mode_exits() {
 
     let bound = handle_boxed(
         &handler,
-        Request::BindKey(BindKeyRequest {
+        Request::BindKey(Box::new(BindKeyRequest {
             table_name: "copy-mode".to_owned(),
             key: "j".to_owned(),
             note: Some("copy-mode-hit".to_owned()),
@@ -549,7 +555,7 @@ async fn send_keys_k_uses_copy_mode_bindings_until_copy_mode_exits() {
                 "copy-mode-hit".to_owned(),
                 "ok".to_owned(),
             ]),
-        }),
+        })),
     )
     .await;
     assert!(matches!(bound, Response::BindKey(_)));
@@ -655,7 +661,7 @@ async fn send_keys_k_uses_copy_mode_vi_bindings_when_mode_keys_is_vi() {
 
     let bound = handle_boxed(
         &handler,
-        Request::BindKey(BindKeyRequest {
+        Request::BindKey(Box::new(BindKeyRequest {
             table_name: "copy-mode-vi".to_owned(),
             key: "v".to_owned(),
             note: Some("copy-mode-vi-hit".to_owned()),
@@ -666,7 +672,7 @@ async fn send_keys_k_uses_copy_mode_vi_bindings_when_mode_keys_is_vi() {
                 "copy-mode-vi-hit".to_owned(),
                 "ok".to_owned(),
             ]),
-        }),
+        })),
     )
     .await;
     assert!(matches!(bound, Response::BindKey(_)));

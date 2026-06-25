@@ -1,0 +1,56 @@
+name: rmux
+title: RMUX
+version: "0.7.0"
+summary: Rust terminal multiplexer with tmux-style commands
+description: |
+  RMUX is a terminal multiplexer with a tmux-style command line, daemon-backed
+  persistent sessions, native Linux/macOS/Windows support, and a Rust SDK for
+  automation.
+
+base: core24
+grade: stable
+confinement: classic
+license: MIT OR Apache-2.0
+website: https://rmux.io
+source-code: https://github.com/Helvesec/rmux
+issues: https://github.com/Helvesec/rmux/issues
+
+platforms:
+  amd64:
+  arm64:
+
+apps:
+  rmux:
+    command: bin/rmux
+  rmux-daemon:
+    command: bin/rmux-daemon
+
+parts:
+  rmux:
+    plugin: rust
+    source: .
+    rust-channel: stable
+    rust-path:
+      - .
+    override-build: |
+      craftctl default
+      install -Dm755 target/release/rmux "$CRAFT_PART_INSTALL/libexec/rmux/rmux"
+      cargo build --locked --release --features tiny-cli --bin rmux
+      install -Dm755 target/release/rmux "$CRAFT_PART_INSTALL/bin/rmux"
+      cargo build --locked --release --bin rmux-daemon
+      install -Dm755 target/release/rmux-daemon "$CRAFT_PART_INSTALL/bin/rmux-daemon"
+      install -Dm0644 docs/man/rmux.1 "$CRAFT_PART_INSTALL/share/man/man1/rmux.1"
+      completion_dir="$(mktemp -d)"
+      cargo run --locked --release --package xtask -- generate-completions --output-dir "$completion_dir"
+      install -Dm0644 "$completion_dir/rmux.bash" "$CRAFT_PART_INSTALL/share/bash-completion/completions/rmux"
+      install -Dm0644 "$completion_dir/_rmux" "$CRAFT_PART_INSTALL/share/zsh/vendor-completions/_rmux"
+      install -Dm0644 "$completion_dir/rmux.fish" "$CRAFT_PART_INSTALL/share/fish/vendor_completions.d/rmux.fish"
+      install -Dm0644 "$completion_dir/_rmux.ps1" "$CRAFT_PART_INSTALL/share/powershell/Completions/_rmux.ps1"
+      install -Dm0644 "$completion_dir/rmux.elv" "$CRAFT_PART_INSTALL/share/elvish/lib/rmux.elv"
+    rust-inherit-ldflags: true
+    build-attributes:
+      - enable-patchelf
+    build-environment:
+      - LDFLAGS: >-
+          -Wl,-rpath=\$ORIGIN/lib:/snap/core24/current/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR
+          -Wl,-dynamic-linker=$(find /snap/core24/current/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR -name 'ld*.so.*' -print | head -n1)

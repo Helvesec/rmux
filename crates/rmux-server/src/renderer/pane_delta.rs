@@ -279,6 +279,7 @@ impl PaneRenderSnapshot {
             frame.extend_from_slice(
                 cursor_position_bytes(self.y.saturating_add(row as u16), self.x).as_slice(),
             );
+            frame.extend_from_slice(b"\x1b[0m");
             frame.extend_from_slice(line);
         }
         frame.extend_from_slice(b"\x1b[0m\x1b[u");
@@ -1326,9 +1327,30 @@ mod tests {
 
         let text = String::from_utf8(snapshot.full_frame()).expect("frame is utf8");
 
-        assert!(text.contains("\u{1b}[1;1Habc"));
-        assert!(text.contains("\u{1b}[2;1Hdef"));
+        assert!(text.contains("\u{1b}[1;1H\u{1b}[0mabc"));
+        assert!(text.contains("\u{1b}[2;1H\u{1b}[0mdef"));
         assert!(text.ends_with("\u{1b}[2;4H"));
+    }
+
+    #[test]
+    fn pane_snapshot_full_frame_resets_before_default_row_after_styled_full_width_row() {
+        let session = Session::new(session_name("alpha"), TerminalSize { cols: 10, rows: 4 });
+        let pane = session.window().active_pane().expect("active pane");
+        let options = OptionStore::new();
+        let screen = screen_with(b"\x1b[48;5;255m          \r\n\x1b[0mplain");
+        let snapshot =
+            PaneRenderSnapshot::capture(&session, &options, pane, &screen).expect("snapshot");
+
+        let text = String::from_utf8(snapshot.full_frame()).expect("frame is utf8");
+
+        assert!(
+            text.contains("\u{1b}[1;1H\u{1b}[0m\u{1b}[48;5;255m          "),
+            "{text:?}"
+        );
+        assert!(
+            text.contains("\u{1b}[2;1H\u{1b}[0mplain"),
+            "default rows must not inherit the previous row's background: {text:?}"
+        );
     }
 
     #[test]

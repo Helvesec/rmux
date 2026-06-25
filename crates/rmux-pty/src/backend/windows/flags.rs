@@ -1,4 +1,5 @@
 use std::env;
+use std::sync::OnceLock;
 
 use super::version::{current_windows_version, WindowsVersion};
 
@@ -28,6 +29,11 @@ impl ConptyFlags {
 }
 
 pub(super) fn selected_conpty_flags() -> ConptyFlags {
+    static SELECTED: OnceLock<ConptyFlags> = OnceLock::new();
+    *SELECTED.get_or_init(compute_selected_conpty_flags)
+}
+
+fn compute_selected_conpty_flags() -> ConptyFlags {
     let version = current_windows_version().ok();
     let passthrough_disabled = env_flag(DISABLE_PASSTHROUGH_ENV);
     let flags = select_conpty_flags(version, passthrough_disabled);

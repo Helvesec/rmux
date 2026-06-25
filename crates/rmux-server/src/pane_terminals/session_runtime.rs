@@ -5,6 +5,24 @@ use crate::terminal::SessionBaseEnvironment;
 
 use super::{session_not_found, HandlerState};
 
+fn pane_base_environment_with_starting_fallback(
+    state: &HandlerState,
+    runtime_session_name: &SessionName,
+    pane_id: PaneId,
+) -> Option<SessionBaseEnvironment> {
+    let base = state
+        .terminals
+        .pane_base_environment(runtime_session_name, pane_id);
+    #[cfg(windows)]
+    {
+        base.or_else(|| state.starting_pane_base_environment(runtime_session_name, pane_id))
+    }
+    #[cfg(not(windows))]
+    {
+        base
+    }
+}
+
 impl HandlerState {
     pub(in crate::pane_terminals) fn runtime_session_name(
         &self,
@@ -23,8 +41,7 @@ impl HandlerState {
         let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
         self.first_pane_id_for_window(session_name, window_index)
             .and_then(|pane_id| {
-                self.terminals
-                    .pane_base_environment(&runtime_session_name, pane_id)
+                pane_base_environment_with_starting_fallback(self, &runtime_session_name, pane_id)
             })
             .or_else(|| {
                 self.terminals
@@ -44,8 +61,7 @@ impl HandlerState {
             target.pane_index(),
         )
         .and_then(|pane_id| {
-            self.terminals
-                .pane_base_environment(&runtime_session_name, pane_id)
+            pane_base_environment_with_starting_fallback(self, &runtime_session_name, pane_id)
         })
         .or_else(|| {
             self.terminals
@@ -63,8 +79,7 @@ impl HandlerState {
         let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
         self.pane_id_for_indexed_target(session_name, window_index, pane_index)
             .and_then(|pane_id| {
-                self.terminals
-                    .pane_base_environment(&runtime_session_name, pane_id)
+                pane_base_environment_with_starting_fallback(self, &runtime_session_name, pane_id)
             })
             .or_else(|| {
                 self.terminals
@@ -220,6 +235,8 @@ impl HandlerState {
             self.clear_marked_pane();
         }
 
+        #[cfg(windows)]
+        let _ = self.starting_panes.remove(session_name);
         for pipe in self.remove_session_pipes(session_name).into_values() {
             pipe.stop();
         }
@@ -240,6 +257,42 @@ impl HandlerState {
             }
         }
         Ok(removed_terminals.is_some())
+    }
+
+    pub(crate) fn remove_empty_source_session_group(
+        &mut self,
+        mut group_members: Vec<SessionName>,
+    ) -> Result<(), RmuxError> {
+        group_members.sort_by(|left, right| {
+            let left_is_owner = self.sessions.runtime_owner(left).as_ref() == Some(left);
+            let right_is_owner = self.sessions.runtime_owner(right).as_ref() == Some(right);
+            left_is_owner
+                .cmp(&right_is_owner)
+                .then_with(|| left.as_str().cmp(right.as_str()))
+        });
+
+        for session_name in group_members {
+            if self.sessions.session(&session_name).is_none() {
+                continue;
+            }
+            let current_runtime_owner = self.sessions.runtime_owner(&session_name);
+            let next_runtime_owner = if current_runtime_owner.as_ref() == Some(&session_name) {
+                None
+            } else {
+                self.sessions.runtime_owner_transfer_target(&session_name)
+            };
+            let _ = self.sessions.remove_session(&session_name)?;
+            let _ = self.options.remove_session(&session_name);
+            let _ = self.environment.remove_session(&session_name);
+            let _ = self.hooks.remove_session(&session_name);
+            self.remove_session_terminals(
+                &session_name,
+                current_runtime_owner.as_ref(),
+                next_runtime_owner.as_ref(),
+            )?;
+        }
+
+        Ok(())
     }
 
     fn transfer_linked_window_runtimes_before_session_removal(
@@ -335,6 +388,12 @@ impl HandlerState {
                 "pane output readers already exist for session {new_name}"
             )));
         }
+        #[cfg(windows)]
+        if self.starting_panes.contains_key(new_name) {
+            return Err(RmuxError::Server(format!(
+                "starting panes already exist for session {new_name}"
+            )));
+        }
 
         self.pipes.rename_session(session_name, new_name)?;
 
@@ -343,6 +402,8 @@ impl HandlerState {
         let mut pane_output_generations = std::mem::take(&mut self.pane_output_generations);
         #[cfg(unix)]
         let mut pane_output_readers = std::mem::take(&mut self.pane_output_readers);
+        #[cfg(windows)]
+        let mut starting_panes = std::mem::take(&mut self.starting_panes);
         let mut dead_panes = std::mem::take(&mut self.dead_panes);
         let mut attached_submitted_rows = std::mem::take(&mut self.attached_submitted_rows);
 
@@ -357,6 +418,8 @@ impl HandlerState {
             .unwrap_or_default();
         #[cfg(unix)]
         let session_output_readers = pane_output_readers.remove(session_name).unwrap_or_default();
+        #[cfg(windows)]
+        let session_starting_panes = starting_panes.remove(session_name).unwrap_or_default();
         let session_dead_panes = dead_panes.remove(session_name).unwrap_or_default();
         let session_attached_rows = attached_submitted_rows
             .remove(session_name)
@@ -378,6 +441,11 @@ impl HandlerState {
             let previous_readers =
                 pane_output_readers.insert(new_name.clone(), session_output_readers);
             debug_assert!(previous_readers.is_none());
+        }
+        #[cfg(windows)]
+        if !session_starting_panes.is_empty() {
+            let previous_starting = starting_panes.insert(new_name.clone(), session_starting_panes);
+            debug_assert!(previous_starting.is_none());
         }
         if !session_dead_panes.is_empty() {
             let previous_dead_panes = dead_panes.insert(new_name.clone(), session_dead_panes);
@@ -405,6 +473,10 @@ impl HandlerState {
         #[cfg(unix)]
         {
             self.pane_output_readers = pane_output_readers;
+        }
+        #[cfg(windows)]
+        {
+            self.starting_panes = starting_panes;
         }
         self.dead_panes = dead_panes;
         self.attached_submitted_rows = attached_submitted_rows;

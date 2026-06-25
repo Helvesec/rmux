@@ -87,6 +87,9 @@ NestedInstallerFiles:
   - RelativeFilePath: $nested_path
     PortableCommandAlias: rmux
 ReleaseDate: "$release_date"
+Dependencies:
+  PackageDependencies:
+    - PackageIdentifier: Microsoft.VCRedist.2015+.x64
 Installers:
   - Architecture: x64
     InstallerUrl: $base_url/$asset

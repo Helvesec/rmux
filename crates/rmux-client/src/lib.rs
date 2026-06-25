@@ -23,6 +23,8 @@ pub(crate) mod upgrade;
 
 #[cfg(unix)]
 pub use attach::attach_terminal_with_initial_bytes_and_resize_geometry;
+#[cfg(windows)]
+pub use attach::attach_terminal_with_initial_bytes_and_windows_console_key;
 pub use attach::{
     attach_terminal, attach_terminal_with_initial_bytes, attach_with_terminal, drive_attach_stream,
     AttachError, RawTerminal,
@@ -34,9 +36,9 @@ pub use auto_start::{
 pub use commands::server::StartServerError;
 pub use commands::window::SplitWindowOptions;
 pub use connection::{
-    connect, connect_or_absent, default_socket_path, resolve_socket_path, socket_path_for_label,
-    AttachSessionUpgrade, AttachTransition, ConnectResult, Connection, ControlModeUpgrade,
-    ControlTransition,
+    connect, connect_or_absent, default_socket_path, resolve_socket_path,
+    resolve_tmux_compatible_socket_path, socket_path_for_label, AttachSessionUpgrade,
+    AttachTransition, ConnectResult, Connection, ControlModeUpgrade, ControlTransition,
 };
 pub use control::{drive_control_mode, drive_control_mode_with_stdio};
 pub use nested::{

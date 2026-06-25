@@ -21,6 +21,11 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{timeout, Duration};
 
+#[cfg(windows)]
+const ALERT_TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(windows))]
+const ALERT_TEST_EVENT_TIMEOUT: Duration = Duration::from_millis(500);
+
 fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
 }
@@ -42,7 +47,7 @@ async fn create_session(handler: &RequestHandler, name: &str) -> SessionName {
 async fn create_quiet_session(handler: &RequestHandler, name: &str) -> SessionName {
     let session = session_name(name);
     let response = handler
-        .handle(Request::NewSessionExt(NewSessionExtRequest {
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: Some(session.clone()),
             working_directory: None,
             detached: true,
@@ -60,7 +65,7 @@ async fn create_quiet_session(handler: &RequestHandler, name: &str) -> SessionNa
             process_command: None,
             client_environment: None,
             skip_environment_update: false,
-        }))
+        })))
         .await;
     assert!(matches!(response, Response::NewSession(_)));
     session
@@ -68,7 +73,7 @@ async fn create_quiet_session(handler: &RequestHandler, name: &str) -> SessionNa
 
 async fn create_window(handler: &RequestHandler, session: &SessionName) -> WindowTarget {
     let response = handler
-        .handle(Request::NewWindow(NewWindowRequest {
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
             target: session.clone(),
             name: None,
             detached: true,
@@ -78,7 +83,7 @@ async fn create_window(handler: &RequestHandler, session: &SessionName) -> Windo
             process_command: None,
             target_window_index: None,
             insert_at_target: false,
-        }))
+        })))
         .await;
     let Response::NewWindow(response) = response else {
         panic!("expected new-window response");
@@ -88,7 +93,7 @@ async fn create_window(handler: &RequestHandler, session: &SessionName) -> Windo
 
 async fn split_quiet_window(handler: &RequestHandler, session: &SessionName) {
     let response = handler
-        .handle(Request::SplitWindowExt(SplitWindowExtRequest {
+        .handle(Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
             target: SplitWindowTarget::Session(session.clone()),
             direction: SplitDirection::Vertical,
             before: false,
@@ -102,7 +107,7 @@ async fn split_quiet_window(handler: &RequestHandler, session: &SessionName) {
             preserve_zoom: false,
             full_size: false,
             stdin_payload: None,
-        }))
+        })))
         .await;
     assert!(matches!(response, Response::SplitWindow(_)));
 }
@@ -172,7 +177,7 @@ async fn set_option(
 async fn recv_lifecycle(
     receiver: &mut broadcast::Receiver<QueuedLifecycleEvent>,
 ) -> QueuedLifecycleEvent {
-    timeout(Duration::from_millis(500), receiver.recv())
+    timeout(ALERT_TEST_EVENT_TIMEOUT, receiver.recv())
         .await
         .expect("lifecycle event should arrive")
         .expect("lifecycle channel should stay open")
@@ -181,7 +186,7 @@ async fn recv_lifecycle(
 async fn recv_attach_control(
     receiver: &mut mpsc::UnboundedReceiver<AttachControl>,
 ) -> AttachControl {
-    timeout(Duration::from_millis(500), receiver.recv())
+    timeout(ALERT_TEST_EVENT_TIMEOUT, receiver.recv())
         .await
         .expect("attach control should arrive")
         .expect("attach control channel should stay open")
@@ -516,11 +521,9 @@ async fn pane_exit_callback_can_be_invoked_from_reader_thread() {
     let callback = handler.pane_exit_callback();
 
     std::thread::spawn(move || {
-        callback(crate::pane_io::PaneExitEvent {
-            session_name: session,
-            pane_id,
-            generation: None,
-        });
+        callback(crate::pane_io::PaneExitEvent::eof_published(
+            session, pane_id, None,
+        ));
     })
     .join()
     .expect("reader-thread exit callback should not panic outside the Tokio runtime");
@@ -632,7 +635,7 @@ async fn pane_alert_event_updates_grouped_session_window_names() {
     let alpha = create_session(&handler, "alerts-group-alpha").await;
     let beta = session_name("alerts-group-beta");
     let response = handler
-        .handle(Request::NewSessionExt(NewSessionExtRequest {
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: Some(beta.clone()),
             working_directory: None,
             detached: true,
@@ -650,7 +653,7 @@ async fn pane_alert_event_updates_grouped_session_window_names() {
             process_command: None,
             client_environment: None,
             skip_environment_update: false,
-        }))
+        })))
         .await;
     assert!(matches!(response, Response::NewSession(_)));
     set_option(

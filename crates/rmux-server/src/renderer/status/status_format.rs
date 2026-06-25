@@ -1,3 +1,5 @@
+use std::cell::OnceCell;
+
 use rmux_core::formats::{FormatVariable, FormatVariables};
 use rmux_core::{style::Style, OptionStore, Utf8Config};
 use rmux_proto::{OptionName, SessionName};
@@ -32,7 +34,7 @@ pub(super) fn render_explicit_status_format_line(
     let expanded = render_status_template_jobs_with_profile(
         &template,
         &status_runtime,
-        status_runtime.profile.as_ref(),
+        status_runtime.profile_for_template(&template),
         ttl,
     );
     Some(format_draw_line(&expanded, base_style, width, utf8_config))
@@ -47,35 +49,64 @@ fn has_explicit_status_format(options: &OptionStore, session_name: &SessionName)
 
 struct StatusFormatVariables<'a, 'runtime> {
     inner: &'a RuntimeFormatContext<'runtime>,
-    profile: Option<crate::terminal::TerminalProfile>,
-    status_left: Option<String>,
-    status_right: Option<String>,
+    session_name: &'a SessionName,
+    options: &'a OptionStore,
+    ttl: std::time::Duration,
+    profile: OnceCell<Option<crate::terminal::TerminalProfile>>,
+    status_left: OnceCell<Option<String>>,
+    status_right: OnceCell<Option<String>>,
 }
 
 impl<'a, 'runtime> StatusFormatVariables<'a, 'runtime> {
     fn new(
         inner: &'a RuntimeFormatContext<'runtime>,
-        session_name: &SessionName,
-        options: &OptionStore,
+        session_name: &'a SessionName,
+        options: &'a OptionStore,
         ttl: std::time::Duration,
     ) -> Self {
-        let profile = inner.status_job_profile();
-        let status_left = options
-            .resolve(Some(session_name), OptionName::StatusLeft)
-            .map(|template| {
-                render_status_template_jobs_with_profile(template, inner, profile.as_ref(), ttl)
-            });
-        let status_right = options
-            .resolve(Some(session_name), OptionName::StatusRight)
-            .map(|template| {
-                render_status_template_jobs_with_profile(template, inner, profile.as_ref(), ttl)
-            });
         Self {
             inner,
-            profile,
-            status_left,
-            status_right,
+            session_name,
+            options,
+            ttl,
+            profile: OnceCell::new(),
+            status_left: OnceCell::new(),
+            status_right: OnceCell::new(),
         }
+    }
+
+    fn profile_for_template(&self, template: &str) -> Option<&crate::terminal::TerminalProfile> {
+        if !template.contains("#(") {
+            return None;
+        }
+        self.profile
+            .get_or_init(|| self.inner.status_job_profile())
+            .as_ref()
+    }
+
+    fn status_left(&self) -> Option<String> {
+        self.status_left
+            .get_or_init(|| self.render_option(OptionName::StatusLeft))
+            .clone()
+    }
+
+    fn status_right(&self) -> Option<String> {
+        self.status_right
+            .get_or_init(|| self.render_option(OptionName::StatusRight))
+            .clone()
+    }
+
+    fn render_option(&self, option: OptionName) -> Option<String> {
+        self.options
+            .resolve(Some(self.session_name), option)
+            .map(|template| {
+                render_status_template_jobs_with_profile(
+                    template,
+                    self.inner,
+                    self.profile_for_template(template),
+                    self.ttl,
+                )
+            })
     }
 }
 
@@ -105,8 +136,8 @@ impl FormatVariables for StatusFormatVariables<'_, '_> {
 
     fn format_value_by_name(&self, name: &str) -> Option<String> {
         match name {
-            "status-left" => self.status_left.clone(),
-            "status-right" => self.status_right.clone(),
+            "status-left" => self.status_left(),
+            "status-right" => self.status_right(),
             _ => self.inner.format_value_by_name(name),
         }
     }

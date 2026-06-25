@@ -1,16 +1,21 @@
 //! Public CLI dispatch for the RMUX binary.
 
+use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 #[path = "cli/alias_fallback.rs"]
 mod alias_fallback;
+#[path = "cli/automation/mod.rs"]
+mod automation;
 #[path = "cli/buffer_commands.rs"]
 mod buffer_commands;
 #[path = "cli/capabilities.rs"]
 mod capabilities;
 #[path = "cli/capture_pane.rs"]
 mod capture_pane;
+#[path = "cli/claude_launcher.rs"]
+mod claude_launcher;
 #[path = "cli/client_commands.rs"]
 mod client_commands;
 #[path = "cli/command_inventory.rs"]
@@ -51,6 +56,8 @@ mod target_resolution;
 mod terminal_size;
 #[path = "cli/terminal_theme.rs"]
 mod terminal_theme;
+#[path = "cli/tmux_dropin.rs"]
+mod tmux_dropin;
 #[path = "cli/top_level.rs"]
 mod top_level;
 #[path = "cli/web_commands.rs"]
@@ -60,7 +67,10 @@ mod web_share_display;
 #[path = "cli/window_commands.rs"]
 mod window_commands;
 
-use rmux_client::{connect, ensure_server_running_with_config, resolve_socket_path, Connection};
+use rmux_client::{
+    connect, ensure_server_running_with_config, resolve_socket_path,
+    resolve_tmux_compatible_socket_path, Connection,
+};
 
 use crate::cli_args::parse;
 use crate::cli_response::{expect_command_output, expect_command_success};
@@ -71,11 +81,13 @@ use client_commands::{
 };
 #[cfg(test)]
 use command_inventory::render_list_commands_line;
+pub(crate) use command_runner::{
+    capture_target_action_needs_legacy_retry, cli_target_actions_enabled, run_command,
+    run_command_resolved, run_payload_command, run_payload_command_resolved,
+    target_action_needs_legacy_retry,
+};
 use command_runner::{
     finish_command_success, unexpected_response, write_command_output, write_lines_output,
-};
-pub(crate) use command_runner::{
-    run_command, run_command_resolved, run_payload_command, run_payload_command_resolved,
 };
 use dispatch::dispatch_command_queue;
 #[cfg(test)]
@@ -100,6 +112,9 @@ use top_level::{
     accept_compatibility_options, infer_client_utf8_from_env, top_level_parse_failure,
     top_level_version_output, top_level_version_requested, validate_top_level_invocation,
 };
+
+const TMUX_COMPAT_OVERRIDE_ENV: &str = "RMUX_INTERNAL_INVOKED_AS_TMUX";
+
 pub(crate) fn run<I, T>(args: I) -> Result<i32, ExitFailure>
 where
     I: IntoIterator<Item = T>,
@@ -115,8 +130,17 @@ where
             top_level_version_output(invoked_as_tmux(&args)),
         ));
     }
+    if let Some(invocation) = claude_launcher::parse_internal_runner(args.get(1..).unwrap_or(&[])) {
+        return claude_launcher::run_internal_runner(invocation);
+    }
     if let Some(invocation) = diagnose::parse_invocation(args.get(1..).unwrap_or(&[]))? {
         return diagnose::run(invocation);
+    }
+    if let Some(invocation) = tmux_dropin::parse_invocation(args.get(1..).unwrap_or(&[]))? {
+        return tmux_dropin::run(invocation, args.first());
+    }
+    if let Some(invocation) = claude_launcher::parse_invocation(args.get(1..).unwrap_or(&[])) {
+        return claude_launcher::run(invocation);
     }
     if let Some(invocation) = capabilities::parse_invocation(args.get(1..).unwrap_or(&[]))? {
         return capabilities::run(invocation);
@@ -131,8 +155,12 @@ where
     accept_compatibility_options(&cli);
     let startup_config = startup_config_from_cli(&cli);
 
-    let socket_path = resolve_socket_path(cli.socket_name(), cli.socket_path())
-        .map_err(ExitFailure::from_client)?;
+    let socket_path = if invoked_as_tmux(&args) {
+        resolve_tmux_compatible_socket_path(cli.socket_name(), cli.socket_path())
+    } else {
+        resolve_socket_path(cli.socket_name(), cli.socket_path())
+    }
+    .map_err(ExitFailure::from_client)?;
 
     if let Some(shell_command) = cli.shell_command.as_deref() {
         return run_shell_startup(
@@ -160,10 +188,20 @@ where
 }
 
 fn invoked_as_tmux(args: &[OsString]) -> bool {
+    invoked_as_tmux_argv0(args) || internal_tmux_compat_override()
+}
+
+fn invoked_as_tmux_argv0(args: &[OsString]) -> bool {
     args.first()
         .and_then(|arg| std::path::Path::new(arg).file_stem())
         .and_then(|stem| stem.to_str())
-        .is_some_and(|stem| stem == "tmux")
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("tmux"))
+}
+
+fn internal_tmux_compat_override() -> bool {
+    env::var_os(TMUX_COMPAT_OVERRIDE_ENV)
+        .as_deref()
+        .is_some_and(|value| value == "1")
 }
 
 fn parse_failure_or_absent_server(
@@ -178,13 +216,21 @@ fn parse_failure_or_absent_server(
     else {
         return Err(ExitFailure::from_clap(error));
     };
-    let resolved = resolve_socket_path(socket_name.as_deref(), socket_path.as_deref())
-        .map_err(ExitFailure::from_client)?;
+    let resolved = if invoked_as_tmux(args) {
+        resolve_tmux_compatible_socket_path(socket_name.as_deref(), socket_path.as_deref())
+    } else {
+        resolve_socket_path(socket_name.as_deref(), socket_path.as_deref())
+    }
+    .map_err(ExitFailure::from_client)?;
 
     match connect(&resolved) {
-        Ok(_) if error.kind() == clap::error::ErrorKind::InvalidSubcommand => {
-            alias_fallback::run_unknown_command_through_server_aliases(args, &resolved)
-                .map_err(|error| error.with_socket_context(&resolved))
+        Ok(mut connection) if error.kind() == clap::error::ErrorKind::InvalidSubcommand => {
+            alias_fallback::run_unknown_command_through_server_aliases(
+                args,
+                &resolved,
+                &mut connection,
+            )
+            .map_err(|error| error.with_socket_context(&resolved))
         }
         Ok(_) => Err(ExitFailure::from_clap(error)),
         Err(connect_error) => Err(ExitFailure::from_client_connect(&resolved, connect_error)),
@@ -363,7 +409,7 @@ mod tests {
             top_level_parse_failure(&args(&["--help"]))
                 .expect("expected --help to fail before clap")
                 .message(),
-            "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n\nRMUX extensions:\n  capabilities [--human|--json]\n  diagnose [--human|--json]\n  web-share [flags]\n  web-share list|lookup|stop|disconnect|off|config\n\nUse `rmux list-commands` for the tmux-compatible command surface."
+            "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n\nRMUX extensions:\n  capabilities [--human|--json]\n  claude [claude-args...]\n  diagnose [--human|--json]\n  doctor tmux-dropin\n  setup tmux-shim\n  wait-pane [flags]\n  pane-snapshot [flags]\n  stream-pane [--raw|--lines]\n  collect-pane-output --until-pane-exit --max-bytes bytes\n  locator|expect-pane [flags]\n  find-panes|find-sessions [flags]\n  broadcast-keys -t target... -- key ...\n  with-session session-name -- command ...\n  web-share [flags]\n  web-share list|lookup|stop|disconnect|off|config\n\nUse `rmux list-commands` for the tmux-compatible command surface."
         );
         assert_eq!(
             top_level_parse_failure(&args(&["--not-a-tmux-flag", "-h"]))

@@ -217,7 +217,7 @@ impl InputParser {
     }
 
     /// Parse a buffer of bytes, dispatching actions to the screen writer.
-    pub fn parse(&mut self, buf: &[u8], writer: &mut dyn ScreenWriter) {
+    pub fn parse<W: ScreenWriter + ?Sized>(&mut self, buf: &[u8], writer: &mut W) {
         let mut index = 0;
         while index < buf.len() {
             if self.state == InputState::Ground && !self.utf8_started {
@@ -243,7 +243,11 @@ impl InputParser {
         }
     }
 
-    fn handle_printable_ascii_run(&mut self, bytes: &[u8], writer: &mut dyn ScreenWriter) {
+    fn handle_printable_ascii_run<W: ScreenWriter + ?Sized>(
+        &mut self,
+        bytes: &[u8],
+        writer: &mut W,
+    ) {
         debug_assert_eq!(self.state, InputState::Ground);
         let set = if self.cell.set == 0 {
             self.cell.g0set
@@ -258,7 +262,11 @@ impl InputParser {
         self.flags |= INPUT_LAST;
     }
 
-    fn handle_ground_c0_fast_path(&mut self, byte: u8, writer: &mut dyn ScreenWriter) -> bool {
+    fn handle_ground_c0_fast_path<W: ScreenWriter + ?Sized>(
+        &mut self,
+        byte: u8,
+        writer: &mut W,
+    ) -> bool {
         match byte {
             0x0a..=0x0c => {
                 writer.collect_end();
@@ -278,23 +286,10 @@ impl InputParser {
     }
 
     fn find_transition(&self) -> Transition {
-        let table = self.state.transition_table();
-        for entry in table {
-            if self.ch >= entry.first && self.ch <= entry.last {
-                return Transition {
-                    handler: entry.handler,
-                    next_state: entry.next_state,
-                };
-            }
-        }
-        // Should never happen with complete tables, but be safe.
-        Transition {
-            handler: states::Handler::None,
-            next_state: None,
-        }
+        self.state.transition_for_byte(self.ch)
     }
 
-    fn execute_transition(&mut self, trans: Transition, writer: &mut dyn ScreenWriter) {
+    fn execute_transition<W: ScreenWriter + ?Sized>(&mut self, trans: Transition, writer: &mut W) {
         // Any state except print stops collect_end equivalent.
         if !matches!(
             trans.handler,
@@ -327,12 +322,12 @@ impl InputParser {
         }
 
         // If not in ground state, save byte to since_ground.
-        if self.state != InputState::Ground {
+        if self.state != InputState::Ground && self.since_ground.len() < self.input_buf_max {
             self.since_ground.push(self.ch);
         }
     }
 
-    fn set_state(&mut self, next: InputState, writer: &mut dyn ScreenWriter) {
+    fn set_state<W: ScreenWriter + ?Sized>(&mut self, next: InputState, writer: &mut W) {
         // Call exit handler for current state.
         self.exit_state(writer);
         self.state = next;
@@ -340,7 +335,7 @@ impl InputParser {
         self.enter_state(writer);
     }
 
-    fn enter_state(&mut self, writer: &mut dyn ScreenWriter) {
+    fn enter_state<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) {
         match self.state {
             InputState::Ground => self.enter_ground(),
             InputState::EscEnter => self.clear(),
@@ -355,7 +350,7 @@ impl InputParser {
         let _ = writer; // writer not needed for enter handlers currently
     }
 
-    fn exit_state(&mut self, writer: &mut dyn ScreenWriter) {
+    fn exit_state<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) {
         match self.state {
             InputState::OscString => self.exit_osc(writer),
             InputState::ApcString => self.exit_apc(writer),
@@ -408,14 +403,14 @@ impl InputParser {
         self.flags &= !INPUT_LAST;
     }
 
-    fn exit_osc(&mut self, writer: &mut dyn ScreenWriter) {
+    fn exit_osc<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) {
         if self.flags & INPUT_DISCARD != 0 {
             return;
         }
         dispatch::dispatch_osc(self, writer);
     }
 
-    fn exit_apc(&mut self, writer: &mut dyn ScreenWriter) {
+    fn exit_apc<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) {
         if self.flags & INPUT_DISCARD != 0 {
             return;
         }
@@ -427,7 +422,7 @@ impl InputParser {
         writer.set_title(&buf);
     }
 
-    fn exit_rename(&mut self, writer: &mut dyn ScreenWriter) {
+    fn exit_rename<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) {
         if self.flags & INPUT_DISCARD != 0 {
             return;
         }
@@ -436,7 +431,7 @@ impl InputParser {
     }
 
     /// Stop any in-progress UTF-8 sequence and emit U+FFFD.
-    fn stop_utf8(&mut self, writer: &mut dyn ScreenWriter) {
+    fn stop_utf8<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) {
         if self.utf8_started {
             writer.collect_add('\u{FFFD}', &self.cell);
             self.utf8_started = false;
@@ -445,7 +440,7 @@ impl InputParser {
         }
     }
 
-    fn handle_print(&mut self, writer: &mut dyn ScreenWriter) -> bool {
+    fn handle_print<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) -> bool {
         self.stop_utf8(writer);
 
         let ch = self.ch as char;
@@ -527,14 +522,14 @@ impl InputParser {
         false
     }
 
-    fn handle_c0_dispatch(&mut self, writer: &mut dyn ScreenWriter) -> bool {
+    fn handle_c0_dispatch<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) -> bool {
         self.stop_utf8(writer);
         dispatch::dispatch_c0(self, writer);
         self.flags &= !INPUT_LAST;
         false
     }
 
-    fn handle_esc_dispatch(&mut self, writer: &mut dyn ScreenWriter) -> bool {
+    fn handle_esc_dispatch<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) -> bool {
         if self.flags & INPUT_DISCARD != 0 {
             return false;
         }
@@ -543,7 +538,7 @@ impl InputParser {
         false
     }
 
-    fn handle_csi_dispatch(&mut self, writer: &mut dyn ScreenWriter) -> bool {
+    fn handle_csi_dispatch<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) -> bool {
         if self.flags & INPUT_DISCARD != 0 {
             return false;
         }
@@ -552,7 +547,7 @@ impl InputParser {
         false
     }
 
-    fn handle_dcs_dispatch(&mut self, writer: &mut dyn ScreenWriter) -> bool {
+    fn handle_dcs_dispatch<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) -> bool {
         if self.flags & INPUT_DISCARD != 0 {
             return false;
         }
@@ -560,7 +555,7 @@ impl InputParser {
         false
     }
 
-    fn handle_top_bit_set(&mut self, writer: &mut dyn ScreenWriter) -> bool {
+    fn handle_top_bit_set<W: ScreenWriter + ?Sized>(&mut self, writer: &mut W) -> bool {
         self.flags &= !INPUT_LAST;
 
         if !self.utf8_started {

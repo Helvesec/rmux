@@ -1,9 +1,11 @@
 use std::io;
 
 use rmux_core::{input::mode, key_code_lookup_bits};
-use rmux_proto::{PaneTarget, Response};
+use rmux_proto::{AttachedKeystroke, PaneTarget, Response};
 #[cfg(unix)]
 use rmux_pty::PtyMaster;
+#[cfg(windows)]
+use rmux_pty::WindowsConsoleKeyEvent;
 
 use super::super::super::{prompt_support::PromptInputEvent, RequestHandler};
 use super::super::io_other;
@@ -30,6 +32,21 @@ use crate::key_table::{
 const DIRECT_CURRENT_PANE_INPUT_MAX_BYTES: usize = 16;
 
 impl RequestHandler {
+    pub(crate) async fn handle_attached_keystroke_input(
+        &self,
+        attach_pid: u32,
+        pending_input: &mut Vec<u8>,
+        keystroke: &AttachedKeystroke,
+    ) -> io::Result<bool> {
+        self.handle_attached_live_input_inner_with_windows_console_key(
+            attach_pid,
+            pending_input,
+            keystroke.bytes(),
+            keystroke.windows_console_key(),
+        )
+        .await
+    }
+
     #[async_recursion::async_recursion]
     pub(crate) async fn handle_attached_live_input(
         &self,
@@ -49,6 +66,23 @@ impl RequestHandler {
         pending_input: &mut Vec<u8>,
         bytes: &[u8],
     ) -> io::Result<bool> {
+        self.handle_attached_live_input_inner_with_windows_console_key(
+            attach_pid,
+            pending_input,
+            bytes,
+            None,
+        )
+        .await
+    }
+
+    #[async_recursion::async_recursion]
+    async fn handle_attached_live_input_inner_with_windows_console_key(
+        &self,
+        attach_pid: u32,
+        pending_input: &mut Vec<u8>,
+        bytes: &[u8],
+        windows_console_key: Option<rmux_proto::AttachedWindowsConsoleKey>,
+    ) -> io::Result<bool> {
         let mut forwarded_to_pane = false;
         if let Some(forwarded) = self
             .try_forward_plain_attached_bytes_fast(attach_pid, pending_input, bytes)
@@ -56,33 +90,17 @@ impl RequestHandler {
         {
             return Ok(forwarded);
         }
-        let focused_window = {
-            let session_name = {
-                let active_attach = self.active_attach.lock().await;
-                active_attach
-                    .by_pid
-                    .get(&attach_pid)
-                    .map(|active| active.session_name.clone())
-            };
-            match session_name {
-                Some(session_name) => {
-                    let window_index = {
-                        let state = self.state.lock().await;
-                        state
-                            .sessions
-                            .session(&session_name)
-                            .map(|session| session.active_window_index())
-                    };
-                    window_index.map(|window_index| (session_name, window_index))
-                }
-                None => None,
-            }
-        };
-        if let Some((session_name, window_index)) = focused_window {
-            let _ = self
-                .clear_session_alerts_on_focus(&session_name, window_index)
-                .await;
+        if self.attached_client_input_is_read_only(attach_pid).await? {
+            pending_input.clear();
+            return Ok(false);
         }
+        #[cfg(not(windows))]
+        let _ = windows_console_key;
+        #[cfg(windows)]
+        let windows_console_key = windows_console_key
+            .filter(|_| pending_input.is_empty() && !bytes.is_empty())
+            .map(windows_console_key_event);
+        self.clear_attached_focus_alerts(attach_pid).await;
         if self.prompt_active(attach_pid).await {
             self.handle_attached_prompt_input(attach_pid, pending_input, bytes)
                 .await?;
@@ -272,7 +290,28 @@ impl RequestHandler {
                             )
                             .await?;
                         }
-                        if !self.handle_attached_live_key(attach_pid, key).await? {
+                        #[cfg(windows)]
+                        let handled = if let Some(key_event) = windows_console_key.filter(|_| {
+                            raw_start == offset
+                                && offset == 0
+                                && size == pending_input.len()
+                                && size == bytes.len()
+                        }) {
+                            self.handle_attached_live_key_inner(
+                                attach_pid,
+                                key,
+                                super::AttachedPaneForward::WindowsConsoleKey {
+                                    key: key_event,
+                                    bytes: &pending_input[offset..offset + size],
+                                },
+                            )
+                            .await?
+                        } else {
+                            self.handle_attached_live_key(attach_pid, key).await?
+                        };
+                        #[cfg(not(windows))]
+                        let handled = self.handle_attached_live_key(attach_pid, key).await?;
+                        if !handled {
                             forwarded_to_pane = true;
                         }
                         offset += size;
@@ -346,7 +385,28 @@ impl RequestHandler {
                             .await?;
                         forwarded_to_pane = true;
                     }
-                    if !self.handle_attached_live_key(attach_pid, key).await? {
+                    #[cfg(windows)]
+                    let handled = if let Some(key_event) = windows_console_key.filter(|_| {
+                        raw_start == offset
+                            && offset == 0
+                            && size == pending_input.len()
+                            && size == bytes.len()
+                    }) {
+                        self.handle_attached_live_key_inner(
+                            attach_pid,
+                            key,
+                            super::AttachedPaneForward::WindowsConsoleKey {
+                                key: key_event,
+                                bytes: &pending_input[offset..offset + size],
+                            },
+                        )
+                        .await?
+                    } else {
+                        self.handle_attached_live_key(attach_pid, key).await?
+                    };
+                    #[cfg(not(windows))]
+                    let handled = self.handle_attached_live_key(attach_pid, key).await?;
+                    if !handled {
                         forwarded_to_pane = true;
                     }
                     offset += size;
@@ -454,7 +514,7 @@ impl RequestHandler {
                         session.clear_all_winlink_alert_flags(target.window_index())
                     });
             let writes =
-                prepare_attached_pane_input_writes(&state, &target, bytes).map_err(io_other)?;
+                prepare_attached_pane_input_writes(&mut state, &target, bytes).map_err(io_other)?;
             (writes, clear_alerts_changed)
         };
 
@@ -620,6 +680,36 @@ impl RequestHandler {
             == Some(PREFIX_TABLE)
     }
 
+    async fn clear_attached_focus_alerts(&self, attach_pid: u32) {
+        let focused_window = {
+            let session_name = {
+                let active_attach = self.active_attach.lock().await;
+                active_attach
+                    .by_pid
+                    .get(&attach_pid)
+                    .map(|active| active.session_name.clone())
+            };
+            match session_name {
+                Some(session_name) => {
+                    let window_index = {
+                        let state = self.state.lock().await;
+                        state
+                            .sessions
+                            .session(&session_name)
+                            .map(rmux_core::Session::active_window_index)
+                    };
+                    window_index.map(|window_index| (session_name, window_index))
+                }
+                None => None,
+            }
+        };
+        if let Some((session_name, window_index)) = focused_window {
+            let _ = self
+                .clear_session_alerts_on_focus(&session_name, window_index)
+                .await;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) async fn handle_attached_live_input_for_test(
         &self,
@@ -776,4 +866,15 @@ fn submitted_text_before_enter(bytes: &[u8]) -> Option<&[u8]> {
         .iter()
         .position(|byte| matches!(*byte, b'\r' | b'\n'))?;
     (enter > 0).then_some(&bytes[..enter])
+}
+
+#[cfg(windows)]
+fn windows_console_key_event(key: rmux_proto::AttachedWindowsConsoleKey) -> WindowsConsoleKeyEvent {
+    WindowsConsoleKeyEvent::new(
+        key.virtual_key_code(),
+        key.virtual_scan_code(),
+        key.unicode_char(),
+        key.control_key_state(),
+        key.repeat_count(),
+    )
 }

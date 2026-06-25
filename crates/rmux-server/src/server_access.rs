@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
-#[cfg(unix)]
-use std::fs;
 
 use rmux_os::identity::{IdentityResolver, UserIdentity};
-use rmux_proto::{AttachSessionExtRequest, CommandOutput, Request, RmuxError, ServerAccessRequest};
+use rmux_proto::request::{AttachSessionExt2Request, AttachSessionExt3Request};
+use rmux_proto::{
+    AttachSessionExtRequest, CommandOutput, Request, RmuxError, ServerAccessRequest, SessionName,
+    Target,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AccessMode {
@@ -146,10 +148,8 @@ fn current_user_identity() -> std::io::Result<UserIdentity> {
 }
 
 pub(crate) fn resolve_user(value: &str) -> Result<ResolvedUser, RmuxError> {
-    if let Some(user) = passwd_entries()
-        .into_iter()
-        .find(|entry| entry.name == value)
-    {
+    #[cfg(unix)]
+    if let Some(user) = IdentityResolver::unix_user_by_name(value).map_err(resolve_user_error)? {
         return Ok(ResolvedUser {
             uid: user.uid,
             name: user.name,
@@ -159,23 +159,44 @@ pub(crate) fn resolve_user(value: &str) -> Result<ResolvedUser, RmuxError> {
     let uid = value
         .parse::<u32>()
         .map_err(|_| RmuxError::Server(format!("unknown user: {value}")))?;
-    let Some(user) = passwd_entries().into_iter().find(|entry| entry.uid == uid) else {
+    #[cfg(unix)]
+    let Some(user) = IdentityResolver::unix_user_by_uid(uid).map_err(resolve_user_error)?
+    else {
         return Err(RmuxError::Server(format!("unknown user: {value}")));
     };
 
+    #[cfg(windows)]
+    let _ = uid;
+    #[cfg(windows)]
+    return Err(RmuxError::Server(format!("unknown user: {value}")));
+
+    #[cfg(unix)]
     Ok(ResolvedUser {
         uid,
         name: user.name,
     })
 }
 
+#[cfg(unix)]
+fn resolve_user_error(error: std::io::Error) -> RmuxError {
+    RmuxError::Server(format!("failed to resolve user: {error}"))
+}
+
 #[must_use]
 pub(crate) fn user_name_for_uid(uid: u32) -> String {
-    passwd_entries()
-        .into_iter()
-        .find(|entry| entry.uid == uid)
-        .map(|entry| entry.name)
-        .unwrap_or_else(|| uid.to_string())
+    #[cfg(unix)]
+    {
+        IdentityResolver::unix_user_by_uid(uid)
+            .ok()
+            .flatten()
+            .map(|entry| entry.name)
+            .unwrap_or_else(|| uid.to_string())
+    }
+
+    #[cfg(windows)]
+    {
+        uid.to_string()
+    }
 }
 
 #[must_use]
@@ -197,80 +218,122 @@ pub(crate) fn apply_access_policy(request: Request, can_write: bool) -> Result<R
             detach_other_clients: false,
             kill_other_clients: false,
             read_only: true,
-            skip_environment_update: false,
+            skip_environment_update: true,
             flags: None,
         })),
-        Request::AttachSessionExt(mut request) => {
-            request.read_only = true;
-            Ok(Request::AttachSessionExt(request))
-        }
-        Request::AttachSessionExt2(mut request) => {
-            request.read_only = true;
-            Ok(Request::AttachSessionExt2(request))
-        }
-        Request::AttachSessionExt3(mut request) => {
-            request.read_only = true;
-            Ok(Request::AttachSessionExt3(request))
-        }
+        Request::AttachSessionExt(request) => Ok(Request::AttachSessionExt(
+            sanitize_read_only_attach_session_ext(request),
+        )),
+        Request::AttachSessionExt2(request) => Ok(Request::AttachSessionExt2(Box::new(
+            sanitize_read_only_attach_session_ext2(*request),
+        ))),
+        Request::AttachSessionExt3(request) => Ok(Request::AttachSessionExt3(Box::new(
+            sanitize_read_only_attach_session_ext3(*request),
+        ))),
         request if read_only_request_allowed(&request) => Ok(request),
         _ => Err(RmuxError::Server("client is read-only".to_owned())),
     }
 }
 
+fn sanitize_read_only_attach_session_ext(
+    mut request: AttachSessionExtRequest,
+) -> AttachSessionExtRequest {
+    request.detach_other_clients = false;
+    request.kill_other_clients = false;
+    request.read_only = true;
+    request.skip_environment_update = true;
+    request
+}
+
+fn sanitize_read_only_attach_session_ext2(
+    mut request: AttachSessionExt2Request,
+) -> AttachSessionExt2Request {
+    request.target = read_only_attach_target(request.target, request.target_spec.as_deref());
+    request.target_spec = None;
+    request.detach_other_clients = false;
+    request.kill_other_clients = false;
+    request.read_only = true;
+    request.skip_environment_update = true;
+    request.working_directory = None;
+    request.client_size = None;
+    request
+}
+
+fn sanitize_read_only_attach_session_ext3(
+    mut request: AttachSessionExt3Request,
+) -> AttachSessionExt3Request {
+    request.target = read_only_attach_target(request.target, request.target_spec.as_deref());
+    request.target_spec = None;
+    request.detach_other_clients = false;
+    request.kill_other_clients = false;
+    request.read_only = true;
+    request.skip_environment_update = true;
+    request.working_directory = None;
+    request.client_size = None;
+    request
+}
+
+fn read_only_attach_target(
+    target: Option<SessionName>,
+    target_spec: Option<&str>,
+) -> Option<SessionName> {
+    target.or_else(|| {
+        target_spec
+            .and_then(|spec| Target::parse(spec).ok())
+            .map(|target| target.session_name().clone())
+    })
+}
+
 fn read_only_request_allowed(request: &Request) -> bool {
-    matches!(
-        request,
-        Request::HasSession(_)
-            | Request::NextWindow(_)
-            | Request::PreviousWindow(_)
-            | Request::LastWindow(_)
-            | Request::ListWindows(_)
-            | Request::LastPane(_)
-            | Request::NextLayout(_)
-            | Request::PreviousLayout(_)
-            | Request::DisplayPanes(_)
-            | Request::ListPanes(_)
-            | Request::SelectPane(_)
-            | Request::SelectPaneAdjacent(_)
-            | Request::AttachSession(_)
-            | Request::AttachSessionExt(_)
-            | Request::AttachSessionExt2(_)
-            | Request::AttachSessionExt3(_)
-            | Request::SwitchClient(_)
-            | Request::SwitchClientExt(_)
-            | Request::SwitchClientExt2(_)
-            | Request::SwitchClientExt3(_)
-            | Request::DetachClient(_)
-            | Request::DetachClientExt(_)
-            | Request::RefreshClient(_)
-            | Request::ListClients(_)
-            | Request::SuspendClient(_)
-            | Request::ShowOptions(_)
-            | Request::ShowEnvironment(_)
-            | Request::ShowHooks(_)
-            | Request::ShowBuffer(_)
-            | Request::ListBuffers(_)
-            | Request::CapturePane(_)
-            | Request::SubscribePaneOutput(_)
-            | Request::SubscribePaneOutputRef(_)
-            | Request::UnsubscribePaneOutput(_)
-            | Request::PaneOutputCursor(_)
-            | Request::PaneSnapshotRef(_)
-            | Request::SdkWaitForOutput(_)
-            | Request::SdkWaitForOutputRef(_)
-            | Request::CancelSdkWait(_)
-            | Request::DisplayMessage(_)
-            | Request::DisplayMessageExt(_)
-            | Request::ShowMessages(_)
-            | Request::ListSessions(_)
-            | Request::ListKeys(_)
-            | Request::CopyMode(_)
-            | Request::ControlMode(_)
-            | Request::ClockMode(_)
-            | Request::Handshake(_)
-            | Request::DaemonStatus(_)
-            | Request::ServerAccess(ServerAccessRequest { list: true, .. })
-    )
+    match request {
+        Request::CapturePane(request) => {
+            capture_pane_request_is_read_only(request.print, request.buffer_name.as_deref())
+        }
+        Request::CapturePaneTargetAction(request) => {
+            capture_pane_request_is_read_only(request.print, request.buffer_name.as_deref())
+        }
+        Request::DisplayMessage(request) => display_message_request_is_read_only(request.print),
+        Request::DisplayMessageExt(request) => display_message_request_is_read_only(request.print),
+        _ => matches!(
+            request,
+            Request::HasSession(_)
+                | Request::ListWindows(_)
+                | Request::ListPanes(_)
+                | Request::AttachSession(_)
+                | Request::AttachSessionExt(_)
+                | Request::AttachSessionExt2(_)
+                | Request::AttachSessionExt3(_)
+                | Request::ListClients(_)
+                | Request::ShowOptions(_)
+                | Request::ShowEnvironment(_)
+                | Request::ShowHooks(_)
+                | Request::ShowBuffer(_)
+                | Request::ListBuffers(_)
+                | Request::SubscribePaneOutput(_)
+                | Request::SubscribePaneOutputRef(_)
+                | Request::UnsubscribePaneOutput(_)
+                | Request::PaneOutputCursor(_)
+                | Request::PaneSnapshotRef(_)
+                | Request::SdkWaitForOutput(_)
+                | Request::SdkWaitForOutputRef(_)
+                | Request::CancelSdkWait(_)
+                | Request::ShowMessages(_)
+                | Request::ListSessions(_)
+                | Request::ListKeys(_)
+                | Request::ControlMode(_)
+                | Request::Handshake(_)
+                | Request::DaemonStatus(_)
+                | Request::ServerAccess(ServerAccessRequest { list: true, .. })
+        ),
+    }
+}
+
+fn capture_pane_request_is_read_only(print: bool, buffer_name: Option<&str>) -> bool {
+    print && buffer_name.is_none()
+}
+
+fn display_message_request_is_read_only(print: bool) -> bool {
+    print
 }
 
 pub(crate) fn validate_server_access_request(
@@ -294,46 +357,20 @@ pub(crate) fn validate_server_access_request(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PasswdEntry {
-    uid: u32,
-    name: String,
-}
-
-fn passwd_entries() -> Vec<PasswdEntry> {
-    #[cfg(windows)]
-    {
-        Vec::new()
-    }
-
-    #[cfg(unix)]
-    {
-        fs::read_to_string("/etc/passwd")
-            .ok()
-            .map(|contents| {
-                contents
-                    .lines()
-                    .filter_map(parse_passwd_entry)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-    }
-}
-
-fn parse_passwd_entry(line: &str) -> Option<PasswdEntry> {
-    let mut fields = line.split(':');
-    let name = fields.next()?.to_owned();
-    let _password = fields.next()?;
-    let uid = fields.next()?.parse::<u32>().ok()?;
-    Some(PasswdEntry { uid, name })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use rmux_proto::{
-        CancelSdkWaitRequest, PaneOutputSubscriptionStart, PaneTarget, SdkWaitForOutputRequest,
-        SdkWaitId, SdkWaitOwnerId, SessionName,
+        AttachSessionExt2Request, AttachSessionExt3Request, AttachSessionExtRequest,
+        AttachSessionRequest, CancelSdkWaitRequest, CapturePaneRequest,
+        CapturePaneTargetActionRequest, ClockModeRequest, CopyModeRequest, DetachClientExtRequest,
+        DetachClientRequest, DisplayMessageExtRequest, DisplayMessageRequest, DisplayPanesRequest,
+        LastPaneRequest, LastWindowRequest, NextLayoutRequest, NextWindowRequest,
+        PaneOutputSubscriptionStart, PaneTarget, PreviousLayoutRequest, PreviousWindowRequest,
+        RefreshClientRequest, SdkWaitForOutputRequest, SdkWaitId, SdkWaitOwnerId,
+        SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneRequest, SessionName,
+        SuspendClientRequest, SwitchClientExt2Request, SwitchClientExt3Request,
+        SwitchClientExtRequest, SwitchClientRequest, TerminalSize, WindowTarget,
     };
 
     #[test]
@@ -378,6 +415,20 @@ mod tests {
         assert_eq!(store.mode_for_identity(&owner), Some(AccessMode::ReadWrite));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn resolve_user_uses_platform_account_database() {
+        let UserIdentity::Uid(uid) = current_user_identity().expect("current identity") else {
+            panic!("Unix current identity should be a uid");
+        };
+        let by_uid = resolve_user(&uid.to_string()).expect("current uid resolves");
+        let by_name = resolve_user(&by_uid.name).expect("current name resolves");
+
+        assert_eq!(by_uid.uid, uid);
+        assert_eq!(by_name.uid, uid);
+        assert_eq!(by_name.name, by_uid.name);
+    }
+
     #[test]
     fn read_only_access_allows_sdk_wait_observation_and_cancel() {
         let target = PaneTarget::new(SessionName::new("s").expect("session name"), 0);
@@ -402,6 +453,406 @@ mod tests {
                 .expect("SDK wait cancel is read-only cleanup"),
             cancel
         );
+    }
+
+    #[test]
+    fn read_only_access_allows_capture_pane_target_action() {
+        let capture =
+            Request::CapturePaneTargetAction(Box::new(capture_pane_target_action(true, None)));
+
+        assert_eq!(
+            apply_access_policy(capture.clone(), false)
+                .expect("capture-pane target action is read-only observation"),
+            capture
+        );
+    }
+
+    #[test]
+    fn read_only_access_rejects_capture_pane_target_action_that_writes_buffer() {
+        let unnamed_buffer =
+            Request::CapturePaneTargetAction(Box::new(capture_pane_target_action(false, None)));
+        let named_buffer = Request::CapturePaneTargetAction(Box::new(capture_pane_target_action(
+            false,
+            Some("clip".to_owned()),
+        )));
+
+        assert_read_only_rejected(unnamed_buffer);
+        assert_read_only_rejected(named_buffer);
+    }
+
+    #[test]
+    fn read_only_access_allows_direct_capture_pane_output_only() {
+        let capture = Request::CapturePane(Box::new(capture_pane_request(true, None)));
+
+        assert_eq!(
+            apply_access_policy(capture.clone(), false)
+                .expect("printed capture-pane is read-only observation"),
+            capture
+        );
+    }
+
+    #[test]
+    fn read_only_access_rejects_direct_capture_pane_that_writes_buffer() {
+        let unnamed_buffer = Request::CapturePane(Box::new(capture_pane_request(false, None)));
+        let named_buffer = Request::CapturePane(Box::new(capture_pane_request(
+            false,
+            Some("clip".to_owned()),
+        )));
+
+        assert_read_only_rejected(unnamed_buffer);
+        assert_read_only_rejected(named_buffer);
+    }
+
+    #[test]
+    fn read_only_access_allows_printed_display_message() {
+        let message = Request::DisplayMessage(DisplayMessageRequest {
+            target: None,
+            print: true,
+            message: Some("#{session_name}".to_owned()),
+            empty_target_context: false,
+        });
+        let extended = Request::DisplayMessageExt(Box::new(DisplayMessageExtRequest {
+            target: None,
+            print: true,
+            message: Some("#{client_name}".to_owned()),
+            target_client: Some("=".to_owned()),
+            empty_target_context: false,
+        }));
+
+        assert_eq!(
+            apply_access_policy(message.clone(), false)
+                .expect("display-message -p is read-only format expansion"),
+            message
+        );
+        assert_eq!(
+            apply_access_policy(extended.clone(), false)
+                .expect("display-message -p -c is read-only format expansion"),
+            extended
+        );
+    }
+
+    #[test]
+    fn read_only_access_rejects_display_overlays() {
+        assert_read_only_rejected(Request::DisplayMessage(DisplayMessageRequest {
+            target: None,
+            print: false,
+            message: Some("visible overlay".to_owned()),
+            empty_target_context: false,
+        }));
+        assert_read_only_rejected(Request::DisplayMessageExt(Box::new(
+            DisplayMessageExtRequest {
+                target: None,
+                print: false,
+                message: Some("visible overlay".to_owned()),
+                target_client: Some("=".to_owned()),
+                empty_target_context: false,
+            },
+        )));
+        assert_read_only_rejected(Request::DisplayPanes(DisplayPanesRequest {
+            target: session_name(),
+            duration_ms: None,
+            non_blocking: false,
+            no_command: false,
+            template: None,
+        }));
+    }
+
+    #[test]
+    fn read_only_access_rejects_session_window_and_pane_mutations() {
+        let session = session_name();
+        let window = WindowTarget::new(session.clone());
+        let pane = PaneTarget::new(session.clone(), 0);
+        let select_pane = SelectPaneRequest {
+            target: pane.clone(),
+            title: None,
+            input_disabled: None,
+            preserve_zoom: false,
+            style: None,
+        };
+
+        for request in [
+            Request::NextWindow(NextWindowRequest {
+                target: session.clone(),
+                alerts_only: false,
+            }),
+            Request::PreviousWindow(PreviousWindowRequest {
+                target: session.clone(),
+                alerts_only: false,
+            }),
+            Request::LastWindow(LastWindowRequest {
+                target: session.clone(),
+            }),
+            Request::LastPane(LastPaneRequest {
+                target: window.clone(),
+                preserve_zoom: false,
+                input_disabled: None,
+            }),
+            Request::NextLayout(NextLayoutRequest {
+                target: window.clone(),
+            }),
+            Request::PreviousLayout(PreviousLayoutRequest {
+                target: window.clone(),
+            }),
+            Request::SelectPane(Box::new(select_pane)),
+            Request::SelectPaneAdjacent(SelectPaneAdjacentRequest {
+                target: pane,
+                direction: SelectPaneDirection::Right,
+                preserve_zoom: false,
+            }),
+            Request::CopyMode(CopyModeRequest {
+                target: None,
+                page_down: false,
+                exit_on_scroll: false,
+                hide_position: false,
+                mouse_drag_start: false,
+                cancel_mode: false,
+                scrollbar_scroll: false,
+                source: None,
+                page_up: false,
+            }),
+            Request::ClockMode(ClockModeRequest { target: None }),
+        ] {
+            assert_read_only_rejected(request);
+        }
+    }
+
+    #[test]
+    fn read_only_access_rejects_client_control_mutations() {
+        let session = session_name();
+        for request in [
+            Request::SwitchClient(SwitchClientRequest {
+                target: session.clone(),
+            }),
+            Request::SwitchClientExt(SwitchClientExtRequest {
+                target: Some(session.clone()),
+                key_table: None,
+            }),
+            Request::SwitchClientExt2(Box::new(SwitchClientExt2Request {
+                target: Some(session.clone()),
+                key_table: None,
+                last_session: false,
+                next_session: false,
+                previous_session: false,
+                toggle_read_only: false,
+                flags: None,
+                sort_order: None,
+                skip_environment_update: false,
+            })),
+            Request::SwitchClientExt3(Box::new(SwitchClientExt3Request {
+                target_client: Some("123".to_owned()),
+                target: Some(session.to_string()),
+                key_table: None,
+                last_session: false,
+                next_session: false,
+                previous_session: false,
+                toggle_read_only: false,
+                sort_order: None,
+                skip_environment_update: false,
+                zoom: false,
+            })),
+            Request::DetachClient(DetachClientRequest),
+            Request::DetachClientExt(DetachClientExtRequest {
+                target_client: Some("123".to_owned()),
+                all_other_clients: false,
+                target_session: None,
+                kill_on_detach: false,
+                exec_command: None,
+            }),
+            Request::RefreshClient(Box::new(RefreshClientRequest {
+                target_client: Some("123".to_owned()),
+                adjustment: None,
+                clear_pan: false,
+                pan_left: false,
+                pan_right: false,
+                pan_up: false,
+                pan_down: false,
+                status_only: true,
+                clipboard_query: false,
+                flags: None,
+                flags_alias: None,
+                subscriptions: Vec::new(),
+                subscriptions_format: Vec::new(),
+                control_size: None,
+                colour_report: None,
+            })),
+            Request::SuspendClient(SuspendClientRequest {
+                target_client: Some("123".to_owned()),
+            }),
+        ] {
+            assert_read_only_rejected(request);
+        }
+    }
+
+    #[test]
+    fn read_only_access_sanitizes_attach_session_ext_options() {
+        let session = session_name();
+        let request = Request::AttachSessionExt(AttachSessionExtRequest {
+            target: Some(session.clone()),
+            detach_other_clients: true,
+            kill_other_clients: true,
+            read_only: false,
+            skip_environment_update: false,
+            flags: Some(vec!["active-pane".to_owned()]),
+        });
+
+        let Request::AttachSessionExt(sanitized) =
+            apply_access_policy(request, false).expect("read-only attach is allowed")
+        else {
+            panic!("expected sanitized attach-session ext request");
+        };
+
+        assert_eq!(sanitized.target, Some(session));
+        assert!(!sanitized.detach_other_clients);
+        assert!(!sanitized.kill_other_clients);
+        assert!(sanitized.read_only);
+        assert!(sanitized.skip_environment_update);
+        assert_eq!(sanitized.flags, Some(vec!["active-pane".to_owned()]));
+    }
+
+    #[test]
+    fn read_only_access_sanitizes_legacy_attach_session_options() {
+        let session = session_name();
+        let request = Request::AttachSession(AttachSessionRequest {
+            target: session.clone(),
+        });
+
+        let Request::AttachSessionExt(sanitized) =
+            apply_access_policy(request, false).expect("read-only legacy attach is allowed")
+        else {
+            panic!("expected sanitized attach-session ext request");
+        };
+
+        assert_eq!(sanitized.target, Some(session));
+        assert!(!sanitized.detach_other_clients);
+        assert!(!sanitized.kill_other_clients);
+        assert!(sanitized.read_only);
+        assert!(sanitized.skip_environment_update);
+        assert_eq!(sanitized.flags, None);
+    }
+
+    #[test]
+    fn read_only_access_sanitizes_attach_session_ext2_options() {
+        let request = Request::AttachSessionExt2(Box::new(AttachSessionExt2Request {
+            target: None,
+            target_spec: Some("s:1.2".to_owned()),
+            detach_other_clients: true,
+            kill_other_clients: true,
+            read_only: false,
+            skip_environment_update: false,
+            flags: None,
+            working_directory: Some("/tmp".to_owned()),
+            client_terminal: Default::default(),
+            client_size: Some(TerminalSize {
+                cols: 120,
+                rows: 40,
+            }),
+        }));
+
+        let Request::AttachSessionExt2(sanitized) =
+            apply_access_policy(request, false).expect("read-only attach is allowed")
+        else {
+            panic!("expected sanitized attach-session ext2 request");
+        };
+
+        assert_eq!(sanitized.target, Some(session_name()));
+        assert_eq!(sanitized.target_spec, None);
+        assert!(!sanitized.detach_other_clients);
+        assert!(!sanitized.kill_other_clients);
+        assert!(sanitized.read_only);
+        assert!(sanitized.skip_environment_update);
+        assert_eq!(sanitized.working_directory, None);
+        assert_eq!(sanitized.client_size, None);
+    }
+
+    #[test]
+    fn read_only_access_sanitizes_attach_session_ext3_options() {
+        let request = Request::AttachSessionExt3(Box::new(AttachSessionExt3Request {
+            target: None,
+            target_spec: Some("s:2.3".to_owned()),
+            detach_other_clients: true,
+            kill_other_clients: true,
+            read_only: false,
+            skip_environment_update: false,
+            flags: None,
+            working_directory: Some("/tmp".to_owned()),
+            client_terminal: Default::default(),
+            client_size: Some(TerminalSize {
+                cols: 100,
+                rows: 30,
+            }),
+            attach_capabilities: vec!["attach-render".to_owned()],
+        }));
+
+        let Request::AttachSessionExt3(sanitized) =
+            apply_access_policy(request, false).expect("read-only attach is allowed")
+        else {
+            panic!("expected sanitized attach-session ext3 request");
+        };
+
+        assert_eq!(sanitized.target, Some(session_name()));
+        assert_eq!(sanitized.target_spec, None);
+        assert!(!sanitized.detach_other_clients);
+        assert!(!sanitized.kill_other_clients);
+        assert!(sanitized.read_only);
+        assert!(sanitized.skip_environment_update);
+        assert_eq!(sanitized.working_directory, None);
+        assert_eq!(sanitized.client_size, None);
+        assert_eq!(sanitized.attach_capabilities, vec!["attach-render"]);
+    }
+
+    fn assert_read_only_rejected(request: Request) {
+        let error =
+            apply_access_policy(request, false).expect_err("write request must be rejected");
+        assert_eq!(error.to_string(), "server error: client is read-only");
+    }
+
+    fn session_name() -> SessionName {
+        SessionName::new("s").expect("session name")
+    }
+
+    fn capture_pane_target_action(
+        print: bool,
+        buffer_name: Option<String>,
+    ) -> CapturePaneTargetActionRequest {
+        CapturePaneTargetActionRequest {
+            target: Some("s:0.0".to_owned()),
+            start: None,
+            end: None,
+            print,
+            buffer_name,
+            alternate: false,
+            escape_ansi: false,
+            escape_sequences: false,
+            join_wrapped: false,
+            use_mode_screen: false,
+            preserve_trailing_spaces: false,
+            do_not_trim_spaces: false,
+            pending_input: false,
+            quiet: false,
+            start_is_absolute: false,
+            end_is_absolute: false,
+        }
+    }
+
+    fn capture_pane_request(print: bool, buffer_name: Option<String>) -> CapturePaneRequest {
+        CapturePaneRequest {
+            target: PaneTarget::new(SessionName::new("s").expect("session name"), 0),
+            start: None,
+            end: None,
+            print,
+            buffer_name,
+            alternate: false,
+            escape_ansi: false,
+            escape_sequences: false,
+            join_wrapped: false,
+            use_mode_screen: false,
+            preserve_trailing_spaces: false,
+            do_not_trim_spaces: false,
+            pending_input: false,
+            quiet: false,
+            start_is_absolute: false,
+            end_is_absolute: false,
+        }
     }
 
     #[cfg(windows)]

@@ -20,11 +20,12 @@ use rmux_proto::{
 use tokio::time::sleep;
 
 const COMMAND_SURFACE_COUNT: usize = 79;
-const INTERNAL_REQUEST_COMMANDS: [&str; 40] = [
+const INTERNAL_REQUEST_COMMANDS: [&str; 43] = [
     "attach-session-ext",
     "attach-session-ext2",
     "attach-session-ext3",
     "cancel-sdk-wait",
+    "capture-pane-target-action",
     "control-mode",
     "daemon-status",
     "detach-client-ext",
@@ -43,6 +44,7 @@ const INTERNAL_REQUEST_COMMANDS: [&str; 40] = [
     "resolve-target",
     "release-session-lease",
     "renew-session-lease",
+    "resize-pane-target-action",
     "select-custom-layout",
     "select-pane-mark",
     "select-pane-adjacent",
@@ -58,6 +60,7 @@ const INTERNAL_REQUEST_COMMANDS: [&str; 40] = [
     "set-hook-mutation",
     "set-option-by-name",
     "split-window-ext",
+    "split-window-target-action",
     "switch-client-ext",
     "switch-client-ext2",
     "switch-client-ext3",
@@ -320,7 +323,7 @@ async fn buffer_capture_and_scripting_requests_round_trip_over_real_socket(
     assert!(matches!(
         send_request(
             harness.socket_path(),
-            &Request::PasteBuffer(PasteBufferRequest {
+            &Request::PasteBuffer(Box::new(PasteBufferRequest {
                 name: Some("pastecmd".to_owned()),
                 target: pane.clone(),
                 delete_after: false,
@@ -328,7 +331,7 @@ async fn buffer_capture_and_scripting_requests_round_trip_over_real_socket(
                 linefeed: false,
                 raw: false,
                 bracketed: false,
-            }),
+            })),
         )
         .await?,
         Response::PasteBuffer(_)
@@ -349,7 +352,7 @@ async fn buffer_capture_and_scripting_requests_round_trip_over_real_socket(
 
     let captured = send_request(
         harness.socket_path(),
-        &Request::CapturePane(CapturePaneRequest {
+        &Request::CapturePane(Box::new(CapturePaneRequest {
             target: pane.clone(),
             start: None,
             end: None,
@@ -366,7 +369,7 @@ async fn buffer_capture_and_scripting_requests_round_trip_over_real_socket(
             quiet: false,
             start_is_absolute: false,
             end_is_absolute: false,
-        }),
+        })),
     )
     .await?;
     assert!(matches!(captured, Response::CapturePane(_)));
@@ -428,7 +431,7 @@ async fn buffer_capture_and_scripting_requests_round_trip_over_real_socket(
 
     let shell = send_request(
         harness.socket_path(),
-        &Request::RunShell(RunShellRequest {
+        &Request::RunShell(Box::new(RunShellRequest {
             command: "printf server-run-shell-output".to_owned(),
             background: false,
             as_commands: false,
@@ -437,7 +440,7 @@ async fn buffer_capture_and_scripting_requests_round_trip_over_real_socket(
             start_directory: None,
             target: None,
             source_depth: None,
-        }),
+        })),
     )
     .await?;
     match shell {
@@ -454,7 +457,7 @@ async fn buffer_capture_and_scripting_requests_round_trip_over_real_socket(
 
     let if_shell = send_request(
         harness.socket_path(),
-        &Request::IfShell(IfShellRequest {
+        &Request::IfShell(Box::new(IfShellRequest {
             condition: "#{pane_active}".to_owned(),
             format_mode: true,
             then_command: "set-buffer -b branch chosen".to_owned(),
@@ -462,7 +465,7 @@ async fn buffer_capture_and_scripting_requests_round_trip_over_real_socket(
             target: Some(Target::Pane(pane)),
             caller_cwd: None,
             background: false,
-        }),
+        })),
     )
     .await?;
     assert!(matches!(if_shell, Response::IfShell(_)));
@@ -525,7 +528,7 @@ async fn rename_listing_and_wait_for_requests_round_trip_over_real_socket(
     assert!(matches!(
         send_request(
             harness.socket_path(),
-            &Request::NewWindow(NewWindowRequest {
+            &Request::NewWindow(Box::new(NewWindowRequest {
                 target: alpha.clone(),
                 name: Some("logs".to_owned()),
                 detached: true,
@@ -535,7 +538,7 @@ async fn rename_listing_and_wait_for_requests_round_trip_over_real_socket(
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }),
+            })),
         )
         .await?,
         Response::NewWindow(_)
@@ -851,7 +854,7 @@ async fn wait_for_capture(
     for _ in 0..100 {
         let response = send_request(
             socket_path,
-            &Request::CapturePane(CapturePaneRequest {
+            &Request::CapturePane(Box::new(CapturePaneRequest {
                 target: target.clone(),
                 start: None,
                 end: None,
@@ -868,7 +871,7 @@ async fn wait_for_capture(
                 quiet: false,
                 start_is_absolute: false,
                 end_is_absolute: false,
-            }),
+            })),
         )
         .await?;
         let output = std::str::from_utf8(

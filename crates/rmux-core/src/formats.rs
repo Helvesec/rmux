@@ -26,6 +26,8 @@ mod expression;
 mod glob;
 #[path = "formats/modifiers.rs"]
 mod modifiers;
+#[path = "formats/regex_cache.rs"]
+mod regex_cache;
 #[path = "formats/scan.rs"]
 mod scan;
 #[path = "formats/time.rs"]

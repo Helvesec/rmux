@@ -241,32 +241,33 @@ fn attach_with_terminal_restores_termios_after_repeated_detach() -> Result<(), B
     let mut server = start_server(&harness)?;
     let mut setup_connection = connect(harness.socket_path())?;
 
-    let created = setup_connection.roundtrip(&Request::NewSessionExt(NewSessionExtRequest {
-        session_name: Some(session_name("alpha")),
-        working_directory: None,
-        detached: true,
-        size: Some(TerminalSize { cols: 80, rows: 24 }),
-        environment: None,
-        group_target: None,
-        attach_if_exists: false,
-        detach_other_clients: false,
-        kill_other_clients: false,
-        flags: None,
-        window_name: None,
-        print_session_info: false,
-        print_format: None,
-        command: Some(vec![
-            "/bin/sh".to_owned(),
-            "-c".to_owned(),
-            format!(
-                "while :; do printf '{}\\n'; sleep 1; done",
-                ATTACH_READY_MARKER
-            ),
-        ]),
-        process_command: None,
-        client_environment: None,
-        skip_environment_update: false,
-    }))?;
+    let created =
+        setup_connection.roundtrip(&Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(session_name("alpha")),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                format!(
+                    "while :; do printf '{}\\n'; sleep 1; done",
+                    ATTACH_READY_MARKER
+                ),
+            ]),
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))?;
     assert!(matches!(created, Response::NewSession(_)));
 
     let created = setup_connection.roundtrip(&Request::NewSession(NewSessionRequest {

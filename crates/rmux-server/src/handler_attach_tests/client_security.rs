@@ -331,7 +331,7 @@ async fn refresh_client_flags_merge_incrementally() {
     let response = handler
         .dispatch(
             std::process::id(),
-            Request::RefreshClient(RefreshClientRequest {
+            Request::RefreshClient(Box::new(RefreshClientRequest {
                 target_client: None,
                 adjustment: None,
                 clear_pan: false,
@@ -347,7 +347,7 @@ async fn refresh_client_flags_merge_incrementally() {
                 subscriptions_format: vec![],
                 control_size: None,
                 colour_report: None,
-            }),
+            })),
         )
         .await
         .response;
@@ -370,7 +370,7 @@ async fn refresh_client_flags_merge_incrementally() {
     let response = handler
         .dispatch(
             std::process::id(),
-            Request::RefreshClient(RefreshClientRequest {
+            Request::RefreshClient(Box::new(RefreshClientRequest {
                 target_client: None,
                 adjustment: None,
                 clear_pan: false,
@@ -386,7 +386,7 @@ async fn refresh_client_flags_merge_incrementally() {
                 subscriptions_format: vec![],
                 control_size: None,
                 colour_report: None,
-            }),
+            })),
         )
         .await
         .response;
@@ -438,7 +438,7 @@ async fn refresh_client_unimplemented_control_mode_flags_are_rejected() {
     let response = handler
         .dispatch(
             std::process::id(),
-            Request::RefreshClient(RefreshClientRequest {
+            Request::RefreshClient(Box::new(RefreshClientRequest {
                 target_client: None,
                 adjustment: None,
                 clear_pan: false,
@@ -454,7 +454,7 @@ async fn refresh_client_unimplemented_control_mode_flags_are_rejected() {
                 subscriptions_format: vec!["name:%0:#{pane_id}".to_owned()],
                 control_size: Some("80x24".to_owned()),
                 colour_report: Some("%0".to_owned()),
-            }),
+            })),
         )
         .await
         .response;

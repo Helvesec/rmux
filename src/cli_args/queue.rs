@@ -19,6 +19,7 @@ pub(super) fn parse_command_queue(arguments: &[OsString]) -> Result<ParsedComman
         .collect::<Result<Vec<_>, _>>()?;
     let arguments = expand_cli_argument_aliases(arguments);
     TmuxCommandParser::new()
+        .with_exact_commands(super::RMUX_EXTENSION_COMMANDS)
         .parse_arguments(&arguments)
         .map_err(command_parse_error_to_clap)
 }
@@ -189,7 +190,37 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
             .and_then(CopyModeArgs::validate)
             .map(Command::CopyMode),
         "clock-mode" => parse_command_args("clock-mode", arguments).map(Command::ClockMode),
-        "send-keys" => parse_command_args("send-keys", arguments).map(Command::SendKeys),
+        "wait-pane" => parse_command_args::<WaitPaneArgs>("wait-pane", arguments)
+            .and_then(WaitPaneArgs::validate)
+            .map(Command::WaitPane),
+        "pane-snapshot" => {
+            parse_command_args("pane-snapshot", arguments).map(Command::PaneSnapshot)
+        }
+        "stream-pane" => parse_command_args::<StreamPaneArgs>("stream-pane", arguments)
+            .and_then(StreamPaneArgs::validate)
+            .map(Command::StreamPane),
+        "collect-pane-output" => {
+            parse_command_args::<CollectPaneOutputArgs>("collect-pane-output", arguments)
+                .and_then(CollectPaneOutputArgs::validate)
+                .map(Command::CollectPaneOutput)
+        }
+        "locator" => parse_command_args::<LocatorArgs>("locator", arguments)
+            .and_then(LocatorArgs::validate)
+            .map(Command::Locator),
+        "expect-pane" => parse_command_args::<ExpectPaneArgs>("expect-pane", arguments)
+            .and_then(ExpectPaneArgs::validate)
+            .map(Command::ExpectPane),
+        "find-panes" => parse_command_args("find-panes", arguments).map(Command::FindPanes),
+        "find-sessions" => {
+            parse_command_args("find-sessions", arguments).map(Command::FindSessions)
+        }
+        "broadcast-keys" => parse_command_args::<BroadcastKeysArgs>("broadcast-keys", arguments)
+            .and_then(BroadcastKeysArgs::validate)
+            .map(Command::BroadcastKeys),
+        "with-session" => parse_command_args::<WithSessionArgs>("with-session", arguments)
+            .and_then(WithSessionArgs::validate)
+            .map(Command::WithSession),
+        "send-keys" => parse_send_keys_args(arguments).map(Command::SendKeys),
         "bind-key" => parse_command_args("bind-key", arguments).map(Command::BindKey),
         "unbind-key" => parse_command_args("unbind-key", arguments).map(Command::UnbindKey),
         "list-commands" => {
@@ -346,6 +377,29 @@ fn parse_no_args(command_name: &'static str, arguments: Vec<String>) -> Result<(
         )
         .try_get_matches_from(arguments)
         .map(|_| ())
+}
+
+fn parse_send_keys_args(arguments: Vec<String>) -> Result<SendKeysArgs, clap::Error> {
+    let has_wait = arguments.iter().any(|argument| {
+        matches!(
+            argument.as_str(),
+            "--wait"
+                | "--wait-text"
+                | "--wait-visible-text"
+                | "--wait-next-text"
+                | "--wait-pane-exit"
+        ) || argument.starts_with("--wait=")
+            || argument.starts_with("--wait-text=")
+            || argument.starts_with("--wait-visible-text=")
+            || argument.starts_with("--wait-next-text=")
+    });
+    if has_wait && !arguments.iter().any(|argument| argument == "--") {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ValueValidation,
+            "command send-keys: -- is required before payload when using --wait options",
+        ));
+    }
+    parse_command_args::<SendKeysArgs>("send-keys", arguments).and_then(SendKeysArgs::validate)
 }
 
 fn parse_server_access_args(arguments: Vec<String>) -> Result<ServerAccessArgs, clap::Error> {

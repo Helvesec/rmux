@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use crate::hyperlinks::Hyperlinks;
 use crate::input::{Colour, GridAttr, COLOUR_DEFAULT, COLOUR_FLAG_256, COLOUR_FLAG_RGB};
 
@@ -45,6 +47,14 @@ pub(super) fn append_grid_string_code(
     let attr = gc.attr();
     let mut lastattr = lastgc.attr();
     let mut sgr = Vec::new();
+    if lastattr == attr
+        && lastgc.fg() == gc.fg()
+        && lastgc.bg() == gc.bg()
+        && lastgc.us() == gc.us()
+        && lastgc.link() == gc.link()
+    {
+        return;
+    }
 
     for &(mask, _code) in ATTR_CODES {
         if ((attr & mask) == 0 && (lastattr & mask) != 0)
@@ -74,22 +84,22 @@ pub(super) fn append_grid_string_code(
 
     append_colour_code(
         output,
-        &colour_codes_fg(gc.fg()),
-        &colour_codes_fg(lastgc.fg()),
+        colour_codes_fg(gc.fg()),
+        colour_codes_fg(lastgc.fg()),
         !sgr.is_empty() && sgr[0] == 0,
         escape_sequences,
     );
     append_colour_code(
         output,
-        &colour_codes_bg(gc.bg()),
-        &colour_codes_bg(lastgc.bg()),
+        colour_codes_bg(gc.bg()),
+        colour_codes_bg(lastgc.bg()),
         !sgr.is_empty() && sgr[0] == 0,
         escape_sequences,
     );
     append_colour_code(
         output,
-        &colour_codes_us(gc.us()),
-        &colour_codes_us(lastgc.us()),
+        colour_codes_us(gc.us()),
+        colour_codes_us(lastgc.us()),
         !sgr.is_empty() && sgr[0] == 0,
         escape_sequences,
     );
@@ -124,8 +134,8 @@ pub(super) fn append_grid_string_code(
 
 fn append_colour_code(
     output: &mut String,
-    newc: &[i32],
-    oldc: &[i32],
+    newc: ColourCodes,
+    oldc: ColourCodes,
     reset: bool,
     escape_sequences: bool,
 ) {
@@ -144,54 +154,123 @@ fn append_colour_code(
         if index > 0 {
             output.push(';');
         }
-        output.push_str(&value.to_string());
+        push_decimal(output, value);
     }
     output.push('m');
 }
 
-fn colour_codes_fg(colour: Colour) -> Vec<i32> {
-    if colour & COLOUR_FLAG_256 != 0 {
-        return vec![38, 5, colour & 0xff];
-    }
-    if colour & COLOUR_FLAG_RGB != 0 {
-        let (r, g, b) = split_rgb(colour);
-        return vec![38, 2, i32::from(r), i32::from(g), i32::from(b)];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ColourCodes {
+    values: [i32; 5],
+    len: usize,
+}
+
+impl ColourCodes {
+    const fn empty() -> Self {
+        Self {
+            values: [0; 5],
+            len: 0,
+        }
     }
 
-    match colour {
-        0..=7 => vec![colour + 30],
-        COLOUR_DEFAULT => vec![39],
-        90..=97 => vec![colour],
-        _ => Vec::new(),
+    fn one(value: i32) -> Self {
+        let mut codes = Self::empty();
+        codes.push(value);
+        codes
+    }
+
+    fn push(&mut self, value: i32) {
+        debug_assert!(self.len < self.values.len());
+        self.values[self.len] = value;
+        self.len += 1;
+    }
+
+    fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    fn first(self) -> Option<i32> {
+        (self.len > 0).then_some(self.values[0])
+    }
+
+    fn iter(self) -> impl Iterator<Item = i32> {
+        self.values.into_iter().take(self.len)
     }
 }
 
-fn colour_codes_bg(colour: Colour) -> Vec<i32> {
+fn colour_codes_fg(colour: Colour) -> ColourCodes {
     if colour & COLOUR_FLAG_256 != 0 {
-        return vec![48, 5, colour & 0xff];
+        let mut codes = ColourCodes::empty();
+        codes.push(38);
+        codes.push(5);
+        codes.push(colour & 0xff);
+        return codes;
     }
     if colour & COLOUR_FLAG_RGB != 0 {
         let (r, g, b) = split_rgb(colour);
-        return vec![48, 2, i32::from(r), i32::from(g), i32::from(b)];
+        let mut codes = ColourCodes::empty();
+        codes.push(38);
+        codes.push(2);
+        codes.push(i32::from(r));
+        codes.push(i32::from(g));
+        codes.push(i32::from(b));
+        return codes;
     }
 
     match colour {
-        0..=7 => vec![colour + 40],
-        COLOUR_DEFAULT => vec![49],
-        90..=97 => vec![colour + 10],
-        _ => Vec::new(),
+        0..=7 => ColourCodes::one(colour + 30),
+        COLOUR_DEFAULT => ColourCodes::one(39),
+        90..=97 => ColourCodes::one(colour),
+        _ => ColourCodes::empty(),
     }
 }
 
-fn colour_codes_us(colour: Colour) -> Vec<i32> {
+fn colour_codes_bg(colour: Colour) -> ColourCodes {
     if colour & COLOUR_FLAG_256 != 0 {
-        return vec![58, 5, colour & 0xff];
+        let mut codes = ColourCodes::empty();
+        codes.push(48);
+        codes.push(5);
+        codes.push(colour & 0xff);
+        return codes;
     }
     if colour & COLOUR_FLAG_RGB != 0 {
         let (r, g, b) = split_rgb(colour);
-        return vec![58, 2, i32::from(r), i32::from(g), i32::from(b)];
+        let mut codes = ColourCodes::empty();
+        codes.push(48);
+        codes.push(2);
+        codes.push(i32::from(r));
+        codes.push(i32::from(g));
+        codes.push(i32::from(b));
+        return codes;
     }
-    Vec::new()
+
+    match colour {
+        0..=7 => ColourCodes::one(colour + 40),
+        COLOUR_DEFAULT => ColourCodes::one(49),
+        90..=97 => ColourCodes::one(colour + 10),
+        _ => ColourCodes::empty(),
+    }
+}
+
+fn colour_codes_us(colour: Colour) -> ColourCodes {
+    if colour & COLOUR_FLAG_256 != 0 {
+        let mut codes = ColourCodes::empty();
+        codes.push(58);
+        codes.push(5);
+        codes.push(colour & 0xff);
+        return codes;
+    }
+    if colour & COLOUR_FLAG_RGB != 0 {
+        let (r, g, b) = split_rgb(colour);
+        let mut codes = ColourCodes::empty();
+        codes.push(58);
+        codes.push(2);
+        codes.push(i32::from(r));
+        codes.push(i32::from(g));
+        codes.push(i32::from(b));
+        return codes;
+    }
+    ColourCodes::empty()
 }
 
 fn split_rgb(colour: Colour) -> (u8, u8, u8) {
@@ -204,12 +283,16 @@ fn split_rgb(colour: Colour) -> (u8, u8, u8) {
 
 fn push_attr_code(output: &mut String, code: i32) {
     if code < 10 {
-        output.push_str(&code.to_string());
+        push_decimal(output, code);
     } else {
-        output.push_str(&(code / 10).to_string());
+        push_decimal(output, code / 10);
         output.push(':');
-        output.push_str(&(code % 10).to_string());
+        push_decimal(output, code % 10);
     }
+}
+
+fn push_decimal(output: &mut String, value: i32) {
+    let _ = write!(output, "{value}");
 }
 
 fn append_escape_prefix(output: &mut String, escape_sequences: bool, suffix: char) {

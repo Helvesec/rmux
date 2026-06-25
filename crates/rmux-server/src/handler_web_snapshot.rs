@@ -79,8 +79,14 @@ pub(crate) struct WebSessionWindowView {
 }
 
 impl WebPaneSnapshot {
+    #[cfg(test)]
     pub(crate) fn ansi_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
+        self.append_ansi_bytes(&mut out);
+        out
+    }
+
+    pub(crate) fn append_ansi_bytes(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(SNAPSHOT_RESET_PREFIX);
         // Match the inner program's alternate-screen state so the browser's
         // emulator stays in sync with the later 1049h/l toggles in the live
@@ -92,7 +98,7 @@ impl WebPaneSnapshot {
         // can arrive after lost live bytes, so the browser may still be in a
         // stale mode such as synchronized output, alt-screen, bracketed paste,
         // mouse reporting, or modifyOtherKeys.
-        render_dec_modes_for_snapshot(self.mode_bits, self.cursor_style, &mut out);
+        render_dec_modes_for_snapshot(self.mode_bits, self.cursor_style, out);
         for (index, line) in self.ansi_lines.iter().enumerate() {
             if index > 0 {
                 out.extend_from_slice(b"\r\n");
@@ -126,7 +132,6 @@ impl WebPaneSnapshot {
         } else {
             b"\x1b[?25l"
         });
-        out
     }
 }
 
@@ -147,14 +152,20 @@ impl WebSessionSnapshot {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn ansi_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.frame.len() + SNAPSHOT_RESET_PREFIX.len());
+        self.append_ansi_bytes(&mut out);
+        out
+    }
+
+    pub(crate) fn append_ansi_bytes(&self, out: &mut Vec<u8>) {
+        out.reserve(self.frame.len() + SNAPSHOT_RESET_PREFIX.len());
         out.extend_from_slice(SNAPSHOT_RESET_PREFIX);
         // Re-assert only the active pane's *interactive* modes. The composited
         // multi-pane frame owns the layout, so layout modes stay reset here.
-        render_dec_modes_for_snapshot(self.active_mode_bits, self.active_cursor_style, &mut out);
+        render_dec_modes_for_snapshot(self.active_mode_bits, self.active_cursor_style, out);
         out.extend_from_slice(&self.frame);
-        out
     }
 }
 
@@ -289,6 +300,41 @@ mod tests {
         assert!(rendered.starts_with("\x1b[?2026l\x1b[?1049l\x1b[?6l\x1b[r"));
         assert!(rendered.contains("\x1b[32muser@host"));
         assert!(rendered.contains("\x1b[4;8H\x1b[?25h"));
+    }
+
+    #[test]
+    fn web_snapshot_golden_default_modes_and_cursor_are_byte_stable() {
+        let snapshot = default_pane_snapshot(vec![b"golden".to_vec()]);
+        let expected_dec_modes = concat!(
+            "\x1b[?7h",
+            "\x1b[4l",
+            "\x1b[?1l",
+            "\x1b>",
+            "\x1b[20l",
+            "\x1b[?1004l",
+            "\x1b[?2004l",
+            "\x1b[?2031l",
+            "\x1b[?2026l",
+            "\x1b[?1000l",
+            "\x1b[?1002l",
+            "\x1b[?1003l",
+            "\x1b[?1005l",
+            "\x1b[?1006l",
+            "\x1b[<u",
+            "\x1b[>4;0m",
+            "\x1b[0 q",
+        );
+
+        assert_eq!(
+            snapshot.ansi_bytes(),
+            [
+                SNAPSHOT_RESET_PREFIX,
+                expected_dec_modes.as_bytes(),
+                b"\x1b[0mgolden",
+                b"\x1b[0m\x1b[4;8H\x1b[?25h",
+            ]
+            .concat()
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Web-share wire protocol (v2, X25519 + ML-KEM-768 hybrid).
+//! Web-share wire protocol v1 (X25519 + ML-KEM-768 hybrid).
 //!
 //! This module owns the shared vocabulary — constants, the client/auth wire
 //! types, and the small parse/validate helpers — and re-exports the directional
@@ -59,6 +59,8 @@ const SERVER_CAPABILITIES: &[&str] = &[
     PANE_FRAME_CAPABILITY,
 ];
 const OPERATOR_INPUT_FRAME_MAX: usize = 4 * 1024;
+const MAX_SESSION_RESIZE_DIMENSION: u16 = 4096;
+const MAX_SESSION_RESIZE_CELLS: u32 = 1_000_000;
 const MAX_PANE_RESIZE_CELLS: u16 = 10_000;
 const WS_OUTPUT_RAW: u8 = 0x01;
 const WS_RESIZE_NOTIFY: u8 = 0x02;
@@ -145,7 +147,15 @@ fn parse_resize_body(body: &[u8]) -> Option<TerminalSize> {
     }
     let cols = u16::from_be_bytes([body[0], body[1]]);
     let rows = u16::from_be_bytes([body[2], body[3]]);
-    (cols > 0 && rows > 0).then_some(TerminalSize { cols, rows })
+    is_valid_session_resize(cols, rows).then_some(TerminalSize { cols, rows })
+}
+
+fn is_valid_session_resize(cols: u16, rows: u16) -> bool {
+    cols > 0
+        && rows > 0
+        && cols <= MAX_SESSION_RESIZE_DIMENSION
+        && rows <= MAX_SESSION_RESIZE_DIMENSION
+        && u32::from(cols).saturating_mul(u32::from(rows)) <= MAX_SESSION_RESIZE_CELLS
 }
 
 fn parse_pane_resize_body(body: &[u8]) -> Option<(u32, ResizePaneAdjustment)> {

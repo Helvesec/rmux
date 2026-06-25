@@ -7,17 +7,30 @@
 use std::io;
 use std::process::{Child, Command};
 
+#[cfg(windows)]
+use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
+use std::os::fd::RawFd;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 #[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 #[cfg(windows)]
+use std::process;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(windows)]
 use std::sync::{Mutex, MutexGuard, OnceLock};
+#[cfg(windows)]
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{
-    GetHandleInformation, SetHandleInformation, ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE,
-    ERROR_INVALID_PARAMETER, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    CloseHandle, GetHandleInformation, GetLastError, SetHandleInformation, ERROR_ACCESS_DENIED,
+    ERROR_ALREADY_EXISTS, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER, HANDLE,
+    HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Console::{
@@ -25,8 +38,8 @@ use windows_sys::Win32::System::Console::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
-    CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS,
+    CreateEventW, OpenEventW, SetEvent, WaitForSingleObject, CREATE_BREAKAWAY_FROM_JOB,
+    CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, DETACHED_PROCESS, EVENT_MODIFY_STATE,
 };
 
 /// Configures `command` so the spawned RMUX daemon is not tied to the client
@@ -38,6 +51,17 @@ use windows_sys::Win32::System::Threading::{
 /// fresh session is created in the child just before `exec`.
 pub fn configure_hidden_daemon_command(command: &mut Command, allow_job_breakaway: bool) {
     configure_hidden_daemon_command_impl(command, allow_job_breakaway);
+}
+
+/// Configures a hidden daemon command while preserving selected inherited file
+/// descriptors across the final daemon `exec`.
+#[cfg(unix)]
+pub fn configure_hidden_daemon_command_preserving_fds(
+    command: &mut Command,
+    allow_job_breakaway: bool,
+    preserved_fds: &[RawFd],
+) {
+    configure_hidden_daemon_command_impl_preserving(command, allow_job_breakaway, preserved_fds);
 }
 
 /// Spawns a previously configured hidden-daemon command.
@@ -57,15 +81,151 @@ pub fn should_retry_hidden_daemon_without_breakaway(error: &io::Error) -> bool {
     should_retry_hidden_daemon_without_breakaway_impl(error)
 }
 
+/// Writes a single readiness notification to an inherited Linux eventfd.
+#[cfg(target_os = "linux")]
+pub fn signal_startup_ready_fd(ready_fd: RawFd) -> io::Result<()> {
+    if ready_fd < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "startup readiness fd must be non-negative",
+        ));
+    }
+
+    let bytes = 1_u64.to_ne_bytes();
+    // SAFETY: `ready_fd` is supplied by the parent rmux client as an inherited
+    // eventfd. Borrowing it does not transfer ownership, and `write` only
+    // touches the kernel object referenced by this descriptor.
+    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(ready_fd) };
+    let written = rustix::io::write(fd, &bytes).map_err(io::Error::from)?;
+    if written == bytes.len() {
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::WriteZero,
+        "short eventfd readiness write",
+    ))
+}
+
+/// A named Win32 event used to notify a launcher that a hidden daemon bound its pipe.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct StartupReadyEvent {
+    handle: HANDLE,
+    name: OsString,
+}
+
+#[cfg(windows)]
+impl StartupReadyEvent {
+    /// Creates a new unsignaled manual-reset event with a unique local name.
+    pub fn new() -> io::Result<Self> {
+        for _ in 0..64 {
+            let name = unique_startup_ready_event_name();
+            let wide = wide_event_name(&name)?;
+            // SAFETY: the name is a NUL-terminated UTF-16 buffer and the
+            // default security descriptor is suitable for a same-user child
+            // process launched immediately after event creation.
+            let handle = unsafe { CreateEventW(std::ptr::null(), 1, 0, wide.as_ptr()) };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+
+            // A collision is exceptionally unlikely but easy to handle. The
+            // event name is passed to the daemon; if we created a preexisting
+            // object an unrelated peer could release our wait too early.
+            if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+                // SAFETY: `handle` was returned by `CreateEventW` above and
+                // is no longer needed after detecting the name collision.
+                let _ = unsafe { CloseHandle(handle) };
+                continue;
+            }
+
+            return Ok(Self { handle, name });
+        }
+
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique rmux startup readiness event",
+        ))
+    }
+
+    /// Returns the event name to pass to the hidden daemon.
+    #[must_use]
+    pub fn name(&self) -> &OsStr {
+        self.name.as_os_str()
+    }
+
+    /// Waits until the daemon signals readiness, returning `false` on timeout.
+    pub fn wait(&self, timeout: Duration) -> io::Result<bool> {
+        let timeout_ms = duration_to_wait_millis(timeout);
+        // SAFETY: `self.handle` is owned by this object and remains valid for
+        // the duration of the wait.
+        match unsafe { WaitForSingleObject(self.handle, timeout_ms) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => Err(io::Error::last_os_error()),
+            other => Err(io::Error::other(format!(
+                "unexpected startup readiness wait result {other}"
+            ))),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for StartupReadyEvent {
+    fn drop(&mut self) {
+        // SAFETY: `handle` is owned by this object and closed exactly once.
+        let _ = unsafe { CloseHandle(self.handle) };
+    }
+}
+
+/// Signals a named Win32 startup readiness event created by the launcher.
+#[cfg(windows)]
+pub fn signal_startup_ready_event(name: &OsStr) -> io::Result<()> {
+    let wide = wide_event_name(name)?;
+    // SAFETY: the name is a NUL-terminated UTF-16 buffer. The handle, if
+    // returned, is closed before this function exits.
+    let handle = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, wide.as_ptr()) };
+    if handle.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: `handle` is an event handle opened with EVENT_MODIFY_STATE.
+    let result = unsafe { SetEvent(handle) };
+    let error = if result == 0 {
+        Some(io::Error::last_os_error())
+    } else {
+        None
+    };
+    // SAFETY: `handle` was returned by `OpenEventW` above.
+    let _ = unsafe { CloseHandle(handle) };
+    match error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 #[cfg(unix)]
 fn configure_hidden_daemon_command_impl(command: &mut Command, _allow_job_breakaway: bool) {
+    configure_hidden_daemon_command_impl_preserving(command, _allow_job_breakaway, &[]);
+}
+
+#[cfg(unix)]
+fn configure_hidden_daemon_command_impl_preserving(
+    command: &mut Command,
+    _allow_job_breakaway: bool,
+    preserved_fds: &[RawFd],
+) {
+    let mut preserved_fds = preserved_fds.to_vec();
+    preserved_fds.sort_unstable();
+    preserved_fds.dedup();
     // SAFETY: The closure runs after fork and before exec in the daemon child.
     // It only marks inherited descriptors close-on-exec and calls `setsid`;
     // both operations stay inside libc/rustix OS boundaries and avoid touching
     // parent-owned Rust state.
     unsafe {
-        command.pre_exec(|| {
-            mark_inherited_fds_close_on_exec()?;
+        command.pre_exec(move || {
+            mark_inherited_fds_close_on_exec_except(&preserved_fds)?;
             rustix::process::setsid().map_err(io::Error::from)?;
             Ok(())
         });
@@ -73,42 +233,85 @@ fn configure_hidden_daemon_command_impl(command: &mut Command, _allow_job_breaka
 }
 
 #[cfg(target_os = "linux")]
-fn mark_inherited_fds_close_on_exec() -> io::Result<()> {
+fn mark_inherited_fds_close_on_exec_except(preserved_fds: &[RawFd]) -> io::Result<()> {
+    if mark_inherited_fd_ranges_close_on_exec(preserved_fds)? {
+        return Ok(());
+    }
+
+    mark_inherited_fds_close_on_exec_fallback_except(preserved_fds)
+}
+
+#[cfg(target_os = "linux")]
+fn mark_inherited_fd_ranges_close_on_exec(preserved_fds: &[RawFd]) -> io::Result<bool> {
+    let mut start = 3_u32;
+
+    for &fd in preserved_fds {
+        if fd < 3 {
+            continue;
+        }
+        let Ok(fd) = u32::try_from(fd) else {
+            continue;
+        };
+        if start < fd && !close_range_cloexec(start, fd - 1)? {
+            return Ok(false);
+        }
+        clear_close_on_exec(fd as libc::c_int)?;
+        start = fd.saturating_add(1);
+    }
+
+    if !close_range_cloexec(start, u32::MAX)? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn close_range_cloexec(first: u32, last: u32) -> io::Result<bool> {
+    if first > last {
+        return Ok(true);
+    }
+
     // SAFETY: `close_range` with `CLOSE_RANGE_CLOEXEC` does not close file
     // descriptors or dereference Rust memory; it only asks the kernel to mark
-    // inherited descriptors >= 3 close-on-exec in the child process.
+    // inherited descriptors in the supplied range close-on-exec in the child
+    // process.
     let result = unsafe {
         libc::syscall(
             libc::SYS_close_range,
-            3_u32,
-            u32::MAX,
+            first,
+            last,
             libc::CLOSE_RANGE_CLOEXEC,
         )
     };
     if result == 0 {
-        return Ok(());
+        return Ok(true);
     }
 
     let error = io::Error::last_os_error();
     match error.raw_os_error() {
-        Some(libc::ENOSYS | libc::EINVAL) => mark_inherited_fds_close_on_exec_fallback(),
+        Some(libc::ENOSYS | libc::EINVAL) => Ok(false),
         _ => Err(error),
     }
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn mark_inherited_fds_close_on_exec() -> io::Result<()> {
-    mark_inherited_fds_close_on_exec_fallback()
+fn mark_inherited_fds_close_on_exec_except(preserved_fds: &[RawFd]) -> io::Result<()> {
+    mark_inherited_fds_close_on_exec_fallback_except(preserved_fds)
 }
 
 #[cfg(unix)]
 const FALLBACK_FD_SCAN_LIMIT: libc::c_int = 16_384;
 
 #[cfg(unix)]
-fn mark_inherited_fds_close_on_exec_fallback() -> io::Result<()> {
+fn mark_inherited_fds_close_on_exec_fallback_except(preserved_fds: &[RawFd]) -> io::Result<()> {
     let max_fd = inherited_fd_scan_limit();
 
     for fd in 3..max_fd {
+        if preserved_fds.contains(&fd) {
+            clear_close_on_exec(fd)?;
+            continue;
+        }
+
         // SAFETY: `fcntl(F_GETFD)` observes descriptor flags for an integer fd.
         // Invalid descriptors are reported as EBADF and handled below.
         let flags = fcntl_getfd_retry(fd)?;
@@ -132,6 +335,19 @@ fn mark_inherited_fds_close_on_exec_fallback() -> io::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+#[cfg(unix)]
+fn clear_close_on_exec(fd: libc::c_int) -> io::Result<()> {
+    let flags = fcntl_getfd_retry(fd)?;
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let result = fcntl_setfd_retry(fd, flags & !libc::FD_CLOEXEC)?;
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -174,6 +390,43 @@ fn fcntl_setfd_retry(fd: libc::c_int, flags: libc::c_int) -> io::Result<libc::c_
 }
 
 #[cfg(windows)]
+fn unique_startup_ready_event_name() -> OsString {
+    static NEXT_EVENT_ID: AtomicU64 = AtomicU64::new(0);
+
+    let sequence = NEXT_EVENT_ID.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    OsString::from(format!(
+        r"Local\rmux-startup-ready-{}-{sequence}-{timestamp:x}",
+        process::id()
+    ))
+}
+
+#[cfg(windows)]
+fn wide_event_name(name: &OsStr) -> io::Result<Vec<u16>> {
+    let mut wide: Vec<u16> = name.encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "startup readiness event name must not contain NUL",
+        ));
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(windows)]
+fn duration_to_wait_millis(timeout: Duration) -> u32 {
+    timeout
+        .as_millis()
+        .min(u128::from(u32::MAX - 1))
+        .try_into()
+        .unwrap_or(u32::MAX - 1)
+}
+
+#[cfg(windows)]
 fn configure_hidden_daemon_command_impl(command: &mut Command, allow_job_breakaway: bool) {
     command.creation_flags(hidden_daemon_creation_flags(allow_job_breakaway));
 }
@@ -210,8 +463,10 @@ fn should_retry_hidden_daemon_without_breakaway_impl(_error: &io::Error) -> bool
 #[cfg(windows)]
 #[must_use]
 pub const fn hidden_daemon_creation_flags(allow_job_breakaway: bool) -> u32 {
-    let base =
-        DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT;
+    // Keep the daemon detached from the launcher console, but do not create a
+    // new process group: ConPTY's Ctrl-C delivery relies on the host and hosted
+    // console processes staying in the same process group.
+    let base = DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
     if allow_job_breakaway {
         base | CREATE_BREAKAWAY_FROM_JOB
     } else {
@@ -288,6 +543,7 @@ impl Drop for StandardHandleInheritanceGuard {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+    use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
     #[test]
     fn hidden_daemon_flags_detach_console_and_preserve_unicode_env() {
@@ -295,7 +551,7 @@ mod tests {
 
         assert_ne!(flags & DETACHED_PROCESS, 0);
         assert_ne!(flags & CREATE_NO_WINDOW, 0);
-        assert_ne!(flags & CREATE_NEW_PROCESS_GROUP, 0);
+        assert_eq!(flags & CREATE_NEW_PROCESS_GROUP, 0);
         assert_ne!(flags & CREATE_UNICODE_ENVIRONMENT, 0);
         assert_ne!(flags & CREATE_BREAKAWAY_FROM_JOB, 0);
 
@@ -316,5 +572,24 @@ mod tests {
         assert!(!should_retry_hidden_daemon_without_breakaway(
             &io::Error::from_raw_os_error(2)
         ));
+    }
+
+    #[test]
+    fn startup_ready_event_round_trips_signal_by_name() {
+        let ready = StartupReadyEvent::new().expect("create startup readiness event");
+
+        assert!(
+            !ready
+                .wait(Duration::from_millis(1))
+                .expect("initial readiness wait succeeds"),
+            "fresh startup readiness event must start unsignaled"
+        );
+        signal_startup_ready_event(ready.name()).expect("signal readiness event");
+        assert!(
+            ready
+                .wait(Duration::from_millis(100))
+                .expect("signaled readiness wait succeeds"),
+            "startup readiness event should become signaled"
+        );
     }
 }

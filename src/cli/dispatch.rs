@@ -4,14 +4,19 @@ use std::path::Path;
 use rmux_client::connect;
 use rmux_proto::{ClientTerminalContext, CopyModeRequest, ErrorResponse, LayoutName, Response};
 
+use super::automation::{
+    run_broadcast_keys, run_collect_pane_output, run_expect_pane, run_find_panes,
+    run_find_sessions, run_locator, run_pane_snapshot, run_stream_pane, run_wait_pane,
+    run_with_session,
+};
 use super::buffer_commands::{run_load_buffer, run_save_buffer};
-use super::capture_pane::{build_capture_pane_request, capture_pane_request};
+use super::capture_pane::{capture_pane_request, send_capture_pane_request};
 use super::client_commands::run_attach_session;
 use super::command_inventory::run_list_commands;
 use super::command_runner::{
     finish_command_success, inherited_pane_target, run_command, run_command_resolved,
     run_payload_command, run_payload_command_resolved, run_queued_server_command,
-    write_command_output,
+    with_command_connection_cache, write_command_output,
 };
 use super::config_commands::{
     run_set_environment, run_set_hook, run_set_option, run_show_environment, run_show_hooks,
@@ -46,6 +51,7 @@ use super::window_commands::{
 use super::{connect_with_startserver, shell_command_text, ExitFailure, StartupOptions};
 use crate::cli_args::{Command, NewSessionArgs, SetOptionCommandKind, ShowOptionsCommandKind};
 use crate::cli_response::tmux_cli_error_message;
+use crate::tmux_error_surface::source_file_error_uses_stdout;
 
 pub(super) fn default_client_command() -> Command {
     Command::NewSession(NewSessionArgs {
@@ -80,6 +86,24 @@ pub(super) fn dispatch_command_queue(
         commands
     };
 
+    let can_reuse_connection = commands.len() > 1
+        && commands
+            .iter()
+            .all(command_allows_detached_connection_reuse);
+    if can_reuse_connection {
+        return with_command_connection_cache(socket_path, || {
+            dispatch_commands(commands, socket_path, startup, client_terminal)
+        });
+    }
+    dispatch_commands(commands, socket_path, startup, client_terminal)
+}
+
+fn dispatch_commands(
+    commands: Vec<Command>,
+    socket_path: &Path,
+    startup: StartupOptions,
+    client_terminal: ClientTerminalContext,
+) -> Result<i32, ExitFailure> {
     let mut exit_code = 0;
     for command in commands {
         exit_code = dispatch(
@@ -90,6 +114,114 @@ pub(super) fn dispatch_command_queue(
         )?;
     }
     Ok(exit_code)
+}
+
+fn command_allows_detached_connection_reuse(candidate: &Command) -> bool {
+    match candidate {
+        Command::SendKeys(args) if args.has_wait() => false,
+        Command::NewSession(_)
+        | Command::StartServer(_)
+        | Command::KillServer
+        | Command::AttachSession(_)
+        | Command::SourceFile(_)
+        | Command::WaitPane(_)
+        | Command::StreamPane(_)
+        | Command::CollectPaneOutput(_)
+        | Command::WithSession(_)
+        | Command::WebShare(_)
+        | Command::Unsupported(_) => false,
+        Command::HasSession(_)
+        | Command::KillSession(_)
+        | Command::RenameSession(_)
+        | Command::ServerAccess(_)
+        | Command::LockServer
+        | Command::LockSession(_)
+        | Command::LockClient(_)
+        | Command::NewWindow(_)
+        | Command::KillWindow(_)
+        | Command::SelectWindow(_)
+        | Command::RenameWindow(_)
+        | Command::NextWindow(_)
+        | Command::PreviousWindow(_)
+        | Command::LastWindow(_)
+        | Command::ListSessions(_)
+        | Command::ListWindows(_)
+        | Command::MoveWindow(_)
+        | Command::SwapWindow(_)
+        | Command::RotateWindow(_)
+        | Command::ResizeWindow(_)
+        | Command::RespawnWindow(_)
+        | Command::SplitWindow(_)
+        | Command::SwapPane(_)
+        | Command::LastPane(_)
+        | Command::JoinPane(_)
+        | Command::MovePane(_)
+        | Command::BreakPane(_)
+        | Command::PipePane(_)
+        | Command::RespawnPane(_)
+        | Command::KillPane(_)
+        | Command::SelectLayout(_)
+        | Command::NextLayout(_)
+        | Command::PreviousLayout(_)
+        | Command::ResizePane(_)
+        | Command::DisplayPanes(_)
+        | Command::ListPanes(_)
+        | Command::SelectPane(_)
+        | Command::CopyMode(_)
+        | Command::ClockMode(_)
+        | Command::PaneSnapshot(_)
+        | Command::Locator(_)
+        | Command::ExpectPane(_)
+        | Command::FindPanes(_)
+        | Command::FindSessions(_)
+        | Command::BroadcastKeys(_)
+        | Command::SendKeys(_)
+        | Command::BindKey(_)
+        | Command::UnbindKey(_)
+        | Command::ListCommands(_)
+        | Command::ListKeys(_)
+        | Command::SendPrefix(_)
+        | Command::Prompt(_)
+        | Command::ConfirmBefore(_)
+        | Command::FindWindow(_)
+        | Command::LinkWindow(_)
+        | Command::UnlinkWindow(_)
+        | Command::ChooseTree(_)
+        | Command::ChooseBuffer(_)
+        | Command::ChooseClient(_)
+        | Command::CustomizeMode(_)
+        | Command::RefreshClient(_)
+        | Command::ListClients(_)
+        | Command::SwitchClient(_)
+        | Command::DetachClient(_)
+        | Command::SuspendClient(_)
+        | Command::SetOption(_)
+        | Command::SetWindowOption(_)
+        | Command::SetEnvironment(_)
+        | Command::ShowOptions(_)
+        | Command::ShowWindowOptions(_)
+        | Command::ShowEnvironment(_)
+        | Command::SetHook(_)
+        | Command::ShowHooks(_)
+        | Command::SetBuffer(_)
+        | Command::ShowBuffer(_)
+        | Command::PasteBuffer(_)
+        | Command::ListBuffers(_)
+        | Command::DeleteBuffer(_)
+        | Command::LoadBuffer(_)
+        | Command::SaveBuffer(_)
+        | Command::CapturePane(_)
+        | Command::ClearHistory(_)
+        | Command::DisplayMessage(_)
+        | Command::ShowMessages(_)
+        | Command::RunShell(_)
+        | Command::IfShell(_)
+        | Command::WaitFor(_)
+        | Command::DisplayMenu(_)
+        | Command::DisplayPopup(_)
+        | Command::ClearPromptHistory(_)
+        | Command::ShowPromptHistory(_) => true,
+    }
 }
 
 fn dispatch(
@@ -332,6 +464,16 @@ fn dispatch(
                     .map_err(ExitFailure::from_client)
             })
         }
+        Command::WaitPane(args) => run_wait_pane(args, socket_path),
+        Command::PaneSnapshot(args) => run_pane_snapshot(args, socket_path),
+        Command::StreamPane(args) => run_stream_pane(args, socket_path),
+        Command::CollectPaneOutput(args) => run_collect_pane_output(args, socket_path),
+        Command::Locator(args) => run_locator(args, socket_path),
+        Command::ExpectPane(args) => run_expect_pane(args, socket_path),
+        Command::FindPanes(args) => run_find_panes(args, socket_path),
+        Command::FindSessions(args) => run_find_sessions(args, socket_path),
+        Command::BroadcastKeys(args) => run_broadcast_keys(args, socket_path),
+        Command::WithSession(args) => run_with_session(args, socket_path),
         Command::SendKeys(args) => run_send_keys(args, socket_path),
         Command::BindKey(args) => run_bind_key(args, socket_path),
         Command::UnbindKey(args) => run_unbind_key(args, socket_path),
@@ -439,19 +581,13 @@ fn dispatch(
         Command::CapturePane(args) if args.print => {
             let args = capture_pane_request(args)?;
             run_payload_command_resolved(socket_path, "capture-pane", move |connection| {
-                let request = build_capture_pane_request(connection, args)?;
-                connection
-                    .capture_pane(request)
-                    .map_err(ExitFailure::from_client)
+                send_capture_pane_request(connection, socket_path, args)
             })
         }
         Command::CapturePane(args) => {
             let args = capture_pane_request(args)?;
             run_command_resolved(socket_path, "capture-pane", move |connection| {
-                let request = build_capture_pane_request(connection, args)?;
-                connection
-                    .capture_pane(request)
-                    .map_err(ExitFailure::from_client)
+                send_capture_pane_request(connection, socket_path, args)
             })
         }
         Command::ClearHistory(args) => {
@@ -675,47 +811,4 @@ fn run_source_file(
         return Ok(response.exit_status().unwrap_or(0));
     }
     finish_command_success(response, "source-file")
-}
-
-fn source_file_error_uses_stdout(error: &rmux_proto::RmuxError) -> bool {
-    match error {
-        rmux_proto::RmuxError::Server(message) => has_source_file_line_prefix(message),
-        _ => false,
-    }
-}
-
-fn has_source_file_line_prefix(message: &str) -> bool {
-    let mut parts = message.split(':');
-    let Some(mut previous) = parts.next() else {
-        return false;
-    };
-    for current in parts {
-        if !previous.is_empty() && previous.bytes().all(|byte| byte.is_ascii_digit()) {
-            return true;
-        }
-        previous = current;
-    }
-    false
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn source_file_line_prefix_accepts_windows_drive_paths() {
-        assert!(has_source_file_line_prefix(
-            r"C:\Users\RMUXUser\.tmux.conf:12: unknown command"
-        ));
-    }
-
-    #[test]
-    fn source_file_line_prefix_rejects_plain_messages() {
-        assert!(!has_source_file_line_prefix(
-            "source-file failed: missing file"
-        ));
-        assert!(!has_source_file_line_prefix(
-            "C:\\Users\\RMUXUser\\.tmux.conf"
-        ));
-    }
 }

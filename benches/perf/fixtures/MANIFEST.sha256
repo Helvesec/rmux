@@ -1,0 +1,6 @@
+# Updated by maintainers when fixture contents intentionally change.
+# Format: <sha256>  <relative path from benches/perf/fixtures>
+9394e1b8023f859952f15d84479f9f69ce9da7887da4d3e4bac6576154d870e3  README.md
+1747a10c5aedaacadeca7e3938119822ad5f078fc6d004d1ea354ba67ad50dbe  line-generator.sh
+d51138a53d22b38e1e673e40b1e915d5091d47f7202507df0599edccd4480cad  copy-mode-search.txt
+6175bff11f8e975def312cacd1c23196d11c1e7cc68e13d8b1962eb030b0bb0e  web-resize.jsonl

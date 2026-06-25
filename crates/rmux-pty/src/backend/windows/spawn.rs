@@ -28,6 +28,7 @@ use crate::{ChildCommand, ProcessId, Result, Signal};
 
 use super::application::resolve_application_path;
 use super::command_line::{command_line, environment_block, wide_null};
+use super::perf;
 use super::{should_enable_dsr_bootstrap, WindowsPty};
 
 #[derive(Debug)]
@@ -47,6 +48,7 @@ impl WindowsChild {
 }
 
 pub(crate) fn spawn_child(command: ChildCommand, pty: Arc<WindowsPty>) -> Result<WindowsChild> {
+    let _span = perf::span("conpty_spawn_child");
     if should_enable_dsr_bootstrap(&command.program) {
         tracing::debug!(
             target: "rmux::conpty",
@@ -55,10 +57,17 @@ pub(crate) fn spawn_child(command: ChildCommand, pty: Arc<WindowsPty>) -> Result
         pty.enable_dsr_bootstrap()?;
     }
 
-    let job = JobObjectGuard::new()?;
+    let job = {
+        let _span = perf::span("conpty_create_job_object");
+        JobObjectGuard::new()?
+    };
     let process = create_suspended_process_with_conpty_fallback(&command, &pty, 0)?;
 
-    match job.assign(&process.process) {
+    let assign = {
+        let _span = perf::span("conpty_assign_job_object");
+        job.assign(&process.process)
+    };
+    match assign {
         Ok(()) => resume_as_child(process, Some(job), pty),
         Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
             tracing::debug!(
@@ -76,23 +85,32 @@ pub(crate) fn spawn_child(command: ChildCommand, pty: Arc<WindowsPty>) -> Result
 }
 
 fn spawn_child_breakaway(command: ChildCommand, pty: Arc<WindowsPty>) -> Result<WindowsChild> {
-    let job = JobObjectGuard::new()?;
+    let job = {
+        let _span = perf::span("conpty_create_job_object");
+        JobObjectGuard::new()?
+    };
     match create_suspended_process_with_conpty_fallback(&command, &pty, CREATE_BREAKAWAY_FROM_JOB) {
-        Ok(process) => match job.assign(&process.process) {
-            Ok(()) => resume_as_child(process, Some(job), pty),
-            Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
-                tracing::error!(
-                    target: "rmux::conpty",
-                    "breakaway job assignment denied; refusing to run unguarded ConPTY child"
-                );
-                let _ = terminate_process(&process.process, 1);
-                Err(job_required_error("breakaway job assignment denied", error).into())
+        Ok(process) => {
+            let assign = {
+                let _span = perf::span("conpty_assign_job_object");
+                job.assign(&process.process)
+            };
+            match assign {
+                Ok(()) => resume_as_child(process, Some(job), pty),
+                Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+                    tracing::error!(
+                        target: "rmux::conpty",
+                        "breakaway job assignment denied; refusing to run unguarded ConPTY child"
+                    );
+                    let _ = terminate_process(&process.process, 1);
+                    Err(job_required_error("breakaway job assignment denied", error).into())
+                }
+                Err(error) => {
+                    let _ = terminate_process(&process.process, 1);
+                    Err(error.into())
+                }
             }
-            Err(error) => {
-                let _ = terminate_process(&process.process, 1);
-                Err(error.into())
-            }
-        },
+        }
         Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
             tracing::error!(
                 target: "rmux::conpty",
@@ -128,7 +146,10 @@ fn create_suspended_process(
     pty: &WindowsPty,
     extra_creation_flags: u32,
 ) -> io::Result<SuspendedProcess> {
-    let mut attributes = AttributeList::with_pseudoconsole(pty.hpc())?;
+    let mut attributes = {
+        let _span = perf::span("conpty_attribute_list");
+        AttributeList::with_pseudoconsole(pty.hpc())?
+    };
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -137,10 +158,19 @@ fn create_suspended_process(
     startup.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
     startup.lpAttributeList = attributes.as_mut_ptr();
 
-    let application_path = resolve_application_path(command)?;
+    let application_path = {
+        let _span = perf::span("conpty_resolve_application");
+        resolve_application_path(command)?
+    };
     let application = wide_null(application_path.as_os_str());
-    let mut command_line = command_line(command);
-    let mut environment = environment_block(command);
+    let mut command_line = {
+        let _span = perf::span("conpty_build_command_line");
+        command_line(command)
+    };
+    let mut environment = {
+        let _span = perf::span("conpty_build_environment_block");
+        environment_block(command)
+    };
     let current_dir = command
         .current_dir
         .as_ref()
@@ -150,24 +180,27 @@ fn create_suspended_process(
     // SAFETY: All UTF-16 buffers are NUL-terminated and remain alive for the
     // duration of the call, `startup` and `process_info` point to initialized
     // stack values, and handle inheritance is disabled.
-    let created = unsafe {
-        CreateProcessW(
-            application.as_ptr(),
-            command_line.as_mut_ptr(),
-            null(),
-            null(),
-            0,
-            EXTENDED_STARTUPINFO_PRESENT
-                | CREATE_UNICODE_ENVIRONMENT
-                | CREATE_SUSPENDED
-                | extra_creation_flags,
-            environment
-                .as_mut()
-                .map_or(null(), |block| block.as_mut_ptr().cast()),
-            current_dir.as_ref().map_or(null(), |path| path.as_ptr()),
-            &startup.StartupInfo as *const STARTUPINFOW,
-            &mut process_info,
-        )
+    let created = {
+        let _span = perf::span("conpty_create_process_w");
+        unsafe {
+            CreateProcessW(
+                application.as_ptr(),
+                command_line.as_mut_ptr(),
+                null(),
+                null(),
+                0,
+                EXTENDED_STARTUPINFO_PRESENT
+                    | CREATE_UNICODE_ENVIRONMENT
+                    | CREATE_SUSPENDED
+                    | extra_creation_flags,
+                environment
+                    .as_mut()
+                    .map_or(null(), |block| block.as_mut_ptr().cast()),
+                current_dir.as_ref().map_or(null(), |path| path.as_ptr()),
+                &startup.StartupInfo as *const STARTUPINFOW,
+                &mut process_info,
+            )
+        }
     };
     if created == 0 {
         return Err(last_os_error());
@@ -191,7 +224,10 @@ fn resume_as_child(
 ) -> Result<WindowsChild> {
     // SAFETY: `process.thread` is the primary thread handle returned by
     // `CreateProcessW` in suspended mode and is still owned here.
-    let resume = unsafe { ResumeThread(process.thread.as_raw_handle() as HANDLE) };
+    let resume = {
+        let _span = perf::span("conpty_resume_thread");
+        unsafe { ResumeThread(process.thread.as_raw_handle() as HANDLE) }
+    };
     if resume == u32::MAX {
         let _ = terminate_process(&process.process, 1);
         return Err(last_os_error().into());

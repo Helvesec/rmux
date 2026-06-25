@@ -92,28 +92,29 @@ fn twenty_pane_layout_produces_valid_geometry_and_resizes_all_ptys() -> Result<(
         },
     );
 
-    let created = connection.roundtrip(&Request::NewSessionExt(NewSessionExtRequest {
-        session_name: Some(session_name.clone()),
-        working_directory: None,
-        detached: true,
-        size: Some(TerminalSize {
-            cols: TERMINAL_COLS,
-            rows: TERMINAL_ROWS,
-        }),
-        environment: None,
-        group_target: None,
-        attach_if_exists: false,
-        detach_other_clients: false,
-        kill_other_clients: false,
-        flags: None,
-        window_name: None,
-        print_session_info: false,
-        print_format: None,
-        command: None,
-        process_command: Some(ProcessCommand::Argv(vec![STRESS_PANE_COMMAND.to_owned()])),
-        client_environment: None,
-        skip_environment_update: false,
-    }))?;
+    let created =
+        connection.roundtrip(&Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(session_name.clone()),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize {
+                cols: TERMINAL_COLS,
+                rows: TERMINAL_ROWS,
+            }),
+            environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: None,
+            process_command: Some(ProcessCommand::Argv(vec![STRESS_PANE_COMMAND.to_owned()])),
+            client_environment: None,
+            skip_environment_update: false,
+        })))?;
     assert!(matches!(created, Response::NewSession(_)));
 
     tty_paths.insert(
@@ -122,21 +123,22 @@ fn twenty_pane_layout_produces_valid_geometry_and_resizes_all_ptys() -> Result<(
     );
 
     for expected_index in 1..PANE_COUNT as u32 {
-        let split = connection.roundtrip(&Request::SplitWindowExt(SplitWindowExtRequest {
-            target: SplitWindowTarget::Session(session_name.clone()),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-            environment: None,
-            command: None,
-            process_command: Some(ProcessCommand::Argv(vec![STRESS_PANE_COMMAND.to_owned()])),
-            start_directory: None,
-            keep_alive_on_exit: None,
-            detached: false,
-            size: None,
-            preserve_zoom: false,
-            full_size: false,
-            stdin_payload: None,
-        }))?;
+        let split =
+            connection.roundtrip(&Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
+                target: SplitWindowTarget::Session(session_name.clone()),
+                direction: rmux_proto::SplitDirection::Vertical,
+                before: false,
+                environment: None,
+                command: None,
+                process_command: Some(ProcessCommand::Argv(vec![STRESS_PANE_COMMAND.to_owned()])),
+                start_directory: None,
+                keep_alive_on_exit: None,
+                detached: false,
+                size: None,
+                preserve_zoom: false,
+                full_size: false,
+                stdin_payload: None,
+            })))?;
         assert_eq!(
             split,
             Response::SplitWindow(SplitWindowResponse {
@@ -412,24 +414,25 @@ fn wait_for_pane_capture(
         // The edge panes in this stress layout can be one row tall, so the
         // visible screen may roll past the marker immediately after the shell
         // repaints. Capture the full transcript to verify delivery instead.
-        let response = connection.roundtrip(&Request::CapturePane(CapturePaneRequest {
-            target: target.clone(),
-            start: None,
-            end: None,
-            print: true,
-            buffer_name: None,
-            alternate: false,
-            escape_ansi: false,
-            escape_sequences: false,
-            join_wrapped: false,
-            use_mode_screen: false,
-            preserve_trailing_spaces: false,
-            do_not_trim_spaces: false,
-            pending_input: false,
-            quiet: false,
-            start_is_absolute: true,
-            end_is_absolute: true,
-        }))?;
+        let response =
+            connection.roundtrip(&Request::CapturePane(Box::new(CapturePaneRequest {
+                target: target.clone(),
+                start: None,
+                end: None,
+                print: true,
+                buffer_name: None,
+                alternate: false,
+                escape_ansi: false,
+                escape_sequences: false,
+                join_wrapped: false,
+                use_mode_screen: false,
+                preserve_trailing_spaces: false,
+                do_not_trim_spaces: false,
+                pending_input: false,
+                quiet: false,
+                start_is_absolute: true,
+                end_is_absolute: true,
+            })))?;
         let captured = std::str::from_utf8(
             response
                 .command_output()

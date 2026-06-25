@@ -7,10 +7,12 @@ use rmux_proto::{
 use super::super::RequestHandler;
 use super::{
     encode_key_for_target, encode_mouse_for_target, encode_tokens_for_target,
-    expand_send_key_tokens, prepare_pane_input_write, prepare_synchronized_pane_input_writes,
-    resolve_input_target, write_bytes_to_targets, PaneInputWrite,
+    expand_send_key_tokens, pane_id_for_input_target, prepare_pane_input_write,
+    prepare_synchronized_pane_input_writes, resolve_input_target, write_bytes_to_targets,
+    PaneInputWrite,
 };
 use crate::keys::{parse_key_code, resolve_hex_key};
+use crate::limits::bounded_repeat_count;
 
 impl RequestHandler {
     pub(in crate::handler) async fn handle_send_keys(
@@ -18,6 +20,13 @@ impl RequestHandler {
         request: rmux_proto::SendKeysRequest,
     ) -> Response {
         let key_count = request.keys.len();
+        if key_count == 0 {
+            let state = self.state.lock().await;
+            if let Err(error) = pane_id_for_input_target(&state, &request.target) {
+                return Response::Error(ErrorResponse { error });
+            }
+            return Response::SendKeys(SendKeysResponse { key_count });
+        }
         let keys = if request.keys.is_empty() {
             request.keys
         } else {
@@ -33,16 +42,19 @@ impl RequestHandler {
             return Response::SendKeys(SendKeysResponse { key_count });
         }
         let prepared = {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             let resolved = match encode_tokens_for_target(&state, &request.target, &keys) {
                 Ok(resolved) => resolved,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
-            let writes =
-                match prepare_synchronized_pane_input_writes(&state, &request.target, &resolved) {
-                    Ok(writes) => writes,
-                    Err(error) => return Response::Error(ErrorResponse { error }),
-                };
+            let writes = match prepare_synchronized_pane_input_writes(
+                &mut state,
+                &request.target,
+                &resolved,
+            ) {
+                Ok(writes) => writes,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
             (writes, resolved)
         };
         self.write_pane_input_and_mark_interactive(prepared.0, prepared.1, key_count)
@@ -143,7 +155,7 @@ impl RequestHandler {
                 },
             };
             let effective_requester_pid = target_attach_pid.unwrap_or(requester_pid);
-            let repeat_count = request.repeat_count.unwrap_or(1).max(1);
+            let repeat_count = bounded_repeat_count(request.repeat_count);
             for token in &tokens {
                 let key = if request.hex {
                     resolve_hex_key(token).map(u64::from)
@@ -201,12 +213,12 @@ impl RequestHandler {
             let Some(mouse_event) = mouse_event else {
                 return Response::SendKeys(SendKeysResponse { key_count: 0 });
             };
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             let bytes = match encode_mouse_for_target(&state, &target, &mouse_event) {
                 Ok(bytes) => bytes,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
-            let write = match prepare_pane_input_write(&state, &target, &bytes) {
+            let write = match prepare_pane_input_write(&mut state, &target, &bytes) {
                 Ok(write) => write,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
@@ -237,9 +249,12 @@ impl RequestHandler {
                 key_count: request.keys.len(),
             });
         }
+        if request.keys.is_empty() && !request.reset_terminal {
+            return Response::SendKeys(SendKeysResponse { key_count: 0 });
+        }
 
         let prepared = {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             if request.reset_terminal {
                 if let Err(error) = state.reset_pane_terminal_state(&target) {
                     return Response::Error(ErrorResponse { error });
@@ -265,12 +280,13 @@ impl RequestHandler {
                     Err(error) => return Response::Error(ErrorResponse { error }),
                 }
             }
-            let repeat_count = request.repeat_count.unwrap_or(1).max(1);
+            let repeat_count = bounded_repeat_count(request.repeat_count);
             let repeated = bytes.repeat(repeat_count);
-            let writes = match prepare_synchronized_pane_input_writes(&state, &target, &repeated) {
-                Ok(writes) => writes,
-                Err(error) => return Response::Error(ErrorResponse { error }),
-            };
+            let writes =
+                match prepare_synchronized_pane_input_writes(&mut state, &target, &repeated) {
+                    Ok(writes) => writes,
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                };
             (writes, repeated)
         };
         self.write_pane_input_and_mark_interactive(prepared.0, prepared.1, request.keys.len())
@@ -322,7 +338,7 @@ impl RequestHandler {
         };
 
         let (writes, encoded, canonical_key) = {
-            let state = self.state.lock().await;
+            let mut state = self.state.lock().await;
             let option = if request.secondary {
                 OptionName::Prefix2
             } else {
@@ -351,7 +367,8 @@ impl RequestHandler {
                 }
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
-            let writes = match prepare_synchronized_pane_input_writes(&state, &target, &encoded) {
+            let writes = match prepare_synchronized_pane_input_writes(&mut state, &target, &encoded)
+            {
                 Ok(writes) => writes,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };

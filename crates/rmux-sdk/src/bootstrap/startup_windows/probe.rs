@@ -30,7 +30,7 @@ pub(super) async fn probe_responsive(
         })?
 }
 
-fn probe_blocking(
+pub(super) fn probe_blocking(
     endpoint: &LocalEndpoint,
     pipe_name: &Path,
 ) -> Result<Option<BlockingLocalStream>, StartupError> {
@@ -199,5 +199,36 @@ pub(super) async fn wait_for_daemon(
             });
         }
         sleep(deadline.sleep_for(effective_poll)).await;
+    }
+}
+
+pub(super) fn wait_for_daemon_blocking(
+    endpoint: &LocalEndpoint,
+    pipe_name: &Path,
+    deadline: StartupDeadline,
+    poll_interval: Duration,
+) -> Result<BlockingLocalStream, StartupError> {
+    const MIN_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+    let effective_poll = poll_interval.max(MIN_POLL_INTERVAL);
+
+    loop {
+        match probe_blocking(endpoint, pipe_name) {
+            Ok(Some(stream)) => return Ok(stream),
+            Ok(None) => {}
+            Err(StartupError::PipeBusy { .. }) => {
+                // Pipe instances can be momentarily exhausted while the
+                // daemon is binding; keep polling within the same deadline.
+            }
+            Err(error) => return Err(error),
+        }
+
+        if deadline.is_elapsed() {
+            return Err(StartupError::StartupTimeout {
+                pipe_name: pipe_name.to_path_buf(),
+                waited: deadline.elapsed(),
+            });
+        }
+        std::thread::sleep(deadline.sleep_for(effective_poll));
     }
 }

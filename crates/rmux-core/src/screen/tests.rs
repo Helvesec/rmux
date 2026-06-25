@@ -1,7 +1,7 @@
-use super::{Screen, MAX_TERMINAL_PASSTHROUGH_EVENTS};
+use super::{Screen, MAX_TERMINAL_PASSTHROUGH_EVENTS, TITLE_STACK_MAX};
 use crate::input::InputParser;
 use crate::terminal_passthrough::MAX_TERMINAL_PASSTHROUGH_PAYLOAD_BYTES;
-use crate::{GridRenderOptions, OptionStore, ScreenCaptureRange, Utf8Config};
+use crate::{GridRenderOptions, OptionStore, ScreenCaptureRange, Utf8Config, COLOUR_DEFAULT};
 use rmux_proto::{OptionName, ScopeSelector, SetOptionMode, TerminalSize};
 
 fn parse(screen: &mut Screen, bytes: &[u8]) {
@@ -11,6 +11,43 @@ fn parse(screen: &mut Screen, bytes: &[u8]) {
 
 fn new_screen(cols: u16, rows: u16, history: usize) -> Screen {
     Screen::new(TerminalSize { cols, rows }, history)
+}
+
+#[test]
+fn visit_visible_line_cells_returns_exact_padded_row() {
+    let mut screen = new_screen(4, 1, 10);
+    parse(&mut screen, b"ab");
+
+    let mut cells = Vec::new();
+    assert!(screen.visit_visible_line_cells(0, 4, |cell| {
+        cells.push((cell.text().to_owned(), cell.width(), cell.is_padding()));
+    }));
+
+    assert_eq!(
+        cells,
+        vec![
+            ("a".to_owned(), 1, false),
+            ("b".to_owned(), 1, false),
+            (" ".to_owned(), 1, false),
+            (" ".to_owned(), 1, false),
+        ],
+    );
+    assert!(!screen.visit_visible_line_cells(1, 4, |_| {}));
+}
+
+#[test]
+fn visit_visible_line_cells_preserves_wide_padding_metadata() {
+    let mut screen = new_screen(4, 1, 10);
+    parse(&mut screen, "表x".as_bytes());
+
+    let mut cells = Vec::new();
+    assert!(screen.visit_visible_line_cells(0, 4, |cell| {
+        cells.push((cell.text().to_owned(), cell.width(), cell.is_padding()));
+    }));
+
+    assert_eq!(cells[0], ("表".to_owned(), 2, false));
+    assert_eq!(cells[1], (" ".to_owned(), 0, true));
+    assert_eq!(cells[2], ("x".to_owned(), 1, false));
 }
 
 #[test]
@@ -141,6 +178,26 @@ fn terminal_passthrough_keeps_newest_events_when_queue_is_full() {
     );
 }
 
+#[test]
+fn title_stack_keeps_newest_entries_when_full() {
+    let mut screen = new_screen(10, 2, 10);
+
+    for index in 0..(TITLE_STACK_MAX + 5) {
+        screen.set_title(format!("title-{index}"));
+        <Screen as crate::input::ScreenWriter>::push_title(&mut screen);
+    }
+
+    assert_eq!(screen.title_stack.len(), TITLE_STACK_MAX);
+    assert_eq!(
+        screen.title_stack.first().map(String::as_str),
+        Some("title-5")
+    );
+    assert_eq!(
+        screen.title_stack.last().map(String::as_str),
+        Some("title-104")
+    );
+}
+
 fn utf8_config(codepoint_widths: &[&str], vs16_wide: bool) -> Utf8Config {
     let mut options = OptionStore::new();
     for entry in codepoint_widths {
@@ -238,6 +295,18 @@ fn width_resize_clears_wrapped_flags() {
 }
 
 #[test]
+fn width_resize_short_unwrapped_lines_keeps_line_count() {
+    let mut screen = new_screen(10, 2, 10);
+    parse(&mut screen, b"abc\r\ndef");
+    let history_size = screen.history_size();
+
+    screen.resize(TerminalSize { cols: 6, rows: 2 });
+
+    assert_eq!(screen.history_size(), history_size);
+    assert_eq!(screen.capture_grid(false).lines, vec!["abc", "def"]);
+}
+
+#[test]
 fn width_resize_reflows_wrapped_lines_instead_of_truncating() {
     let mut screen = new_screen(5, 16, 10);
     parse(&mut screen, b"PANE1-ABCDE");
@@ -250,6 +319,63 @@ fn width_resize_reflows_wrapped_lines_instead_of_truncating() {
     assert_eq!(
         &lines[..11],
         &["P", "A", "N", "E", "1", "-", "A", "B", "C", "D", "E"]
+    );
+}
+
+#[test]
+fn width_resize_reflows_plain_ascii_without_materializing_cells() {
+    let mut screen = new_screen(4, 3, 20);
+    parse(&mut screen, b"abcdefghijkl");
+
+    screen.resize(TerminalSize { cols: 3, rows: 4 });
+
+    let total_lines = screen.history_size() + usize::from(screen.size().rows);
+    let compact_lines = (0..total_lines)
+        .filter_map(|absolute_y| screen.grid().absolute_line(absolute_y))
+        .filter_map(|line| line.plain_text().map(|text| (line, text)))
+        .filter(|(_, text)| !text.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        compact_lines
+            .iter()
+            .map(|(_, text)| *text)
+            .collect::<Vec<_>>(),
+        vec!["abc", "def", "ghi", "jkl"]
+    );
+    for (line, _) in compact_lines {
+        assert_eq!(line.cells().len(), 0);
+    }
+}
+
+#[test]
+fn width_resize_mixed_style_wide_and_wrapped_text_preserves_transcript() {
+    let mut screen = new_screen(6, 4, 20);
+    parse(
+        &mut screen,
+        "\x1b[31mred\x1b[0m-表x-abcdef\r\nplain-wrap-line".as_bytes(),
+    );
+
+    screen.resize(TerminalSize { cols: 4, rows: 8 });
+    assert_no_wide_cell_fragments(&screen);
+    screen.resize(TerminalSize { cols: 10, rows: 8 });
+    assert_no_wide_cell_fragments(&screen);
+
+    let capture = screen.capture_transcript(
+        full_range(),
+        GridRenderOptions {
+            join_wrapped: true,
+            ..GridRenderOptions::default()
+        },
+    );
+    let rendered = String::from_utf8(capture).expect("capture must be UTF-8");
+
+    assert!(
+        rendered.contains("red-表x-abcdef"),
+        "styled wide logical line must survive resize reflow: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("plain-wrap-line"),
+        "plain wrapped logical line must survive resize reflow: {rendered:?}"
     );
 }
 
@@ -418,6 +544,30 @@ fn alternate_screen_restore_preserves_wrapped_rows() {
 }
 
 #[test]
+fn alternate_screen_restore_after_width_resize_preserves_history_and_main_view() {
+    let mut screen = new_screen(3, 2, 20);
+    parse(&mut screen, b"hist0\r\nhist1\r\nabcdef");
+    parse(&mut screen, b"\x1b[?1049h");
+    parse(&mut screen, b"ALT");
+    screen.resize(TerminalSize { cols: 5, rows: 2 });
+    let history_after_alt_resize = screen.history_size();
+
+    parse(&mut screen, b"\x1b[?1049l");
+
+    assert_eq!(screen.grid().size(), TerminalSize { cols: 5, rows: 2 });
+    assert_eq!(screen.history_size(), history_after_alt_resize);
+    let lines = screen.capture_grid(true).lines;
+    assert!(
+        lines.iter().any(|line| line.contains("abcdef")),
+        "restored main screen should survive width resize: {lines:?}"
+    );
+    assert!(
+        lines.iter().all(|line| !line.contains("ALT")),
+        "alternate-screen content must not leak after restore: {lines:?}"
+    );
+}
+
+#[test]
 fn insert_and_delete_line_ignore_rows_outside_scroll_region() {
     let mut screen = new_screen(4, 4, 10);
     parse(&mut screen, b"1\r\n2\r\n3\r\n4");
@@ -455,6 +605,32 @@ fn default_cell_style_overlay_preserves_application_backgrounds() {
     assert_eq!(line.cell(1).expect("default text").bg(), 0);
     assert_eq!(line.cell(2).expect("default blank").fg(), 2);
     assert_eq!(line.cell(2).expect("default blank").bg(), 0);
+}
+
+#[test]
+fn erase_display_does_not_tint_fully_cleared_rows_with_current_background() {
+    let mut screen = new_screen(6, 4, 10);
+    parse(&mut screen, b"\x1b[48;5;236mA\x1b[J");
+
+    let current = screen.grid().visible_line(0).expect("current row");
+    assert_ne!(
+        current.cell(1).expect("current row trailing cell").bg(),
+        COLOUR_DEFAULT,
+        "ED should preserve BCE on the current line"
+    );
+
+    for row in 1..4 {
+        let line = screen.grid().visible_line(row).expect("fully cleared row");
+        for col in 0..6 {
+            let cell = line.cell(col).expect("cleared cell");
+            assert_eq!(
+                cell.bg(),
+                COLOUR_DEFAULT,
+                "fully cleared row {row}, col {col} must keep the terminal background"
+            );
+            assert_eq!(cell.text(), " ", "row {row}, col {col} should be blank");
+        }
+    }
 }
 
 #[test]

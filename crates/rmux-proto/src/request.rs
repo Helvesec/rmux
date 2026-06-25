@@ -34,9 +34,10 @@ pub use pane::{
     MovePaneRequest, PaneBroadcastInputRequest, PaneInputRequest, PaneKillRequest,
     PaneOutputCursorRequest, PaneOutputSubscriptionStart, PaneResizeRequest, PaneRespawnRequest,
     PaneSelectRequest, PaneSnapshotRefRequest, PaneSnapshotRequest, PaneSplitSize, PipePaneRequest,
-    ResizePaneRequest, RespawnPaneRequest, SelectPaneAdjacentRequest, SelectPaneDirection,
-    SelectPaneMarkRequest, SelectPaneRequest, SendKeysExt2Request, SendKeysExtRequest,
-    SendKeysRequest, SplitWindowExtRequest, SplitWindowRequest, SplitWindowTarget,
+    ResizePaneRequest, ResizePaneTargetActionRequest, RespawnPaneRequest,
+    SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneMarkRequest, SelectPaneRequest,
+    SendKeysExt2Request, SendKeysExtRequest, SendKeysRequest, SplitWindowExtRequest,
+    SplitWindowRequest, SplitWindowTarget, SplitWindowTargetActionRequest,
     SubscribePaneOutputRefRequest, SubscribePaneOutputRequest, SwapPaneDirection, SwapPaneRequest,
     UnsubscribePaneOutputRequest,
 };
@@ -95,8 +96,9 @@ pub use options::{
 #[path = "request/buffer.rs"]
 mod buffer;
 pub use buffer::{
-    CapturePaneRequest, ClearHistoryRequest, DeleteBufferRequest, ListBuffersRequest,
-    LoadBufferRequest, PasteBufferRequest, SaveBufferRequest, SetBufferRequest, ShowBufferRequest,
+    CapturePaneRequest, CapturePaneTargetActionRequest, ClearHistoryRequest, DeleteBufferRequest,
+    ListBuffersRequest, LoadBufferRequest, PasteBufferRequest, SaveBufferRequest, SetBufferRequest,
+    ShowBufferRequest,
 };
 
 #[path = "request/web.rs"]
@@ -118,7 +120,7 @@ pub enum Request {
     /// `kill-session`
     KillSession(KillSessionRequest),
     /// `new-window`
-    NewWindow(NewWindowRequest),
+    NewWindow(Box<NewWindowRequest>),
     /// `kill-window`
     KillWindow(KillWindowRequest),
     /// `select-window`
@@ -148,7 +150,7 @@ pub enum Request {
     /// `join-pane`
     JoinPane(JoinPaneRequest),
     /// `break-pane`
-    BreakPane(BreakPaneRequest),
+    BreakPane(Box<BreakPaneRequest>),
     /// `kill-pane`
     KillPane(KillPaneRequest),
     /// `select-layout`
@@ -158,7 +160,7 @@ pub enum Request {
     /// `display-panes`
     DisplayPanes(DisplayPanesRequest),
     /// `select-pane`
-    SelectPane(SelectPaneRequest),
+    SelectPane(Box<SelectPaneRequest>),
     /// `select-pane -U/-D/-L/-R`
     SelectPaneAdjacent(SelectPaneAdjacentRequest),
     /// `send-keys`
@@ -172,7 +174,7 @@ pub enum Request {
     /// `set-option`
     SetOption(SetOptionRequest),
     /// `set-environment`
-    SetEnvironment(SetEnvironmentRequest),
+    SetEnvironment(Box<SetEnvironmentRequest>),
     /// `set-hook`
     SetHook(SetHookRequest),
     /// `next-layout`
@@ -188,7 +190,7 @@ pub enum Request {
     /// `show-buffer`
     ShowBuffer(ShowBufferRequest),
     /// `paste-buffer`
-    PasteBuffer(PasteBufferRequest),
+    PasteBuffer(Box<PasteBufferRequest>),
     /// `list-buffers`
     ListBuffers(ListBuffersRequest),
     /// `delete-buffer`
@@ -198,13 +200,13 @@ pub enum Request {
     /// `save-buffer`
     SaveBuffer(SaveBufferRequest),
     /// `capture-pane`
-    CapturePane(CapturePaneRequest),
+    CapturePane(Box<CapturePaneRequest>),
     /// `display-message`
     DisplayMessage(DisplayMessageRequest),
     /// `run-shell`
-    RunShell(RunShellRequest),
+    RunShell(Box<RunShellRequest>),
     /// `if-shell`
-    IfShell(IfShellRequest),
+    IfShell(Box<IfShellRequest>),
     /// `wait-for`
     WaitFor(WaitForRequest),
     /// `rename-session`
@@ -214,9 +216,9 @@ pub enum Request {
     /// `list-panes`
     ListPanes(ListPanesRequest),
     /// `source-file`
-    SourceFile(SourceFileRequest),
+    SourceFile(Box<SourceFileRequest>),
     /// `set-option` using an open string-based option name.
-    SetOptionByName(SetOptionByNameRequest),
+    SetOptionByName(Box<SetOptionByNameRequest>),
     /// Extended `set-hook` mutation semantics.
     SetHookMutation(SetHookMutationRequest),
     /// `show-hooks`
@@ -226,11 +228,11 @@ pub enum Request {
     /// Extended `switch-client` semantics including `-T key-table`.
     SwitchClientExt(SwitchClientExtRequest),
     /// `bind-key`
-    BindKey(BindKeyRequest),
+    BindKey(Box<BindKeyRequest>),
     /// `unbind-key`
     UnbindKey(UnbindKeyRequest),
     /// `list-keys`
-    ListKeys(ListKeysRequest),
+    ListKeys(Box<ListKeysRequest>),
     /// `send-prefix`
     SendPrefix(SendPrefixRequest),
     /// `clear-history`
@@ -244,11 +246,11 @@ pub enum Request {
     /// `show-messages`
     ShowMessages(ShowMessagesRequest),
     /// Extended `new-session` semantics including grouped sessions and attach-if-exists.
-    NewSessionExt(NewSessionExtRequest),
+    NewSessionExt(Box<NewSessionExtRequest>),
     /// Extended `attach-session` semantics including client flags and detach-others.
     AttachSessionExt(AttachSessionExtRequest),
     /// Extended `switch-client` semantics including `-l`, `-n`, `-p`, and readonly toggles.
-    SwitchClientExt2(SwitchClientExt2Request),
+    SwitchClientExt2(Box<SwitchClientExt2Request>),
     /// `select-layout` with a tmux custom layout string.
     SelectCustomLayout(SelectCustomLayoutRequest),
     /// `select-layout -o`
@@ -266,27 +268,27 @@ pub enum Request {
     /// `server-access`
     ServerAccess(ServerAccessRequest),
     /// `refresh-client`
-    RefreshClient(RefreshClientRequest),
+    RefreshClient(Box<RefreshClientRequest>),
     /// `list-clients`
-    ListClients(ListClientsRequest),
+    ListClients(Box<ListClientsRequest>),
     /// `suspend-client`
     SuspendClient(SuspendClientRequest),
     /// Extended `detach-client` semantics including `-a`, `-s`, `-P`, and `-E`.
     DetachClientExt(DetachClientExtRequest),
     /// Further-extended `attach-session` semantics including `-c working-directory`.
-    AttachSessionExt2(AttachSessionExt2Request),
+    AttachSessionExt2(Box<AttachSessionExt2Request>),
     /// Further-extended `switch-client` semantics including `-c target-client` and `-Z`.
-    SwitchClientExt3(SwitchClientExt3Request),
+    SwitchClientExt3(Box<SwitchClientExt3Request>),
     /// `resize-window`
     ResizeWindow(ResizeWindowRequest),
     /// `respawn-window`
-    RespawnWindow(RespawnWindowRequest),
+    RespawnWindow(Box<RespawnWindowRequest>),
     /// `move-pane`
     MovePane(MovePaneRequest),
     /// `pipe-pane`
     PipePane(PipePaneRequest),
     /// `respawn-pane`
-    RespawnPane(RespawnPaneRequest),
+    RespawnPane(Box<RespawnPaneRequest>),
     /// `link-window`
     LinkWindow(LinkWindowRequest),
     /// `unlink-window`
@@ -296,7 +298,7 @@ pub enum Request {
     /// Internal detached target resolution for tmux-style raw target text.
     ResolveTarget(ResolveTargetRequest),
     /// Extended `split-window` semantics including an explicit shell command.
-    SplitWindowExt(SplitWindowExtRequest),
+    SplitWindowExt(Box<SplitWindowExtRequest>),
     /// Internal SDK/daemon version and capability negotiation.
     Handshake(HandshakeRequest),
     /// Internal daemon-backed structured pane snapshot endpoint.
@@ -318,7 +320,7 @@ pub enum Request {
     /// SDK pane kill endpoint with stable pane-id targeting.
     PaneKill(PaneKillRequest),
     /// SDK pane respawn endpoint with stable pane-id targeting.
-    PaneRespawn(PaneRespawnRequest),
+    PaneRespawn(Box<PaneRespawnRequest>),
     /// SDK pane snapshot endpoint with stable pane-id targeting.
     PaneSnapshotRef(PaneSnapshotRefRequest),
     /// SDK pane select/title endpoint with stable pane-id targeting.
@@ -340,13 +342,19 @@ pub enum Request {
     /// Internal idle-only shutdown endpoint used by seamless upgrades.
     ShutdownIfIdle(ShutdownIfIdleRequest),
     /// Browser-visible pane sharing command family.
-    WebShare(WebShareRequest),
+    WebShare(Box<WebShareRequest>),
     /// `display-message` extension with target-client context.
-    DisplayMessageExt(DisplayMessageExtRequest),
+    DisplayMessageExt(Box<DisplayMessageExtRequest>),
     /// `send-keys` extension with target-client context.
-    SendKeysExt2(SendKeysExt2Request),
+    SendKeysExt2(Box<SendKeysExt2Request>),
     /// Attach-session extension with attach-stream client capabilities.
-    AttachSessionExt3(AttachSessionExt3Request),
+    AttachSessionExt3(Box<AttachSessionExt3Request>),
+    /// `split-window` with raw target text resolved server-side.
+    SplitWindowTargetAction(Box<SplitWindowTargetActionRequest>),
+    /// `resize-pane` with raw target text resolved server-side.
+    ResizePaneTargetAction(ResizePaneTargetActionRequest),
+    /// `capture-pane` with raw target text resolved server-side.
+    CapturePaneTargetAction(Box<CapturePaneTargetActionRequest>),
 }
 
 impl Request {
@@ -369,7 +377,9 @@ impl Request {
             Self::MoveWindow(_) => "move-window",
             Self::SwapWindow(_) => "swap-window",
             Self::RotateWindow(_) => "rotate-window",
-            Self::SplitWindow(_) | Self::SplitWindowExt(_) => "split-window",
+            Self::SplitWindow(_) | Self::SplitWindowExt(_) | Self::SplitWindowTargetAction(_) => {
+                "split-window"
+            }
             Self::SwapPane(_) => "swap-pane",
             Self::LastPane(_) => "last-pane",
             Self::JoinPane(_) => "join-pane",
@@ -399,7 +409,7 @@ impl Request {
             Self::DeleteBuffer(_) => "delete-buffer",
             Self::LoadBuffer(_) => "load-buffer",
             Self::SaveBuffer(_) => "save-buffer",
-            Self::CapturePane(_) => "capture-pane",
+            Self::CapturePane(_) | Self::CapturePaneTargetAction(_) => "capture-pane",
             Self::PaneSnapshot(_) => "pane-snapshot",
             Self::SubscribePaneOutput(_) | Self::SubscribePaneOutputRef(_) => {
                 "subscribe-pane-output"
@@ -413,7 +423,7 @@ impl Request {
             Self::CreateSessionLease(_) => "create-session-lease",
             Self::RenewSessionLease(_) => "renew-session-lease",
             Self::ReleaseSessionLease(_) => "release-session-lease",
-            Self::PaneResize(_) => "resize-pane",
+            Self::PaneResize(_) | Self::ResizePaneTargetAction(_) => "resize-pane",
             Self::PaneKill(_) => "kill-pane",
             Self::PaneRespawn(_) => "respawn-pane",
             Self::PaneSnapshotRef(_) => "pane-snapshot",
@@ -668,8 +678,10 @@ mod tests {
     use super::*;
     use crate::{
         OptionScopeSelector, PaneTarget, ScopeSelector, SelectPaneDirection, SetOptionMode,
-        SplitDirection,
+        SplitDirection, WebShareScope,
     };
+    use serde::Serialize;
+    use std::mem::size_of;
 
     fn alpha() -> SessionName {
         SessionName::new("alpha").expect("valid session")
@@ -682,7 +694,7 @@ mod tests {
     #[test]
     fn request_command_names_cover_extended_aliases_and_internal_tags() {
         assert_eq!(
-            Request::NewSessionExt(NewSessionExtRequest {
+            Request::NewSessionExt(Box::new(NewSessionExtRequest {
                 session_name: None,
                 working_directory: None,
                 detached: true,
@@ -700,12 +712,12 @@ mod tests {
                 process_command: None,
                 client_environment: None,
                 skip_environment_update: false,
-            })
+            }))
             .command_name(),
             "new-session"
         );
         assert_eq!(
-            Request::SplitWindowExt(SplitWindowExtRequest {
+            Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
                 target: SplitWindowTarget::Pane(pane()),
                 direction: SplitDirection::Vertical,
                 before: false,
@@ -719,7 +731,7 @@ mod tests {
                 preserve_zoom: false,
                 full_size: false,
                 stdin_payload: None,
-            })
+            }))
             .command_name(),
             "split-window"
         );
@@ -742,7 +754,7 @@ mod tests {
             "select-pane"
         );
         assert_eq!(
-            Request::SetOptionByName(SetOptionByNameRequest {
+            Request::SetOptionByName(Box::new(SetOptionByNameRequest {
                 scope: OptionScopeSelector::ServerGlobal,
                 name: "status".to_owned(),
                 value: Some("on".to_owned()),
@@ -752,7 +764,7 @@ mod tests {
                 unset_pane_overrides: false,
                 format: false,
                 format_target: None,
-            })
+            }))
             .command_name(),
             "set-option"
         );
@@ -771,7 +783,7 @@ mod tests {
             "set-hook"
         );
         assert_eq!(
-            Request::AttachSessionExt2(AttachSessionExt2Request {
+            Request::AttachSessionExt2(Box::new(AttachSessionExt2Request {
                 target: Some(alpha()),
                 target_spec: None,
                 detach_other_clients: false,
@@ -782,12 +794,12 @@ mod tests {
                 working_directory: None,
                 client_terminal: crate::ClientTerminalContext::default(),
                 client_size: None,
-            })
+            }))
             .command_name(),
             "attach-session"
         );
         assert_eq!(
-            Request::AttachSessionExt3(AttachSessionExt3Request::from_ext2(
+            Request::AttachSessionExt3(Box::new(AttachSessionExt3Request::from_ext2(
                 AttachSessionExt2Request {
                     target: Some(alpha()),
                     target_spec: None,
@@ -801,12 +813,12 @@ mod tests {
                     client_size: None,
                 },
                 vec![crate::CAPABILITY_ATTACH_RENDER.to_owned()],
-            ))
+            )))
             .command_name(),
             "attach-session"
         );
         assert_eq!(
-            Request::SwitchClientExt3(SwitchClientExt3Request {
+            Request::SwitchClientExt3(Box::new(SwitchClientExt3Request {
                 target_client: None,
                 target: Some("alpha:0.0".to_owned()),
                 key_table: None,
@@ -817,7 +829,7 @@ mod tests {
                 sort_order: None,
                 skip_environment_update: false,
                 zoom: false,
-            })
+            }))
             .command_name(),
             "switch-client"
         );
@@ -861,6 +873,191 @@ mod tests {
             })
             .command_name(),
             "wait-for"
+        );
+    }
+
+    #[test]
+    fn pr6g_request_boxing_keeps_request_size_bounded() {
+        let request_size = size_of::<Request>();
+        let box_size = size_of::<Box<NewSessionExtRequest>>();
+
+        eprintln!("PR6G size baseline: Request={request_size} Box<T>={box_size}");
+        eprintln!(
+            "PR6G candidate sizes: NewSessionExt={} NewWindow={} SetOptionByName={} \
+             AttachSessionExt3={} SwitchClientExt3={} SendKeysExt2={} SourceFile={} WebShare={}",
+            size_of::<NewSessionExtRequest>(),
+            size_of::<NewWindowRequest>(),
+            size_of::<SetOptionByNameRequest>(),
+            size_of::<AttachSessionExt3Request>(),
+            size_of::<SwitchClientExt3Request>(),
+            size_of::<SendKeysExt2Request>(),
+            size_of::<SourceFileRequest>(),
+            size_of::<WebShareRequest>(),
+        );
+        let mut remaining = [
+            ("AttachSessionExt2", size_of::<AttachSessionExt2Request>()),
+            ("BindKey", size_of::<BindKeyRequest>()),
+            ("BreakPane", size_of::<BreakPaneRequest>()),
+            ("CapturePane", size_of::<CapturePaneRequest>()),
+            ("ClearHistory", size_of::<ClearHistoryRequest>()),
+            ("ClockMode", size_of::<ClockModeRequest>()),
+            ("ControlMode", size_of::<ControlModeRequest>()),
+            ("CopyMode", size_of::<CopyModeRequest>()),
+            ("CreateSessionLease", size_of::<CreateSessionLeaseRequest>()),
+            ("DeleteBuffer", size_of::<DeleteBufferRequest>()),
+            ("DetachClientExt", size_of::<DetachClientExtRequest>()),
+            ("DisplayPanes", size_of::<DisplayPanesRequest>()),
+            ("DisplayMessage", size_of::<DisplayMessageRequest>()),
+            ("DisplayMessageExt", size_of::<DisplayMessageExtRequest>()),
+            ("Handshake", size_of::<HandshakeRequest>()),
+            ("IfShell", size_of::<IfShellRequest>()),
+            ("JoinPane", size_of::<JoinPaneRequest>()),
+            ("KillPane", size_of::<KillPaneRequest>()),
+            ("KillWindow", size_of::<KillWindowRequest>()),
+            ("LinkWindow", size_of::<LinkWindowRequest>()),
+            ("ListClients", size_of::<ListClientsRequest>()),
+            ("ListKeys", size_of::<ListKeysRequest>()),
+            ("ListPanes", size_of::<ListPanesRequest>()),
+            ("ListSessions", size_of::<ListSessionsRequest>()),
+            ("ListWindows", size_of::<ListWindowsRequest>()),
+            ("LoadBuffer", size_of::<LoadBufferRequest>()),
+            ("MovePane", size_of::<MovePaneRequest>()),
+            ("MoveWindow", size_of::<MoveWindowRequest>()),
+            ("NewSession", size_of::<NewSessionRequest>()),
+            ("PasteBuffer", size_of::<PasteBufferRequest>()),
+            ("PaneInput", size_of::<PaneInputRequest>()),
+            ("PaneKill", size_of::<PaneKillRequest>()),
+            ("PaneResize", size_of::<PaneResizeRequest>()),
+            ("PaneRespawn", size_of::<PaneRespawnRequest>()),
+            ("PaneSelect", size_of::<PaneSelectRequest>()),
+            ("PaneSnapshot", size_of::<PaneSnapshotRequest>()),
+            ("PaneSnapshotRef", size_of::<PaneSnapshotRefRequest>()),
+            ("PipePane", size_of::<PipePaneRequest>()),
+            ("RefreshClient", size_of::<RefreshClientRequest>()),
+            ("RespawnPane", size_of::<RespawnPaneRequest>()),
+            ("RespawnWindow", size_of::<RespawnWindowRequest>()),
+            ("ResizePane", size_of::<ResizePaneRequest>()),
+            ("ResizeWindow", size_of::<ResizeWindowRequest>()),
+            ("RotateWindow", size_of::<RotateWindowRequest>()),
+            ("RunShell", size_of::<RunShellRequest>()),
+            ("SaveBuffer", size_of::<SaveBufferRequest>()),
+            ("SelectCustomLayout", size_of::<SelectCustomLayoutRequest>()),
+            ("SelectLayout", size_of::<SelectLayoutRequest>()),
+            ("SelectPane", size_of::<SelectPaneRequest>()),
+            ("SelectPaneAdjacent", size_of::<SelectPaneAdjacentRequest>()),
+            ("SelectPaneMark", size_of::<SelectPaneMarkRequest>()),
+            ("SetEnvironment", size_of::<SetEnvironmentRequest>()),
+            ("SetBuffer", size_of::<SetBufferRequest>()),
+            ("SetHook", size_of::<SetHookRequest>()),
+            ("SetHookMutation", size_of::<SetHookMutationRequest>()),
+            ("SetOption", size_of::<SetOptionRequest>()),
+            ("ShowBuffer", size_of::<ShowBufferRequest>()),
+            ("ShowEnvironment", size_of::<ShowEnvironmentRequest>()),
+            ("ShowHooks", size_of::<ShowHooksRequest>()),
+            ("ShowMessages", size_of::<ShowMessagesRequest>()),
+            ("ShowOptions", size_of::<ShowOptionsRequest>()),
+            ("SplitWindow", size_of::<SplitWindowRequest>()),
+            ("SplitWindowExt", size_of::<SplitWindowExtRequest>()),
+            (
+                "SubscribePaneOutput",
+                size_of::<SubscribePaneOutputRequest>(),
+            ),
+            (
+                "SubscribePaneOutputRef",
+                size_of::<SubscribePaneOutputRefRequest>(),
+            ),
+            ("SwitchClientExt2", size_of::<SwitchClientExt2Request>()),
+        ];
+        remaining.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
+        eprintln!("PR6G largest remaining candidates: {remaining:?}");
+
+        assert!(
+            request_size <= 96,
+            "Request grew past the PR6G boxed payload budget: {request_size}"
+        );
+        assert_eq!(box_size, size_of::<usize>());
+    }
+
+    #[test]
+    fn pr6g_boxed_payloads_are_bincode_transparent_for_request_candidates() {
+        assert_box_serializes_like_value(NewSessionExtRequest {
+            session_name: Some(alpha()),
+            working_directory: Some("/tmp".to_owned()),
+            detached: true,
+            size: Some(crate::TerminalSize {
+                cols: 120,
+                rows: 40,
+            }),
+            environment: Some(vec!["A=B".to_owned()]),
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: Some(vec!["read-only".to_owned()]),
+            window_name: Some("main".to_owned()),
+            print_session_info: true,
+            print_format: Some("#{session_name}".to_owned()),
+            command: Some(vec!["sh".to_owned(), "-lc".to_owned(), "true".to_owned()]),
+            process_command: None,
+            client_environment: Some(vec!["PATH=/bin".to_owned()]),
+            skip_environment_update: false,
+        });
+        assert_box_serializes_like_value(SetOptionByNameRequest {
+            scope: OptionScopeSelector::ServerGlobal,
+            name: "@plugin".to_owned(),
+            value: Some("enabled".to_owned()),
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: false,
+            unset_pane_overrides: false,
+            format: true,
+            format_target: Some(crate::Target::Session(alpha())),
+        });
+        assert_box_serializes_like_value(AttachSessionExt3Request::from_ext2(
+            AttachSessionExt2Request {
+                target: Some(alpha()),
+                target_spec: Some("alpha:0.0".to_owned()),
+                detach_other_clients: false,
+                kill_other_clients: false,
+                read_only: true,
+                skip_environment_update: false,
+                flags: Some(vec!["active-pane".to_owned()]),
+                working_directory: Some("/tmp".to_owned()),
+                client_terminal: crate::ClientTerminalContext::default(),
+                client_size: Some(crate::TerminalSize { cols: 80, rows: 24 }),
+            },
+            vec![crate::CAPABILITY_ATTACH_RENDER.to_owned()],
+        ));
+        assert_box_serializes_like_value(WebShareRequest::Create(CreateWebShareRequest {
+            scope: WebShareScope::Session(alpha()),
+            public_base_url: Some("https://example.invalid".to_owned()),
+            tunnel_provider: None,
+            frontend_url: Some("https://share.example.invalid".to_owned()),
+            ttl_seconds: Some(60),
+            expires_at_unix: None,
+            max_spectators: Some(8),
+            max_operators: Some(1),
+            url_options: WebShareUrlOptions::default(),
+            require_pin: true,
+            operator_pin: Some("123456".to_owned()),
+            spectator_pin: Some("654321".to_owned()),
+            terminal_palette: None,
+            operator: true,
+            spectator: true,
+            controls: true,
+            kill_session_on_expire: false,
+        }));
+    }
+
+    fn assert_box_serializes_like_value<T>(value: T)
+    where
+        T: Clone + Serialize,
+    {
+        let boxed = Box::new(value.clone());
+        assert_eq!(
+            bincode::serialize(&value).expect("value encodes"),
+            bincode::serialize(&boxed).expect("boxed value encodes"),
+            "Box<T> must be transparent before PR6G boxes enum variants"
         );
     }
 }

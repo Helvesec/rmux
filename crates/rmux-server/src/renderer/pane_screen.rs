@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use rmux_core::style::{Style, StyleCell};
 use rmux_core::{
     text_width as tmux_text_width, GridRenderOptions, OptionStore, Pane, Screen,
@@ -13,6 +15,10 @@ pub(crate) fn render_pane_screen(
     pane: &Pane,
     screen: &Screen,
 ) -> Vec<u8> {
+    let _render_span = crate::perf_instrument::span("render_compose")
+        .with_str("site", "pane_screen")
+        .with_u64("pane_id", u64::from(pane.id().as_u32()))
+        .with_usize("history_size", screen.history_size());
     let geometry = StatusGeometry::for_session(session, options);
     let Some(pane_geometry) = visible_pane_geometry(session, options, pane, geometry.content_rows)
     else {
@@ -57,34 +63,49 @@ pub(crate) fn render_pane_screen(
             )
             .as_slice(),
         );
+        frame.extend_from_slice(b"\x1b[0m");
         frame.extend_from_slice(&line);
         if sparse_full_width_clear {
-            frame.extend_from_slice(b"\x1b[0m\x1b[K");
+            if !line.is_empty() {
+                frame.extend_from_slice(b"\x1b[0m");
+            }
+            frame.extend_from_slice(b"\x1b[K");
         }
     }
     frame.extend_from_slice(b"\x1b[0m\x1b[u");
     frame
 }
 
-pub(crate) fn styled_pane_screen(
+pub(crate) fn styled_pane_screen<'a>(
     session: &Session,
     options: &OptionStore,
     pane: &Pane,
-    screen: &Screen,
-) -> Screen {
+    screen: &'a Screen,
+) -> Cow<'a, Screen> {
+    let default_style = pane_default_style(session, options, pane);
+    let selection_style = screen
+        .has_selected_cells()
+        .then(|| {
+            options.resolve_for_pane(
+                session.name(),
+                session.active_window_index(),
+                pane.index(),
+                OptionName::CopyModeSelectionStyle,
+            )
+        })
+        .flatten();
+    if default_style.is_none() && selection_style.is_none() {
+        return Cow::Borrowed(screen);
+    }
+
     let mut styled_screen = screen.clone();
-    if let Some(style) = pane_default_style(session, options, pane) {
+    if let Some(style) = default_style {
         styled_screen.overlay_default_style(&style);
     }
-    if let Some(style) = options.resolve_for_pane(
-        session.name(),
-        session.active_window_index(),
-        pane.index(),
-        OptionName::CopyModeSelectionStyle,
-    ) {
+    if let Some(style) = selection_style {
         styled_screen.overlay_style_on_selected(style);
     }
-    styled_screen
+    Cow::Owned(styled_screen)
 }
 
 pub(crate) fn pane_default_style(

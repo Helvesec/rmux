@@ -54,7 +54,7 @@ async fn run_shell_expands_socket_path_without_target() {
     let command = write_text_command(&output_path, "#{socket_path}");
 
     let response = handler
-        .handle(Request::RunShell(RunShellRequest {
+        .handle(Request::RunShell(Box::new(RunShellRequest {
             command,
             background: false,
             as_commands: false,
@@ -63,7 +63,7 @@ async fn run_shell_expands_socket_path_without_target() {
             start_directory: None,
             target: None,
             source_depth: None,
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -118,7 +118,7 @@ async fn run_shell_rejects_invalid_delay_without_closing_connection() {
 
     for delay in [-1.0, f64::NAN, f64::INFINITY] {
         let response = handler
-            .handle(Request::RunShell(RunShellRequest {
+            .handle(Request::RunShell(Box::new(RunShellRequest {
                 command: shell_success_command(),
                 background: false,
                 as_commands: false,
@@ -127,7 +127,7 @@ async fn run_shell_rejects_invalid_delay_without_closing_connection() {
                 start_directory: None,
                 target: None,
                 source_depth: None,
-            }))
+            })))
             .await;
 
         assert!(
@@ -143,7 +143,7 @@ async fn run_shell_background_rejects_invalid_delay_before_reporting_success() {
 
     for delay in [-1.0, f64::NAN, f64::INFINITY] {
         let response = handler
-            .handle(Request::RunShell(RunShellRequest {
+            .handle(Request::RunShell(Box::new(RunShellRequest {
                 command: shell_success_command(),
                 background: true,
                 as_commands: false,
@@ -152,7 +152,7 @@ async fn run_shell_background_rejects_invalid_delay_before_reporting_success() {
                 start_directory: None,
                 target: None,
                 source_depth: None,
-            }))
+            })))
             .await;
 
         assert!(
@@ -274,7 +274,7 @@ fn parsed_new_session_accepts_tmux_shell_command_after_double_dash() {
 
     assert_eq!(
         parsed,
-        Request::NewSessionExt(NewSessionExtRequest {
+        Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: Some(session_name("alpha")),
             working_directory: None,
             detached: true,
@@ -292,7 +292,7 @@ fn parsed_new_session_accepts_tmux_shell_command_after_double_dash() {
             process_command: None,
             client_environment: None,
             skip_environment_update: false,
-        })
+        }))
     );
 }
 

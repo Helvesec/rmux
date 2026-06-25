@@ -9,6 +9,9 @@ case "$TARGET_DIR" in
 esac
 
 RMUX="$TARGET_DIR/debug/rmux"
+RMUX_BINARY="$RMUX"
+unset RMUX TMUX RMUX_PANE TMUX_PANE TERM_PROGRAM TERM_PROGRAM_VERSION
+RMUX="$RMUX_BINARY"
 SMOKE_DIR="${RMUX_SMOKE_DIR:-$ROOT/target/smoke-reports}"
 SIGN_OFF="${RMUX_SMOKE_SIGNOFF:-$(whoami)@$(hostname)}"
 

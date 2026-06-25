@@ -5,7 +5,10 @@ use rmux_core::formats::{
     is_truthy, DEFAULT_LIST_PANES_ALL_FORMAT, DEFAULT_LIST_PANES_SESSION_FORMAT,
     DEFAULT_LIST_PANES_WINDOW_FORMAT,
 };
-use rmux_proto::{CommandOutput, ResizePaneAdjustment, ResolveTargetType, RespawnPaneRequest};
+use rmux_proto::{
+    CommandOutput, ResizePaneAdjustment, ResizePaneTargetActionRequest, ResolveTargetType,
+    RespawnPaneRequest,
+};
 
 #[path = "pane_commands/split.rs"]
 mod split;
@@ -16,10 +19,11 @@ use super::json_output::{
     filter_delimited_json_output, list_panes_json_format, write_list_panes_json,
 };
 use super::{
-    expect_command_output, expect_command_success, list_session_names, resolve_current_pane_target,
-    resolve_pane_target_or_current, resolve_pane_target_spec, resolve_session_listing_target,
-    resolve_target_spec, resolve_window_target_or_current, run_command_resolved,
-    shell_command_text, write_lines_output, ExitFailure,
+    cli_target_actions_enabled, expect_command_output, expect_command_success, list_session_names,
+    resolve_current_pane_target, resolve_pane_target_or_current, resolve_pane_target_spec,
+    resolve_session_listing_target, resolve_target_spec, resolve_window_target_or_current,
+    run_command_resolved, shell_command_text, target_action_needs_legacy_retry, write_lines_output,
+    ExitFailure,
 };
 use crate::cli_args::{
     LastPaneArgs, ListPanesArgs, PipePaneArgs, ResizePaneArgs, RespawnPaneArgs, SelectPaneArgs,
@@ -347,50 +351,37 @@ pub(super) fn run_resize_pane(
     args: ResizePaneArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
+    if !cli_target_actions_enabled() || resize_pane_uses_percent(&args) {
+        return run_resize_pane_legacy(args, socket_path);
+    }
+
+    let legacy_args = args.clone();
+    let target = args.target.as_ref().map(|target| target.raw().to_owned());
+    let adjustment = resize_pane_adjustment(args, None);
+    let mut connection = connect(socket_path)
+        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    let response =
+        connection.resize_pane_target_action(ResizePaneTargetActionRequest { target, adjustment });
+    if target_action_needs_legacy_retry(&response) {
+        return run_resize_pane_legacy(legacy_args, socket_path);
+    }
+    response
+        .map_err(ExitFailure::from_client)
+        .and_then(|response| {
+            expect_command_success(response, "resize-pane")?;
+            Ok(0)
+        })
+}
+
+fn run_resize_pane_legacy(args: ResizePaneArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
     let target =
         resolve_pane_target_or_current(&mut connection, args.target.as_ref(), "resize-pane")?;
-    let adjustment = if args.trim_below {
-        ResizePaneAdjustment::TrimBelow
-    } else {
-        let window_size = if args
-            .columns
-            .is_some_and(|size| matches!(size, crate::cli_args::ResizePaneSize::Percent(_)))
-            || args
-                .rows
-                .is_some_and(|size| matches!(size, crate::cli_args::ResizePaneSize::Percent(_)))
-        {
-            Some(resize_pane_window_size(&mut connection, &target)?)
-        } else {
-            None
-        };
-        let columns = args
-            .columns
-            .and_then(|size| size.resolve(window_size.map_or(0, |(width, _)| width)));
-        let rows = args
-            .rows
-            .and_then(|size| size.resolve(window_size.map_or(0, |(_, height)| height)));
-        if let Some(cells) = args.down {
-            ResizePaneAdjustment::Down { cells }
-        } else if let Some(cells) = args.up {
-            ResizePaneAdjustment::Up { cells }
-        } else if let Some(cells) = args.left {
-            ResizePaneAdjustment::Left { cells }
-        } else if let Some(cells) = args.right {
-            ResizePaneAdjustment::Right { cells }
-        } else if let (Some(columns), Some(rows)) = (columns, rows) {
-            ResizePaneAdjustment::AbsoluteSize { columns, rows }
-        } else if let Some(columns) = columns {
-            ResizePaneAdjustment::AbsoluteWidth { columns }
-        } else if let Some(rows) = rows {
-            ResizePaneAdjustment::AbsoluteHeight { rows }
-        } else if args.zoom {
-            ResizePaneAdjustment::Zoom
-        } else {
-            ResizePaneAdjustment::NoOp
-        }
-    };
+    let window_size = resize_pane_uses_percent(&args)
+        .then(|| resize_pane_window_size(&mut connection, &target))
+        .transpose()?;
+    let adjustment = resize_pane_adjustment(args, window_size);
 
     connection
         .resize_pane(target, adjustment)
@@ -399,6 +390,48 @@ pub(super) fn run_resize_pane(
             expect_command_success(response, "resize-pane")?;
             Ok(0)
         })
+}
+
+fn resize_pane_uses_percent(args: &ResizePaneArgs) -> bool {
+    args.columns
+        .is_some_and(|size| matches!(size, crate::cli_args::ResizePaneSize::Percent(_)))
+        || args
+            .rows
+            .is_some_and(|size| matches!(size, crate::cli_args::ResizePaneSize::Percent(_)))
+}
+
+fn resize_pane_adjustment(
+    args: ResizePaneArgs,
+    window_size: Option<(u16, u16)>,
+) -> ResizePaneAdjustment {
+    if args.trim_below {
+        return ResizePaneAdjustment::TrimBelow;
+    }
+    let columns = args
+        .columns
+        .and_then(|size| size.resolve(window_size.map_or(0, |(width, _)| width)));
+    let rows = args
+        .rows
+        .and_then(|size| size.resolve(window_size.map_or(0, |(_, height)| height)));
+    if let Some(cells) = args.down {
+        ResizePaneAdjustment::Down { cells }
+    } else if let Some(cells) = args.up {
+        ResizePaneAdjustment::Up { cells }
+    } else if let Some(cells) = args.left {
+        ResizePaneAdjustment::Left { cells }
+    } else if let Some(cells) = args.right {
+        ResizePaneAdjustment::Right { cells }
+    } else if let (Some(columns), Some(rows)) = (columns, rows) {
+        ResizePaneAdjustment::AbsoluteSize { columns, rows }
+    } else if let Some(columns) = columns {
+        ResizePaneAdjustment::AbsoluteWidth { columns }
+    } else if let Some(rows) = rows {
+        ResizePaneAdjustment::AbsoluteHeight { rows }
+    } else if args.zoom {
+        ResizePaneAdjustment::Zoom
+    } else {
+        ResizePaneAdjustment::NoOp
+    }
 }
 
 fn resize_pane_window_size(

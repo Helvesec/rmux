@@ -443,13 +443,13 @@ async fn respawn_window_rejects_active_window_without_kill_flag() {
 
     // Window 0 has a running pane — respawn without -k should fail.
     let response = handler
-        .handle(Request::RespawnWindow(RespawnWindowRequest {
+        .handle(Request::RespawnWindow(Box::new(RespawnWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 0),
             kill: false,
             start_directory: None,
             environment: None,
             command: None,
-        }))
+        })))
         .await;
 
     assert!(
@@ -465,13 +465,13 @@ async fn respawn_window_succeeds_with_kill_flag() {
     create_session(&handler, "alpha").await;
 
     let response = handler
-        .handle(Request::RespawnWindow(RespawnWindowRequest {
+        .handle(Request::RespawnWindow(Box::new(RespawnWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 0),
             kill: true,
             start_directory: None,
             environment: None,
             command: None,
-        }))
+        })))
         .await;
 
     assert!(
@@ -498,7 +498,7 @@ async fn respawn_window_retains_surviving_pane_lifecycle_counters_and_redacts_en
     let respawn_command = crate::test_shell::stdin_discard_command();
 
     let created = handler
-        .handle(Request::NewSessionExt(NewSessionExtRequest {
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: Some(alpha.clone()),
             working_directory: None,
             detached: true,
@@ -519,7 +519,7 @@ async fn respawn_window_retains_surviving_pane_lifecycle_counters_and_redacts_en
             process_command: None,
             client_environment: None,
             skip_environment_update: false,
-        }))
+        })))
         .await;
     assert!(matches!(created, Response::NewSession(_)));
 
@@ -568,13 +568,13 @@ async fn respawn_window_retains_surviving_pane_lifecycle_counters_and_redacts_en
     };
 
     let response = handler
-        .handle(Request::RespawnWindow(RespawnWindowRequest {
+        .handle(Request::RespawnWindow(Box::new(RespawnWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 0),
             kill: true,
             start_directory: None,
             environment: Some(vec![respawn_secret.clone()]),
             command: Some(vec![respawn_command.clone()]),
-        }))
+        })))
         .await;
 
     assert!(
@@ -678,13 +678,13 @@ async fn respawn_window_selects_target_window_like_tmux() {
     ));
 
     let response = handler
-        .handle(Request::RespawnWindow(RespawnWindowRequest {
+        .handle(Request::RespawnWindow(Box::new(RespawnWindowRequest {
             target: WindowTarget::with_window(alpha.clone(), 0),
             kill: true,
             start_directory: None,
             environment: None,
             command: None,
-        }))
+        })))
         .await;
 
     assert!(

@@ -46,64 +46,11 @@ fn default_shell_window_name() -> String {
 
 #[cfg(windows)]
 fn default_shell_window_name() -> String {
-    if windows_command_path("pwsh.exe").is_some() {
-        return "pwsh.exe".to_owned();
-    }
-    if windows_powershell_path().is_some_and(|path| path.is_file()) {
-        return "powershell.exe".to_owned();
-    }
     std::env::var_os("COMSPEC")
         .and_then(|shell| Path::new(&shell).file_name().map(|name| name.to_owned()))
         .map(|name| name.to_string_lossy().trim_start_matches('-').to_owned())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "cmd.exe".to_owned())
-}
-
-#[cfg(windows)]
-fn windows_command_path(command: &str) -> Option<std::path::PathBuf> {
-    let path_value = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_value).find_map(|directory| {
-        let candidate = directory.join(command);
-        if candidate.is_file() && windows_shell_candidate_is_usable(&candidate) {
-            Some(candidate)
-        } else {
-            None
-        }
-    })
-}
-
-#[cfg(windows)]
-fn windows_shell_candidate_is_usable(path: &Path) -> bool {
-    !windows_shell_candidate_is_windowsapps_alias(path)
-}
-
-#[cfg(windows)]
-fn windows_shell_candidate_is_windowsapps_alias(path: &Path) -> bool {
-    let components = path
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>();
-    components.windows(2).any(|window| {
-        window[0].eq_ignore_ascii_case("Microsoft") && window[1].eq_ignore_ascii_case("WindowsApps")
-    })
-}
-
-#[cfg(windows)]
-fn windows_powershell_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("SystemRoot").map(|root| {
-        std::path::PathBuf::from(root)
-            .join("System32")
-            .join("WindowsPowerShell")
-            .join("v1.0")
-            .join("powershell.exe")
-    })
-}
-
-#[cfg(windows)]
-fn windows_powershell_command() -> std::path::PathBuf {
-    windows_command_path("pwsh.exe")
-        .or_else(|| windows_powershell_path().filter(|path| path.is_file()))
-        .unwrap_or_else(|| std::path::PathBuf::from("powershell.exe"))
 }
 
 fn default_shell_pane_status() -> String {
@@ -141,20 +88,25 @@ async fn create_attached_session(
     requester_pid: u32,
     session: &SessionName,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
-    #[cfg(unix)]
-    set_unix_test_shell(handler, session).await;
+    #[cfg(windows)]
+    create_quiet_session(handler, session).await;
+    #[cfg(not(windows))]
+    {
+        #[cfg(unix)]
+        set_unix_test_shell(handler, session).await;
 
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     handler
         .register_attach(requester_pid, session.clone(), control_tx)
@@ -367,7 +319,7 @@ async fn create_session_with_command(
     command: Vec<String>,
 ) {
     let response = handler
-        .handle(Request::NewSessionExt(NewSessionExtRequest {
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: Some(session.clone()),
             working_directory: None,
             detached: true,
@@ -385,7 +337,7 @@ async fn create_session_with_command(
             process_command: None,
             client_environment: None,
             skip_environment_update: false,
-        }))
+        })))
         .await;
     assert!(
         matches!(response, Response::NewSession(_)),
@@ -428,40 +380,32 @@ fn line_exiting_command(marker: &str) -> Vec<String> {
 
 #[cfg(windows)]
 fn line_exiting_command(marker: &str) -> Vec<String> {
-    let powershell = windows_powershell_command();
-    vec![
-        powershell.to_string_lossy().into_owned(),
-        "-NoProfile".to_owned(),
-        "-NonInteractive".to_owned(),
-        "-Command".to_owned(),
-        format!(
-            "[Console]::Out.WriteLine('{marker}'); \
-             [Console]::Out.Flush(); \
-             while ($true) {{ \
-                 $line=[Console]::In.ReadLine(); \
-                 if ($null -eq $line -or $line -eq 'RMUX_EXIT') {{ exit 0 }} \
-             }}"
-        ),
-    ]
+    windows_cmd_command(format!(
+        "echo {marker} & set \"line=\" & set /p \"line=\" & if /I \"!line!\"==\"RMUX_EXIT\" exit /b 0 & ping -n 120 127.0.0.1 >NUL"
+    ))
 }
 
 #[cfg(windows)]
 fn line_echo_command(marker: &str) -> Vec<String> {
-    let powershell = windows_powershell_command();
+    windows_cmd_command(format!(
+        "chcp 65001 >NUL & echo {marker} & set \"line=\" & set /p \"line=\" & echo ECHO:!line! & ping -n 60 127.0.0.1 >NUL"
+    ))
+}
+
+#[cfg(windows)]
+fn windows_cmd_command(command: String) -> Vec<String> {
+    let system_root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+    let cmd = std::path::PathBuf::from(system_root)
+        .join("System32")
+        .join("cmd.exe");
     vec![
-        powershell.to_string_lossy().into_owned(),
-        "-NoProfile".to_owned(),
-        "-NonInteractive".to_owned(),
-        "-Command".to_owned(),
-        format!(
-            "[Console]::InputEncoding = [Text.UTF8Encoding]::new($false); \
-             [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); \
-             [Console]::Out.WriteLine('{marker}'); \
-             [Console]::Out.Flush(); \
-             $line=[Console]::In.ReadLine(); \
-             if ($null -ne $line) {{ [Console]::Out.WriteLine('ECHO:' + $line) }}; \
-             Start-Sleep -Seconds 60"
-        ),
+        cmd.to_string_lossy().into_owned(),
+        "/d".to_owned(),
+        "/q".to_owned(),
+        "/v:on".to_owned(),
+        "/c".to_owned(),
+        command,
     ]
 }
 
@@ -649,7 +593,7 @@ async fn recv_overlay_frame(
 
 async fn capture_pane_print(handler: &RequestHandler, target: PaneTarget) -> String {
     let response = handler
-        .handle(Request::CapturePane(CapturePaneRequest {
+        .handle(Request::CapturePane(Box::new(CapturePaneRequest {
             target,
             start: None,
             end: None,
@@ -666,7 +610,7 @@ async fn capture_pane_print(handler: &RequestHandler, target: PaneTarget) -> Str
             quiet: false,
             start_is_absolute: false,
             end_is_absolute: false,
-        }))
+        })))
         .await;
     let Response::CapturePane(response) = response else {
         panic!("expected capture-pane response, got {response:?}");

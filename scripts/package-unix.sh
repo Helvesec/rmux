@@ -73,6 +73,20 @@ write_package_checksums() {
   ) > "$output"
 }
 
+strip_linux_tiny_binary() {
+  local binary_path
+  binary_path="$1"
+
+  [ "$configuration" = "release" ] || return 0
+  [ "${RMUX_PACKAGE_STRIP_TINY:-1}" = "1" ] || return 0
+  case "$target" in
+    *-unknown-linux-gnu) ;;
+    *) return 0 ;;
+  esac
+  command -v strip >/dev/null 2>&1 || return 0
+  strip -s "$binary_path" || die "failed to strip package binary: $binary_path"
+}
+
 workspace_version() {
   awk '
     /^\[workspace\.package\]$/ { in_workspace = 1; next }
@@ -185,26 +199,34 @@ if [ "$configuration" = "release" ]; then
   cargo_args+=(--release)
 fi
 
+target_dir="${CARGO_TARGET_DIR:-target}"
+binary="$target_dir/$target/$profile_dir/rmux"
+helper_binary="$target_dir/$target/$profile_dir/rmux-full"
+daemon_binary="$target_dir/$target/$profile_dir/rmux-daemon"
+completion_cache="${RMUX_COMPLETIONS_DIR:-$target_dir/$target/$profile_dir/completions}"
+
 if [ "$skip_build" -eq 0 ]; then
   cargo "${cargo_args[@]}" --package rmux --bin rmux
+  cp "$binary" "$helper_binary"
+  cargo "${cargo_args[@]}" --package rmux --features tiny-cli --bin rmux
   cargo "${cargo_args[@]}" --package rmux --bin rmux-daemon
 elif [ "$allow_stale_binary" -eq 0 ]; then
   die "--skip-build is local-only packaging; pass --allow-stale-binary to acknowledge that"
 fi
 
-target_dir="${CARGO_TARGET_DIR:-target}"
-binary="$target_dir/$target/$profile_dir/rmux"
-daemon_binary="$target_dir/$target/$profile_dir/rmux-daemon"
-completion_cache="${RMUX_COMPLETIONS_DIR:-$target_dir/$target/$profile_dir/completions}"
 [ -f "$binary" ] || die "expected binary was not found: $binary"
 [ -x "$binary" ] || die "expected binary is not executable: $binary"
+[ -f "$helper_binary" ] || die "expected private helper binary was not found: $helper_binary"
+[ -x "$helper_binary" ] || die "expected private helper binary is not executable: $helper_binary"
 [ -f "$daemon_binary" ] || die "expected daemon binary was not found: $daemon_binary"
 [ -x "$daemon_binary" ] || die "expected daemon binary is not executable: $daemon_binary"
 if [ "${RMUX_PACKAGE_CODESIGN_ADHOC:-0}" = "1" ]; then
   command -v codesign >/dev/null 2>&1 || die "RMUX_PACKAGE_CODESIGN_ADHOC=1 requires codesign"
   codesign --force --sign - "$binary"
+  codesign --force --sign - "$helper_binary"
   codesign --force --sign - "$daemon_binary"
   codesign --verify --verbose=2 "$binary"
+  codesign --verify --verbose=2 "$helper_binary"
   codesign --verify --verbose=2 "$daemon_binary"
 fi
 
@@ -224,11 +246,13 @@ trap cleanup_package_work EXIT
 
 case "$stage_dir" in "$dist_dir"/*) ;; *) die "stage path escapes output dir" ;; esac
 rm -rf "$stage_dir"
-mkdir -p "$stage_dir/bin" "$stage_dir/share/man/man1" "$stage_dir/share/rmux"
+mkdir -p "$stage_dir/bin" "$stage_dir/libexec/rmux" "$stage_dir/share/man/man1" "$stage_dir/share/rmux"
 
 cp "$binary" "$stage_dir/bin/rmux"
+cp "$helper_binary" "$stage_dir/libexec/rmux/rmux"
 cp "$daemon_binary" "$stage_dir/bin/rmux-daemon"
-cp rmux.1 "$stage_dir/share/man/man1/rmux.1"
+strip_linux_tiny_binary "$stage_dir/bin/rmux"
+cp docs/man/rmux.1 "$stage_dir/share/man/man1/rmux.1"
 completion_tmp="$(mktemp -d "${TMPDIR:-/tmp}/rmux-completions.XXXXXX")"
 if [ "$skip_build" -eq 0 ]; then
   cargo run --quiet --package xtask -- generate-completions --output-dir "$completion_tmp" >/dev/null
@@ -261,12 +285,18 @@ for license_file in LICENSE LICENSE.* LICENSE-*; do
 done
 [ "$license_copied" = true ] || die "license files are missing"
 
-binary_abs="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"
-daemon_binary_abs="$(cd "$(dirname "$daemon_binary")" && pwd)/$(basename "$daemon_binary")"
-binary_sha256="$(sha256_file "$binary")"
-daemon_binary_sha256="$(sha256_file "$daemon_binary")"
-binary_bytes="$(wc -c < "$binary" | tr -d ' ')"
-daemon_binary_bytes="$(wc -c < "$daemon_binary" | tr -d ' ')"
+packaged_binary="$stage_dir/bin/rmux"
+packaged_helper="$stage_dir/libexec/rmux/rmux"
+packaged_daemon="$stage_dir/bin/rmux-daemon"
+binary_abs="$(cd "$(dirname "$packaged_binary")" && pwd)/$(basename "$packaged_binary")"
+helper_binary_abs="$(cd "$(dirname "$packaged_helper")" && pwd)/$(basename "$packaged_helper")"
+daemon_binary_abs="$(cd "$(dirname "$packaged_daemon")" && pwd)/$(basename "$packaged_daemon")"
+binary_sha256="$(sha256_file "$packaged_binary")"
+helper_binary_sha256="$(sha256_file "$packaged_helper")"
+daemon_binary_sha256="$(sha256_file "$packaged_daemon")"
+binary_bytes="$(wc -c < "$packaged_binary" | tr -d ' ')"
+helper_binary_bytes="$(wc -c < "$packaged_helper" | tr -d ' ')"
+daemon_binary_bytes="$(wc -c < "$packaged_daemon" | tr -d ' ')"
 git_commit="$(git rev-parse HEAD)"
 git_dirty=false
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
@@ -285,6 +315,9 @@ cat > "$stage_dir/share/rmux/artifact-metadata.json" <<EOF
   "binary_path": "$(printf '%s' "$binary_abs" | json_escape)",
   "binary_sha256": "$binary_sha256",
   "binary_bytes": $binary_bytes,
+  "helper_binary_path": "$(printf '%s' "$helper_binary_abs" | json_escape)",
+  "helper_binary_sha256": "$helper_binary_sha256",
+  "helper_binary_bytes": $helper_binary_bytes,
   "daemon_binary_path": "$(printf '%s' "$daemon_binary_abs" | json_escape)",
   "daemon_binary_sha256": "$daemon_binary_sha256",
   "daemon_binary_bytes": $daemon_binary_bytes,
@@ -298,7 +331,7 @@ cat > "$stage_dir/share/rmux/artifact-metadata.json" <<EOF
   "package_name": "$package_name",
   "package_target": "$target",
   "package_target_label": "$platform_label",
-  "package_layout": "rmux-package-v1",
+  "package_layout": "rmux-package-v2",
   "archive_format": "tar.gz",
   "archive_reproducibility": "normalized-mtime-gzip-no-name",
   "skip_build": $([ "$skip_build" -eq 1 ] && printf true || printf false),
@@ -327,5 +360,6 @@ printf '%s  %s\n' "$archive_sha256" "$(basename "$archive_path")" > "$checksums_
 printf 'package=%s\n' "$archive_path"
 printf 'sha256=%s\n' "$archive_sha256"
 printf 'binary_sha256=%s\n' "$binary_sha256"
+printf 'helper_binary_sha256=%s\n' "$helper_binary_sha256"
 printf 'daemon_binary_sha256=%s\n' "$daemon_binary_sha256"
 printf 'release_artifact=%s\n' "$release_artifact"

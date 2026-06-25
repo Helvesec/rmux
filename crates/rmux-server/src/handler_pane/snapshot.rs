@@ -12,6 +12,12 @@ use rmux_proto::{
 use super::super::RequestHandler;
 use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::pane_terminals::HandlerState;
+use crate::pane_transcript::SharedPaneTranscript;
+
+pub(in crate::handler) struct PaneSnapshotInputs {
+    pane_id: PaneId,
+    transcript: SharedPaneTranscript,
+}
 
 /// Saturating cast for cursor coordinates emitted by `Screen::cursor_position`.
 ///
@@ -32,34 +38,49 @@ impl RequestHandler {
         &self,
         request: PaneSnapshotRequest,
     ) -> Response {
-        let state = self.state.lock().await;
-        self.handle_resolved_pane_snapshot(&state, &request.target)
+        let inputs = {
+            let state = self.state.lock().await;
+            let _lock_span = crate::perf_instrument::span("state_lock_hold")
+                .with_str("site", "pane_snapshot_resolve");
+            match self.resolve_pane_snapshot_inputs(&state, &request.target) {
+                Ok(inputs) => inputs,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            }
+        };
+        self.handle_pane_snapshot_inputs(inputs)
     }
 
-    pub(in crate::handler) fn handle_resolved_pane_snapshot(
+    pub(in crate::handler) fn resolve_pane_snapshot_inputs(
         &self,
         state: &HandlerState,
         target: &rmux_proto::PaneTarget,
-    ) -> Response {
-        let pane_id = match pane_id_for_target(
+    ) -> Result<PaneSnapshotInputs, RmuxError> {
+        let pane_id = pane_id_for_target(
             &state.sessions,
             target.session_name(),
             target.window_index(),
             target.pane_index(),
-        ) {
-            Ok(pane_id) => pane_id,
-            Err(error) => return Response::Error(ErrorResponse { error }),
-        };
-        let transcript = match state.transcript_handle(target) {
-            Ok(transcript) => transcript,
-            Err(error) => return Response::Error(ErrorResponse { error }),
-        };
+        )?;
+        let transcript = state.transcript_handle(target)?;
+        Ok(PaneSnapshotInputs {
+            pane_id,
+            transcript,
+        })
+    }
 
+    pub(in crate::handler) fn handle_pane_snapshot_inputs(
+        &self,
+        inputs: PaneSnapshotInputs,
+    ) -> Response {
+        let pane_id = inputs.pane_id;
+        let _snapshot_span = crate::perf_instrument::span("snapshot")
+            .with_u64("pane_id", u64::from(pane_id.as_u32()));
         let (cols, rows, cells, cursor, output_sequence, history_size, history_bytes) = {
-            let transcript = transcript
+            let transcript = inputs
+                .transcript
                 .lock()
                 .expect("pane transcript mutex must not be poisoned");
-            let screen = transcript.clone_screen();
+            let screen = transcript.screen();
             let size = screen.size();
             let cols = size.cols;
             let rows = size.rows;
@@ -75,7 +96,7 @@ impl RequestHandler {
             };
             let output_sequence = transcript.output_sequence();
 
-            let cells = match collect_cells(&screen, cols, rows, history_size) {
+            let cells = match collect_cells(screen, cols, rows, history_size) {
                 Ok(cells) => cells,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
@@ -191,7 +212,7 @@ fn collect_cells(
     screen: &rmux_core::Screen,
     cols: u16,
     rows: u16,
-    history_size: usize,
+    _history_size: usize,
 ) -> Result<Vec<PaneSnapshotCell>, RmuxError> {
     let cols_usize = usize::from(cols);
     let rows_usize = usize::from(rows);
@@ -202,35 +223,26 @@ fn collect_cells(
     }
 
     for row in 0..rows_usize {
-        let line = screen.absolute_line_view(history_size + row);
-        let mut row_cells = match line {
-            Some(line) => line
-                .cells()
-                .iter()
-                .take(cols_usize)
-                .map(|cell| PaneSnapshotCell {
-                    text: cell.text().to_owned(),
-                    width: cell.width(),
-                    padding: cell.is_padding(),
-                    attributes: cell.attr(),
-                    fg: cell.fg(),
-                    bg: cell.bg(),
-                    us: cell.us(),
-                    link: cell.link(),
-                })
-                .collect::<Vec<_>>(),
-            None => Vec::new(),
-        };
-        // The screen library normally clips at `cols`, but a misconfigured or
-        // future grid backend could hand us a row that does not. Truncate so
-        // the on-the-wire row length is invariant: exactly `cols` cells.
-        if row_cells.len() > cols_usize {
-            row_cells.truncate(cols_usize);
+        let before = cells.len();
+        let found = screen.visit_visible_line_cells(row, cols_usize, |cell| {
+            cells.push(PaneSnapshotCell {
+                text: cell.text().to_owned(),
+                width: cell.width(),
+                padding: cell.is_padding(),
+                attributes: cell.attr(),
+                fg: cell.fg(),
+                bg: cell.bg(),
+                us: cell.us(),
+                link: cell.link(),
+            });
+        });
+        if !found {
+            cells.extend((0..cols_usize).map(|_| blank_cell()));
+            continue;
         }
-        while row_cells.len() < cols_usize {
-            row_cells.push(blank_cell());
+        while cells.len() - before < cols_usize {
+            cells.push(blank_cell());
         }
-        cells.extend(row_cells);
     }
 
     Ok(cells)

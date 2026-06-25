@@ -187,7 +187,7 @@ async fn spawn_single_argv_binary_is_direct_and_shell_is_explicit() -> TestResul
     let executable = write_executable_script(
         harness._root.path(),
         "single argv binary",
-        "#!/bin/sh\nprintf 'sdk_direct_single_argv\\n'\n",
+        "#!/bin/sh\nprintf 'sdk_direct_single_argv\\n'\nsleep 1\n",
     )?;
 
     pane.spawn([executable.to_string_lossy().into_owned()])

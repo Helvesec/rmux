@@ -67,6 +67,19 @@ fn startup_mutex_name_rejects_oversized_label() {
 }
 
 #[test]
+fn blocking_startup_reuses_pipe_validation() {
+    let error = connect_or_start_blocking_with(
+        Path::new("/tmp/not-a-pipe"),
+        || panic!("invalid pipes must not launch"),
+        DEFAULT_STARTUP_DEADLINE,
+        STARTUP_POLL_INTERVAL,
+    )
+    .expect_err("invalid pipe should fail before launching");
+
+    assert!(matches!(error, StartupError::InvalidPipeName { .. }));
+}
+
+#[test]
 fn startup_mutex_holder_release_is_idempotent() {
     // The holder must tolerate `release()` running before `Drop` (and vice
     // versa) without panicking on the second call; the bootstrap fast-path

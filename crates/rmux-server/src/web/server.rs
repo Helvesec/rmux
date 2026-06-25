@@ -25,6 +25,7 @@ use pre_auth::{PreAuthGuard, PreAuthQueue};
 use streams::{serve_pane_loop, serve_session_loop};
 
 const PRE_AUTH_SLOTS: usize = 64;
+const PRE_AUTH_SLOTS_PER_IP: usize = 4;
 const PRE_READY_TIMEOUT: Duration = Duration::from_secs(8);
 const WEB_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const FD_EXHAUSTION_ACCEPT_BACKOFF: Duration = Duration::from_millis(250);
@@ -48,10 +49,28 @@ struct PreReadyWebShare {
 }
 
 pub(crate) async fn spawn(handler: Arc<RequestHandler>) -> io::Result<()> {
-    let listener_config = handler.web_listener();
-    let bind_addr = format!("{}:{}", listener_config.host, listener_config.port);
-    let listener = match TcpListener::bind(&bind_addr).await {
-        Ok(listener) => listener,
+    let settings = handler.web_settings();
+    let bind_addr = format!("{}:{}", settings.host, settings.port);
+    let (listener, bind_addr) = match TcpListener::bind(&bind_addr).await {
+        Ok(listener) => (listener, bind_addr),
+        Err(error)
+            if settings.allows_automatic_port_fallback()
+                && error.kind() == io::ErrorKind::AddrInUse =>
+        {
+            let fallback_addr = format!("{}:0", settings.host);
+            let listener = match TcpListener::bind(&fallback_addr).await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    handler.mark_web_listener_unavailable(error.to_string());
+                    warn!("web-share listener unavailable: {error}");
+                    return Err(error);
+                }
+            };
+            let actual_port = listener.local_addr()?.port();
+            handler.update_web_listener_port(actual_port);
+            let bind_addr = format!("{}:{}", settings.host, actual_port);
+            (listener, bind_addr)
+        }
         Err(error) => {
             handler.mark_web_listener_unavailable(error.to_string());
             warn!("web-share listener unavailable: {error}");
@@ -74,10 +93,10 @@ async fn serve(
     listener: TcpListener,
     bind_addr: String,
 ) -> io::Result<()> {
-    let pre_auth = PreAuthQueue::new(PRE_AUTH_SLOTS);
+    let pre_auth = PreAuthQueue::with_per_ip_capacity(PRE_AUTH_SLOTS, PRE_AUTH_SLOTS_PER_IP);
     debug!("web-share listener bound to {bind_addr}");
     loop {
-        let (stream, _) = match listener.accept().await {
+        let (stream, peer_addr) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(error) if is_fd_exhaustion(&error) => {
                 warn!(
@@ -94,8 +113,14 @@ async fn serve(
             }
             Err(error) => return Err(error),
         };
-        let Some(pre_auth_guard) = pre_auth.try_register() else {
-            debug!("web-share pre-auth capacity reached; closing pending connection");
+        if let Err(error) = stream.set_nodelay(true) {
+            warn!(%peer_addr, ?error, "failed to enable TCP_NODELAY for web-share client");
+        }
+        let Some(pre_auth_guard) = pre_auth.try_register_peer(peer_addr.ip()) else {
+            debug!(
+                %peer_addr,
+                "web-share pre-auth capacity reached; closing pending connection"
+            );
             continue;
         };
         let handler = Arc::clone(&handler);

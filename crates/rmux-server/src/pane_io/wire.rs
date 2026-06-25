@@ -249,7 +249,19 @@ pub(super) async fn read_from_pane(
         // Read once before awaiting readiness. A pane can emit its initial
         // prompt/output before the async task reaches readable().await; this
         // preserves AsyncFd while avoiding dependence on a later readiness edge.
-        match try_read_pane_now(pane_reader.get_ref(), buffer)? {
+        let startup_read = try_read_pane_now(pane_reader.get_ref(), buffer)?;
+        pane_reader.get_ref().release_startup_slave_guard();
+        match startup_read {
+            PaneRead::Bytes(0) if !readiness.output_established() => {
+                match readiness.retry_startup_eio() {
+                    StartupEioReadiness::Retry(delay) => {
+                        delay_startup_eio_retry(delay).await;
+                        continue;
+                    }
+                    StartupEioReadiness::StartupRetriesExhausted
+                    | StartupEioReadiness::EstablishedEof => return Ok(0),
+                }
+            }
             PaneRead::Bytes(bytes_read) => {
                 readiness.record_immediate_bytes(bytes_read);
                 return Ok(bytes_read);
@@ -268,6 +280,14 @@ pub(super) async fn read_from_pane(
 
         let mut ready = pane_reader.readable().await?;
         match ready.try_io(|inner| inner.get_ref().read(&mut *buffer)) {
+            Ok(Ok(0)) if !readiness.output_established() => match readiness.retry_startup_eio() {
+                StartupEioReadiness::Retry(delay) => {
+                    delay_startup_eio_retry(delay).await;
+                    continue;
+                }
+                StartupEioReadiness::StartupRetriesExhausted
+                | StartupEioReadiness::EstablishedEof => return Ok(0),
+            },
             Ok(Ok(bytes_read)) => {
                 readiness.record_ready_bytes(bytes_read);
                 return Ok(bytes_read);
@@ -428,12 +448,17 @@ impl PaneReadinessState {
         self.startup_eio_reads
     }
 
+    fn output_established(&self) -> bool {
+        self.established
+    }
+
     fn retry_startup_eio(&mut self) -> StartupEioReadiness {
         self.immediate_reads = 0;
-        // Unix PTY masters can report EIO as EOF. Linux can also report it
-        // briefly before the slave side has reached a stable post-spawn state.
-        // Before the first successful read, treat a bounded run of EIO as
-        // startup latency; after output is established, EIO is normal EOF.
+        // Unix PTY masters can report EIO or a zero-length read as EOF. Linux
+        // can also report it briefly before the slave side has reached a
+        // stable post-spawn state. Before the first successful read, treat a
+        // bounded run of these signals as startup latency; after output is
+        // established, they are normal EOF.
         if self.established {
             return StartupEioReadiness::EstablishedEof;
         }

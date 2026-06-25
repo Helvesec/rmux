@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+#![deny(clippy::await_holding_lock)]
 
 //! Tokio-based detached RPC server for RMUX.
 
@@ -56,6 +57,8 @@ mod keys;
 #[cfg_attr(windows, allow(dead_code))]
 mod legacy_command;
 #[cfg(any(unix, windows))]
+mod limits;
+#[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod listener;
 #[cfg(any(unix, windows))]
@@ -95,6 +98,8 @@ mod pane_transcript;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod pane_visible_geometry;
+#[cfg(any(unix, windows))]
+mod perf_instrument;
 #[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod renderer;

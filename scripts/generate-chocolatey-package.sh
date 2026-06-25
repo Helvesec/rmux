@@ -73,6 +73,9 @@ write_nuspec() {
     <summary>Terminal multiplexer with a tmux-style CLI and native Windows support.</summary>
     <releaseNotes>https://github.com/$repository/releases/tag/v$version</releaseNotes>
     <tags>rmux terminal multiplexer tmux cli rust</tags>
+    <dependencies>
+      <dependency id="vcredist140" />
+    </dependencies>
   </metadata>
   <files>
     <file src="tools\\**" target="tools" />

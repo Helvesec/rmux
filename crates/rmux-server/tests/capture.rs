@@ -47,7 +47,7 @@ async fn capture_pane_reads_unattached_transcript() -> Result<(), Box<dyn Error>
 
     let captured = send_request(
         harness.socket_path(),
-        &Request::CapturePane(CapturePaneRequest {
+        &Request::CapturePane(Box::new(CapturePaneRequest {
             target,
             start: None,
             end: None,
@@ -64,7 +64,7 @@ async fn capture_pane_reads_unattached_transcript() -> Result<(), Box<dyn Error>
             quiet: false,
             start_is_absolute: false,
             end_is_absolute: false,
-        }),
+        })),
     )
     .await?;
     match captured {
@@ -101,7 +101,7 @@ async fn wait_for_capture(
     for _ in 0..100 {
         let response = send_request(
             socket_path,
-            &Request::CapturePane(CapturePaneRequest {
+            &Request::CapturePane(Box::new(CapturePaneRequest {
                 target: target.clone(),
                 start: None,
                 end: None,
@@ -118,7 +118,7 @@ async fn wait_for_capture(
                 quiet: false,
                 start_is_absolute: false,
                 end_is_absolute: false,
-            }),
+            })),
         )
         .await?;
         let output = response

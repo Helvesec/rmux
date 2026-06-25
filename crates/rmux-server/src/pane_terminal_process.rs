@@ -60,6 +60,10 @@ impl PaneTerminal {
         self.master.try_clone()
     }
 
+    pub(crate) fn clone_master_for_output_reader(&mut self) -> rmux_pty::Result<PtyMaster> {
+        self.master.try_clone_for_startup_reader()
+    }
+
     #[cfg(windows)]
     pub(crate) fn clone_child_for_wait(&self) -> rmux_pty::Result<PtyChild> {
         self.child.try_clone_for_wait()
@@ -163,7 +167,7 @@ pub(crate) fn open_pane_terminal(
 }
 
 pub(crate) fn pty_size_from_geometry(geometry: PaneGeometry) -> PtyTerminalSize {
-    PtyTerminalSize::new(geometry.cols(), geometry.rows())
+    PtyTerminalSize::new(geometry.cols().max(1), geometry.rows().max(1))
 }
 
 pub(crate) fn pty_geometry_from_layout(
@@ -204,7 +208,7 @@ mod tests {
     use rmux_core::PaneGeometry;
     use rmux_proto::{TerminalPixels, TerminalSize};
 
-    use super::pty_geometry_from_layout;
+    use super::{pty_geometry_from_layout, pty_size_from_geometry};
 
     #[test]
     fn pty_geometry_scales_terminal_pixels_to_pane_cells() {
@@ -216,5 +220,17 @@ mod tests {
 
         assert_eq!(geometry.size, TerminalSize::new(60, 20));
         assert_eq!(geometry.pixels, Some(TerminalPixels::new(720, 480)));
+    }
+
+    #[test]
+    fn pty_size_from_geometry_never_opens_or_resizes_zero_sized_backend() {
+        assert_eq!(
+            pty_size_from_geometry(PaneGeometry::new(0, 0, 0, 0)),
+            TerminalSize::new(1, 1)
+        );
+        assert_eq!(
+            pty_size_from_geometry(PaneGeometry::new(0, 23, 80, 0)),
+            TerminalSize::new(80, 1)
+        );
     }
 }

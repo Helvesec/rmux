@@ -1,7 +1,6 @@
-use regex::RegexBuilder;
-
 use crate::utf8::{text_width, truncate_right_to_width, truncate_to_width, Utf8Config};
 
+use super::regex_cache::cached_regex;
 use super::FormatModifier;
 
 /// Shell quoting: backslash-escapes tmux shell special characters.
@@ -68,10 +67,7 @@ pub(super) fn apply_substitution(value: &str, modifier: &FormatModifier) -> Stri
         .get(2)
         .is_some_and(|flags| flags.contains('i'));
 
-    match RegexBuilder::new(pattern)
-        .case_insensitive(case_insensitive)
-        .build()
-    {
+    match cached_regex(pattern, case_insensitive) {
         Ok(regex) => regex
             .replace_all(value, tmux_regex_replacement(replacement).as_str())
             .into_owned(),

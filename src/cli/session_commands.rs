@@ -35,7 +35,6 @@ pub(super) fn run_new_session(
 
     let mut connection = connect_with_startserver(socket_path, startup)?;
     let client_flags = optional_client_flags(args.flags.clone());
-    let client_size = current_terminal_size();
     let working_directory = args
         .working_directory
         .or_else(current_working_directory_string);
@@ -105,7 +104,7 @@ pub(super) fn run_new_session(
                 flags: client_flags,
                 working_directory: None,
                 client_terminal,
-                client_size,
+                client_size: current_terminal_size(),
             },
         ),
     }
@@ -127,6 +126,8 @@ fn current_working_directory_string() -> Option<String> {
 
 #[cfg(windows)]
 const RMUX_CLIENT_SHELL_ENV: &str = "RMUX_CLIENT_SHELL";
+#[cfg(windows)]
+const INTERNAL_TMUX_COMPAT_ENV: &str = "RMUX_INTERNAL_INVOKED_AS_TMUX";
 
 #[cfg(windows)]
 fn invoking_client_environment() -> Option<Vec<String>> {
@@ -139,6 +140,7 @@ fn invoking_client_environment() -> Option<Vec<String>> {
         })
         .filter(|(name, _)| !name.starts_with('='))
         .filter(|(name, _)| !name.eq_ignore_ascii_case(RMUX_CLIENT_SHELL_ENV))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TMUX_COMPAT_ENV))
         .map(|(name, value)| format!("{name}={value}"))
         .collect::<Vec<_>>();
 

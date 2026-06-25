@@ -51,9 +51,9 @@ mod name;
 #[path = "startup_windows/probe.rs"]
 mod probe;
 
-use mutex::acquire_startup_mutex;
+use mutex::{acquire_startup_mutex, acquire_startup_mutex_blocking};
 use name::{startup_mutex_name, validate_pipe_name};
-use probe::{probe_responsive, wait_for_daemon};
+use probe::{probe_blocking, probe_responsive, wait_for_daemon, wait_for_daemon_blocking};
 
 const PIPE_PREFIX: &str = r"\\.\pipe\";
 const STARTUP_MUTEX_PREFIX: &str = r"Local\rmux-startup-";
@@ -351,6 +351,54 @@ where
 
     let stream = wait_for_daemon(&endpoint, pipe_name, deadline, poll_interval).await?;
     drop(_guard);
+    Ok(StartupOutcome::Started(stream))
+}
+
+/// Blocking variant of [`connect_or_start_with`] for synchronous Windows
+/// clients that would otherwise pay for a Tokio runtime only to spawn a
+/// hidden daemon and poll a named pipe.
+pub fn connect_or_start_blocking_with<L>(
+    pipe_name: &Path,
+    launcher: L,
+    deadline: Duration,
+    poll_interval: Duration,
+) -> Result<StartupOutcome, StartupError>
+where
+    L: FnOnce() -> io::Result<()>,
+{
+    connect_or_start_blocking_with_timeout(pipe_name, launcher, Some(deadline), poll_interval)
+}
+
+/// Blocking variant of [`connect_or_start_with_timeout`].
+pub fn connect_or_start_blocking_with_timeout<L>(
+    pipe_name: &Path,
+    launcher: L,
+    deadline: Option<Duration>,
+    poll_interval: Duration,
+) -> Result<StartupOutcome, StartupError>
+where
+    L: FnOnce() -> io::Result<()>,
+{
+    let deadline = StartupDeadline::from_timeout(deadline);
+    validate_pipe_name(pipe_name)?;
+    let endpoint = LocalEndpoint::from_path(pipe_name.to_path_buf());
+
+    if let Some(stream) = probe_blocking(&endpoint, pipe_name)? {
+        return Ok(StartupOutcome::JoinedExisting(stream));
+    }
+
+    let mutex_name = startup_mutex_name(pipe_name)?;
+    let guard = acquire_startup_mutex_blocking(pipe_name, &mutex_name, deadline)?;
+
+    if let Some(stream) = probe_blocking(&endpoint, pipe_name)? {
+        drop(guard);
+        return Ok(StartupOutcome::JoinedExisting(stream));
+    }
+
+    launcher().map_err(|source| StartupError::Launcher { source })?;
+
+    let stream = wait_for_daemon_blocking(&endpoint, pipe_name, deadline, poll_interval)?;
+    drop(guard);
     Ok(StartupOutcome::Started(stream))
 }
 

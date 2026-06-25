@@ -120,6 +120,19 @@ pub(super) fn parse_queue_invocation(
         )
         .map(QueueInvocation::Request);
     }
+    if matches!(
+        command_name.as_str(),
+        "display-menu" | "menu" | "display-popup" | "popup"
+    ) {
+        let arguments = command_arguments_with_blocks_as_strings(command.arguments());
+        let arguments =
+            resolve_queue_target_arguments(&command_name, arguments, sessions, find_context)?;
+        if let Some(command) =
+            RequestHandler::parse_overlay_queue_command(&command_name, arguments)?
+        {
+            return Ok(QueueInvocation::Overlay(command));
+        }
+    }
     let arguments = resolve_queue_target_arguments(
         &command_name,
         command_arguments_as_strings(&command_name, command.arguments())?,

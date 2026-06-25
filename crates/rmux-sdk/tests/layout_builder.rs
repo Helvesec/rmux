@@ -47,7 +47,7 @@ async fn layout_builder_creates_incomplete_grid_with_process_options() -> TestRe
         .cwd(harness.root_path())
         .env("RMUX_LAYOUT_ENV", "ok")
         .pane("Beta")
-        .shell("printf 'sdk_layout_beta\\n'; exit 4")
+        .shell("printf 'sdk_layout_beta\\n'; sleep 1; exit 4")
         .keep_alive_on_exit(true)
         .pane("Gamma")
         .shell("printf 'sdk_layout_gamma\\n'; sleep 30")
@@ -68,7 +68,11 @@ async fn layout_builder_creates_incomplete_grid_with_process_options() -> TestRe
         "sdk_layout_delta",
         "sdk_layout_epsilon",
     ]) {
-        wait_for_visible_text(pane, marker).await?;
+        if marker == "sdk_layout_beta" {
+            wait_for_captured_text(pane, marker).await?;
+        } else {
+            wait_for_visible_text(pane, marker).await?;
+        }
     }
 
     let ids = collect_pane_ids(&panes).await?;
@@ -203,6 +207,28 @@ async fn wait_for_visible_text(pane: &rmux_sdk::Pane, marker: &str) -> TestResul
         .into());
     }
     Ok(())
+}
+
+async fn wait_for_captured_text(pane: &rmux_sdk::Pane, marker: &str) -> TestResult {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let last_capture = loop {
+        let capture = pane.capture_pane().start_absolute(0).await?;
+        let capture = String::from_utf8_lossy(&capture.stdout).into_owned();
+        if capture.contains(marker) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            break capture;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    let visible = pane.snapshot().await?.visible_text();
+    Err(format!(
+        "pane {:?} did not keep {marker:?} in capture-pane history; visible={visible:?}; capture={last_capture:?}",
+        pane.target()
+    )
+    .into())
 }
 
 fn session_name(value: &str) -> SessionName {

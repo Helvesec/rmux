@@ -198,10 +198,27 @@ fn validate_resize_pane_tmux_direction_delta_syntax(
                 clap::error::ErrorKind::UnknownArgument,
                 format!("unexpected argument '{argument}'"),
             ));
+        } else if let Some(flag) = attached_resize_pane_direction_flag(argument) {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::UnknownArgument,
+                format!("command resize-pane: unknown flag -{flag}"),
+            ));
         }
     }
 
     Ok(())
+}
+
+fn attached_resize_pane_direction_flag(argument: &str) -> Option<char> {
+    for prefix in ["-D", "-U", "-L", "-R"] {
+        if let Some(value) = argument.strip_prefix(prefix) {
+            if value.is_empty() {
+                return None;
+            }
+            return value.chars().next();
+        }
+    }
+    None
 }
 
 #[derive(Clone, Copy)]

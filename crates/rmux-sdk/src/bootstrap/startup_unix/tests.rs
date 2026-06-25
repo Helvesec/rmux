@@ -106,6 +106,39 @@ fn shared_sticky_parent_symlink_uses_private_lock_directory() {
 }
 
 #[test]
+fn custom_socket_parent_accepts_terminal_symlink_to_shared_sticky_parent() {
+    let tmp = PathBuf::from("/tmp");
+    let target_metadata = fs::metadata(&tmp).expect("stat /tmp");
+    let owner_uid = real_user_id();
+    if target_metadata.uid() == owner_uid
+        || !has_mode_bit(target_metadata.mode(), libc::S_ISVTX)
+        || target_metadata.mode() & 0o022 == 0
+    {
+        return;
+    }
+
+    let link = unique_dir("stickylink");
+    let _ = fs::remove_dir_all(&link);
+    std::os::unix::fs::symlink(&tmp, &link).expect("create sticky parent symlink");
+    let socket = link.join(format!(
+        "rmux-sticky-link-{}-{}.sock",
+        std::process::id(),
+        NEXT_TEST_DIR_ID.fetch_add(1, Ordering::SeqCst)
+    ));
+
+    let prepared = prepare_socket_parent(&socket, &link, owner_uid)
+        .expect("terminal symlink to sticky shared parent should be accepted");
+
+    let lock_dir = link.join(format!("rmux-{owner_uid}")).join("startup-locks");
+    assert!(
+        prepared.lock_path.starts_with(&lock_dir),
+        "lock path should live under private lock dir through custom symlink: {:?}",
+        prepared.lock_path
+    );
+    let _ = fs::remove_file(&link);
+}
+
+#[test]
 fn custom_socket_parent_preserves_existing_permissions() {
     let dir = unique_dir("parentmode");
     create_test_dir(&dir);
@@ -136,22 +169,137 @@ fn custom_socket_parent_accepts_other_readable_permissions() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+fn assert_private_lock_path(
+    prepared: &super::filesystem::PreparedSocketParent,
+    custom_parent: &Path,
+) {
+    let owner_uid = real_user_id();
+    let root = fs::canonicalize("/tmp").expect("private lock root");
+    let lock_dir = root.join(format!("rmux-{owner_uid}")).join("startup-locks");
+    assert!(
+        prepared.lock_path.starts_with(&lock_dir),
+        "group-writable custom parents must use private lock dir: {:?}",
+        prepared.lock_path
+    );
+    assert!(
+        !prepared.lock_path.starts_with(custom_parent),
+        "private lock path must not live below custom parent: {:?}",
+        prepared.lock_path
+    );
+    let metadata = fs::symlink_metadata(&lock_dir).expect("stat private lock dir");
+    assert_eq!(metadata.uid(), owner_uid);
+    assert_eq!(metadata.mode() & 0o777, SOCKET_DIRECTORY_MODE);
+}
+
 #[test]
-fn custom_socket_parent_rejects_group_writable_permissions() {
-    let dir = unique_dir("parentbad");
+fn custom_socket_parent_accepts_group_writable_permissions_with_private_lock() {
+    let dir = unique_dir("parentgw");
     create_test_dir(&dir);
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).expect("chmod temp dir");
     let socket = dir.join("sock");
     let owner_uid = real_user_id();
 
-    let error = prepare_socket_parent(&socket, &dir, owner_uid)
-        .expect_err("group-writable custom parent should be rejected");
+    let prepared = prepare_socket_parent(&socket, &dir, owner_uid)
+        .expect("group-writable owner-owned custom parent should be accepted");
+
+    assert_private_lock_path(&prepared, &dir);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn custom_socket_parent_accepts_setgid_group_writable_permissions_with_private_lock() {
+    let dir = unique_dir("parentsgid");
+    create_test_dir(&dir);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o2775)).expect("chmod temp dir");
+    let socket = dir.join("sock");
+    let owner_uid = real_user_id();
+
+    let prepared = prepare_socket_parent(&socket, &dir, owner_uid)
+        .expect("setgid group-writable owner-owned custom parent should be accepted");
+
+    assert_private_lock_path(&prepared, &dir);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn custom_socket_parent_rejects_other_writable_permissions() {
+    for mode in [0o777, 0o707] {
+        let dir = unique_dir(&format!("parent{mode:o}"));
+        create_test_dir(&dir);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).expect("chmod temp dir");
+        let socket = dir.join("sock");
+        let owner_uid = real_user_id();
+
+        let error = prepare_socket_parent(&socket, &dir, owner_uid)
+            .expect_err("other-writable custom parent should be rejected");
+
+        assert!(
+            matches!(error, StartupError::UnsafePermissions { .. }),
+            "unexpected error for mode {mode:o}: {error:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn custom_socket_parent_rejects_wrong_owner() {
+    let dir = unique_dir("parentowner");
+    create_test_dir(&dir);
+    let socket = dir.join("sock");
+    let unexpected_uid = real_user_id().wrapping_add(1);
+
+    let error = prepare_socket_parent(&socket, &dir, unexpected_uid)
+        .expect_err("custom parent with wrong owner should be rejected");
 
     assert!(
-        matches!(error, StartupError::UnsafePermissions { .. }),
+        matches!(error, StartupError::UnsafeOwner { .. }),
         "unexpected error: {error:?}"
     );
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn custom_socket_parent_rejects_symlink_parent() {
+    let target = unique_dir("parentsymlinktarget");
+    let link = unique_dir("parentsymlink");
+    create_test_dir(&target);
+    std::os::unix::fs::symlink(&target, &link).expect("create parent symlink");
+    let socket = link.join("sock");
+    let owner_uid = real_user_id();
+
+    let error = prepare_socket_parent(&socket, &link, owner_uid)
+        .expect_err("non-sticky parent symlink should be rejected");
+
+    assert!(
+        matches!(error, StartupError::SymlinkRejected { .. }),
+        "unexpected error: {error:?}"
+    );
+    let _ = fs::remove_file(&link);
+    let _ = fs::remove_dir_all(&target);
+}
+
+#[test]
+fn custom_socket_parent_rejects_intermediate_symlink_component() {
+    let root = unique_dir("parentsymroot");
+    let target = unique_dir("parentsymtarget");
+    create_test_dir(&root);
+    create_test_dir(&target);
+    let link = root.join("link");
+    std::os::unix::fs::symlink(&target, &link).expect("create intermediate symlink");
+    fs::create_dir_all(target.join("child")).expect("create target child");
+    let parent = link.join("child");
+    let socket = parent.join("sock");
+    let owner_uid = real_user_id();
+
+    let error = prepare_socket_parent(&socket, &parent, owner_uid)
+        .expect_err("intermediate symlink should be rejected");
+
+    assert!(
+        matches!(error, StartupError::SymlinkRejected { .. }),
+        "unexpected error: {error:?}"
+    );
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&target);
 }
 
 #[tokio::test]

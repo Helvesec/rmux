@@ -25,7 +25,7 @@ async fn create_session(handler: &RequestHandler, name: &str, size: TerminalSize
     let session_name = session_name(name);
     let ready_marker = "RCREADY";
     let response = handler
-        .handle(Request::NewSessionExt(NewSessionExtRequest {
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: Some(session_name.clone()),
             working_directory: None,
             detached: true,
@@ -43,7 +43,7 @@ async fn create_session(handler: &RequestHandler, name: &str, size: TerminalSize
             process_command: None,
             client_environment: None,
             skip_environment_update: false,
-        }))
+        })))
         .await;
     assert!(matches!(response, Response::NewSession(_)));
     let target = PaneTarget::with_window(session_name, 0, 0);

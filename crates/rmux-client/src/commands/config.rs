@@ -63,7 +63,7 @@ impl Connection {
             request.value.as_deref(),
             request.unset,
         )?;
-        self.roundtrip(&Request::SetOptionByName(request))
+        self.roundtrip(&Request::SetOptionByName(Box::new(request)))
     }
 
     /// Sends a `set-environment` request over the detached RPC channel.
@@ -76,14 +76,14 @@ impl Connection {
         hidden: bool,
         format: bool,
     ) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::SetEnvironment(SetEnvironmentRequest {
+        self.roundtrip(&Request::SetEnvironment(Box::new(SetEnvironmentRequest {
             scope,
             name,
             value,
             mode,
             hidden,
             format,
-        }))
+        })))
     }
 
     /// Sends a `set-hook` request over the detached RPC channel.
@@ -189,7 +189,7 @@ impl Connection {
         target: Option<PaneTarget>,
         stdin: Option<String>,
     ) -> Result<Response, ClientError> {
-        self.roundtrip_without_read_timeout(&Request::SourceFile(SourceFileRequest {
+        self.roundtrip_without_read_timeout(&Request::SourceFile(Box::new(SourceFileRequest {
             paths,
             quiet,
             parse_only,
@@ -198,7 +198,7 @@ impl Connection {
             target,
             caller_cwd: current_working_directory(),
             stdin,
-        }))
+        })))
     }
 }
 

@@ -236,7 +236,7 @@ async fn window_mutations_refresh_attached_sessions() {
     drain_attach_controls(&mut control_rx).await;
 
     let new_window = handler
-        .handle(Request::NewWindow(NewWindowRequest {
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
             target: alpha.clone(),
             name: None,
             detached: true,
@@ -246,7 +246,7 @@ async fn window_mutations_refresh_attached_sessions() {
             process_command: None,
             target_window_index: None,
             insert_at_target: false,
-        }))
+        })))
         .await;
     assert!(
         matches!(new_window, Response::NewWindow(_)),

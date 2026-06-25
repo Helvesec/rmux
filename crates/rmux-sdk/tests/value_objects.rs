@@ -327,23 +327,22 @@ fn sparse_serde_payloads_preserve_proto_defaults() {
     assert_eq!(command.endpoint, RmuxEndpoint::Default);
     assert!(matches!(
         command.into_request(),
-        rmux_proto::Request::RefreshClient(rmux_proto::RefreshClientRequest {
-            target_client: None,
-            adjustment: None,
-            clear_pan: false,
-            pan_left: false,
-            pan_right: false,
-            pan_up: false,
-            pan_down: false,
-            status_only: false,
-            clipboard_query: false,
-            flags: None,
-            flags_alias: None,
-            subscriptions,
-            subscriptions_format,
-            control_size: None,
-            colour_report: None,
-        }) if subscriptions.is_empty() && subscriptions_format.is_empty()
+        rmux_proto::Request::RefreshClient(request)
+            if request.target_client.is_none()
+                && request.adjustment.is_none()
+                && !request.clear_pan
+                && !request.pan_left
+                && !request.pan_right
+                && !request.pan_up
+                && !request.pan_down
+                && !request.status_only
+                && !request.clipboard_query
+                && request.flags.is_none()
+                && request.flags_alias.is_none()
+                && request.subscriptions.is_empty()
+                && request.subscriptions_format.is_empty()
+                && request.control_size.is_none()
+                && request.colour_report.is_none()
     ));
 }
 
@@ -425,20 +424,19 @@ fn command_value_object_round_trip_and_materializes_proto_request() {
     let request = command.into_request();
     assert!(matches!(
         request,
-        rmux_proto::Request::SplitWindowExt(rmux_proto::SplitWindowExtRequest {
-            target: rmux_proto::SplitWindowTarget::Session(_),
-            direction: rmux_proto::SplitDirection::Vertical,
-            before: false,
-            environment: None,
-            command: None,
-            process_command: None,
-            start_directory: None,
-            keep_alive_on_exit: None,
-            detached: false,
-            size: None,
-            preserve_zoom: false,
-            full_size: false,
-            stdin_payload: None,
-        })
+        rmux_proto::Request::SplitWindowExt(request)
+            if matches!(request.target, rmux_proto::SplitWindowTarget::Session(_))
+                && request.direction == rmux_proto::SplitDirection::Vertical
+                && !request.before
+                && request.environment.is_none()
+                && request.command.is_none()
+                && request.process_command.is_none()
+                && request.start_directory.is_none()
+                && request.keep_alive_on_exit.is_none()
+                && !request.detached
+                && request.size.is_none()
+                && !request.preserve_zoom
+                && !request.full_size
+                && request.stdin_payload.is_none()
     ));
 }

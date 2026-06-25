@@ -50,6 +50,25 @@ impl PaneTerminalStore {
         Ok(())
     }
 
+    #[cfg(windows)]
+    pub(super) fn insert_pending_session(
+        &mut self,
+        session_name: SessionName,
+        environment: SessionBaseEnvironment,
+    ) -> Result<(), RmuxError> {
+        if self.sessions.contains_key(&session_name) {
+            return Err(RmuxError::Server(format!(
+                "pane terminals already exist for session {session_name}"
+            )));
+        }
+
+        let previous = self.sessions.insert(session_name.clone(), HashMap::new());
+        debug_assert!(previous.is_none());
+        let previous_environment = self.session_environments.insert(session_name, environment);
+        debug_assert!(previous_environment.is_none());
+        Ok(())
+    }
+
     pub(super) fn insert_pane(
         &mut self,
         session_name: SessionName,

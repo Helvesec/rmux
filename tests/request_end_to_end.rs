@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use common::{assert_success, stderr, stdout, CliHarness};
 
-const COMMAND_SURFACE: [&str; 91] = [
+const COMMAND_SURFACE: [&str; 101] = [
     "new-session",
     "start-server",
     "kill-server",
@@ -58,6 +58,16 @@ const COMMAND_SURFACE: [&str; 91] = [
     "choose-client",
     "customize-mode",
     "clock-mode",
+    "wait-pane",
+    "pane-snapshot",
+    "stream-pane",
+    "collect-pane-output",
+    "locator",
+    "expect-pane",
+    "find-panes",
+    "find-sessions",
+    "broadcast-keys",
+    "with-session",
     "send-keys",
     "bind-key",
     "unbind-key",
@@ -135,13 +145,24 @@ fn cli_command_surface_matches_public_help_enum_and_dispatch() -> Result<(), Box
     )?;
 
     // The bare `list-commands` listing is byte-compared against tmux, so it omits
-    // RMUX extensions (web-share). They stay in the clap enum, dispatch and
-    // --help. Keep this in sync with RMUX_EXTENSION_COMMANDS in
-    // src/cli/command_inventory.rs.
-    let rmux_extensions: BTreeSet<String> = ["web-share"]
-        .iter()
-        .map(|name| (*name).to_owned())
-        .collect();
+    // RMUX server extensions. Top-level-only extensions such as capabilities,
+    // doctor and setup are tested separately.
+    let rmux_extensions: BTreeSet<String> = [
+        "broadcast-keys",
+        "collect-pane-output",
+        "expect-pane",
+        "find-panes",
+        "find-sessions",
+        "locator",
+        "pane-snapshot",
+        "stream-pane",
+        "wait-pane",
+        "web-share",
+        "with-session",
+    ]
+    .iter()
+    .map(|name| (*name).to_owned())
+    .collect();
     let listed_expected: BTreeSet<String> =
         expected.difference(&rmux_extensions).cloned().collect();
 

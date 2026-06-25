@@ -28,13 +28,15 @@ impl Connection {
         message: Option<String>,
         target_client: Option<String>,
     ) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::DisplayMessageExt(DisplayMessageExtRequest {
-            target,
-            print,
-            message,
-            target_client,
-            empty_target_context: false,
-        }))
+        self.roundtrip(&Request::DisplayMessageExt(Box::new(
+            DisplayMessageExtRequest {
+                target,
+                print,
+                message,
+                target_client,
+                empty_target_context: false,
+            },
+        )))
     }
 
     /// Sends a `show-messages` request over the detached RPC channel.

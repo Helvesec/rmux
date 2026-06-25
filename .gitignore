@@ -1,5 +1,13 @@
 /target
 /dist/
+__pycache__/
+*.py[cod]
+/*.snap
+/snapcraft-login.txt
+/.snapcraft/
+/parts/
+/prime/
+/stage/
 fuzz/target/
 tests/reference/screenshots/*/*/
 SDK demo/node_modules/
@@ -14,6 +22,7 @@ SDK demo/playwright-report/
 /rmux-release.sh
 /.release-deployment/
 /.rmux-audit/
+/tools/bench/README.md
 
 # Local secret material and environment overrides.
 .env

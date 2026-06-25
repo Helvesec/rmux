@@ -44,6 +44,8 @@ struct DaemonArgs {
     config_cwd: Option<PathBuf>,
     web_frontend: Option<String>,
     web_port: Option<u16>,
+    startup_ready_fd: Option<i32>,
+    startup_ready_event: Option<OsString>,
 }
 
 fn parse_daemon_args<I>(mut args: I) -> Result<DaemonArgs, String>
@@ -60,6 +62,8 @@ where
     let mut config_cwd = None;
     let mut web_frontend = None;
     let mut web_port = None;
+    let mut startup_ready_fd = None;
+    let mut startup_ready_event = None;
 
     if let Some(first) = args.next() {
         if is_internal_flag_token(first.as_os_str()) {
@@ -71,6 +75,8 @@ where
                 &mut config_cwd,
                 &mut web_frontend,
                 &mut web_port,
+                &mut startup_ready_fd,
+                &mut startup_ready_event,
             )?;
         } else {
             socket_path = Some(PathBuf::from(first));
@@ -89,6 +95,8 @@ where
             &mut config_cwd,
             &mut web_frontend,
             &mut web_port,
+            &mut startup_ready_fd,
+            &mut startup_ready_event,
         )?;
     }
 
@@ -99,9 +107,12 @@ where
         config_cwd,
         web_frontend,
         web_port,
+        startup_ready_fd,
+        startup_ready_event,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_internal_flag<I>(
     argument: OsString,
     args: &mut I,
@@ -110,6 +121,8 @@ fn parse_internal_flag<I>(
     config_cwd: &mut Option<PathBuf>,
     web_frontend: &mut Option<String>,
     web_port: &mut Option<u16>,
+    startup_ready_fd: &mut Option<i32>,
+    startup_ready_event: &mut Option<OsString>,
 ) -> Result<(), String>
 where
     I: Iterator<Item = OsString>,
@@ -165,6 +178,26 @@ where
                 .ok_or_else(|| "invalid UTF-8 in --frontend-url".to_owned())?;
             *web_frontend = Some(frontend.to_owned());
         }
+        Some("--startup-ready-fd") => {
+            let fd = args
+                .next()
+                .ok_or_else(|| "--startup-ready-fd requires a file descriptor".to_owned())?;
+            let fd = fd
+                .to_str()
+                .ok_or_else(|| "invalid UTF-8 in --startup-ready-fd".to_owned())?
+                .parse::<i32>()
+                .map_err(|_| "--startup-ready-fd requires an integer file descriptor".to_owned())?;
+            if fd < 0 {
+                return Err("--startup-ready-fd requires a non-negative file descriptor".to_owned());
+            }
+            *startup_ready_fd = Some(fd);
+        }
+        Some("--startup-ready-event") => {
+            let event = args
+                .next()
+                .ok_or_else(|| "--startup-ready-event requires an event name".to_owned())?;
+            *startup_ready_event = Some(event);
+        }
         Some(other) => return Err(format!("unexpected hidden daemon argument '{other}'")),
         None => return Err("invalid UTF-8 in hidden daemon flag".to_owned()),
     }
@@ -193,6 +226,14 @@ fn run_hidden_daemon(args: DaemonArgs) -> io::Result<()> {
     }
     if let Some(frontend) = args.web_frontend {
         config = config.with_web_frontend(frontend);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(ready_fd) = args.startup_ready_fd {
+        config = config.with_startup_ready_fd(ready_fd);
+    }
+    #[cfg(windows)]
+    if let Some(ready_event) = args.startup_ready_event {
+        config = config.with_startup_ready_event(ready_event);
     }
     rmux_os::memory::configure_daemon_allocator();
     let runtime = server_runtime::build_daemon_runtime()?;

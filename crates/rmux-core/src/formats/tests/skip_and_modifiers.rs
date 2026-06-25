@@ -66,6 +66,14 @@ fn modifier_literal() {
 }
 
 #[test]
+fn modifier_parser_handles_utf8_leading_bytes_without_panic() {
+    assert_eq!(
+        render_template("#{☃:session_name}", &StaticWindowValues),
+        ""
+    );
+}
+
+#[test]
 fn modifier_expand() {
     // `#{E:#{session_name}}` → expand "alpha" → "alpha".
     assert_eq!(

@@ -91,6 +91,8 @@ impl RequestHandler {
         session_name: rmux_proto::SessionName,
         registration: AttachRegistration,
     ) -> u64 {
+        #[cfg(windows)]
+        self.wait_for_windows_deferred_all_pane_pids().await;
         let mut replaced_key_table = None;
         let attached_session_name = session_name.clone();
         let client_size = if let Some(client_size) = registration.client_size {
@@ -152,8 +154,8 @@ impl RequestHandler {
         ) {
             replaced_key_table = previous.key_table_name.clone();
             super::terminate_overlay_job(previous.overlay.take());
-            previous.closing.store(true, Ordering::SeqCst);
             let _ = previous.control_tx.send(AttachControl::Detach);
+            previous.closing.store(true, Ordering::SeqCst);
         }
         drop(active_attach);
 

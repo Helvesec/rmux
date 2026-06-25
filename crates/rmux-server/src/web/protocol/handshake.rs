@@ -136,12 +136,6 @@ pub(crate) fn close_for_auth_error(error: &str) -> AuthClose {
             wire_close: HANDSHAKE_REJECTED,
         };
     }
-    if error.contains("missing web-share pairing code") {
-        return AuthClose {
-            reason: "pin_required",
-            wire_close: HANDSHAKE_REJECTED,
-        };
-    }
     if error.contains("no operator") {
         return AuthClose {
             reason: "operator_not_available",
@@ -195,6 +189,7 @@ mod tests {
         ] {
             let close = super::close_for_auth_error(error);
             assert_eq!(close.wire_close, super::HANDSHAKE_REJECTED);
+            assert_ne!(close.reason, "pin_required");
         }
     }
 }

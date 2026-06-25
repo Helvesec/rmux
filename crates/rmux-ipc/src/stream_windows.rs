@@ -1,5 +1,6 @@
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::AsRawHandle;
 use std::ptr::null_mut;
 use std::sync::Mutex;
@@ -19,7 +20,7 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION;
 use windows_sys::Win32::System::Pipes::{
     GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, ImpersonateNamedPipeClient,
-    PeekNamedPipe,
+    PeekNamedPipe, WaitNamedPipeW,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken,
@@ -98,12 +99,16 @@ pub fn connect_blocking(
     endpoint: &LocalEndpoint,
     timeout: Duration,
 ) -> io::Result<BlockingLocalStream> {
+    let pipe_name = endpoint.as_pipe_name().to_owned();
+    if named_pipe_is_definitely_absent(&pipe_name) {
+        return Err(io::Error::from_raw_os_error(ERROR_FILE_NOT_FOUND as i32));
+    }
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
         .build()?;
     let deadline = Instant::now() + timeout;
-    let pipe_name = endpoint.as_pipe_name().to_owned();
     loop {
         match runtime.block_on(open_named_pipe_client(&pipe_name)) {
             Ok(inner) => {
@@ -129,6 +134,26 @@ pub fn connect_blocking(
             Err(error) => return Err(error),
         }
     }
+}
+
+fn named_pipe_is_definitely_absent(pipe_name: &std::ffi::OsStr) -> bool {
+    let wide = pipe_name
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let available = unsafe {
+        // SAFETY: `wide` is a nul-terminated UTF-16 pipe name. A zero timeout
+        // only asks the kernel whether any matching pipe instance exists.
+        WaitNamedPipeW(wide.as_ptr(), 0)
+    };
+    if available != 0 {
+        return false;
+    }
+
+    matches!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(code) if code == ERROR_FILE_NOT_FOUND as i32
+    )
 }
 
 pub(super) async fn wait_for_peer_close_impl(stream: &LocalStream) -> io::Result<()> {

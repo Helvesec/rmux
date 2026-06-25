@@ -365,7 +365,7 @@ async fn source_file_format_expands_path_against_target_context() {
     let config = root.join("alpha.conf");
     write_config(&config, "set-buffer -b formatted ok\n");
     let response = handler
-        .handle(Request::SourceFile(SourceFileRequest {
+        .handle(Request::SourceFile(Box::new(SourceFileRequest {
             paths: vec![format!("{}/#{{session_name}}.conf", root.display())],
             quiet: false,
             parse_only: false,
@@ -374,7 +374,7 @@ async fn source_file_format_expands_path_against_target_context() {
             target: Some(PaneTarget::with_window(alpha, 0, 0)),
             caller_cwd: None,
             stdin: None,
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -417,7 +417,7 @@ async fn source_file_if_condition_uses_target_format_context_at_parse_time() {
     );
 
     let response = handler
-        .handle(Request::SourceFile(SourceFileRequest {
+        .handle(Request::SourceFile(Box::new(SourceFileRequest {
             paths: vec!["target.conf".to_owned()],
             quiet: false,
             parse_only: false,
@@ -426,7 +426,7 @@ async fn source_file_if_condition_uses_target_format_context_at_parse_time() {
             target: Some(PaneTarget::with_window(alpha, 0, 0)),
             caller_cwd: Some(root),
             stdin: None,
-        }))
+        })))
         .await;
 
     assert_eq!(

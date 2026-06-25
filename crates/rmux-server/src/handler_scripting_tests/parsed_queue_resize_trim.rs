@@ -7,17 +7,12 @@ async fn parsed_queue_resize_pane_trim_flag_trims_below_cursor() {
     let handler = RequestHandler::new();
     let session = session_name("resize-trim");
     let target = PaneTarget::with_window(session.clone(), 0, 0);
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 10, rows: 5 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    create_test_session(
+        &handler,
+        session.clone(),
+        TerminalSize { cols: 10, rows: 5 },
+    )
+    .await;
     {
         let mut state = handler.state.lock().await;
         state
@@ -64,17 +59,12 @@ async fn parsed_queue_resize_pane_trim_flag_trims_below_cursor() {
 async fn parsed_queue_resize_pane_trim_flag_takes_precedence_over_size_flags() {
     let handler = RequestHandler::new();
     let session = session_name("resize-trim-size");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    create_test_session(
+        &handler,
+        session.clone(),
+        TerminalSize { cols: 80, rows: 24 },
+    )
+    .await;
     execute(&handler, "split-window -v -t resize-trim-size:0.0").await;
 
     let before = pane_height(&handler, &session, 0).await;
@@ -88,17 +78,12 @@ async fn parsed_queue_resize_pane_trim_flag_takes_precedence_over_size_flags() {
 async fn parsed_queue_resize_pane_mouse_flag_is_noop_without_mouse_context() {
     let handler = RequestHandler::new();
     let session = session_name("resize-mouse-noop");
-    assert!(matches!(
-        handler
-            .handle(Request::NewSession(NewSessionRequest {
-                session_name: session.clone(),
-                detached: true,
-                size: Some(TerminalSize { cols: 80, rows: 24 }),
-                environment: None,
-            }))
-            .await,
-        Response::NewSession(_)
-    ));
+    create_test_session(
+        &handler,
+        session.clone(),
+        TerminalSize { cols: 80, rows: 24 },
+    )
+    .await;
     execute(&handler, "split-window -h -t resize-mouse-noop:0.0").await;
 
     let before = pane_sizes(&handler, &session).await;
@@ -106,6 +91,55 @@ async fn parsed_queue_resize_pane_mouse_flag_is_noop_without_mouse_context() {
     let after = pane_sizes(&handler, &session).await;
 
     assert_eq!(after, before);
+}
+
+async fn create_test_session(handler: &RequestHandler, session: SessionName, size: TerminalSize) {
+    let response = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(session),
+            working_directory: None,
+            detached: true,
+            size: Some(size),
+            environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(quiet_resize_test_command()),
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))
+        .await;
+    assert!(
+        matches!(response, Response::NewSession(_)),
+        "resize test session should be created, got {response:?}"
+    );
+}
+
+#[cfg(unix)]
+fn quiet_resize_test_command() -> Vec<String> {
+    vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 60".to_owned()]
+}
+
+#[cfg(windows)]
+fn quiet_resize_test_command() -> Vec<String> {
+    let system_root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+    let cmd = std::path::PathBuf::from(system_root)
+        .join("System32")
+        .join("cmd.exe");
+    vec![
+        cmd.to_string_lossy().into_owned(),
+        "/d".to_owned(),
+        "/q".to_owned(),
+        "/c".to_owned(),
+        "ping -n 120 127.0.0.1 >NUL".to_owned(),
+    ]
 }
 
 async fn execute(handler: &RequestHandler, command: &str) {

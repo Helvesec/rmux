@@ -163,6 +163,49 @@ fn split_lines_yields_many_lines_in_order_from_one_chunk() {
 }
 
 #[test]
+fn split_lines_forces_flush_at_line_buffer_limit() {
+    let mut buffer = Vec::new();
+    let mut force_flushed = false;
+    let mut out: VecDeque<PaneLineItem> = VecDeque::new();
+    let chunk = vec![b'a'; LINE_BUFFER_MAX];
+
+    split_lines_bounded(&mut buffer, &mut force_flushed, &chunk, &mut out);
+
+    assert!(buffer.is_empty());
+    assert!(force_flushed);
+    assert_eq!(out.len(), 1);
+    assert!(matches!(
+        out.front().unwrap(),
+        PaneLineItem::Line { text } if text.len() == LINE_BUFFER_MAX
+    ));
+}
+
+#[test]
+fn split_lines_suppresses_newline_after_forced_flush() {
+    let mut buffer = Vec::new();
+    let mut force_flushed = false;
+    let mut out: VecDeque<PaneLineItem> = VecDeque::new();
+    let chunk = vec![b'a'; LINE_BUFFER_MAX];
+
+    split_lines_bounded(&mut buffer, &mut force_flushed, &chunk, &mut out);
+    split_lines_bounded(&mut buffer, &mut force_flushed, b"\n\n", &mut out);
+
+    let texts: Vec<String> = out
+        .into_iter()
+        .map(|item| match item {
+            PaneLineItem::Line { text } => text,
+            other => panic!("expected line item, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(texts.len(), 2);
+    assert_eq!(texts[0].len(), LINE_BUFFER_MAX);
+    assert!(
+        texts[1].is_empty(),
+        "second LF still represents an empty line"
+    );
+}
+
+#[test]
 fn ingest_cursor_preserves_event_order_and_payload_bytes() {
     let mut pending: VecDeque<PaneOutputChunk> = VecDeque::new();
     ingest_cursor(

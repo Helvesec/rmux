@@ -8,9 +8,9 @@ use super::super::RequestHandler;
 use super::session_name;
 use rmux_core::{input::InputParser, Screen};
 use rmux_proto::{
-    CapturePaneRequest, CopyModeRequest, ListPanesRequest, NewSessionRequest, OptionScopeSelector,
-    PaneTarget, Request, Response, SendKeysExtRequest, SetOptionByNameRequest, SetOptionMode,
-    ShowBufferRequest, TerminalSize,
+    CapturePaneRequest, CopyModeRequest, ListPanesRequest, NewSessionExtRequest,
+    OptionScopeSelector, PaneTarget, Request, Response, SendKeysExtRequest, SetOptionByNameRequest,
+    SetOptionMode, ShowBufferRequest, TerminalSize,
 };
 use tokio::time::sleep;
 
@@ -38,15 +38,47 @@ fn capture_request(target: PaneTarget, use_mode_screen: bool) -> CapturePaneRequ
 async fn create_session(handler: &RequestHandler, name: &str, size: TerminalSize) -> PaneTarget {
     let session_name = session_name(name);
     let response = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name.clone(),
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(session_name.clone()),
+            working_directory: None,
             detached: true,
             size: Some(size),
             environment: None,
-        }))
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(quiet_copy_mode_command()),
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))
         .await;
     assert!(matches!(response, Response::NewSession(_)));
     PaneTarget::with_window(session_name, 0, 0)
+}
+
+#[cfg(unix)]
+fn quiet_copy_mode_command() -> Vec<String> {
+    vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 60".to_owned()]
+}
+
+#[cfg(windows)]
+fn quiet_copy_mode_command() -> Vec<String> {
+    let system_root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+    let cmd = PathBuf::from(system_root).join("System32").join("cmd.exe");
+    vec![
+        cmd.to_string_lossy().into_owned(),
+        "/d".to_owned(),
+        "/q".to_owned(),
+        "/c".to_owned(),
+        "ping -n 120 127.0.0.1 >NUL".to_owned(),
+    ]
 }
 
 async fn replace_transcript_contents(
@@ -82,10 +114,10 @@ async fn wait_for_capture(
 ) -> String {
     for _ in 0..100 {
         let response = handler
-            .handle(Request::CapturePane(capture_request(
+            .handle(Request::CapturePane(Box::new(capture_request(
                 target.clone(),
                 use_mode_screen,
-            )))
+            ))))
             .await;
         let output = response
             .command_output()
@@ -185,7 +217,7 @@ fn stdin_to_file_command(path: &Path) -> String {
 
 async fn set_copy_command(handler: &RequestHandler, command: String) {
     let response = handler
-        .handle(Request::SetOptionByName(SetOptionByNameRequest {
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
             scope: OptionScopeSelector::ServerGlobal,
             name: "copy-command".to_owned(),
             value: Some(command),
@@ -195,7 +227,7 @@ async fn set_copy_command(handler: &RequestHandler, command: String) {
             unset_pane_overrides: false,
             format: false,
             format_target: None,
-        }))
+        })))
         .await;
     assert!(
         matches!(response, Response::SetOptionByName(_)),

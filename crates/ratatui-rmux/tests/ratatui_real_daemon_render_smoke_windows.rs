@@ -16,6 +16,9 @@ use rmux_sdk::{
     SessionName,
 };
 
+#[path = "../../../tests/support/windows_cargo_build.rs"]
+mod windows_cargo_build;
+
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 const MARKER: &str = "RMUX_RATATUI_WINDOWS_RENDER";
@@ -219,6 +222,7 @@ fn resolve_rmux_binary() -> TestResult<PathBuf> {
         return Ok(candidate);
     }
 
+    let _cargo_build_guard = windows_cargo_build::acquire()?;
     let status = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
         .arg("build")
         .arg("--bin")

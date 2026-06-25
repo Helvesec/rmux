@@ -32,13 +32,13 @@ async fn bind_key_without_a_command_requires_an_existing_binding() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::BindKey(BindKeyRequest {
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
             table_name: "root".to_owned(),
             key: "User1000".to_owned(),
             note: Some("missing".to_owned()),
             repeat: true,
             command: None,
-        }))
+        })))
         .await;
 
     assert!(matches!(response, Response::Error(_)));
@@ -49,18 +49,18 @@ async fn bind_key_without_a_command_updates_note_and_repeat_in_place() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::BindKey(BindKeyRequest {
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
             table_name: "prefix".to_owned(),
             key: "C-b".to_owned(),
             note: Some("updated note".to_owned()),
             repeat: true,
             command: None,
-        }))
+        })))
         .await;
     assert!(matches!(response, Response::BindKey(_)));
 
     let listed = handler
-        .handle(Request::ListKeys(ListKeysRequest {
+        .handle(Request::ListKeys(Box::new(ListKeysRequest {
             table_name: Some("prefix".to_owned()),
             first_only: true,
             notes: false,
@@ -70,7 +70,7 @@ async fn bind_key_without_a_command_updates_note_and_repeat_in_place() {
             sort_order: None,
             prefix: None,
             key: Some("C-b".to_owned()),
-        }))
+        })))
         .await;
     let Response::ListKeys(response) = listed else {
         panic!("expected list-keys response");
@@ -109,12 +109,12 @@ async fn list_keys_notes_render_effective_prefix_column() {
             command: Some(vec!["display-message".to_owned(), "root".to_owned()]),
         },
     ] {
-        let response = handler.handle(Request::BindKey(request)).await;
+        let response = handler.handle(Request::BindKey(Box::new(request))).await;
         assert!(matches!(response, Response::BindKey(_)));
     }
 
     let listed = handler
-        .handle(Request::ListKeys(ListKeysRequest {
+        .handle(Request::ListKeys(Box::new(ListKeysRequest {
             table_name: None,
             first_only: false,
             notes: true,
@@ -124,7 +124,7 @@ async fn list_keys_notes_render_effective_prefix_column() {
             sort_order: None,
             prefix: None,
             key: None,
-        }))
+        })))
         .await;
     let Response::ListKeys(response) = listed else {
         panic!("expected list-keys response");
@@ -134,7 +134,7 @@ async fn list_keys_notes_render_effective_prefix_column() {
     assert!(stdout.contains("    F12     root note\n"), "{stdout:?}");
 
     let listed = handler
-        .handle(Request::ListKeys(ListKeysRequest {
+        .handle(Request::ListKeys(Box::new(ListKeysRequest {
             table_name: None,
             first_only: false,
             notes: true,
@@ -144,7 +144,7 @@ async fn list_keys_notes_render_effective_prefix_column() {
             sort_order: None,
             prefix: Some("PFX".to_owned()),
             key: None,
-        }))
+        })))
         .await;
     let Response::ListKeys(response) = listed else {
         panic!("expected list-keys response");
@@ -159,7 +159,7 @@ async fn list_keys_single_key_filter_uses_tmux_unpadded_alignment() {
     let handler = RequestHandler::new();
 
     let listed = handler
-        .handle(Request::ListKeys(ListKeysRequest {
+        .handle(Request::ListKeys(Box::new(ListKeysRequest {
             table_name: Some("prefix".to_owned()),
             first_only: false,
             notes: false,
@@ -169,7 +169,7 @@ async fn list_keys_single_key_filter_uses_tmux_unpadded_alignment() {
             sort_order: None,
             prefix: None,
             key: Some("C-b".to_owned()),
-        }))
+        })))
         .await;
     let Response::ListKeys(response) = listed else {
         panic!("expected list-keys response");
@@ -185,7 +185,7 @@ async fn list_keys_single_key_filter_aligns_multiple_matching_tables() {
     let handler = RequestHandler::new();
 
     let listed = handler
-        .handle(Request::ListKeys(ListKeysRequest {
+        .handle(Request::ListKeys(Box::new(ListKeysRequest {
             table_name: None,
             first_only: false,
             notes: false,
@@ -195,7 +195,7 @@ async fn list_keys_single_key_filter_aligns_multiple_matching_tables() {
             sort_order: None,
             prefix: None,
             key: Some("C-b".to_owned()),
-        }))
+        })))
         .await;
     let Response::ListKeys(response) = listed else {
         panic!("expected list-keys response");
@@ -216,7 +216,7 @@ async fn list_keys_single_key_filter_errors_when_unbound() {
     let handler = RequestHandler::new();
 
     let listed = handler
-        .handle(Request::ListKeys(ListKeysRequest {
+        .handle(Request::ListKeys(Box::new(ListKeysRequest {
             table_name: Some("prefix".to_owned()),
             first_only: false,
             notes: false,
@@ -226,7 +226,7 @@ async fn list_keys_single_key_filter_errors_when_unbound() {
             sort_order: None,
             prefix: None,
             key: Some("Z".to_owned()),
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -242,7 +242,7 @@ async fn list_keys_rejects_unknown_sort_orders() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::ListKeys(ListKeysRequest {
+        .handle(Request::ListKeys(Box::new(ListKeysRequest {
             table_name: None,
             first_only: false,
             notes: false,
@@ -252,7 +252,7 @@ async fn list_keys_rejects_unknown_sort_orders() {
             sort_order: Some("bogus".to_owned()),
             prefix: None,
             key: None,
-        }))
+        })))
         .await;
 
     assert!(matches!(response, Response::Error(_)));
@@ -317,7 +317,7 @@ async fn repeating_non_repeat_lookup_restarts_in_the_default_table() {
             ]),
         },
     ] {
-        let response = handler.handle(Request::BindKey(request)).await;
+        let response = handler.handle(Request::BindKey(Box::new(request))).await;
         assert!(matches!(response, Response::BindKey(_)));
     }
 
@@ -463,7 +463,7 @@ async fn repeat_timeout_clears_custom_key_tables_without_waiting_for_the_next_ke
         .await;
 
     let bound = handler
-        .handle(Request::BindKey(BindKeyRequest {
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
             table_name: "my-table".to_owned(),
             key: "r".to_owned(),
             note: Some("repeat".to_owned()),
@@ -474,7 +474,7 @@ async fn repeat_timeout_clears_custom_key_tables_without_waiting_for_the_next_ke
                 "repeat-hit".to_owned(),
                 "yes".to_owned(),
             ]),
-        }))
+        })))
         .await;
     assert!(matches!(bound, Response::BindKey(_)));
 
@@ -547,7 +547,7 @@ async fn unbind_key_all_removes_active_bindings_without_dropping_default_tables(
     ));
 
     let listed = handler
-        .handle(Request::ListKeys(ListKeysRequest {
+        .handle(Request::ListKeys(Box::new(ListKeysRequest {
             table_name: Some("prefix".to_owned()),
             first_only: false,
             notes: false,
@@ -557,7 +557,7 @@ async fn unbind_key_all_removes_active_bindings_without_dropping_default_tables(
             sort_order: None,
             prefix: None,
             key: None,
-        }))
+        })))
         .await;
     let Response::ListKeys(response) = listed else {
         panic!("expected list-keys response");
@@ -565,13 +565,13 @@ async fn unbind_key_all_removes_active_bindings_without_dropping_default_tables(
     assert_eq!(response.match_count, 0);
 
     let rebound = handler
-        .handle(Request::BindKey(BindKeyRequest {
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
             table_name: "prefix".to_owned(),
             key: "User1000".to_owned(),
             note: Some("user".to_owned()),
             repeat: false,
             command: Some(vec!["send-prefix".to_owned()]),
-        }))
+        })))
         .await;
     assert!(matches!(rebound, Response::BindKey(_)));
 }

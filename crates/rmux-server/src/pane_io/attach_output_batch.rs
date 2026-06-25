@@ -31,7 +31,24 @@ pub(super) fn collect_attach_output_batch(
     first_item: OutputCursorItem,
     receiver: Option<&mut PaneOutputReceiver>,
 ) -> AttachOutputBatch {
-    let mut batch = AttachOutputBatchBuilder::default();
+    collect_attach_output_batch_with_mode(first_item, receiver, ByteCollection::Collect)
+}
+
+#[cfg(any(unix, windows))]
+pub(super) fn collect_attach_output_batch_metadata(
+    first_item: OutputCursorItem,
+    receiver: Option<&mut PaneOutputReceiver>,
+) -> AttachOutputBatch {
+    collect_attach_output_batch_with_mode(first_item, receiver, ByteCollection::Skip)
+}
+
+#[cfg(any(unix, windows))]
+fn collect_attach_output_batch_with_mode(
+    first_item: OutputCursorItem,
+    receiver: Option<&mut PaneOutputReceiver>,
+    byte_collection: ByteCollection,
+) -> AttachOutputBatch {
+    let mut batch = AttachOutputBatchBuilder::new(byte_collection);
     if let Some(result) = batch.push_first(first_item) {
         return result;
     }
@@ -56,6 +73,7 @@ pub(super) fn collect_attach_output_batch(
 #[cfg(any(unix, windows))]
 #[derive(Default)]
 struct AttachOutputBatchBuilder {
+    byte_collection: ByteCollection,
     saw_output_bytes: bool,
     bytes_seen: usize,
     events_seen: usize,
@@ -67,6 +85,13 @@ struct AttachOutputBatchBuilder {
 
 #[cfg(any(unix, windows))]
 impl AttachOutputBatchBuilder {
+    fn new(byte_collection: ByteCollection) -> Self {
+        Self {
+            byte_collection,
+            ..Self::default()
+        }
+    }
+
     fn push_first(&mut self, item: OutputCursorItem) -> Option<AttachOutputBatch> {
         self.push(item, GapLog::AlreadyLogged)
     }
@@ -80,9 +105,15 @@ impl AttachOutputBatchBuilder {
             OutputCursorItem::Event(event) => {
                 let byte_len = event.byte_len();
                 let has_bytes = !event.is_empty();
-                let (bytes, passthroughs) = event.into_parts();
-                let has_passthroughs = !passthroughs.is_empty();
-                self.bytes.extend_from_slice(&bytes);
+                let has_passthroughs = !event.passthroughs().is_empty();
+                let passthroughs = match self.byte_collection {
+                    ByteCollection::Collect => {
+                        let (bytes, passthroughs) = event.into_parts();
+                        self.bytes.extend_from_slice(&bytes);
+                        passthroughs
+                    }
+                    ByteCollection::Skip => event.into_passthroughs(),
+                };
                 self.passthroughs.extend(passthroughs);
                 if has_bytes {
                     self.saw_output_bytes = true;
@@ -129,6 +160,14 @@ impl AttachOutputBatchBuilder {
 }
 
 #[cfg(any(unix, windows))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ByteCollection {
+    #[default]
+    Collect,
+    Skip,
+}
+
+#[cfg(any(unix, windows))]
 enum GapLog {
     AlreadyLogged,
     Log,
@@ -139,7 +178,9 @@ mod tests {
     use rmux_core::events::OutputCursorItem;
     use rmux_core::TerminalPassthrough;
 
-    use super::{collect_attach_output_batch, AttachOutputBatch};
+    use super::{
+        collect_attach_output_batch, collect_attach_output_batch_metadata, AttachOutputBatch,
+    };
     use crate::pane_io::types::pane_output_channel_with_limits;
 
     #[test]
@@ -175,6 +216,42 @@ mod tests {
         };
         assert_eq!(bytes, b"onetwo");
         assert_eq!(passthroughs.len(), 2);
+        assert!(!close_after_render);
+        assert!(!sustained);
+    }
+
+    #[test]
+    fn collect_metadata_batch_skips_output_byte_clones() {
+        let sender = pane_output_channel_with_limits(8, 1024);
+        let mut receiver = sender.subscribe();
+        sender.send_for_generation_with_passthroughs(
+            None,
+            b"one".to_vec(),
+            vec![TerminalPassthrough::kitty_graphics(
+                0,
+                0,
+                b"Gf=100;one".to_vec(),
+            )],
+        );
+        sender.send(b"two".to_vec());
+
+        let first = receiver.try_recv().expect("first output event");
+        let batch = collect_attach_output_batch_metadata(first, Some(&mut receiver));
+
+        let AttachOutputBatch::Events {
+            bytes,
+            passthroughs,
+            close_after_render,
+            sustained,
+        } = batch
+        else {
+            panic!("expected coalesced output batch");
+        };
+        assert!(
+            bytes.is_empty(),
+            "metadata batch must not clone raw output bytes"
+        );
+        assert_eq!(passthroughs.len(), 1);
         assert!(!close_after_render);
         assert!(!sustained);
     }

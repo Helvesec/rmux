@@ -43,7 +43,7 @@ pub(super) async fn split_pane_with_process(
     crate::capabilities::require_process_command_if_present(client, process_command.as_ref())
         .await?;
     match client
-        .request(Request::SplitWindowExt(SplitWindowExtRequest {
+        .request(Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
             target: SplitWindowTarget::Pane(target.into()),
             direction: direction.axis(),
             before: direction.before(),
@@ -57,7 +57,7 @@ pub(super) async fn split_pane_with_process(
             preserve_zoom: false,
             full_size: false,
             stdin_payload: None,
-        }))
+        })))
         .await?
     {
         Response::SplitWindow(response) => Ok(response.pane.into()),

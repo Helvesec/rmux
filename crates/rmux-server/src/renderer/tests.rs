@@ -329,13 +329,41 @@ fn pane_render_uses_line_clear_for_unstyled_full_width_panes() {
         .expect("pane frame is utf-8");
 
     assert!(
-        frame.contains("\u{1b}[1;1Hshort\u{1b}[0m\u{1b}[K"),
+        frame.contains("\u{1b}[1;1H\u{1b}[0mshort\u{1b}[0m\u{1b}[K"),
         "{frame:?}"
     );
     assert!(frame.contains("\u{1b}[2;1H\u{1b}[0m\u{1b}[K"), "{frame:?}");
     assert!(
         !frame.contains("short       "),
         "full-width unstyled panes should clear trailing cells instead of padding: {frame:?}"
+    );
+}
+
+#[test]
+fn styled_pane_screen_borrows_when_no_overlay_is_needed() {
+    let size = TerminalSize { cols: 6, rows: 2 };
+    let session = Session::new(session_name("alpha"), size);
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let screen = screen_with(b"D", size);
+    let options = OptionStore::new();
+
+    assert!(matches!(
+        super::styled_pane_screen(&session, &options, pane, &screen),
+        std::borrow::Cow::Borrowed(_)
+    ));
+}
+
+#[test]
+fn attach_render_golden_normal_idle_pane_is_byte_stable() {
+    let size = TerminalSize { cols: 6, rows: 2 };
+    let session = Session::new(session_name("alpha"), size);
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let screen = screen_with(b"D", size);
+    let options = OptionStore::new();
+
+    assert_eq!(
+        super::render_pane_screen(&session, &options, pane, &screen),
+        b"\x1b[s\x1b[0m\x1b[1;1H\x1b[0mD\x1b[0m\x1b[K\x1b[0m\x1b[u"
     );
 }
 
@@ -354,6 +382,32 @@ fn pane_render_keeps_padding_for_split_panes_to_avoid_clearing_neighbors() {
     assert!(
         !frame.contains("\u{1b}[K"),
         "split-pane repaint must not clear to terminal EOL: {frame:?}"
+    );
+}
+
+#[test]
+fn pane_render_resets_before_default_split_pane_row_after_styled_row() {
+    let size = TerminalSize { cols: 20, rows: 4 };
+    let mut session = Session::new(session_name("alpha"), size);
+    session.split_active_pane().expect("split succeeds");
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let screen = screen_with(b"\x1b[48;5;255m          \r\n\x1b[0mplain", size);
+    let options = OptionStore::new();
+
+    let frame = String::from_utf8(super::render_pane_screen(&session, &options, pane, &screen))
+        .expect("pane frame is utf-8");
+
+    assert!(
+        frame.contains("\u{1b}[1;1H\u{1b}[0m\u{1b}[48;5;255m"),
+        "{frame:?}"
+    );
+    assert!(
+        frame.contains("\u{1b}[2;1H\u{1b}[0mplain"),
+        "default rows must not inherit the previous row's background: {frame:?}"
+    );
+    assert!(
+        !frame.contains("\u{1b}[K"),
+        "split-pane repaint must still avoid clearing neighboring columns: {frame:?}"
     );
 }
 

@@ -27,7 +27,7 @@ async fn new_session(handler: &RequestHandler, session_name: &SessionName) {
 
 async fn new_window(handler: &RequestHandler, session_name: &SessionName) -> WindowTarget {
     let response = handler
-        .handle(Request::NewWindow(NewWindowRequest {
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
             target: session_name.clone(),
             name: None,
             detached: true,
@@ -37,7 +37,7 @@ async fn new_window(handler: &RequestHandler, session_name: &SessionName) -> Win
             process_command: None,
             target_window_index: None,
             insert_at_target: false,
-        }))
+        })))
         .await;
 
     let Response::NewWindow(response) = response else {

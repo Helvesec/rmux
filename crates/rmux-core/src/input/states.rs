@@ -1,5 +1,7 @@
 //! Parser states and transition tables matching tmux `input.c:390–507`.
 
+use std::sync::LazyLock;
+
 /// The 17 parser states matching tmux exactly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InputState {
@@ -56,6 +58,7 @@ pub(crate) enum Handler {
 }
 
 /// A single entry in a state transition table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TransitionEntry {
     pub first: u8,
     pub last: u8,
@@ -64,12 +67,35 @@ pub(crate) struct TransitionEntry {
 }
 
 /// Resolved transition from a table lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Transition {
     pub handler: Handler,
     pub next_state: Option<InputState>,
 }
 
 impl InputState {
+    pub(crate) const COUNT: usize = 17;
+
+    pub(crate) const ALL: [Self; Self::COUNT] = [
+        Self::Ground,
+        Self::EscEnter,
+        Self::EscIntermediate,
+        Self::CsiEnter,
+        Self::CsiParameter,
+        Self::CsiIntermediate,
+        Self::CsiIgnore,
+        Self::DcsEnter,
+        Self::DcsParameter,
+        Self::DcsIntermediate,
+        Self::DcsHandler,
+        Self::DcsEscape,
+        Self::DcsIgnore,
+        Self::OscString,
+        Self::ApcString,
+        Self::RenameString,
+        Self::ConsumeSt,
+    ];
+
     /// Returns the transition table for this state.
     pub(crate) fn transition_table(self) -> &'static [TransitionEntry] {
         match self {
@@ -92,6 +118,57 @@ impl InputState {
             Self::ConsumeSt => CONSUME_ST_TABLE,
         }
     }
+
+    pub(crate) fn transition_for_byte(self, byte: u8) -> Transition {
+        TRANSITION_LUT[self.index()][byte as usize]
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Ground => 0,
+            Self::EscEnter => 1,
+            Self::EscIntermediate => 2,
+            Self::CsiEnter => 3,
+            Self::CsiParameter => 4,
+            Self::CsiIntermediate => 5,
+            Self::CsiIgnore => 6,
+            Self::DcsEnter => 7,
+            Self::DcsParameter => 8,
+            Self::DcsIntermediate => 9,
+            Self::DcsHandler => 10,
+            Self::DcsEscape => 11,
+            Self::DcsIgnore => 12,
+            Self::OscString => 13,
+            Self::ApcString => 14,
+            Self::RenameString => 15,
+            Self::ConsumeSt => 16,
+        }
+    }
+}
+
+static TRANSITION_LUT: LazyLock<[[Transition; 256]; InputState::COUNT]> =
+    LazyLock::new(build_transition_lut);
+
+fn build_transition_lut() -> [[Transition; 256]; InputState::COUNT] {
+    let fallback = Transition {
+        handler: Handler::None,
+        next_state: None,
+    };
+    let mut lut = [[fallback; 256]; InputState::COUNT];
+
+    for state in InputState::ALL {
+        let row = &mut lut[state.index()];
+        for entry in state.transition_table() {
+            for byte in entry.first..=entry.last {
+                row[byte as usize] = Transition {
+                    handler: entry.handler,
+                    next_state: entry.next_state,
+                };
+            }
+        }
+    }
+
+    lut
 }
 
 // Shorthand.

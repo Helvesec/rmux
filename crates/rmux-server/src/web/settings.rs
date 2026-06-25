@@ -11,6 +11,7 @@ const DEFAULT_PORT: u16 = 9777;
 pub(crate) struct WebShareSettings {
     pub(super) host: String,
     pub(super) port: u16,
+    pub(super) port_explicit: bool,
     pub(super) frontend_origin: String,
     pub(super) frontend_url: String,
 }
@@ -20,6 +21,7 @@ impl Default for WebShareSettings {
         Self {
             host: DEFAULT_HOST.to_owned(),
             port: DEFAULT_PORT,
+            port_explicit: false,
             frontend_origin: DEFAULT_FRONTEND_ORIGIN.to_owned(),
             frontend_url: DEFAULT_FRONTEND_URL.to_owned(),
         }
@@ -27,9 +29,18 @@ impl Default for WebShareSettings {
 }
 
 impl WebShareSettings {
+    #[cfg(test)]
     pub(crate) fn from_options(
         port: u16,
         frontend_origin: Option<String>,
+    ) -> Result<Self, RmuxError> {
+        Self::from_options_with_port_explicit(port, frontend_origin, true)
+    }
+
+    pub(crate) fn from_options_with_port_explicit(
+        port: u16,
+        frontend_origin: Option<String>,
+        port_explicit: bool,
     ) -> Result<Self, RmuxError> {
         if port == 0 {
             return Err(RmuxError::Server(
@@ -46,6 +57,7 @@ impl WebShareSettings {
         Ok(Self {
             host: DEFAULT_HOST.to_owned(),
             port,
+            port_explicit,
             frontend_origin: frontend.origin,
             frontend_url: frontend.url,
         })
@@ -61,5 +73,13 @@ impl WebShareSettings {
 
     pub(crate) fn local_endpoint_origin(&self) -> String {
         format!("http://{}:{}", self.host, self.port)
+    }
+
+    pub(crate) const fn allows_automatic_port_fallback(&self) -> bool {
+        !self.port_explicit
+    }
+
+    pub(crate) fn set_port(&mut self, port: u16) {
+        self.port = port;
     }
 }

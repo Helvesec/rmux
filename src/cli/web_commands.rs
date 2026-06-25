@@ -36,17 +36,21 @@ pub(super) fn run_web_share(
     let response = connection
         .web_share(request)
         .map_err(ExitFailure::from_client)?;
-    if let Response::WebShare(WebShareResponse::Created(created)) = &response {
-        write_created_share_output(created)?;
-        return Ok(0);
+    if let Response::WebShare(response) = &response {
+        if let WebShareResponse::Created(created) = response.as_ref() {
+            write_created_share_output(created)?;
+            return Ok(0);
+        }
     }
     if disconnect_output {
-        if let Response::WebShare(WebShareResponse::Stopped(stopped)) = &response {
-            write_command_output(&disconnect_share_output(
-                stopped.share_id.as_str(),
-                stopped.stopped,
-            ))?;
-            return Ok(0);
+        if let Response::WebShare(response) = &response {
+            if let WebShareResponse::Stopped(stopped) = response.as_ref() {
+                write_command_output(&disconnect_share_output(
+                    stopped.share_id.as_str(),
+                    stopped.stopped,
+                ))?;
+                return Ok(0);
+            }
         }
     }
     finish_command_success(response, "web-share")

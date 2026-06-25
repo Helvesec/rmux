@@ -3,8 +3,10 @@
 mod common;
 
 use std::error::Error;
+use std::time::{Duration, Instant};
 
-use common::{assert_success, stderr, stdout, CliHarness};
+use common::{assert_success, stderr, stdout, AttachedSession, CliHarness};
+use rmux_pty::TerminalSize;
 
 #[test]
 fn list_panes_all_sessions_prints_all_panes_across_session_windows() -> Result<(), Box<dyn Error>> {
@@ -132,6 +134,117 @@ fn list_panes_exposes_pane_geometry_through_the_shared_formatter() -> Result<(),
     assert_eq!(stdout(&listed), "80x24\n");
     assert!(stderr(&listed).is_empty());
     Ok(())
+}
+
+#[test]
+fn default_list_panes_uses_attached_visible_geometry() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("list-panes-default-attached-geometry")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-x", "80", "-y", "24"])?);
+
+    let mut attach = AttachedSession::spawn(&harness, "alpha", TerminalSize::new(80, 24))?;
+    attach.wait_for_raw_mode(Duration::from_secs(10))?;
+    wait_for_attached_client(&harness)?;
+
+    let default = harness.run(&["list-panes", "-t", "alpha"])?;
+    assert_eq!(default.status.code(), Some(0));
+    assert!(stderr(&default).is_empty());
+
+    let formatted = harness.run(&[
+        "list-panes",
+        "-t",
+        "alpha",
+        "-F",
+        "#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(formatted.status.code(), Some(0));
+    assert!(stderr(&formatted).is_empty());
+
+    let formatted_geometry = stdout(&formatted).trim().to_owned();
+    assert_eq!(formatted_geometry, "80x23");
+    assert!(
+        stdout(&default).contains(&format!("[{formatted_geometry}]")),
+        "default list-panes output should use attached visible geometry {formatted_geometry:?}, got {:?}",
+        stdout(&default)
+    );
+
+    assert_success(&harness.run(&["kill-session", "-t", "alpha"])?);
+    let status = attach.wait_for_exit(Duration::from_secs(10))?;
+    assert_eq!(status.code(), Some(0));
+    Ok(())
+}
+
+#[test]
+fn default_list_panes_uses_reflowed_attached_geometry_for_vertical_splits(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("list-panes-default-attached-vertical")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-x", "80", "-y", "24"])?);
+
+    let mut attach = AttachedSession::spawn(&harness, "alpha", TerminalSize::new(80, 24))?;
+    attach.wait_for_raw_mode(Duration::from_secs(10))?;
+    wait_for_attached_client(&harness)?;
+
+    assert_success(&harness.run(&["split-window", "-v", "-t", "alpha"])?);
+
+    let default = harness.run(&["list-panes", "-t", "alpha"])?;
+    assert_eq!(default.status.code(), Some(0));
+    assert!(stderr(&default).is_empty());
+
+    let formatted = harness.run(&[
+        "list-panes",
+        "-t",
+        "alpha",
+        "-F",
+        "#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(formatted.status.code(), Some(0));
+    assert!(stderr(&formatted).is_empty());
+
+    let default_geometries = stdout(&default)
+        .lines()
+        .map(default_list_panes_geometry)
+        .collect::<Result<Vec<_>, _>>()?;
+    let formatted_geometries = stdout(&formatted)
+        .lines()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        default_geometries,
+        formatted_geometries,
+        "default list-panes output should match formatter geometries; default={:?}, formatted={:?}",
+        stdout(&default),
+        stdout(&formatted)
+    );
+
+    assert_success(&harness.run(&["kill-session", "-t", "alpha"])?);
+    let status = attach.wait_for_exit(Duration::from_secs(10))?;
+    assert_eq!(status.code(), Some(0));
+    Ok(())
+}
+
+fn default_list_panes_geometry(line: &str) -> Result<String, Box<dyn Error>> {
+    let geometry = line
+        .split('[')
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .ok_or_else(|| format!("missing geometry bracket in default list-panes line: {line}"))?;
+    Ok(geometry.to_owned())
+}
+
+fn wait_for_attached_client(harness: &CliHarness) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let clients = harness.run(&["list-clients", "-F", "#{session_name}"])?;
+        if clients.status.code() == Some(0) && stdout(&clients).lines().any(|line| line == "alpha")
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Err("timed out waiting for attached alpha client".into())
 }
 
 #[test]

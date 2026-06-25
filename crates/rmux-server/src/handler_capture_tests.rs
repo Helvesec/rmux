@@ -5,9 +5,9 @@ use super::RequestHandler;
 use rmux_core::{input::InputParser, Screen};
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
-    CapturePaneRequest, LoadBufferRequest, NewSessionRequest, PaneTarget, Request, Response,
-    SaveBufferRequest, SendKeysRequest, SetBufferRequest, SetOptionByNameRequest, SetOptionMode,
-    ShowBufferRequest, TerminalSize,
+    CapturePaneRequest, CapturePaneTargetActionRequest, LoadBufferRequest, NewSessionRequest,
+    PaneTarget, Request, Response, SaveBufferRequest, SendKeysRequest, SetBufferRequest,
+    SetOptionByNameRequest, SetOptionMode, ShowBufferRequest, TerminalSize,
 };
 use tokio::time::sleep;
 
@@ -97,6 +97,50 @@ async fn create_session_with_size(handler: &RequestHandler, name: &str, size: Te
     assert!(matches!(response, Response::NewSession(_)));
 }
 
+#[tokio::test]
+async fn target_action_capture_resolves_raw_target_server_side() {
+    let handler = RequestHandler::new();
+    create_session_with_size(&handler, "alpha", TerminalSize { cols: 20, rows: 4 }).await;
+    let target = PaneTarget::with_window(session_name("alpha"), 0, 0);
+    replace_transcript_contents(
+        &handler,
+        &target,
+        TerminalSize { cols: 20, rows: 4 },
+        b"target-capture",
+    )
+    .await;
+
+    let response = handler
+        .handle(Request::CapturePaneTargetAction(Box::new(
+            CapturePaneTargetActionRequest {
+                target: Some("alpha:0.0".to_owned()),
+                start: Some(0),
+                end: Some(0),
+                print: true,
+                buffer_name: None,
+                alternate: false,
+                escape_ansi: false,
+                escape_sequences: false,
+                join_wrapped: false,
+                use_mode_screen: false,
+                preserve_trailing_spaces: false,
+                do_not_trim_spaces: false,
+                pending_input: false,
+                quiet: false,
+                start_is_absolute: false,
+                end_is_absolute: false,
+            },
+        )))
+        .await;
+    let Response::CapturePane(response) = response else {
+        panic!("expected capture-pane response, got {response:?}");
+    };
+    let output = response
+        .command_output()
+        .expect("capture-pane -p returns command output");
+    assert_eq!(output.stdout(), b"target-capture\n");
+}
+
 async fn replace_transcript_contents(
     handler: &RequestHandler,
     target: &PaneTarget,
@@ -161,13 +205,13 @@ async fn wait_for_capture(handler: &RequestHandler, target: PaneTarget, marker: 
     let mut last_stdout = Vec::new();
     while Instant::now() < deadline {
         let response = handler
-            .handle(Request::CapturePane(capture_pane_request(
+            .handle(Request::CapturePane(Box::new(capture_pane_request(
                 target.clone(),
                 None,
                 None,
                 true,
                 None,
-            )))
+            ))))
             .await;
 
         let output = response
@@ -216,13 +260,13 @@ async fn capture_pane_writes_named_buffer() {
     wait_for_capture(&handler, target.clone(), marker).await;
 
     let capture = handler
-        .handle(Request::CapturePane(capture_pane_request(
+        .handle(Request::CapturePane(Box::new(capture_pane_request(
             target,
             None,
             None,
             false,
             Some("capture-buffer"),
-        )))
+        ))))
         .await;
     match capture {
         Response::CapturePane(response) => {
@@ -252,7 +296,9 @@ async fn capture_pane_do_not_trim_uses_tmux_cell_capacity() {
 
     let mut request = capture_pane_request(target, None, None, true, None);
     request.do_not_trim_spaces = true;
-    let response = handler.handle(Request::CapturePane(request)).await;
+    let response = handler
+        .handle(Request::CapturePane(Box::new(request)))
+        .await;
     let output = response
         .command_output()
         .expect("capture-pane -Np returns command output");
@@ -268,7 +314,7 @@ async fn alternate_screen_off_keeps_program_output_on_main_screen() {
     create_session_with_size(&handler, "altscreen", TerminalSize { cols: 20, rows: 5 }).await;
 
     let response = handler
-        .handle(Request::SetOptionByName(SetOptionByNameRequest {
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
             scope: OptionScopeSelector::WindowGlobal,
             name: "alternate-screen".to_owned(),
             value: Some("off".to_owned()),
@@ -278,21 +324,21 @@ async fn alternate_screen_off_keeps_program_output_on_main_screen() {
             unset_pane_overrides: false,
             format: false,
             format_target: None,
-        }))
+        })))
         .await;
     assert!(matches!(response, Response::SetOptionByName(_)));
 
     append_to_transcript(
         &handler,
         &target,
-        b"\x1b[?1049hALTLINE\r\n\x1b[?1049lMAINLINE\r\n",
+        b"\x1b[2J\x1b[H\x1b[?1049hALTLINE\r\n\x1b[?1049lMAINLINE\r\n",
     )
     .await;
 
     let response = handler
-        .handle(Request::CapturePane(capture_pane_request(
+        .handle(Request::CapturePane(Box::new(capture_pane_request(
             target, None, None, true, None,
-        )))
+        ))))
         .await;
     let output = response
         .command_output()

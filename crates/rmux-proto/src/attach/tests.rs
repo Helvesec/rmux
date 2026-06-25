@@ -1,8 +1,9 @@
 use super::{
     decode_attach_data_frame, encode_attach_data_into_slice, encode_attach_message,
-    AttachFrameDecoder, AttachMessage, AttachShellCommand, AttachedKeystroke, KeyDispatched,
+    encode_data_like_message, AttachFrameDecoder, AttachMessage, AttachShellCommand,
+    AttachedKeystroke, KeyDispatched, KEYSTROKE_TAG, WINDOWS_CONSOLE_KEYSTROKE_TAG,
 };
-use crate::{RmuxError, TerminalGeometry, TerminalPixels, TerminalSize};
+use crate::{AttachedWindowsConsoleKey, RmuxError, TerminalGeometry, TerminalPixels, TerminalSize};
 
 #[test]
 fn data_messages_round_trip() {
@@ -132,6 +133,61 @@ fn keystroke_messages_round_trip() {
     let mut decoder = AttachFrameDecoder::new();
     decoder.push_bytes(&encoded);
 
+    assert_eq!(encoded[0], KEYSTROKE_TAG);
+    assert_eq!(
+        decoder.next_message().expect("decode attach keystroke"),
+        Some(message)
+    );
+}
+
+#[test]
+fn plain_keystroke_uses_legacy_vec_payload() {
+    let bytes = b"\x1b[A".to_vec();
+    let encoded = encode_attach_message(&AttachMessage::Keystroke(AttachedKeystroke::new(
+        bytes.clone(),
+    )))
+    .expect("encode attach keystroke");
+    let payload_len = u32::from_le_bytes(
+        encoded[1..5]
+            .try_into()
+            .expect("legacy keystroke payload length"),
+    ) as usize;
+    let payload = &encoded[5..5 + payload_len];
+
+    assert_eq!(encoded[0], KEYSTROKE_TAG);
+    assert_eq!(
+        bincode::deserialize::<Vec<u8>>(payload).expect("legacy vector payload decodes"),
+        bytes
+    );
+}
+
+#[test]
+fn legacy_keystroke_payload_decodes_under_current_codec() {
+    let bytes = vec![0x10];
+    let payload = bincode::serialize(&bytes).expect("legacy keystroke payload encodes");
+    let encoded =
+        encode_data_like_message(KEYSTROKE_TAG, &payload).expect("encode legacy keystroke frame");
+    let mut decoder = AttachFrameDecoder::new();
+    decoder.push_bytes(&encoded);
+
+    assert_eq!(
+        decoder
+            .next_message()
+            .expect("decode legacy attach keystroke"),
+        Some(AttachMessage::Keystroke(AttachedKeystroke::new(bytes)))
+    );
+}
+
+#[test]
+fn keystroke_messages_preserve_windows_console_key() {
+    let key = AttachedWindowsConsoleKey::new(0x44, 0x20, 0x04, 0x0008, 1);
+    let message =
+        AttachMessage::Keystroke(AttachedKeystroke::new(vec![0x04]).with_windows_console_key(key));
+    let encoded = encode_attach_message(&message).expect("encode attach keystroke");
+    let mut decoder = AttachFrameDecoder::new();
+    decoder.push_bytes(&encoded);
+
+    assert_eq!(encoded[0], WINDOWS_CONSOLE_KEYSTROKE_TAG);
     assert_eq!(
         decoder.next_message().expect("decode attach keystroke"),
         Some(message)

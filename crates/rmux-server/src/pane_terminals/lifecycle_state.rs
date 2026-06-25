@@ -33,6 +33,8 @@ impl fmt::Debug for PrivatePaneEnvironment {
 pub(crate) enum PaneLifecycleProcessState {
     #[default]
     Unknown,
+    #[cfg(windows)]
+    Starting,
     Running {
         pid: Option<u32>,
     },
@@ -136,10 +138,27 @@ pub(in crate::pane_terminals) struct PaneLifecycleSpawn {
 }
 
 impl HandlerState {
+    #[cfg(windows)]
+    pub(in crate::pane_terminals) fn record_pane_lifecycle_starting(
+        &mut self,
+        spawn: PaneLifecycleSpawn,
+    ) -> u64 {
+        self.record_pane_lifecycle_with_process(spawn, PaneLifecycleProcessState::Starting)
+    }
+
     pub(in crate::pane_terminals) fn record_pane_lifecycle_spawn(
         &mut self,
         spawn: PaneLifecycleSpawn,
     ) {
+        let pid = spawn.pid;
+        self.record_pane_lifecycle_with_process(spawn, PaneLifecycleProcessState::Running { pid });
+    }
+
+    fn record_pane_lifecycle_with_process(
+        &mut self,
+        spawn: PaneLifecycleSpawn,
+        process: PaneLifecycleProcessState,
+    ) -> u64 {
         let previous = self.pane_lifecycle.remove(&spawn.pane_id);
         let generation = previous
             .as_ref()
@@ -162,13 +181,30 @@ impl HandlerState {
                 ),
                 tags: Vec::new(),
                 dimensions: spawn.dimensions,
-                process: PaneLifecycleProcessState::Running { pid: spawn.pid },
+                process,
                 generation,
                 revision,
                 output_sequence,
                 exit_state: None,
             },
         );
+        generation
+    }
+
+    #[cfg(windows)]
+    pub(in crate::pane_terminals) fn mark_pane_lifecycle_running(
+        &mut self,
+        pane_id: PaneId,
+        pid: Option<u32>,
+    ) {
+        let Some(state) = self.pane_lifecycle.get_mut(&pane_id) else {
+            return;
+        };
+        if state.process == (PaneLifecycleProcessState::Running { pid }) {
+            return;
+        }
+        state.process = PaneLifecycleProcessState::Running { pid };
+        state.revision = state.revision.saturating_add(1);
     }
 
     pub(in crate::pane_terminals) fn update_pane_lifecycle_output_sequence(
@@ -264,8 +300,8 @@ impl HandlerState {
 
 pub(crate) fn terminal_size_from_geometry(geometry: PaneGeometry) -> TerminalSize {
     TerminalSize {
-        cols: geometry.cols(),
-        rows: geometry.rows(),
+        cols: geometry.cols().max(1),
+        rows: geometry.rows().max(1),
     }
 }
 
@@ -314,7 +350,9 @@ fn percent_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_command_field;
+    use super::{encode_command_field, terminal_size_from_geometry};
+    use rmux_core::PaneGeometry;
+    use rmux_proto::TerminalSize;
 
     #[test]
     fn command_encoding_removes_record_separators_and_newlines() {
@@ -326,5 +364,17 @@ mod tests {
         assert_eq!(encoded, "printf\u{1f}alpha%09beta%0Asecret%1Fgamma%25");
         assert!(!encoded.contains('\t'));
         assert!(!encoded.contains('\n'));
+    }
+
+    #[test]
+    fn terminal_size_from_geometry_never_sends_zero_sized_pty() {
+        assert_eq!(
+            terminal_size_from_geometry(PaneGeometry::new(0, 0, 0, 0)),
+            TerminalSize { cols: 1, rows: 1 }
+        );
+        assert_eq!(
+            terminal_size_from_geometry(PaneGeometry::new(0, 23, 80, 0)),
+            TerminalSize { cols: 80, rows: 1 }
+        );
     }
 }

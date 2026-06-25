@@ -51,10 +51,28 @@ pub fn attach_terminal_with_initial_bytes(
     stream: BlockingLocalStream,
     initial_bytes: Vec<u8>,
 ) -> std::result::Result<(), ClientError> {
+    attach_terminal_with_initial_bytes_and_windows_console_key(stream, initial_bytes, false)
+}
+
+/// Runs the attach loop with optional Windows console-key attach-stream frames.
+///
+/// Enable `windows_console_key_enabled` only after the daemon advertises the
+/// `stream.attach.windows_console_key` capability.
+pub fn attach_terminal_with_initial_bytes_and_windows_console_key(
+    stream: BlockingLocalStream,
+    initial_bytes: Vec<u8>,
+    windows_console_key_enabled: bool,
+) -> std::result::Result<(), ClientError> {
     let input = io::stdin();
     let output = output::AttachStdout::new(io::stdout());
 
-    attach_with_stdio(stream, initial_bytes, input, output)
+    attach_with_stdio(
+        stream,
+        initial_bytes,
+        input,
+        output,
+        windows_console_key_enabled,
+    )
 }
 
 /// Runs the attach loop with an explicit terminal handle.
@@ -71,7 +89,7 @@ where
     Input: Read + AsRawHandle + Send + 'static,
     Output: Write + Send + 'static,
 {
-    attach_with_stdio(stream, Vec::new(), input, output)
+    attach_with_stdio(stream, Vec::new(), input, output, false)
 }
 
 fn attach_with_stdio<Input, Output>(
@@ -79,6 +97,7 @@ fn attach_with_stdio<Input, Output>(
     initial_bytes: Vec<u8>,
     input: Input,
     output: Output,
+    windows_console_key_enabled: bool,
 ) -> std::result::Result<(), ClientError>
 where
     Input: Read + AsRawHandle + Send + 'static,
@@ -94,6 +113,7 @@ where
         &screen_tracker,
         input,
         output,
+        windows_console_key_enabled,
     );
     if result.is_err() && !screen_tracker.was_stopped() {
         let _ = terminal::restore_attach_terminal_state();
@@ -108,6 +128,7 @@ fn drive_attach_stream_with_terminal_state<Input, Output>(
     screen_tracker: &AttachScreenTracker,
     input: Input,
     output: Output,
+    windows_console_key_enabled: bool,
 ) -> std::result::Result<(), ClientError>
 where
     Input: Read + AsRawHandle + Send + 'static,
@@ -126,8 +147,11 @@ where
         screen_tracker.clone(),
         input,
         output,
-        resize_rx,
-        action::ManagedTerminalActions::new(raw_terminal),
+        AttachLoopInputs {
+            resize_rx,
+            actions: action::ManagedTerminalActions::new(raw_terminal),
+            windows_console_key_enabled,
+        },
     )
 }
 
@@ -147,9 +171,18 @@ where
         AttachScreenTracker::default(),
         input,
         output,
-        closed_resize_rx(),
-        action::StreamOnlyActions,
+        AttachLoopInputs {
+            resize_rx: closed_resize_rx(),
+            actions: action::StreamOnlyActions,
+            windows_console_key_enabled: false,
+        },
     )
+}
+
+struct AttachLoopInputs<Actions> {
+    resize_rx: mpsc::UnboundedReceiver<TerminalSize>,
+    actions: Actions,
+    windows_console_key_enabled: bool,
 }
 
 fn drive_attach_stream_inner<Input, Output, Actions>(
@@ -158,14 +191,18 @@ fn drive_attach_stream_inner<Input, Output, Actions>(
     screen_tracker: AttachScreenTracker,
     input: Input,
     output: Output,
-    resize_rx: mpsc::UnboundedReceiver<TerminalSize>,
-    actions: Actions,
+    loop_inputs: AttachLoopInputs<Actions>,
 ) -> std::result::Result<(), ClientError>
 where
     Input: Read + AsRawHandle + Send + 'static,
     Output: Write + Send + 'static,
     Actions: action::AttachActionExecutor + Send + 'static,
 {
+    let AttachLoopInputs {
+        resize_rx,
+        actions,
+        windows_console_key_enabled,
+    } = loop_inputs;
     let input_join_policy = input_join_policy(input.as_raw_handle());
     let (input_tx, input_rx) = mpsc::channel(ATTACH_INPUT_QUEUE_CAPACITY);
     let lock_state = Arc::new(AttachLockState::default());
@@ -190,6 +227,7 @@ where
                 action_tx,
                 action_completion_rx,
                 Arc::clone(&lock_state),
+                windows_console_key_enabled,
             ),
         )
         .await
@@ -228,7 +266,7 @@ where
 
 fn input_loop<Input>(
     mut input: Input,
-    input_tx: mpsc::Sender<Vec<u8>>,
+    input_tx: mpsc::Sender<input::AttachInput>,
     lock_state: Arc<AttachLockState>,
 ) -> std::result::Result<(), ClientError>
 where
@@ -255,9 +293,9 @@ where
             continue;
         }
 
-        let bytes = if let Some(console_input) = console_input.as_mut() {
-            match console_input.read_key_bytes() {
-                Ok(bytes) => bytes,
+        let inputs = if let Some(console_input) = console_input.as_mut() {
+            match console_input.read_key_inputs() {
+                Ok(inputs) => inputs,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(ClientError::Io(error)),
             }
@@ -268,15 +306,19 @@ where
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(ClientError::Io(error)),
             };
-            read_buffer[..bytes_read].to_vec()
+            vec![input::AttachInput::bytes(
+                read_buffer[..bytes_read].to_vec(),
+            )]
         };
 
-        if bytes.is_empty() || locked || lock_state.is_locked() {
+        if inputs.is_empty() || locked || lock_state.is_locked() {
             continue;
         }
 
-        if input_tx.blocking_send(bytes).is_err() {
-            return Ok(());
+        for input in inputs {
+            if input_tx.blocking_send(input).is_err() {
+                return Ok(());
+            }
         }
     }
 }
@@ -398,10 +440,8 @@ mod tests {
         writer.flush()?;
         drop(writer);
 
-        assert_eq!(
-            input_rx.blocking_recv().as_deref(),
-            Some(payload.as_slice())
-        );
+        let received = input_rx.blocking_recv().expect("input payload");
+        assert_eq!(received.payload(), payload.as_slice());
         lock_state.close();
         input_thread
             .join()

@@ -187,8 +187,19 @@ impl Session {
             )));
         }
 
+        self.remove_window_allowing_empty(window_index)
+    }
+
+    pub(crate) fn remove_window_allowing_empty(
+        &mut self,
+        window_index: u32,
+    ) -> Result<Window, RmuxError> {
+        if !self.windows.contains_key(&window_index) {
+            return Err(invalid_window_target(&self.name, window_index));
+        }
+
         let next_active = if self.active_window == window_index {
-            Some(self.next_active_window_after_removal(window_index))
+            (self.windows.len() > 1).then(|| self.next_active_window_after_removal(window_index))
         } else {
             None
         };

@@ -2,7 +2,7 @@ use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::null;
 
-use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
+use windows_sys::Win32::Foundation::{GetLastError, ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::Pipes::CreatePipe;
 
@@ -50,7 +50,14 @@ pub(crate) fn read(handle: &OwnedHandle, buffer: &mut [u8]) -> io::Result<usize>
         )
     };
     if ok == 0 {
-        return Err(last_os_error());
+        let error = unsafe {
+            // SAFETY: `GetLastError` reads the calling thread's last-error slot.
+            GetLastError()
+        };
+        if matches!(error, ERROR_BROKEN_PIPE | ERROR_HANDLE_EOF) {
+            return Ok(0);
+        }
+        return Err(io::Error::from_raw_os_error(error as i32));
     }
     Ok(bytes_read as usize)
 }
@@ -87,4 +94,20 @@ fn last_os_error() -> io::Error {
     // no preconditions.
     let code = unsafe { GetLastError() };
     io::Error::from_raw_os_error(code as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_closed_pipe_reports_eof() {
+        let pipe = create_pipe(0).expect("pipe");
+        drop(pipe.write);
+
+        let mut buffer = [0_u8; 8];
+        let bytes_read = read(&pipe.read, &mut buffer).expect("closed pipe read");
+
+        assert_eq!(bytes_read, 0);
+    }
 }

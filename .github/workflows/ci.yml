@@ -24,6 +24,7 @@ permissions:
 
 env:
   CARGO_INCREMENTAL: "0"
+  CARGO_HTTP_MULTIPLEXING: "false"
   CARGO_TERM_COLOR: always
   RUSTDOCFLAGS: -D warnings
   TMPDIR: /tmp
@@ -58,11 +59,17 @@ jobs:
       - name: Fetch locked dependencies
         run: cargo fetch --locked
 
+      - name: Install audit tooling
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ripgrep
+
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Await-under-lock audit
+        run: scripts/audit-await-holding-lock.sh
 
       - name: rustdoc with warnings denied
         run: cargo doc --workspace --locked --no-deps
@@ -243,6 +250,95 @@ jobs:
       - name: No side effects in debug assertions
         run: scripts/no-debug-assert-side-effects.sh
 
+  release-review-gate:
+    name: Release review gate (no package)
+    runs-on: ubuntu-latest
+    env:
+      RUST_MIN_STACK: "8388608"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Release review gate
+        run: scripts/release-review-gate.sh --skip-package --target-dir target/release-review-ci
+
+  snap-package:
+    name: Snap package smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Build snap
+        id: snapcraft
+        uses: snapcore/action-build@3bdaa03e1ba6bf59a65f84a751d943d549a54e79
+        with:
+          path: .
+
+      - name: Smoke snap package
+        run: scripts/smoke-snap-package.sh "${{ steps.snapcraft.outputs.snap }}"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-snap-${{ github.sha }}
+          path: ${{ steps.snapcraft.outputs.snap }}
+          if-no-files-found: error
+
+  nix-flake:
+    name: Nix flake gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: nix flake check
+        run: nix flake check
+
+      - name: nix build
+        run: nix build .#packages.x86_64-linux.default --no-link
+
+      - name: nix run version matches Cargo.toml
+        run: |
+          set -euo pipefail
+          expected="$(python3 - <<'PY'
+          import pathlib
+          import tomllib
+
+          manifest = tomllib.loads(pathlib.Path("Cargo.toml").read_text())
+          print(manifest["workspace"]["package"]["version"])
+          PY
+          )"
+          actual="$(nix run . -- -V)"
+          if [ "$actual" != "rmux $expected" ]; then
+            echo "::error::expected 'rmux $expected', got '$actual'"
+            exit 1
+          fi
+
   linux-sdk-smoke:
     name: Linux SDK v1 daemon smoke
     runs-on: ubuntu-latest
@@ -296,6 +392,16 @@ jobs:
 
       - name: Non-final local performance budget smoke
         run: scripts/perf-bench.sh --iterations 3 --line-count 10000 --output-dir target/perf/non-final-ci --fail-on-budget
+
+      - name: Issue 34 responsiveness smoke
+        env:
+          RMUX_BIN: target/release/rmux
+        run: scripts/smoke-issue34-responsiveness-unix.sh
+
+      - name: RSS and FD drift smoke
+        env:
+          RMUX_BIN: target/release/rmux
+        run: scripts/smoke-rss-fd-drift-unix.sh
 
   linux-dependency-audit:
     name: Linux dependency audit

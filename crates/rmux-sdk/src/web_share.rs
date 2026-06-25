@@ -20,14 +20,20 @@ use crate::{Result, RmuxError};
 async fn list_web_shares(transport: &TransportClient) -> Result<Vec<WebShareSummary>> {
     require_web_share(transport).await?;
     let response = transport
-        .request(Request::WebShare(WebShareRequest::List(
+        .request(Request::WebShare(Box::new(WebShareRequest::List(
             ListWebSharesRequest,
-        )))
+        ))))
         .await?;
     match response {
-        Response::WebShare(WebShareResponse::List(response)) => {
-            Ok(response.shares.into_iter().map(Into::into).collect())
-        }
+        Response::WebShare(response) => match *response {
+            WebShareResponse::List(response) => {
+                Ok(response.shares.into_iter().map(Into::into).collect())
+            }
+            other => Err(unexpected_response(
+                "web-share list",
+                Response::WebShare(Box::new(other)),
+            )),
+        },
         Response::Error(error) => Err(error.into()),
         response => Err(unexpected_response("web-share list", response)),
     }
@@ -36,14 +42,20 @@ async fn list_web_shares(transport: &TransportClient) -> Result<Vec<WebShareSumm
 async fn stop_web_share(transport: &TransportClient, id: &str) -> Result<bool> {
     require_web_share(transport).await?;
     let response = transport
-        .request(Request::WebShare(WebShareRequest::Stop(
+        .request(Request::WebShare(Box::new(WebShareRequest::Stop(
             StopWebShareRequest {
                 share_id: id.to_owned(),
             },
-        )))
+        ))))
         .await?;
     match response {
-        Response::WebShare(WebShareResponse::Stopped(response)) => Ok(response.stopped),
+        Response::WebShare(response) => match *response {
+            WebShareResponse::Stopped(response) => Ok(response.stopped),
+            other => Err(unexpected_response(
+                "web-share stop",
+                Response::WebShare(Box::new(other)),
+            )),
+        },
         Response::Error(error) => Err(error.into()),
         response => Err(unexpected_response("web-share stop", response)),
     }
@@ -52,14 +64,20 @@ async fn stop_web_share(transport: &TransportClient, id: &str) -> Result<bool> {
 async fn stop_all_web_shares(transport: &TransportClient) -> Result<usize> {
     require_web_share(transport).await?;
     let response = transport
-        .request(Request::WebShare(WebShareRequest::StopAll(
+        .request(Request::WebShare(Box::new(WebShareRequest::StopAll(
             StopAllWebSharesRequest,
-        )))
+        ))))
         .await?;
     match response {
-        Response::WebShare(WebShareResponse::StoppedAll(response)) => {
-            Ok(usize::try_from(response.stopped).unwrap_or(usize::MAX))
-        }
+        Response::WebShare(response) => match *response {
+            WebShareResponse::StoppedAll(response) => {
+                Ok(usize::try_from(response.stopped).unwrap_or(usize::MAX))
+            }
+            other => Err(unexpected_response(
+                "web-share stop-all",
+                Response::WebShare(Box::new(other)),
+            )),
+        },
         Response::Error(error) => Err(error.into()),
         response => Err(unexpected_response("web-share stop-all", response)),
     }
@@ -68,20 +86,24 @@ async fn stop_all_web_shares(transport: &TransportClient) -> Result<usize> {
 async fn lookup_summary(transport: &TransportClient, id: &str) -> Result<WebShareSummary> {
     require_web_share(transport).await?;
     let response = transport
-        .request(Request::WebShare(WebShareRequest::Lookup(
+        .request(Request::WebShare(Box::new(WebShareRequest::Lookup(
             LookupWebShareRequest {
                 share_id: id.to_owned(),
             },
-        )))
+        ))))
         .await?;
     match response {
-        Response::WebShare(WebShareResponse::Lookup(response)) => {
-            response.share.map(Into::into).ok_or_else(|| {
+        Response::WebShare(response) => match *response {
+            WebShareResponse::Lookup(response) => response.share.map(Into::into).ok_or_else(|| {
                 RmuxError::protocol(rmux_proto::RmuxError::Server(
                     "web share not found".to_owned(),
                 ))
-            })
-        }
+            }),
+            other => Err(unexpected_response(
+                "web-share lookup",
+                Response::WebShare(Box::new(other)),
+            )),
+        },
         Response::Error(error) => Err(error.into()),
         response => Err(unexpected_response("web-share lookup", response)),
     }
@@ -90,12 +112,18 @@ async fn lookup_summary(transport: &TransportClient, id: &str) -> Result<WebShar
 async fn web_config(transport: &TransportClient) -> Result<WebConfigInfo> {
     require_web_share(transport).await?;
     let response = transport
-        .request(Request::WebShare(WebShareRequest::Config(
+        .request(Request::WebShare(Box::new(WebShareRequest::Config(
             WebShareConfigRequest,
-        )))
+        ))))
         .await?;
     match response {
-        Response::WebShare(WebShareResponse::Config(response)) => Ok(response.listener.into()),
+        Response::WebShare(response) => match *response {
+            WebShareResponse::Config(response) => Ok(response.listener.into()),
+            other => Err(unexpected_response(
+                "web-share config",
+                Response::WebShare(Box::new(other)),
+            )),
+        },
         Response::Error(error) => Err(error.into()),
         response => Err(unexpected_response("web-share config", response)),
     }

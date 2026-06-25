@@ -92,6 +92,11 @@ fn time_modifier_with_non_numeric_value() {
 }
 
 #[test]
+fn templates_without_percent_are_returned_unchanged() {
+    assert_eq!(expand_time_tokens("plain status text"), "plain status text");
+}
+
+#[test]
 fn invalid_strftime_percent_is_rendered_literally() {
     assert_eq!(expand_time_tokens("cpu 100%"), "cpu 100%");
 }

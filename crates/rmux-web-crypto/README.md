@@ -2,6 +2,9 @@
 
 Single-crate crypto core for rmux web-share E2EE.
 
+The wire protocol and security invariants are specified in
+[docs/specs/web-share-e2ee-protocol-v1.md](../../docs/specs/web-share-e2ee-protocol-v1.md).
+
 It provides:
 
 - ephemeral **X25519** key generation and Diffie-Hellman;

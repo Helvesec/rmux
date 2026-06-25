@@ -293,13 +293,13 @@ impl OutputRing {
         if next < oldest {
             let missed = oldest.saturating_sub(next);
             cursor.record_gap(missed, oldest);
-            return Some(OutputCursorItem::Gap(OutputGap::new(
+            return Some(OutputCursorItem::Gap(Box::new(OutputGap::new(
                 next,
                 oldest,
                 missed,
                 self.newest_sequence(),
                 self.recent_snapshot(),
-            )));
+            ))));
         }
 
         if next >= self.next_sequence {

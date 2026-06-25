@@ -23,10 +23,11 @@ different key.
 
 ## Debian / Ubuntu
 
-The Debian package artifact is:
+The Debian package artifacts are:
 
 ```text
 rmux_<semver>_amd64.deb
+rmux_<semver>_arm64.deb
 ```
 
 The APT repository layout is generated under:
@@ -35,11 +36,14 @@ The APT repository layout is generated under:
 public/packages/debian/
   rmux.asc
   pool/main/r/rmux/rmux_<semver>_amd64.deb
+  pool/main/r/rmux/rmux_<semver>_arm64.deb
   dists/stable/Release
   dists/stable/InRelease
   dists/stable/Release.gpg
   dists/stable/main/binary-amd64/Packages
   dists/stable/main/binary-amd64/Packages.gz
+  dists/stable/main/binary-arm64/Packages
+  dists/stable/main/binary-arm64/Packages.gz
 ```
 
 User install command:
@@ -60,6 +64,7 @@ scripts/generate-apt-repository.sh \
   --suite stable \
   --component main \
   --architecture amd64 \
+  --architecture arm64 \
   --signing-key "$RMUX_APT_GPG_KEY"
 gpg --armor --export "$RMUX_APT_GPG_KEY" > ../rmuxio/public/packages/debian/rmux.asc
 ```

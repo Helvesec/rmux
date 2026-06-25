@@ -73,13 +73,13 @@ async fn attached_session_mutations_emit_refresh_switches() {
     assert!(layout_frame.contains('│'));
 
     let selected_pane = handler
-        .handle(Request::SelectPane(SelectPaneRequest {
+        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
             target: PaneTarget::new(alpha, 1),
             title: None,
             style: None,
             input_disabled: None,
             preserve_zoom: false,
-        }))
+        })))
         .await;
     assert_eq!(
         selected_pane,

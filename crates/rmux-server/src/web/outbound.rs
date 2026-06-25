@@ -23,6 +23,17 @@ pub(crate) enum OutboundQueueResult {
     Full,
 }
 
+impl OutboundQueueResult {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Backpressure => "backpressure",
+            Self::Closed => "closed",
+            Self::Full => "full",
+        }
+    }
+}
+
 pub(crate) struct WebSocketOutbound {
     tx: mpsc::Sender<DataCmd>,
     control_tx: mpsc::UnboundedSender<ControlCmd>,
@@ -90,55 +101,85 @@ impl WebSocketOutbound {
     }
 
     pub(crate) fn queue_frame(&self, bytes: Vec<u8>) -> OutboundQueueResult {
-        if self.backlog_exceeds(bytes.len()) {
-            return OutboundQueueResult::Backpressure;
-        }
         let len = bytes.len();
+        if self.backlog_exceeds(len) {
+            let result = OutboundQueueResult::Backpressure;
+            trace_outbound_queue("frame", len, result, false);
+            return result;
+        }
         let epoch = self.latest_epoch.load(Ordering::Acquire);
-        match self.tx.try_send(DataCmd::Frame { bytes, epoch }) {
+        let result = match self.tx.try_send(DataCmd::Frame { bytes, epoch }) {
             Ok(()) => {
                 self.backlog_bytes.fetch_add(len, Ordering::Relaxed);
                 OutboundQueueResult::Queued
             }
             Err(mpsc::error::TrySendError::Closed(_)) => OutboundQueueResult::Closed,
             Err(mpsc::error::TrySendError::Full(_)) => OutboundQueueResult::Full,
-        }
+        };
+        trace_outbound_queue("frame", len, result, false);
+        result
     }
 
     pub(crate) fn queue_snapshot(&self, bytes: Vec<u8>) -> OutboundQueueResult {
-        if self.backlog_exceeds(bytes.len()) {
-            return OutboundQueueResult::Backpressure;
-        }
         let len = bytes.len();
+        if self.backlog_exceeds(len) {
+            let result = OutboundQueueResult::Backpressure;
+            trace_outbound_queue("snapshot", len, result, false);
+            return result;
+        }
         let permit = match self.tx.try_reserve() {
             Ok(permit) => permit,
-            Err(mpsc::error::TrySendError::Closed(_)) => return OutboundQueueResult::Closed,
-            Err(mpsc::error::TrySendError::Full(_)) => return OutboundQueueResult::Full,
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                let result = OutboundQueueResult::Closed;
+                trace_outbound_queue("snapshot", len, result, false);
+                return result;
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                let result = OutboundQueueResult::Full;
+                trace_outbound_queue("snapshot", len, result, false);
+                return result;
+            }
         };
         let epoch = self.latest_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         self.backlog_bytes.fetch_add(len, Ordering::Relaxed);
         permit.send(DataCmd::Snapshot { bytes, epoch });
-        OutboundQueueResult::Queued
+        let result = OutboundQueueResult::Queued;
+        trace_outbound_queue("snapshot", len, result, false);
+        result
     }
 
     pub(crate) fn queue_keyframe(&self, frames: Vec<Vec<u8>>) -> OutboundQueueResult {
+        let len = keyframe_len(&frames);
+        if self.backlog_exceeds(len) {
+            let result = OutboundQueueResult::Backpressure;
+            trace_outbound_queue("keyframe", len, result, false);
+            return result;
+        }
         let epoch = self.latest_epoch.fetch_add(1, Ordering::AcqRel) + 1;
         match self.latest_keyframe.lock() {
             Ok(mut latest) => {
                 *latest = Some(KeyframeCmd { frames, epoch });
             }
-            Err(_) => return OutboundQueueResult::Closed,
+            Err(_) => {
+                let result = OutboundQueueResult::Closed;
+                trace_outbound_queue("keyframe", len, result, false);
+                return result;
+            }
         }
         if self.keyframe_wakeup_pending.swap(true, Ordering::AcqRel) {
-            return OutboundQueueResult::Queued;
+            let result = OutboundQueueResult::Queued;
+            trace_outbound_queue("keyframe", len, result, true);
+            return result;
         }
-        match self.control_tx.send(ControlCmd::Keyframe) {
+        let result = match self.control_tx.send(ControlCmd::Keyframe) {
             Ok(()) => OutboundQueueResult::Queued,
             Err(_) => {
                 self.keyframe_wakeup_pending.store(false, Ordering::Release);
                 OutboundQueueResult::Closed
             }
-        }
+        };
+        trace_outbound_queue("keyframe", len, result, false);
+        result
     }
 
     pub(crate) async fn write_text(&self, text: &str) -> io::Result<()> {
@@ -230,6 +271,12 @@ impl Drop for WebSocketOutbound {
     }
 }
 
+fn keyframe_len(frames: &[Vec<u8>]) -> usize {
+    frames
+        .iter()
+        .fold(0usize, |total, frame| total.saturating_add(frame.len()))
+}
+
 async fn writer_task(
     mut writer: EncryptedWebSocketWriter,
     mut rx: mpsc::Receiver<DataCmd>,
@@ -280,6 +327,10 @@ async fn handle_data_cmd(
             if epoch < latest_epoch.load(Ordering::Acquire) {
                 return true;
             }
+            let _span = crate::perf_instrument::span("web_writer")
+                .with_str("frame", "output")
+                .with_usize("bytes", bytes.len())
+                .with_u64("epoch", epoch);
             if let Err(error) = write_with_timeout(writer.write_binary(&bytes)).await {
                 warn!(
                     frame = "output",
@@ -295,6 +346,10 @@ async fn handle_data_cmd(
             if epoch < latest_epoch.load(Ordering::Acquire) {
                 return true;
             }
+            let _span = crate::perf_instrument::span("web_writer")
+                .with_str("frame", "snapshot")
+                .with_usize("bytes", bytes.len())
+                .with_u64("epoch", epoch);
             if let Err(error) = write_with_timeout(writer.write_binary(&bytes)).await {
                 warn!(
                     frame = "snapshot",
@@ -331,6 +386,12 @@ async fn handle_control_cmd(
                 return true;
             }
             for (index, frame) in frames.iter().enumerate() {
+                let _span = crate::perf_instrument::span("web_writer")
+                    .with_str("frame", "keyframe")
+                    .with_usize("bytes", frame.len())
+                    .with_usize("frame_index", index)
+                    .with_usize("frame_count", frames.len())
+                    .with_u64("epoch", epoch);
                 if let Err(error) = write_with_timeout(writer.write_binary(frame)).await {
                     warn!(
                         frame = "keyframe",
@@ -346,6 +407,9 @@ async fn handle_control_cmd(
             latest_epoch.fetch_max(epoch, Ordering::Release);
         }
         ControlCmd::Text { text, done } => {
+            let _span = crate::perf_instrument::span("web_writer")
+                .with_str("frame", "text")
+                .with_usize("bytes", text.len());
             let result = write_with_timeout(writer.write_text(&text)).await;
             let failed = log_writer_failure("text", &result);
             let _ = done.send(result);
@@ -354,6 +418,9 @@ async fn handle_control_cmd(
             }
         }
         ControlCmd::Close { code, reason, done } => {
+            let _span = crate::perf_instrument::span("web_writer")
+                .with_str("frame", "close")
+                .with_usize("bytes", reason.len());
             let result = match code {
                 Some(code) => write_with_timeout(writer.write_close_code(code, &reason)).await,
                 None => write_with_timeout(writer.write_close()).await,
@@ -365,6 +432,9 @@ async fn handle_control_cmd(
             }
         }
         ControlCmd::Pong { payload, done } => {
+            let _span = crate::perf_instrument::span("web_writer")
+                .with_str("frame", "pong")
+                .with_usize("bytes", payload.len());
             let result = write_with_timeout(writer.write_pong(&payload)).await;
             let failed = log_writer_failure("pong", &result);
             let _ = done.send(result);
@@ -374,6 +444,21 @@ async fn handle_control_cmd(
         }
     }
     true
+}
+
+fn trace_outbound_queue(
+    kind: &'static str,
+    bytes: usize,
+    result: OutboundQueueResult,
+    coalesced: bool,
+) {
+    crate::perf_instrument::event("queue_backpressure")
+        .with_str("queue", "web_outbound")
+        .with_str("kind", kind)
+        .with_usize("bytes", bytes)
+        .with_str("result", result.as_str())
+        .with_bool("coalesced", coalesced)
+        .emit();
 }
 
 fn log_writer_failure(frame: &'static str, result: &io::Result<()>) -> bool {
@@ -465,5 +550,39 @@ mod tests {
             outbound.backlog_bytes.load(Ordering::Acquire),
             BACKLOG_BYTES_MAX
         );
+    }
+
+    #[tokio::test]
+    async fn keyframes_respect_backlog_byte_limit_without_advancing_epoch() {
+        let (outbound, _data_rx, mut control_rx) = WebSocketOutbound::test_channels();
+
+        assert_eq!(
+            outbound.queue_frame(vec![0; BACKLOG_BYTES_MAX]),
+            OutboundQueueResult::Queued
+        );
+        assert_eq!(
+            outbound.queue_keyframe(vec![vec![0]]),
+            OutboundQueueResult::Backpressure
+        );
+
+        assert_eq!(outbound.latest_epoch.load(Ordering::Acquire), 0);
+        assert!(control_rx.try_recv().is_err());
+        let latest = outbound.latest_keyframe.lock().expect("keyframe lock");
+        assert!(latest.is_none());
+    }
+
+    #[tokio::test]
+    async fn oversized_keyframes_are_rejected_without_epoch_gap() {
+        let (outbound, _data_rx, mut control_rx) = WebSocketOutbound::test_channels();
+
+        assert_eq!(
+            outbound.queue_keyframe(vec![vec![0; BACKLOG_BYTES_MAX], vec![0]]),
+            OutboundQueueResult::Backpressure
+        );
+
+        assert_eq!(outbound.latest_epoch.load(Ordering::Acquire), 0);
+        assert!(control_rx.try_recv().is_err());
+        let latest = outbound.latest_keyframe.lock().expect("keyframe lock");
+        assert!(latest.is_none());
     }
 }

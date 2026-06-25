@@ -122,6 +122,83 @@ fn break_pane_to_other_session_renumbers_the_detached_window_to_pane_zero() {
 }
 
 #[test]
+fn break_pane_to_other_session_moves_last_source_window() {
+    let mut source = Session::new(
+        session_name("alpha"),
+        TerminalSize {
+            cols: 120,
+            rows: 40,
+        },
+    );
+    let mut destination = Session::new(
+        session_name("hidden"),
+        TerminalSize {
+            cols: 120,
+            rows: 40,
+        },
+    );
+    source.split_active_pane().expect("split succeeds");
+    source
+        .kill_pane_in_window(0, 0)
+        .expect("killing pane 0 leaves a distinct pane id behind");
+    let moved_pane_id = source.pane_id_in_window(0, 0).expect("pane id exists");
+
+    let destination_index = source
+        .break_pane_to_session(
+            SessionPaneTarget::new(0, 0),
+            &mut destination,
+            BreakPaneOptions::new(None, None, true, false, false),
+        )
+        .expect("cross-session break of last source window succeeds");
+
+    assert_eq!(destination_index, 1);
+    assert!(source.windows().is_empty());
+    assert_eq!(destination.pane_id_in_window(1, 0), Some(moved_pane_id));
+}
+
+#[test]
+fn join_pane_from_other_session_moves_last_source_window() {
+    let mut source = Session::new(
+        session_name("alpha"),
+        TerminalSize {
+            cols: 120,
+            rows: 40,
+        },
+    );
+    let mut destination = Session::new(
+        session_name("hidden"),
+        TerminalSize {
+            cols: 120,
+            rows: 40,
+        },
+    );
+    source.split_active_pane().expect("split succeeds");
+    source
+        .kill_pane_in_window(0, 0)
+        .expect("killing pane 0 leaves a distinct pane id behind");
+    let moved_pane_id = source.pane_id_in_window(0, 0).expect("pane id exists");
+
+    destination
+        .join_pane_from_session(
+            SessionPaneTarget::new(0, 0),
+            &mut source,
+            SessionPaneTarget::new(0, 0),
+            PaneJoinOptions::new(SplitDirection::Vertical, true, false, false, None),
+        )
+        .expect("cross-session join of last source window succeeds");
+
+    assert!(source.windows().is_empty());
+    assert_eq!(
+        destination
+            .window_at(0)
+            .expect("destination window exists")
+            .pane_count(),
+        2
+    );
+    assert_eq!(destination.pane_id_in_window(0, 1), Some(moved_pane_id));
+}
+
+#[test]
 fn resize_pane_in_window_targets_the_requested_pane_in_custom_layouts() {
     let mut session = Session::new(
         session_name("alpha"),

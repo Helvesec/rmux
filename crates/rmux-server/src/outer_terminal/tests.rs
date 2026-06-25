@@ -251,6 +251,7 @@ fn render_prelude_emits_title_path_and_cursor_colour() {
         alternate_on: false,
         title: "build logs".to_owned(),
         path: "file:///tmp/project".to_owned(),
+        cursor_position: (0, 0),
         cursor_style: 6,
     };
     let prelude = String::from_utf8(terminal.render_prelude(

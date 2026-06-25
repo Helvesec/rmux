@@ -1,12 +1,47 @@
+use std::cell::RefCell;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use rmux_client::{connect, ClientError, Connection};
-use rmux_proto::{CommandOutput, PaneTarget, ResolveTargetType, Response, Target};
+use rmux_proto::{CommandOutput, PaneTarget, ResolveTargetType, Response, RmuxError, Target};
 
 use crate::cli_response::{expect_command_output, expect_command_success, response_name};
 
 use super::ExitFailure;
+
+thread_local! {
+    static COMMAND_CONNECTION_CACHE: RefCell<Option<CommandConnectionCache>> =
+        const { RefCell::new(None) };
+}
+
+struct CommandConnectionCache {
+    socket_path: PathBuf,
+    connection: Option<Connection>,
+}
+
+struct CommandConnectionCacheReset {
+    previous: Option<CommandConnectionCache>,
+}
+
+impl Drop for CommandConnectionCacheReset {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        COMMAND_CONNECTION_CACHE.with(|cache| {
+            let _ = cache.replace(previous);
+        });
+    }
+}
+
+pub(super) fn with_command_connection_cache<R>(socket_path: &Path, run: impl FnOnce() -> R) -> R {
+    let previous = COMMAND_CONNECTION_CACHE.with(|cache| {
+        cache.replace(Some(CommandConnectionCache {
+            socket_path: socket_path.to_path_buf(),
+            connection: None,
+        }))
+    });
+    let _reset = CommandConnectionCacheReset { previous };
+    run()
+}
 
 pub(crate) fn run_command<F>(
     socket_path: &Path,
@@ -16,10 +51,28 @@ pub(crate) fn run_command<F>(
 where
     F: FnOnce(&mut Connection) -> Result<Response, ClientError>,
 {
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
-    let response = send(&mut connection).map_err(ExitFailure::from_client)?;
+    let response = with_command_connection(socket_path, |connection| {
+        send(connection).map_err(ExitFailure::from_client)
+    })?;
     finish_command_success(response, command_name)
+}
+
+pub(crate) fn cli_target_actions_enabled() -> bool {
+    std::env::var_os("RMUX_DISABLE_CLI_TARGET_ACTIONS").is_none()
+}
+
+pub(crate) fn target_action_needs_legacy_retry(response: &Result<Response, ClientError>) -> bool {
+    matches!(
+        response,
+        Ok(Response::Error(error)) if matches!(error.error, RmuxError::Decode(_))
+    )
+}
+
+pub(crate) fn capture_target_action_needs_legacy_retry(
+    response: &Result<Response, ClientError>,
+) -> bool {
+    target_action_needs_legacy_retry(response)
+        || matches!(response, Err(ClientError::UnexpectedEof))
 }
 
 pub(crate) fn run_payload_command<F>(
@@ -30,9 +83,9 @@ pub(crate) fn run_payload_command<F>(
 where
     F: FnOnce(&mut Connection) -> Result<Response, ClientError>,
 {
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
-    let response = send(&mut connection).map_err(ExitFailure::from_client)?;
+    let response = with_command_connection(socket_path, |connection| {
+        send(connection).map_err(ExitFailure::from_client)
+    })?;
     let output = expect_command_output(&response, command_name)?;
     write_command_output(output)?;
     Ok(0)
@@ -46,9 +99,7 @@ pub(crate) fn run_command_resolved<F>(
 where
     F: FnOnce(&mut Connection) -> Result<Response, ExitFailure>,
 {
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
-    let response = send(&mut connection)?;
+    let response = with_command_connection(socket_path, send)?;
     finish_command_success(response, command_name)
 }
 
@@ -60,9 +111,7 @@ pub(crate) fn run_payload_command_resolved<F>(
 where
     F: FnOnce(&mut Connection) -> Result<Response, ExitFailure>,
 {
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
-    let response = send(&mut connection)?;
+    let response = with_command_connection(socket_path, send)?;
     let output = expect_command_output(&response, command_name)?;
     write_command_output(output)?;
     Ok(0)
@@ -73,10 +122,29 @@ pub(super) fn run_queued_server_command(
     command_name: &'static str,
     queue_command: String,
 ) -> Result<i32, ExitFailure> {
-    let mut connection = connect(socket_path)
-        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
-    let target = inherited_pane_target(&mut connection, socket_path)?;
-    let response = connection
+    let response = with_command_connection(socket_path, |connection| {
+        queued_server_command_response(connection, socket_path, queue_command)
+    })?;
+    finish_queued_server_command(command_name, response)
+}
+
+pub(super) fn run_queued_server_command_with_connection(
+    connection: &mut Connection,
+    socket_path: &Path,
+    command_name: &'static str,
+    queue_command: String,
+) -> Result<i32, ExitFailure> {
+    let response = queued_server_command_response(connection, socket_path, queue_command)?;
+    finish_queued_server_command(command_name, response)
+}
+
+fn queued_server_command_response(
+    connection: &mut Connection,
+    socket_path: &Path,
+    queue_command: String,
+) -> Result<Response, ExitFailure> {
+    let target = inherited_pane_target(connection, socket_path)?;
+    connection
         .source_file(
             vec!["-".to_owned()],
             false,
@@ -86,7 +154,13 @@ pub(super) fn run_queued_server_command(
             target,
             Some(queue_command),
         )
-        .map_err(ExitFailure::from_client)?;
+        .map_err(ExitFailure::from_client)
+}
+
+fn finish_queued_server_command(
+    command_name: &'static str,
+    response: Response,
+) -> Result<i32, ExitFailure> {
     if let Some(output) = response
         .command_output()
         .filter(|output| !output.stdout().is_empty())
@@ -105,6 +179,48 @@ pub(super) fn run_queued_server_command(
     }
     finish_command_success(response, command_name)
         .map_err(|error| normalize_queued_direct_error(command_name, error))
+}
+
+fn with_command_connection<F, R>(socket_path: &Path, run: F) -> Result<R, ExitFailure>
+where
+    F: FnOnce(&mut Connection) -> Result<R, ExitFailure>,
+{
+    if command_connection_cache_matches(socket_path) {
+        return COMMAND_CONNECTION_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let cache = cache
+                .as_mut()
+                .expect("cache must exist after positive match");
+            if cache.connection.is_none() {
+                cache.connection = Some(
+                    connect(socket_path)
+                        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?,
+                );
+            }
+            let connection = cache
+                .connection
+                .as_mut()
+                .expect("connection must exist after initialization");
+            let result = run(connection);
+            if result.is_err() {
+                cache.connection = None;
+            }
+            result
+        });
+    }
+
+    let mut connection = connect(socket_path)
+        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    run(&mut connection)
+}
+
+fn command_connection_cache_matches(socket_path: &Path) -> bool {
+    COMMAND_CONNECTION_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|cache| cache.socket_path == socket_path)
+    })
 }
 
 pub(crate) fn inherited_pane_target(
@@ -238,4 +354,35 @@ pub(super) fn write_lines_output(lines: &[String]) -> Result<i32, ExitFailure> {
         ))?;
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use rmux_client::ClientError;
+    use rmux_proto::{ErrorResponse, Response, RmuxError};
+
+    use super::{capture_target_action_needs_legacy_retry, target_action_needs_legacy_retry};
+
+    #[test]
+    fn target_action_retry_is_limited_to_protocol_decode_failures() {
+        assert!(target_action_needs_legacy_retry(&Ok(Response::Error(
+            ErrorResponse {
+                error: RmuxError::Decode("unknown variant index".to_owned()),
+            },
+        ))));
+        assert!(!target_action_needs_legacy_retry(&Err(
+            ClientError::UnexpectedEof,
+        )));
+        assert!(capture_target_action_needs_legacy_retry(&Err(
+            ClientError::UnexpectedEof,
+        )));
+        assert!(!target_action_needs_legacy_retry(&Ok(Response::Error(
+            ErrorResponse {
+                error: RmuxError::InvalidTarget {
+                    value: "alpha:0.99".to_owned(),
+                    reason: "can't find pane: 99".to_owned(),
+                },
+            },
+        ))));
+    }
 }

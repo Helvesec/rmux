@@ -1237,6 +1237,33 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         None,
         "Attach-session request carrying attach-stream client capabilities; pinned bincode tag 117.",
     ),
+    entry(
+        c2s(118),
+        FrameDirection::ClientToServer,
+        ACTIVE,
+        "SplitWindowTargetActionRequest",
+        FrameFeature::Panes,
+        Some("split_window_target_action_request"),
+        "Server-side target resolution for split-window; pinned bincode tag 118.",
+    ),
+    entry(
+        c2s(119),
+        FrameDirection::ClientToServer,
+        ACTIVE,
+        "ResizePaneTargetActionRequest",
+        FrameFeature::Panes,
+        Some("resize_pane_target_action_request"),
+        "Server-side target resolution for resize-pane; pinned bincode tag 119.",
+    ),
+    entry(
+        c2s(120),
+        FrameDirection::ClientToServer,
+        ACTIVE,
+        "CapturePaneTargetActionRequest",
+        FrameFeature::Panes,
+        Some("capture_pane_target_action_request"),
+        "Server-side target resolution for capture-pane; pinned bincode tag 120.",
+    ),
     // Reserved client→server slot. Removed values must be listed and never reused.
     entry(
         c2s(0x7FFE),
@@ -2250,6 +2277,9 @@ pub const fn frame_kind_for_request(request: &Request) -> FrameKind {
         Request::DisplayMessageExt(_) => c2s(115),
         Request::SendKeysExt2(_) => c2s(116),
         Request::AttachSessionExt3(_) => c2s(117),
+        Request::SplitWindowTargetAction(_) => c2s(118),
+        Request::ResizePaneTargetAction(_) => c2s(119),
+        Request::CapturePaneTargetAction(_) => c2s(120),
     }
 }
 

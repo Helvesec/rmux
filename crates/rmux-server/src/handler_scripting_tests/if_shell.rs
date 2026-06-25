@@ -5,7 +5,7 @@ async fn if_shell_format_mode_dispatches_selected_rmux_command() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::IfShell(IfShellRequest {
+        .handle(Request::IfShell(Box::new(IfShellRequest {
             condition: "1".to_owned(),
             format_mode: true,
             then_command: "set-buffer -b chosen selected".to_owned(),
@@ -13,7 +13,7 @@ async fn if_shell_format_mode_dispatches_selected_rmux_command() {
             target: None,
             caller_cwd: None,
             background: false,
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -41,7 +41,7 @@ async fn if_shell_format_mode_expands_socket_path_without_target() {
     handler.set_socket_path("/tmp/rmux-test.sock");
 
     let response = handler
-        .handle(Request::IfShell(IfShellRequest {
+        .handle(Request::IfShell(Box::new(IfShellRequest {
             condition: "#{socket_path}".to_owned(),
             format_mode: true,
             then_command: "set-buffer -b chosen selected".to_owned(),
@@ -49,7 +49,7 @@ async fn if_shell_format_mode_expands_socket_path_without_target() {
             target: None,
             caller_cwd: None,
             background: false,
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -78,7 +78,7 @@ async fn if_shell_format_mode_treats_zero_prefixed_values_as_false_like_tmux() {
     for condition in ["00", "09", "01", "0abc", "0.0"] {
         let buffer = format!("chosen-{condition}");
         let response = handler
-            .handle(Request::IfShell(IfShellRequest {
+            .handle(Request::IfShell(Box::new(IfShellRequest {
                 condition: condition.to_owned(),
                 format_mode: true,
                 then_command: format!("set-buffer -b {buffer} selected"),
@@ -86,7 +86,7 @@ async fn if_shell_format_mode_treats_zero_prefixed_values_as_false_like_tmux() {
                 target: None,
                 caller_cwd: None,
                 background: false,
-            }))
+            })))
             .await;
         assert_eq!(
             response,
@@ -126,7 +126,7 @@ async fn if_shell_format_mode_without_target_uses_preferred_session_context() {
     ));
 
     let response = handler
-        .handle(Request::IfShell(IfShellRequest {
+        .handle(Request::IfShell(Box::new(IfShellRequest {
             condition: "#{session_name}".to_owned(),
             format_mode: true,
             then_command: "set-buffer -b chosen selected".to_owned(),
@@ -134,7 +134,7 @@ async fn if_shell_format_mode_without_target_uses_preferred_session_context() {
             target: None,
             caller_cwd: None,
             background: false,
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -291,11 +291,139 @@ async fn queued_if_shell_target_becomes_branch_current_target() {
 }
 
 #[tokio::test]
+async fn queued_if_shell_accepts_compact_format_target_with_attached_value() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    for session in [&alpha, &beta] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
+
+    let parsed = CommandParser::new()
+        .parse("if-shell -Ft= 1 { display-message -p '#{session_name}' }")
+        .expect("if-shell compact target parses");
+    let output = handler
+        .execute_parsed_commands(
+            std::process::id(),
+            parsed,
+            QueueExecutionContext::without_caller_cwd()
+                .with_current_target(Some(Target::Session(beta)))
+                .with_mouse_target(Some(Target::Window(rmux_proto::WindowTarget::with_window(
+                    alpha, 0,
+                )))),
+        )
+        .await
+        .expect("compact if-shell branch should execute");
+    assert_eq!(output.stdout(), b"alpha\n");
+}
+
+#[tokio::test]
+async fn queued_if_shell_compact_mouse_target_falls_back_to_current_target() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    for session in [&alpha, &beta] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
+
+    let parsed = CommandParser::new()
+        .parse("if-shell -Ft= 1 { display-message -p '#{session_name}' }")
+        .expect("if-shell compact target parses");
+    let output = handler
+        .execute_parsed_commands(
+            std::process::id(),
+            parsed,
+            QueueExecutionContext::without_caller_cwd()
+                .with_current_target(Some(Target::Session(beta))),
+        )
+        .await
+        .expect("compact if-shell branch should execute without mouse context");
+    assert_eq!(output.stdout(), b"beta\n");
+}
+
+#[tokio::test]
+async fn queued_if_shell_accepts_compact_format_target_with_next_argument() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    for session in [&alpha, &beta] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
+
+    let parsed = CommandParser::new()
+        .parse("if-shell -Ft beta:0.0 1 { new-window -d -n compact }")
+        .expect("if-shell compact target parses");
+    handler
+        .execute_parsed_commands(
+            std::process::id(),
+            parsed,
+            QueueExecutionContext::without_caller_cwd().with_current_target(Some(Target::Pane(
+                PaneTarget::with_window(alpha.clone(), 0, 0),
+            ))),
+        )
+        .await
+        .expect("compact if-shell branch should execute");
+
+    let state = handler.state.lock().await;
+    let alpha_windows = state
+        .sessions
+        .session(&alpha)
+        .expect("alpha exists")
+        .windows()
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    let beta_session = state.sessions.session(&beta).expect("beta exists");
+    assert_eq!(alpha_windows, vec![0]);
+    assert_eq!(
+        beta_session.windows().keys().copied().collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(
+        beta_session
+            .window_at(1)
+            .expect("compact window exists")
+            .name(),
+        Some("compact")
+    );
+}
+
+#[tokio::test]
 async fn if_shell_false_without_else_is_a_successful_noop() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::IfShell(IfShellRequest {
+        .handle(Request::IfShell(Box::new(IfShellRequest {
             condition: "0".to_owned(),
             format_mode: true,
             then_command: "set-buffer impossible".to_owned(),
@@ -303,7 +431,7 @@ async fn if_shell_false_without_else_is_a_successful_noop() {
             target: None,
             caller_cwd: None,
             background: false,
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -330,7 +458,7 @@ async fn scripted_pane_commands_accept_session_targets_like_tmux() {
     ));
 
     let response = handler
-        .handle(Request::IfShell(IfShellRequest {
+        .handle(Request::IfShell(Box::new(IfShellRequest {
             condition: "1".to_owned(),
             format_mode: true,
             then_command: "copy-mode -t alpha".to_owned(),
@@ -338,7 +466,7 @@ async fn scripted_pane_commands_accept_session_targets_like_tmux() {
             target: None,
             caller_cwd: None,
             background: false,
-        }))
+        })))
         .await;
     assert!(matches!(response, Response::IfShell(_)));
 
@@ -395,20 +523,20 @@ async fn if_shell_shell_mode_uses_tmux_shell_environment_and_caller_cwd() {
     ));
     assert!(matches!(
         handler
-            .handle(Request::SetEnvironment(SetEnvironmentRequest {
+            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
                 scope: ScopeSelector::Session(alpha.clone()),
                 name: "FOO".to_owned(),
                 value: "bar".to_owned(),
                 mode: None,
                 hidden: false,
                 format: false,
-            }))
+            })))
             .await,
         Response::SetEnvironment(_)
     ));
 
     let response = handler
-        .handle(Request::IfShell(IfShellRequest {
+        .handle(Request::IfShell(Box::new(IfShellRequest {
             condition: format!(
                 "test \"$FOO\" = bar && test \"$PWD\" = {}",
                 shell_quote(&root)
@@ -419,7 +547,7 @@ async fn if_shell_shell_mode_uses_tmux_shell_environment_and_caller_cwd() {
             target: Some(Target::Session(alpha)),
             caller_cwd: Some(root),
             background: false,
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -475,21 +603,21 @@ async fn if_shell_shell_mode_uses_windows_shell_environment_and_caller_cwd() {
     ));
     assert!(matches!(
         handler
-            .handle(Request::SetEnvironment(SetEnvironmentRequest {
+            .handle(Request::SetEnvironment(Box::new(SetEnvironmentRequest {
                 scope: ScopeSelector::Session(alpha.clone()),
                 name: "FOO".to_owned(),
                 value: "bar".to_owned(),
                 mode: None,
                 hidden: false,
                 format: false,
-            }))
+            })))
             .await,
         Response::SetEnvironment(_)
     ));
 
     let root = root.to_string_lossy().into_owned();
     let response = handler
-        .handle(Request::IfShell(IfShellRequest {
+        .handle(Request::IfShell(Box::new(IfShellRequest {
             condition: format!(
                 "if not \"%FOO%\"==\"bar\" exit /b 1 & if not \"%CD%\"==\"{root}\" exit /b 1 & exit /b 0"
             ),
@@ -499,7 +627,7 @@ async fn if_shell_shell_mode_uses_windows_shell_environment_and_caller_cwd() {
             target: Some(Target::Session(alpha)),
             caller_cwd: Some(PathBuf::from(root)),
             background: false,
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -524,7 +652,7 @@ async fn if_shell_nested_set_buffer_accepts_hyphen_prefixed_content() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::IfShell(IfShellRequest {
+        .handle(Request::IfShell(Box::new(IfShellRequest {
             condition: "1".to_owned(),
             format_mode: true,
             then_command: "set-buffer -b hyphen -value".to_owned(),
@@ -532,7 +660,7 @@ async fn if_shell_nested_set_buffer_accepts_hyphen_prefixed_content() {
             target: None,
             caller_cwd: None,
             background: false,
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -559,7 +687,7 @@ async fn if_shell_nested_wait_for_accepts_hyphen_prefixed_channel_after_mode_fla
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::IfShell(IfShellRequest {
+        .handle(Request::IfShell(Box::new(IfShellRequest {
             condition: "1".to_owned(),
             format_mode: true,
             then_command: "wait-for -S -channel".to_owned(),
@@ -567,7 +695,7 @@ async fn if_shell_nested_wait_for_accepts_hyphen_prefixed_channel_after_mode_fla
             target: None,
             caller_cwd: None,
             background: false,
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -581,7 +709,7 @@ async fn if_shell_nested_run_shell_accepts_double_dash_before_command() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::IfShell(IfShellRequest {
+        .handle(Request::IfShell(Box::new(IfShellRequest {
             condition: "1".to_owned(),
             format_mode: true,
             then_command: format!("run-shell -- {}", command_quote(&shell_success_command())),
@@ -589,7 +717,7 @@ async fn if_shell_nested_run_shell_accepts_double_dash_before_command() {
             target: None,
             caller_cwd: None,
             background: false,
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -603,7 +731,7 @@ async fn if_shell_string_mode_runs_multiple_commands_in_one_group() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::IfShell(IfShellRequest {
+        .handle(Request::IfShell(Box::new(IfShellRequest {
             condition: "1".to_owned(),
             format_mode: true,
             then_command: "set-buffer -b one first; set-buffer -b two second".to_owned(),
@@ -611,7 +739,7 @@ async fn if_shell_string_mode_runs_multiple_commands_in_one_group() {
             target: None,
             caller_cwd: None,
             background: false,
-        }))
+        })))
         .await;
 
     assert_eq!(

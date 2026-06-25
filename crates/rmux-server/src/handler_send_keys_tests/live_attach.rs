@@ -133,6 +133,96 @@ async fn live_attach_ctrl_a_emulates_cmd_select_all() {
     capture.assert_contents(&handler, &expected).await;
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn live_attach_ctrl_d_uses_windows_console_key_path() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "live-attach-c-d", 1).await;
+
+    let mut pending_input = Vec::new();
+    let keystroke = rmux_proto::AttachedKeystroke::new(vec![0x04]).with_windows_console_key(
+        rmux_proto::AttachedWindowsConsoleKey::new(0x44, 0x20, 0x04, 0x0008, 1),
+    );
+    let forwarded = handler
+        .handle_attached_keystroke_input(requester_pid, &mut pending_input, &keystroke)
+        .await
+        .expect("Ctrl+D attached input succeeds");
+
+    assert!(forwarded);
+    assert!(pending_input.is_empty());
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, &[0x04]).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn live_attach_unbound_ctrl_p_uses_windows_console_key_path() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "live-attach-c-p", 1).await;
+
+    let mut pending_input = Vec::new();
+    let keystroke = rmux_proto::AttachedKeystroke::new(vec![0x10]).with_windows_console_key(
+        rmux_proto::AttachedWindowsConsoleKey::new(0x50, 0x19, 0x10, 0x0008, 1),
+    );
+    let forwarded = handler
+        .handle_attached_keystroke_input(requester_pid, &mut pending_input, &keystroke)
+        .await
+        .expect("Ctrl+P attached input succeeds");
+
+    assert!(forwarded);
+    assert!(pending_input.is_empty());
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, &[0x10]).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn live_attach_prefix_ctrl_b_is_not_forwarded_as_windows_console_key() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "live-attach-c-b", 0).await;
+
+    let mut pending_input = Vec::new();
+    let keystroke = rmux_proto::AttachedKeystroke::new(vec![0x02]).with_windows_console_key(
+        rmux_proto::AttachedWindowsConsoleKey::new(0x42, 0x30, 0x02, 0x0008, 1),
+    );
+    let forwarded = handler
+        .handle_attached_keystroke_input(requester_pid, &mut pending_input, &keystroke)
+        .await
+        .expect("Ctrl+B attached input succeeds");
+
+    assert!(!forwarded);
+    assert!(pending_input.is_empty());
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, &[]).await;
+}
+
 #[tokio::test]
 async fn send_keys_m_forwards_the_current_mouse_event_to_the_pane() {
     let handler = RequestHandler::new();
@@ -243,6 +333,40 @@ async fn live_attach_extended_keys_are_reencoded_for_the_target_pane() {
 
     capture.finish(&handler, &alpha).await;
     capture.assert_contents(&handler, expected).await;
+}
+
+#[tokio::test]
+async fn read_only_live_attach_drops_decoded_key_input() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    {
+        let mut active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get_mut(&requester_pid)
+            .expect("attach is active");
+        active
+            .flags
+            .insert(crate::client_flags::ClientFlags::READONLY);
+    }
+
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "read-only-decoded-key", 0).await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[9;2u")
+        .await
+        .expect("read-only live attach input");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, b"").await;
 }
 
 #[tokio::test]
@@ -586,7 +710,7 @@ async fn live_attach_control_bytes_dispatch_tmux_distinct_bindings() {
         ("C-_", "U"),
     ] {
         let rebound = handler
-            .handle(Request::BindKey(BindKeyRequest {
+            .handle(Request::BindKey(Box::new(BindKeyRequest {
                 table_name: "root".to_owned(),
                 key: key.to_owned(),
                 note: Some("live-attach-control-byte".to_owned()),
@@ -596,7 +720,7 @@ async fn live_attach_control_bytes_dispatch_tmux_distinct_bindings() {
                     "-l".to_owned(),
                     literal.to_owned(),
                 ]),
-            }))
+            })))
             .await;
         assert!(matches!(rebound, Response::BindKey(_)), "{key} should bind");
     }
@@ -634,7 +758,7 @@ async fn live_attach_nul_dispatches_c_at_alias_binding() {
         .await;
 
     let rebound = handler
-        .handle(Request::BindKey(BindKeyRequest {
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
             table_name: "root".to_owned(),
             key: "C-@".to_owned(),
             note: Some("live-attach-control-byte-alias".to_owned()),
@@ -644,7 +768,7 @@ async fn live_attach_nul_dispatches_c_at_alias_binding() {
                 "-l".to_owned(),
                 "A".to_owned(),
             ]),
-        }))
+        })))
         .await;
     assert!(matches!(rebound, Response::BindKey(_)));
 
@@ -767,11 +891,16 @@ async fn live_attach_focus_sequences_are_consumed_at_attach_boundary() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
-
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
         .register_attach(requester_pid, alpha.clone(), control_tx)
         .await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004l")
+            .expect("focus mode reset transcript update");
+    }
 
     let capture = RawPaneInputProbe::start(&handler, &alpha, "live-attach-focus", 0).await;
 
@@ -791,17 +920,16 @@ async fn live_attach_focus_sequences_forward_when_pane_focus_mode_is_enabled() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
     {
         let mut state = handler.state.lock().await;
         state
             .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1004h")
             .expect("focus mode transcript update");
     }
-
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    let _attach_id = handler
-        .register_attach(requester_pid, alpha.clone(), control_tx)
-        .await;
 
     let expected = b"\x1b[I\x1b[O";
     let capture =
@@ -837,13 +965,13 @@ async fn live_attach_mouse_sequences_dispatch_default_mouse_bindings() {
         .await;
 
     let rebound = handler
-        .handle(Request::BindKey(BindKeyRequest {
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
             table_name: "root".to_owned(),
             key: "MouseDrag1Pane".to_owned(),
             note: Some("live-attach-mouse".to_owned()),
             repeat: false,
             command: Some(vec!["send-keys".to_owned(), "-M".to_owned()]),
-        }))
+        })))
         .await;
     assert!(matches!(rebound, Response::BindKey(_)));
 
@@ -903,13 +1031,13 @@ async fn live_attach_mouse_down_selects_the_clicked_pane() {
     assert!(matches!(split, Response::SplitWindow(_)));
 
     let selected = handler
-        .handle(Request::SelectPane(SelectPaneRequest {
+        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
             target: PaneTarget::new(alpha.clone(), 0),
             title: None,
             style: None,
             input_disabled: None,
             preserve_zoom: false,
-        }))
+        })))
         .await;
     assert!(matches!(selected, Response::SelectPane(_)));
 
@@ -1040,6 +1168,47 @@ async fn live_attach_sgr_motion_forwards_without_explicit_binding_when_mouse_all
 
     capture.finish(&handler, &alpha).await;
     capture.assert_contents(&handler, expected).await;
+}
+
+#[tokio::test]
+async fn read_only_live_attach_drops_mouse_forwarding() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1003h\x1b[?1006h")
+            .expect("mouse all and sgr transcript update");
+    }
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    {
+        let mut active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get_mut(&requester_pid)
+            .expect("attach is active");
+        active
+            .flags
+            .insert(crate::client_flags::ClientFlags::READONLY);
+    }
+
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "read-only-mouse-forwarding", 0).await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[<35;2;2M")
+        .await
+        .expect("read-only live attach mouse input");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, b"").await;
 }
 
 #[tokio::test]

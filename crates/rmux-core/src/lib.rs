@@ -73,7 +73,7 @@ pub use options::{
     ShowOptionsMode,
 };
 pub use pane::{Pane, PaneGeometry};
-pub use screen::{Screen, ScreenCellView, ScreenLineView};
+pub use screen::{Screen, ScreenCellRef, ScreenCellView, ScreenLineView};
 pub use session::{
     BreakPaneOptions, KillPaneOutcome, PaneJoinOptions, PaneSwapOptions, Session,
     SessionPaneTarget, SessionStore,

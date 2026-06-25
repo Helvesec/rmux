@@ -298,6 +298,8 @@ impl RequestHandler {
         };
         let client_size = client_geometry.size;
 
+        #[cfg(windows)]
+        self.wait_for_windows_deferred_all_pane_pids().await;
         let mut state = self.state.lock().await;
         state.set_attached_terminal_pixels(session_name, client_geometry.pixels);
         state.mutate_session_and_resize_terminals(session_name, |session| {

@@ -1,6 +1,7 @@
-use rmux_proto::{CommandOutput, ErrorResponse, Response, RmuxError};
+use rmux_proto::{CommandOutput, ErrorResponse, Response};
 
 use crate::cli::ExitFailure;
+pub(crate) use crate::tmux_error_surface::tmux_cli_error_message;
 
 const QUEUED_SOURCE_FILE_SUCCESS_COMMANDS: &[&str] = &[
     "command-prompt",
@@ -155,82 +156,6 @@ pub(crate) fn expect_command_output<'a>(
         }
         other => Err(unexpected_response(command_name, other)),
     }
-}
-
-pub(crate) fn tmux_cli_error_message(command_name: &str, error: &RmuxError) -> String {
-    match error {
-        RmuxError::InvalidTarget { value, reason }
-            if matches!(command_name, "link-window" | "move-window")
-                && reason == "window index already exists in session" =>
-        {
-            window_index_from_target(value)
-                .map(|index| format!("index in use: {index}"))
-                .unwrap_or_else(|| error.to_string())
-        }
-        RmuxError::InvalidTarget { reason, .. } if reason.starts_with("can't find ") => {
-            reason.clone()
-        }
-        RmuxError::SessionNotFound(session_name) if command_name == "kill-session" => {
-            format!("can't find session: {session_name}")
-        }
-        RmuxError::InvalidSetOption(message)
-            if message.starts_with("unknown value: ") || message.starts_with("bad value: ") =>
-        {
-            message.clone()
-        }
-        RmuxError::InvalidSetOption(message)
-            if message.starts_with("value is ") || message.starts_with("invalid style: ") =>
-        {
-            message.clone()
-        }
-        RmuxError::InvalidSetOption(message)
-            if message
-                .strip_prefix("invalid set-option request: ")
-                .is_some_and(|message| {
-                    message.starts_with("value is ") || message.starts_with("invalid style: ")
-                }) =>
-        {
-            message
-                .strip_prefix("invalid set-option request: ")
-                .unwrap_or(message)
-                .to_owned()
-        }
-        RmuxError::InvalidSetOption(message) if message.ends_with(" is already set") => message
-            .strip_suffix(" is already set")
-            .map(|name| format!("already set: {name}"))
-            .unwrap_or_else(|| message.clone()),
-        RmuxError::Server(message)
-            if command_name == "detach-client"
-                && message == "detach-client requires an attached client" =>
-        {
-            "no current client".to_owned()
-        }
-        RmuxError::Server(message) | RmuxError::Message(message)
-            if message
-                .strip_prefix("invalid set-option request: ")
-                .is_some_and(|message| {
-                    message.starts_with("value is ") || message.starts_with("invalid style: ")
-                }) =>
-        {
-            message
-                .strip_prefix("invalid set-option request: ")
-                .unwrap_or(message)
-                .to_owned()
-        }
-        RmuxError::Server(message) if command_name == "delete-buffer" => {
-            if let Some(name) = message.strip_prefix("no buffer ") {
-                format!("unknown buffer: {name}")
-            } else {
-                message.clone()
-            }
-        }
-        RmuxError::Server(message) => message.clone(),
-        _ => error.to_string(),
-    }
-}
-
-fn window_index_from_target(target: &str) -> Option<&str> {
-    target.rsplit_once(':').map(|(_, index)| index)
 }
 
 fn unexpected_response(command_name: &str, response: &Response) -> ExitFailure {

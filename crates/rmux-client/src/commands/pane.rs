@@ -1,10 +1,16 @@
 use rmux_proto::{
-    BreakPaneRequest, ClockModeRequest, CopyModeRequest, DisplayPanesRequest, JoinPaneRequest,
-    KillPaneRequest, LastPaneRequest, MovePaneRequest, PaneTarget, PipePaneRequest, Request,
-    ResizePaneAdjustment, ResizePaneRequest, RespawnPaneRequest, Response,
-    SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneMarkRequest, SelectPaneRequest,
-    SendKeysExt2Request, SendKeysExtRequest, SendKeysRequest, SendPrefixRequest, SessionName,
-    SwapPaneDirection, SwapPaneRequest, WindowTarget, CAPABILITY_TARGET_CLIENT_COMMANDS,
+    BreakPaneRequest, CancelSdkWaitRequest, ClockModeRequest, CopyModeRequest, DisplayPanesRequest,
+    JoinPaneRequest, KillPaneRequest, LastPaneRequest, MovePaneRequest, PaneBroadcastInputRequest,
+    PaneInputRequest, PaneOutputCursorRequest, PaneOutputSubscriptionId,
+    PaneOutputSubscriptionStart, PaneSnapshotRefRequest, PaneTarget, PaneTargetRef,
+    PipePaneRequest, Request, ResizePaneAdjustment, ResizePaneRequest,
+    ResizePaneTargetActionRequest, RespawnPaneRequest, Response, SdkWaitForOutputRefRequest,
+    SdkWaitId, SdkWaitOwnerId, SelectPaneAdjacentRequest, SelectPaneDirection,
+    SelectPaneMarkRequest, SelectPaneRequest, SendKeysExt2Request, SendKeysExtRequest,
+    SendKeysRequest, SendPrefixRequest, SessionName, SubscribePaneOutputRefRequest,
+    SwapPaneDirection, SwapPaneRequest, UnsubscribePaneOutputRequest, WindowTarget,
+    CAPABILITY_SDK_PANE_BROADCAST, CAPABILITY_SDK_PANE_BY_ID, CAPABILITY_SDK_WAITS,
+    CAPABILITY_TARGET_CLIENT_COMMANDS,
 };
 
 use crate::{connection::Connection, ClientError};
@@ -99,7 +105,7 @@ impl Connection {
 
     /// Sends a `break-pane` request over the detached RPC channel.
     pub fn break_pane(&mut self, request: BreakPaneRequest) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::BreakPane(request))
+        self.roundtrip(&Request::BreakPane(Box::new(request)))
     }
 
     /// Sends a `resize-pane` request over the detached RPC channel.
@@ -112,6 +118,14 @@ impl Connection {
             target,
             adjustment,
         }))
+    }
+
+    /// Sends a `resize-pane` request with server-side target resolution.
+    pub fn resize_pane_target_action(
+        &mut self,
+        request: ResizePaneTargetActionRequest,
+    ) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::ResizePaneTargetAction(request))
     }
 
     /// Sends a `display-panes` request over the detached RPC channel.
@@ -157,7 +171,7 @@ impl Connection {
 
     /// Sends a `respawn-pane` request over the detached RPC channel.
     pub fn respawn_pane(&mut self, request: RespawnPaneRequest) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::RespawnPane(request))
+        self.roundtrip(&Request::RespawnPane(Box::new(request)))
     }
 
     /// Sends a `select-pane` request over the detached RPC channel.
@@ -193,13 +207,13 @@ impl Connection {
         input_disabled: Option<bool>,
         preserve_zoom: bool,
     ) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::SelectPane(SelectPaneRequest {
+        self.roundtrip(&Request::SelectPane(Box::new(SelectPaneRequest {
             target,
             title,
             input_disabled,
             preserve_zoom,
             style,
-        }))
+        })))
     }
 
     /// Sends a `select-pane -d` / `-e` input-state request.
@@ -208,13 +222,13 @@ impl Connection {
         target: PaneTarget,
         disabled: bool,
     ) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::SelectPane(SelectPaneRequest {
+        self.roundtrip(&Request::SelectPane(Box::new(SelectPaneRequest {
             target,
             title: None,
             style: None,
             input_disabled: Some(disabled),
             preserve_zoom: false,
-        }))
+        })))
     }
 
     /// Sends a directional `select-pane` request over the detached RPC channel.
@@ -310,7 +324,167 @@ impl Connection {
                 },
             ));
         }
-        self.roundtrip(&Request::SendKeysExt2(request))
+        self.roundtrip(&Request::SendKeysExt2(Box::new(request)))
+    }
+
+    /// Sends a stable-target SDK pane input request over detached RPC.
+    pub fn pane_input(&mut self, request: PaneInputRequest) -> Result<Response, ClientError> {
+        if !self.supports_capability(CAPABILITY_SDK_PANE_BY_ID)? {
+            return Err(ClientError::Protocol(
+                rmux_proto::RmuxError::UnsupportedCapability {
+                    feature: CAPABILITY_SDK_PANE_BY_ID.to_owned(),
+                    supported: Vec::new(),
+                },
+            ));
+        }
+        self.roundtrip(&Request::PaneInput(request))
+    }
+
+    /// Sends a stable-target SDK pane input broadcast request over detached RPC.
+    pub fn pane_broadcast_input(
+        &mut self,
+        request: PaneBroadcastInputRequest,
+    ) -> Result<Response, ClientError> {
+        if !self.supports_capability(CAPABILITY_SDK_PANE_BROADCAST)? {
+            return Err(ClientError::Protocol(
+                rmux_proto::RmuxError::UnsupportedCapability {
+                    feature: CAPABILITY_SDK_PANE_BROADCAST.to_owned(),
+                    supported: Vec::new(),
+                },
+            ));
+        }
+        self.roundtrip(&Request::PaneBroadcastInput(request))
+    }
+
+    /// Captures a stable-target structured pane snapshot over detached RPC.
+    pub fn pane_snapshot_ref(&mut self, target: PaneTargetRef) -> Result<Response, ClientError> {
+        if !self.supports_capability(CAPABILITY_SDK_PANE_BY_ID)? {
+            return Err(ClientError::Protocol(
+                rmux_proto::RmuxError::UnsupportedCapability {
+                    feature: CAPABILITY_SDK_PANE_BY_ID.to_owned(),
+                    supported: Vec::new(),
+                },
+            ));
+        }
+        self.roundtrip(&Request::PaneSnapshotRef(PaneSnapshotRefRequest { target }))
+    }
+
+    /// Subscribes to stable-target pane output.
+    pub fn subscribe_pane_output_ref(
+        &mut self,
+        target: PaneTargetRef,
+        start: PaneOutputSubscriptionStart,
+    ) -> Result<Response, ClientError> {
+        if !self.supports_capability(CAPABILITY_SDK_PANE_BY_ID)? {
+            return Err(ClientError::Protocol(
+                rmux_proto::RmuxError::UnsupportedCapability {
+                    feature: CAPABILITY_SDK_PANE_BY_ID.to_owned(),
+                    supported: Vec::new(),
+                },
+            ));
+        }
+        self.roundtrip(&Request::SubscribePaneOutputRef(
+            SubscribePaneOutputRefRequest { target, start },
+        ))
+    }
+
+    /// Polls a pane-output subscription cursor.
+    pub fn pane_output_cursor(
+        &mut self,
+        subscription_id: PaneOutputSubscriptionId,
+        max_events: Option<u16>,
+    ) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::PaneOutputCursor(PaneOutputCursorRequest {
+            subscription_id,
+            max_events,
+        }))
+    }
+
+    /// Unsubscribes from pane output.
+    pub fn unsubscribe_pane_output(
+        &mut self,
+        subscription_id: PaneOutputSubscriptionId,
+    ) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::UnsubscribePaneOutput(
+            UnsubscribePaneOutputRequest { subscription_id },
+        ))
+    }
+
+    /// Arms a daemon-backed stable-target SDK byte wait.
+    pub fn sdk_wait_for_output_ref(
+        &mut self,
+        owner_id: SdkWaitOwnerId,
+        wait_id: SdkWaitId,
+        target: PaneTargetRef,
+        bytes: Vec<u8>,
+        start: PaneOutputSubscriptionStart,
+    ) -> Result<Response, ClientError> {
+        if !self.supports_capability(CAPABILITY_SDK_WAITS)? {
+            return Err(ClientError::Protocol(
+                rmux_proto::RmuxError::UnsupportedCapability {
+                    feature: CAPABILITY_SDK_WAITS.to_owned(),
+                    supported: Vec::new(),
+                },
+            ));
+        }
+        self.roundtrip_without_read_timeout(&Request::SdkWaitForOutputRef(
+            SdkWaitForOutputRefRequest {
+                owner_id,
+                wait_id,
+                target,
+                bytes,
+                start,
+            },
+        ))
+    }
+
+    /// Writes a stable-target SDK byte wait request without reading its response.
+    ///
+    /// Callers use this to arm a future-output wait before performing another
+    /// action, then read the response later on the same connection.
+    pub fn arm_sdk_wait_for_output_ref(
+        &mut self,
+        owner_id: SdkWaitOwnerId,
+        wait_id: SdkWaitId,
+        target: PaneTargetRef,
+        bytes: Vec<u8>,
+        start: PaneOutputSubscriptionStart,
+    ) -> Result<(), ClientError> {
+        if !self.supports_capability(CAPABILITY_SDK_WAITS)? {
+            return Err(ClientError::Protocol(
+                rmux_proto::RmuxError::UnsupportedCapability {
+                    feature: CAPABILITY_SDK_WAITS.to_owned(),
+                    supported: Vec::new(),
+                },
+            ));
+        }
+        self.write_request(&Request::SdkWaitForOutputRef(SdkWaitForOutputRefRequest {
+            owner_id,
+            wait_id,
+            target,
+            bytes,
+            start,
+        }))
+    }
+
+    /// Cancels a daemon-backed SDK byte wait.
+    pub fn cancel_sdk_wait(
+        &mut self,
+        owner_id: SdkWaitOwnerId,
+        wait_id: SdkWaitId,
+    ) -> Result<Response, ClientError> {
+        if !self.supports_capability(CAPABILITY_SDK_WAITS)? {
+            return Err(ClientError::Protocol(
+                rmux_proto::RmuxError::UnsupportedCapability {
+                    feature: CAPABILITY_SDK_WAITS.to_owned(),
+                    supported: Vec::new(),
+                },
+            ));
+        }
+        self.roundtrip(&Request::CancelSdkWait(CancelSdkWaitRequest {
+            owner_id,
+            wait_id,
+        }))
     }
 
     /// Sends a `send-prefix` request over the detached RPC channel.

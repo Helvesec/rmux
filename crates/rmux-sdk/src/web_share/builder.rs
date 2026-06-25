@@ -247,7 +247,7 @@ impl<'a> WebShareBuilder<'a> {
         let controls = self.operator && matches!(&self.scope, WebShareScope::Session(_));
         let response = self
             .transport
-            .request(Request::WebShare(WebShareRequest::Create(
+            .request(Request::WebShare(Box::new(WebShareRequest::Create(
                 CreateWebShareRequest {
                     scope: self.scope,
                     public_base_url: self.public_base_url,
@@ -270,12 +270,18 @@ impl<'a> WebShareBuilder<'a> {
                     controls,
                     kill_session_on_expire: self.kill_session_on_expire,
                 },
-            )))
+            ))))
             .await?;
         match response {
-            Response::WebShare(WebShareResponse::Created(created)) => {
-                Ok(WebShareHandle::new(self.transport.clone(), created))
-            }
+            Response::WebShare(response) => match *response {
+                WebShareResponse::Created(created) => {
+                    Ok(WebShareHandle::new(self.transport.clone(), created))
+                }
+                other => Err(unexpected_response(
+                    "web-share create",
+                    Response::WebShare(Box::new(other)),
+                )),
+            },
             Response::Error(error) => Err(error.into()),
             response => Err(unexpected_response("web-share create", response)),
         }

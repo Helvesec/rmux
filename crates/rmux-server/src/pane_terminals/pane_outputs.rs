@@ -83,6 +83,15 @@ impl HandlerState {
         runtime_session_name: &SessionName,
         pane_id: PaneId,
     ) -> Result<Option<PaneExitMetadata>, RmuxError> {
+        #[cfg(windows)]
+        if self
+            .starting_panes
+            .get(runtime_session_name)
+            .is_some_and(|panes| panes.contains_key(&pane_id))
+        {
+            return Ok(None);
+        }
+
         let Some(target) = self.pane_target_for_runtime_pane(runtime_session_name, pane_id) else {
             return Ok(None);
         };
@@ -161,51 +170,6 @@ impl HandlerState {
         Ok(())
     }
 
-    pub(crate) fn clear_runtime_pane_transcript_for_dead_exit_if_marked(
-        &mut self,
-        runtime_session_name: &SessionName,
-        pane_id: PaneId,
-    ) -> Result<bool, RmuxError> {
-        let transcript = self
-            .transcripts
-            .get(runtime_session_name)
-            .and_then(|panes| panes.get(&pane_id))
-            .ok_or_else(|| {
-                RmuxError::Server(format!(
-                    "missing pane transcript for pane id {} in session {}",
-                    pane_id.as_u32(),
-                    runtime_session_name
-                ))
-            })?;
-        Ok(transcript
-            .lock()
-            .expect("pane transcript mutex must not be poisoned")
-            .clear_for_dead_exit_if_marked())
-    }
-
-    pub(crate) fn active_pane_output(
-        &self,
-        session_name: &SessionName,
-    ) -> Result<PaneOutputSender, RmuxError> {
-        let session = self
-            .sessions
-            .session(session_name)
-            .ok_or_else(|| session_not_found(session_name))?;
-        let window_index = session.active_window_index();
-        let pane_index = session.active_pane_index();
-        let pane_id = session
-            .active_pane()
-            .map(|pane| pane.id())
-            .ok_or_else(|| missing_pane_terminal(session_name, window_index, pane_index))?;
-        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-
-        self.pane_outputs
-            .get(&runtime_session_name)
-            .and_then(|panes| panes.get(&pane_id))
-            .cloned()
-            .ok_or_else(|| missing_pane_terminal(session_name, window_index, pane_index))
-    }
-
     pub(crate) fn pane_output_for_target(
         &self,
         session_name: &SessionName,
@@ -280,6 +244,18 @@ impl HandlerState {
             .get(runtime_session_name)
             .and_then(|panes| panes.get(&pane_id))
             .map(PaneOutputSender::subscribe)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn subscribe_runtime_pane_output_from_oldest(
+        &self,
+        runtime_session_name: &SessionName,
+        pane_id: PaneId,
+    ) -> Option<crate::pane_io::PaneOutputReceiver> {
+        self.pane_outputs
+            .get(runtime_session_name)
+            .and_then(|panes| panes.get(&pane_id))
+            .map(PaneOutputSender::subscribe_from_oldest)
     }
 
     pub(crate) fn runtime_pane_output_drain_handles(

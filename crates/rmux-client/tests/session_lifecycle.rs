@@ -274,25 +274,26 @@ fn grouped_new_session_without_explicit_name_round_trips_through_the_real_socket
         environment: None,
     }))?;
 
-    let grouped = connection.roundtrip(&Request::NewSessionExt(NewSessionExtRequest {
-        session_name: None,
-        working_directory: None,
-        detached: true,
-        size: None,
-        environment: None,
-        group_target: Some(session_name("alpha")),
-        attach_if_exists: false,
-        detach_other_clients: false,
-        kill_other_clients: false,
-        flags: None,
-        window_name: None,
-        print_session_info: true,
-        print_format: Some("#{session_name}".to_owned()),
-        command: None,
-        process_command: None,
-        client_environment: None,
-        skip_environment_update: false,
-    }))?;
+    let grouped =
+        connection.roundtrip(&Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: None,
+            working_directory: None,
+            detached: true,
+            size: None,
+            environment: None,
+            group_target: Some(session_name("alpha")),
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: true,
+            print_format: Some("#{session_name}".to_owned()),
+            command: None,
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))?;
 
     assert_eq!(
         grouped,

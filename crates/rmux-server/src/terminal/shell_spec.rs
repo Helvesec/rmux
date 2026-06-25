@@ -75,7 +75,6 @@ impl ShellSpec {
             #[cfg(windows)]
             ShellKind::PowerShell => ShellCommandPlan::new(&self.program)
                 .arg("-NoLogo")
-                .arg("-NoProfile")
                 .arg("-NoExit")
                 .arg("-Command")
                 .arg(format!(
@@ -244,7 +243,6 @@ mod tests {
             interactive.args,
             os_args([
                 "-NoLogo",
-                "-NoProfile",
                 "-NoExit",
                 "-Command",
                 "Set-Location -LiteralPath 'C:\\Users\\RMUXUser''s Workspace\\rmux'",

@@ -1,5 +1,7 @@
 //! Daemon-backed session creation and reuse builders.
 
+#[cfg(windows)]
+use std::ffi::OsString;
 use std::fmt;
 use std::time::Duration;
 
@@ -12,6 +14,11 @@ use crate::transport::TransportClient;
 use crate::{ProcessCommandSpec, ProcessSpec, Result, RmuxError, SessionName, TerminalSizeSpec};
 use redaction::redact_environment_error;
 use rmux_proto::{NewSessionExtRequest, Request, Response};
+
+#[cfg(windows)]
+const RMUX_CLIENT_SHELL_ENV: &str = "RMUX_CLIENT_SHELL";
+#[cfg(windows)]
+const INTERNAL_TMUX_COMPAT_ENV: &str = "RMUX_INTERNAL_INVOKED_AS_TMUX";
 
 /// Session ensure policy.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -299,10 +306,40 @@ impl EnsureSession {
                 .process_command
                 .clone()
                 .map(rmux_proto::ProcessCommand::from),
-            client_environment: None,
+            client_environment: sdk_client_environment(),
             skip_environment_update: false,
         }
     }
+}
+
+#[cfg(windows)]
+fn sdk_client_environment() -> Option<Vec<String>> {
+    let mut environment = std::env::vars_os()
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
+        .filter(|(name, _)| !name.starts_with('='))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(RMUX_CLIENT_SHELL_ENV))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TMUX_COMPAT_ENV))
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>();
+
+    let shell = std::env::var_os("COMSPEC")
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| OsString::from("cmd.exe"))
+        .to_string_lossy()
+        .into_owned();
+    environment.push(format!("{RMUX_CLIENT_SHELL_ENV}={shell}"));
+
+    Some(environment)
+}
+
+#[cfg(not(windows))]
+fn sdk_client_environment() -> Option<Vec<String>> {
+    None
 }
 
 impl Default for EnsureSession {
@@ -405,7 +442,7 @@ async fn create_session(
     .await
     .map_err(|error| redact_builder_environment_error(error, builder))?;
     match transport
-        .request(Request::NewSessionExt(request))
+        .request(Request::NewSessionExt(Box::new(request)))
         .await
         .map_err(|error| redact_builder_environment_error(error, builder))?
     {

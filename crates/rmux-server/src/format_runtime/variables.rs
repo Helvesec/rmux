@@ -11,12 +11,15 @@ use crate::host_name::local_hostname;
 
 use super::{bool_string, server_start_time, RuntimeFormatContext};
 
+const PANE_CONTENT_SEARCH_REGEX_SIZE_LIMIT: usize = 1_000_000;
+const PANE_CONTENT_SEARCH_REGEX_DFA_SIZE_LIMIT: usize = 1_000_000;
+
 impl RuntimeFormatContext<'_> {
     fn pane_history_all_bytes(&self) -> Option<String> {
         let session = self.session?;
         let pane = self.pane?;
-        let stats = self.state?.pane_history_stats(session.name(), pane.id())?;
-        Some(stats.all_bytes)
+        self.state?
+            .pane_history_all_bytes(session.name(), pane.id())
     }
 
     fn pane_pipe(&self) -> Option<String> {
@@ -84,10 +87,17 @@ impl RuntimeFormatContext<'_> {
     fn pane_content_search(&self, options: &str, pattern: &str) -> Option<String> {
         let session = self.session?;
         let pane = self.pane?;
-        let screen = self
+        if let Some(screen) = self
             .state?
             .pane_copy_mode_render_screen(session.name(), pane.id())
-            .or_else(|| self.state?.pane_render_screen(session.name(), pane.id()))?;
+        {
+            let lines = screen.capture_transcript_lines_independent(
+                ScreenCaptureRange::default(),
+                GridRenderOptions::default(),
+            );
+            return Some(search_visible_lines(&lines, options, pattern).to_string());
+        }
+        let screen = self.state?.pane_screen(session.name(), pane.id())?;
         let lines = screen.capture_transcript_lines_independent(
             ScreenCaptureRange::default(),
             GridRenderOptions::default(),
@@ -576,10 +586,11 @@ fn search_visible_lines(lines: &[Vec<u8>], options: &str, pattern: &str) -> usiz
 
     let ignore_case = options.contains('i');
     if options.contains('r') {
-        let Ok(regex) = RegexBuilder::new(pattern)
-            .case_insensitive(ignore_case)
-            .build()
-        else {
+        let mut builder = RegexBuilder::new(pattern);
+        builder.case_insensitive(ignore_case);
+        builder.size_limit(PANE_CONTENT_SEARCH_REGEX_SIZE_LIMIT);
+        builder.dfa_size_limit(PANE_CONTENT_SEARCH_REGEX_DFA_SIZE_LIMIT);
+        let Ok(regex) = builder.build() else {
             return 0;
         };
         return search_lines(lines, |line| regex.is_match(line));

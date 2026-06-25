@@ -22,6 +22,26 @@ fn option_registry_is_closed_unique_and_contains_full_frozen_inventory() {
 }
 
 #[test]
+fn option_lookup_indexes_match_registry_metadata() {
+    for metadata in registry::registry() {
+        assert_eq!(
+            registry::option_metadata(metadata.option()).name(),
+            metadata.name()
+        );
+
+        let by_name = registry::resolve_exact_option_name(metadata.name())
+            .expect("canonical option name resolves exactly");
+        assert_eq!(by_name.known_option(), Some(metadata.option()));
+
+        for alias in metadata.aliases() {
+            let by_alias =
+                registry::resolve_exact_option_name(alias).expect("option alias resolves exactly");
+            assert_eq!(by_alias.known_option(), Some(metadata.option()));
+        }
+    }
+}
+
+#[test]
 fn option_registry_matches_frozen_tmux_option_names() {
     let Some(source) = frozen_options_table_source() else {
         return;
@@ -85,11 +105,11 @@ fn frozen_choice_lists_and_scope_masks_match_tmux_inventory() {
     );
     assert_eq!(
         registry::option_metadata(OptionName::PaneBorderStyle).scope_mask(),
-        registry::SCOPE_WINDOW
+        registry::SCOPE_WINDOW | registry::SCOPE_PANE
     );
     assert_eq!(
         registry::option_metadata(OptionName::PaneActiveBorderStyle).scope_mask(),
-        registry::SCOPE_WINDOW
+        registry::SCOPE_WINDOW | registry::SCOPE_PANE
     );
     assert_eq!(
         registry::option_metadata(OptionName::WindowStyle).scope_mask(),

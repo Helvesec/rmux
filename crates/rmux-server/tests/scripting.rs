@@ -18,7 +18,7 @@ async fn run_shell_foreground_returns_status_without_stdout() -> Result<(), Box<
 
     let response = send_request(
         &socket_path,
-        &Request::RunShell(RunShellRequest {
+        &Request::RunShell(Box::new(RunShellRequest {
             command: "printf server".to_owned(),
             background: false,
             as_commands: false,
@@ -27,7 +27,7 @@ async fn run_shell_foreground_returns_status_without_stdout() -> Result<(), Box<
             start_directory: None,
             target: None,
             source_depth: None,
-        }),
+        })),
     )
     .await?;
 
@@ -48,7 +48,7 @@ async fn if_shell_rejects_unsupported_nested_command() -> Result<(), Box<dyn Err
 
     let response = send_request(
         &socket_path,
-        &Request::IfShell(IfShellRequest {
+        &Request::IfShell(Box::new(IfShellRequest {
             condition: "1".to_owned(),
             format_mode: true,
             then_command: "unsupported-command".to_owned(),
@@ -56,7 +56,7 @@ async fn if_shell_rejects_unsupported_nested_command() -> Result<(), Box<dyn Err
             target: None,
             caller_cwd: None,
             background: false,
-        }),
+        })),
     )
     .await?;
 
@@ -86,7 +86,7 @@ async fn if_shell_returns_nested_command_output() -> Result<(), Box<dyn Error>> 
 
     let response = send_request(
         &socket_path,
-        &Request::IfShell(IfShellRequest {
+        &Request::IfShell(Box::new(IfShellRequest {
             condition: "1".to_owned(),
             format_mode: true,
             then_command: "show-buffer -b selected".to_owned(),
@@ -94,7 +94,7 @@ async fn if_shell_returns_nested_command_output() -> Result<(), Box<dyn Error>> 
             target: None,
             caller_cwd: None,
             background: false,
-        }),
+        })),
     )
     .await?;
 

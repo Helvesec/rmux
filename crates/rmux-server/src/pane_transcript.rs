@@ -22,7 +22,6 @@ pub(crate) struct PaneTranscript {
     mode: Option<PaneModeState>,
     output_sequence: u64,
     next_clock_generation: u64,
-    clear_on_dead_exit: bool,
     #[cfg(test)]
     utf8_config: Utf8Config,
 }
@@ -66,7 +65,6 @@ impl PaneTranscript {
             mode: None,
             output_sequence: 0,
             next_clock_generation: 1,
-            clear_on_dead_exit: false,
             #[cfg(test)]
             utf8_config: Utf8Config::default(),
         }
@@ -131,6 +129,10 @@ impl PaneTranscript {
 
     pub(crate) fn set_alternate_screen_enabled(&mut self, enabled: bool) {
         self.terminal.set_alternate_screen_enabled(enabled);
+    }
+
+    pub(crate) fn set_title_rename_enabled(&mut self, enabled: bool) {
+        self.terminal.set_title_rename_enabled(enabled);
     }
 
     pub(crate) fn set_input_buffer_limit(&mut self, limit: usize) {
@@ -233,25 +235,6 @@ impl PaneTranscript {
         trimmed
     }
 
-    pub(crate) fn mark_clear_on_dead_exit(&mut self) {
-        self.clear_on_dead_exit = true;
-    }
-
-    pub(crate) fn clear_for_dead_exit_if_marked(&mut self) -> bool {
-        if !std::mem::take(&mut self.clear_on_dead_exit) {
-            return false;
-        }
-
-        self.terminal.reset_parser();
-        self.mode = None;
-        self.terminal
-            .screen_mut()
-            .clear_history_and_hyperlinks(true);
-        // tmux drops the top visible row for remain-on-exit respawn deaths.
-        let _ = self.terminal.screen_mut().delete_visible_line(0);
-        true
-    }
-
     pub(crate) fn delete_attached_submitted_line(
         &mut self,
         absolute_y: usize,
@@ -295,6 +278,10 @@ impl PaneTranscript {
 
     pub(crate) fn clone_screen(&self) -> Screen {
         self.terminal.screen().clone()
+    }
+
+    pub(crate) fn screen(&self) -> &Screen {
+        self.terminal.screen()
     }
 
     pub(crate) fn copy_mode_state(&self) -> Option<&CopyModeState> {
@@ -396,6 +383,10 @@ impl PaneTranscript {
 
     pub(crate) fn cursor_style(&self) -> u32 {
         self.terminal.screen().cursor_style()
+    }
+
+    pub(crate) fn cursor_position(&self) -> (u32, u32) {
+        self.terminal.screen().cursor_position()
     }
 
     pub(crate) fn is_alternate(&self) -> bool {

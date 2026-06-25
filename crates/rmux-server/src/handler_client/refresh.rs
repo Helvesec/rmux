@@ -164,6 +164,8 @@ impl RequestHandler {
         };
 
         if let (Some(session_name), Some(size)) = (session_name.as_ref(), control_size) {
+            #[cfg(windows)]
+            self.wait_for_windows_deferred_all_pane_pids().await;
             let target = {
                 let mut state = self.state.lock().await;
                 match state.mutate_session_and_resize_terminals(session_name, |session| {

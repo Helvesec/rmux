@@ -41,8 +41,12 @@ pub(crate) async fn serve(
         RequestHandler::with_owner_uid_subscription_limits_and_web_settings(
             options.owner_uid,
             options.subscription_limits,
-            crate::web::WebShareSettings::from_options(options.web_port, options.web_frontend)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?,
+            crate::web::WebShareSettings::from_options_with_port_explicit(
+                options.web_port,
+                options.web_frontend,
+                options.web_port_explicit,
+            )
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?,
         ),
     );
     #[cfg(not(all(any(unix, windows), feature = "web")))]
@@ -105,6 +109,7 @@ pub(crate) async fn serve(
             }
             _ = &mut shutdown => {
                 debug!("shutdown requested");
+                cleanup_on_drop.cleanup_now();
                 break;
             }
             result = wait_server_signal(&server_signals), if server_signals.is_some() => {
@@ -152,7 +157,7 @@ async fn serve_connection(
     mut shutdown: watch::Receiver<()>,
     shutdown_handle: ShutdownHandle,
 ) -> io::Result<()> {
-    let Some(access_mode) = handler.access_mode_for_peer(&requester) else {
+    let Some(_) = handler.access_mode_for_peer(&requester) else {
         let mut conn = Connection::new(stream);
         conn.write_response(&Response::Error(ErrorResponse {
             error: rmux_proto::RmuxError::Server("access not allowed".to_owned()),
@@ -169,14 +174,22 @@ async fn serve_connection(
                 let Some(request) = request? else {
                     return Ok(());
                 };
-                let request = match apply_access_policy(request, access_mode.can_write()) {
+                let Some(access_mode) = handler.access_mode_for_peer(&requester) else {
+                    conn.write_response(&Response::Error(ErrorResponse {
+                        error: rmux_proto::RmuxError::Server("access not allowed".to_owned()),
+                    }))
+                    .await?;
+                    continue;
+                };
+                let can_write = access_mode.can_write();
+                let request = match apply_access_policy(request, can_write) {
                     Ok(request) => request,
                     Err(error) => {
                         conn.write_response(&Response::Error(ErrorResponse { error })).await?;
                         continue;
                     }
                 };
-                let detached_request_guard = request_counts_as_detached_activity(&request)
+                let mut detached_request_guard = request_counts_as_detached_activity(&request)
                     .then(|| handler.begin_detached_request());
 
                 let cancel_on_peer_disconnect = request_cancels_on_peer_disconnect(&request);
@@ -195,7 +208,13 @@ async fn serve_connection(
                         return Ok(());
                     }
                 };
-                conn.write_response(&outcome.response).await?;
+                if let Err(error) = conn.write_response(&outcome.response).await {
+                    drop(detached_request_guard.take());
+                    #[cfg(windows)]
+                    let _ = handler
+                        .request_shutdown_if_pending_excluding_detached_connection(Some(connection_id));
+                    return Err(error);
+                }
 
                 if let Some(attach) = outcome.attach {
                     let Response::AttachSession(response) = &outcome.response else {
@@ -219,13 +238,13 @@ async fn serve_connection(
                                 render_stream: attach.render_stream,
                                 uid: requester.uid,
                                 user: requester.user.clone(),
-                                can_write: access_mode.can_write(),
+                                can_write,
                                 client_size: attach.client_size,
                             },
                         )
                         .await;
                     drop(detached_connection_guard);
-                    drop(detached_request_guard);
+                    drop(detached_request_guard.take());
                     handler.emit_client_attached(requester.pid, session_name).await;
                     let (stream, buffered_bytes) = conn.into_raw_parts();
                     if !buffered_bytes.is_empty() {
@@ -265,12 +284,12 @@ async fn serve_connection(
                                 closing: closing.clone(),
                                 uid: requester.uid,
                                 user: requester.user.clone(),
-                                can_write: access_mode.can_write(),
+                                can_write,
                             },
                         )
                         .await;
                     drop(detached_connection_guard);
-                    drop(detached_request_guard);
+                    drop(detached_request_guard.take());
                     let (stream, buffered_bytes) = conn.into_raw_parts();
                     let result = control::forward_control(
                         stream,
@@ -289,7 +308,7 @@ async fn serve_connection(
                     return result;
                 }
 
-                drop(detached_request_guard);
+                drop(detached_request_guard.take());
                 if handler
                     .request_shutdown_if_pending_excluding_detached_connection(Some(connection_id))
                 {
@@ -388,8 +407,10 @@ impl Connection {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::server_access::AccessMode;
     use rmux_proto::{
-        DaemonStatusRequest, ErrorResponse, HandshakeRequest, RmuxError, ShutdownIfIdleRequest,
+        DaemonStatusRequest, ErrorResponse, HandshakeRequest, ListSessionsRequest,
+        RenameSessionRequest, RmuxError, SessionName, ShutdownIfIdleRequest,
         ShutdownIfIdleResponse, WaitForMode, WaitForRequest, WaitForResponse, RMUX_WIRE_VERSION,
     };
 
@@ -509,6 +530,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistent_connection_reevaluates_server_access_per_request() -> io::Result<()> {
+        let peer_uid = rmux_os::identity::real_user_id().saturating_add(10_000);
+        let peer = PeerIdentity {
+            pid: std::process::id(),
+            uid: peer_uid,
+            user: rmux_os::identity::UserIdentity::Uid(peer_uid),
+        };
+        let handler = Arc::new(RequestHandler::new());
+        handler
+            .set_test_access_mode_for_uid(peer_uid, AccessMode::ReadWrite)
+            .expect("test peer starts read-write");
+        let (mut client, _shutdown_tx, connection_task) =
+            spawn_test_connection_with_peer(&handler, peer)?;
+
+        write_test_request(&mut client, rename_missing_session_request()).await?;
+        let response = read_test_response(&mut client).await?;
+        match response {
+            Response::Error(ErrorResponse {
+                error: RmuxError::Server(message),
+            }) => {
+                assert_ne!(message, "client is read-only");
+                assert_ne!(message, "access not allowed");
+            }
+            Response::Error(_) => {}
+            response => panic!("expected rename-session to reach the handler, got {response:?}"),
+        }
+
+        handler
+            .set_test_access_mode_for_uid(peer_uid, AccessMode::ReadOnly)
+            .expect("test peer downgrades to read-only");
+        write_test_request(&mut client, rename_missing_session_request()).await?;
+        assert_eq!(
+            read_test_response(&mut client).await?,
+            Response::Error(ErrorResponse {
+                error: RmuxError::Server("client is read-only".to_owned())
+            })
+        );
+
+        handler
+            .remove_test_access_for_uid(peer_uid)
+            .expect("test peer access can be revoked");
+        write_test_request(
+            &mut client,
+            Request::ListSessions(ListSessionsRequest {
+                format: None,
+                filter: None,
+                sort_order: None,
+                reversed: false,
+            }),
+        )
+        .await?;
+        assert_eq!(
+            read_test_response(&mut client).await?,
+            Response::Error(ErrorResponse {
+                error: RmuxError::Server("access not allowed".to_owned())
+            })
+        );
+
+        drop(client);
+        connection_task.await.expect("connection task")?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn read_request_sends_framed_error_for_unsupported_wire_version() -> io::Result<()> {
         let (server, mut client) = LocalStream::pair()?;
         let mut connection = Connection::new(server);
@@ -618,6 +703,24 @@ mod tests {
         watch::Sender<()>,
         tokio::task::JoinHandle<io::Result<()>>,
     )> {
+        spawn_test_connection_with_peer(
+            handler,
+            PeerIdentity {
+                pid: std::process::id(),
+                uid: rmux_os::identity::real_user_id(),
+                user: rmux_os::identity::UserIdentity::Uid(rmux_os::identity::real_user_id()),
+            },
+        )
+    }
+
+    fn spawn_test_connection_with_peer(
+        handler: &Arc<RequestHandler>,
+        peer: PeerIdentity,
+    ) -> io::Result<(
+        LocalStream,
+        watch::Sender<()>,
+        tokio::task::JoinHandle<io::Result<()>>,
+    )> {
         let (server, client) = LocalStream::pair()?;
         let handler = Arc::clone(handler);
         let (shutdown_tx, shutdown_rx) = watch::channel(());
@@ -626,11 +729,7 @@ mod tests {
         let task = tokio::spawn(async move {
             let result = serve_connection(
                 server,
-                PeerIdentity {
-                    pid: std::process::id(),
-                    uid: rmux_os::identity::real_user_id(),
-                    user: rmux_os::identity::UserIdentity::Uid(rmux_os::identity::real_user_id()),
-                },
+                peer,
                 Arc::clone(&handler),
                 connection_id,
                 shutdown_rx,
@@ -644,6 +743,13 @@ mod tests {
             result
         });
         Ok((client, shutdown_tx, task))
+    }
+
+    fn rename_missing_session_request() -> Request {
+        Request::RenameSession(RenameSessionRequest {
+            target: SessionName::new("missing").expect("valid source session"),
+            new_name: SessionName::new("renamed").expect("valid destination session"),
+        })
     }
 
     fn wait_for(channel: &str, mode: WaitForMode) -> Request {
@@ -691,5 +797,72 @@ mod tests {
         }
 
         assert_eq!(handler.wait_for_counts(channel), expected);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    use rmux_proto::KillServerRequest;
+
+    #[tokio::test]
+    async fn kill_server_peer_disconnect_still_requests_shutdown() -> io::Result<()> {
+        let endpoint = rmux_ipc::endpoint_for_label(format!(
+            "listener-kill-disconnect-{}",
+            std::process::id()
+        ))?;
+        let listener = rmux_ipc::LocalListener::bind(&endpoint)?;
+        let handler = Arc::new(RequestHandler::new());
+        let (connection_shutdown_tx, connection_shutdown_rx) = watch::channel(());
+        let (shutdown_handle, shutdown_request_rx) = ShutdownHandle::new();
+        handler.install_shutdown_handle(shutdown_handle.clone());
+
+        let connection_handler = Arc::clone(&handler);
+        let connection_task = tokio::spawn(async move {
+            let (server, requester) = listener.accept().await?;
+            let connection_id = connection_handler.allocate_connection_id();
+            let result = serve_connection(
+                server,
+                requester,
+                Arc::clone(&connection_handler),
+                connection_id,
+                connection_shutdown_rx,
+                shutdown_handle,
+            )
+            .await;
+            connection_handler
+                .cleanup_connection_subscriptions(connection_id)
+                .await;
+            connection_handler
+                .cleanup_connection_sdk_waits(connection_id)
+                .await;
+            result
+        });
+
+        let frame =
+            encode_frame(&Request::KillServer(KillServerRequest)).map_err(io::Error::other)?;
+        let endpoint_for_client = endpoint.clone();
+        tokio::task::spawn_blocking(move || -> io::Result<()> {
+            let mut client =
+                rmux_ipc::connect_blocking(&endpoint_for_client, Duration::from_secs(2))?;
+            client.write_all(&frame)?;
+            Ok(())
+        })
+        .await
+        .expect("client task should not panic")?;
+
+        tokio::time::timeout(Duration::from_secs(2), shutdown_request_rx)
+            .await
+            .expect("kill-server should request daemon shutdown")
+            .expect("shutdown receiver should complete cleanly");
+        let _ = connection_shutdown_tx.send(());
+
+        match connection_task.await.expect("connection task") {
+            Ok(()) => Ok(()),
+            Err(error) if rmux_ipc::is_peer_disconnect(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 }

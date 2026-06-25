@@ -7,6 +7,7 @@ use super::target_is_in_copy_mode;
 use crate::key_table::{
     default_key_table_name, lookup_key_table_binding, COPY_MODE_TABLE, COPY_MODE_VI_TABLE,
 };
+use crate::limits::clamp_repeat_count;
 
 pub(in crate::handler) struct DirectCopyModeCommand {
     pub(in crate::handler) command: String,
@@ -40,10 +41,10 @@ pub(in crate::handler) fn direct_copy_mode_command(
             }
             "-X" => copy_mode_command = true,
             "-N" => {
-                repeat_count = args.next()?.as_string()?.parse::<usize>().ok()?.max(1);
+                repeat_count = clamp_repeat_count(args.next()?.as_string()?.parse::<usize>().ok()?);
             }
             value if value.starts_with("-N") && value.len() > 2 => {
-                repeat_count = value[2..].parse::<usize>().ok()?.max(1);
+                repeat_count = clamp_repeat_count(value[2..].parse::<usize>().ok()?);
             }
             value if value.starts_with('-') => return None,
             value => {
@@ -131,5 +132,20 @@ mod tests {
         assert_eq!(command.command, "cancel");
         assert_eq!(command.args, Vec::<String>::new());
         assert_eq!(command.repeat_count, 3);
+    }
+
+    #[test]
+    fn direct_copy_mode_command_clamps_repeat_count() {
+        use rmux_core::command_parser::CommandParser;
+
+        let parsed = CommandParser::new()
+            .parse_one_group("send -N999999 -X cancel")
+            .unwrap();
+        let command = direct_copy_mode_command(&parsed).unwrap();
+
+        assert_eq!(
+            command.repeat_count,
+            crate::limits::MAX_COMMAND_REPEAT_COUNT
+        );
     }
 }

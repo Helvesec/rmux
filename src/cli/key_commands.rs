@@ -24,6 +24,9 @@ pub(super) fn run_send_keys(args: SendKeysArgs, socket_path: &Path) -> Result<i3
     if args.repeat_count == Some(0) {
         return Err(ExitFailure::new(1, "repeat count too small"));
     }
+    if args.has_wait() {
+        return super::automation::run_send_keys_with_wait(args, socket_path);
+    }
 
     if send_keys_uses_legacy_path(&args) {
         let target = args

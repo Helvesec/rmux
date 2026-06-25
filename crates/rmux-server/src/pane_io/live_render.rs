@@ -12,14 +12,27 @@ pub(crate) struct LivePaneRender {
 }
 
 impl LivePaneRender {
-    pub(crate) fn new(
+    pub(crate) fn new_from_transcript(
         transcript: SharedPaneTranscript,
         session: Session,
         options: OptionStore,
         pane: Pane,
-        screen: &rmux_core::Screen,
     ) -> Option<Box<Self>> {
-        let snapshot = PaneRenderSnapshot::capture(&session, &options, &pane, screen)?;
+        let snapshot = {
+            let transcript_guard = transcript
+                .lock()
+                .expect("pane transcript mutex must not be poisoned");
+            PaneRenderSnapshot::capture_unstyled_transcript_reusing(
+                &session,
+                &options,
+                &pane,
+                &transcript_guard,
+                None,
+            )
+            .or_else(|| {
+                PaneRenderSnapshot::capture(&session, &options, &pane, transcript_guard.screen())
+            })?
+        };
         Some(Box::new(Self {
             transcript,
             session,
@@ -89,7 +102,7 @@ impl LivePaneRender {
 
 #[cfg(test)]
 mod tests {
-    use rmux_core::{input::InputParser, OptionStore, Screen, Session};
+    use rmux_core::{OptionStore, Session};
     use rmux_proto::{SessionName, TerminalSize};
 
     use crate::pane_transcript::PaneTranscript;
@@ -112,10 +125,9 @@ mod tests {
             .expect("transcript mutex must not be poisoned")
             .append_bytes(b"abc");
 
-        let mut screen = Screen::new(TerminalSize { cols: 10, rows: 3 }, 100);
-        InputParser::new().parse(b"abc", &mut screen);
-        let mut renderer = LivePaneRender::new(transcript.clone(), session, options, pane, &screen)
-            .expect("initial render snapshot");
+        let mut renderer =
+            LivePaneRender::new_from_transcript(transcript.clone(), session, options, pane)
+                .expect("initial render snapshot");
 
         transcript
             .lock()

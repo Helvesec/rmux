@@ -753,13 +753,16 @@ fn resize_pane_accepts_tmux_style_space_separated_direction_delta() {
 }
 
 #[test]
-fn resize_pane_does_not_steal_absolute_size_value_as_direction_delta() {
-    let error = parse_args(&["resize-pane", "-U", "-x", "10"]).unwrap_err();
+fn resize_pane_valueless_relative_before_absolute_follows_tmux_last_wins() {
+    let cli = parse_args(&["resize-pane", "-U", "-x", "10"]).unwrap();
 
-    assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
-    assert!(error.to_string().contains(
-        "resize-pane accepts only one relative adjustment, trim, zoom, or absolute size"
-    ));
+    match cli.command.expect("parsed command") {
+        super::super::Command::ResizePane(args) => {
+            assert_eq!(args.up, None);
+            assert_eq!(args.columns, Some(super::super::ResizePaneSize::Cells(10)));
+        }
+        other => panic!("expected ResizePane command, got {other:?}"),
+    }
 }
 
 #[test]

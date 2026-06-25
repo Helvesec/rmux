@@ -73,6 +73,7 @@ manifest() {
       "extract_dir": "rmux-$version-windows-x86_64"
     }
   },
+  "depends": "vcredist2022",
   "bin": "rmux.exe",
   "checkver": {
     "github": "https://github.com/$repository"

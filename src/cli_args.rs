@@ -29,6 +29,13 @@ pub(crate) use config::{
     SetEnvironmentArgs, SetHookArgs, SetOptionArgs, SetOptionCommandKind, ShowEnvironmentArgs,
     ShowHooksArgs, ShowOptionsArgs, ShowOptionsCommandKind,
 };
+#[path = "cli_args/automation.rs"]
+mod automation;
+pub(crate) use automation::{
+    BroadcastKeysArgs, CollectPaneOutputArgs, ExpectPaneArgs, FindPanesArgs, FindSessionsArgs,
+    LocatorArgs, PaneSnapshotArgs, SendKeysWaitMode, SnapshotRegion, StreamPaneArgs, WaitPaneArgs,
+    WithSessionArgs,
+};
 #[path = "cli_args/keys.rs"]
 mod keys;
 pub(crate) use keys::{BindKeyArgs, ListKeysArgs, SendKeysArgs, SendPrefixArgs, UnbindKeyArgs};
@@ -63,6 +70,8 @@ use targets::{parse_session_name, parse_target};
 pub(crate) use targets::{parse_target_spec, TargetSpec};
 #[path = "cli_args/pane.rs"]
 mod pane;
+#[path = "cli_args/tmux_last_wins.rs"]
+mod tmux_last_wins;
 use pane::{
     parse_join_pane_args, parse_resize_pane_args, parse_select_layout_args, parse_select_pane_args,
     parse_split_window_args,
@@ -111,10 +120,68 @@ static IMPLEMENTED_COMMAND_SURFACE: OnceLock<Vec<&'static CommandEntry>> = OnceL
 
 static IMPLEMENTED_COMMAND_HELP: OnceLock<String> = OnceLock::new();
 
-const RMUX_EXTENSION_COMMANDS: &[CommandEntry] = &[CommandEntry {
-    name: "capabilities",
-    alias: None,
-}];
+const RMUX_EXTENSION_COMMANDS: &[CommandEntry] = &[
+    CommandEntry {
+        name: "capabilities",
+        alias: None,
+    },
+    CommandEntry {
+        name: "claude",
+        alias: None,
+    },
+    CommandEntry {
+        name: "doctor",
+        alias: None,
+    },
+    CommandEntry {
+        name: "setup",
+        alias: None,
+    },
+    CommandEntry {
+        name: "wait-pane",
+        alias: None,
+    },
+    CommandEntry {
+        name: "pane-snapshot",
+        alias: None,
+    },
+    CommandEntry {
+        name: "stream-pane",
+        alias: None,
+    },
+    CommandEntry {
+        name: "collect-pane-output",
+        alias: None,
+    },
+    CommandEntry {
+        name: "locator",
+        alias: None,
+    },
+    CommandEntry {
+        name: "expect-pane",
+        alias: None,
+    },
+    CommandEntry {
+        name: "find-panes",
+        alias: None,
+    },
+    CommandEntry {
+        name: "find-sessions",
+        alias: None,
+    },
+    CommandEntry {
+        name: "broadcast-keys",
+        alias: None,
+    },
+    CommandEntry {
+        name: "with-session",
+        alias: None,
+    },
+    CommandEntry {
+        name: "web-share",
+        alias: None,
+    },
+];
 
 pub(crate) fn parse<I, T>(args: I) -> Result<Cli, clap::Error>
 where
@@ -365,6 +432,7 @@ where
             .no_binary_name(true)
             .disable_help_flag(true),
     )
+    .args_override_self(true)
     .disable_help_subcommand(true)
     .arg(
         clap::Arg::new("help")
@@ -373,6 +441,7 @@ where
             .help("Print help"),
     );
     let arguments = normalize_attached_short_values(&command, arguments);
+    let arguments = tmux_last_wins::normalize(command_name, arguments);
     validate_options_before_positionals(command_name, &command, &arguments)?;
     let matches = command.try_get_matches_from(arguments)?;
     T::from_arg_matches(&matches)
@@ -479,7 +548,7 @@ fn missing_value_error(command_name: &'static str, flag: String) -> clap::Error 
 fn normalize_attached_short_values(command: &clap::Command, arguments: Vec<String>) -> Vec<String> {
     let value_flags = command
         .get_arguments()
-        .filter(|argument| matches!(argument.get_action(), ArgAction::Set | ArgAction::Append))
+        .filter(|argument| argument_requires_value(argument))
         .filter_map(clap::Arg::get_short)
         .collect::<std::collections::BTreeSet<_>>();
     let has_trailing_position = command
@@ -655,6 +724,16 @@ pub(crate) enum Command {
     SelectPane(SelectPaneArgs),
     CopyMode(CopyModeArgs),
     ClockMode(ClockModeArgs),
+    WaitPane(WaitPaneArgs),
+    PaneSnapshot(PaneSnapshotArgs),
+    StreamPane(StreamPaneArgs),
+    CollectPaneOutput(CollectPaneOutputArgs),
+    Locator(LocatorArgs),
+    ExpectPane(ExpectPaneArgs),
+    FindPanes(FindPanesArgs),
+    FindSessions(FindSessionsArgs),
+    BroadcastKeys(BroadcastKeysArgs),
+    WithSession(WithSessionArgs),
     SendKeys(SendKeysArgs),
     BindKey(BindKeyArgs),
     UnbindKey(UnbindKeyArgs),

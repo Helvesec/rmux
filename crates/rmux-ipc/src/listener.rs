@@ -11,6 +11,8 @@ use std::mem::size_of;
 use std::os::fd::{FromRawFd, IntoRawFd};
 
 #[cfg(windows)]
+use crate::endpoint::current_integrity_label;
+#[cfg(windows)]
 use crate::is_peer_disconnect;
 use crate::{LocalEndpoint, LocalStream, PeerIdentity};
 #[cfg(windows)]
@@ -218,7 +220,10 @@ impl SameUserSecurityAttributes {
                 ));
             }
         };
-        let sddl = wide_null(&format!("O:{sid}G:{sid}D:P(A;;GA;;;{sid})"));
+        let sddl = wide_null(&same_user_pipe_sddl(
+            sid.as_ref(),
+            current_integrity_label()?,
+        )?);
         let mut descriptor = std::ptr::null_mut();
 
         // SAFETY: sddl is null-terminated UTF-16 and descriptor is an out pointer
@@ -263,6 +268,29 @@ impl Drop for SameUserSecurityAttributes {
 }
 
 #[cfg(windows)]
+fn same_user_pipe_sddl(sid: &str, integrity_label: &str) -> io::Result<String> {
+    let integrity_sid = integrity_sddl_sid(integrity_label)?;
+    Ok(format!(
+        "O:{sid}G:{sid}D:P(A;;GA;;;{sid})S:(ML;;NW;;;{integrity_sid})"
+    ))
+}
+
+#[cfg(windows)]
+fn integrity_sddl_sid(integrity_label: &str) -> io::Result<&'static str> {
+    match integrity_label {
+        "untrusted" => Ok("UN"),
+        "low" => Ok("LW"),
+        "medium" => Ok("ME"),
+        "high" => Ok("HI"),
+        "system" => Ok("SI"),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported Windows integrity label {other:?}"),
+        )),
+    }
+}
+
+#[cfg(windows)]
 fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -276,6 +304,18 @@ mod tests {
     use std::time::Duration;
 
     const _: () = assert!(NAMED_PIPE_PENDING_INSTANCES >= 4);
+
+    #[test]
+    fn same_user_pipe_sddl_includes_current_user_dacl_and_integrity_label() {
+        let sid = "S-1-5-21-1000";
+
+        assert_eq!(
+            same_user_pipe_sddl(sid, "medium").expect("medium integrity sddl"),
+            "O:S-1-5-21-1000G:S-1-5-21-1000D:P(A;;GA;;;S-1-5-21-1000)S:(ML;;NW;;;ME)"
+        );
+        assert_eq!(integrity_sddl_sid("low").expect("low integrity"), "LW");
+        assert!(integrity_sddl_sid("unknown").is_err());
+    }
 
     #[tokio::test]
     async fn cancelled_accept_does_not_drain_windows_pipe_backlog() -> io::Result<()> {

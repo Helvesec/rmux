@@ -55,10 +55,18 @@ impl HandlerState {
                         before: false,
                     })
                 }
-                MoveWindowTarget::Window(target) => Ok(MoveWindowResponse {
-                    session_name: target.session_name().clone(),
-                    target: None,
-                }),
+                MoveWindowTarget::Window(target) => {
+                    let target_session_name = target.session_name().clone();
+                    self.reindex_windows(MoveWindowRequest {
+                        source: None,
+                        target: MoveWindowTarget::Session(target_session_name),
+                        renumber: true,
+                        kill_destination: false,
+                        detached: request.detached,
+                        after: false,
+                        before: false,
+                    })
+                }
             };
         }
 

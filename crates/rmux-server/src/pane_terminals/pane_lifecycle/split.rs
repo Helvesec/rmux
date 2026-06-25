@@ -129,7 +129,7 @@ impl HandlerState {
         let runtime_window_name = profile.runtime_window_name(command);
         let initial_title = profile.initial_pane_title();
         let lifecycle_cwd = profile.cwd().to_path_buf();
-        let terminal = match open_pane_terminal(
+        let mut terminal = match open_pane_terminal(
             new_pane_geometry,
             profile,
             runtime_window_name.clone(),
@@ -143,7 +143,7 @@ impl HandlerState {
         };
         let pid = terminal.pid();
         let output_reader =
-            match clone_terminal_for_output_reader(&terminal, &session_name, new_pane_id) {
+            match clone_terminal_for_output_reader(&mut terminal, &session_name, new_pane_id) {
                 Ok(output_reader) => output_reader,
                 Err(error) => {
                     self.replace_session(&session_name, previous_session)?;

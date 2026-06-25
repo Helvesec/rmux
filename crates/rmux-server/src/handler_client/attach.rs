@@ -103,6 +103,8 @@ impl RequestHandler {
                 }
             }
         }
+        #[cfg(windows)]
+        self.wait_for_windows_deferred_all_pane_pids().await;
         let flags = match parse_client_flags(request.flags.as_ref(), request.read_only) {
             Ok(flags) => flags,
             Err(error) => return HandleOutcome::response(Response::Error(ErrorResponse { error })),

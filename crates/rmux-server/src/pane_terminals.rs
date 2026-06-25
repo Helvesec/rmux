@@ -20,7 +20,12 @@ use crate::pane_io::{PaneAlertCallback, PaneExitCallback, PaneOutputSender};
 use crate::pane_reader_runtime::PaneReaderRuntime;
 use crate::pane_transcript::SharedPaneTranscript;
 use crate::pane_visible_geometry::visible_pane_content_geometry;
+#[cfg(windows)]
+use crate::terminal::TerminalProfile;
 
+#[cfg(windows)]
+#[path = "pane_terminals/deferred_initial.rs"]
+mod deferred_initial;
 #[path = "pane_terminals/lifecycle_state.rs"]
 mod lifecycle_state;
 #[path = "pane_terminals/marked_pane.rs"]
@@ -91,6 +96,46 @@ pub(crate) struct InitialPaneSpawnOptions<'a> {
     pub(crate) pane_exit_callback: Option<PaneExitCallback>,
 }
 
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) struct DeferredInitialPaneSpawn {
+    pub(crate) runtime_session_name: SessionName,
+    pub(crate) visible_session_name: SessionName,
+    pub(crate) pane_id: PaneId,
+    pub(crate) geometry: PaneGeometry,
+    pub(crate) profile: TerminalProfile,
+    pub(crate) runtime_window_name: Option<String>,
+    pub(crate) command: Option<ProcessCommand>,
+    pub(crate) generation: u64,
+    pub(crate) pane_alert_callback: Option<PaneAlertCallback>,
+    pub(crate) pane_exit_callback: Option<PaneExitCallback>,
+}
+
+#[cfg(windows)]
+pub(crate) struct CompletedDeferredInitialPane {
+    pub(crate) visible_session_name: SessionName,
+    pub(crate) runtime_session_name: SessionName,
+    pub(crate) pane_id: PaneId,
+    pub(crate) input_writer: Option<rmux_pty::PtyMaster>,
+    pub(crate) queued_input: Vec<Vec<u8>>,
+}
+
+#[cfg(windows)]
+pub(crate) struct DeferredInitialPaneInputFlush {
+    pub(crate) input_writer: rmux_pty::PtyMaster,
+    pub(crate) queued_input: Vec<Vec<u8>>,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct StartingPane {
+    profile: TerminalProfile,
+    runtime_window_name: Option<String>,
+    generation: u64,
+    queued_input: VecDeque<Vec<u8>>,
+    queued_input_bytes: usize,
+}
+
 pub(crate) struct NewWindowOptions<'a> {
     pub(crate) name: Option<String>,
     pub(crate) detached: bool,
@@ -113,6 +158,8 @@ pub(crate) struct HandlerState {
     pub(crate) message_log: VecDeque<MessageEntry>,
     next_message_number: u64,
     terminals: PaneTerminalStore,
+    #[cfg(windows)]
+    starting_panes: HashMap<SessionName, HashMap<PaneId, StartingPane>>,
     transcripts: HashMap<SessionName, HashMap<PaneId, SharedPaneTranscript>>,
     pane_outputs: HashMap<SessionName, HashMap<PaneId, PaneOutputSender>>,
     #[cfg(unix)]

@@ -12,7 +12,7 @@ Options:
   --output-dir <dir>         Repository output directory
   --suite <name>             APT suite/codename (default: stable)
   --component <name>         APT component (default: main)
-  --architecture <arch>      Debian architecture (default: amd64)
+  --architecture <arch>      Debian architecture; repeat for multiple arches (default: amd64)
   --origin <name>            Release Origin field (default: RMUX)
   --label <name>             Release Label field (default: RMUX)
   --signing-key <key-id>     GPG key id/fingerprint for InRelease and Release.gpg
@@ -57,7 +57,7 @@ input_dir=""
 output_dir=""
 suite="stable"
 component="main"
-architecture="amd64"
+architectures=()
 origin="RMUX"
 label="RMUX"
 signing_key="${RMUX_APT_GPG_KEY:-}"
@@ -86,7 +86,7 @@ while [ "$#" -gt 0 ]; do
       ;;
     --architecture)
       [ "$#" -ge 2 ] || die "--architecture requires a value"
-      architecture="$2"
+      architectures+=("$2")
       shift 2
       ;;
     --origin)
@@ -120,7 +120,12 @@ done
 case "$output_dir" in /|.|..) die "--output-dir is too broad: $output_dir" ;; esac
 case "$suite" in *[!A-Za-z0-9_.-]*|""|.*) die "invalid suite: $suite" ;; esac
 case "$component" in *[!A-Za-z0-9_.-]*|""|.*) die "invalid component: $component" ;; esac
-case "$architecture" in *[!A-Za-z0-9_-]*|"") die "invalid architecture: $architecture" ;; esac
+if [ "${#architectures[@]}" -eq 0 ]; then
+  architectures=(amd64)
+fi
+for architecture in "${architectures[@]}"; do
+  case "$architecture" in *[!A-Za-z0-9_-]*|"") die "invalid architecture: $architecture" ;; esac
+done
 
 need dpkg-deb
 need gzip
@@ -130,38 +135,43 @@ need sha256sum
 input_dir="$(cd "$input_dir" && pwd)"
 output_dir="$(mkdir -p "$output_dir" && cd "$output_dir" && pwd)"
 pool_dir="$output_dir/pool/$component/r/rmux"
-binary_dir="$output_dir/dists/$suite/$component/binary-$architecture"
 rm -rf "$output_dir/dists/$suite" "$pool_dir"
-mkdir -p "$pool_dir" "$binary_dir"
+mkdir -p "$pool_dir"
 
-found=0
-for deb in "$input_dir"/rmux_*_"$architecture".deb; do
-  [ -e "$deb" ] || continue
-  cp "$deb" "$pool_dir/"
-  found=1
-done
-[ "$found" -eq 1 ] || die "no rmux_*_${architecture}.deb files found in $input_dir"
+release_files=()
+for architecture in "${architectures[@]}"; do
+  binary_dir="$output_dir/dists/$suite/$component/binary-$architecture"
+  mkdir -p "$binary_dir"
 
-packages="$binary_dir/Packages"
-: > "$packages"
-find "$pool_dir" -type f -name '*.deb' | LC_ALL=C sort |
-  while IFS= read -r deb; do
-    relative="${deb#"$output_dir"/}"
-    size="$(wc -c < "$deb" | tr -d ' ')"
-    md5="$(hash_file md5 "$deb")"
-    sha256="$(hash_file sha256 "$deb")"
-    dpkg-deb -f "$deb" >> "$packages"
-    {
-      printf 'Filename: %s\n' "$relative"
-      printf 'Size: %s\n' "$size"
-      printf 'MD5sum: %s\n' "$md5"
-      printf 'SHA256: %s\n\n' "$sha256"
-    } >> "$packages"
+  found=0
+  for deb in "$input_dir"/rmux_*_"$architecture".deb; do
+    [ -e "$deb" ] || continue
+    cp "$deb" "$pool_dir/"
+    found=1
   done
-gzip -n -c "$packages" > "$packages.gz"
+  [ "$found" -eq 1 ] || die "no rmux_*_${architecture}.deb files found in $input_dir"
+
+  packages="$binary_dir/Packages"
+  : > "$packages"
+  find "$pool_dir" -type f -name "rmux_*_${architecture}.deb" | LC_ALL=C sort |
+    while IFS= read -r deb; do
+      relative="${deb#"$output_dir"/}"
+      size="$(wc -c < "$deb" | tr -d ' ')"
+      md5="$(hash_file md5 "$deb")"
+      sha256="$(hash_file sha256 "$deb")"
+      dpkg-deb -f "$deb" >> "$packages"
+      {
+        printf 'Filename: %s\n' "$relative"
+        printf 'Size: %s\n' "$size"
+        printf 'MD5sum: %s\n' "$md5"
+        printf 'SHA256: %s\n\n' "$sha256"
+      } >> "$packages"
+    done
+  gzip -n -c "$packages" > "$packages.gz"
+  release_files+=("$packages" "$packages.gz")
+done
 
 release="$output_dir/dists/$suite/Release"
-release_files=("$packages" "$packages.gz")
 date_utc="$(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S +0000')"
 cat > "$release" <<EOF
 Origin: $origin
@@ -169,7 +179,7 @@ Label: $label
 Suite: $suite
 Codename: $suite
 Date: $date_utc
-Architectures: $architecture
+Architectures: ${architectures[*]}
 Components: $component
 Description: RMUX APT repository
 MD5Sum:
@@ -190,5 +200,5 @@ fi
 printf 'repository=%s\n' "$output_dir"
 printf 'suite=%s\n' "$suite"
 printf 'component=%s\n' "$component"
-printf 'architecture=%s\n' "$architecture"
+printf 'architectures=%s\n' "${architectures[*]}"
 printf 'signed=%s\n' "$([ -n "$signing_key" ] && printf true || printf false)"

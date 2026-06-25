@@ -73,7 +73,7 @@ pub(super) fn parse_new_session(mut args: CommandTokens) -> Result<Request, Rmux
         ));
     }
 
-    Ok(Request::NewSessionExt(NewSessionExtRequest {
+    Ok(Request::NewSessionExt(Box::new(NewSessionExtRequest {
         detached,
         size,
         environment: (!environment.is_empty()).then_some(environment),
@@ -91,7 +91,7 @@ pub(super) fn parse_new_session(mut args: CommandTokens) -> Result<Request, Rmux
         process_command: None,
         client_environment: None,
         skip_environment_update,
-    }))
+    })))
 }
 
 pub(super) fn parse_session_request(
@@ -235,16 +235,18 @@ pub(super) fn parse_attach_session(mut args: CommandTokens) -> Result<Request, R
         }
     }
 
-    Ok(Request::AttachSessionExt2(AttachSessionExt2Request {
-        target,
-        target_spec,
-        detach_other_clients: detach_other_clients || kill_other_clients,
-        kill_other_clients,
-        read_only,
-        skip_environment_update,
-        flags: (!flags.is_empty()).then_some(flags),
-        working_directory,
-        client_terminal: ClientTerminalContext::default(),
-        client_size: None,
-    }))
+    Ok(Request::AttachSessionExt2(Box::new(
+        AttachSessionExt2Request {
+            target,
+            target_spec,
+            detach_other_clients: detach_other_clients || kill_other_clients,
+            kill_other_clients,
+            read_only,
+            skip_environment_update,
+            flags: (!flags.is_empty()).then_some(flags),
+            working_directory,
+            client_terminal: ClientTerminalContext::default(),
+            client_size: None,
+        },
+    )))
 }

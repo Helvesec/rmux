@@ -50,7 +50,7 @@ async fn list_sessions_uses_shared_formatter_through_real_socket() -> Result<(),
 
     let new_window = send_request(
         harness.socket_path(),
-        &Request::NewWindow(NewWindowRequest {
+        &Request::NewWindow(Box::new(NewWindowRequest {
             target: alpha,
             name: Some("logs".to_owned()),
             detached: true,
@@ -60,7 +60,7 @@ async fn list_sessions_uses_shared_formatter_through_real_socket() -> Result<(),
             process_command: None,
             target_window_index: None,
             insert_at_target: false,
-        }),
+        })),
     )
     .await?;
     assert!(matches!(new_window, Response::NewWindow(_)));
@@ -123,7 +123,7 @@ async fn list_panes_uses_shared_formatter_through_real_socket() -> Result<(), Bo
 
     let new_window = send_request(
         harness.socket_path(),
-        &Request::NewWindow(NewWindowRequest {
+        &Request::NewWindow(Box::new(NewWindowRequest {
             target: alpha.clone(),
             name: Some("logs".to_owned()),
             detached: true,
@@ -133,7 +133,7 @@ async fn list_panes_uses_shared_formatter_through_real_socket() -> Result<(), Bo
             process_command: None,
             target_window_index: None,
             insert_at_target: false,
-        }),
+        })),
     )
     .await?;
     assert!(matches!(new_window, Response::NewWindow(_)));
@@ -195,14 +195,14 @@ async fn rename_session_round_trips_and_migrates_session_scoped_state() -> Resul
     assert!(matches!(
         send_request(
             harness.socket_path(),
-            &Request::SetEnvironment(SetEnvironmentRequest {
+            &Request::SetEnvironment(Box::new(SetEnvironmentRequest {
                 scope: ScopeSelector::Session(alpha.clone()),
                 name: "TERM".to_owned(),
                 value: "screen".to_owned(),
                 mode: None,
                 hidden: false,
                 format: false,
-            }),
+            })),
         )
         .await?,
         Response::SetEnvironment(_)

@@ -8,7 +8,7 @@ async fn attached_mode_tree_acceptance_uses_mode_before_prefix_or_pty() {
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     assert!(matches!(
         handler
-            .handle(Request::NewWindow(NewWindowRequest {
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
                 target: alpha.clone(),
                 name: Some("w1".to_owned()),
                 detached: true,
@@ -18,7 +18,7 @@ async fn attached_mode_tree_acceptance_uses_mode_before_prefix_or_pty() {
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await,
         Response::NewWindow(_)
     ));
@@ -71,7 +71,7 @@ async fn attached_compact_prefix_wq_uses_choose_tree_before_the_following_key() 
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     assert!(matches!(
         handler
-            .handle(Request::NewWindow(NewWindowRequest {
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
                 target: alpha.clone(),
                 name: Some("w1".to_owned()),
                 detached: true,
@@ -81,7 +81,7 @@ async fn attached_compact_prefix_wq_uses_choose_tree_before_the_following_key() 
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await,
         Response::NewWindow(_)
     ));

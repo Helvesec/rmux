@@ -1,5 +1,5 @@
 //! Inbound dispatch: decode client text/binary frames and drive the matching
-//! handler/session action. Operator-only actions fail closed for spectators.
+//! handler/session action. Mutating and input actions fail closed for spectators.
 
 use std::io;
 
@@ -119,6 +119,21 @@ pub(crate) async fn handle_session_client_text(
             }
             Ok(SessionClientTextOutcome::Snapshot)
         }
+        ClientMessage::SelectWindow { window_index } => {
+            match handler
+                .web_session_select_window_for_view(
+                    session.target(),
+                    session.attach_pid(),
+                    window_index,
+                )
+                .await
+            {
+                Ok(true) => session.select_window_for_view(window_index),
+                Ok(false) => tracing::debug!(window_index, "web session select window ignored"),
+                Err(error) => tracing::debug!(?error, "web session select window ignored"),
+            }
+            Ok(SessionClientTextOutcome::Snapshot)
+        }
         ClientMessage::RenameWindow { window_index, name } if session.is_operator() => {
             if !valid_window_name(&name) {
                 let _ = socket.write_close_code(4006, "invalid_window_name").await;
@@ -144,7 +159,6 @@ pub(crate) async fn handle_session_client_text(
         ClientMessage::SplitPane { .. }
         | ClientMessage::NewWindow
         | ClientMessage::KillPane
-        | ClientMessage::SelectWindow { .. }
         | ClientMessage::RenameWindow { .. }
         | ClientMessage::KillWindow { .. } => {
             let _ = socket

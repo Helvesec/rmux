@@ -10,7 +10,7 @@ use rmux_proto::{
 };
 
 use super::super::target_support::{
-    pane_id_target, requester_environment_pane_id, requester_environment_source_depth,
+    pane_id_target, requester_environment_context, requester_environment_pane_id,
 };
 use super::super::{ConfigLoadingGuard, RequestHandler};
 use super::command_args::CommandListArgument;
@@ -125,10 +125,18 @@ impl RequestHandler {
     ) -> Response {
         let mut command = ParsedSourceFileCommand::from(request);
         let explicit_target = command.target.is_some();
+        let socket_path = self.socket_path();
+        let requester_environment = requester_environment_context(requester_pid, &socket_path);
         if command.target.is_none() {
-            command.target = self.implicit_source_file_target(requester_pid).await;
+            command.target = self
+                .implicit_source_file_target_with_pane_id(
+                    requester_pid,
+                    requester_environment.pane_id,
+                )
+                .await;
         }
-        let depth = requester_environment_source_depth(requester_pid, &self.socket_path())
+        let depth = requester_environment
+            .source_depth
             .unwrap_or(0)
             .saturating_add(1);
         let mut loaded = match self.load_source_file_command(&command, depth).await {
@@ -201,10 +209,19 @@ impl RequestHandler {
         &self,
         requester_pid: u32,
     ) -> Option<PaneTarget> {
-        let attached_session = self.current_session_candidate(requester_pid).await;
-        let preferred_session = self.preferred_session_name().await.ok();
         let socket_path = self.socket_path();
         let requester_pane_id = requester_environment_pane_id(requester_pid, &socket_path);
+        self.implicit_source_file_target_with_pane_id(requester_pid, requester_pane_id)
+            .await
+    }
+
+    async fn implicit_source_file_target_with_pane_id(
+        &self,
+        requester_pid: u32,
+        requester_pane_id: Option<u32>,
+    ) -> Option<PaneTarget> {
+        let attached_session = self.current_session_candidate(requester_pid).await;
+        let preferred_session = self.preferred_session_name().await.ok();
         let state = self.state.lock().await;
         attached_session
             .as_ref()
@@ -1070,6 +1087,30 @@ mod tests {
             state.options.global_value(OptionName::Status),
             None,
             "startup config must retain the error but skip the bad file"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_dev_null_startup_config_is_silent() {
+        let _lock = crate::test_env::lock_async().await;
+        let root = unique_temp_root("explicit-dev-null");
+        let handler = RequestHandler::new();
+        let config = DaemonConfig::new(root.join("rmux.sock")).with_config_files(
+            vec![PathBuf::from("/dev/null")],
+            false,
+            Some(root.clone()),
+        );
+
+        handler
+            .load_startup_config(config.config_load().clone())
+            .await;
+
+        assert!(
+            handler.startup_config_errors.lock().await.is_empty(),
+            "/dev/null startup config must be a silent no-op"
         );
 
         let _ = fs::remove_dir_all(root);

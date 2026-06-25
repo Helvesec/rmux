@@ -396,7 +396,12 @@ async fn raw_new_session(socket_path: &Path, name: SessionName) -> TestResult {
         ..NewSessionSpec::default()
     };
 
-    match framed_request(socket_path, Request::NewSessionExt(request.into())).await? {
+    match framed_request(
+        socket_path,
+        Request::NewSessionExt(Box::new(request.into())),
+    )
+    .await?
+    {
         Response::NewSession(response) => {
             assert_eq!(response.session_name, name);
             Ok(())

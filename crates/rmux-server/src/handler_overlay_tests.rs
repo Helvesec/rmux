@@ -37,7 +37,7 @@ async fn create_quiet_attached_session(
     requester_pid: u32,
 ) -> mpsc::UnboundedReceiver<AttachControl> {
     let response = handler
-        .handle(Request::NewSessionExt(NewSessionExtRequest {
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: Some(name.clone()),
             working_directory: None,
             detached: true,
@@ -55,7 +55,7 @@ async fn create_quiet_attached_session(
             process_command: None,
             client_environment: None,
             skip_environment_update: false,
-        }))
+        })))
         .await;
     assert!(
         matches!(response, Response::NewSession(_)),
@@ -105,6 +105,25 @@ async fn run_overlay_command(handler: &RequestHandler, requester_pid: u32, comma
     assert!(result.stdout().is_empty());
 }
 
+#[tokio::test]
+async fn display_menu_accepts_parsed_command_list_items_from_queue() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-menu -xM -yM -T Menu "First" "f" { display-message first }"#,
+    )
+    .await;
+
+    let frame = next_overlay_frame(&mut control_rx).await;
+    let rendered = String::from_utf8(frame.frame).expect("menu frame is utf-8");
+    assert!(rendered.contains("First"));
+}
+
 async fn next_overlay_frame(
     control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
 ) -> crate::pane_io::OverlayFrame {
@@ -119,7 +138,7 @@ async fn next_overlay_frame(
 
 async fn capture_pane_print(handler: &RequestHandler, target: PaneTarget) -> String {
     let response = handler
-        .handle(Request::CapturePane(CapturePaneRequest {
+        .handle(Request::CapturePane(Box::new(CapturePaneRequest {
             target,
             start: None,
             end: None,
@@ -136,7 +155,7 @@ async fn capture_pane_print(handler: &RequestHandler, target: PaneTarget) -> Str
             quiet: false,
             start_is_absolute: false,
             end_is_absolute: false,
-        }))
+        })))
         .await;
     let Response::CapturePane(response) = response else {
         panic!("expected capture-pane response, got {response:?}");
@@ -456,7 +475,7 @@ async fn status_right_click_routes_window_menu_to_clicked_window_target() {
     let requester_pid = std::process::id();
     let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
     let rebound = handler
-        .handle(Request::BindKey(BindKeyRequest {
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
             table_name: "root".to_owned(),
             key: "MouseDown3Status".to_owned(),
             note: Some("overlay-status-menu".to_owned()),
@@ -473,7 +492,7 @@ async fn status_right_click_routes_window_menu_to_clicked_window_target() {
                 "i".to_owned(),
                 "display-message inspect".to_owned(),
             ]),
-        }))
+        })))
         .await;
     assert!(matches!(rebound, Response::BindKey(_)));
 

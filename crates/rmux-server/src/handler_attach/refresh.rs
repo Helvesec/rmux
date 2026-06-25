@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 
 use super::super::prompt_support::ClientPromptState;
@@ -8,6 +8,11 @@ use crate::pane_io::AttachControl;
 
 impl RequestHandler {
     pub(crate) async fn refresh_attached_session(&self, session_name: &rmux_proto::SessionName) {
+        let _refresh_span = crate::perf_instrument::span("attach_refresh")
+            .with_str("scope", "session")
+            .with_str("session", session_name.as_str());
+        #[cfg(windows)]
+        self.wait_for_windows_deferred_all_pane_pids().await;
         let attached_count = { self.attached_count(session_name).await };
         let (refresh_contexts, mode_tree_pids, overlay_pids) = {
             let mut active_attach = self.active_attach.lock().await;
@@ -60,6 +65,8 @@ impl RequestHandler {
         };
         let targets = {
             let state = self.state.lock().await;
+            let _lock_span = crate::perf_instrument::span("state_lock_hold")
+                .with_str("site", "attach_refresh_session_targets");
             let mut targets = Vec::with_capacity(refresh_contexts.len());
             for (
                 pid,
@@ -154,6 +161,12 @@ impl RequestHandler {
         attach_pid: u32,
         session_name: &rmux_proto::SessionName,
     ) {
+        let _refresh_span = crate::perf_instrument::span("attach_refresh")
+            .with_str("scope", "client")
+            .with_u64("attach_pid", u64::from(attach_pid))
+            .with_str("session", session_name.as_str());
+        #[cfg(windows)]
+        self.wait_for_windows_deferred_all_pane_pids().await;
         let attached_count = self.attached_count(session_name).await;
         let prompt = {
             let active_attach = self.active_attach.lock().await;
@@ -188,6 +201,8 @@ impl RequestHandler {
         };
         let target = {
             let state = self.state.lock().await;
+            let _lock_span = crate::perf_instrument::span("state_lock_hold")
+                .with_str("site", "attach_refresh_client_target");
             super::attach_render_target_for_session_with_prompt(
                 &state,
                 session_name,
@@ -231,6 +246,10 @@ impl RequestHandler {
         attach_pid: u32,
         session_name: &rmux_proto::SessionName,
     ) {
+        let _refresh_span = crate::perf_instrument::span("attach_refresh")
+            .with_str("scope", "client_base_only")
+            .with_u64("attach_pid", u64::from(attach_pid))
+            .with_str("session", session_name.as_str());
         let attached_count = self.attached_count(session_name).await;
         let prompt = {
             let active_attach = self.active_attach.lock().await;
@@ -265,6 +284,8 @@ impl RequestHandler {
         };
         let target = {
             let state = self.state.lock().await;
+            let _lock_span = crate::perf_instrument::span("state_lock_hold")
+                .with_str("site", "attach_refresh_client_base_target");
             super::attach_render_target_for_session_with_prompt(
                 &state,
                 session_name,
@@ -304,11 +325,14 @@ impl RequestHandler {
     pub(in crate::handler) async fn refresh_all_attached_sessions(&self) {
         let session_names = {
             let active_attach = self.active_attach.lock().await;
-            active_attach
-                .by_pid
-                .values()
-                .map(|active| active.session_name.clone())
-                .collect::<Vec<_>>()
+            let mut seen = HashSet::new();
+            let mut session_names = Vec::new();
+            for active in active_attach.by_pid.values() {
+                if seen.insert(active.session_name.clone()) {
+                    session_names.push(active.session_name.clone());
+                }
+            }
+            session_names
         };
 
         for session_name in session_names {
@@ -361,8 +385,8 @@ fn enqueue_tracked_render_control(active: &mut ActiveAttach, command: AttachCont
         AttachControl::Refresh | AttachControl::Switch(_)
     ));
     if active.control_backlog.load(Ordering::Acquire) >= super::ATTACH_CONTROL_BACKLOG_LIMIT {
-        active.closing.store(true, Ordering::SeqCst);
         let _ = active.control_tx.send(AttachControl::Detach);
+        active.closing.store(true, Ordering::SeqCst);
         return false;
     }
     active.control_backlog.fetch_add(1, Ordering::AcqRel);
@@ -379,8 +403,8 @@ fn enqueue_tracked_render_control(active: &mut ActiveAttach, command: AttachCont
 
 fn enqueue_tracked_interactive_input_control(active: &mut ActiveAttach) -> bool {
     if active.control_backlog.load(Ordering::Acquire) >= super::ATTACH_CONTROL_BACKLOG_LIMIT {
-        active.closing.store(true, Ordering::SeqCst);
         let _ = active.control_tx.send(AttachControl::Detach);
+        active.closing.store(true, Ordering::SeqCst);
         return false;
     }
     active.control_backlog.fetch_add(1, Ordering::AcqRel);

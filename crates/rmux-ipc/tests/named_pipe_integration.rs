@@ -11,6 +11,20 @@ use tokio::net::windows::named_pipe::ClientOptions;
 use tokio::net::windows::named_pipe::ServerOptions;
 use tokio::time::timeout;
 
+#[test]
+fn blocking_connect_to_missing_pipe_reports_not_found() -> std::io::Result<()> {
+    let endpoint = endpoint_for_label(format!("missing-{}", std::process::id()))?;
+
+    let error = connect_blocking(&endpoint, Duration::from_millis(100))
+        .expect_err("missing pipe should not connect");
+
+    assert!(
+        error.kind() == ErrorKind::NotFound || matches!(error.raw_os_error(), Some(2)),
+        "unexpected missing-pipe error: {error:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn named_pipe_roundtrip_uses_bound_endpoint() -> std::io::Result<()> {
     let endpoint = endpoint_for_label(format!("integration-{}", std::process::id()))?;

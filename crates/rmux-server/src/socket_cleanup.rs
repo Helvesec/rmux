@@ -30,21 +30,16 @@ impl SocketCleanup {
     pub(crate) fn update_socket_identity(&mut self, socket_identity: Option<SocketFileIdentity>) {
         self.socket_identity = socket_identity;
     }
+
+    pub(crate) fn cleanup_now(&mut self) {
+        cleanup_socket_artifacts(&self.socket_path, self.socket_identity.take());
+    }
 }
 
 #[cfg(unix)]
 impl Drop for SocketCleanup {
     fn drop(&mut self) {
-        if let Some(socket_identity) = self.socket_identity {
-            let _ = crate::unix_socket::remove_socket_file_if_identity_matches(
-                &self.socket_path,
-                socket_identity,
-            );
-        }
-        for lock_path in startup_lock_paths(&self.socket_path) {
-            let _ = remove_regular_file_if_present(&lock_path);
-        }
-        crate::tmux_shim::cleanup_tmux_shim(&self.socket_path);
+        cleanup_socket_artifacts(&self.socket_path, self.socket_identity.take());
     }
 }
 
@@ -56,6 +51,22 @@ impl SocketCleanup {
     pub(crate) fn new(_socket_path: PathBuf) -> Self {
         Self
     }
+
+    pub(crate) fn cleanup_now(&mut self) {}
+}
+
+#[cfg(unix)]
+fn cleanup_socket_artifacts(socket_path: &Path, socket_identity: Option<SocketFileIdentity>) {
+    if let Some(socket_identity) = socket_identity {
+        let _ = crate::unix_socket::remove_socket_file_if_identity_matches(
+            socket_path,
+            socket_identity,
+        );
+    }
+    for lock_path in startup_lock_paths(socket_path) {
+        let _ = remove_regular_file_if_present(&lock_path);
+    }
+    crate::tmux_shim::cleanup_tmux_shim(socket_path);
 }
 
 #[cfg(unix)]

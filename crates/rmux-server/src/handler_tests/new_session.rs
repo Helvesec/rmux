@@ -192,7 +192,7 @@ async fn attach_if_exists_existing_session_reports_attach_semantics() {
     assert!(matches!(created, Response::NewSession(_)));
 
     let reused = handler
-        .handle(Request::NewSessionExt(NewSessionExtRequest {
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: Some(alpha.clone()),
             working_directory: None,
             detached: true,
@@ -210,7 +210,7 @@ async fn attach_if_exists_existing_session_reports_attach_semantics() {
             process_command: None,
             client_environment: None,
             skip_environment_update: false,
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -239,7 +239,7 @@ async fn grouped_new_session_without_explicit_name_uses_tmux_suffix_shape() {
     assert!(matches!(created, Response::NewSession(_)));
 
     let grouped = handler
-        .handle(Request::NewSessionExt(NewSessionExtRequest {
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: None,
             working_directory: None,
             detached: true,
@@ -257,7 +257,7 @@ async fn grouped_new_session_without_explicit_name_uses_tmux_suffix_shape() {
             process_command: None,
             client_environment: None,
             skip_environment_update: false,
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -302,7 +302,7 @@ async fn auto_named_session_uses_next_global_session_id_after_named_sessions() {
     }
 
     let unnamed = handler
-        .handle(Request::NewSessionExt(NewSessionExtRequest {
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: None,
             working_directory: None,
             detached: true,
@@ -320,7 +320,7 @@ async fn auto_named_session_uses_next_global_session_id_after_named_sessions() {
             process_command: None,
             client_environment: None,
             skip_environment_update: false,
-        }))
+        })))
         .await;
 
     assert_eq!(
@@ -349,7 +349,7 @@ async fn grouped_new_session_rejects_shell_command_like_tmux() {
     assert!(matches!(created, Response::NewSession(_)));
 
     let grouped = handler
-        .handle(Request::NewSessionExt(NewSessionExtRequest {
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: Some(session_name("peer")),
             working_directory: None,
             detached: true,
@@ -367,7 +367,7 @@ async fn grouped_new_session_rejects_shell_command_like_tmux() {
             process_command: None,
             client_environment: None,
             skip_environment_update: false,
-        }))
+        })))
         .await;
 
     assert!(
@@ -392,7 +392,7 @@ async fn grouped_new_session_uses_next_global_session_id_suffix_when_group_is_ne
     }
 
     let grouped = handler
-        .handle(Request::NewSessionExt(NewSessionExtRequest {
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: None,
             working_directory: None,
             detached: true,
@@ -410,7 +410,7 @@ async fn grouped_new_session_uses_next_global_session_id_suffix_when_group_is_ne
             process_command: None,
             client_environment: None,
             skip_environment_update: false,
-        }))
+        })))
         .await;
 
     assert_eq!(

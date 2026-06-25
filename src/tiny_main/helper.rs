@@ -1,0 +1,235 @@
+use std::env;
+use std::ffi::OsString;
+#[cfg(not(unix))]
+use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+#[cfg(not(unix))]
+use std::process::Stdio;
+#[cfg(not(unix))]
+use std::thread;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
+const FULL_HELPER_OVERRIDE_ENV: &str = "RMUX_FULL_BINARY_PATH";
+const PUBLIC_BINARY_OVERRIDE_ENV: &str = "RMUX_INTERNAL_PUBLIC_BINARY_PATH";
+#[cfg(windows)]
+const TMUX_COMPAT_OVERRIDE_ENV: &str = "RMUX_INTERNAL_INVOKED_AS_TMUX";
+
+pub(super) fn exec_full_helper(args: &[OsString]) -> Result<i32, String> {
+    let helper = full_helper_path()?;
+    let mut command = Command::new(&helper);
+    command.args(args.iter().skip(1));
+    if let Ok(current) = env::current_exe() {
+        command.env(PUBLIC_BINARY_OVERRIDE_ENV, current);
+    }
+    #[cfg(windows)]
+    if invoked_as_tmux(args) {
+        command.env(TMUX_COMPAT_OVERRIDE_ENV, "1");
+    }
+
+    #[cfg(unix)]
+    {
+        if let Some(argv0) = args.first() {
+            command.arg0(argv0);
+        }
+        let error = command.exec();
+        Err(format!(
+            "failed to exec private rmux helper '{}': {error}",
+            helper.display()
+        ))
+    }
+
+    #[cfg(not(unix))]
+    {
+        if helper_output_should_be_piped() {
+            return run_full_helper_with_piped_output(command);
+        }
+        let status = command.status().map_err(|error| {
+            format!(
+                "failed to run private rmux helper '{}': {error}",
+                helper.display()
+            )
+        })?;
+        Ok(status.code().unwrap_or(1))
+    }
+}
+
+#[cfg(not(unix))]
+fn helper_output_should_be_piped() -> bool {
+    !io::stdout().is_terminal() || !io::stderr().is_terminal()
+}
+
+#[cfg(not(unix))]
+fn run_full_helper_with_piped_output(mut command: Command) -> Result<i32, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|error| {
+        format!(
+            "failed to run private rmux helper '{}': {error}",
+            command.get_program().to_string_lossy()
+        )
+    })?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    let stdout_thread = thread::spawn(move || {
+        if let Some(mut stdout) = stdout {
+            copy_helper_output(&mut stdout, io::stdout())
+        } else {
+            Ok(())
+        }
+    });
+    let stderr_thread = thread::spawn(move || {
+        if let Some(mut stderr) = stderr {
+            copy_helper_output(&mut stderr, io::stderr())
+        } else {
+            Ok(())
+        }
+    });
+
+    let status = child.wait().map_err(|error| error.to_string())?;
+    join_output_thread(stdout_thread)?;
+    join_output_thread(stderr_thread)?;
+    Ok(status.code().unwrap_or(1))
+}
+
+#[cfg(not(unix))]
+fn copy_helper_output<R, W>(reader: &mut R, writer: W) -> io::Result<()>
+where
+    R: io::Read,
+    W: Write,
+{
+    let mut writer = writer;
+    match io::copy(reader, &mut writer) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(unix))]
+fn join_output_thread(thread: thread::JoinHandle<io::Result<()>>) -> Result<(), String> {
+    thread
+        .join()
+        .map_err(|_| "private rmux helper output thread panicked".to_owned())?
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+fn invoked_as_tmux(args: &[OsString]) -> bool {
+    args.first()
+        .and_then(|arg| Path::new(arg).file_stem())
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("tmux"))
+}
+
+pub(super) fn full_helper_path() -> Result<PathBuf, String> {
+    if let Some(path) = env::var_os(FULL_HELPER_OVERRIDE_ENV) {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+
+    let current = env::current_exe().map_err(|error| error.to_string())?;
+    if let Some(path) = helper_from_executable_path(&current) {
+        return Ok(path);
+    }
+
+    Err("private rmux helper not found under libexec/rmux; rebuild or reinstall rmux".to_owned())
+}
+
+#[cfg(not(windows))]
+pub(super) fn daemon_helper_path() -> Result<PathBuf, String> {
+    if let Ok(current) = env::current_exe() {
+        if let Some(path) = daemon_from_executable_path(&current) {
+            return Ok(path);
+        }
+    }
+
+    full_helper_path()
+}
+
+fn helper_from_executable_path(current: &Path) -> Option<PathBuf> {
+    full_helper_candidates(current)
+        .into_iter()
+        .find(|candidate| candidate.is_file() && candidate.as_path() != current)
+}
+
+fn full_helper_candidates(current_exe: &Path) -> Vec<PathBuf> {
+    let Some(parent) = current_exe.parent() else {
+        return Vec::new();
+    };
+    vec![
+        parent.join("libexec").join("rmux").join(helper_file_name()),
+        parent
+            .join("..")
+            .join("libexec")
+            .join("rmux")
+            .join(helper_file_name()),
+    ]
+}
+
+#[cfg(not(windows))]
+fn daemon_from_executable_path(current: &Path) -> Option<PathBuf> {
+    daemon_helper_candidates(current)
+        .into_iter()
+        .find(|candidate| candidate.is_file() && candidate.as_path() != current)
+}
+
+#[cfg(not(windows))]
+fn daemon_helper_candidates(current_exe: &Path) -> Vec<PathBuf> {
+    let Some(parent) = current_exe.parent() else {
+        return Vec::new();
+    };
+    let daemon_name = daemon_file_name();
+    vec![
+        parent.join(&daemon_name),
+        parent.join("..").join("bin").join(&daemon_name),
+        parent.join("..").join("..").join("bin").join(&daemon_name),
+    ]
+}
+
+fn helper_file_name() -> OsString {
+    let mut name = OsString::from("rmux");
+    if !env::consts::EXE_SUFFIX.is_empty() {
+        name.push(env::consts::EXE_SUFFIX);
+    }
+    name
+}
+
+#[cfg(not(windows))]
+fn daemon_file_name() -> OsString {
+    let mut name = OsString::from("rmux-daemon");
+    if !env::consts::EXE_SUFFIX.is_empty() {
+        name.push(env::consts::EXE_SUFFIX);
+    }
+    name
+}
+
+#[cfg(all(test, not(windows)))]
+mod tests {
+    use std::env;
+
+    use super::{daemon_file_name, daemon_from_executable_path, helper_file_name};
+
+    #[test]
+    fn daemon_candidate_prefers_packaged_bin_sibling() {
+        let root = env::temp_dir().join(format!("rmux-tiny-helper-test-{}", std::process::id()));
+        let bin = root.join("bin");
+        let libexec = root.join("libexec").join("rmux");
+        std::fs::create_dir_all(&bin).expect("create bin");
+        std::fs::create_dir_all(&libexec).expect("create libexec");
+        let public = bin.join(helper_file_name());
+        let daemon = bin.join(daemon_file_name());
+        let full = libexec.join(helper_file_name());
+        std::fs::write(&public, b"public").expect("write public");
+        std::fs::write(&daemon, b"daemon").expect("write daemon");
+        std::fs::write(&full, b"full").expect("write full");
+
+        assert_eq!(daemon_from_executable_path(&public), Some(daemon));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

@@ -21,7 +21,7 @@ fn session_name(value: &str) -> SessionName {
 
 async fn create_session(handler: &RequestHandler, name: &str) {
     let created = handler
-        .handle(Request::NewSessionExt(NewSessionExtRequest {
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: Some(session_name(name)),
             working_directory: None,
             detached: true,
@@ -42,14 +42,14 @@ async fn create_session(handler: &RequestHandler, name: &str) {
             process_command: None,
             client_environment: None,
             skip_environment_update: false,
-        }))
+        })))
         .await;
     assert!(matches!(created, Response::NewSession(_)));
 }
 
 async fn create_grouped_session(handler: &RequestHandler, name: &str, group_target: &SessionName) {
     let created = handler
-        .handle(Request::NewSessionExt(NewSessionExtRequest {
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
             session_name: Some(session_name(name)),
             working_directory: None,
             detached: true,
@@ -70,7 +70,7 @@ async fn create_grouped_session(handler: &RequestHandler, name: &str, group_targ
             process_command: None,
             client_environment: None,
             skip_environment_update: false,
-        }))
+        })))
         .await;
     assert!(matches!(created, Response::NewSession(_)));
 }

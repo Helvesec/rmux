@@ -116,7 +116,7 @@ pub(crate) struct WebShareRegistry {
     connection_limit: std::sync::Arc<ConnectionLimit>,
     inner: Mutex<WebShareState>,
     next_id: AtomicU64,
-    settings: WebShareSettings,
+    settings: Mutex<WebShareSettings>,
 }
 
 impl Default for WebShareRegistry {
@@ -150,7 +150,7 @@ impl WebShareRegistry {
             connection_limit: ConnectionLimit::new(max_connections),
             inner: Mutex::new(WebShareState::default()),
             next_id: AtomicU64::new(1),
-            settings: WebShareSettings::default(),
+            settings: Mutex::new(WebShareSettings::default()),
         }
     }
 
@@ -160,7 +160,7 @@ impl WebShareRegistry {
             connection_limit: ConnectionLimit::new(DEFAULT_AUTHENTICATED_CONNECTION_LIMIT),
             inner: Mutex::new(WebShareState::default()),
             next_id: AtomicU64::new(1),
-            settings,
+            settings: Mutex::new(settings),
         }
     }
 
@@ -201,8 +201,10 @@ impl WebShareRegistry {
             tunnel,
         } = resolved;
         let limits = self.validate_create_options(&request)?;
-        let endpoint_origin = self.endpoint_origin(request.public_base_url.as_deref())?;
-        let frontend = self.frontend(request.frontend_url.as_deref())?;
+        let settings = self.settings();
+        let endpoint_origin =
+            self.endpoint_origin(&settings, request.public_base_url.as_deref())?;
+        let frontend = self.frontend(&settings, request.frontend_url.as_deref())?;
         let share_id = self.next_share_id()?;
         let operator_token = request.operator.then(random_token).transpose()?;
         let spectator_token = if request.spectator {
@@ -280,7 +282,7 @@ impl WebShareRegistry {
             public = request.public_base_url.is_some(),
             tunnel_provider = tunnel_provider.as_deref().unwrap_or(""),
             pin_required = request.require_pin,
-            listener_port = self.settings.port,
+            listener_port = settings.port,
             "web_share_created"
         );
 
@@ -519,7 +521,7 @@ impl WebShareRegistry {
     }
 
     pub(crate) fn listener(&self) -> WebShareListener {
-        self.settings.listener()
+        self.settings().listener()
     }
 
     pub(crate) fn listener_available(&self) -> bool {
@@ -531,7 +533,17 @@ impl WebShareRegistry {
     }
 
     pub(crate) fn settings(&self) -> WebShareSettings {
-        self.settings.clone()
+        self.settings
+            .lock()
+            .expect("web-share settings mutex must not be poisoned")
+            .clone()
+    }
+
+    pub(crate) fn update_listener_port(&self, port: u16) {
+        self.settings
+            .lock()
+            .expect("web-share settings mutex must not be poisoned")
+            .set_port(port);
     }
 
     pub(crate) fn validate_create_options(
@@ -626,19 +638,27 @@ impl WebShareRegistry {
         )))
     }
 
-    fn endpoint_origin(&self, requested: Option<&str>) -> Result<String, RmuxError> {
+    fn endpoint_origin(
+        &self,
+        settings: &WebShareSettings,
+        requested: Option<&str>,
+    ) -> Result<String, RmuxError> {
         match requested {
             Some(value) => validate_public_base_url(value),
-            None => Ok(self.settings.local_endpoint_origin()),
+            None => Ok(settings.local_endpoint_origin()),
         }
     }
 
-    fn frontend(&self, requested: Option<&str>) -> Result<FrontendUrl, RmuxError> {
+    fn frontend(
+        &self,
+        settings: &WebShareSettings,
+        requested: Option<&str>,
+    ) -> Result<FrontendUrl, RmuxError> {
         match requested {
             Some(value) => validate_frontend_url(value),
             None => Ok(FrontendUrl {
-                origin: self.settings.frontend_origin.clone(),
-                url: self.settings.frontend_url.clone(),
+                origin: settings.frontend_origin.clone(),
+                url: settings.frontend_url.clone(),
             }),
         }
     }
@@ -659,8 +679,7 @@ impl WebShareRegistry {
 
 fn is_auth_failure_for_backoff(error: &RmuxError) -> bool {
     let message = error.to_string();
-    message.contains("invalid web-share key")
-        || message.contains("invalid web-share pairing code")
+    message.contains("invalid web-share pairing code")
         || message.contains("does not exist or has expired")
 }
 

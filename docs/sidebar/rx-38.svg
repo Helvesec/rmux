@@ -1,0 +1,9 @@
+<svg width="400" height="44" viewBox="60 0 340 44" fill="none" xmlns="http://www.w3.org/2000/svg">
+<style>
+  .title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; font-size: 20px; font-weight: 600; fill: #1f2328; }
+  .item { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; font-size: 14px; fill: #0969da; }
+</style>
+<rect x="110" y="0" width="1" height="44" fill="#d0d7de" shape-rendering="crispEdges"/>
+<line x1="118" y1="-2" x2="118" y2="200" stroke="#30363d" stroke-width="1"/>
+<line x1="154" y1="22" x2="386" y2="22" stroke="#d1d9e0" stroke-width="1" />
+</svg>

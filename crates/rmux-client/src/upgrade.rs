@@ -2,8 +2,8 @@ use std::borrow::Cow;
 use std::path::Path;
 
 use rmux_proto::{
-    Response, RmuxError, CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE, CAPABILITY_DAEMON_STATUS,
-    RMUX_WIRE_VERSION,
+    DaemonStatusResponse, Response, RmuxError, CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE,
+    CAPABILITY_DAEMON_STATUS, RMUX_WIRE_VERSION,
 };
 
 use crate::shell_quote::shell_quote_path;
@@ -67,6 +67,19 @@ pub(crate) fn inspect_daemon(connection: &mut Connection) -> Result<DaemonFreshn
     }))
 }
 
+pub(crate) fn daemon_status_matches_current_client(
+    status: &DaemonStatusResponse,
+) -> Result<bool, IncompatibleDaemon> {
+    if status.wire_version != RMUX_WIRE_VERSION {
+        return Err(IncompatibleDaemon {
+            daemon_version: Some(format!("v{}", status.rmux_version)),
+            daemon_wire_version: Some(status.wire_version),
+        });
+    }
+
+    Ok(status.rmux_version == client_version().as_ref())
+}
+
 pub(crate) fn request_idle_shutdown(
     connection: &mut Connection,
     stale: &StaleDaemon,
@@ -107,21 +120,16 @@ fn inspect_current_daemon(connection: &mut Connection) -> Result<DaemonFreshness
         }
     };
     match connection.daemon_status()? {
-        Response::DaemonStatus(status) if status.wire_version != RMUX_WIRE_VERSION => {
-            Ok(DaemonFreshness::Incompatible(IncompatibleDaemon {
+        Response::DaemonStatus(status) => match daemon_status_matches_current_client(&status) {
+            Err(incompatible) => Ok(DaemonFreshness::Incompatible(incompatible)),
+            Ok(true) => Ok(DaemonFreshness::Current),
+            Ok(false) => Ok(classify_stale_daemon(StaleDaemon {
                 daemon_version: Some(format!("v{}", status.rmux_version)),
-                daemon_wire_version: Some(status.wire_version),
-            }))
-        }
-        Response::DaemonStatus(status) if status.rmux_version == client_version().as_ref() => {
-            Ok(DaemonFreshness::Current)
-        }
-        Response::DaemonStatus(status) => Ok(classify_stale_daemon(StaleDaemon {
-            daemon_version: Some(format!("v{}", status.rmux_version)),
-            session_count: status.session_count,
-            client_count: status.client_count,
-            supports_shutdown_if_idle,
-        })),
+                session_count: status.session_count,
+                client_count: status.client_count,
+                supports_shutdown_if_idle,
+            })),
+        },
         Response::Error(_) => {
             let session_count = legacy_session_count(connection)?;
             Ok(DaemonFreshness::StaleActive(StaleDaemon {
@@ -226,7 +234,9 @@ fn kill_server_command(socket_path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_stale_daemon, DaemonFreshness, StaleDaemon};
+    use super::{
+        classify_stale_daemon, daemon_status_matches_current_client, DaemonFreshness, StaleDaemon,
+    };
     #[cfg(unix)]
     use super::{inspect_daemon, request_idle_shutdown};
 
@@ -239,11 +249,11 @@ mod tests {
 
     #[cfg(unix)]
     use rmux_proto::{
-        encode_frame, CommandOutput, DaemonStatusRequest, DaemonStatusResponse,
-        DisplayMessageRequest, DisplayMessageResponse, ErrorResponse, FrameDecoder,
-        HandshakeRequest, HandshakeResponse, Request, Response, RmuxError,
-        CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE, CAPABILITY_DAEMON_STATUS, RMUX_WIRE_VERSION,
+        encode_frame, CommandOutput, DaemonStatusRequest, DisplayMessageRequest,
+        DisplayMessageResponse, ErrorResponse, FrameDecoder, HandshakeRequest, HandshakeResponse,
+        Request, Response, RmuxError, CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE, CAPABILITY_DAEMON_STATUS,
     };
+    use rmux_proto::{DaemonStatusResponse, RMUX_WIRE_VERSION};
 
     #[cfg(unix)]
     use crate::Connection;
@@ -290,6 +300,33 @@ mod tests {
         assert_eq!(
             classify_stale_daemon(stale.clone()),
             DaemonFreshness::StaleActive(stale)
+        );
+    }
+
+    #[test]
+    fn current_status_matches_client_version() {
+        let status = daemon_status(env!("CARGO_PKG_VERSION"), RMUX_WIRE_VERSION);
+
+        assert!(daemon_status_matches_current_client(&status).expect("wire version is compatible"));
+    }
+
+    #[test]
+    fn stale_status_does_not_match_client_version() {
+        let status = daemon_status("0.5.0+stale", RMUX_WIRE_VERSION);
+
+        assert!(!daemon_status_matches_current_client(&status).expect("wire version is compatible"));
+    }
+
+    #[test]
+    fn status_wire_mismatch_reports_incompatible_daemon() {
+        let status = daemon_status("0.5.0+stale", RMUX_WIRE_VERSION + 1);
+        let incompatible = daemon_status_matches_current_client(&status)
+            .expect_err("wire mismatch is incompatible");
+
+        assert_eq!(incompatible.daemon_version.as_deref(), Some("v0.5.0+stale"));
+        assert_eq!(
+            incompatible.daemon_wire_version,
+            Some(RMUX_WIRE_VERSION + 1)
         );
     }
 
@@ -439,6 +476,16 @@ mod tests {
                 }),
             ),
         ])
+    }
+
+    fn daemon_status(rmux_version: &str, wire_version: u32) -> DaemonStatusResponse {
+        DaemonStatusResponse {
+            rmux_version: rmux_version.to_owned(),
+            wire_version,
+            session_count: 0,
+            client_count: 0,
+            config_loading: false,
+        }
     }
 
     #[cfg(unix)]

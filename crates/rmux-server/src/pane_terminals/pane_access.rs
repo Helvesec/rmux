@@ -136,8 +136,17 @@ impl HandlerState {
     }
 
     pub(crate) fn contains_session_terminals(&self, session_name: &SessionName) -> bool {
-        self.terminals
-            .contains_session(&self.runtime_session_name(session_name))
+        let runtime_session_name = self.runtime_session_name(session_name);
+        if self.terminals.contains_session(&runtime_session_name) {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            if self.starting_panes.contains_key(&runtime_session_name) {
+                return true;
+            }
+        }
+        false
     }
 
     pub(in crate::pane_terminals) fn session_pane_terminal_geometries_by_runtime(
@@ -180,8 +189,31 @@ impl HandlerState {
         session_name: &SessionName,
         pane_ids: &[PaneId],
     ) -> Result<(), RmuxError> {
+        let runtime_session_name = self.runtime_session_name(session_name);
+        if self
+            .terminals
+            .ensure_panes_exist(&runtime_session_name, pane_ids)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        #[cfg(windows)]
+        {
+            let all_present = pane_ids.iter().copied().all(|pane_id| {
+                self.terminals
+                    .ensure_panes_exist(&runtime_session_name, &[pane_id])
+                    .is_ok()
+                    || self
+                        .starting_panes
+                        .get(&runtime_session_name)
+                        .is_some_and(|panes| panes.contains_key(&pane_id))
+            });
+            if all_present {
+                return Ok(());
+            }
+        }
         self.terminals
-            .ensure_panes_exist(&self.runtime_session_name(session_name), pane_ids)
+            .ensure_panes_exist(&runtime_session_name, pane_ids)
     }
 
     pub(crate) fn ensure_window_panes_exist(
@@ -190,10 +222,27 @@ impl HandlerState {
         window_index: u32,
         pane_ids: &[PaneId],
     ) -> Result<(), RmuxError> {
-        self.terminals.ensure_panes_exist(
-            &self.runtime_session_name_for_window(session_name, window_index),
-            pane_ids,
-        )
+        let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
+        match self
+            .terminals
+            .ensure_panes_exist(&runtime_session_name, pane_ids)
+        {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                #[cfg(windows)]
+                {
+                    let all_starting = pane_ids.iter().all(|pane_id| {
+                        self.starting_panes
+                            .get(&runtime_session_name)
+                            .is_some_and(|panes| panes.contains_key(pane_id))
+                    });
+                    if all_starting {
+                        return Ok(());
+                    }
+                }
+                Err(error)
+            }
+        }
     }
 
     #[cfg(test)]
@@ -265,6 +314,12 @@ impl HandlerState {
     ) -> Result<PtyMaster, RmuxError> {
         let pane_id = pane_id_for_target(&self.sessions, session_name, window_index, pane_index)?;
         let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
+        #[cfg(windows)]
+        if self.pane_is_starting_in_window(session_name, window_index, pane_index) {
+            return Err(RmuxError::Server(format!(
+                "pane {session_name}:{window_index}.{pane_index} is still starting"
+            )));
+        }
         self.terminals
             .clone_pane_master(&runtime_session_name, pane_id, window_index, pane_index)
     }
@@ -311,6 +366,12 @@ impl HandlerState {
     ) -> Result<u32, RmuxError> {
         let pane_id = pane_id_for_target(&self.sessions, session_name, window_index, pane_index)?;
         let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
+        #[cfg(windows)]
+        if self.pane_is_starting_in_window(session_name, window_index, pane_index) {
+            return Err(RmuxError::Server(format!(
+                "pane {session_name}:{window_index}.{pane_index} is still starting"
+            )));
+        }
         self.terminals
             .pane_pid(&runtime_session_name, pane_id, window_index, pane_index)
     }
@@ -398,6 +459,14 @@ impl HandlerState {
     ) -> Result<&TerminalProfile, RmuxError> {
         let pane_id = pane_id_for_target(&self.sessions, session_name, window_index, pane_index)?;
         let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
+        #[cfg(windows)]
+        {
+            if let Some(profile) =
+                self.starting_pane_profile_in_window(session_name, window_index, pane_index)
+            {
+                return Ok(profile);
+            }
+        }
         self.terminals
             .pane_profile(&runtime_session_name, pane_id, window_index, pane_index)
     }
@@ -410,6 +479,16 @@ impl HandlerState {
     ) -> Result<Option<String>, RmuxError> {
         let pane_id = pane_id_for_target(&self.sessions, session_name, window_index, pane_index)?;
         let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
+        #[cfg(windows)]
+        {
+            if let Some(name) = self.starting_pane_runtime_window_name_in_window(
+                session_name,
+                window_index,
+                pane_index,
+            ) {
+                return Ok(Some(name.to_owned()));
+            }
+        }
         self.terminals
             .pane_runtime_window_name(&runtime_session_name, pane_id, window_index, pane_index)
             .map(|value| value.map(str::to_owned))

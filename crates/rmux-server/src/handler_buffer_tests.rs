@@ -326,11 +326,11 @@ async fn paste_buffer_writes_to_pty() {
         .await;
 
     let response = handler
-        .handle(Request::PasteBuffer(paste_buffer_request(
+        .handle(Request::PasteBuffer(Box::new(paste_buffer_request(
             None,
             PaneTarget::new(session_name("alpha"), 0),
             false,
-        )))
+        ))))
         .await;
 
     match response {
@@ -358,11 +358,11 @@ async fn paste_buffer_with_delete_removes_buffer_after_write() {
         .await;
 
     let response = handler
-        .handle(Request::PasteBuffer(paste_buffer_request(
+        .handle(Request::PasteBuffer(Box::new(paste_buffer_request(
             None,
             PaneTarget::new(session_name("alpha"), 0),
             true,
-        )))
+        ))))
         .await;
 
     assert!(matches!(response, Response::PasteBuffer(_)));
@@ -390,11 +390,11 @@ async fn paste_buffer_with_delete_keeps_newer_named_replacements() {
     let paste_handler = Arc::clone(&handler);
     let paste = tokio::spawn(async move {
         paste_handler
-            .handle(Request::PasteBuffer(paste_buffer_request(
+            .handle(Request::PasteBuffer(Box::new(paste_buffer_request(
                 Some("shared"),
                 PaneTarget::new(session_name("alpha"), 0),
                 true,
-            )))
+            ))))
             .await
     });
 
@@ -437,11 +437,11 @@ async fn paste_buffer_nonexistent_session_returns_error() {
         .await;
 
     let response = handler
-        .handle(Request::PasteBuffer(paste_buffer_request(
+        .handle(Request::PasteBuffer(Box::new(paste_buffer_request(
             None,
             PaneTarget::new(session_name("missing"), 0),
             false,
-        )))
+        ))))
         .await;
 
     assert!(matches!(response, Response::Error(_)));
@@ -453,11 +453,11 @@ async fn paste_buffer_empty_store_returns_error() {
     create_session(&handler, "alpha").await;
 
     let response = handler
-        .handle(Request::PasteBuffer(paste_buffer_request(
+        .handle(Request::PasteBuffer(Box::new(paste_buffer_request(
             None,
             PaneTarget::new(session_name("alpha"), 0),
             false,
-        )))
+        ))))
         .await;
 
     assert!(matches!(response, Response::Error(_)));
@@ -503,11 +503,11 @@ async fn implicit_paste_buffer_ignores_newer_named_buffers() {
         .await;
 
     let response = handler
-        .handle(Request::PasteBuffer(paste_buffer_request(
+        .handle(Request::PasteBuffer(Box::new(paste_buffer_request(
             None,
             PaneTarget::new(session_name("alpha"), 0),
             false,
-        )))
+        ))))
         .await;
 
     match response {
@@ -527,11 +527,11 @@ async fn paste_buffer_nonexistent_pane_returns_error() {
 
     // Pane 5 doesn't exist in window 0
     let response = handler
-        .handle(Request::PasteBuffer(paste_buffer_request(
+        .handle(Request::PasteBuffer(Box::new(paste_buffer_request(
             None,
             PaneTarget::with_window(session_name("alpha"), 0, 5),
             false,
-        )))
+        ))))
         .await;
 
     assert!(matches!(response, Response::Error(_)));
@@ -554,11 +554,11 @@ async fn paste_buffer_with_delete_nonexistent_pane_preserves_buffer() {
 
     // Pane 5 doesn't exist - paste fails, buffer should NOT be deleted
     let response = handler
-        .handle(Request::PasteBuffer(paste_buffer_request(
+        .handle(Request::PasteBuffer(Box::new(paste_buffer_request(
             None,
             PaneTarget::with_window(session_name("alpha"), 0, 5),
             true,
-        )))
+        ))))
         .await;
 
     assert!(matches!(response, Response::Error(_)));

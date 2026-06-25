@@ -19,13 +19,13 @@ async fn attached_prefix_right_dispatches_select_pane_right() {
     ));
     assert!(matches!(
         handler
-            .handle(Request::SelectPane(SelectPaneRequest {
+            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
                 target: PaneTarget::new(alpha.clone(), 0),
                 title: None,
                 style: None,
                 input_disabled: None,
                 preserve_zoom: false,
-            }))
+            })))
             .await,
         Response::SelectPane(_)
     ));
@@ -46,7 +46,7 @@ async fn attached_prefix_n_dispatches_next_window() {
     let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
     assert!(matches!(
         handler
-            .handle(Request::NewWindow(NewWindowRequest {
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
                 target: alpha.clone(),
                 name: None,
                 detached: true,
@@ -56,7 +56,7 @@ async fn attached_prefix_n_dispatches_next_window() {
                 process_command: None,
                 target_window_index: None,
                 insert_at_target: false,
-            }))
+            })))
             .await,
         Response::NewWindow(_)
     ));
@@ -198,8 +198,48 @@ async fn attached_prefix_meta_digits_select_tmux_layout_presets() {
             .handle_attached_live_input_for_test(requester_pid, bytes)
             .await
             .expect("prefix meta digit input");
-        assert_eq!(current_layout(&handler, &alpha).await, expected_layout);
+        assert_eq!(
+            current_layout(&handler, &alpha).await,
+            expected_layout,
+            "prefix meta digit input {bytes:?} should select {expected_layout:?}"
+        );
     }
+}
+
+#[tokio::test]
+async fn attached_select_layout_main_horizontal_binding_command_executes() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let alpha = session_name("alpha");
+    let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    for _ in 0..2 {
+        assert!(matches!(
+            handler
+                .handle(Request::SplitWindow(SplitWindowRequest {
+                    target: SplitWindowTarget::Session(alpha.clone()),
+                    direction: rmux_proto::SplitDirection::Vertical,
+                    before: false,
+                    environment: None,
+                }))
+                .await,
+            Response::SplitWindow(_)
+        ));
+    }
+    select_layout(&handler, &alpha, LayoutName::Tiled).await;
+
+    let commands = handler
+        .parse_command_string_one_group("select-layout main-horizontal")
+        .await
+        .expect("binding command parses");
+    handler
+        .execute_parsed_commands_for_test(requester_pid, commands)
+        .await
+        .expect("binding command executes");
+
+    assert_eq!(
+        current_layout(&handler, &alpha).await,
+        LayoutName::MainHorizontal
+    );
 }
 
 #[tokio::test]

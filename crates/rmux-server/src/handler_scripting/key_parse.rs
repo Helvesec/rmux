@@ -106,19 +106,21 @@ pub(super) fn parse_send_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
     }
 
     if target_client.is_some() {
-        return Ok(Request::SendKeysExt2(rmux_proto::SendKeysExt2Request {
-            target,
-            keys,
-            expand_formats,
-            hex,
-            literal,
-            dispatch_key_table,
-            copy_mode_command,
-            forward_mouse_event,
-            reset_terminal,
-            repeat_count,
-            target_client,
-        }));
+        return Ok(Request::SendKeysExt2(Box::new(
+            rmux_proto::SendKeysExt2Request {
+                target,
+                keys,
+                expand_formats,
+                hex,
+                literal,
+                dispatch_key_table,
+                copy_mode_command,
+                forward_mouse_event,
+                reset_terminal,
+                repeat_count,
+                target_client,
+            },
+        )));
     }
 
     Ok(Request::SendKeysExt(rmux_proto::SendKeysExtRequest {
@@ -175,13 +177,13 @@ pub(super) fn parse_bind_key(mut args: CommandTokens) -> Result<Request, RmuxErr
     }
 
     let key = args.required("key")?;
-    Ok(Request::BindKey(rmux_proto::BindKeyRequest {
+    Ok(Request::BindKey(Box::new(rmux_proto::BindKeyRequest {
         table_name: table_name.unwrap_or_else(|| "prefix".to_owned()),
         key,
         note,
         repeat,
         command: (!args.is_empty()).then_some(args.remaining()),
-    }))
+    })))
 }
 
 pub(super) fn parse_unbind_key(mut args: CommandTokens) -> Result<Request, RmuxError> {
@@ -278,7 +280,7 @@ pub(super) fn parse_list_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
 
     let key = args.optional();
     args.no_extra("list-keys")?;
-    Ok(Request::ListKeys(rmux_proto::ListKeysRequest {
+    Ok(Request::ListKeys(Box::new(rmux_proto::ListKeysRequest {
         table_name,
         first_only,
         notes,
@@ -288,7 +290,7 @@ pub(super) fn parse_list_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
         sort_order,
         prefix,
         key,
-    }))
+    })))
 }
 
 pub(super) fn parse_send_prefix(mut args: CommandTokens) -> Result<Request, RmuxError> {

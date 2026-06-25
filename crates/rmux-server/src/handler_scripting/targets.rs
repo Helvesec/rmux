@@ -275,10 +275,40 @@ fn queue_target_spec_for_flag(
     } else if command_name == "new-window" && flag == 't' && new_window_target_is_session(value) {
         spec.find_type = TargetFindType::Session;
         spec.flags = TargetFindFlags::NONE;
+    } else if command_name == "set-option" && flag == 't' {
+        spec.find_type = set_option_target_find_type(arguments);
     } else if matches!(command_name, "set-hook" | "show-hooks") && flag == 't' {
         spec.find_type = hook_target_find_type(value, arguments);
     }
     Some(spec)
+}
+
+fn set_option_target_find_type(arguments: &[String]) -> TargetFindType {
+    let mut find_type = TargetFindType::Session;
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = &arguments[index];
+        if argument == "--" || !argument.starts_with('-') || argument == "-" {
+            break;
+        }
+        if argument == "-t" {
+            index += 2;
+            continue;
+        }
+        if argument.starts_with("-t") && argument.len() > 2 {
+            index += 1;
+            continue;
+        }
+        for flag in argument[1..].chars() {
+            match flag {
+                'p' => return TargetFindType::Pane,
+                'w' => find_type = TargetFindType::Window,
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    find_type
 }
 
 fn has_explicit_window_part(value: &str) -> bool {

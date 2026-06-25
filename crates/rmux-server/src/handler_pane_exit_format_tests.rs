@@ -46,14 +46,14 @@ async fn display_message_pane_dead_observes_exited_child_promptly() {
     assert!(matches!(remain_on_exit, Response::SetOption(_)));
 
     let respawned = handler
-        .handle(Request::RespawnPane(RespawnPaneRequest {
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
             target: target.clone(),
             kill: true,
             start_directory: None,
             environment: None,
             command: Some(successful_exit_command()),
             process_command: None,
-        }))
+        })))
         .await;
     assert!(matches!(respawned, Response::RespawnPane(_)));
 
