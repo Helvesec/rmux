@@ -186,6 +186,55 @@ fn signed_window_index_target(value: &str) -> bool {
     rest.is_empty() || rest.bytes().all(|byte| byte.is_ascii_digit())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IfShellTargetFlag {
+    NextArgument,
+    Attached(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct IfShellFlagCluster {
+    background: bool,
+    format_mode: bool,
+    target: Option<IfShellTargetFlag>,
+}
+
+fn parse_if_shell_flag_cluster(token: &str) -> Option<IfShellFlagCluster> {
+    if !token.starts_with('-') || token == "-" || token == "--" || token.len() <= 2 {
+        return None;
+    }
+
+    let flags = token.strip_prefix('-')?;
+    let mut cluster = IfShellFlagCluster::default();
+    for (index, flag) in flags.char_indices() {
+        match flag {
+            'b' => cluster.background = true,
+            'F' => cluster.format_mode = true,
+            't' => {
+                let value_start = index + flag.len_utf8();
+                cluster.target = Some(if value_start == flags.len() {
+                    IfShellTargetFlag::NextArgument
+                } else {
+                    IfShellTargetFlag::Attached(flags[value_start..].to_owned())
+                });
+                return Some(cluster);
+            }
+            _ => return None,
+        }
+    }
+
+    Some(cluster)
+}
+
+fn parse_queued_if_shell_target(
+    raw_target: String,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Result<Target, RmuxError> {
+    let value = resolve_queue_target_argument("if-shell", 't', raw_target, sessions, find_context)?;
+    parse_target_arg("if-shell", value)
+}
+
 pub(super) fn parse_queued_if_shell(
     command: ParsedCommand,
     caller_cwd: Option<&Path>,
@@ -213,16 +262,33 @@ pub(super) fn parse_queued_if_shell(
             }
             "-t" => {
                 let _ = args.pop_front();
-                let value = resolve_queue_target_argument(
-                    "if-shell",
-                    't',
+                target = Some(parse_queued_if_shell_target(
                     pop_string_argument(&mut args, "-t target")?,
                     sessions,
                     find_context,
-                )?;
-                target = Some(parse_target_arg("if-shell", value)?);
+                )?);
             }
-            _ => break,
+            token => {
+                let Some(cluster) = parse_if_shell_flag_cluster(token) else {
+                    break;
+                };
+                let _ = args.pop_front();
+                background |= cluster.background;
+                format_mode |= cluster.format_mode;
+                if let Some(target_flag) = cluster.target {
+                    let raw_target = match target_flag {
+                        IfShellTargetFlag::NextArgument => {
+                            pop_string_argument(&mut args, "-t target")?
+                        }
+                        IfShellTargetFlag::Attached(value) => value,
+                    };
+                    target = Some(parse_queued_if_shell_target(
+                        raw_target,
+                        sessions,
+                        find_context,
+                    )?);
+                }
+            }
         }
     }
 
