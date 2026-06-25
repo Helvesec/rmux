@@ -127,7 +127,7 @@ Tags:
   - terminal
   - tmux
 ReleaseNotesUrl: https://github.com/$repository/releases/tag/v$version
-ManifestType: defaultLocale
+ManifestType: locale
 ManifestVersion: 1.10.0
 EOF
 }
