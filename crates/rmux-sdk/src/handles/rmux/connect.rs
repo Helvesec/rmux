@@ -226,6 +226,21 @@ fn hidden_daemon_binary_candidates_from_sources(
     override_binary: Option<OsString>,
     public_binary: Option<PathBuf>,
 ) -> Vec<OsString> {
+    let resolved_public_binary = public_binary
+        .as_deref()
+        .and_then(|path| std::fs::canonicalize(path).ok());
+    hidden_daemon_binary_candidates_from_sources_with_resolved(
+        override_binary,
+        public_binary,
+        resolved_public_binary.as_deref(),
+    )
+}
+
+fn hidden_daemon_binary_candidates_from_sources_with_resolved(
+    override_binary: Option<OsString>,
+    public_binary: Option<PathBuf>,
+    resolved_public_binary: Option<&Path>,
+) -> Vec<OsString> {
     if let Some(binary) = override_binary {
         return vec![binary];
     }
@@ -233,8 +248,7 @@ fn hidden_daemon_binary_candidates_from_sources(
     let mut candidates = Vec::new();
     push_unique_candidate(&mut candidates, OsString::from("rmux-daemon"));
     if let Some(public_binary) = public_binary.as_deref() {
-        let resolved = std::fs::canonicalize(public_binary).ok();
-        push_daemon_sibling_candidates(&mut candidates, public_binary, resolved.as_deref());
+        push_daemon_sibling_candidates(&mut candidates, public_binary, resolved_public_binary);
     }
     push_unique_candidate(&mut candidates, OsString::from("rmux"));
     candidates
@@ -445,7 +459,7 @@ mod tests {
 
     use super::{
         hidden_daemon_binary_candidates_from_env, hidden_daemon_binary_candidates_from_sources,
-        hidden_daemon_not_found_error,
+        hidden_daemon_binary_candidates_from_sources_with_resolved, hidden_daemon_not_found_error,
     };
 
     fn temp_root(name: &str) -> PathBuf {
@@ -486,6 +500,36 @@ mod tests {
 
         assert_eq!(
             hidden_daemon_binary_candidates_from_sources(None, Some(public)),
+            vec![
+                OsString::from("rmux-daemon"),
+                daemon.into_os_string(),
+                OsString::from("rmux"),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hidden_daemon_spawn_uses_resolved_public_binary_daemon_sibling_before_rmux_fallback() {
+        let root = temp_root("resolved-public-sibling");
+        let links = root.join("links");
+        let package = root.join("package");
+        std::fs::create_dir_all(&links).expect("create links");
+        std::fs::create_dir_all(&package).expect("create package");
+        let alias = links.join("rmux");
+        let public = package.join("rmux");
+        let daemon = package.join("rmux-daemon");
+        std::fs::write(&alias, b"alias").expect("write alias");
+        std::fs::write(&public, b"rmux").expect("write public");
+        std::fs::write(&daemon, b"daemon").expect("write daemon");
+
+        assert_eq!(
+            hidden_daemon_binary_candidates_from_sources_with_resolved(
+                None,
+                Some(alias),
+                Some(&public),
+            ),
             vec![
                 OsString::from("rmux-daemon"),
                 daemon.into_os_string(),

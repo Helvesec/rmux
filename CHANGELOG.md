@@ -55,6 +55,8 @@
   resolution, and daemon startup from a WinGet-like Links layout.
 - Exposed `rmux-daemon` in the Scoop manifest and expanded package-manager
   metadata smokes to cover the installed daemon path.
+- Added reusable installed-package smokes that force the tiny helper fallback
+  before exercising daemon startup.
 
 ## 0.7.0
 

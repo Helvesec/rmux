@@ -9,7 +9,7 @@ Verify a local-first RMUX Unix package.
 
 Options:
   --checksums <path>     SHA256SUMS file (default: archive directory)
-  --run-binary           Execute rmux -V and rmux diagnose --json
+  --run-binary           Execute rmux -V plus helper fallback and daemon smokes
   --require-release-artifact
                          Fail unless metadata marks this as a release artifact
   -h, --help             Show this help
@@ -31,24 +31,6 @@ sha256_file() {
   else
     die "no SHA256 tool found"
   fi
-}
-
-run_daemon_smoke() {
-  local binary label sessions
-  binary="$1"
-  label="package-smoke-$$-$(date +%s)"
-  "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
-  if ! "$binary" -L "$label" new-session -d -s package_smoke >/dev/null; then
-    "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
-    die "packaged rmux failed to create a session through its daemon"
-  fi
-  if ! sessions="$("$binary" -L "$label" list-sessions -F '#{session_name}')"; then
-    "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
-    die "packaged rmux failed to list sessions through its daemon"
-  fi
-  "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
-  printf '%s\n' "$sessions" | grep -qx 'package_smoke' ||
-    die "daemon smoke did not list package_smoke session"
 }
 
 verify_checksum_manifest() {
@@ -119,6 +101,7 @@ case "$archive" in
 esac
 
 archive_dir="$(cd "$(dirname "$archive")" && pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 archive_name="$(basename "$archive")"
 archive_abs="$archive_dir/$archive_name"
 
@@ -171,8 +154,7 @@ fi
 
 if [ "$run_binary" -eq 1 ]; then
   "$package_root/bin/rmux" -V >/dev/null
-  "$package_root/bin/rmux" diagnose --json >/dev/null
-  run_daemon_smoke "$package_root/bin/rmux"
+  "$script_dir/smoke-installed-rmux.sh" "$package_root/bin/rmux" >/dev/null
 fi
 
 printf 'archive=%s\n' "$archive_abs"

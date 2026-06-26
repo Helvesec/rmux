@@ -50,6 +50,17 @@ function AssertSuccessNoCapture([string]$Binary, [string[]]$Arguments) {
     }
 }
 
+function AssertHelperFallback([string]$Binary) {
+    $output = & $Binary "--help" 2>&1
+    $status = $LASTEXITCODE
+    if ($status -ne 0 -and $status -ne 1) {
+        Fail "command failed with unexpected exit code $($status): $Binary --help`n$output"
+    }
+    if (($output -join "`n") -notmatch 'usage: rmux') {
+        Fail "command did not reach private helper: $Binary --help`n$output"
+    }
+}
+
 function NewPortableAliasSmoke([string]$Binary, [string]$Root) {
     $links = Join-Path $Root "winget-links"
     New-Item -ItemType Directory -Force -Path $links | Out-Null
@@ -189,10 +200,13 @@ try {
 
     if ($RunBinary) {
         AssertSuccess $binary @("-V") | Out-Null
+        AssertHelperFallback $binary
         AssertSuccess $binary @("diagnose", "--json") | Out-Null
         AssertSuccess $portableAlias.Binary @("-V") | Out-Null
+        AssertHelperFallback $portableAlias.Binary
         AssertSuccess $portableAlias.Binary @("diagnose", "--json") | Out-Null
         InvokeWithPathPrefix $portableAlias.Directory {
+            AssertHelperFallback "rmux"
             AssertSuccess "rmux" @("diagnose", "--json") | Out-Null
         }
         $previousDisableTiny = $env:RMUX_DISABLE_TINY_CLI

@@ -812,6 +812,11 @@ jobs:
           }
           "VERSION=$($env:RELEASE_REF.Substring(1))" | Out-File -FilePath $env:GITHUB_ENV -Append
 
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ env.RELEASE_REF }}
+          persist-credentials: false
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: package-manager-metadata-${{ env.RELEASE_REF }}
@@ -873,38 +878,7 @@ jobs:
             throw "Unexpected rmux version from Chocolatey install: $versionOutput"
           }
 
-          $daemonCommand = Get-Command rmux-daemon -ErrorAction SilentlyContinue
-          if ($null -eq $daemonCommand) {
-            throw "Chocolatey install did not expose rmux-daemon on PATH"
-          }
-
-          $diagnoseJson = & rmux diagnose --json
-          if ($LASTEXITCODE -ne 0) {
-            throw "rmux diagnose --json failed after Chocolatey install"
-          }
-          try {
-            $diagnoseJson | ConvertFrom-Json | Out-Null
-          } catch {
-            throw "rmux diagnose --json returned invalid JSON after Chocolatey install: $_"
-          }
-
-          $label = "choco-smoke-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-          $sessionName = "choco_smoke_$PID"
-          try {
-            & rmux -L $label new-session -d -s $sessionName cmd.exe /d /q /k
-            if ($LASTEXITCODE -ne 0) {
-              throw "Chocolatey daemon smoke failed to create session"
-            }
-            $sessions = & rmux -L $label list-sessions -F "#{session_name}"
-            if ($LASTEXITCODE -ne 0) {
-              throw "Chocolatey daemon smoke failed to list sessions"
-            }
-            if (($sessions -join "`n") -notmatch [regex]::Escape($sessionName)) {
-              throw "Chocolatey daemon smoke did not list $sessionName"
-            }
-          } finally {
-            & rmux -L $label kill-server | Out-Null
-          }
+          .\scripts\smoke-installed-rmux.ps1 -Rmux rmux -RequireDaemonCommand
 
           choco uninstall rmux --yes --no-progress
           "CHOCOLATEY_PACKAGE=$package" | Out-File -FilePath $env:GITHUB_ENV -Append

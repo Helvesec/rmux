@@ -9,7 +9,7 @@ Verify an RMUX Fedora/RPM package.
 
 Options:
   --checksums <path>     SHA256SUMS file (default: package directory)
-  --run-binary           Execute rmux -V and rmux diagnose --json after extraction
+  --run-binary           Execute rmux -V plus helper fallback and daemon smokes
   --require-release-artifact
                          Fail unless package metadata marks this as a release artifact
   -h, --help             Show this help
@@ -27,24 +27,6 @@ need() {
 
 sha256_file() {
   sha256sum "$1" | awk '{print $1}'
-}
-
-run_daemon_smoke() {
-  local binary label sessions
-  binary="$1"
-  label="package-smoke-$$-$(date +%s)"
-  "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
-  if ! "$binary" -L "$label" new-session -d -s package_smoke >/dev/null; then
-    "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
-    die "packaged rmux failed to create a session through its daemon"
-  fi
-  if ! sessions="$("$binary" -L "$label" list-sessions -F '#{session_name}')"; then
-    "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
-    die "packaged rmux failed to list sessions through its daemon"
-  fi
-  "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
-  printf '%s\n' "$sessions" | grep -qx 'package_smoke' ||
-    die "daemon smoke did not list package_smoke session"
 }
 
 archive=""
@@ -91,6 +73,7 @@ need cpio
 need sha256sum
 
 archive_dir="$(cd "$(dirname "$archive")" && pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 archive_name="$(basename "$archive")"
 archive_abs="$archive_dir/$archive_name"
 if [ -z "$checksums" ]; then
@@ -155,8 +138,7 @@ packaged_daemon_hash="$(sha256_file "$tmpdir/usr/bin/rmux-daemon")"
 
 if [ "$run_binary" -eq 1 ]; then
   "$tmpdir/usr/bin/rmux" -V >/dev/null
-  "$tmpdir/usr/bin/rmux" diagnose --json >/dev/null
-  run_daemon_smoke "$tmpdir/usr/bin/rmux"
+  "$script_dir/smoke-installed-rmux.sh" "$tmpdir/usr/bin/rmux" >/dev/null
 fi
 
 printf 'package=%s\n' "$archive_abs"
