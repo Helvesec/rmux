@@ -27,6 +27,8 @@
   portable aliases such as WinGet Links while keeping packaged layouts first.
 - Resolved hidden daemon siblings through canonical executable paths so portable
   aliases can cold-start the packaged daemon directly.
+- Resolved SDK daemon candidates from installed `rmux` binaries before falling
+  back to PATH names, avoiding extra tiny-helper hops in portable layouts.
 
 ### Compatibility
 
@@ -41,6 +43,8 @@
   corrected public split-direction documentation.
 - Shared detected client terminal features between the full and tiny attach
   paths, including Windows Terminal rendering and input capabilities.
+- Improved SDK and CLI daemon startup diagnostics when no daemon binary can be
+  found or a hidden daemon exits before creating its endpoint.
 
 ### CI
 

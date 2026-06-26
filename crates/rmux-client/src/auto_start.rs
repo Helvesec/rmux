@@ -572,9 +572,11 @@ impl fmt::Display for AutoStartError {
                 waited,
             } => write!(
                 formatter,
-                "timed out after {}s waiting for rmux server socket '{}'",
+                "timed out after {}s waiting for rmux server socket '{}'. \
+                 The hidden daemon may have exited before creating the socket; run `{}` to surface startup errors.",
                 waited.as_secs(),
-                socket_path.display()
+                socket_path.display(),
+                diagnostic_start_server_command(socket_path)
             ),
         }
     }
@@ -714,6 +716,18 @@ fn incompatible_daemon_kill_server_command(socket_path: &Path) -> String {
     }
 
     format!("rmux -S {} kill-server", shell_quote_path(socket_path))
+}
+
+fn diagnostic_start_server_command(socket_path: &Path) -> String {
+    if default_socket_path()
+        .ok()
+        .as_deref()
+        .is_some_and(|default_path| default_path == socket_path)
+    {
+        return "rmux start-server".to_owned();
+    }
+
+    format!("rmux -S {} start-server", shell_quote_path(socket_path))
 }
 
 fn probe_server_readiness(connection: &mut Connection) -> Result<(), ClientError> {
