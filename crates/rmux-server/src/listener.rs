@@ -194,6 +194,8 @@ async fn serve_connection(
                         continue;
                     }
                 };
+                let _requester_access_guard =
+                    handler.begin_detached_requester_access(requester.pid, can_write);
                 let mut detached_request_guard = request_counts_as_detached_activity(&request)
                     .then(|| handler.begin_detached_request());
 

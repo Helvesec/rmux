@@ -58,6 +58,17 @@ impl RequestHandler {
         if let Some(active) = active_control.by_pid.get(&requester_pid) {
             return active.can_write;
         }
+        drop(active_control);
+
+        {
+            let detached_access = self
+                .active_detached_requester_access
+                .lock()
+                .expect("active detached requester access mutex must not be poisoned");
+            if let Some(active) = detached_access.get(&requester_pid) {
+                return active.can_write();
+            }
+        }
 
         requester_pid == std::process::id()
     }

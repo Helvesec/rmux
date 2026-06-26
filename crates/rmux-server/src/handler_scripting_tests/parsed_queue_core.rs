@@ -148,6 +148,44 @@ async fn unknown_requester_rejects_special_queue_invocations() {
 }
 
 #[tokio::test]
+async fn detached_write_requester_allows_mutating_queue_commands() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_003;
+    let _access = handler.begin_detached_requester_access(requester_pid, true);
+    let parsed = CommandParser::new()
+        .parse("set-buffer -b repro-buffer hello ; show-buffer -b repro-buffer")
+        .expect("commands parse");
+
+    let output = handler
+        .execute_parsed_commands_for_test(requester_pid, parsed)
+        .await
+        .expect("authenticated detached requester can mutate");
+
+    assert_eq!(String::from_utf8(output.stdout).expect("utf8"), "hello");
+}
+
+#[tokio::test]
+async fn detached_read_only_requester_rejects_mutating_queue_commands() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_004;
+    let _access = handler.begin_detached_requester_access(requester_pid, false);
+    let parsed = CommandParser::new()
+        .parse("set-buffer -b repro-buffer hello ; show-buffer -b repro-buffer")
+        .expect("commands parse");
+
+    let result = handler
+        .execute_parsed_commands_for_test(requester_pid, parsed)
+        .await;
+
+    assert_eq!(
+        result
+            .expect_err("read-only detached requester should be rejected")
+            .to_string(),
+        "server error: client is read-only"
+    );
+}
+
+#[tokio::test]
 async fn read_only_control_allows_list_panes_all_observation() {
     let handler = RequestHandler::new();
     let requester_pid = 42_004;
