@@ -72,7 +72,8 @@ done
 [ -n "$rmux" ] || die "rmux binary is required"
 
 # `--help` is intentionally outside the tiny direct path. It proves that the
-# public CLI can find and execute its private libexec helper.
+# installed public CLI can reach the complete command surface: directly for full
+# CLIs, or through the private helper for tiny dispatchers.
 assert_helper_fallback
 "$rmux" diagnose --json >/dev/null
 

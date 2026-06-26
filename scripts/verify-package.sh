@@ -122,12 +122,13 @@ tar -xzf "$archive_abs" -C "$tmpdir"
 package_root="$tmpdir/${archive_name%.tar.gz}"
 [ -d "$package_root" ] || die "archive root directory is missing: ${archive_name%.tar.gz}"
 
-for required in bin/rmux libexec/rmux/rmux bin/rmux-daemon LICENSE-APACHE LICENSE-MIT SHA256SUMS.txt share/rmux/artifact-metadata.json share/man/man1/rmux.1; do
+for required in bin/rmux libexec/rmux/rmux bin/rmux-daemon install.sh LICENSE-APACHE LICENSE-MIT SHA256SUMS.txt share/rmux/artifact-metadata.json share/man/man1/rmux.1; do
   [ -e "$package_root/$required" ] || die "missing package file: $required"
 done
 [ -x "$package_root/bin/rmux" ] || die "packaged rmux is not executable"
 [ -x "$package_root/libexec/rmux/rmux" ] || die "packaged private helper is not executable"
 [ -x "$package_root/bin/rmux-daemon" ] || die "packaged rmux-daemon is not executable"
+[ -x "$package_root/install.sh" ] || die "packaged install.sh is not executable"
 verify_checksum_manifest "$package_root" "$package_root/SHA256SUMS.txt"
 
 metadata="$package_root/share/rmux/artifact-metadata.json"
@@ -155,6 +156,9 @@ fi
 if [ "$run_binary" -eq 1 ]; then
   "$package_root/bin/rmux" -V >/dev/null
   "$script_dir/smoke-installed-rmux.sh" "$package_root/bin/rmux" >/dev/null
+  install_prefix="$tmpdir/install-prefix"
+  "$package_root/install.sh" --prefix "$install_prefix" >/dev/null
+  "$script_dir/smoke-installed-rmux.sh" "$install_prefix/bin/rmux" >/dev/null
 fi
 
 printf 'archive=%s\n' "$archive_abs"

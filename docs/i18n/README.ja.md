@@ -130,6 +130,11 @@ RMUX を何に使えるかを示す短い例です。
 
 パッケージマネージャはレジストリ審査中に遅れることがあります。直接ダウンロードと rmux.io インストーラは現在の GitHub Release に追従します。
 
+Unix の `.tar.gz` を直接ダウンロードした場合は、展開したアーカイブ内で
+`./install.sh --prefix ~/.local` を実行してください。このインストーラは、
+小さな公開 CLI が完全な helper に必ず到達できるよう、必要な `bin/` と
+`libexec/` の配置を保ちます。
+
 リリースパッケージでは、高速な detached コマンドに小さな公開 CLI を使い、複雑な tmux 互換コマンド形式には非公開の完全 CLI helper を使う場合があります。Windows パッケージでは `rmux.exe` が軽量 dispatcher になり、完全 CLI は `libexec/rmux/rmux.exe` に配置されます。CLI 互換性の診断中に完全 helper を強制するには `RMUX_DISABLE_TINY_CLI=1` を設定してください。
 
 <a id="claude-teammate-mode"></a>

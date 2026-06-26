@@ -17,6 +17,8 @@
 
 - Added panic-safe connection cleanup so subscriptions and SDK waits are removed
   even if a connection task unwinds.
+- Added a Unix archive installer that preserves the tiny/full `bin` and
+  `libexec` layout and installs the public tiny binary last during upgrades.
 - Made connection subscription/wait cleanup tolerate poisoned cleanup locks.
 - Spawned popup waiters before popup readers so popup children are reaped even
   if reader setup fails.
@@ -57,6 +59,8 @@
   metadata smokes to cover the installed daemon path.
 - Added reusable installed-package smokes that force the tiny helper fallback
   before exercising daemon startup.
+- Extended Unix archive verification to install the archive into a temporary
+  prefix and smoke the installed `bin/rmux` through its packaged helper.
 
 ## 0.7.0
 

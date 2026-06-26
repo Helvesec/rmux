@@ -32,7 +32,8 @@ function Assert-RmuxHelperFallback {
 }
 
 # `--help` is intentionally outside the tiny direct path. It proves that the
-# public CLI can find and execute its private libexec helper.
+# installed public CLI can reach the complete command surface: directly for full
+# CLIs, or through the private helper for tiny dispatchers.
 Assert-RmuxHelperFallback
 $diagnoseJson = Invoke-RmuxSuccess @("diagnose", "--json")
 try {

@@ -130,6 +130,11 @@ Les téléchargements directs (`.tar.gz`, `.deb`, `.rpm`, `.zip`) sont disponibl
 
 Les gestionnaires de paquets peuvent avoir du retard pendant la revue des registres ; les téléchargements directs et les installateurs rmux.io suivent la release GitHub courante.
 
+Pour les téléchargements Unix `.tar.gz`, lancez `./install.sh --prefix ~/.local`
+depuis l'archive extraite. L'installateur préserve le layout `bin/` et
+`libexec/` requis pour que la petite CLI publique puisse toujours atteindre son
+helper complet.
+
 Les paquets de release peuvent utiliser une petite CLI publique pour les commandes détachées rapides et un helper CLI complet privé pour les formes de commandes tmux compatibles plus complexes. Les paquets Windows livrent `rmux.exe` comme dispatcher léger et placent la CLI complète sous `libexec/rmux/rmux.exe`. Définissez `RMUX_DISABLE_TINY_CLI=1` pour forcer le helper complet pendant le diagnostic de compatibilité CLI.
 
 <a id="claude-teammate-mode"></a>

@@ -129,6 +129,10 @@ Direct downloads (`.tar.gz`, `.deb`, `.rpm`, `.zip`) are available from the [v0.
 
 Package managers can lag while registries review new releases; direct downloads and the rmux.io installers track the current GitHub Release.
 
+For Unix `.tar.gz` downloads, run `./install.sh --prefix ~/.local` from the
+extracted archive. The installer preserves the required `bin/` and `libexec/`
+layout so the tiny public CLI can always reach its full helper.
+
 Release packages may use a tiny public CLI for hot detached commands and a
 private full CLI helper for complex tmux-compatible command forms. Windows
 packages ship `rmux.exe` as the tiny dispatcher and keep the full CLI under
