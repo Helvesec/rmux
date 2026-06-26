@@ -1,0 +1,8 @@
+<svg width="340" height="25.500" viewBox="60 0 340 30" fill="none" xmlns="http://www.w3.org/2000/svg">
+<style>
+  .title { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; font-size: 24px; font-weight: 600; fill: #f0f6fc; }
+  .item { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; font-size: 20px; fill: #4493f8; }
+</style>
+<circle cx="162" cy="15" r="3.5" fill="#9198a1" />
+<text x="178" y="22" class="item">Installation</text>
+</svg>

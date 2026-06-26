@@ -1,0 +1,16 @@
+<svg width="340" height="25.500" viewBox="60 0 340 30" fill="none" xmlns="http://www.w3.org/2000/svg">
+<style>
+  .item { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; font-size: 20px; fill: #4493f8; }
+  .new { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; font-size: 15px; font-weight: 800; fill: #f6d6ff; }
+</style>
+<circle cx="162" cy="15" r="3.5" fill="#9198a1" />
+<text x="178" y="22" class="item">Benchmarks</text>
+<g transform="rotate(-6 339 15)">
+  <path d="M317 8.5 L301 10.5 L317 14.5 Z" fill="#241430" stroke="#c77dff" stroke-width="2" stroke-linejoin="round" />
+  <rect x="315" y="3.5" width="67" height="22" rx="6" fill="#241430" stroke="#c77dff" stroke-width="2" />
+  <text x="325" y="20" class="new">NEW !</text>
+</g>
+<path d="M385 5 L389 -4" stroke="#ffad2f" stroke-width="2.2" stroke-linecap="round" />
+<path d="M391 13 L399 9" stroke="#ffad2f" stroke-width="2.2" stroke-linecap="round" />
+<path d="M391 22 L399 24" stroke="#ffad2f" stroke-width="2.2" stroke-linecap="round" />
+</svg>
