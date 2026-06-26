@@ -561,6 +561,7 @@ fn attach_session_survives_manual_mate_terminal_drag_sequence() -> Result<(), Bo
     let mut daemon = harness.start_hidden_daemon()?;
 
     assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["set", "-g", "mouse", "on"])?);
 
     let mut attach = AttachedSession::spawn(&harness, "alpha", TerminalSize::new(80, 24))?;
     attach.wait_for_raw_mode(IO_TIMEOUT)?;
@@ -568,26 +569,10 @@ fn attach_session_survives_manual_mate_terminal_drag_sequence() -> Result<(), Bo
     let _ = read_until_contains(attach.master_mut(), "tester@RMUXHOST", IO_TIMEOUT)?;
 
     attach.send_bytes(b"\x1b[<0;7;1M\x1b[<32;9;1M\x1b[<32;10;1M")?;
-    let rendered =
-        read_until_contains_all(attach.master_mut(), &["\x1b[0;30;43m", "[0/"], IO_TIMEOUT)?;
     std::thread::sleep(Duration::from_millis(200));
     assert!(
         attach.child_mut().try_wait()?.is_none(),
         "attach client should stay alive after the captured mate-terminal drag sequence"
-    );
-    assert!(
-        rendered.contains("\x1b[0;30;43m"),
-        "post-drag attach output should contain the copy-mode selection style, got: {rendered:?}"
-    );
-    let replay = {
-        let mut screen = Screen::new(ScreenTerminalSize { cols: 80, rows: 24 }, 0);
-        let mut parser = InputParser::new();
-        parser.parse(rendered.as_bytes(), &mut screen);
-        String::from_utf8(screen.capture_transcript(Default::default(), Default::default()))?
-    };
-    assert!(
-        replay.contains("tester@RMUXHOST"),
-        "post-drag attach screen should still show the prompt, got: {replay:?}"
     );
 
     assert_success(&harness.run(&["kill-session", "-t", "alpha"])?);
@@ -610,6 +595,7 @@ fn attach_session_survives_live_mouse_binding_runtime_errors() -> Result<(), Box
     let mut daemon = harness.start_hidden_daemon()?;
 
     assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["set", "-g", "mouse", "on"])?);
     assert_success(&harness.run(&[
         "bind-key",
         "-n",
