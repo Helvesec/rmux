@@ -380,6 +380,22 @@ impl RequestHandler {
         if self.attached_client_input_is_read_only(attach_pid).await? {
             return Ok(());
         }
+        let session_name = self
+            .attached_session_name(attach_pid)
+            .await
+            .map_err(io_other)?;
+        let mouse_enabled = {
+            let state = self.state.lock().await;
+            matches!(
+                state
+                    .options
+                    .resolve(Some(&session_name), OptionName::Mouse),
+                Some("on")
+            )
+        };
+        if !mouse_enabled {
+            return Ok(());
+        }
         if self.mode_tree_active(attach_pid).await {
             let _ = self
                 .handle_mode_tree_mouse_event(attach_pid, raw)
@@ -387,10 +403,6 @@ impl RequestHandler {
                 .map_err(io_other)?;
             return Ok(());
         }
-        let session_name = self
-            .attached_session_name(attach_pid)
-            .await
-            .map_err(io_other)?;
         let attached_count = self.attached_count(&session_name).await;
         let layout = {
             let state = self.state.lock().await;

@@ -8,6 +8,8 @@ pub(super) trait AttachActionExecutor {
     fn handle_lock(&mut self, command: &AttachShellCommand)
         -> std::result::Result<(), ClientError>;
     fn handle_legacy_lock(&mut self, command: &str) -> std::result::Result<(), ClientError>;
+    fn handle_mouse_input_enabled(&mut self, enabled: bool)
+        -> std::result::Result<(), ClientError>;
     fn handle_suspend(&mut self) -> std::result::Result<(), ClientError>;
     fn handle_detach_kill(&mut self) -> std::result::Result<(), ClientError>;
     fn handle_detach_exec(
@@ -21,6 +23,7 @@ pub(super) trait AttachActionExecutor {
 pub(super) enum AttachAction {
     Lock(AttachShellCommand),
     LegacyLock(String),
+    MouseInputEnabled(bool),
     Suspend,
     DetachKill,
     DetachExec(AttachShellCommand),
@@ -29,6 +32,7 @@ pub(super) enum AttachAction {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AttachActionOutcome {
+    Continue,
     Unlock,
     Exit,
 }
@@ -57,6 +61,15 @@ impl AttachActionExecutor for ManagedTerminalActions {
     fn handle_legacy_lock(&mut self, command: &str) -> std::result::Result<(), ClientError> {
         self.terminal
             .run_legacy_lock_command(command)
+            .map_err(ClientError::from)
+    }
+
+    fn handle_mouse_input_enabled(
+        &mut self,
+        enabled: bool,
+    ) -> std::result::Result<(), ClientError> {
+        self.terminal
+            .set_mouse_input_enabled(enabled)
             .map_err(ClientError::from)
     }
 
@@ -97,6 +110,13 @@ impl AttachActionExecutor for StreamOnlyActions {
 
     fn handle_legacy_lock(&mut self, _command: &str) -> std::result::Result<(), ClientError> {
         Err(unmanaged_terminal_error("lock"))
+    }
+
+    fn handle_mouse_input_enabled(
+        &mut self,
+        _enabled: bool,
+    ) -> std::result::Result<(), ClientError> {
+        Ok(())
     }
 
     fn handle_suspend(&mut self) -> std::result::Result<(), ClientError> {
@@ -140,6 +160,10 @@ pub(super) fn run_attach_action(
         AttachAction::LegacyLock(command) => {
             actions.handle_legacy_lock(&command)?;
             Ok(AttachActionOutcome::Unlock)
+        }
+        AttachAction::MouseInputEnabled(enabled) => {
+            actions.handle_mouse_input_enabled(enabled)?;
+            Ok(AttachActionOutcome::Continue)
         }
         AttachAction::Suspend => {
             actions.handle_suspend()?;

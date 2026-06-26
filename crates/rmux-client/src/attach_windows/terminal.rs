@@ -105,6 +105,10 @@ impl RawTerminal {
         Ok(())
     }
 
+    pub(super) fn set_mouse_input_enabled(&self, enabled: bool) -> Result<()> {
+        self.inner.set_mouse_input_enabled(enabled)
+    }
+
     pub(super) fn run_legacy_lock_command(&self, command: &str) -> Result<()> {
         self.restore()?;
         let command_result = run_shell_command(command_from_legacy(command));
@@ -271,6 +275,7 @@ struct RawTerminalGuard<C: ConsoleApi> {
     console: C,
     input: Option<ConsoleMode<C::Handle>>,
     output: Option<ConsoleMode<C::Handle>>,
+    mouse_enabled: Mutex<bool>,
 }
 
 impl<C: ConsoleApi> RawTerminalGuard<C> {
@@ -281,6 +286,7 @@ impl<C: ConsoleApi> RawTerminalGuard<C> {
             console,
             input,
             output,
+            mouse_enabled: Mutex::new(false),
         };
 
         if let Some(input) = &guard.input {
@@ -305,12 +311,36 @@ impl<C: ConsoleApi> RawTerminalGuard<C> {
 
     fn reapply_raw_mode(&self) -> Result<()> {
         if let Some(input) = &self.input {
-            input.set(&self.console, raw_input_mode(input.original))?;
+            input.set(
+                &self.console,
+                raw_input_mode_with_mouse(input.original, self.mouse_input_enabled()),
+            )?;
         }
         if let Some(output) = &self.output {
             output.set(&self.console, raw_output_mode(output.original))?;
         }
         Ok(())
+    }
+
+    fn set_mouse_input_enabled(&self, enabled: bool) -> Result<()> {
+        if let Some(input) = &self.input {
+            input.set(
+                &self.console,
+                raw_input_mode_with_mouse(input.original, enabled),
+            )?;
+        }
+        *self
+            .mouse_enabled
+            .lock()
+            .map_err(|_| AttachError::Io(io::Error::other("mouse mode mutex poisoned")))? = enabled;
+        Ok(())
+    }
+
+    fn mouse_input_enabled(&self) -> bool {
+        self.mouse_enabled
+            .lock()
+            .map(|enabled| *enabled)
+            .unwrap_or(false)
     }
 
     fn flush_pending_input(&self) -> Result<()> {
@@ -562,12 +592,21 @@ fn console_mode_absent_or_error<T>() -> Result<Option<T>> {
 }
 
 const fn raw_input_mode(original: u32) -> u32 {
-    // ENABLE_MOUSE_INPUT delivers mouse events as MOUSE_EVENT records; ENABLE_QUICK_EDIT_MODE
-    // must be cleared or the console itself consumes the mouse (drag = text selection,
-    // wheel = console scrollback) and the app never sees the events. ENABLE_EXTENDED_FLAGS
-    // is required for the QUICK_EDIT clear to take effect.
-    (original | ENABLE_EXTENDED_FLAGS | ENABLE_MOUSE_INPUT)
-        & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE)
+    raw_input_mode_with_mouse(original, false)
+}
+
+const fn raw_input_mode_with_mouse(original: u32, mouse_enabled: bool) -> u32 {
+    let line_editing = ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT;
+    if mouse_enabled {
+        // ENABLE_MOUSE_INPUT delivers mouse events as MOUSE_EVENT records; ENABLE_QUICK_EDIT_MODE
+        // must be cleared or the console itself consumes the mouse (drag = text selection,
+        // wheel = console scrollback) and the app never sees the events. ENABLE_EXTENDED_FLAGS
+        // is required for the QUICK_EDIT clear to take effect.
+        (original | ENABLE_EXTENDED_FLAGS | ENABLE_MOUSE_INPUT)
+            & !(line_editing | ENABLE_QUICK_EDIT_MODE)
+    } else {
+        (original | ENABLE_EXTENDED_FLAGS) & !line_editing
+    }
 }
 
 const fn raw_output_mode(original: u32) -> u32 {

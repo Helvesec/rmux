@@ -4,8 +4,10 @@ use crate::mouse::{layout_for_session, StatusRangeType};
 use crate::pane_io::AttachControl;
 use rmux_proto::{
     BindKeyRequest, CapturePaneRequest, NewSessionExtRequest, NewSessionRequest, PaneTarget,
-    Request, Response, SessionName, Target, TerminalSize, WindowTarget, DEFAULT_MAX_FRAME_LENGTH,
+    Request, Response, ScopeSelector, SessionName, SetOptionMode, Target, TerminalSize,
+    WindowTarget, DEFAULT_MAX_FRAME_LENGTH,
 };
+use rmux_proto::{OptionName, SetOptionRequest};
 use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
@@ -105,6 +107,18 @@ async fn run_overlay_command(handler: &RequestHandler, requester_pid: u32, comma
     assert!(result.stdout().is_empty());
 }
 
+async fn enable_mouse(handler: &RequestHandler) {
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::Mouse,
+            value: "on".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)));
+}
+
 #[tokio::test]
 async fn display_menu_accepts_parsed_command_list_items_from_queue() {
     let handler = RequestHandler::new();
@@ -127,12 +141,18 @@ async fn display_menu_accepts_parsed_command_list_items_from_queue() {
 async fn next_overlay_frame(
     control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
 ) -> crate::pane_io::OverlayFrame {
-    match timeout(Duration::from_secs(1), control_rx.recv())
-        .await
-        .expect("overlay control message arrives")
-    {
-        Some(AttachControl::Overlay(frame)) => frame,
-        other => panic!("expected overlay frame, got {other:?}"),
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let now = tokio::time::Instant::now();
+        assert!(now < deadline, "overlay control message arrives");
+        match timeout(deadline - now, control_rx.recv())
+            .await
+            .expect("overlay control message arrives")
+        {
+            Some(AttachControl::Overlay(frame)) => return frame,
+            Some(AttachControl::Refresh | AttachControl::Switch(_)) => continue,
+            other => panic!("expected overlay frame, got {other:?}"),
+        }
     }
 }
 
@@ -474,6 +494,7 @@ async fn status_right_click_routes_window_menu_to_clicked_window_target() {
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
     let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+    enable_mouse(&handler).await;
     let rebound = handler
         .handle(Request::BindKey(Box::new(BindKeyRequest {
             table_name: "root".to_owned(),

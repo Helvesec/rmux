@@ -1,5 +1,17 @@
 use super::*;
 
+async fn enable_mouse(handler: &RequestHandler) {
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::Mouse,
+            value: "on".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)));
+}
+
 #[tokio::test]
 async fn send_keys_uses_runtime_extended_key_format_for_mode_two() {
     let handler = RequestHandler::new();
@@ -951,6 +963,7 @@ async fn live_attach_mouse_sequences_dispatch_default_mouse_bindings() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
+    enable_mouse(&handler).await;
 
     {
         let mut state = handler.state.lock().await;
@@ -1013,6 +1026,44 @@ async fn live_attach_mouse_sequences_dispatch_default_mouse_bindings() {
 }
 
 #[tokio::test]
+async fn live_attach_mouse_sequences_are_ignored_when_mouse_option_is_off() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1002h")
+            .expect("mouse motion mode transcript update");
+    }
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "live-attach-mouse-off", 0).await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[<32;2;2M")
+        .await
+        .expect("live attach mouse input");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, b"").await;
+
+    let active_attach = handler.active_attach.lock().await;
+    let event = active_attach
+        .by_pid
+        .get(&requester_pid)
+        .and_then(|active| active.mouse.current_event.as_ref());
+    assert!(event.is_none());
+}
+
+#[tokio::test]
 async fn live_attach_mouse_down_selects_the_clicked_pane() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -1041,15 +1092,7 @@ async fn live_attach_mouse_down_selects_the_clicked_pane() {
         .await;
     assert!(matches!(selected, Response::SelectPane(_)));
 
-    let mouse_enabled = handler
-        .handle(Request::SetOption(SetOptionRequest {
-            scope: ScopeSelector::Global,
-            option: OptionName::Mouse,
-            value: "on".to_owned(),
-            mode: SetOptionMode::Replace,
-        }))
-        .await;
-    assert!(matches!(mouse_enabled, Response::SetOption(_)));
+    enable_mouse(&handler).await;
 
     let (control_tx, _control_rx) = mpsc::unbounded_channel();
     let _attach_id = handler
@@ -1086,6 +1129,7 @@ async fn live_attach_sgr_wheel_forwards_when_pane_mouse_any_is_enabled() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
+    enable_mouse(&handler).await;
 
     {
         let mut state = handler.state.lock().await;
@@ -1144,6 +1188,7 @@ async fn live_attach_sgr_motion_forwards_without_explicit_binding_when_mouse_all
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
+    enable_mouse(&handler).await;
 
     {
         let mut state = handler.state.lock().await;
@@ -1177,6 +1222,7 @@ async fn read_only_live_attach_drops_mouse_forwarding() {
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
+    enable_mouse(&handler).await;
 
     {
         let mut state = handler.state.lock().await;
@@ -1218,6 +1264,7 @@ async fn live_attach_sgr_release_forwards_without_explicit_binding_when_mouse_al
     let requester_pid = std::process::id();
 
     create_send_keys_test_session(&handler, &alpha).await;
+    enable_mouse(&handler).await;
 
     {
         let mut state = handler.state.lock().await;

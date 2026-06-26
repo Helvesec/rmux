@@ -73,6 +73,7 @@ where
     decoder.push_bytes(&initial_bytes);
     let mut read_buffer = [0_u8; super::READ_BUFFER_SIZE];
     let mut stop_detector = AttachStopDetector::new(screen_tracker.clone());
+    let mut mouse_tracker = WindowsConsoleMouseTracker::default();
     let mut pending_actions = 0_usize;
     let mut input_open = true;
     let mut resize_open = true;
@@ -84,6 +85,7 @@ where
             DrainContext {
                 screen_tracker: &screen_tracker,
                 stop_detector: &mut stop_detector,
+                mouse_tracker: &mut mouse_tracker,
                 action_tx: &action_tx,
                 locked: &locked,
                 pending_actions: &mut pending_actions,
@@ -135,9 +137,9 @@ where
                         "attach action worker stopped before attach stream ended",
                     )));
                 };
-                pending_actions = pending_actions.saturating_sub(1);
                 match completion {
                     Ok(AttachActionOutcome::Unlock) => {
+                        pending_actions = pending_actions.saturating_sub(1);
                         let unlock_result =
                             write_async_attach_message(&mut writer, AttachMessage::Unlock).await;
                         if pending_actions == 0 {
@@ -145,6 +147,7 @@ where
                         }
                         unlock_result?;
                     }
+                    Ok(AttachActionOutcome::Continue) => {}
                     Ok(AttachActionOutcome::Exit) => {
                         return Ok(());
                     }
@@ -195,6 +198,7 @@ where
     let DrainContext {
         screen_tracker,
         stop_detector,
+        mouse_tracker,
         action_tx,
         locked,
         pending_actions,
@@ -211,6 +215,9 @@ where
                     screen_tracker.mark_stopped();
                 }
                 stop_detector.observe(&bytes);
+                if let Some(enabled) = mouse_tracker.observe(&bytes) {
+                    send_attach_action(action_tx, AttachAction::MouseInputEnabled(enabled))?;
+                }
                 if locked.is_locked() {
                     continue;
                 }
@@ -304,10 +311,59 @@ impl AttachAsyncChannels {
 struct DrainContext<'context> {
     screen_tracker: &'context AttachScreenTracker,
     stop_detector: &'context mut AttachStopDetector,
+    mouse_tracker: &'context mut WindowsConsoleMouseTracker,
     action_tx: &'context std_mpsc::Sender<AttachAction>,
     locked: &'context Arc<AttachLockState>,
     pending_actions: &'context mut usize,
     metrics: &'context mut AttachMetricsRecorder,
+}
+
+#[derive(Debug, Default)]
+struct WindowsConsoleMouseTracker {
+    enabled: bool,
+    tail: Vec<u8>,
+}
+
+impl WindowsConsoleMouseTracker {
+    fn observe(&mut self, bytes: &[u8]) -> Option<bool> {
+        const ENABLE: [&[u8]; 3] = [b"\x1b[?1000h", b"\x1b[?1002h", b"\x1b[?1006h"];
+        const DISABLE: [&[u8]; 3] = [b"\x1b[?1000l", b"\x1b[?1002l", b"\x1b[?1006l"];
+        const TAIL_LEN: usize = 7;
+
+        if bytes.is_empty() {
+            return None;
+        }
+
+        let mut combined = Vec::with_capacity(self.tail.len() + bytes.len());
+        combined.extend_from_slice(&self.tail);
+        combined.extend_from_slice(bytes);
+
+        let mut observed = None;
+        for index in 0..combined.len() {
+            if ENABLE
+                .iter()
+                .any(|sequence| combined[index..].starts_with(sequence))
+            {
+                observed = Some(true);
+            } else if DISABLE
+                .iter()
+                .any(|sequence| combined[index..].starts_with(sequence))
+            {
+                observed = Some(false);
+            }
+        }
+
+        self.tail.clear();
+        self.tail
+            .extend_from_slice(&combined[combined.len().saturating_sub(TAIL_LEN)..]);
+
+        let enabled = observed?;
+        if self.enabled == enabled {
+            return None;
+        }
+        self.enabled = enabled;
+        Some(enabled)
+    }
 }
 
 fn send_attach_action(
