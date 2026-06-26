@@ -55,12 +55,14 @@ test -f /snap/rmux/current/share/man/man1/rmux.1 ||
   die "snap package did not install rmux.1 manpage"
 test -f /snap/rmux/current/share/bash-completion/completions/rmux ||
   die "snap package did not install bash completion"
+test -x /snap/rmux/current/bin/rmux-daemon ||
+  die "snap package did not install rmux-daemon"
 
 version_output="$(/snap/bin/rmux -V)"
 [ "$version_output" = "rmux $version" ] || die "unexpected rmux version: $version_output"
 
 /snap/bin/rmux list-commands >/dev/null
-PATH="/snap/bin:$PATH" "$script_dir/smoke-installed-rmux.sh" /snap/bin/rmux --require-daemon-command >/dev/null
+PATH="/snap/bin:$PATH" "$script_dir/smoke-installed-rmux.sh" /snap/bin/rmux >/dev/null
 
 printf 'snap=%s\n' "$snap_path"
 printf 'version=%s\n' "$version"
