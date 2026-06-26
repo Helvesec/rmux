@@ -4,8 +4,10 @@ use std::os::windows::io::RawHandle;
 use rmux_proto::AttachedWindowsConsoleKey;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Console::{
-    GetConsoleMode, ReadConsoleInputW, INPUT_RECORD, KEY_EVENT, KEY_EVENT_RECORD, LEFT_ALT_PRESSED,
-    LEFT_CTRL_PRESSED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
+    GetConsoleMode, ReadConsoleInputW, FROM_LEFT_1ST_BUTTON_PRESSED, FROM_LEFT_2ND_BUTTON_PRESSED,
+    FROM_LEFT_3RD_BUTTON_PRESSED, INPUT_RECORD, KEY_EVENT, KEY_EVENT_RECORD, LEFT_ALT_PRESSED,
+    LEFT_CTRL_PRESSED, MOUSE_EVENT, MOUSE_EVENT_RECORD, MOUSE_MOVED, MOUSE_WHEELED,
+    RIGHTMOST_BUTTON_PRESSED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F10, VK_F11, VK_F12, VK_F2, VK_F3,
@@ -55,6 +57,7 @@ impl AttachInput {
 pub(super) struct ConsoleInputReader {
     handle: HANDLE,
     pending_high_surrogate: Option<u16>,
+    last_mouse_button_state: u32,
 }
 
 impl ConsoleInputReader {
@@ -68,6 +71,7 @@ impl ConsoleInputReader {
         (ok != 0).then_some(Self {
             handle,
             pending_high_surrogate: None,
+            last_mouse_button_state: 0,
         })
     }
 
@@ -90,26 +94,134 @@ impl ConsoleInputReader {
 
         let mut inputs = Vec::new();
         for record in &records[..records_read as usize] {
-            if u32::from(record.EventType) != KEY_EVENT {
-                continue;
+            match u32::from(record.EventType) {
+                KEY_EVENT => {
+                    let event = unsafe {
+                        // SAFETY: EventType says this union currently contains a KEY_EVENT_RECORD.
+                        record.Event.KeyEvent
+                    };
+                    let event = ConsoleKeyEvent::from_win32(event);
+                    let bytes = encode_key_event(event, &mut self.pending_high_surrogate);
+                    if bytes.is_empty() {
+                        continue;
+                    }
+                    let input = windows_console_key_for_event(event, &bytes).map_or_else(
+                        || AttachInput::bytes(bytes.clone()),
+                        |key| AttachInput::with_windows_console_key(bytes.clone(), key),
+                    );
+                    inputs.push(input);
+                }
+                MOUSE_EVENT => {
+                    let event = unsafe {
+                        // SAFETY: EventType says this union currently holds a MOUSE_EVENT_RECORD.
+                        record.Event.MouseEvent
+                    };
+                    if let Some(bytes) =
+                        encode_mouse_event(event, &mut self.last_mouse_button_state)
+                    {
+                        inputs.push(AttachInput::bytes(bytes));
+                    }
+                }
+                _ => {}
             }
-            let event = unsafe {
-                // SAFETY: EventType says this union currently contains a KEY_EVENT_RECORD.
-                record.Event.KeyEvent
-            };
-            let event = ConsoleKeyEvent::from_win32(event);
-            let bytes = encode_key_event(event, &mut self.pending_high_surrogate);
-            if bytes.is_empty() {
-                continue;
-            }
-            let input = windows_console_key_for_event(event, &bytes).map_or_else(
-                || AttachInput::bytes(bytes.clone()),
-                |key| AttachInput::with_windows_console_key(bytes.clone(), key),
-            );
-            inputs.push(input);
         }
         Ok(inputs)
     }
+}
+
+// SGR mouse button codes (xterm). Modifiers are OR-ed in; drag adds 32; wheel uses 64/65.
+const SGR_BTN_LEFT: u16 = 0;
+const SGR_BTN_MIDDLE: u16 = 1;
+const SGR_BTN_RIGHT: u16 = 2;
+const SGR_BTN_RELEASE: u16 = 3;
+const SGR_WHEEL_UP: u16 = 64;
+const SGR_WHEEL_DOWN: u16 = 65;
+const SGR_MOD_SHIFT: u16 = 4;
+const SGR_MOD_ALT: u16 = 8;
+const SGR_MOD_CTRL: u16 = 16;
+const SGR_DRAG_FLAG: u16 = 32;
+
+/// Encode a Win32 console `MOUSE_EVENT_RECORD` into an SGR mouse sequence
+/// (`\x1b[<b;x;yM` press/wheel, `\x1b[<b;x;ym` release). The rmux server gates these
+/// against the active mouse mode, so we always emit and let the server decide.
+fn encode_mouse_event(event: MOUSE_EVENT_RECORD, last_button_state: &mut u32) -> Option<Vec<u8>> {
+    let x = u16::try_from(event.dwMousePosition.X.max(0)).unwrap_or(0) + 1;
+    let y = u16::try_from(event.dwMousePosition.Y.max(0)).unwrap_or(0) + 1;
+    let buttons = event.dwButtonState;
+    let modifiers = sgr_modifier_bits(event.dwControlKeyState);
+
+    if event.dwEventFlags & MOUSE_WHEELED != 0 {
+        // High word of dwButtonState is the signed wheel delta; positive = up.
+        let delta = (buttons >> 16) as i16;
+        let base = if delta >= 0 {
+            SGR_WHEEL_UP
+        } else {
+            SGR_WHEEL_DOWN
+        };
+        return Some(format_sgr_mouse(base | modifiers, x, y, 'M'));
+    }
+
+    // Ignore horizontal wheel and bare double-click flags; movement is handled below.
+    let previous = *last_button_state;
+    *last_button_state = buttons;
+    let changed = previous ^ buttons;
+
+    let primary_pressed = sgr_button_for_state(buttons);
+    let is_move = event.dwEventFlags & MOUSE_MOVED != 0;
+
+    if changed == 0 {
+        if is_move {
+            // Drag (motion with a button held) or bare hover motion.
+            if let Some(button) = primary_pressed {
+                return Some(format_sgr_mouse(
+                    button | SGR_DRAG_FLAG | modifiers,
+                    x,
+                    y,
+                    'M',
+                ));
+            }
+        }
+        return None;
+    }
+
+    // A button transition occurred. Determine press vs release.
+    if let Some(button) = primary_pressed {
+        // Some button is currently down -> press of the newly-pressed button.
+        Some(format_sgr_mouse(button | modifiers, x, y, 'M'))
+    } else {
+        // All buttons up -> release. SGR release uses button 3 with 'm'.
+        Some(format_sgr_mouse(SGR_BTN_RELEASE | modifiers, x, y, 'm'))
+    }
+}
+
+fn sgr_button_for_state(buttons: u32) -> Option<u16> {
+    if buttons & FROM_LEFT_1ST_BUTTON_PRESSED != 0 {
+        Some(SGR_BTN_LEFT)
+    } else if buttons & RIGHTMOST_BUTTON_PRESSED != 0 {
+        Some(SGR_BTN_RIGHT)
+    } else if buttons & (FROM_LEFT_2ND_BUTTON_PRESSED | FROM_LEFT_3RD_BUTTON_PRESSED) != 0 {
+        Some(SGR_BTN_MIDDLE)
+    } else {
+        None
+    }
+}
+
+fn sgr_modifier_bits(control_key_state: u32) -> u16 {
+    let mut bits = 0;
+    if control_key_state & SHIFT_PRESSED != 0 {
+        bits |= SGR_MOD_SHIFT;
+    }
+    if control_key_state & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED) != 0 {
+        bits |= SGR_MOD_ALT;
+    }
+    if control_key_state & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED) != 0 {
+        bits |= SGR_MOD_CTRL;
+    }
+    bits
+}
+
+fn format_sgr_mouse(button: u16, x: u16, y: u16, terminator: char) -> Vec<u8> {
+    format!("\x1b[<{button};{x};{y}{terminator}").into_bytes()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -513,11 +625,12 @@ fn marker_adjusted_end(bytes: &[u8], start: usize, end: usize, marker: &[u8]) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_input_chunks, encode_key_event, windows_console_key_for_event, ConsoleKeyEvent,
-        ATTACH_INPUT_CHUNK_LIMIT, BRACKETED_PASTE_END, BRACKETED_PASTE_START,
+        attach_input_chunks, encode_key_event, encode_mouse_event, windows_console_key_for_event,
+        ConsoleKeyEvent, ATTACH_INPUT_CHUNK_LIMIT, BRACKETED_PASTE_END, BRACKETED_PASTE_START,
     };
     use windows_sys::Win32::System::Console::{
-        LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, RIGHT_ALT_PRESSED, SHIFT_PRESSED,
+        FROM_LEFT_1ST_BUTTON_PRESSED, LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, MOUSE_EVENT_RECORD,
+        MOUSE_MOVED, MOUSE_WHEELED, RIGHTMOST_BUTTON_PRESSED, RIGHT_ALT_PRESSED, SHIFT_PRESSED,
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F5, VK_HOME, VK_LEFT, VK_RETURN,
@@ -773,5 +886,111 @@ mod tests {
             unicode_char,
             control_key_state,
         }
+    }
+
+    fn mouse_event(
+        button_state: u32,
+        event_flags: u32,
+        control_key_state: u32,
+        x: i16,
+        y: i16,
+    ) -> MOUSE_EVENT_RECORD {
+        MOUSE_EVENT_RECORD {
+            dwMousePosition: windows_sys::Win32::System::Console::COORD { X: x, Y: y },
+            dwButtonState: button_state,
+            dwControlKeyState: control_key_state,
+            dwEventFlags: event_flags,
+        }
+    }
+
+    fn encode_mouse(event: MOUSE_EVENT_RECORD, last: &mut u32) -> Option<String> {
+        encode_mouse_event(event, last).map(|bytes| String::from_utf8(bytes).unwrap())
+    }
+
+    #[test]
+    fn mouse_wheel_up_encodes_sgr_button_64() {
+        // High word of dwButtonState carries the signed wheel delta; positive = up.
+        let event = mouse_event(0x0078_0000, MOUSE_WHEELED, 0, 9, 14);
+        let mut last = 0;
+        // Coordinates are 0-based from the console and become 1-based in SGR.
+        assert_eq!(
+            encode_mouse(event, &mut last).as_deref(),
+            Some("\x1b[<64;10;15M")
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_down_encodes_sgr_button_65() {
+        let event = mouse_event(0xff88_0000, MOUSE_WHEELED, 0, 0, 0);
+        let mut last = 0;
+        assert_eq!(
+            encode_mouse(event, &mut last).as_deref(),
+            Some("\x1b[<65;1;1M")
+        );
+    }
+
+    #[test]
+    fn mouse_left_press_then_release_encodes_press_and_sgr_release() {
+        let mut last = 0;
+        let press = mouse_event(FROM_LEFT_1ST_BUTTON_PRESSED, 0, 0, 4, 4);
+        assert_eq!(
+            encode_mouse(press, &mut last).as_deref(),
+            Some("\x1b[<0;5;5M")
+        );
+        // Button transition to all-up encodes the SGR release form (button 3, 'm').
+        let release = mouse_event(0, 0, 0, 4, 4);
+        assert_eq!(
+            encode_mouse(release, &mut last).as_deref(),
+            Some("\x1b[<3;5;5m")
+        );
+    }
+
+    #[test]
+    fn mouse_left_drag_sets_drag_flag() {
+        let mut last = 0;
+        let _ = encode_mouse(
+            mouse_event(FROM_LEFT_1ST_BUTTON_PRESSED, 0, 0, 1, 1),
+            &mut last,
+        );
+        // Motion while the left button stays held -> drag (button 0 | 32).
+        let drag = mouse_event(FROM_LEFT_1ST_BUTTON_PRESSED, MOUSE_MOVED, 0, 2, 1);
+        assert_eq!(
+            encode_mouse(drag, &mut last).as_deref(),
+            Some("\x1b[<32;3;2M")
+        );
+    }
+
+    #[test]
+    fn mouse_right_press_encodes_button_2() {
+        let mut last = 0;
+        let press = mouse_event(RIGHTMOST_BUTTON_PRESSED, 0, 0, 0, 0);
+        assert_eq!(
+            encode_mouse(press, &mut last).as_deref(),
+            Some("\x1b[<2;1;1M")
+        );
+    }
+
+    #[test]
+    fn mouse_modifiers_are_or_ed_into_button() {
+        let mut last = 0;
+        // Ctrl+Shift wheel up -> 64 | 4 (shift) | 16 (ctrl) = 84.
+        let event = mouse_event(
+            0x0078_0000,
+            MOUSE_WHEELED,
+            SHIFT_PRESSED | LEFT_CTRL_PRESSED,
+            0,
+            0,
+        );
+        assert_eq!(
+            encode_mouse(event, &mut last).as_deref(),
+            Some("\x1b[<84;1;1M")
+        );
+    }
+
+    #[test]
+    fn mouse_idle_move_without_button_is_ignored() {
+        let mut last = 0;
+        let event = mouse_event(0, MOUSE_MOVED, 0, 5, 5);
+        assert_eq!(encode_mouse(event, &mut last), None);
     }
 }
