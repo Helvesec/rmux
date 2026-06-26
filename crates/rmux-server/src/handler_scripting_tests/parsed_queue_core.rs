@@ -102,6 +102,52 @@ async fn read_only_control_rejects_special_queue_invocations() {
 }
 
 #[tokio::test]
+async fn unknown_requester_rejects_parse_time_assignments() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_001;
+    let parsed = CommandParser::new()
+        .parse("FOO=bar list-sessions")
+        .expect("commands parse");
+
+    let result = handler
+        .execute_parsed_commands_for_test(requester_pid, parsed)
+        .await;
+
+    assert_eq!(
+        result
+            .expect_err("unknown requester should be read-only")
+            .to_string(),
+        "server error: client is read-only"
+    );
+    let state = handler.state.lock().await;
+    assert_eq!(state.environment.global_value("FOO"), None);
+}
+
+#[tokio::test]
+async fn unknown_requester_rejects_special_queue_invocations() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_002;
+
+    for command in [
+        "if-shell -F 1 { list-sessions }",
+        "source-file /definitely/missing-rmux.conf",
+        "clear-prompt-history",
+    ] {
+        let parsed = CommandParser::new().parse(command).expect("commands parse");
+
+        let result = handler
+            .execute_parsed_commands_for_test(requester_pid, parsed)
+            .await;
+
+        let error = match result {
+            Ok(_) => panic!("{command} should be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "server error: client is read-only");
+    }
+}
+
+#[tokio::test]
 async fn read_only_control_allows_list_panes_all_observation() {
     let handler = RequestHandler::new();
     let requester_pid = 42_004;
