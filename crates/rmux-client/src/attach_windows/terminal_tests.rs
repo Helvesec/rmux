@@ -5,7 +5,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 use super::*;
-use windows_sys::Win32::System::Console::{ENABLE_INSERT_MODE, ENABLE_QUICK_EDIT_MODE};
+use windows_sys::Win32::System::Console::{
+    ENABLE_INSERT_MODE, ENABLE_MOUSE_INPUT, ENABLE_QUICK_EDIT_MODE,
+};
 
 const INPUT_HANDLE: u8 = 1;
 const OUTPUT_HANDLE: u8 = 2;
@@ -37,7 +39,7 @@ fn enter_applies_raw_input_and_vt_output_flags() -> Result<()> {
 }
 
 #[test]
-fn raw_modes_preserve_selection_flags_and_disable_line_editing() {
+fn raw_modes_enable_mouse_and_disable_quick_edit_and_line_editing() {
     let input_original = ENABLE_LINE_INPUT
         | ENABLE_ECHO_INPUT
         | ENABLE_PROCESSED_INPUT
@@ -47,7 +49,10 @@ fn raw_modes_preserve_selection_flags_and_disable_line_editing() {
     let input_mode = raw_input_mode(input_original);
 
     assert_ne!(input_mode & ENABLE_EXTENDED_FLAGS, 0);
-    assert_ne!(input_mode & ENABLE_QUICK_EDIT_MODE, 0);
+    // QUICK_EDIT must be cleared so the console stops consuming mouse events, and
+    // MOUSE_INPUT must be set so mouse events are delivered to the attach client.
+    assert_eq!(input_mode & ENABLE_QUICK_EDIT_MODE, 0);
+    assert_ne!(input_mode & ENABLE_MOUSE_INPUT, 0);
     assert_ne!(input_mode & ENABLE_INSERT_MODE, 0);
     assert_eq!(input_mode & ENABLE_LINE_INPUT, 0);
     assert_eq!(input_mode & ENABLE_ECHO_INPUT, 0);

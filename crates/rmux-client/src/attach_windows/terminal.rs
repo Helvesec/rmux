@@ -19,8 +19,9 @@ use windows_sys::Win32::System::Console::{
     GetNumberOfConsoleInputEvents, GetStdHandle, SetConsoleCtrlHandler, SetConsoleMode,
     CONSOLE_SCREEN_BUFFER_INFO, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT,
     CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT, DISABLE_NEWLINE_AUTO_RETURN, ENABLE_ECHO_INPUT,
-    ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
-    ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT, ENABLE_MOUSE_INPUT, ENABLE_PROCESSED_INPUT,
+    ENABLE_QUICK_EDIT_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
@@ -561,8 +562,12 @@ fn console_mode_absent_or_error<T>() -> Result<Option<T>> {
 }
 
 const fn raw_input_mode(original: u32) -> u32 {
-    (original | ENABLE_EXTENDED_FLAGS)
-        & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT)
+    // ENABLE_MOUSE_INPUT delivers mouse events as MOUSE_EVENT records; ENABLE_QUICK_EDIT_MODE
+    // must be cleared or the console itself consumes the mouse (drag = text selection,
+    // wheel = console scrollback) and the app never sees the events. ENABLE_EXTENDED_FLAGS
+    // is required for the QUICK_EDIT clear to take effect.
+    (original | ENABLE_EXTENDED_FLAGS | ENABLE_MOUSE_INPUT)
+        & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE)
 }
 
 const fn raw_output_mode(original: u32) -> u32 {
