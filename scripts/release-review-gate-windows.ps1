@@ -1,10 +1,13 @@
 param(
     [string]$OutputDir = "target\release-review-gate-windows",
+    [string]$TargetDir = "target\release-review-gate-windows-cargo",
     [switch]$SkipPackage,
     [switch]$SkipClippy
 )
 
 $ErrorActionPreference = "Stop"
+
+$env:CARGO_TARGET_DIR = $TargetDir
 
 function Step([string]$Name, [scriptblock]$Body) {
     Write-Host ""
@@ -130,6 +133,7 @@ function Check-CfgBudgets {
 }
 
 Step "release versions" { Check-ReleaseVersions }
+Write-Host "cargo-target-dir=$env:CARGO_TARGET_DIR"
 Step "formatting" { Run "cargo" @("fmt", "--all", "--check") }
 Step "platform cfg budget" { Check-CfgBudgets }
 
