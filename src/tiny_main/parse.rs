@@ -4,10 +4,12 @@ use std::path::PathBuf;
 
 use rmux_proto::request::{AttachSessionExt2Request, NewSessionExtRequest};
 use rmux_proto::{
-    CapturePaneTargetActionRequest, ClientTerminalContext, OptionScopeSelector, PaneTarget,
-    ResizePaneAdjustment, ResizePaneTargetActionRequest, SessionName, SplitDirection,
-    SplitWindowTargetActionRequest, Target, TerminalSize, WindowTarget,
+    CapturePaneTargetActionRequest, OptionScopeSelector, PaneTarget, ResizePaneAdjustment,
+    ResizePaneTargetActionRequest, SessionName, SplitDirection, SplitWindowTargetActionRequest,
+    Target, TerminalSize, WindowTarget,
 };
+
+use crate::client_terminal::client_terminal_context_from_parts;
 
 pub(super) struct TinyDisplayMessage {
     pub(super) target: Option<Target>,
@@ -594,10 +596,10 @@ pub(super) fn parse_attach_session(args: &[OsString]) -> Option<AttachSessionExt
         skip_environment_update,
         flags: None,
         working_directory,
-        client_terminal: ClientTerminalContext {
-            terminal_features: Vec::new(),
-            utf8: infer_client_utf8_from_env(),
-        },
+        client_terminal: client_terminal_context_from_parts(
+            Vec::new(),
+            infer_client_utf8_from_env(),
+        ),
         client_size: rmux_os::terminal::current_size(),
     })
 }

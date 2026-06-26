@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use super::{
     ensure_server_running_with_probe, hidden_daemon_binary_path,
-    hidden_daemon_binary_path_for_config, incompatible_daemon_kill_server_command,
-    probe_connected_server, startup_readiness_poll_sleep, AutoStartConfig, AutoStartError,
-    STARTUP_POLL_INTERVAL,
+    hidden_daemon_binary_path_for_config, hidden_daemon_binary_path_for_executable_paths,
+    incompatible_daemon_kill_server_command, probe_connected_server, startup_readiness_poll_sleep,
+    AutoStartConfig, AutoStartError, STARTUP_POLL_INTERVAL,
 };
 use crate::{ClientError, ConnectResult, Connection};
 use rmux_proto::{
@@ -67,6 +67,35 @@ fn auto_start_prefers_installed_hidden_daemon_sibling() {
 
     assert_eq!(hidden_daemon_binary_path(&current), Some(daemon.clone()));
     assert_eq!(hidden_daemon_binary_path(&daemon), None);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn auto_start_falls_back_to_resolved_executable_daemon_sibling() {
+    let base = std::env::temp_dir().join(format!(
+        "rmux-auto-start-resolved-sibling-{}",
+        std::process::id()
+    ));
+    let links = base.join("links");
+    let package = base.join("package");
+    std::fs::create_dir_all(&links).expect("create links dir");
+    std::fs::create_dir_all(&package).expect("create package dir");
+    let alias = links.join("rmux");
+    let current = package.join("rmux");
+    let daemon = package.join("rmux-daemon");
+    std::fs::write(&alias, b"alias").expect("write fake alias");
+    std::fs::write(&current, b"cli").expect("write fake cli");
+    std::fs::write(&daemon, b"daemon").expect("write fake daemon");
+
+    assert_eq!(
+        hidden_daemon_binary_path_for_executable_paths(
+            &alias,
+            Some(&current),
+            &AutoStartConfig::disabled(),
+        ),
+        Some(daemon)
+    );
 
     let _ = std::fs::remove_dir_all(&base);
 }

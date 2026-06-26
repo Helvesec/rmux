@@ -25,6 +25,8 @@
   behavior.
 - Resolved tiny CLI helpers through canonical executable paths, covering
   portable aliases such as WinGet Links while keeping packaged layouts first.
+- Resolved hidden daemon siblings through canonical executable paths so portable
+  aliases can cold-start the packaged daemon directly.
 
 ### Compatibility
 
@@ -37,12 +39,16 @@
   toggles such as `set -g mode-keys`.
 - Added `Display` and `Error` implementations for `StartServerError`, and
   corrected public split-direction documentation.
+- Shared detected client terminal features between the full and tiny attach
+  paths, including Windows Terminal rendering and input capabilities.
 
 ### CI
 
 - Bumped release-facing versions to `0.7.1` across Cargo workspace metadata,
   `Cargo.lock`, the manpage, snap metadata, README download links, and localized
   README files.
+- Added a Windows package smoke that exercises portable alias fallback, PATH
+  resolution, and daemon startup from a WinGet-like Links layout.
 
 ## 0.7.0
 

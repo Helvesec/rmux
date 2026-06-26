@@ -34,6 +34,7 @@ use crate::cli_args::{
     AttachSessionArgs, Cli, DetachClientArgs, ListClientsArgs, RefreshClientArgs,
     SuspendClientArgs, SwitchClientArgs,
 };
+use crate::client_terminal::client_terminal_context_from_parts;
 
 pub(super) fn client_terminal_context_from_cli(cli: &Cli) -> ClientTerminalContext {
     let mut terminal_features = cli
@@ -48,39 +49,7 @@ pub(super) fn client_terminal_context_from_cli(cli: &Cli) -> ClientTerminalConte
         terminal_features.push("256".to_owned());
     }
 
-    let mut context = ClientTerminalContext {
-        terminal_features,
-        utf8: cli.utf8,
-    };
-    apply_detected_client_terminal_features(&mut context);
-    context
-}
-
-fn apply_detected_client_terminal_features(context: &mut ClientTerminalContext) {
-    #[cfg(windows)]
-    if std::env::var_os("WT_SESSION").is_some_and(|value| !value.is_empty()) {
-        apply_windows_terminal_features(context);
-    }
-    #[cfg(not(windows))]
-    let _ = context;
-}
-
-#[cfg(windows)]
-fn apply_windows_terminal_features(context: &mut ClientTerminalContext) {
-    context.utf8 = true;
-    push_unique_terminal_feature(&mut context.terminal_features, "sync");
-    push_unique_terminal_feature(&mut context.terminal_features, "bpaste");
-    push_unique_terminal_feature(&mut context.terminal_features, "mouse");
-}
-
-#[cfg(windows)]
-fn push_unique_terminal_feature(features: &mut Vec<String>, feature: &str) {
-    if !features
-        .iter()
-        .any(|value| value.eq_ignore_ascii_case(feature))
-    {
-        features.push(feature.to_owned());
-    }
+    client_terminal_context_from_parts(terminal_features, cli.utf8)
 }
 
 pub(super) fn run_attach_session(
@@ -486,9 +455,6 @@ mod tests {
     use std::ffi::OsStr;
     use std::path::Path;
 
-    #[cfg(windows)]
-    use rmux_proto::ClientTerminalContext;
-
     use super::inherited_rmux_socket_matches_from_env;
 
     #[test]
@@ -505,30 +471,5 @@ mod tests {
             None,
             Path::new("/tmp/rmux-1000/default"),
         ));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_terminal_features_are_sent_by_client_context() {
-        let mut context = ClientTerminalContext::default();
-
-        super::apply_windows_terminal_features(&mut context);
-
-        assert!(context.utf8);
-        assert_eq!(context.terminal_features, vec!["sync", "bpaste", "mouse"]);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn detected_windows_terminal_features_are_not_duplicated() {
-        let mut context = ClientTerminalContext {
-            terminal_features: vec!["SYNC".to_owned(), "BPASTE".to_owned(), "MOUSE".to_owned()],
-            utf8: false,
-        };
-
-        super::apply_windows_terminal_features(&mut context);
-
-        assert!(context.utf8);
-        assert_eq!(context.terminal_features, vec!["SYNC", "BPASTE", "MOUSE"]);
     }
 }
