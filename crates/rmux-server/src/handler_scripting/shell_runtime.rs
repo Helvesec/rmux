@@ -31,8 +31,11 @@ impl RequestHandler {
                     return Response::Error(ErrorResponse { error });
                 }
             }
+            let can_write = self.requester_can_write(requester_pid).await;
             let handler = self.clone();
             if let Err(error) = spawn_background_async("rmux-run-shell", move || async move {
+                let _requester_access_guard =
+                    handler.begin_detached_requester_access(requester_pid, can_write);
                 let _ = handler.run_shell_task(requester_pid, request).await;
             }) {
                 return Response::Error(ErrorResponse { error });
@@ -66,8 +69,11 @@ impl RequestHandler {
         request: IfShellRequest,
     ) -> Response {
         if request.background {
+            let can_write = self.requester_can_write(requester_pid).await;
             let handler = self.clone();
             if let Err(error) = spawn_background_async("rmux-if-shell", move || async move {
+                let _requester_access_guard =
+                    handler.begin_detached_requester_access(requester_pid, can_write);
                 let _ = handler.if_shell_task(requester_pid, request).await;
             }) {
                 return Response::Error(ErrorResponse { error });

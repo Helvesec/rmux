@@ -328,10 +328,10 @@ impl RequestHandler {
         })
     }
 
-    pub(crate) async fn cleanup_connection_sdk_waits(&self, connection_id: u64) {
+    pub(crate) fn cleanup_connection_sdk_waits_sync(&self, connection_id: u64) {
         self.sdk_waits
             .lock()
-            .expect("SDK wait registry mutex must not be poisoned")
+            .unwrap_or_else(|error| error.into_inner())
             .remove_connection(connection_id);
     }
 }

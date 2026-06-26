@@ -126,6 +126,37 @@ async fn use_platform_test_shell(handler: &RequestHandler) {
     }
 }
 
+async fn wait_for_named_buffer(handler: &RequestHandler, name: &str, expected: &[u8]) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Some(output) = handler
+                .handle(Request::ShowBuffer(ShowBufferRequest {
+                    name: Some(name.to_owned()),
+                }))
+                .await
+                .command_output()
+            {
+                if output.stdout() == expected {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("buffer {name:?} did not become {expected:?}"));
+}
+
+#[cfg(unix)]
+fn delayed_true_shell_condition() -> String {
+    "sleep 0.05; true".to_owned()
+}
+
+#[cfg(windows)]
+fn delayed_true_shell_condition() -> String {
+    "Start-Sleep -Milliseconds 50; exit 0".to_owned()
+}
+
 #[cfg(unix)]
 fn shell_print_command(text: &str) -> String {
     format!("printf {}", command_quote(text))

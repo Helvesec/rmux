@@ -789,7 +789,7 @@ fn invoked_as_tmux(args: &[OsString]) -> bool {
 }
 
 fn invoked_as_tmux_from(args: &[OsString], internal_override: Option<&OsStr>) -> bool {
-    if internal_override.is_some_and(|value| !value.is_empty()) {
+    if internal_override.is_some_and(|value| value == "1") {
         return true;
     }
     args.first()

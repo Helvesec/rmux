@@ -159,7 +159,7 @@ pub fn format_exit_line(reason: Option<&str>) -> String {
 
 /// Formats a tmux-compatible control-mode data payload.
 ///
-/// ASCII control bytes, DEL, and `\` are `\NNN` octal-escaped. Valid UTF-8
+/// ASCII control bytes and `\` are `\NNN` octal-escaped. Valid UTF-8
 /// text is left intact so clients that expect tmux-style Unicode output do
 /// not see every non-ASCII byte expanded into octal sequences. Invalid UTF-8
 /// bytes are escaped one byte at a time.
@@ -208,7 +208,7 @@ fn push_escaped_text(output: &mut String, text: &str) {
 }
 
 const fn needs_octal_escape(byte: u8) -> bool {
-    byte < b' ' || byte == b'\\' || byte == 0x7F
+    byte < b' ' || byte == b'\\'
 }
 
 fn push_octal_escape(output: &mut String, byte: u8) {
@@ -240,8 +240,8 @@ mod tests {
         assert_eq!(octal_escape(b"\\\0"), "\\134\\000");
         assert_eq!(octal_escape(b" "), " ");
         assert_eq!(octal_escape(b"~"), "~");
-        // DEL is escaped; valid UTF-8 non-ASCII is left intact.
-        assert_eq!(octal_escape(b"\x7f"), "\\177");
+        // DEL is printable from tmux control-mode's perspective.
+        assert_eq!(octal_escape(b"\x7f"), "\x7f");
         assert_eq!(octal_escape("é".as_bytes()), "é");
         assert_eq!(octal_escape("hello 👋".as_bytes()), "hello 👋");
         // Invalid UTF-8 still round-trips as octal bytes.

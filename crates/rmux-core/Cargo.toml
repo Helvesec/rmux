@@ -1,6 +1,6 @@
 [package]
 name = "rmux-core"
-version = "0.7.0"
+version = "0.7.1"
 edition.workspace = true
 publish = true
 license.workspace = true
@@ -13,5 +13,5 @@ categories = ["command-line-interface"]
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "std"] }
 compact_str = "0.8.1"
 regex = "1.12.2"
-rmux-proto = { path = "../rmux-proto", version = "0.7.0" }
+rmux-proto = { path = "../rmux-proto", version = "0.7.1" }
 unicode-width = "0.1"

@@ -83,6 +83,15 @@ async fn live_attach_chunked_sgr_mouse_sequence_still_dispatches() {
     let alpha = session_name("alpha");
     let requester_pid = std::process::id();
     let _control_rx = create_attached_live_session(&handler, &alpha, requester_pid).await;
+    let mouse_enabled = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::Mouse,
+            value: "on".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(mouse_enabled, Response::SetOption(_)));
 
     {
         let mut state = handler.state.lock().await;

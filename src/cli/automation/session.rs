@@ -14,6 +14,13 @@ pub(crate) fn run_with_session(
     args: WithSessionArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
+    if args.command.is_empty() {
+        return Err(ExitFailure::new(
+            1,
+            "with-session requires a child command".to_owned(),
+        ));
+    }
+
     let ttl_millis = duration_millis(args.ttl);
     let mut connection = connect_cli(socket_path)?;
     let lease = create_lease(&mut connection, args.session_name.clone(), ttl_millis)?;

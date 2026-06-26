@@ -21,6 +21,8 @@ use super::{
     SignalMaskGuard, TerminalSize,
 };
 
+static RESIZE_WATCHER_SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[test]
 fn terminal_size_from_fd_ignores_zero_sized_terminals() -> Result<(), Box<dyn std::error::Error>> {
     let pair = PtyPair::open_with_size(rmux_pty::TerminalSize::new(80, 24))?;
@@ -43,6 +45,9 @@ fn terminal_size_from_fd_ignores_zero_sized_terminals() -> Result<(), Box<dyn st
 
 #[test]
 fn resize_watcher_reports_sigwinch_updates() -> Result<(), Box<dyn std::error::Error>> {
+    let _signal_test_lock = RESIZE_WATCHER_SIGNAL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let pair = PtyPair::open_with_size(rmux_pty::TerminalSize::new(80, 24))?;
     let (_master, slave) = pair.into_split();
     let terminal = File::from(slave.into_owned_fd());
@@ -74,6 +79,9 @@ fn resize_watcher_reports_sigwinch_updates() -> Result<(), Box<dyn std::error::E
 #[test]
 fn resize_watcher_reports_pixel_dimensions_when_available() -> Result<(), Box<dyn std::error::Error>>
 {
+    let _signal_test_lock = RESIZE_WATCHER_SIGNAL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let pair = PtyPair::open_with_size(rmux_pty::TerminalSize::new(80, 24))?;
     let (_master, slave) = pair.into_split();
     let terminal = File::from(slave.into_owned_fd());

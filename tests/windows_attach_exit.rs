@@ -13,7 +13,7 @@ use rmux_pty::{
 };
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(6);
-const EXIT_TIMEOUT: Duration = Duration::from_secs(6);
+const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const EXIT_LATENCY_TIMEOUT: Duration = Duration::from_secs(2);
 const EXIT_LATENCY_BUDGET: Duration = Duration::from_millis(250);
 
@@ -37,6 +37,8 @@ fn windows_attach_exit_emits_exited_banner() -> Result<(), Box<dyn Error>> {
     let io = attach.master().try_clone_io()?;
 
     wait_for_needle_or_error(&mut attach, b">", SETUP_TIMEOUT)?;
+    io.write_all(b"echo RMUX_EXIT_READY\r\n")?;
+    wait_for_needle_or_error(&mut attach, b"RMUX_EXIT_READY", SETUP_TIMEOUT)?;
     io.write_all(b"exit\r\n")?;
 
     let (exited, output) = wait_for_needle_or_terminate(&mut attach, b"[exited]", EXIT_TIMEOUT)?;

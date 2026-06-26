@@ -102,6 +102,90 @@ async fn read_only_control_rejects_special_queue_invocations() {
 }
 
 #[tokio::test]
+async fn unknown_requester_rejects_parse_time_assignments() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_001;
+    let parsed = CommandParser::new()
+        .parse("FOO=bar list-sessions")
+        .expect("commands parse");
+
+    let result = handler
+        .execute_parsed_commands_for_test(requester_pid, parsed)
+        .await;
+
+    assert_eq!(
+        result
+            .expect_err("unknown requester should be read-only")
+            .to_string(),
+        "server error: client is read-only"
+    );
+    let state = handler.state.lock().await;
+    assert_eq!(state.environment.global_value("FOO"), None);
+}
+
+#[tokio::test]
+async fn unknown_requester_rejects_special_queue_invocations() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_002;
+
+    for command in [
+        "if-shell -F 1 { list-sessions }",
+        "source-file /definitely/missing-rmux.conf",
+        "clear-prompt-history",
+    ] {
+        let parsed = CommandParser::new().parse(command).expect("commands parse");
+
+        let result = handler
+            .execute_parsed_commands_for_test(requester_pid, parsed)
+            .await;
+
+        let error = match result {
+            Ok(_) => panic!("{command} should be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "server error: client is read-only");
+    }
+}
+
+#[tokio::test]
+async fn detached_write_requester_allows_mutating_queue_commands() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_003;
+    let _access = handler.begin_detached_requester_access(requester_pid, true);
+    let parsed = CommandParser::new()
+        .parse("set-buffer -b repro-buffer hello ; show-buffer -b repro-buffer")
+        .expect("commands parse");
+
+    let output = handler
+        .execute_parsed_commands_for_test(requester_pid, parsed)
+        .await
+        .expect("authenticated detached requester can mutate");
+
+    assert_eq!(String::from_utf8(output.stdout).expect("utf8"), "hello");
+}
+
+#[tokio::test]
+async fn detached_read_only_requester_rejects_mutating_queue_commands() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_004;
+    let _access = handler.begin_detached_requester_access(requester_pid, false);
+    let parsed = CommandParser::new()
+        .parse("set-buffer -b repro-buffer hello ; show-buffer -b repro-buffer")
+        .expect("commands parse");
+
+    let result = handler
+        .execute_parsed_commands_for_test(requester_pid, parsed)
+        .await;
+
+    assert_eq!(
+        result
+            .expect_err("read-only detached requester should be rejected")
+            .to_string(),
+        "server error: client is read-only"
+    );
+}
+
+#[tokio::test]
 async fn read_only_control_allows_list_panes_all_observation() {
     let handler = RequestHandler::new();
     let requester_pid = 42_004;
@@ -523,6 +607,161 @@ async fn parsed_queue_keeps_signed_new_window_targets_relative() {
     assert_eq!(
         session.window_at(2).and_then(|window| window.name()),
         Some("rel")
+    );
+}
+
+#[tokio::test]
+async fn parsed_queue_accepts_compact_new_window_flags() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let parsed = CommandParser::new()
+        .parse(
+            "new-window -ad -n after0 ; \
+             new-window -dn named ; \
+             new-window -adt alpha:1 -n after1",
+        )
+        .expect("compact new-window commands parse");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("compact new-window flags should execute");
+
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("session exists");
+    assert_eq!(
+        session.window_at(1).and_then(|window| window.name()),
+        Some("after0")
+    );
+    assert_eq!(
+        session.window_at(2).and_then(|window| window.name()),
+        Some("after1")
+    );
+    assert_eq!(
+        session.window_at(3).and_then(|window| window.name()),
+        Some("named")
+    );
+}
+
+#[tokio::test]
+async fn parsed_queue_accepts_compact_break_pane_flag_clusters() {
+    for (session, flags) in [
+        ("breakdprint", "-dP"),
+        ("breakafter", "-adP"),
+        ("breakprintafter", "-Pad"),
+    ] {
+        let handler = RequestHandler::new();
+        let alpha = session_name(session);
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: alpha.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+
+        let parsed = CommandParser::new()
+            .parse(&format!(
+                "split-window -d -t {session}:0.0 ; break-pane {flags} -s {session}:0.1"
+            ))
+            .expect("compact break-pane command parses");
+        let output = handler
+            .execute_parsed_commands_for_test(std::process::id(), parsed)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("break-pane {flags} should execute with compact flags: {error}")
+            });
+
+        assert!(
+            String::from_utf8_lossy(output.stdout()).starts_with(&format!("{session}:")),
+            "break-pane {flags} should print its target, got {:?}",
+            output.stdout()
+        );
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&alpha).expect("session exists");
+        assert_eq!(session.windows().len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn parsed_queue_accepts_compact_kill_window_and_kill_pane_targets() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let setup = CommandParser::new()
+        .parse("new-window -d -n keep ; new-window -d -n remove")
+        .expect("window setup parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), setup)
+        .await
+        .expect("window setup succeeds");
+
+    let kill_window = CommandParser::new()
+        .parse("kill-window -at alpha:1")
+        .expect("compact kill-window parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), kill_window)
+        .await
+        .expect("compact kill-window target should execute");
+
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(PaneTarget::with_window(alpha.clone(), 1, 0)),
+                direction: SplitDirection::Horizontal,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+
+    let kill_pane = CommandParser::new()
+        .parse("kill-pane -at alpha:1.1")
+        .expect("compact kill-pane parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), kill_pane)
+        .await
+        .expect("compact kill-pane target should execute");
+
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("session exists");
+    assert_eq!(
+        session.windows().keys().copied().collect::<Vec<_>>(),
+        vec![1]
+    );
+    assert_eq!(
+        session
+            .window_at(1)
+            .expect("target window exists")
+            .pane_count(),
+        1
     );
 }
 

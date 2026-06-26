@@ -192,9 +192,7 @@ async fn exited_pane_subscription_stays_alive_after_eof_until_cleanup() {
     };
     assert!(idle_after_eof.events.is_empty());
 
-    handler
-        .cleanup_connection_subscriptions(connection_id)
-        .await;
+    handler.cleanup_connection_subscriptions_sync(connection_id);
     let closed = handler
         .handle_pane_output_cursor(
             connection_id,
@@ -279,9 +277,7 @@ async fn empty_server_shutdown_waits_for_exited_pane_subscription_drain() {
         "the SDK connection must remain alive after EOF so callers can reconcile exit state"
     );
 
-    handler
-        .cleanup_connection_subscriptions(connection_id)
-        .await;
+    handler.cleanup_connection_subscriptions_sync(connection_id);
     assert!(
         tokio::time::timeout(Duration::from_millis(50), shutdown_rx)
             .await

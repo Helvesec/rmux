@@ -34,7 +34,7 @@
   <a href="#verification"><img src="https://img.shields.io/badge/unsafe-restricted-success.svg" alt="Unsafe policy"></a>
   <a href="https://github.com/Helvesec/rmux/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/Helvesec/rmux/ci.yml?branch=main&amp;event=push&amp;label=CI" alt="CI"></a>
   <a href="https://www.bestpractices.dev/projects/13290"><img src="https://www.bestpractices.dev/projects/13290/badge" alt="OpenSSF Best Practices"></a>
-  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/rmux-0.7.0-informational.svg" alt="rmux 0.7.0"></a>
+  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.7.1"><img src="https://img.shields.io/badge/rmux-0.7.1-informational.svg" alt="rmux 0.7.1"></a>
 </p>
 
 </div>
@@ -126,9 +126,14 @@ RMUX を何に使えるかを示す短い例です。
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/linux.svg"><img src="../install/linux-light.svg" width="28" alt="Linux"></picture> <picture><source media="(prefers-color-scheme: dark)" srcset="../install/apple.svg"><img src="../install/apple-light.svg" width="28" alt="macOS"></picture> / Nix | `nix profile install github:Helvesec/rmux` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/rust.svg"><img src="../install/rust-light.svg" width="28" alt="Rust"></picture> / Cargo | `cargo install rmux --locked` |
 
-直接ダウンロード（`.tar.gz`、`.deb`、`.rpm`、`.zip`）は [v0.7.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.7.0) から利用できます。
+直接ダウンロード（`.tar.gz`、`.deb`、`.rpm`、`.zip`）は [v0.7.1 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.7.1) から利用できます。
 
 パッケージマネージャはレジストリ審査中に遅れることがあります。直接ダウンロードと rmux.io インストーラは現在の GitHub Release に追従します。
+
+Unix の `.tar.gz` を直接ダウンロードした場合は、展開したアーカイブ内で
+`./install.sh --prefix ~/.local` を実行してください。このインストーラは、
+小さな公開 CLI が完全な helper に必ず到達できるよう、必要な `bin/` と
+`libexec/` の配置を保ちます。
 
 リリースパッケージでは、高速な detached コマンドに小さな公開 CLI を使い、複雑な tmux 互換コマンド形式には非公開の完全 CLI helper を使う場合があります。Windows パッケージでは `rmux.exe` が軽量 dispatcher になり、完全 CLI は `libexec/rmux/rmux.exe` に配置されます。CLI 互換性の診断中に完全 helper を強制するには `RMUX_DISABLE_TINY_CLI=1` を設定してください。
 
@@ -262,9 +267,9 @@ fn render(snapshot: PaneSnapshot, area: Rect, buffer: &mut Buffer) {
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://rmux.io/rmux-architecture-dark.png?v=0.7.0-web-share">
-  <source media="(prefers-color-scheme: light)" srcset="https://rmux.io/rmux-architecture-light.png?v=0.7.0-web-share">
-  <img src="https://rmux.io/rmux-architecture-dark.png?v=0.7.0-web-share" alt="RMUX ランタイムアーキテクチャ" width="800">
+  <source media="(prefers-color-scheme: dark)" srcset="https://rmux.io/rmux-architecture-dark.png?v=0.7.1-web-share">
+  <source media="(prefers-color-scheme: light)" srcset="https://rmux.io/rmux-architecture-light.png?v=0.7.1-web-share">
+  <img src="https://rmux.io/rmux-architecture-dark.png?v=0.7.1-web-share" alt="RMUX ランタイムアーキテクチャ" width="800">
 </picture>
 
 </div>

@@ -32,9 +32,25 @@ pub(super) fn write_stdout(bytes: &[u8]) -> io::Result<()> {
 }
 
 fn stdout_write_error_is_tty_compatible_exit(kind: ErrorKind) -> bool {
-    matches!(kind, ErrorKind::BrokenPipe | ErrorKind::StorageFull)
+    matches!(kind, ErrorKind::BrokenPipe)
 }
 
 pub(super) fn client_error(socket_path: &Path, error: ClientError) -> String {
     tmux_client_connect_error_message(socket_path, &error).unwrap_or_else(|| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stdout_write_error_is_tty_compatible_exit;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn stdout_write_only_tolerates_broken_pipe() {
+        assert!(stdout_write_error_is_tty_compatible_exit(
+            ErrorKind::BrokenPipe
+        ));
+        assert!(!stdout_write_error_is_tty_compatible_exit(
+            ErrorKind::StorageFull
+        ));
+    }
 }

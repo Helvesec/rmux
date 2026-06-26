@@ -21,6 +21,58 @@ fn shell_command_token(token: String) -> String {
     format!("'{}'", token.replace('\'', "'\\''"))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CompactFlag {
+    Bare(char),
+    Value { flag: char, value: Option<String> },
+}
+
+impl CompactFlag {
+    pub(super) fn value_or_next(
+        self,
+        args: &mut CommandTokens,
+        description: &str,
+    ) -> Result<String, RmuxError> {
+        match self {
+            Self::Value {
+                value: Some(value), ..
+            } => Ok(value),
+            Self::Value { value: None, .. } => args.required(description),
+            Self::Bare(flag) => Err(RmuxError::Server(format!(
+                "flag -{flag} does not take {description}"
+            ))),
+        }
+    }
+}
+
+pub(super) fn parse_compact_flag_cluster(
+    token: &str,
+    bare_flags: &str,
+    value_flags: &str,
+) -> Option<Vec<CompactFlag>> {
+    if !token.starts_with('-') || token == "-" || token == "--" || token.len() <= 2 {
+        return None;
+    }
+
+    let flags = token.strip_prefix('-')?;
+    let mut cluster = Vec::new();
+    for (index, flag) in flags.char_indices() {
+        if bare_flags.contains(flag) {
+            cluster.push(CompactFlag::Bare(flag));
+            continue;
+        }
+        if value_flags.contains(flag) {
+            let value_start = index + flag.len_utf8();
+            let value = (value_start < flags.len()).then(|| flags[value_start..].to_owned());
+            cluster.push(CompactFlag::Value { flag, value });
+            return Some(cluster);
+        }
+        return None;
+    }
+
+    Some(cluster)
+}
+
 pub(super) struct CommandTokens {
     tokens: VecDeque<String>,
 }

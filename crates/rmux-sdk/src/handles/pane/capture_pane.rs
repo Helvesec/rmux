@@ -64,9 +64,12 @@ impl<'a> PaneCaptureBuilder<'a> {
         self
     }
 
-    /// Sets an absolute inclusive start line (`capture-pane -S -` form).
-    pub const fn start_absolute(mut self, line: i64) -> Self {
-        self.start = Some(line);
+    /// Sets the absolute inclusive start line (`capture-pane -S -` form).
+    ///
+    /// The daemon-side absolute form matches tmux's `-S -` sentinel; it does
+    /// not carry a numeric line value. Use [`Self::start`] for numeric bounds.
+    pub const fn start_absolute(mut self, _line: i64) -> Self {
+        self.start = None;
         self.start_is_absolute = true;
         self
     }
@@ -78,9 +81,12 @@ impl<'a> PaneCaptureBuilder<'a> {
         self
     }
 
-    /// Sets an absolute inclusive end line (`capture-pane -E -` form).
-    pub const fn end_absolute(mut self, line: i64) -> Self {
-        self.end = Some(line);
+    /// Sets the absolute inclusive end line (`capture-pane -E -` form).
+    ///
+    /// The daemon-side absolute form matches tmux's `-E -` sentinel; it does
+    /// not carry a numeric line value. Use [`Self::end`] for numeric bounds.
+    pub const fn end_absolute(mut self, _line: i64) -> Self {
+        self.end = None;
         self.end_is_absolute = true;
         self
     }
@@ -279,6 +285,45 @@ mod tests {
             .expect("capture succeeds");
         assert_eq!(capture.stdout, b"hello\n");
         assert_eq!(capture.buffer_name, None);
+    }
+
+    #[tokio::test]
+    async fn pane_capture_builder_sends_absolute_bounds_as_sentinels() {
+        let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+        let pane = pane(crate::transport::TransportClient::spawn(client_stream));
+
+        let capture = tokio::spawn({
+            let pane = pane.clone();
+            async move {
+                pane.capture_pane()
+                    .start_absolute(20)
+                    .end_absolute(30)
+                    .await
+            }
+        });
+
+        match read_request(&mut server_stream).await {
+            Request::CapturePane(request) => {
+                assert_eq!(request.start, None);
+                assert_eq!(request.end, None);
+                assert!(request.start_is_absolute);
+                assert!(request.end_is_absolute);
+            }
+            request => panic!("expected capture-pane, got {request:?}"),
+        }
+        write_response(
+            &mut server_stream,
+            Response::CapturePane(CapturePaneResponse::from_output(
+                CommandOutput::from_stdout(b"hello\n".to_vec()),
+            )),
+        )
+        .await;
+
+        let capture = capture
+            .await
+            .expect("capture task")
+            .expect("capture succeeds");
+        assert_eq!(capture.stdout, b"hello\n");
     }
 
     #[tokio::test]

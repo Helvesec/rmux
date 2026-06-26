@@ -156,23 +156,12 @@ pub(super) fn normalize_scalar_value(
         OptionValueType::Choice(choices) => {
             let raw = value.unwrap_or_default();
             if raw.is_empty() {
-                let current = current.unwrap_or(choices[0]);
-                let next = if choices.contains(&"on") && choices.contains(&"off") {
-                    if current == "on" {
-                        "off"
-                    } else {
-                        "on"
-                    }
-                } else if choices.len() == 2 {
-                    if current == choices[0] {
-                        choices[1]
-                    } else {
-                        choices[0]
-                    }
-                } else {
-                    current
-                };
-                return Ok(StoredOptionValue::Choice(next.to_owned()));
+                if choices.contains(&"on") && choices.contains(&"off") {
+                    let current = current.unwrap_or(choices[0]);
+                    let next = if current == "on" { "off" } else { "on" };
+                    return Ok(StoredOptionValue::Choice(next.to_owned()));
+                }
+                return Err(RmuxError::InvalidSetOption("empty value".to_owned()));
             }
             if choices.contains(&raw) {
                 Ok(StoredOptionValue::Choice(raw.to_owned()))

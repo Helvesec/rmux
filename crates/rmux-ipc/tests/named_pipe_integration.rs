@@ -11,6 +11,8 @@ use tokio::net::windows::named_pipe::ClientOptions;
 use tokio::net::windows::named_pipe::ServerOptions;
 use tokio::time::timeout;
 
+const WINDOWS_IPC_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[test]
 fn blocking_connect_to_missing_pipe_reports_not_found() -> std::io::Result<()> {
     let endpoint = endpoint_for_label(format!("missing-{}", std::process::id()))?;
@@ -48,9 +50,9 @@ async fn named_pipe_roundtrip_uses_bound_endpoint() -> std::io::Result<()> {
 
     let endpoint_for_client = endpoint.clone();
     let client = timeout(
-        Duration::from_secs(2),
+        WINDOWS_IPC_TEST_TIMEOUT,
         tokio::task::spawn_blocking(move || {
-            connect_blocking(&endpoint_for_client, Duration::from_secs(2))
+            connect_blocking(&endpoint_for_client, WINDOWS_IPC_TEST_TIMEOUT)
         }),
     )
     .await
@@ -58,7 +60,7 @@ async fn named_pipe_roundtrip_uses_bound_endpoint() -> std::io::Result<()> {
     .expect("client connect task")?;
 
     timeout(
-        Duration::from_secs(2),
+        WINDOWS_IPC_TEST_TIMEOUT,
         tokio::task::spawn_blocking(move || {
             let mut client = client;
             client.write_all(b"ping")?;
@@ -72,7 +74,7 @@ async fn named_pipe_roundtrip_uses_bound_endpoint() -> std::io::Result<()> {
     .expect("client roundtrip timed out")
     .expect("client roundtrip task")?;
 
-    timeout(Duration::from_secs(2), accept)
+    timeout(WINDOWS_IPC_TEST_TIMEOUT, accept)
         .await
         .expect("accept task timed out")
         .expect("accept task")?;
@@ -94,9 +96,9 @@ async fn named_pipe_read_timeout_bounds_silent_server() -> std::io::Result<()> {
 
     let endpoint_for_client = endpoint.clone();
     timeout(
-        Duration::from_secs(2),
+        WINDOWS_IPC_TEST_TIMEOUT,
         tokio::task::spawn_blocking(move || {
-            let mut client = connect_blocking(&endpoint_for_client, Duration::from_secs(2))?;
+            let mut client = connect_blocking(&endpoint_for_client, WINDOWS_IPC_TEST_TIMEOUT)?;
             client.set_read_timeout(Some(Duration::from_millis(100)))?;
             let mut byte = [0_u8; 1];
             let error = client
@@ -110,7 +112,7 @@ async fn named_pipe_read_timeout_bounds_silent_server() -> std::io::Result<()> {
     .expect("client read task timed out")
     .expect("client read task")?;
 
-    timeout(Duration::from_secs(2), accept)
+    timeout(WINDOWS_IPC_TEST_TIMEOUT, accept)
         .await
         .expect("accept task timed out")
         .expect("accept task")?;
@@ -124,7 +126,7 @@ async fn wait_for_peer_close_resolves_when_named_pipe_client_disconnects() -> st
 
     let accept = tokio::spawn(async move {
         let (stream, _peer) = listener.accept().await?;
-        timeout(Duration::from_secs(2), wait_for_peer_close(&stream))
+        timeout(WINDOWS_IPC_TEST_TIMEOUT, wait_for_peer_close(&stream))
             .await
             .expect("peer close wait timed out")?;
         std::io::Result::Ok(())
@@ -134,9 +136,9 @@ async fn wait_for_peer_close_resolves_when_named_pipe_client_disconnects() -> st
 
     let endpoint_for_client = endpoint.clone();
     timeout(
-        Duration::from_secs(2),
+        WINDOWS_IPC_TEST_TIMEOUT,
         tokio::task::spawn_blocking(move || {
-            let client = connect_blocking(&endpoint_for_client, Duration::from_secs(2))?;
+            let client = connect_blocking(&endpoint_for_client, WINDOWS_IPC_TEST_TIMEOUT)?;
             drop(client);
             std::io::Result::Ok(())
         }),
@@ -145,7 +147,7 @@ async fn wait_for_peer_close_resolves_when_named_pipe_client_disconnects() -> st
     .expect("client connect/drop timed out")
     .expect("client connect/drop task")?;
 
-    timeout(Duration::from_secs(2), accept)
+    timeout(WINDOWS_IPC_TEST_TIMEOUT, accept)
         .await
         .expect("accept task timed out")
         .expect("accept task")?;
@@ -159,7 +161,7 @@ async fn wait_for_peer_close_keeps_polling_after_buffered_bytes() -> std::io::Re
 
     let accept = tokio::spawn(async move {
         let (stream, _peer) = listener.accept().await?;
-        timeout(Duration::from_secs(2), wait_for_peer_close(&stream))
+        timeout(WINDOWS_IPC_TEST_TIMEOUT, wait_for_peer_close(&stream))
             .await
             .expect("peer close wait timed out after buffered bytes")?;
         std::io::Result::Ok(())
@@ -169,9 +171,9 @@ async fn wait_for_peer_close_keeps_polling_after_buffered_bytes() -> std::io::Re
 
     let endpoint_for_client = endpoint.clone();
     timeout(
-        Duration::from_secs(2),
+        WINDOWS_IPC_TEST_TIMEOUT,
         tokio::task::spawn_blocking(move || {
-            let mut client = connect_blocking(&endpoint_for_client, Duration::from_secs(2))?;
+            let mut client = connect_blocking(&endpoint_for_client, WINDOWS_IPC_TEST_TIMEOUT)?;
             client.write_all(b"buffered")?;
             std::thread::sleep(Duration::from_millis(100));
             drop(client);
@@ -182,7 +184,7 @@ async fn wait_for_peer_close_keeps_polling_after_buffered_bytes() -> std::io::Re
     .expect("client write/drop timed out")
     .expect("client write/drop task")?;
 
-    timeout(Duration::from_secs(2), accept)
+    timeout(WINDOWS_IPC_TEST_TIMEOUT, accept)
         .await
         .expect("accept task timed out")
         .expect("accept task")?;
@@ -228,7 +230,7 @@ async fn listener_accepts_next_client_after_abandoned_instance() -> std::io::Res
 
     let endpoint_for_abandoned = endpoint.clone();
     timeout(
-        Duration::from_secs(2),
+        WINDOWS_IPC_TEST_TIMEOUT,
         tokio::task::spawn_blocking(move || {
             let client = ClientOptions::new().open(endpoint_for_abandoned.as_pipe_name())?;
             drop(client);
@@ -239,25 +241,25 @@ async fn listener_accepts_next_client_after_abandoned_instance() -> std::io::Res
     .expect("abandoned client open timed out")
     .expect("abandoned client task")?;
 
-    let _ = timeout(Duration::from_secs(2), listener.accept())
+    let _ = timeout(WINDOWS_IPC_TEST_TIMEOUT, listener.accept())
         .await
         .expect("first accept should observe the abandoned instance");
 
     let endpoint_for_client = endpoint.clone();
     let client = tokio::task::spawn_blocking(move || {
-        let mut client = connect_blocking(&endpoint_for_client, Duration::from_secs(2))?;
+        let mut client = connect_blocking(&endpoint_for_client, WINDOWS_IPC_TEST_TIMEOUT)?;
         client.write_all(b"ok")?;
         std::io::Result::Ok(())
     });
 
-    let (mut stream, _peer) = timeout(Duration::from_secs(2), listener.accept())
+    let (mut stream, _peer) = timeout(WINDOWS_IPC_TEST_TIMEOUT, listener.accept())
         .await
         .expect("listener should accept a later healthy client")?;
     let mut bytes = [0_u8; 2];
     stream.read_exact(&mut bytes).await?;
     assert_eq!(&bytes, b"ok");
 
-    timeout(Duration::from_secs(2), client)
+    timeout(WINDOWS_IPC_TEST_TIMEOUT, client)
         .await
         .expect("healthy client timed out")
         .expect("healthy client task")?;

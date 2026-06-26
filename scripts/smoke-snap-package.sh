@@ -40,6 +40,7 @@ command -v sudo >/dev/null 2>&1 || die "sudo is required"
 
 version="$(workspace_version)"
 [ -n "$version" ] || die "unable to read workspace package version"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 sudo snap remove rmux >/dev/null 2>&1 || true
 cleanup() {
@@ -54,19 +55,14 @@ test -f /snap/rmux/current/share/man/man1/rmux.1 ||
   die "snap package did not install rmux.1 manpage"
 test -f /snap/rmux/current/share/bash-completion/completions/rmux ||
   die "snap package did not install bash completion"
+test -x /snap/rmux/current/bin/rmux-daemon ||
+  die "snap package did not install rmux-daemon"
 
 version_output="$(/snap/bin/rmux -V)"
 [ "$version_output" = "rmux $version" ] || die "unexpected rmux version: $version_output"
 
 /snap/bin/rmux list-commands >/dev/null
-
-label="snap-smoke-$$"
-/snap/bin/rmux -L "$label" kill-server >/dev/null 2>&1 || true
-/snap/bin/rmux -L "$label" new-session -d -s snap_smoke >/dev/null
-sessions="$(/snap/bin/rmux -L "$label" list-sessions -F '#{session_name}')"
-/snap/bin/rmux -L "$label" kill-server >/dev/null 2>&1 || true
-printf '%s\n' "$sessions" | grep -qx 'snap_smoke' ||
-  die "snap daemon smoke did not list snap_smoke session"
+PATH="/snap/bin:$PATH" "$script_dir/smoke-installed-rmux.sh" /snap/bin/rmux >/dev/null
 
 printf 'snap=%s\n' "$snap_path"
 printf 'version=%s\n' "$version"

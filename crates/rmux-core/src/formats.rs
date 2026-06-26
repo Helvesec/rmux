@@ -171,6 +171,7 @@ const MOD_BASENAME: u32 = 1 << 6;
 const MOD_DIRNAME: u32 = 1 << 7;
 const MOD_LENGTH: u32 = 1 << 8;
 const MOD_EXPAND_TIME: u32 = 1 << 9;
+const FORMAT_PADDING_LIMIT: usize = 1024 * 1024;
 
 /// Processes the content inside `#{...}`, applying modifiers and returning the
 /// expanded result.
@@ -383,7 +384,7 @@ where
             result = truncated;
         }
     } else if limit < 0 {
-        let truncated = truncate_right(&result, (-limit) as usize);
+        let truncated = truncate_right(&result, signed_i32_abs_usize(limit));
         if truncated != result {
             if let Some(marker) = limit_marker {
                 result = format!("{marker}{truncated}");
@@ -397,13 +398,13 @@ where
 
     // Padding.
     if width > 0 {
-        let w = width as usize;
+        let w = bounded_format_padding_width(width);
         let current_width = text_width(&result, &Utf8Config::default());
         if current_width < w {
             result.push_str(&" ".repeat(w - current_width));
         }
     } else if width < 0 {
-        let w = (-width) as usize;
+        let w = bounded_format_padding_width(width);
         let current_width = text_width(&result, &Utf8Config::default());
         if current_width < w {
             result = format!("{}{result}", " ".repeat(w - current_width));
@@ -447,6 +448,14 @@ where
     }
 
     result
+}
+
+fn signed_i32_abs_usize(value: i32) -> usize {
+    value.unsigned_abs() as usize
+}
+
+fn bounded_format_padding_width(value: i32) -> usize {
+    signed_i32_abs_usize(value).min(FORMAT_PADDING_LIMIT)
 }
 
 fn split_loop_body(body: &str) -> (&str, Option<&str>) {

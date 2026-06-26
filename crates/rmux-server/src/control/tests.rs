@@ -89,6 +89,7 @@ async fn notifications_wait_until_after_the_active_command_block() {
     let (server_event_tx, server_event_rx) = mpsc::unbounded_channel();
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
+    let _requester_access_guard = handler.begin_detached_requester_access(4242, true);
 
     let control_task = tokio::spawn(forward_control(
         server_stream,

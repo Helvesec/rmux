@@ -200,10 +200,10 @@ async fn switch_client_last_session_recalls_the_previous_session() {
             session_name: beta.clone(),
         })
     );
-    assert!(matches!(
-        control_rx.try_recv(),
-        Ok(AttachControl::Switch(_))
-    ));
+    let _ = recv_matching_attach_control(&mut control_rx, "switch to beta", |control| {
+        matches!(control, AttachControl::Switch(_))
+    })
+    .await;
 
     let switched_back = handler
         .dispatch(
@@ -228,10 +228,10 @@ async fn switch_client_last_session_recalls_the_previous_session() {
             session_name: alpha,
         })
     );
-    assert!(matches!(
-        control_rx.try_recv(),
-        Ok(AttachControl::Switch(_))
-    ));
+    let _ = recv_matching_attach_control(&mut control_rx, "switch back to alpha", |control| {
+        matches!(control, AttachControl::Switch(_))
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -281,10 +281,10 @@ async fn kill_session_clears_attached_last_session_references() {
             session_name: beta.clone(),
         })
     );
-    assert!(matches!(
-        control_rx.try_recv(),
-        Ok(AttachControl::Switch(_))
-    ));
+    let _ = recv_matching_attach_control(&mut control_rx, "switch to beta", |control| {
+        matches!(control, AttachControl::Switch(_))
+    })
+    .await;
 
     {
         let active_attach = handler.active_attach.lock().await;

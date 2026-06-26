@@ -204,25 +204,20 @@ impl<'de> Visitor<'de> for NewSessionExtRequestVisitor {
         }
 
         Ok(NewSessionExtRequest {
-            session_name: session_name.ok_or_else(|| de::Error::missing_field("session_name"))?,
-            working_directory: working_directory
-                .ok_or_else(|| de::Error::missing_field("working_directory"))?,
+            session_name: session_name.unwrap_or_default(),
+            working_directory: working_directory.unwrap_or_default(),
             detached: detached.ok_or_else(|| de::Error::missing_field("detached"))?,
-            size: size.ok_or_else(|| de::Error::missing_field("size"))?,
-            environment: environment.ok_or_else(|| de::Error::missing_field("environment"))?,
-            group_target: group_target.ok_or_else(|| de::Error::missing_field("group_target"))?,
-            attach_if_exists: attach_if_exists
-                .ok_or_else(|| de::Error::missing_field("attach_if_exists"))?,
-            detach_other_clients: detach_other_clients
-                .ok_or_else(|| de::Error::missing_field("detach_other_clients"))?,
-            kill_other_clients: kill_other_clients
-                .ok_or_else(|| de::Error::missing_field("kill_other_clients"))?,
-            flags: flags.ok_or_else(|| de::Error::missing_field("flags"))?,
-            window_name: window_name.ok_or_else(|| de::Error::missing_field("window_name"))?,
-            print_session_info: print_session_info
-                .ok_or_else(|| de::Error::missing_field("print_session_info"))?,
-            print_format: print_format.ok_or_else(|| de::Error::missing_field("print_format"))?,
-            command: command.ok_or_else(|| de::Error::missing_field("command"))?,
+            size: size.unwrap_or_default(),
+            environment: environment.unwrap_or_default(),
+            group_target: group_target.unwrap_or_default(),
+            attach_if_exists: attach_if_exists.unwrap_or_default(),
+            detach_other_clients: detach_other_clients.unwrap_or_default(),
+            kill_other_clients: kill_other_clients.unwrap_or_default(),
+            flags: flags.unwrap_or_default(),
+            window_name: window_name.unwrap_or_default(),
+            print_session_info: print_session_info.unwrap_or_default(),
+            print_format: print_format.unwrap_or_default(),
+            command: command.unwrap_or_default(),
             process_command: process_command.unwrap_or_default(),
             client_environment: client_environment.unwrap_or_default(),
             skip_environment_update: skip_environment_update.unwrap_or_default(),

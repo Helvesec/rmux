@@ -17,6 +17,7 @@ use super::targets::{
     parse_queued_new_window_target_argument, parse_target_arg, resolve_queue_target_argument,
     NewWindowTargetIndex,
 };
+use super::tokens::{parse_compact_flag_cluster, CompactFlag};
 use super::values::{missing_argument, unsupported_flag};
 use crate::pane_terminals::session_not_found;
 
@@ -104,7 +105,57 @@ pub(super) fn parse_queued_new_window(
                 let _ = args.pop_front();
                 detached = true;
             }
-            _ => break,
+            token => {
+                let Some(cluster) = parse_compact_flag_cluster(token, "abd", "cetn") else {
+                    break;
+                };
+                let _ = args.pop_front();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('a') => after = true,
+                        CompactFlag::Bare('b') => before = true,
+                        CompactFlag::Bare('d') => detached = true,
+                        CompactFlag::Bare(flag) => {
+                            return Err(unsupported_flag("new-window", &format!("-{flag}")))
+                        }
+                        CompactFlag::Value { flag: 'c', value } => {
+                            start_directory = Some(PathBuf::from(compact_value_or_next_argument(
+                                &mut args,
+                                value,
+                                "-c start-directory",
+                            )?));
+                        }
+                        CompactFlag::Value { flag: 'e', value } => {
+                            environment.push(compact_value_or_next_argument(
+                                &mut args,
+                                value,
+                                "-e name=value",
+                            )?);
+                        }
+                        CompactFlag::Value { flag: 't', value } => {
+                            let raw_target =
+                                compact_value_or_next_argument(&mut args, value, "-t target")?;
+                            target_has_signed_window_part =
+                                signed_window_target_session_part(&raw_target).is_some();
+                            let (session_name, window_index) =
+                                parse_queued_new_window_target_argument(
+                                    raw_target,
+                                    sessions,
+                                    find_context,
+                                )?;
+                            target = Some(session_name);
+                            target_window_index = window_index;
+                        }
+                        CompactFlag::Value { flag: 'n', value } => {
+                            name =
+                                Some(compact_value_or_next_argument(&mut args, value, "-n name")?);
+                        }
+                        CompactFlag::Value { flag, .. } => {
+                            return Err(unsupported_flag("new-window", &format!("-{flag}")));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -179,51 +230,22 @@ fn signed_window_target_session_part(raw_target: &str) -> Option<Option<&str>> {
     Some(Some(session))
 }
 
+fn compact_value_or_next_argument(
+    args: &mut VecDeque<CommandArgument>,
+    value: Option<String>,
+    description: &str,
+) -> Result<String, RmuxError> {
+    match value {
+        Some(value) => Ok(value),
+        None => pop_string_argument(args, description),
+    }
+}
+
 fn signed_window_index_target(value: &str) -> bool {
     let Some(rest) = value.strip_prefix(['+', '-']) else {
         return false;
     };
     rest.is_empty() || rest.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum IfShellTargetFlag {
-    NextArgument,
-    Attached(String),
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct IfShellFlagCluster {
-    background: bool,
-    format_mode: bool,
-    target: Option<IfShellTargetFlag>,
-}
-
-fn parse_if_shell_flag_cluster(token: &str) -> Option<IfShellFlagCluster> {
-    if !token.starts_with('-') || token == "-" || token == "--" || token.len() <= 2 {
-        return None;
-    }
-
-    let flags = token.strip_prefix('-')?;
-    let mut cluster = IfShellFlagCluster::default();
-    for (index, flag) in flags.char_indices() {
-        match flag {
-            'b' => cluster.background = true,
-            'F' => cluster.format_mode = true,
-            't' => {
-                let value_start = index + flag.len_utf8();
-                cluster.target = Some(if value_start == flags.len() {
-                    IfShellTargetFlag::NextArgument
-                } else {
-                    IfShellTargetFlag::Attached(flags[value_start..].to_owned())
-                });
-                return Some(cluster);
-            }
-            _ => return None,
-        }
-    }
-
-    Some(cluster)
 }
 
 fn parse_queued_if_shell_target(
@@ -278,30 +300,37 @@ pub(super) fn parse_queued_if_shell(
             }
             "-t" => {
                 let _ = args.pop_front();
-                target = Some(parse_queued_if_shell_target(
+                target = Some(parse_queued_if_shell_attached_target(
                     pop_string_argument(&mut args, "-t target")?,
                     sessions,
                     find_context,
                 )?);
             }
             token => {
-                let Some(cluster) = parse_if_shell_flag_cluster(token) else {
+                let Some(cluster) = parse_compact_flag_cluster(token, "bF", "t") else {
                     break;
                 };
                 let _ = args.pop_front();
-                background |= cluster.background;
-                format_mode |= cluster.format_mode;
-                if let Some(target_flag) = cluster.target {
-                    target = Some(match target_flag {
-                        IfShellTargetFlag::NextArgument => parse_queued_if_shell_target(
-                            pop_string_argument(&mut args, "-t target")?,
-                            sessions,
-                            find_context,
-                        )?,
-                        IfShellTargetFlag::Attached(value) => {
-                            parse_queued_if_shell_attached_target(value, sessions, find_context)?
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('b') => background = true,
+                        CompactFlag::Bare('F') => format_mode = true,
+                        CompactFlag::Bare(flag) => {
+                            return Err(unsupported_flag("if-shell", &format!("-{flag}")));
                         }
-                    });
+                        CompactFlag::Value { flag: 't', value } => {
+                            let value =
+                                compact_value_or_next_argument(&mut args, value, "-t target")?;
+                            target = Some(parse_queued_if_shell_attached_target(
+                                value,
+                                sessions,
+                                find_context,
+                            )?);
+                        }
+                        CompactFlag::Value { flag, .. } => {
+                            return Err(unsupported_flag("if-shell", &format!("-{flag}")));
+                        }
+                    }
                 }
             }
         }
@@ -349,46 +378,66 @@ pub(super) fn parse_queued_source_file(
     let mut target = None;
 
     while let Some(token) = args.front().and_then(CommandArgument::as_string) {
-        if token == "--" {
-            let _ = args.pop_front();
-            break;
-        }
-        if token == "-" || !token.starts_with('-') {
-            break;
-        }
-
-        let flag_token = pop_string_argument(&mut args, "source-file flag")?;
-        let mut chars = flag_token.chars();
-        let _dash = chars.next();
-        while let Some(flag) = chars.next() {
-            match flag {
-                'F' => expand_paths = true,
-                'n' => parse_only = true,
-                'q' => quiet = true,
-                'v' => verbose = true,
-                't' => {
-                    if chars.next().is_some() {
-                        return Err(RmuxError::Server(
-                            "source-file -t must be followed by a target argument".to_owned(),
-                        ));
-                    }
-                    let value = pop_string_argument(&mut args, "-t target")?;
-                    target = Some(parse_pane_target("source-file", value.clone()).or_else(
-                        |_| {
-                            let resolved = resolve_queue_target_argument(
-                                "source-file",
-                                't',
+        match token {
+            "--" => {
+                let _ = args.pop_front();
+                break;
+            }
+            "-" => break,
+            "-F" => {
+                let _ = args.pop_front();
+                expand_paths = true;
+            }
+            "-n" => {
+                let _ = args.pop_front();
+                parse_only = true;
+            }
+            "-q" => {
+                let _ = args.pop_front();
+                quiet = true;
+            }
+            "-v" => {
+                let _ = args.pop_front();
+                verbose = true;
+            }
+            "-t" => {
+                let _ = args.pop_front();
+                target = Some(parse_queued_source_file_target(
+                    pop_string_argument(&mut args, "-t target")?,
+                    sessions,
+                    find_context,
+                )?);
+            }
+            token if token.starts_with('-') => {
+                let Some(cluster) = parse_compact_flag_cluster(token, "Fnqv", "t") else {
+                    return Err(unsupported_flag("source-file", token));
+                };
+                let _ = args.pop_front();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('F') => expand_paths = true,
+                        CompactFlag::Bare('n') => parse_only = true,
+                        CompactFlag::Bare('q') => quiet = true,
+                        CompactFlag::Bare('v') => verbose = true,
+                        CompactFlag::Bare(flag) => {
+                            return Err(unsupported_flag("source-file", &format!("-{flag}")));
+                        }
+                        CompactFlag::Value { flag: 't', value } => {
+                            let value =
+                                compact_value_or_next_argument(&mut args, value, "-t target")?;
+                            target = Some(parse_queued_source_file_target(
                                 value,
                                 sessions,
                                 find_context,
-                            )?;
-                            parse_pane_target("source-file", resolved)
-                        },
-                    )?);
-                    break;
+                            )?);
+                        }
+                        CompactFlag::Value { flag, .. } => {
+                            return Err(unsupported_flag("source-file", &format!("-{flag}")));
+                        }
+                    }
                 }
-                _ => return Err(unsupported_flag("source-file", &format!("-{flag}"))),
             }
+            _ => break,
         }
     }
 
@@ -418,5 +467,17 @@ pub(super) fn parse_queued_source_file(
         stdin: None,
         current_file: None,
         syntax: SourceSyntax::Rmux,
+    })
+}
+
+fn parse_queued_source_file_target(
+    value: String,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Result<rmux_proto::PaneTarget, RmuxError> {
+    parse_pane_target("source-file", value.clone()).or_else(|_| {
+        let resolved =
+            resolve_queue_target_argument("source-file", 't', value, sessions, find_context)?;
+        parse_pane_target("source-file", resolved)
     })
 }

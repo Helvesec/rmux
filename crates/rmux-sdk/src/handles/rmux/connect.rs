@@ -1,6 +1,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -168,16 +169,15 @@ fn spawn_hidden_daemon(endpoint: &OsStr) -> io::Result<()> {
                 last_error = Some(error);
                 continue;
             }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                last_error = Some(error);
+                break;
+            }
             Err(error) => return Err(error),
         }
     }
 
-    Err(last_error.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "no rmux hidden daemon binary candidate was available",
-        )
-    }))
+    Err(hidden_daemon_not_found_error(&candidates, last_error))
 }
 
 fn spawn_hidden_daemon_with_binary(
@@ -211,15 +211,136 @@ pub(super) fn daemon_binary() -> std::ffi::OsString {
 }
 
 fn hidden_daemon_binary_candidates() -> Vec<OsString> {
-    hidden_daemon_binary_candidates_from_env(std::env::var_os(discovery::SDK_DAEMON_BINARY_ENV))
+    hidden_daemon_binary_candidates_from_sources(
+        std::env::var_os(discovery::SDK_DAEMON_BINARY_ENV),
+        resolve_executable_on_path("rmux"),
+    )
 }
 
+#[cfg(test)]
 fn hidden_daemon_binary_candidates_from_env(override_binary: Option<OsString>) -> Vec<OsString> {
+    hidden_daemon_binary_candidates_from_sources(override_binary, None)
+}
+
+fn hidden_daemon_binary_candidates_from_sources(
+    override_binary: Option<OsString>,
+    public_binary: Option<PathBuf>,
+) -> Vec<OsString> {
+    let resolved_public_binary = public_binary
+        .as_deref()
+        .and_then(|path| std::fs::canonicalize(path).ok());
+    hidden_daemon_binary_candidates_from_sources_with_resolved(
+        override_binary,
+        public_binary,
+        resolved_public_binary.as_deref(),
+    )
+}
+
+fn hidden_daemon_binary_candidates_from_sources_with_resolved(
+    override_binary: Option<OsString>,
+    public_binary: Option<PathBuf>,
+    resolved_public_binary: Option<&Path>,
+) -> Vec<OsString> {
     if let Some(binary) = override_binary {
         return vec![binary];
     }
 
-    vec![OsString::from("rmux-daemon"), OsString::from("rmux")]
+    let mut candidates = Vec::new();
+    push_unique_candidate(&mut candidates, OsString::from("rmux-daemon"));
+    if let Some(public_binary) = public_binary.as_deref() {
+        push_daemon_sibling_candidates(&mut candidates, public_binary, resolved_public_binary);
+    }
+    push_unique_candidate(&mut candidates, OsString::from("rmux"));
+    candidates
+}
+
+fn push_daemon_sibling_candidates(
+    candidates: &mut Vec<OsString>,
+    public_binary: &Path,
+    resolved_binary: Option<&Path>,
+) {
+    if let Some(path) = daemon_sibling_path(public_binary) {
+        push_unique_candidate(candidates, path.into_os_string());
+    }
+    if let Some(path) = resolved_binary.and_then(daemon_sibling_path) {
+        push_unique_candidate(candidates, path.into_os_string());
+    }
+}
+
+fn daemon_sibling_path(binary: &Path) -> Option<PathBuf> {
+    let mut candidate = binary.to_path_buf();
+    let daemon_file_name = match binary.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) if !extension.is_empty() => format!("rmux-daemon.{extension}"),
+        _ => "rmux-daemon".to_owned(),
+    };
+    candidate.set_file_name(daemon_file_name);
+    candidate.is_file().then_some(candidate)
+}
+
+fn push_unique_candidate(candidates: &mut Vec<OsString>, candidate: OsString) {
+    if !candidates.iter().any(|existing| existing == &candidate) {
+        candidates.push(candidate);
+    }
+}
+
+fn resolve_executable_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&path) {
+        for file_name in executable_file_names(name) {
+            let candidate = directory.join(file_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn executable_file_names(name: &str) -> Vec<OsString> {
+    #[cfg(windows)]
+    {
+        let mut names = vec![OsString::from(name)];
+        if Path::new(name).extension().is_none() {
+            let pathext =
+                std::env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+            for extension in pathext.to_string_lossy().split(';') {
+                if extension.is_empty() {
+                    continue;
+                }
+                let normalized = if extension.starts_with('.') {
+                    extension.to_owned()
+                } else {
+                    format!(".{extension}")
+                };
+                names.push(OsString::from(format!("{name}{normalized}")));
+            }
+        }
+        names
+    }
+    #[cfg(not(windows))]
+    {
+        vec![OsString::from(name)]
+    }
+}
+
+fn hidden_daemon_not_found_error(
+    candidates: &[OsString],
+    last_error: Option<io::Error>,
+) -> io::Error {
+    let candidates = candidates
+        .iter()
+        .map(|candidate| candidate.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut message = format!(
+        "no rmux hidden daemon binary candidate was available; tried [{candidates}]. \
+         Install rmux, ensure rmux-daemon or rmux is on PATH, or set {} to an absolute rmux binary path",
+        discovery::SDK_DAEMON_BINARY_ENV
+    );
+    if let Some(error) = last_error {
+        message.push_str(&format!("; last error: {error}"));
+    }
+    io::Error::new(io::ErrorKind::NotFound, message)
 }
 
 fn startup_error(error: impl fmt::Display) -> RmuxError {
@@ -333,8 +454,41 @@ fn timeout_error(operation: &str, timeout: Duration) -> io::Error {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::hidden_daemon_binary_candidates_from_env;
+    use super::{
+        hidden_daemon_binary_candidates_from_env, hidden_daemon_binary_candidates_from_sources,
+        hidden_daemon_binary_candidates_from_sources_with_resolved, hidden_daemon_not_found_error,
+    };
+
+    fn temp_root(name: &str) -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "rmux-sdk-daemon-candidate-{name}-{}-{timestamp}",
+            std::process::id()
+        ))
+    }
+
+    fn expected_public_binary_daemon_candidates(public: &Path, daemon: &Path) -> Vec<OsString> {
+        let mut candidates = vec![
+            OsString::from("rmux-daemon"),
+            daemon.as_os_str().to_os_string(),
+        ];
+        if let Ok(resolved_public) = std::fs::canonicalize(public) {
+            let mut resolved_daemon = resolved_public;
+            resolved_daemon.set_file_name("rmux-daemon");
+            let candidate = resolved_daemon.into_os_string();
+            if !candidates.iter().any(|existing| existing == &candidate) {
+                candidates.push(candidate);
+            }
+        }
+        candidates.push(OsString::from("rmux"));
+        candidates
+    }
 
     #[test]
     fn hidden_daemon_spawn_prefers_minimal_sibling_binary() {
@@ -350,5 +504,64 @@ mod tests {
             hidden_daemon_binary_candidates_from_env(Some(OsString::from("/tmp/custom-rmux"))),
             vec![OsString::from("/tmp/custom-rmux")]
         );
+    }
+
+    #[test]
+    fn hidden_daemon_spawn_uses_public_binary_daemon_sibling_before_rmux_fallback() {
+        let root = temp_root("public-sibling");
+        std::fs::create_dir_all(&root).expect("create root");
+        let public = root.join("rmux");
+        let daemon = root.join("rmux-daemon");
+        std::fs::write(&public, b"rmux").expect("write public");
+        std::fs::write(&daemon, b"daemon").expect("write daemon");
+
+        assert_eq!(
+            hidden_daemon_binary_candidates_from_sources(None, Some(public)),
+            expected_public_binary_daemon_candidates(&root.join("rmux"), &daemon)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hidden_daemon_spawn_uses_resolved_public_binary_daemon_sibling_before_rmux_fallback() {
+        let root = temp_root("resolved-public-sibling");
+        let links = root.join("links");
+        let package = root.join("package");
+        std::fs::create_dir_all(&links).expect("create links");
+        std::fs::create_dir_all(&package).expect("create package");
+        let alias = links.join("rmux");
+        let public = package.join("rmux");
+        let daemon = package.join("rmux-daemon");
+        std::fs::write(&alias, b"alias").expect("write alias");
+        std::fs::write(&public, b"rmux").expect("write public");
+        std::fs::write(&daemon, b"daemon").expect("write daemon");
+
+        assert_eq!(
+            hidden_daemon_binary_candidates_from_sources_with_resolved(
+                None,
+                Some(alias),
+                Some(&public),
+            ),
+            vec![
+                OsString::from("rmux-daemon"),
+                daemon.into_os_string(),
+                OsString::from("rmux"),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hidden_daemon_not_found_error_mentions_env_override() {
+        let error = hidden_daemon_not_found_error(
+            &[OsString::from("rmux-daemon"), OsString::from("rmux")],
+            None,
+        );
+        let message = error.to_string();
+
+        assert!(message.contains("rmux-daemon"));
+        assert!(message.contains("RMUX_SDK_DAEMON_BINARY"));
     }
 }

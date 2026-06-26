@@ -82,8 +82,8 @@ Any hit must be either removed or explicitly justified before release.
 6. Verify the binary reports the intended version:
 
    ```sh
-   cargo run --locked -- -V
-   cargo run --locked -- diagnose --json
+   cargo run --locked --bin rmux -- -V
+   cargo run --locked --bin rmux -- diagnose --json
    ```
 
 ## Required local gates

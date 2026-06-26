@@ -42,7 +42,12 @@ helper together. Setting `RMUX_DISABLE_TINY_CLI=1` forces the public binary to
 exec the full helper and is the supported operational kill switch for debugging
 tiny-path compatibility issues.
 
-Windows packages for `0.7.0` use the same public tiny/private helper split:
+Unix `.tar.gz` archives include an `install.sh` that installs the private helper
+and daemon before replacing the public tiny binary. This preserves the `bin/`
+and `libexec/` layout for user-local installs such as `~/.local`, where copying
+only `bin/rmux` would strand the dispatcher without its full CLI helper.
+
+Windows packages for `0.7.1` use the same public tiny/private helper split:
 `rmux.exe` is the public tiny dispatcher, `libexec/rmux/rmux.exe` is the private
 full helper, and `rmux-daemon.exe` is the daemon.
 

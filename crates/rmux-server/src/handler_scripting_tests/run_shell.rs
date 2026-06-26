@@ -44,6 +44,26 @@ async fn run_shell_background_returns_immediately_without_output() {
 }
 
 #[tokio::test]
+async fn background_run_shell_commands_keep_detached_write_access_after_response() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_005;
+    let parsed = CommandParser::new()
+        .parse("run-shell -b -d 0.05 -C 'set-buffer -b bg-run-shell ok'")
+        .expect("background run-shell command parses");
+
+    {
+        let _access = handler.begin_detached_requester_access(requester_pid, true);
+        let output = handler
+            .execute_parsed_commands_for_test(requester_pid, parsed)
+            .await
+            .expect("background run-shell dispatch succeeds");
+        assert!(output.stdout().is_empty());
+    }
+
+    wait_for_named_buffer(&handler, "bg-run-shell", b"ok").await;
+}
+
+#[tokio::test]
 async fn run_shell_expands_socket_path_without_target() {
     let handler = RequestHandler::new();
     use_platform_test_shell(&handler).await;

@@ -252,6 +252,7 @@ cp "$binary" "$stage_dir/bin/rmux"
 cp "$helper_binary" "$stage_dir/libexec/rmux/rmux"
 cp "$daemon_binary" "$stage_dir/bin/rmux-daemon"
 strip_linux_tiny_binary "$stage_dir/bin/rmux"
+install -m 0755 scripts/install-unix-archive.sh "$stage_dir/install.sh"
 cp docs/man/rmux.1 "$stage_dir/share/man/man1/rmux.1"
 completion_tmp="$(mktemp -d "${TMPDIR:-/tmp}/rmux-completions.XXXXXX")"
 if [ "$skip_build" -eq 0 ]; then

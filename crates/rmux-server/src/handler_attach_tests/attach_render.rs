@@ -74,7 +74,7 @@ async fn session_target_refreshes_follow_the_current_active_window() {
             pane: PaneTarget::with_window(alpha, 5, 1),
         })
     );
-    let split_frame = take_render_frame(control_rx.try_recv().expect("split refresh"));
+    let split_frame = recv_render_frame(&mut control_rx, "split refresh").await;
     assert!(split_frame.contains('│'));
 }
 

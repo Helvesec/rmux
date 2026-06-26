@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -7,7 +7,7 @@ use rmux_proto::OptionName;
 
 use crate::diagnostic_log::{record_shutdown_queued, record_shutdown_request};
 
-use super::{PendingShutdownReason, RequestHandler};
+use super::{DetachedRequesterAccess, PendingShutdownReason, RequestHandler};
 
 const SHUTDOWN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -37,6 +37,28 @@ impl RequestHandler {
         DetachedConnectionGuard {
             connection_id,
             active_detached_connections: self.active_detached_connections.clone(),
+        }
+    }
+
+    pub(crate) fn begin_detached_requester_access(
+        &self,
+        requester_pid: u32,
+        can_write: bool,
+    ) -> DetachedRequesterAccessGuard {
+        let mut access = self
+            .active_detached_requester_access
+            .lock()
+            .expect("active detached requester access mutex must not be poisoned");
+        let entry = access.entry(requester_pid).or_default();
+        if can_write {
+            entry.write_scopes += 1;
+        } else {
+            entry.read_only_scopes += 1;
+        }
+        DetachedRequesterAccessGuard {
+            requester_pid,
+            can_write,
+            active_detached_requester_access: self.active_detached_requester_access.clone(),
         }
     }
 
@@ -248,6 +270,32 @@ impl Drop for DetachedConnectionGuard {
             .lock()
             .expect("active detached connection mutex must not be poisoned")
             .remove(&self.connection_id);
+    }
+}
+
+pub(crate) struct DetachedRequesterAccessGuard {
+    requester_pid: u32,
+    can_write: bool,
+    active_detached_requester_access: Arc<StdMutex<HashMap<u32, DetachedRequesterAccess>>>,
+}
+
+impl Drop for DetachedRequesterAccessGuard {
+    fn drop(&mut self) {
+        let mut access = self
+            .active_detached_requester_access
+            .lock()
+            .expect("active detached requester access mutex must not be poisoned");
+        let Some(entry) = access.get_mut(&self.requester_pid) else {
+            return;
+        };
+        if self.can_write {
+            entry.write_scopes = entry.write_scopes.saturating_sub(1);
+        } else {
+            entry.read_only_scopes = entry.read_only_scopes.saturating_sub(1);
+        }
+        if entry.is_empty() {
+            access.remove(&self.requester_pid);
+        }
     }
 }
 

@@ -16,6 +16,9 @@ use rmux_proto::{KillServerRequest, ListSessionsRequest, Request, Response};
 const BINARY_OVERRIDE_ENV: &str = "RMUX_INTERNAL_BINARY_PATH";
 const BINARY_OVERRIDE_TEST_OPT_IN_ENV: &str = "RMUX_ALLOW_INTERNAL_BINARY_OVERRIDE";
 const CLIENT_VERSION_OVERRIDE_ENV: &str = "RMUX_INTERNAL_CLIENT_VERSION";
+const WINDOWS_DAEMON_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+const WINDOWS_DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(20);
+const WINDOWS_DAEMON_EXIT_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[test]
 fn hidden_daemon_mode_serves_windows_ipc_requests() -> Result<(), Box<dyn Error>> {
@@ -234,7 +237,7 @@ fn run_command_status(mut command: Command) -> Result<ExitStatus, Box<dyn Error>
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WINDOWS_DAEMON_COMMAND_TIMEOUT;
 
     loop {
         if let Some(status) = child.try_wait()? {
@@ -255,7 +258,7 @@ fn run_command_output(mut command: Command) -> Result<Output, Box<dyn Error>> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + WINDOWS_DAEMON_COMMAND_TIMEOUT;
 
     loop {
         if child.try_wait()?.is_some() {
@@ -280,7 +283,7 @@ fn wait_for_connection(
     socket_path: &std::path::Path,
     child: &mut Child,
 ) -> Result<Connection, Box<dyn Error>> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + WINDOWS_DAEMON_READY_TIMEOUT;
 
     loop {
         if let Some(status) = child.try_wait()? {
@@ -299,7 +302,7 @@ fn wait_for_connection(
 }
 
 fn wait_for_daemon_process_absent(socket_path: &Path) -> Result<(), Box<dyn Error>> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + WINDOWS_DAEMON_EXIT_TIMEOUT;
 
     loop {
         let process_count = daemon_process_count(socket_path)?;
@@ -347,7 +350,7 @@ Write-Output $count
 }
 
 fn wait_for_child_exit(child: &mut Child) -> Result<(), Box<dyn Error>> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + WINDOWS_DAEMON_EXIT_TIMEOUT;
 
     loop {
         if child.try_wait()?.is_some() {

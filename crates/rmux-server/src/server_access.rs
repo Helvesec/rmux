@@ -313,7 +313,9 @@ fn read_only_request_allowed(request: &Request) -> bool {
                 | Request::SubscribePaneOutputRef(_)
                 | Request::UnsubscribePaneOutput(_)
                 | Request::PaneOutputCursor(_)
+                | Request::PaneSnapshot(_)
                 | Request::PaneSnapshotRef(_)
+                | Request::ResolveTarget(_)
                 | Request::SdkWaitForOutput(_)
                 | Request::SdkWaitForOutputRef(_)
                 | Request::CancelSdkWait(_)
@@ -366,11 +368,12 @@ mod tests {
         CapturePaneTargetActionRequest, ClockModeRequest, CopyModeRequest, DetachClientExtRequest,
         DetachClientRequest, DisplayMessageExtRequest, DisplayMessageRequest, DisplayPanesRequest,
         LastPaneRequest, LastWindowRequest, NextLayoutRequest, NextWindowRequest,
-        PaneOutputSubscriptionStart, PaneTarget, PreviousLayoutRequest, PreviousWindowRequest,
-        RefreshClientRequest, SdkWaitForOutputRequest, SdkWaitId, SdkWaitOwnerId,
-        SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneRequest, SessionName,
-        SuspendClientRequest, SwitchClientExt2Request, SwitchClientExt3Request,
-        SwitchClientExtRequest, SwitchClientRequest, TerminalSize, WindowTarget,
+        PaneOutputSubscriptionStart, PaneSnapshotRequest, PaneTarget, PreviousLayoutRequest,
+        PreviousWindowRequest, RefreshClientRequest, ResolveTargetRequest, ResolveTargetType,
+        SdkWaitForOutputRequest, SdkWaitId, SdkWaitOwnerId, SelectPaneAdjacentRequest,
+        SelectPaneDirection, SelectPaneRequest, SessionName, SuspendClientRequest,
+        SwitchClientExt2Request, SwitchClientExt3Request, SwitchClientExtRequest,
+        SwitchClientRequest, TerminalSize, WindowTarget,
     };
 
     #[test]
@@ -452,6 +455,30 @@ mod tests {
             apply_access_policy(cancel.clone(), false)
                 .expect("SDK wait cancel is read-only cleanup"),
             cancel
+        );
+    }
+
+    #[test]
+    fn read_only_access_allows_sdk_target_discovery_and_snapshot() {
+        let session = session_name();
+        let pane = PaneTarget::new(session.clone(), 0);
+        let resolve = Request::ResolveTarget(ResolveTargetRequest {
+            target: Some("s:0.0".to_owned()),
+            target_type: ResolveTargetType::Pane,
+            window_index: false,
+            prefer_unattached: false,
+        });
+        let snapshot = Request::PaneSnapshot(PaneSnapshotRequest { target: pane });
+
+        assert_eq!(
+            apply_access_policy(resolve.clone(), false)
+                .expect("target resolution is read-only discovery"),
+            resolve
+        );
+        assert_eq!(
+            apply_access_policy(snapshot.clone(), false)
+                .expect("pane snapshot is read-only observation"),
+            snapshot
         );
     }
 

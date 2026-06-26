@@ -63,6 +63,10 @@ impl LivePaneRender {
         delta
     }
 
+    pub(crate) fn render_interactive_frame_from_transcript(&mut self) -> PaneRenderDelta {
+        self.render_frame_from_transcript(false)
+    }
+
     pub(crate) fn can_forward_plain_bytes(&self, bytes: &[u8]) -> bool {
         self.snapshot.can_forward_plain_bytes(bytes)
     }
@@ -145,6 +149,43 @@ mod tests {
         assert!(
             frame.contains("\u{1b}[2;1H"),
             "replaceable render frames must be self-contained so clients can keep only the latest one: {frame:?}"
+        );
+    }
+
+    #[test]
+    fn interactive_live_render_only_repaints_changed_rows() {
+        let session = Session::new(session_name("alpha"), TerminalSize { cols: 10, rows: 4 });
+        let pane = session.window().active_pane().expect("active pane").clone();
+        let options = OptionStore::new();
+        let transcript = PaneTranscript::shared(100, TerminalSize { cols: 10, rows: 3 });
+        transcript
+            .lock()
+            .expect("transcript mutex must not be poisoned")
+            .append_bytes(b"abc");
+
+        let mut renderer =
+            LivePaneRender::new_from_transcript(transcript.clone(), session, options, pane)
+                .expect("initial render snapshot");
+
+        transcript
+            .lock()
+            .expect("transcript mutex must not be poisoned")
+            .append_bytes(b"d");
+
+        let PaneRenderDelta::Incremental(delta) =
+            renderer.render_interactive_frame_from_transcript()
+        else {
+            panic!("single-line output should render as an incremental delta");
+        };
+        let frame = String::from_utf8(delta.frame().to_vec()).expect("frame is utf8");
+
+        assert!(
+            frame.contains("d"),
+            "interactive delta should include new text: {frame:?}"
+        );
+        assert!(
+            !frame.contains("\u{1b}[2;1H"),
+            "interactive render should not repaint unchanged rows: {frame:?}"
         );
     }
 }

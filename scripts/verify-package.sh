@@ -9,7 +9,7 @@ Verify a local-first RMUX Unix package.
 
 Options:
   --checksums <path>     SHA256SUMS file (default: archive directory)
-  --run-binary           Execute rmux -V and rmux diagnose --json
+  --run-binary           Execute rmux -V plus helper fallback and daemon smokes
   --require-release-artifact
                          Fail unless metadata marks this as a release artifact
   -h, --help             Show this help
@@ -31,24 +31,6 @@ sha256_file() {
   else
     die "no SHA256 tool found"
   fi
-}
-
-run_daemon_smoke() {
-  local binary label sessions
-  binary="$1"
-  label="package-smoke-$$-$(date +%s)"
-  "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
-  if ! "$binary" -L "$label" new-session -d -s package_smoke >/dev/null; then
-    "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
-    die "packaged rmux failed to create a session through its daemon"
-  fi
-  if ! sessions="$("$binary" -L "$label" list-sessions -F '#{session_name}')"; then
-    "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
-    die "packaged rmux failed to list sessions through its daemon"
-  fi
-  "$binary" -L "$label" kill-server >/dev/null 2>&1 || true
-  printf '%s\n' "$sessions" | grep -qx 'package_smoke' ||
-    die "daemon smoke did not list package_smoke session"
 }
 
 verify_checksum_manifest() {
@@ -119,6 +101,7 @@ case "$archive" in
 esac
 
 archive_dir="$(cd "$(dirname "$archive")" && pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 archive_name="$(basename "$archive")"
 archive_abs="$archive_dir/$archive_name"
 
@@ -139,12 +122,13 @@ tar -xzf "$archive_abs" -C "$tmpdir"
 package_root="$tmpdir/${archive_name%.tar.gz}"
 [ -d "$package_root" ] || die "archive root directory is missing: ${archive_name%.tar.gz}"
 
-for required in bin/rmux libexec/rmux/rmux bin/rmux-daemon LICENSE-APACHE LICENSE-MIT SHA256SUMS.txt share/rmux/artifact-metadata.json share/man/man1/rmux.1; do
+for required in bin/rmux libexec/rmux/rmux bin/rmux-daemon install.sh LICENSE-APACHE LICENSE-MIT SHA256SUMS.txt share/rmux/artifact-metadata.json share/man/man1/rmux.1; do
   [ -e "$package_root/$required" ] || die "missing package file: $required"
 done
 [ -x "$package_root/bin/rmux" ] || die "packaged rmux is not executable"
 [ -x "$package_root/libexec/rmux/rmux" ] || die "packaged private helper is not executable"
 [ -x "$package_root/bin/rmux-daemon" ] || die "packaged rmux-daemon is not executable"
+[ -x "$package_root/install.sh" ] || die "packaged install.sh is not executable"
 verify_checksum_manifest "$package_root" "$package_root/SHA256SUMS.txt"
 
 metadata="$package_root/share/rmux/artifact-metadata.json"
@@ -171,8 +155,10 @@ fi
 
 if [ "$run_binary" -eq 1 ]; then
   "$package_root/bin/rmux" -V >/dev/null
-  "$package_root/bin/rmux" diagnose --json >/dev/null
-  run_daemon_smoke "$package_root/bin/rmux"
+  "$script_dir/smoke-installed-rmux.sh" "$package_root/bin/rmux" >/dev/null
+  install_prefix="$tmpdir/install-prefix"
+  "$package_root/install.sh" --prefix "$install_prefix" >/dev/null
+  "$script_dir/smoke-installed-rmux.sh" "$install_prefix/bin/rmux" >/dev/null
 fi
 
 printf 'archive=%s\n' "$archive_abs"

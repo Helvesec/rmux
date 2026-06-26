@@ -17,6 +17,7 @@ mod cli;
 mod cli_args;
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod cli_response;
+mod client_terminal;
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]
 mod os_string;
 #[cfg(any(not(feature = "tiny-cli"), debug_assertions))]

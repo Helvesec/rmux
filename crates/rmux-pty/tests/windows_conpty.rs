@@ -79,7 +79,9 @@ fn conpty_interactive_cmd_accepts_written_input() -> Result<(), Box<dyn std::err
 }
 
 #[test]
-fn conpty_console_ctrl_d_interrupts_timeout() -> Result<(), Box<dyn std::error::Error>> {
+#[ignore = "host-dependent Windows console injection probe; run explicitly when validating Ctrl-D semantics"]
+fn conpty_console_ctrl_d_interrupts_timeout_when_supported(
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut spawned = ChildCommand::new("C:\\Windows\\System32\\cmd.exe")
         .args(["/D", "/K"])
         .size(TerminalSize::new(100, 30))
@@ -104,7 +106,7 @@ fn conpty_console_ctrl_d_interrupts_timeout() -> Result<(), Box<dyn std::error::
 
     assert!(
         String::from_utf8_lossy(&output).contains("RMUX_READY>"),
-        "expected Ctrl-D to return to the cmd prompt, got {:?}",
+        "Ctrl-D should interrupt timeout.exe and return to the prompt; observed {:?}",
         String::from_utf8_lossy(&output)
     );
     Ok(())

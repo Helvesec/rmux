@@ -5,7 +5,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 use super::*;
-use windows_sys::Win32::System::Console::{ENABLE_INSERT_MODE, ENABLE_QUICK_EDIT_MODE};
+use windows_sys::Win32::System::Console::{
+    ENABLE_INSERT_MODE, ENABLE_MOUSE_INPUT, ENABLE_QUICK_EDIT_MODE,
+};
 
 const INPUT_HANDLE: u8 = 1;
 const OUTPUT_HANDLE: u8 = 2;
@@ -42,12 +44,14 @@ fn raw_modes_preserve_selection_flags_and_disable_line_editing() {
         | ENABLE_ECHO_INPUT
         | ENABLE_PROCESSED_INPUT
         | ENABLE_QUICK_EDIT_MODE
+        | ENABLE_MOUSE_INPUT
         | ENABLE_INSERT_MODE
         | PRESERVED_INPUT_FLAG;
     let input_mode = raw_input_mode(input_original);
 
     assert_ne!(input_mode & ENABLE_EXTENDED_FLAGS, 0);
     assert_ne!(input_mode & ENABLE_QUICK_EDIT_MODE, 0);
+    assert_eq!(input_mode & ENABLE_MOUSE_INPUT, 0);
     assert_ne!(input_mode & ENABLE_INSERT_MODE, 0);
     assert_eq!(input_mode & ENABLE_LINE_INPUT, 0);
     assert_eq!(input_mode & ENABLE_ECHO_INPUT, 0);
@@ -58,6 +62,26 @@ fn raw_modes_preserve_selection_flags_and_disable_line_editing() {
     assert_ne!(output_mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING, 0);
     assert_ne!(output_mode & DISABLE_NEWLINE_AUTO_RETURN, 0);
     assert_ne!(output_mode & PRESERVED_OUTPUT_FLAG, 0);
+}
+
+#[test]
+fn raw_mouse_mode_enables_mouse_and_disables_quick_edit() {
+    let input_original = ENABLE_LINE_INPUT
+        | ENABLE_ECHO_INPUT
+        | ENABLE_PROCESSED_INPUT
+        | ENABLE_QUICK_EDIT_MODE
+        | ENABLE_INSERT_MODE
+        | PRESERVED_INPUT_FLAG;
+    let input_mode = raw_input_mode_with_mouse(input_original, true);
+
+    assert_ne!(input_mode & ENABLE_EXTENDED_FLAGS, 0);
+    assert_eq!(input_mode & ENABLE_QUICK_EDIT_MODE, 0);
+    assert_ne!(input_mode & ENABLE_MOUSE_INPUT, 0);
+    assert_ne!(input_mode & ENABLE_INSERT_MODE, 0);
+    assert_eq!(input_mode & ENABLE_LINE_INPUT, 0);
+    assert_eq!(input_mode & ENABLE_ECHO_INPUT, 0);
+    assert_eq!(input_mode & ENABLE_PROCESSED_INPUT, 0);
+    assert_ne!(input_mode & PRESERVED_INPUT_FLAG, 0);
 }
 
 #[test]
@@ -107,6 +131,28 @@ fn reapply_raw_mode_restores_raw_flags_after_explicit_restore() -> Result<()> {
     assert_eq!(
         console.mode(OUTPUT_HANDLE),
         Some(raw_output_mode(output_original))
+    );
+    Ok(())
+}
+
+#[test]
+fn reapply_raw_mode_preserves_enabled_mouse_mode() -> Result<()> {
+    let input_original = ENABLE_LINE_INPUT
+        | ENABLE_ECHO_INPUT
+        | ENABLE_PROCESSED_INPUT
+        | ENABLE_QUICK_EDIT_MODE
+        | PRESERVED_INPUT_FLAG;
+    let output_original = PRESERVED_OUTPUT_FLAG;
+    let console = FakeConsole::new(Some(input_original), Some(output_original));
+    let guard = RawTerminalGuard::enter(console.clone())?;
+
+    guard.set_mouse_input_enabled(true)?;
+    guard.restore()?;
+    guard.reapply_raw_mode()?;
+
+    assert_eq!(
+        console.mode(INPUT_HANDLE),
+        Some(raw_input_mode_with_mouse(input_original, true))
     );
     Ok(())
 }

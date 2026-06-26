@@ -38,7 +38,7 @@ async fn attached_session_mutations_emit_refresh_switches() {
             pane: PaneTarget::new(alpha.clone(), 1),
         })
     );
-    let split_frame = take_render_frame(control_rx.try_recv().expect("split refresh"));
+    let split_frame = recv_render_frame(&mut control_rx, "split refresh").await;
     assert!(split_frame.contains('│'));
 
     let resized = handler
@@ -54,7 +54,7 @@ async fn attached_session_mutations_emit_refresh_switches() {
             adjustment: ResizePaneAdjustment::AbsoluteWidth { columns: 34 },
         })
     );
-    let resize_frame = take_render_frame(control_rx.try_recv().expect("resize refresh"));
+    let resize_frame = recv_render_frame(&mut control_rx, "resize refresh").await;
     assert!(resize_frame.contains('│'));
 
     let selected_layout = handler
@@ -69,7 +69,7 @@ async fn attached_session_mutations_emit_refresh_switches() {
             layout: LayoutName::MainVertical,
         })
     );
-    let layout_frame = take_render_frame(control_rx.try_recv().expect("layout refresh"));
+    let layout_frame = recv_render_frame(&mut control_rx, "layout refresh").await;
     assert!(layout_frame.contains('│'));
 
     let selected_pane = handler
@@ -87,7 +87,7 @@ async fn attached_session_mutations_emit_refresh_switches() {
             target: PaneTarget::new(session_name("alpha"), 1),
         })
     );
-    let select_frame = take_render_frame(control_rx.try_recv().expect("pane refresh"));
+    let select_frame = recv_render_frame(&mut control_rx, "pane refresh").await;
     assert!(select_frame.contains('│'));
     assert!(matches!(control_rx.try_recv(), Err(TryRecvError::Empty)));
 }
@@ -137,7 +137,7 @@ async fn switch_client_updates_the_tracked_session_for_follow_up_refreshes() {
             session_name: beta.clone(),
         })
     );
-    let switch_frame = take_render_frame(control_rx.try_recv().expect("switch refresh"));
+    let switch_frame = recv_render_frame(&mut control_rx, "switch refresh").await;
     assert!(switch_frame.contains('│'));
 
     let global_border = handler
@@ -149,7 +149,7 @@ async fn switch_client_updates_the_tracked_session_for_follow_up_refreshes() {
         }))
         .await;
     assert!(matches!(global_border, Response::SetOption(_)));
-    let global_frame = take_render_frame(control_rx.try_recv().expect("global refresh"));
+    let global_frame = recv_render_frame(&mut control_rx, "global refresh").await;
     assert!(global_frame.contains("\u{1b}[31m"));
 
     let beta_window = WindowTarget::with_window(beta.clone(), 0);
@@ -162,7 +162,7 @@ async fn switch_client_updates_the_tracked_session_for_follow_up_refreshes() {
         }))
         .await;
     assert!(matches!(session_border, Response::SetOption(_)));
-    let session_frame = take_render_frame(control_rx.try_recv().expect("session refresh"));
+    let session_frame = recv_render_frame(&mut control_rx, "session refresh").await;
     assert!(session_frame.contains("\u{1b}[34m"));
 
     let alpha_window = WindowTarget::with_window(session_name("alpha"), 0);
@@ -214,7 +214,7 @@ async fn terminal_feature_mutations_refresh_attached_targets_with_client_context
         .await;
     assert!(matches!(set, Response::SetOption(_)));
 
-    let target = take_switch_target(control_rx.try_recv().expect("terminal feature refresh"));
+    let target = recv_switch_target(&mut control_rx, "terminal feature refresh").await;
     assert!(target.outer_terminal.features_string().contains("sync"));
     assert!(target
         .outer_terminal
@@ -258,7 +258,7 @@ async fn allow_passthrough_mutations_refresh_attached_targets() {
         .await;
     assert!(matches!(set, Response::SetOption(_)));
 
-    let target = take_switch_target(control_rx.try_recv().expect("passthrough refresh"));
+    let target = recv_switch_target(&mut control_rx, "passthrough refresh").await;
     assert!(
         target.kitty_graphics_passthrough,
         "allow-passthrough changes must recompute the attach target gate"
@@ -305,7 +305,7 @@ async fn allow_passthrough_enables_sixel_for_sixel_terminals() {
         .await;
     assert!(matches!(set, Response::SetOption(_)));
 
-    let target = take_switch_target(control_rx.try_recv().expect("passthrough refresh"));
+    let target = recv_switch_target(&mut control_rx, "passthrough refresh").await;
     assert!(
         target.sixel_passthrough,
         "allow-passthrough should enable sixel passthrough on sixel terminals"
@@ -348,7 +348,7 @@ async fn allow_passthrough_all_shares_the_active_pane_gate() {
         .await;
     assert!(matches!(set, Response::SetOption(_)));
 
-    let target = take_switch_target(control_rx.try_recv().expect("passthrough refresh"));
+    let target = recv_switch_target(&mut control_rx, "passthrough refresh").await;
     assert!(
         target.kitty_graphics_passthrough,
         "all is accepted and shares the active-pane passthrough path, since RMUX \
@@ -391,7 +391,7 @@ async fn kitty_passthrough_is_disabled_while_active_pane_is_in_copy_mode() {
         }))
         .await;
     assert!(matches!(set, Response::SetOption(_)));
-    let target = take_switch_target(control_rx.try_recv().expect("passthrough refresh"));
+    let target = recv_switch_target(&mut control_rx, "passthrough refresh").await;
     assert!(
         target.kitty_graphics_passthrough,
         "kitty passthrough should be available before modal pane modes"
@@ -412,7 +412,7 @@ async fn kitty_passthrough_is_disabled_while_active_pane_is_in_copy_mode() {
         .await;
     assert!(matches!(copied, Response::CopyMode(_)));
 
-    let target = take_switch_target(control_rx.try_recv().expect("copy-mode refresh"));
+    let target = recv_switch_target(&mut control_rx, "copy-mode refresh").await;
     assert!(
         !target.kitty_graphics_passthrough,
         "modal pane modes must suppress live kitty passthrough"
@@ -459,10 +459,10 @@ async fn different_requester_pids_can_control_the_sole_active_attach() {
             session_name: beta.clone(),
         })
     );
-    assert!(matches!(
-        control_rx.try_recv(),
-        Ok(AttachControl::Switch(_))
-    ));
+    let _ = recv_matching_attach_control(&mut control_rx, "switch refresh", |control| {
+        matches!(control, AttachControl::Switch(_))
+    })
+    .await;
 
     let detached = handler
         .dispatch(
@@ -475,7 +475,10 @@ async fn different_requester_pids_can_control_the_sole_active_attach() {
         detached,
         Response::DetachClient(rmux_proto::DetachClientResponse)
     );
-    assert!(matches!(control_rx.try_recv(), Ok(AttachControl::Detach)));
+    let _ = recv_matching_attach_control(&mut control_rx, "detach control", |control| {
+        matches!(control, AttachControl::Detach)
+    })
+    .await;
 }
 
 #[tokio::test]

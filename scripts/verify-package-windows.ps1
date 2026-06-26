@@ -15,6 +15,24 @@ function Fail([string]$Message) {
     exit 1
 }
 
+function Invoke-NativeCapture([string]$Program, [string[]]$Arguments) {
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # Native stderr redirection is surfaced as NativeCommandError under
+        # pwsh when ErrorActionPreference is Stop. Capture it as data instead.
+        $ErrorActionPreference = "Continue"
+        $output = & $Program @Arguments 2>&1
+        $status = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    [pscustomobject]@{
+        Output = $output
+        Status = $status
+    }
+}
+
 function Sha256File([string]$Path) {
     $getFileHash = Get-Command Get-FileHash -ErrorAction SilentlyContinue
     if ($getFileHash) {
@@ -36,17 +54,60 @@ function Sha256File([string]$Path) {
 }
 
 function AssertSuccess([string]$Binary, [string[]]$Arguments) {
-    $output = & $Binary @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        Fail "command failed: $Binary $($Arguments -join ' ')`n$output"
+    $result = Invoke-NativeCapture $Binary $Arguments
+    if ($result.Status -ne 0) {
+        Fail "command failed: $Binary $($Arguments -join ' ')`n$($result.Output)"
     }
-    $output
+    $result.Output
 }
 
 function AssertSuccessNoCapture([string]$Binary, [string[]]$Arguments) {
     & $Binary @Arguments
     if ($LASTEXITCODE -ne 0) {
         Fail "command failed: $Binary $($Arguments -join ' ')"
+    }
+}
+
+function AssertHelperFallback([string]$Binary) {
+    $result = Invoke-NativeCapture $Binary @("--help")
+    $output = $result.Output
+    $status = $result.Status
+    if ($status -ne 0 -and $status -ne 1) {
+        Fail "command failed with unexpected exit code $($status): $Binary --help`n$output"
+    }
+    if (($output -join "`n") -notmatch 'usage: rmux') {
+        Fail "command did not reach private helper: $Binary --help`n$output"
+    }
+}
+
+function NewPortableAliasSmoke([string]$Binary, [string]$Root) {
+    $links = Join-Path $Root "winget-links"
+    New-Item -ItemType Directory -Force -Path $links | Out-Null
+    $alias = Join-Path $links ([System.IO.Path]::GetFileName($Binary))
+    try {
+        New-Item -ItemType SymbolicLink -Path $alias -Target $Binary -ErrorAction Stop | Out-Null
+    } catch {
+        Copy-Item -LiteralPath (Split-Path -Parent $Binary) -Destination $links -Recurse -Force
+        $copied = Join-Path $links (Join-Path ([System.IO.Path]::GetFileName((Split-Path -Parent $Binary))) ([System.IO.Path]::GetFileName($Binary)))
+        if (-not (Test-Path -LiteralPath $copied -PathType Leaf)) {
+            Fail "failed to create portable alias smoke copy after symlink failure: $_"
+        }
+        $alias = $copied
+    }
+
+    [pscustomobject]@{
+        Binary = $alias
+        Directory = Split-Path -Parent $alias
+    }
+}
+
+function InvokeWithPathPrefix([string]$Directory, [scriptblock]$Body) {
+    $previousPath = $env:Path
+    try {
+        $env:Path = "$Directory$([System.IO.Path]::PathSeparator)$previousPath"
+        & $Body
+    } finally {
+        $env:Path = $previousPath
     }
 }
 
@@ -156,9 +217,22 @@ try {
         Fail "metadata daemon_binary_sha256 does not match packaged daemon binary"
     }
 
+    $portableAlias = $null
+    if ($RunBinary -or $RunDaemonSmoke) {
+        $portableAlias = NewPortableAliasSmoke $binary $tmpRoot
+    }
+
     if ($RunBinary) {
         AssertSuccess $binary @("-V") | Out-Null
+        AssertHelperFallback $binary
         AssertSuccess $binary @("diagnose", "--json") | Out-Null
+        AssertSuccess $portableAlias.Binary @("-V") | Out-Null
+        AssertHelperFallback $portableAlias.Binary
+        AssertSuccess $portableAlias.Binary @("diagnose", "--json") | Out-Null
+        InvokeWithPathPrefix $portableAlias.Directory {
+            AssertHelperFallback "rmux"
+            AssertSuccess "rmux" @("diagnose", "--json") | Out-Null
+        }
         $previousDisableTiny = $env:RMUX_DISABLE_TINY_CLI
         try {
             $env:RMUX_DISABLE_TINY_CLI = "1"
@@ -201,6 +275,21 @@ try {
                 $env:RMUX_DISABLE_TINY_CLI = $previousDisableTiny
             }
             & $binary "-L" $fallbackLabel "kill-server" | Out-Null
+        }
+
+        $portableAliasLabel = "package-alias-smoke-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+        try {
+            InvokeWithPathPrefix $portableAlias.Directory {
+                AssertSuccessNoCapture "rmux" @("-L", $portableAliasLabel, "new-session", "-d", "-s", "package_alias_smoke", "cmd.exe", "/d", "/q", "/k")
+                $sessions = AssertSuccess "rmux" @("-L", $portableAliasLabel, "list-sessions", "-F", "#{session_name}")
+                if (($sessions -join "`n") -notmatch 'package_alias_smoke') {
+                    Fail "portable alias daemon smoke did not list package_alias_smoke session"
+                }
+            }
+        } finally {
+            InvokeWithPathPrefix $portableAlias.Directory {
+                & "rmux" "-L" $portableAliasLabel "kill-server" | Out-Null
+            }
         }
     }
 

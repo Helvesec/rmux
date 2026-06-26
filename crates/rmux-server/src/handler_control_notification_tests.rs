@@ -240,6 +240,27 @@ async fn control_window_notifications_follow_each_clients_session_visibility() {
         drain_control_notifications(&mut beta_rx),
         vec![format!("%unlinked-window-renamed @{window_id} build")]
     );
+
+    let renamed = handler
+        .handle(Request::RenameWindow(RenameWindowRequest {
+            target: target.clone(),
+            name: "bad\n%output %1 injected".to_owned(),
+        }))
+        .await;
+    assert!(matches!(renamed, Response::RenameWindow(_)));
+
+    assert_eq!(
+        drain_control_notifications(&mut alpha_rx),
+        vec![format!(
+            "%window-renamed @{window_id} bad\\012%output %1 injected"
+        )]
+    );
+    assert_eq!(
+        drain_control_notifications(&mut beta_rx),
+        vec![format!(
+            "%unlinked-window-renamed @{window_id} bad\\012%output %1 injected"
+        )]
+    );
 }
 
 #[tokio::test]
@@ -330,6 +351,32 @@ async fn paste_buffer_notifications_use_the_buffer_name() {
     assert_eq!(
         drain_control_notifications(&mut control_rx),
         vec!["%paste-buffer-deleted named".to_owned()]
+    );
+
+    let set_response = handler
+        .handle(Request::SetBuffer(SetBufferRequest {
+            name: Some("bad\nname".to_owned()),
+            content: b"hello".to_vec(),
+            append: false,
+            set_clipboard: false,
+            new_name: None,
+        }))
+        .await;
+    assert!(matches!(set_response, Response::SetBuffer(_)));
+    assert_eq!(
+        drain_control_notifications(&mut control_rx),
+        vec!["%paste-buffer-changed bad\\012name".to_owned()]
+    );
+
+    let delete_response = handler
+        .handle(Request::DeleteBuffer(DeleteBufferRequest {
+            name: Some("bad\nname".to_owned()),
+        }))
+        .await;
+    assert!(matches!(delete_response, Response::DeleteBuffer(_)));
+    assert_eq!(
+        drain_control_notifications(&mut control_rx),
+        vec!["%paste-buffer-deleted bad\\012name".to_owned()]
     );
 }
 

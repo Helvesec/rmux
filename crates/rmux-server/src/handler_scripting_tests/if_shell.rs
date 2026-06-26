@@ -36,6 +36,38 @@ async fn if_shell_format_mode_dispatches_selected_rmux_command() {
 }
 
 #[tokio::test]
+async fn background_if_shell_keeps_detached_write_access_after_response() {
+    let handler = RequestHandler::new();
+    use_platform_test_shell(&handler).await;
+    let requester_pid = 424_006;
+
+    {
+        let _access = handler.begin_detached_requester_access(requester_pid, true);
+        let response = handler
+            .dispatch(
+                requester_pid,
+                Request::IfShell(Box::new(IfShellRequest {
+                    condition: delayed_true_shell_condition(),
+                    format_mode: false,
+                    then_command: "set-buffer -b bg-if-shell ok".to_owned(),
+                    else_command: None,
+                    target: None,
+                    caller_cwd: None,
+                    background: true,
+                })),
+            )
+            .await
+            .response;
+        assert_eq!(
+            response,
+            Response::IfShell(rmux_proto::IfShellResponse::no_output())
+        );
+    }
+
+    wait_for_named_buffer(&handler, "bg-if-shell", b"ok").await;
+}
+
+#[tokio::test]
 async fn if_shell_format_mode_expands_socket_path_without_target() {
     let handler = RequestHandler::new();
     handler.set_socket_path("/tmp/rmux-test.sock");
@@ -358,6 +390,40 @@ async fn queued_if_shell_compact_mouse_target_falls_back_to_current_target() {
         )
         .await
         .expect("compact if-shell branch should execute without mouse context");
+    assert_eq!(output.stdout(), b"beta\n");
+}
+
+#[tokio::test]
+async fn queued_if_shell_separated_mouse_target_falls_back_to_current_target() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    for session in [&alpha, &beta] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
+
+    let parsed = CommandParser::new()
+        .parse("if-shell -F -t = 1 { display-message -p '#{session_name}' }")
+        .expect("if-shell separated target parses");
+    let output = handler
+        .execute_parsed_commands(
+            std::process::id(),
+            parsed,
+            QueueExecutionContext::without_caller_cwd()
+                .with_current_target(Some(Target::Session(beta))),
+        )
+        .await
+        .expect("separated if-shell branch should execute without mouse context");
     assert_eq!(output.stdout(), b"beta\n");
 }
 

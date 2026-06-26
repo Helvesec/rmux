@@ -572,9 +572,11 @@ impl fmt::Display for AutoStartError {
                 waited,
             } => write!(
                 formatter,
-                "timed out after {}s waiting for rmux server socket '{}'",
+                "timed out after {}s waiting for rmux server socket '{}'. \
+                 The hidden daemon may have exited before creating the socket; run `{}` to surface startup errors.",
                 waited.as_secs(),
-                socket_path.display()
+                socket_path.display(),
+                diagnostic_start_server_command(socket_path)
             ),
         }
     }
@@ -714,6 +716,18 @@ fn incompatible_daemon_kill_server_command(socket_path: &Path) -> String {
     }
 
     format!("rmux -S {} kill-server", shell_quote_path(socket_path))
+}
+
+fn diagnostic_start_server_command(socket_path: &Path) -> String {
+    if default_socket_path()
+        .ok()
+        .as_deref()
+        .is_some_and(|default_path| default_path == socket_path)
+    {
+        return "rmux start-server".to_owned();
+    }
+
+    format!("rmux -S {} start-server", shell_quote_path(socket_path))
 }
 
 fn probe_server_readiness(connection: &mut Connection) -> Result<(), ClientError> {
@@ -957,11 +971,15 @@ fn rmux_binary_path(config: &AutoStartConfig) -> io::Result<PathBuf> {
     }
 
     let current_exe = env::current_exe()?;
+    let resolved_exe = std::fs::canonicalize(&current_exe).ok();
     match env::var_os(BINARY_OVERRIDE_ENV).filter(|_| binary_override_enabled_for_tests()) {
         Some(path) => Ok(PathBuf::from(path)),
-        None => {
-            Ok(hidden_daemon_binary_path_for_config(&current_exe, config).unwrap_or(current_exe))
-        }
+        None => Ok(hidden_daemon_binary_path_for_executable_paths(
+            &current_exe,
+            resolved_exe.as_deref(),
+            config,
+        )
+        .unwrap_or(current_exe)),
     }
 }
 
@@ -972,7 +990,17 @@ fn binary_override_enabled_for_tests() -> bool {
 
 #[cfg(all(test, unix))]
 fn hidden_daemon_binary_path(current_exe: &Path) -> Option<PathBuf> {
-    hidden_daemon_binary_path_for_config(current_exe, &AutoStartConfig::disabled())
+    hidden_daemon_binary_path_for_executable_paths(current_exe, None, &AutoStartConfig::disabled())
+}
+
+fn hidden_daemon_binary_path_for_executable_paths(
+    current_exe: &Path,
+    resolved_exe: Option<&Path>,
+    config: &AutoStartConfig,
+) -> Option<PathBuf> {
+    hidden_daemon_binary_path_for_config(current_exe, config).or_else(|| {
+        resolved_exe.and_then(|path| hidden_daemon_binary_path_for_config(path, config))
+    })
 }
 
 fn hidden_daemon_binary_path_for_config(

@@ -74,7 +74,10 @@ manifest() {
     }
   },
   "depends": "vcredist2022",
-  "bin": "rmux.exe",
+  "bin": [
+    "rmux.exe",
+    "rmux-daemon.exe"
+  ],
   "checkver": {
     "github": "https://github.com/$repository"
   },

@@ -8,7 +8,9 @@ use rmux_proto::{
     SplitWindowRequest, SwapPaneDirection, SwapPaneRequest, WindowTarget,
 };
 
-use super::tokens::{rebuild_shell_command, CommandTokens};
+use super::tokens::{
+    parse_compact_flag_cluster, rebuild_shell_command, CommandTokens, CompactFlag,
+};
 use super::values::{missing_argument, parse_percentage, unsupported_flag};
 use super::{
     implicit_pane_target, implicit_split_target, marked_pane_target, parse_pane_target,
@@ -52,7 +54,31 @@ pub(super) fn parse_pane_request(
                 let _ = args.optional();
                 target = Some(parse_pane_target(command, args.required("-t target")?)?);
             }
-            _ => break,
+            token => {
+                let Some(cluster) = parse_compact_flag_cluster(token, "a", "t") else {
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('a') if command == "kill-pane" => {
+                            kill_all_except = true;
+                        }
+                        CompactFlag::Bare(flag) => {
+                            return Err(unsupported_flag(command, &format!("-{flag}")));
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target = Some(parse_pane_target(
+                                command,
+                                compact_flag.value_or_next(&mut args, "-t target")?,
+                            )?);
+                        }
+                        CompactFlag::Value { flag, .. } => {
+                            return Err(unsupported_flag(command, &format!("-{flag}")));
+                        }
+                    }
+                }
+            }
         }
     }
     args.no_extra(command)?;
@@ -509,7 +535,58 @@ pub(super) fn parse_break_pane(
                 let _ = args.optional();
                 name = Some(args.required("-n name")?);
             }
-            _ => break,
+            token => {
+                let Some(cluster) = parse_compact_flag_cluster(token, "abdP", "Fstn") else {
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('a') => {
+                            if before {
+                                return Err(RmuxError::Server(
+                                    "break-pane accepts only one of -a or -b".to_owned(),
+                                ));
+                            }
+                            after = true;
+                        }
+                        CompactFlag::Bare('b') => {
+                            if after {
+                                return Err(RmuxError::Server(
+                                    "break-pane accepts only one of -a or -b".to_owned(),
+                                ));
+                            }
+                            before = true;
+                        }
+                        CompactFlag::Bare('d') => detached = true,
+                        CompactFlag::Bare('P') => print_target = true,
+                        CompactFlag::Bare(flag) => {
+                            return Err(unsupported_flag("break-pane", &format!("-{flag}")));
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'F', .. } => {
+                            format = Some(compact_flag.value_or_next(&mut args, "-F format")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 's', .. } => {
+                            source = Some(parse_pane_target(
+                                "break-pane",
+                                compact_flag.value_or_next(&mut args, "-s target")?,
+                            )?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target = Some(parse_window_target(
+                                "break-pane",
+                                compact_flag.value_or_next(&mut args, "-t target")?,
+                            )?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'n', .. } => {
+                            name = Some(compact_flag.value_or_next(&mut args, "-n name")?);
+                        }
+                        CompactFlag::Value { flag, .. } => {
+                            return Err(unsupported_flag("break-pane", &format!("-{flag}")));
+                        }
+                    }
+                }
+            }
         }
     }
     args.no_extra("break-pane")?;

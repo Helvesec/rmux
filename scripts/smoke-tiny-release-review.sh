@@ -267,7 +267,7 @@ run_rmux_smoke() {
   assert_rc resize_good 0
   assert_trace resize_good "rmux tiny: direct: resize-pane"
 
-  for prefix in resize_valueless_relative resize_zoom_relative resize_relative_absolute; do
+  for prefix in resize_valueless_relative resize_zoom_relative; do
     case "$prefix" in
       resize_valueless_relative)
         run_capture "$prefix" -L "$sock" resize-pane -R -L -t alpha:0.0
@@ -275,13 +275,13 @@ run_rmux_smoke() {
       resize_zoom_relative)
         run_capture "$prefix" -L "$sock" resize-pane -Z -R -t alpha:0.0
         ;;
-      resize_relative_absolute)
-        run_capture "$prefix" -L "$sock" resize-pane -R -x 80 -t alpha:0.0
-        ;;
     esac
     assert_rc "$prefix" 0
     assert_trace "$prefix" "rmux tiny: direct: resize-pane"
   done
+  run_capture resize_relative_absolute -L "$sock" resize-pane -R -x 80 -t alpha:0.0
+  assert_rc resize_relative_absolute 0
+  assert_trace resize_relative_absolute "rmux tiny: fallback: unsupported invocation"
   RMUX_DISABLE_TINY_CLI=1 "$RMUX" -L "$sock" resize-pane -R -L -t alpha:0.0 \
     >"$SMOKE_ROOT/full_resize_lastwins.out" 2>"$SMOKE_ROOT/full_resize_lastwins.err" ||
     die "full helper rejected tmux-compatible resize-pane valueless adjustment last-wins"

@@ -241,7 +241,7 @@ async fn attached_copy_mode_q_exits_and_refreshes_normal_surface() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     assert_eq!(pane_mode_status(&handler, &alpha).await, "0:::\n");
-    let frame = take_render_frame(control_rx.try_recv().expect("exit refresh"));
+    let frame = recv_render_frame(&mut control_rx, "exit refresh").await;
     assert!(
         !frame.is_empty(),
         "exit refresh should re-render the attached normal surface"
@@ -319,7 +319,7 @@ async fn attached_copy_mode_copies_selection_to_buffer_and_exits_cleanly() {
         String::from_utf8_lossy(output.stdout()).contains("needle"),
         "copy-mode transfer should publish the selected text into the rmux buffer"
     );
-    let frame = take_render_frame(control_rx.try_recv().expect("copy-mode exit refresh"));
+    let frame = recv_render_frame(&mut control_rx, "copy-mode exit refresh").await;
     assert!(
         !frame.is_empty(),
         "copy-mode copy-and-cancel should refresh the attached normal surface"
@@ -426,10 +426,10 @@ async fn attached_copy_mode_escape_exits_and_clears_mode_state() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     assert_eq!(pane_mode_status(&handler, &alpha).await, "0:::\n");
-    assert!(
-        matches!(control_rx.try_recv(), Ok(AttachControl::Switch(_))),
-        "Escape exit should refresh the attached client"
-    );
+    let _ = recv_matching_attach_control(&mut control_rx, "Escape exit refresh", |control| {
+        matches!(control, AttachControl::Switch(_))
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -465,7 +465,7 @@ async fn attached_copy_mode_u_refresh_renders_history_backing() {
         Response::CopyMode(_)
     ));
 
-    let frame = take_render_frame(control_rx.try_recv().expect("copy-mode -u refresh"));
+    let frame = recv_render_frame(&mut control_rx, "copy-mode -u refresh").await;
     assert!(
         frame.contains("copy-u-line-12"),
         "copy-mode -u attached refresh should render history-backed copy-mode content, got {frame:?}"
@@ -509,7 +509,7 @@ async fn attached_copy_mode_refresh_renders_tmux_position_indicator() {
         Response::CopyMode(_)
     ));
 
-    let frame = take_render_frame(control_rx.try_recv().expect("copy-mode refresh"));
+    let frame = recv_render_frame(&mut control_rx, "copy-mode refresh").await;
     assert!(
         frame.contains("[0/0]"),
         "copy-mode attached refresh should render tmux position indicator, got {frame:?}"

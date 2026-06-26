@@ -47,6 +47,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ env.RELEASE_REF }}
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
@@ -144,6 +145,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ env.RELEASE_REF }}
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
@@ -308,6 +310,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ env.RELEASE_REF }}
+          persist-credentials: false
 
       - name: Build snap
         id: snapcraft
@@ -343,6 +346,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ env.RELEASE_REF }}
+          persist-credentials: false
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -483,7 +487,13 @@ jobs:
             --checksums release-assets/SHA256SUMS \
             --output-dir target/package-managers/chocolatey/rmux
           if command -v ruby >/dev/null 2>&1; then
-            ruby -rjson -e 'manifest = JSON.parse(File.read(ARGV.fetch(0))); abort "missing Scoop vcredist2022 dependency" unless manifest["depends"] == "vcredist2022"' target/package-managers/scoop/rmux.json
+            ruby -rjson -e '
+              manifest = JSON.parse(File.read(ARGV.fetch(0)))
+              abort "missing Scoop vcredist2022 dependency" unless manifest["depends"] == "vcredist2022"
+              bin = manifest["bin"].is_a?(Array) ? manifest["bin"] : [manifest["bin"]]
+              missing = ["rmux.exe", "rmux-daemon.exe"] - bin
+              abort "missing Scoop bin entries: #{missing.join(", ")}" unless missing.empty?
+            ' target/package-managers/scoop/rmux.json
           fi
           grep -F '<dependency id="vcredist140" />' target/package-managers/chocolatey/rmux/rmux.nuspec
 
@@ -741,6 +751,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ env.RELEASE_REF }}
+          persist-credentials: false
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -800,6 +811,11 @@ jobs:
             throw "Invalid release ref: $env:RELEASE_REF"
           }
           "VERSION=$($env:RELEASE_REF.Substring(1))" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ env.RELEASE_REF }}
+          persist-credentials: false
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -861,6 +877,8 @@ jobs:
           if ($versionOutput -ne "rmux $version") {
             throw "Unexpected rmux version from Chocolatey install: $versionOutput"
           }
+
+          .\scripts\smoke-installed-rmux.ps1 -Rmux rmux -RequireDaemonCommand
 
           choco uninstall rmux --yes --no-progress
           "CHOCOLATEY_PACKAGE=$package" | Out-File -FilePath $env:GITHUB_ENV -Append

@@ -10,7 +10,7 @@ use rmux_proto::{
 
 use crate::pane_terminals::session_not_found;
 
-use super::tokens::CommandTokens;
+use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
 use super::values::{missing_argument, unsupported_flag};
 use super::{
     implicit_session_name, implicit_window_target, parse_new_window_target_argument,
@@ -223,7 +223,49 @@ pub(super) fn parse_new_window(
                 let _ = args.optional();
                 detached = true;
             }
-            _ => break,
+            token => {
+                let Some(cluster) = parse_compact_flag_cluster(token, "abd", "cetn") else {
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('a') => after = true,
+                        CompactFlag::Bare('b') => before = true,
+                        CompactFlag::Bare('d') => detached = true,
+                        CompactFlag::Bare(flag) => {
+                            return Err(unsupported_flag("new-window", &format!("-{flag}")));
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'c', .. } => {
+                            start_directory = Some(PathBuf::from(
+                                compact_flag.value_or_next(&mut args, "-c start-directory")?,
+                            ));
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'e', .. } => {
+                            environment
+                                .push(compact_flag.value_or_next(&mut args, "-e name=value")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            let raw_target = compact_flag.value_or_next(&mut args, "-t target")?;
+                            target_has_signed_window_part =
+                                signed_window_target_session_part(&raw_target).is_some();
+                            let (session_name, window_index) = parse_new_window_target_argument(
+                                raw_target,
+                                sessions,
+                                find_context,
+                            )?;
+                            target = Some(session_name);
+                            target_window_index = window_index;
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'n', .. } => {
+                            name = Some(compact_flag.value_or_next(&mut args, "-n name")?);
+                        }
+                        CompactFlag::Value { flag, .. } => {
+                            return Err(unsupported_flag("new-window", &format!("-{flag}")));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -352,7 +394,28 @@ pub(super) fn parse_kill_window(
                     args.required("-t target")?,
                 )?);
             }
-            flag if flag.starts_with('-') => return Err(unsupported_flag("kill-window", flag)),
+            flag if flag.starts_with('-') => {
+                let Some(cluster) = parse_compact_flag_cluster(flag, "a", "t") else {
+                    return Err(unsupported_flag("kill-window", flag));
+                };
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('a') => kill_all_others = true,
+                        CompactFlag::Bare(flag) => {
+                            return Err(unsupported_flag("kill-window", &format!("-{flag}")));
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target = Some(parse_window_target(
+                                "kill-window",
+                                compact_flag.value_or_next(&mut args, "-t target")?,
+                            )?);
+                        }
+                        CompactFlag::Value { flag, .. } => {
+                            return Err(unsupported_flag("kill-window", &format!("-{flag}")));
+                        }
+                    }
+                }
+            }
             _ => {
                 return Err(RmuxError::Server(format!(
                     "unexpected argument '{token}' for kill-window"

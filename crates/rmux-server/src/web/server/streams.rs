@@ -6,6 +6,8 @@ use std::time::{Duration, SystemTime};
 
 use rmux_core::events::OutputCursorItem;
 use rmux_core::PaneId;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, Instant, MissedTickBehavior, Sleep};
 use tracing::{debug, info};
 
@@ -32,7 +34,7 @@ const SESSION_INTERACTIVE_MAX_WAIT: Duration = Duration::from_millis(32);
 
 pub(super) async fn serve_pane_loop(
     handler: Arc<RequestHandler>,
-    mut socket: EncryptedWebSocketReader,
+    socket: EncryptedWebSocketReader,
     outbound: WebSocketOutbound,
     share_id: String,
     mut pane: WebPaneStream,
@@ -57,6 +59,7 @@ pub(super) async fn serve_pane_loop(
         .unwrap_or_else(|| Duration::from_secs(365 * 24 * 60 * 60));
     let ttl_sleep = sleep(ttl_delay);
     tokio::pin!(ttl_sleep);
+    let mut inbound = WebSocketReadPump::new(socket);
 
     loop {
         tokio::select! {
@@ -92,8 +95,11 @@ pub(super) async fn serve_pane_loop(
                     }
                 }
             }
-            message = socket.read_message() => {
-                match message? {
+            message = inbound.recv() => {
+                let Some(message) = message? else {
+                    return Ok(());
+                };
+                match message {
                     WebSocketMessage::Text(text) => {
                         if !rate_limiter.try_acquire() {
                             info!(share_id = %share_id, "web_share_client_text_rate_limit_hit");
@@ -171,6 +177,43 @@ pub(super) async fn serve_pane_loop(
     }
 }
 
+struct WebSocketReadPump {
+    messages: mpsc::Receiver<io::Result<WebSocketMessage>>,
+    task: JoinHandle<()>,
+}
+
+impl WebSocketReadPump {
+    fn new(mut socket: EncryptedWebSocketReader) -> Self {
+        let (tx, messages) = mpsc::channel(16);
+        let task = tokio::spawn(async move {
+            loop {
+                let result = socket.read_message().await;
+                let should_stop = matches!(result, Err(_) | Ok(WebSocketMessage::Close));
+                if tx.send(result).await.is_err() {
+                    break;
+                }
+                if should_stop {
+                    break;
+                }
+            }
+        });
+        Self { messages, task }
+    }
+
+    async fn recv(&mut self) -> io::Result<Option<WebSocketMessage>> {
+        match self.messages.recv().await {
+            Some(result) => result.map(Some),
+            None => Ok(None),
+        }
+    }
+}
+
+impl Drop for WebSocketReadPump {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 async fn queue_fresh_pane_snapshot(
     handler: &RequestHandler,
     outbound: &WebSocketOutbound,
@@ -188,7 +231,7 @@ async fn queue_fresh_pane_snapshot(
 
 pub(super) async fn serve_session_loop(
     handler: Arc<RequestHandler>,
-    mut socket: EncryptedWebSocketReader,
+    socket: EncryptedWebSocketReader,
     outbound: WebSocketOutbound,
     share_id: String,
     mut session: WebSessionStream,
@@ -212,6 +255,7 @@ pub(super) async fn serve_session_loop(
     let mut snapshot_pending = false;
     let mut view_pending = false;
     let mut pending_started_at = None;
+    let mut inbound = WebSocketReadPump::new(socket);
 
     loop {
         tokio::select! {
@@ -255,8 +299,11 @@ pub(super) async fn serve_session_loop(
                     }
                 }
             }
-            message = socket.read_message() => {
-                match message? {
+            message = inbound.recv() => {
+                let Some(message) = message? else {
+                    return Ok(());
+                };
+                match message {
                     WebSocketMessage::Text(text) => {
                         if !rate_limiter.try_acquire() {
                             info!(share_id = %share_id, "web_share_client_text_rate_limit_hit");

@@ -318,6 +318,88 @@ async fn render_frames_flush_while_stream_stays_busy() -> Result<(), Box<dyn std
 }
 
 #[tokio::test]
+async fn mouse_sequences_toggle_windows_console_mouse_actions(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut scenario = AttachScenario::new(RecordingActions::default());
+    let actions = scenario.actions.clone();
+    let mut server = scenario.take_server();
+
+    write_server_message(
+        &mut server,
+        AttachMessage::Data(b"\x1b[?1006h\x1b[?1000h\x1b[?1002h".to_vec()),
+    )
+    .await?;
+    actions
+        .wait_for_call("mouse:true", Duration::from_secs(1))
+        .await?;
+
+    write_server_message(
+        &mut server,
+        AttachMessage::Data(b"\x1b[?1002l\x1b[?1000l\x1b[?1006l".to_vec()),
+    )
+    .await?;
+    actions
+        .wait_for_call("mouse:false", Duration::from_secs(1))
+        .await?;
+
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    scenario.join().await?;
+
+    assert_eq!(
+        actions.calls(),
+        vec!["mouse:true", "mouse:false", "detach-kill"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn split_mouse_sequence_toggles_windows_console_mouse(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut scenario = AttachScenario::new(RecordingActions::default());
+    let actions = scenario.actions.clone();
+    let mut server = scenario.take_server();
+
+    write_server_message(&mut server, AttachMessage::Data(b"\x1b[?10".to_vec())).await?;
+    write_server_message(&mut server, AttachMessage::Data(b"06h".to_vec())).await?;
+    actions
+        .wait_for_call("mouse:true", Duration::from_secs(1))
+        .await?;
+
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    scenario.join().await?;
+
+    assert_eq!(actions.calls(), vec!["mouse:true", "detach-kill"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn mouse_all_sequences_toggle_windows_console_mouse_actions(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut scenario = AttachScenario::new(RecordingActions::default());
+    let actions = scenario.actions.clone();
+    let mut server = scenario.take_server();
+
+    write_server_message(&mut server, AttachMessage::Data(b"\x1b[?1003h".to_vec())).await?;
+    actions
+        .wait_for_call("mouse:true", Duration::from_secs(1))
+        .await?;
+
+    write_server_message(&mut server, AttachMessage::Data(b"\x1b[?1003l".to_vec())).await?;
+    actions
+        .wait_for_call("mouse:false", Duration::from_secs(1))
+        .await?;
+
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    scenario.join().await?;
+
+    assert_eq!(
+        actions.calls(),
+        vec!["mouse:true", "mouse:false", "detach-kill"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn split_detached_banner_marks_stream_stopped_before_eof(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut scenario = AttachScenario::new(RecordingActions::default());
@@ -513,6 +595,14 @@ impl AttachActionExecutor for RecordingActions {
         if !self.lock_blocks_for.is_zero() {
             std::thread::sleep(self.lock_blocks_for);
         }
+        Ok(())
+    }
+
+    fn handle_mouse_input_enabled(
+        &mut self,
+        enabled: bool,
+    ) -> std::result::Result<(), crate::ClientError> {
+        self.push(format!("mouse:{enabled}"));
         Ok(())
     }
 

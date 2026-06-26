@@ -129,6 +129,20 @@ function AssertManifestValue([string]$Key, [string]$Expected) {
     }
 }
 
+function AssertManifestSchema([string]$ExpectedType) {
+    $expectedSchema = "https://aka.ms/winget-manifest.$ExpectedType.1.10.0.schema.json"
+    foreach ($line in $script:manifestLines) {
+        if ($line -match '^\s*#\s*yaml-language-server:\s*\$schema=(\S+)\s*$') {
+            $actualSchema = $Matches[1]
+            if ($actualSchema -ne $expectedSchema) {
+                Fail "unexpected yaml-language-server schema in ${script:currentManifest}: expected '$expectedSchema', got '$actualSchema'"
+            }
+            return
+        }
+    }
+    Fail "missing yaml-language-server schema in ${script:currentManifest}"
+}
+
 function AssertManifestLine([string]$Expected) {
     foreach ($line in $script:manifestLines) {
         if ($line.Trim() -eq $Expected) {
@@ -187,6 +201,7 @@ $expectedSha256 = ReadChecksum $Checksums $asset
 $owner = $Repository.Split('/')[0]
 
 UseManifest $versionManifest
+AssertManifestSchema "version"
 AssertManifestValue "PackageIdentifier" $Identifier
 AssertManifestValue "PackageVersion" $versionValue
 AssertManifestValue "DefaultLocale" "en-US"
@@ -194,6 +209,7 @@ AssertManifestValue "ManifestType" "version"
 AssertManifestValue "ManifestVersion" "1.10.0"
 
 UseManifest $installerManifest
+AssertManifestSchema "installer"
 AssertManifestValue "PackageIdentifier" $Identifier
 AssertManifestValue "PackageVersion" $versionValue
 AssertManifestValue "InstallerType" "zip"
@@ -222,6 +238,7 @@ if (-not [string]::IsNullOrWhiteSpace($expectedSha256) -and $actualSha256.ToLowe
 }
 
 UseManifest $localeManifest
+AssertManifestSchema "defaultLocale"
 AssertManifestValue "PackageIdentifier" $Identifier
 AssertManifestValue "PackageVersion" $versionValue
 AssertManifestValue "PackageLocale" "en-US"

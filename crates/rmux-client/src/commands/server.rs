@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::Path;
 
 use rmux_proto::{
@@ -83,4 +84,22 @@ pub enum StartServerError {
     Client(ClientError),
     /// Auto-starting the server failed.
     AutoStart(AutoStartError),
+}
+
+impl fmt::Display for StartServerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Client(error) => fmt::Display::fmt(error, formatter),
+            Self::AutoStart(error) => fmt::Display::fmt(error, formatter),
+        }
+    }
+}
+
+impl std::error::Error for StartServerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Client(error) => Some(error),
+            Self::AutoStart(error) => Some(error),
+        }
+    }
 }

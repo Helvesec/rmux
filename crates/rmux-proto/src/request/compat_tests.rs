@@ -418,6 +418,129 @@ fn new_session_ext_request_deserializes_old_payloads_with_defaulted_fields() {
 }
 
 #[test]
+fn new_session_ext_request_map_deserialize_respects_defaulted_fields() {
+    let decoded: NewSessionExtRequest =
+        serde_json::from_str(r#"{"detached":false}"#).expect("sparse map decodes");
+
+    assert_eq!(decoded.session_name, None);
+    assert_eq!(decoded.working_directory, None);
+    assert!(!decoded.detached);
+    assert_eq!(decoded.size, None);
+    assert_eq!(decoded.environment, None);
+    assert_eq!(decoded.group_target, None);
+    assert!(!decoded.attach_if_exists);
+    assert!(!decoded.detach_other_clients);
+    assert!(!decoded.kill_other_clients);
+    assert_eq!(decoded.flags, None);
+    assert_eq!(decoded.window_name, None);
+    assert!(!decoded.print_session_info);
+    assert_eq!(decoded.print_format, None);
+    assert_eq!(decoded.command, None);
+    assert_eq!(decoded.process_command, None);
+    assert_eq!(decoded.client_environment, None);
+    assert!(!decoded.skip_environment_update);
+
+    let error = serde_json::from_str::<NewSessionExtRequest>("{}")
+        .expect_err("detached remains required for sparse maps");
+    assert!(
+        error.to_string().contains("missing field `detached`"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn request_map_deserialize_respects_option_and_default_fields() {
+    let session = session_name("alpha");
+    let window_target = WindowTarget::with_window(session.clone(), 1);
+    let pane_target = PaneTarget::with_window(session.clone(), 1, 2);
+    let split_target = SplitWindowTarget::Pane(pane_target.clone());
+
+    let new_window: NewWindowRequest =
+        serde_json::from_str(&format!(r#"{{"target":"{}","detached":false}}"#, session))
+            .expect("sparse new-window map decodes");
+    assert_eq!(new_window.name, None);
+    assert_eq!(new_window.environment, None);
+    assert_eq!(new_window.command, None);
+    assert_eq!(new_window.start_directory, None);
+    assert_eq!(new_window.target_window_index, None);
+    assert!(!new_window.insert_at_target);
+    assert_eq!(new_window.process_command, None);
+
+    let respawn_window: RespawnWindowRequest = serde_json::from_value(serde_json::json!({
+        "target": window_target,
+    }))
+    .expect("sparse respawn-window map decodes");
+    assert!(!respawn_window.kill);
+    assert_eq!(respawn_window.environment, None);
+    assert_eq!(respawn_window.command, None);
+    assert_eq!(respawn_window.start_directory, None);
+
+    let move_window: MoveWindowRequest = serde_json::from_value(serde_json::json!({
+        "target": MoveWindowTarget::Session(session.clone()),
+        "renumber": true,
+        "kill_destination": false,
+        "detached": false,
+    }))
+    .expect("sparse move-window map decodes");
+    assert_eq!(move_window.source, None);
+    assert!(!move_window.after);
+    assert!(!move_window.before);
+
+    let display: DisplayMessageRequest =
+        serde_json::from_str(r#"{"print":true}"#).expect("sparse display-message map decodes");
+    assert_eq!(display.target, None);
+    assert_eq!(display.message, None);
+    assert!(!display.empty_target_context);
+
+    let display_ext: DisplayMessageExtRequest =
+        serde_json::from_str(r#"{"print":false}"#).expect("sparse display-message-ext map decodes");
+    assert_eq!(display_ext.target, None);
+    assert_eq!(display_ext.message, None);
+    assert_eq!(display_ext.target_client, None);
+    assert!(!display_ext.empty_target_context);
+
+    let set_option: SetOptionByNameRequest = serde_json::from_value(serde_json::json!({
+        "scope": OptionScopeSelector::SessionGlobal,
+        "name": "@probe",
+        "mode": SetOptionMode::Replace,
+        "only_if_unset": false,
+        "unset": false,
+        "unset_pane_overrides": false,
+    }))
+    .expect("sparse set-option-by-name map decodes");
+    assert_eq!(set_option.value, None);
+    assert!(!set_option.format);
+    assert_eq!(set_option.format_target, None);
+
+    let split: SplitWindowExtRequest = serde_json::from_value(serde_json::json!({
+        "target": split_target,
+        "direction": SplitDirection::Horizontal,
+    }))
+    .expect("sparse split-window-ext map decodes");
+    assert!(!split.before);
+    assert_eq!(split.environment, None);
+    assert_eq!(split.command, None);
+    assert_eq!(split.process_command, None);
+    assert_eq!(split.start_directory, None);
+    assert_eq!(split.keep_alive_on_exit, None);
+    assert!(!split.detached);
+    assert_eq!(split.size, None);
+    assert!(!split.preserve_zoom);
+    assert!(!split.full_size);
+    assert_eq!(split.stdin_payload, None);
+
+    let respawn_pane: RespawnPaneRequest = serde_json::from_value(serde_json::json!({
+        "target": pane_target,
+    }))
+    .expect("sparse respawn-pane map decodes");
+    assert!(!respawn_pane.kill);
+    assert_eq!(respawn_pane.start_directory, None);
+    assert_eq!(respawn_pane.environment, None);
+    assert_eq!(respawn_pane.command, None);
+    assert_eq!(respawn_pane.process_command, None);
+}
+
+#[test]
 fn show_options_request_deserializes_old_payloads_with_defaulted_fields() {
     let scope = OptionScopeSelector::SessionGlobal;
     let bytes = bincode::serialize(&OldShowOptionsRequest {

@@ -34,7 +34,7 @@
   <a href="#verification"><img src="https://img.shields.io/badge/unsafe-restricted-success.svg" alt="Unsafe policy"></a>
   <a href="https://github.com/Helvesec/rmux/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/Helvesec/rmux/ci.yml?branch=main&amp;event=push&amp;label=CI" alt="CI"></a>
   <a href="https://www.bestpractices.dev/projects/13290"><img src="https://www.bestpractices.dev/projects/13290/badge" alt="OpenSSF Best Practices"></a>
-  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/rmux-0.7.0-informational.svg" alt="rmux 0.7.0"></a>
+  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.7.1"><img src="https://img.shields.io/badge/rmux-0.7.1-informational.svg" alt="rmux 0.7.1"></a>
 </p>
 
 </div>
@@ -126,9 +126,13 @@ rmux web-share --help
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/linux.svg"><img src="../install/linux-light.svg" width="28" alt="Linux"></picture> <picture><source media="(prefers-color-scheme: dark)" srcset="../install/apple.svg"><img src="../install/apple-light.svg" width="28" alt="macOS"></picture> / Nix | `nix profile install github:Helvesec/rmux` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/rust.svg"><img src="../install/rust-light.svg" width="28" alt="Rust"></picture> / Cargo | `cargo install rmux --locked` |
 
-直接下载（`.tar.gz`、`.deb`、`.rpm`、`.zip`）可在 [v0.7.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.7.0) 获取。
+直接下载（`.tar.gz`、`.deb`、`.rpm`、`.zip`）可在 [v0.7.1 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.7.1) 获取。
 
 包管理器在注册表审核新版本时可能会滞后；直接下载和 rmux.io 安装器会跟随当前 GitHub Release。
+
+对于 Unix `.tar.gz` 直接下载，请在解压后的归档目录中运行
+`./install.sh --prefix ~/.local`。该安装器会保留所需的 `bin/` 和
+`libexec/` 布局，确保轻量公开 CLI 始终能找到完整 helper。
 
 发布包可能会为常用的 detached 命令使用轻量公开 CLI，并为复杂的 tmux 兼容命令形式使用私有完整 CLI helper。Windows 包将 `rmux.exe` 作为轻量 dispatcher，并把完整 CLI 放在 `libexec/rmux/rmux.exe` 下。诊断 CLI 兼容性问题时，可设置 `RMUX_DISABLE_TINY_CLI=1` 强制使用完整 helper。
 
@@ -262,9 +266,9 @@ fn render(snapshot: PaneSnapshot, area: Rect, buffer: &mut Buffer) {
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://rmux.io/rmux-architecture-dark.png?v=0.7.0-web-share">
-  <source media="(prefers-color-scheme: light)" srcset="https://rmux.io/rmux-architecture-light.png?v=0.7.0-web-share">
-  <img src="https://rmux.io/rmux-architecture-dark.png?v=0.7.0-web-share" alt="RMUX 运行时架构" width="800">
+  <source media="(prefers-color-scheme: dark)" srcset="https://rmux.io/rmux-architecture-dark.png?v=0.7.1-web-share">
+  <source media="(prefers-color-scheme: light)" srcset="https://rmux.io/rmux-architecture-light.png?v=0.7.1-web-share">
+  <img src="https://rmux.io/rmux-architecture-dark.png?v=0.7.1-web-share" alt="RMUX 运行时架构" width="800">
 </picture>
 
 </div>

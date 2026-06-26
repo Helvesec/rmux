@@ -33,7 +33,7 @@ async fn attached_copy_mode_u_attach_render_matches_mode_capture_source() {
         Response::CopyMode(_)
     ));
 
-    let frame = take_render_frame(control_rx.try_recv().expect("copy-mode -u refresh"));
+    let frame = recv_render_frame(&mut control_rx, "copy-mode -u refresh").await;
     let mode_capture = {
         let response = handler
             .handle(Request::CapturePane(Box::new(CapturePaneRequest {
@@ -139,7 +139,7 @@ async fn attached_mouse_drag_copy_mode_refresh_keeps_prompt_visible() {
         Response::CopyMode(_)
     ));
 
-    let frame = take_render_frame(control_rx.try_recv().expect("copy-mode mouse refresh"));
+    let frame = recv_render_frame(&mut control_rx, "copy-mode mouse refresh").await;
     let mode_capture = {
         let response = handler
             .handle(Request::CapturePane(Box::new(CapturePaneRequest {

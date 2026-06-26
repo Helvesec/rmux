@@ -228,10 +228,10 @@ async fn detach_client_all_other_detaches_only_non_requester_clients() {
         matches!(first_rx.try_recv(), Err(TryRecvError::Empty)),
         "the requester itself must not be detached"
     );
-    assert!(
-        matches!(second_rx.try_recv(), Ok(AttachControl::Detach)),
-        "the other client must receive a detach control"
-    );
+    let _ = recv_matching_attach_control(&mut second_rx, "other client detach", |control| {
+        matches!(control, AttachControl::Detach)
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -266,10 +266,10 @@ async fn suspend_client_marks_client_as_suspended() {
         .await
         .response;
     assert!(matches!(response, Response::SuspendClient(_)));
-    assert!(
-        matches!(control_rx.try_recv(), Ok(AttachControl::Suspend)),
-        "suspend-client must emit Suspend control"
-    );
+    let _ = recv_matching_attach_control(&mut control_rx, "suspend-client control", |control| {
+        matches!(control, AttachControl::Suspend)
+    })
+    .await;
 
     {
         let active_attach = handler.active_attach.lock().await;

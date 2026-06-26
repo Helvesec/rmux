@@ -16,6 +16,16 @@ fn truncation_with_marker() {
     );
 }
 
+#[test]
+fn negative_modifier_bounds_do_not_overflow() {
+    assert_eq!(signed_i32_abs_usize(i32::MIN), 2_147_483_648);
+    assert_eq!(bounded_format_padding_width(i32::MIN), FORMAT_PADDING_LIMIT);
+    assert_eq!(
+        render_template("#{=-2147483648:session_name}", &StaticWindowValues),
+        "alpha"
+    );
+}
+
 // -----------------------------------------------------------------------
 // New tests — substitution
 // -----------------------------------------------------------------------

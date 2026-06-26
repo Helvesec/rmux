@@ -133,7 +133,8 @@ pub(super) fn full_helper_path() -> Result<PathBuf, String> {
     }
 
     let current = env::current_exe().map_err(|error| error.to_string())?;
-    if let Some(path) = helper_from_executable_path(&current) {
+    let resolved = std::fs::canonicalize(&current).ok();
+    if let Some(path) = helper_from_executable_paths(&current, resolved.as_deref()) {
         return Ok(path);
     }
 
@@ -155,6 +156,10 @@ fn helper_from_executable_path(current: &Path) -> Option<PathBuf> {
     full_helper_candidates(current)
         .into_iter()
         .find(|candidate| candidate.is_file() && candidate.as_path() != current)
+}
+
+fn helper_from_executable_paths(current: &Path, resolved: Option<&Path>) -> Option<PathBuf> {
+    helper_from_executable_path(current).or_else(|| resolved.and_then(helper_from_executable_path))
 }
 
 fn full_helper_candidates(current_exe: &Path) -> Vec<PathBuf> {
@@ -208,15 +213,80 @@ fn daemon_file_name() -> OsString {
     name
 }
 
-#[cfg(all(test, not(windows)))]
+#[cfg(test)]
 mod tests {
     use std::env;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{daemon_file_name, daemon_from_executable_path, helper_file_name};
+    #[cfg(not(windows))]
+    use super::{daemon_file_name, daemon_from_executable_path};
+    use super::{helper_file_name, helper_from_executable_paths};
+
+    fn temp_root(name: &str) -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "rmux-tiny-helper-{name}-{}-{timestamp}",
+            std::process::id()
+        ))
+    }
 
     #[test]
+    fn full_helper_falls_back_to_resolved_executable_layout() {
+        let root = temp_root("resolved");
+        let links = root.join("links");
+        let install = root.join("package");
+        let libexec = install.join("libexec").join("rmux");
+        std::fs::create_dir_all(&links).expect("create links");
+        std::fs::create_dir_all(&libexec).expect("create libexec");
+
+        let alias = links.join(helper_file_name());
+        let public = install.join(helper_file_name());
+        let full = libexec.join(helper_file_name());
+        std::fs::write(&alias, b"alias").expect("write alias");
+        std::fs::write(&public, b"public").expect("write public");
+        std::fs::write(&full, b"full").expect("write full");
+
+        assert_eq!(
+            helper_from_executable_paths(&alias, Some(&public)),
+            Some(full)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn full_helper_prefers_current_executable_layout_before_resolved_layout() {
+        let root = temp_root("current-first");
+        let links_libexec = root.join("links").join("libexec").join("rmux");
+        let install_libexec = root.join("package").join("libexec").join("rmux");
+        std::fs::create_dir_all(&links_libexec).expect("create links libexec");
+        std::fs::create_dir_all(&install_libexec).expect("create install libexec");
+
+        let alias = root.join("links").join(helper_file_name());
+        let public = root.join("package").join(helper_file_name());
+        let links_full = links_libexec.join(helper_file_name());
+        let install_full = install_libexec.join(helper_file_name());
+        std::fs::write(&alias, b"alias").expect("write alias");
+        std::fs::write(&public, b"public").expect("write public");
+        std::fs::write(&links_full, b"links full").expect("write links full");
+        std::fs::write(&install_full, b"install full").expect("write install full");
+
+        assert_eq!(
+            helper_from_executable_paths(&alias, Some(&public)),
+            Some(links_full)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
     fn daemon_candidate_prefers_packaged_bin_sibling() {
-        let root = env::temp_dir().join(format!("rmux-tiny-helper-test-{}", std::process::id()));
+        let root = temp_root("daemon");
         let bin = root.join("bin");
         let libexec = root.join("libexec").join("rmux");
         std::fs::create_dir_all(&bin).expect("create bin");

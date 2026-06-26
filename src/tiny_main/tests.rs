@@ -435,10 +435,15 @@ fn tiny_tmux_invocation_honors_internal_override() {
         &os_args(&["rmux", "list-sessions"]),
         Some(OsStr::new("1")),
     ));
-    assert!(!invoked_as_tmux_from(
-        &os_args(&["rmux", "list-sessions"]),
-        Some(OsStr::new("")),
-    ));
+    for value in ["", "0", "true", "yes"] {
+        assert!(
+            !invoked_as_tmux_from(
+                &os_args(&["rmux", "list-sessions"]),
+                Some(OsStr::new(value))
+            ),
+            "internal tmux override should require exactly 1, got {value:?}"
+        );
+    }
 }
 
 #[cfg(windows)]
@@ -636,7 +641,12 @@ fn resize_pane_relative_numeric_delta_is_tiny_parseable() {
 
 #[test]
 fn resize_pane_conflicting_adjustments_fall_back_to_helper() {
-    for args in [["-R", "10", "-t", "0"].as_slice(), ["-R", "0"].as_slice()] {
+    for args in [
+        ["-R", "10", "-t", "0"].as_slice(),
+        ["-R", "0"].as_slice(),
+        ["-R", "-x", "80", "-t", "0"].as_slice(),
+        ["-x", "80", "-R", "-t", "0"].as_slice(),
+    ] {
         assert!(
             parse_resize_pane(&os_args(args)).is_none(),
             "{args:?} should stay on the canonical helper path"
@@ -649,7 +659,6 @@ fn resize_pane_repeated_adjustments_follow_tmux_last_wins() {
     for args in [
         ["-R", "-L", "-t", "0"].as_slice(),
         ["-Z", "-R", "-t", "0"].as_slice(),
-        ["-R", "-x", "80", "-t", "0"].as_slice(),
     ] {
         assert!(
             parse_resize_pane(&os_args(args)).is_some(),

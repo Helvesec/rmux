@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.7.1
+
+### Security
+
+- Escaped control-mode window and paste-buffer names before emitting
+  notifications, preventing injected control frames from newline-bearing names.
+- Rejected overflowing and non-minimal varint frame lengths in the protocol
+  decoder while preserving the existing minimal encoder output.
+- Preserved UTF-8 character boundaries when truncating WebSocket close reasons.
+- Capped negative format padding widths before allocation to avoid pathological
+  padding requests.
+- Disabled persisted GitHub checkout credentials in the release workflow.
+
+### Reliability
+
+- Added panic-safe connection cleanup so subscriptions and SDK waits are removed
+  even if a connection task unwinds.
+- Added a Unix archive installer that preserves the tiny/full `bin` and
+  `libexec` layout and installs the public tiny binary last during upgrades.
+- Made connection subscription/wait cleanup tolerate poisoned cleanup locks.
+- Spawned popup waiters before popup readers so popup children are reaped even
+  if reader setup fails.
+- Relaxed the Windows ConPTY Ctrl-D timeout smoke when the host leaves
+  `timeout.exe` running, preserving coverage without failing on runner-specific
+  behavior.
+- Resolved tiny CLI helpers through canonical executable paths, covering
+  portable aliases such as WinGet Links while keeping packaged layouts first.
+- Resolved hidden daemon siblings through canonical executable paths so portable
+  aliases can cold-start the packaged daemon directly.
+- Resolved SDK daemon candidates from installed `rmux` binaries before falling
+  back to PATH names, avoiding extra tiny-helper hops in portable layouts.
+
+### Compatibility
+
+- Restored sparse-map deserialization defaults for `NewSessionExtRequest` and
+  related request types without changing the bincode wire layout.
+- Added a defensive `with-session` empty-command guard before lease creation.
+- Matched tmux control-mode escaping for DEL and fixed HEAD responses to omit
+  bodies.
+- Corrected `input-buffer-size` validation and rejected bare non-boolean choice
+  toggles such as `set -g mode-keys`.
+- Added `Display` and `Error` implementations for `StartServerError`, and
+  corrected public split-direction documentation.
+- Shared detected client terminal features between the full and tiny attach
+  paths, including Windows Terminal rendering and input capabilities.
+- Improved SDK and CLI daemon startup diagnostics when no daemon binary can be
+  found or a hidden daemon exits before creating its endpoint.
+
+### CI
+
+- Bumped release-facing versions to `0.7.1` across Cargo workspace metadata,
+  `Cargo.lock`, the manpage, snap metadata, README download links, and localized
+  README files.
+- Added a Windows package smoke that exercises portable alias fallback, PATH
+  resolution, and daemon startup from a WinGet-like Links layout.
+- Exposed `rmux-daemon` in the Scoop manifest and expanded package-manager
+  metadata smokes to cover the installed daemon path.
+- Added reusable installed-package smokes that force the tiny helper fallback
+  before exercising daemon startup.
+- Extended Unix archive verification to install the archive into a temporary
+  prefix and smoke the installed `bin/rmux` through its packaged helper.
+
 ## 0.7.0
 
 - Added the tiny public CLI package layout for hot detached commands, with the

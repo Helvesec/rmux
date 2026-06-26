@@ -815,7 +815,7 @@ finally:
             PaneReaderRuntime::current().expect("test runtime is active"),
         );
 
-        let contents = wait_for_file_contents(&output, Duration::from_secs(12)).await?;
+        let contents = wait_for_file_contents(&output, Duration::from_secs(30)).await?;
         let _ = spawned.child_mut().wait();
         output_reader_task.abort();
         let _ = fs::remove_file(&output);

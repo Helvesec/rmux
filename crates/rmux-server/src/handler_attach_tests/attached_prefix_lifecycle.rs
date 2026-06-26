@@ -26,14 +26,10 @@ async fn attached_prefix_d_dispatches_detach_client() {
     // Entering and leaving the prefix key table now repaints the status bar
     // (so #{client_prefix} can show a prefix indicator), so the Detach control
     // may be preceded by status-refresh Write frames; scan past them.
-    let mut detached = false;
-    while let Ok(control) = control_rx.try_recv() {
-        if matches!(control, AttachControl::Detach) {
-            detached = true;
-            break;
-        }
-    }
-    assert!(detached, "C-b d must detach the attached client");
+    recv_matching_attach_control(&mut control_rx, "prefix d detach", |control| {
+        matches!(control, AttachControl::Detach)
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -52,17 +48,10 @@ async fn attached_prefix_d_dispatches_detach_client_across_separate_reads() {
         .await
         .expect("prefix d input");
 
-    let mut detached = false;
-    while let Ok(control) = control_rx.try_recv() {
-        if matches!(control, AttachControl::Detach) {
-            detached = true;
-            break;
-        }
-    }
-    assert!(
-        detached,
-        "C-b d must still detach when prefix and command arrive in separate reads"
-    );
+    recv_matching_attach_control(&mut control_rx, "split prefix d detach", |control| {
+        matches!(control, AttachControl::Detach)
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -172,7 +161,17 @@ async fn attached_command_prompt_can_create_window_from_same_read() {
         sleep(Duration::from_millis(25)).await;
     }
 
-    let frame = wait_for_switch_frame_containing(&mut control_rx, "ISSUE8_WINDOW_READY").await;
+    let target = PaneTarget::with_window(alpha.clone(), 1, 0);
+    wait_for_capture_containing(
+        &handler,
+        target,
+        "ISSUE8_WINDOW_READY",
+        "prompt-created window should publish its first output",
+    )
+    .await;
+    handler.refresh_attached_session(&alpha).await;
+
+    let frame = wait_for_attach_output_containing(&mut control_rx, "ISSUE8_WINDOW_READY").await;
     assert!(
         frame.contains("ISSUE8_WINDOW_READY"),
         "prompt-created window must render its first output, got {frame:?}"
@@ -350,20 +349,26 @@ async fn wait_for_switch_frame_containing(
     control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
     expected: &str,
 ) -> String {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + ATTACH_LIFECYCLE_TIMEOUT;
     loop {
-        let control =
-            match tokio::time::timeout(Duration::from_millis(250), control_rx.recv()).await {
-                Ok(Some(control)) => control,
-                Ok(None) => panic!("attach refresh channel closed"),
-                Err(_) => {
-                    assert!(
-                        tokio::time::Instant::now() < deadline,
-                        "timed out waiting for attach frame containing {expected:?}"
-                    );
-                    continue;
-                }
-            };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let control = match tokio::time::timeout(
+            remaining.min(Duration::from_millis(250)),
+            control_rx.recv(),
+        )
+        .await
+        {
+            Ok(Some(control)) => control,
+            Ok(None) => panic!("attach refresh channel closed"),
+            Err(_) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out after {:?} waiting for attach frame containing {expected:?}",
+                    ATTACH_LIFECYCLE_TIMEOUT
+                );
+                continue;
+            }
+        };
         if let AttachControl::Switch(target) = control {
             let frame = String::from_utf8(target.render_frame).expect("render frame is utf-8");
             if frame.contains(expected) {
@@ -372,7 +377,56 @@ async fn wait_for_switch_frame_containing(
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "timed out waiting for attach frame containing {expected:?}"
+            "timed out after {:?} waiting for attach frame containing {expected:?}",
+            ATTACH_LIFECYCLE_TIMEOUT
+        );
+    }
+}
+
+async fn wait_for_attach_output_containing(
+    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
+    expected: &str,
+) -> String {
+    let deadline = tokio::time::Instant::now() + ATTACH_LIFECYCLE_TIMEOUT;
+    let mut seen = String::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let control = match tokio::time::timeout(
+            remaining.min(Duration::from_millis(250)),
+            control_rx.recv(),
+        )
+        .await
+        {
+            Ok(Some(control)) => control,
+            Ok(None) => panic!("attach refresh channel closed"),
+            Err(_) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out after {:?} waiting for attach output containing {expected:?}; saw {seen:?}",
+                    ATTACH_LIFECYCLE_TIMEOUT
+                );
+                continue;
+            }
+        };
+        match control {
+            AttachControl::Switch(target) => {
+                seen.push_str(&String::from_utf8_lossy(&target.render_frame));
+            }
+            AttachControl::Overlay(frame) => {
+                seen.push_str(&String::from_utf8_lossy(&frame.frame));
+            }
+            AttachControl::Write(bytes) => {
+                seen.push_str(&String::from_utf8_lossy(&bytes));
+            }
+            _ => {}
+        }
+        if seen.contains(expected) {
+            return seen;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out after {:?} waiting for attach output containing {expected:?}; saw {seen:?}",
+            ATTACH_LIFECYCLE_TIMEOUT
         );
     }
 }
@@ -433,7 +487,7 @@ async fn attached_resize_resizes_session_and_refreshes_status_frame() {
             rows: 42
         }
     );
-    let frame = take_render_frame(control_rx.try_recv().expect("resize refresh"));
+    let frame = recv_render_frame(&mut control_rx, "resize refresh").await;
     assert!(
         frame.contains("[alpha]"),
         "resize should redraw status for the attached client, got {frame:?}"
@@ -463,8 +517,8 @@ async fn attached_refresh_renders_each_client_at_its_own_size() {
         .await
         .expect("browser resize succeeds");
 
-    let local_frame = take_render_frame(local_rx.try_recv().expect("local refresh"));
-    let browser_frame = take_render_frame(browser_rx.try_recv().expect("browser refresh"));
+    let local_frame = recv_render_frame(&mut local_rx, "local refresh").await;
+    let browser_frame = recv_render_frame(&mut browser_rx, "browser refresh").await;
     assert!(
         local_frame.contains("\x1b[24;1H"),
         "local attach must keep a 24-row status line, got {local_frame:?}"
@@ -482,7 +536,7 @@ async fn attached_refresh_renders_each_client_at_its_own_size() {
         .refresh_attached_client_status(local_pid, &alpha)
         .await
         .expect("status refresh succeeds");
-    let local_status = match local_rx.try_recv().expect("local status refresh") {
+    let local_status = match recv_attach_control(&mut local_rx, "local status refresh").await {
         AttachControl::Write(bytes) => String::from_utf8(bytes).expect("status is utf-8"),
         other => panic!("expected status write, got {other:?}"),
     };

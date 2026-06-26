@@ -22,6 +22,8 @@ use rmux_server::{DaemonConfig, ServerDaemon, ServerHandle};
 static UNIQUE_ID: AtomicUsize = AtomicUsize::new(0);
 const LAG_OUTPUT_EVENT_TARGET: usize = 8;
 const LAG_OUTPUT_COMMAND: &str = "payload=$(printf '%4096s' '' | tr ' ' X); i=0; while [ \"$i\" -lt 160 ]; do printf 'rmux_subscription_lag_%04d_%s\\n' \"$i\" \"$payload\"; i=$((i+1)); done; printf rmux_subscription_lag_done";
+const LAG_OUTPUT_PUMP_ATTEMPTS: usize = 6;
+const LAG_OUTPUT_SEQUENCE_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Harness {
     runtime: tokio::runtime::Runtime,
@@ -267,9 +269,7 @@ fn slow_subscriber_batch_cap_then_lag_resumes_at_oldest_retained_event(
     let cursor_sequence = wait_for_limited_cursor(&mut subscriber, subscription.subscription_id)
         .map_err(|error| io::Error::other(format!("limited cursor failed: {error}")))?;
 
-    send_keys(&mut sender, target.clone(), LAG_OUTPUT_COMMAND)
-        .map_err(|error| io::Error::other(format!("lag send-keys failed: {error}")))?;
-    wait_for_output_sequence(
+    pump_output_until_sequence(
         &mut sender,
         target.clone(),
         cursor_sequence + u64::try_from(LAG_OUTPUT_EVENT_TARGET)?,
@@ -469,7 +469,7 @@ fn wait_for_output_sequence(
     target: PaneTarget,
     minimum_sequence: u64,
 ) -> Result<(), Box<dyn Error>> {
-    let deadline = Instant::now() + Duration::from_secs(45);
+    let deadline = Instant::now() + LAG_OUTPUT_SEQUENCE_TIMEOUT;
     let mut last_sequence = 0;
 
     while Instant::now() < deadline {
@@ -490,6 +490,24 @@ fn wait_for_output_sequence(
         thread::sleep(Duration::from_millis(25));
     }
     Err(format!("pane output sequence reached {last_sequence}, below {minimum_sequence}").into())
+}
+
+fn pump_output_until_sequence(
+    connection: &mut Connection,
+    target: PaneTarget,
+    minimum_sequence: u64,
+) -> Result<(), Box<dyn Error>> {
+    let mut last_error = String::new();
+    for attempt in 0..LAG_OUTPUT_PUMP_ATTEMPTS {
+        send_keys(connection, target.clone(), LAG_OUTPUT_COMMAND)?;
+        match wait_for_output_sequence(connection, target.clone(), minimum_sequence) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                last_error = format!("attempt {}: {error}", attempt + 1);
+            }
+        }
+    }
+    Err(last_error.into())
 }
 
 fn wait_for_output_quiescence(

@@ -67,10 +67,12 @@ async fn lock_server_skips_already_suspended_clients() {
         .handle(Request::LockServer(rmux_proto::LockServerRequest))
         .await;
     assert!(matches!(first_lock, Response::LockServer(_)));
-    match control_rx.try_recv() {
-        Ok(AttachControl::LockShellCommand(_)) => {}
-        other => panic!("expected Lock control from first lock-server, got {other:?}"),
-    }
+    recv_matching_attach_control(
+        &mut control_rx,
+        "first lock-server lock control",
+        |control| matches!(control, AttachControl::LockShellCommand(_)),
+    )
+    .await;
     assert!(
         control_rx.try_recv().is_err(),
         "unexpected extra control message after first lock"

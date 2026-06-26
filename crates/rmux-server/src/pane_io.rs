@@ -1167,20 +1167,17 @@ pub(crate) async fn forward_attach(
                                 }
                                 if interactive_output {
                                     pane_refresh.note_interactive_output();
-                                    let replaceable_render = current_target.render_stream;
                                     match current_target
                                         .live_pane
                                         .as_mut()
-                                        .map(|pane| {
-                                            pane.render_frame_from_transcript(replaceable_render)
-                                        })
+                                        .map(|pane| pane.render_interactive_frame_from_transcript())
                                     {
                                         Some(PaneRenderDelta::Incremental(delta)) => {
                                             emit_live_render_frame(
                                                 &stream,
                                                 &mut current_target,
                                                 &delta,
-                                                replaceable_render,
+                                                false,
                                             )
                                             .await?;
                                             if close_after_render {

@@ -1,6 +1,6 @@
 use rmux_core::formats::FormatContext;
 use rmux_core::{encode_paste_bytes, LifecycleEvent, Session, Window};
-use rmux_proto::{SessionName, WindowTarget};
+use rmux_proto::{octal_escape, SessionName, WindowTarget};
 
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::pane_terminals::HandlerState;
@@ -88,11 +88,17 @@ pub(crate) fn collect_control_notifications(
         }
         LifecycleEvent::PasteBufferChanged { buffer_name } => broadcast_line(
             clients,
-            Some(format!("%paste-buffer-changed {buffer_name}")),
+            Some(format!(
+                "%paste-buffer-changed {}",
+                control_arg(buffer_name)
+            )),
         ),
         LifecycleEvent::PasteBufferDeleted { buffer_name } => broadcast_line(
             clients,
-            Some(format!("%paste-buffer-deleted {buffer_name}")),
+            Some(format!(
+                "%paste-buffer-deleted {}",
+                control_arg(buffer_name)
+            )),
         ),
         LifecycleEvent::ClientAttached { .. }
         | LifecycleEvent::AlertBell { .. }
@@ -223,10 +229,14 @@ fn window_renamed_notifications(
             };
             PreparedControlNotification {
                 pid,
-                line: format!("{prefix} @{window_id} {window_name}"),
+                line: format!("{prefix} @{window_id} {}", control_arg(&window_name)),
             }
         })
         .collect()
+}
+
+fn control_arg(value: &str) -> String {
+    octal_escape(value.as_bytes())
 }
 
 fn client_session_changed_notifications(

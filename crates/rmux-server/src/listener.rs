@@ -101,10 +101,15 @@ pub(crate) async fn serve(
 
                 connection_tasks.spawn(async move {
                     let connection_id = handler.allocate_connection_id();
-                    let result = serve_connection(stream, requester, Arc::clone(&handler), connection_id, connection_shutdown, shutdown_handle).await;
-                    handler.cleanup_connection_subscriptions(connection_id).await;
-                    handler.cleanup_connection_sdk_waits(connection_id).await;
-                    result
+                    run_connection_with_cleanup(
+                        stream,
+                        requester,
+                        handler,
+                        connection_id,
+                        connection_shutdown,
+                        shutdown_handle,
+                    )
+                    .await
                 });
             }
             _ = &mut shutdown => {
@@ -189,6 +194,8 @@ async fn serve_connection(
                         continue;
                     }
                 };
+                let _requester_access_guard =
+                    handler.begin_detached_requester_access(requester.pid, can_write);
                 let mut detached_request_guard = request_counts_as_detached_activity(&request)
                     .then(|| handler.begin_detached_request());
 
@@ -322,6 +329,61 @@ async fn serve_connection(
                 return Ok(());
             }
         }
+    }
+}
+
+async fn run_connection_with_cleanup(
+    stream: LocalStream,
+    requester: PeerIdentity,
+    handler: Arc<RequestHandler>,
+    connection_id: u64,
+    shutdown: watch::Receiver<()>,
+    shutdown_handle: ShutdownHandle,
+) -> io::Result<()> {
+    let mut cleanup_guard = ConnectionCleanupGuard::new(Arc::clone(&handler), connection_id);
+    let result = serve_connection(
+        stream,
+        requester,
+        handler,
+        connection_id,
+        shutdown,
+        shutdown_handle,
+    )
+    .await;
+    cleanup_guard.cleanup_now();
+    result
+}
+
+struct ConnectionCleanupGuard {
+    handler: Arc<RequestHandler>,
+    connection_id: u64,
+    active: bool,
+}
+
+impl ConnectionCleanupGuard {
+    fn new(handler: Arc<RequestHandler>, connection_id: u64) -> Self {
+        Self {
+            handler,
+            connection_id,
+            active: true,
+        }
+    }
+
+    fn cleanup_now(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.handler
+            .cleanup_connection_subscriptions_sync(self.connection_id);
+        self.handler
+            .cleanup_connection_sdk_waits_sync(self.connection_id);
+        self.active = false;
+    }
+}
+
+impl Drop for ConnectionCleanupGuard {
+    fn drop(&mut self) {
+        self.cleanup_now();
     }
 }
 
@@ -727,20 +789,15 @@ mod tests {
         let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
         let connection_id = handler.allocate_connection_id();
         let task = tokio::spawn(async move {
-            let result = serve_connection(
+            run_connection_with_cleanup(
                 server,
                 peer,
-                Arc::clone(&handler),
+                handler,
                 connection_id,
                 shutdown_rx,
                 shutdown_handle,
             )
-            .await;
-            handler
-                .cleanup_connection_subscriptions(connection_id)
-                .await;
-            handler.cleanup_connection_sdk_waits(connection_id).await;
-            result
+            .await
         });
         Ok((client, shutdown_tx, task))
     }
@@ -823,22 +880,15 @@ mod windows_tests {
         let connection_task = tokio::spawn(async move {
             let (server, requester) = listener.accept().await?;
             let connection_id = connection_handler.allocate_connection_id();
-            let result = serve_connection(
+            run_connection_with_cleanup(
                 server,
                 requester,
-                Arc::clone(&connection_handler),
+                connection_handler,
                 connection_id,
                 connection_shutdown_rx,
                 shutdown_handle,
             )
-            .await;
-            connection_handler
-                .cleanup_connection_subscriptions(connection_id)
-                .await;
-            connection_handler
-                .cleanup_connection_sdk_waits(connection_id)
-                .await;
-            result
+            .await
         });
 
         let frame =

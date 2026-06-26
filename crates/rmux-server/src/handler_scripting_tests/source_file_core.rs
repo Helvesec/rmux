@@ -527,6 +527,59 @@ async fn nested_source_file_format_path_inherits_current_target() {
 }
 
 #[tokio::test]
+async fn queued_source_file_accepts_compact_format_target_with_attached_value() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    for session in [&alpha, &beta] {
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+    }
+
+    let root = temp_root("source-file-compact-format-target");
+    write_config(
+        &root.join("beta.conf"),
+        "display-message -p '#{session_name}'\nset-buffer -b compact-source ok\n",
+    );
+    let parsed = CommandParser::new()
+        .parse("source-file -Ftbeta:0.0 '#{session_name}.conf'")
+        .expect("source-file compact target parses");
+    let output = handler
+        .execute_parsed_commands(
+            std::process::id(),
+            parsed,
+            QueueExecutionContext::new(Some(root.clone()))
+                .with_current_target(Some(Target::Session(alpha))),
+        )
+        .await
+        .expect("source-file compact target should execute");
+
+    assert_eq!(output.stdout(), b"beta\n");
+    assert_eq!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("compact-source".to_owned()),
+            }))
+            .await
+            .command_output()
+            .expect("compact-source buffer output")
+            .stdout(),
+        b"ok"
+    );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn nested_source_file_preserves_implicit_target_canfail_behavior() {
     let handler = RequestHandler::new();
     for session in [session_name("alpha"), session_name("beta")] {

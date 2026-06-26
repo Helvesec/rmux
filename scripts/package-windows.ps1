@@ -294,6 +294,7 @@ $metadata = [ordered]@{
     generated_at_utc = $generatedAtUtc
 }
 $metadataPath = Join-Path $stageDir "share/rmux/artifact-metadata.json"
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $metadataPath) | Out-Null
 $metadata | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $metadataPath -Encoding utf8
 
 WritePackageChecksums $stageDir (Join-Path $stageDir "SHA256SUMS.txt")

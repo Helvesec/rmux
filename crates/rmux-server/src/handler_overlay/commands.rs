@@ -192,8 +192,13 @@ impl RequestHandler {
         }
 
         if let Some(job) = popup.job.clone() {
-            self.spawn_popup_reader(attach_pid, popup.id, popup.surface.clone(), job.clone())?;
-            self.spawn_popup_waiter(attach_pid, popup.id, job);
+            self.spawn_popup_waiter(attach_pid, popup.id, job.clone());
+            if let Err(error) =
+                self.spawn_popup_reader(attach_pid, popup.id, popup.surface.clone(), job.clone())
+            {
+                job.terminate();
+                return Err(error);
+            }
         }
 
         self.refresh_interactive_overlay_if_active(attach_pid)

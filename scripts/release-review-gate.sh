@@ -10,6 +10,9 @@ the bug classes that manual reviews kept finding: tiny CLI fallback boundaries,
 tmux authority cases, package layout, version drift, platform-neutrality budget,
 and mutating target-action retry safety.
 
+On Windows, prefer scripts/release-review-gate-windows.ps1. Running this Bash
+gate through WSL may require a healthy Linux Rust toolchain and network access.
+
 Options:
   --target-dir DIR     Cargo target dir. Defaults to /tmp/rmux-release-review-target.
   --layout DIR         Reuse or populate a release layout directory.

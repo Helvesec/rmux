@@ -65,6 +65,16 @@ async fn non_websocket_http_paths_return_404() {
 }
 
 #[tokio::test]
+async fn head_requests_return_headers_without_body() {
+    let response = response_for("HEAD /missing HTTP/1.1\r\nHost: local\r\n\r\n").await;
+
+    assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+    assert!(response.contains("Content-Length: 10\r\n"), "{response}");
+    assert!(response.ends_with("\r\n\r\n"), "{response}");
+    assert!(!response.contains("not found\n"), "{response}");
+}
+
+#[tokio::test]
 async fn non_get_head_methods_return_405() {
     let response = response_for("POST /share HTTP/1.1\r\nHost: local\r\n\r\n").await;
     assert!(response.starts_with("HTTP/1.1 405 Method Not Allowed"));

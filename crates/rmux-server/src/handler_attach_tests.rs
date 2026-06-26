@@ -83,6 +83,47 @@ fn take_switch_target(control: AttachControl) -> crate::pane_io::AttachTarget {
     }
 }
 
+async fn recv_attach_control(
+    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
+    context: &str,
+) -> AttachControl {
+    tokio::time::timeout(ATTACH_LIFECYCLE_TIMEOUT, control_rx.recv())
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for attach control: {context}"))
+        .unwrap_or_else(|| panic!("attach control channel closed while waiting for {context}"))
+}
+
+async fn recv_render_frame(
+    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
+    context: &str,
+) -> String {
+    take_render_frame(recv_attach_control(control_rx, context).await)
+}
+
+async fn recv_switch_target(
+    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
+    context: &str,
+) -> crate::pane_io::AttachTarget {
+    take_switch_target(recv_attach_control(control_rx, context).await)
+}
+
+async fn recv_matching_attach_control(
+    control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
+    context: &str,
+    matches: impl Fn(&AttachControl) -> bool,
+) -> AttachControl {
+    tokio::time::timeout(ATTACH_LIFECYCLE_TIMEOUT, async {
+        while let Some(control) = control_rx.recv().await {
+            if matches(&control) {
+                return control;
+            }
+        }
+        panic!("attach control channel closed while waiting for {context}");
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for attach control: {context}"))
+}
+
 async fn create_attached_session(
     handler: &RequestHandler,
     requester_pid: u32,

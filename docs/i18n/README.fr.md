@@ -34,7 +34,7 @@
   <a href="#verification"><img src="https://img.shields.io/badge/unsafe-restricted-success.svg" alt="Unsafe policy"></a>
   <a href="https://github.com/Helvesec/rmux/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/Helvesec/rmux/ci.yml?branch=main&amp;event=push&amp;label=CI" alt="CI"></a>
   <a href="https://www.bestpractices.dev/projects/13290"><img src="https://www.bestpractices.dev/projects/13290/badge" alt="OpenSSF Best Practices"></a>
-  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/rmux-0.7.0-informational.svg" alt="rmux 0.7.0"></a>
+  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.7.1"><img src="https://img.shields.io/badge/rmux-0.7.1-informational.svg" alt="rmux 0.7.1"></a>
 </p>
 
 </div>
@@ -126,9 +126,14 @@ Quelques exemples courts de ce que RMUX permet de faire.
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/linux.svg"><img src="../install/linux-light.svg" width="28" alt="Linux"></picture> <picture><source media="(prefers-color-scheme: dark)" srcset="../install/apple.svg"><img src="../install/apple-light.svg" width="28" alt="macOS"></picture> / Nix | `nix profile install github:Helvesec/rmux` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/rust.svg"><img src="../install/rust-light.svg" width="28" alt="Rust"></picture> / Cargo | `cargo install rmux --locked` |
 
-Les téléchargements directs (`.tar.gz`, `.deb`, `.rpm`, `.zip`) sont disponibles dans la [GitHub Release v0.7.0](https://github.com/helvesec/rmux/releases/tag/v0.7.0).
+Les téléchargements directs (`.tar.gz`, `.deb`, `.rpm`, `.zip`) sont disponibles dans la [GitHub Release v0.7.1](https://github.com/helvesec/rmux/releases/tag/v0.7.1).
 
 Les gestionnaires de paquets peuvent avoir du retard pendant la revue des registres ; les téléchargements directs et les installateurs rmux.io suivent la release GitHub courante.
+
+Pour les téléchargements Unix `.tar.gz`, lancez `./install.sh --prefix ~/.local`
+depuis l'archive extraite. L'installateur préserve le layout `bin/` et
+`libexec/` requis pour que la petite CLI publique puisse toujours atteindre son
+helper complet.
 
 Les paquets de release peuvent utiliser une petite CLI publique pour les commandes détachées rapides et un helper CLI complet privé pour les formes de commandes tmux compatibles plus complexes. Les paquets Windows livrent `rmux.exe` comme dispatcher léger et placent la CLI complète sous `libexec/rmux/rmux.exe`. Définissez `RMUX_DISABLE_TINY_CLI=1` pour forcer le helper complet pendant le diagnostic de compatibilité CLI.
 
@@ -263,9 +268,9 @@ fn render(snapshot: PaneSnapshot, area: Rect, buffer: &mut Buffer) {
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://rmux.io/rmux-architecture-dark.png?v=0.7.0-web-share">
-  <source media="(prefers-color-scheme: light)" srcset="https://rmux.io/rmux-architecture-light.png?v=0.7.0-web-share">
-  <img src="https://rmux.io/rmux-architecture-dark.png?v=0.7.0-web-share" alt="Architecture runtime RMUX" width="800">
+  <source media="(prefers-color-scheme: dark)" srcset="https://rmux.io/rmux-architecture-dark.png?v=0.7.1-web-share">
+  <source media="(prefers-color-scheme: light)" srcset="https://rmux.io/rmux-architecture-light.png?v=0.7.1-web-share">
+  <img src="https://rmux.io/rmux-architecture-dark.png?v=0.7.1-web-share" alt="Architecture runtime RMUX" width="800">
 </picture>
 
 </div>

@@ -141,6 +141,22 @@ pub(in crate::handler) enum PendingShutdownReason {
     SeamlessUpgradeIdle,
 }
 
+#[derive(Debug, Default)]
+pub(in crate::handler) struct DetachedRequesterAccess {
+    write_scopes: usize,
+    read_only_scopes: usize,
+}
+
+impl DetachedRequesterAccess {
+    pub(in crate::handler) fn can_write(&self) -> bool {
+        self.write_scopes > 0
+    }
+
+    pub(in crate::handler) fn is_empty(&self) -> bool {
+        self.write_scopes == 0 && self.read_only_scopes == 0
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct RequestHandler {
     state: Arc<Mutex<HandlerState>>,
@@ -158,6 +174,7 @@ pub(crate) struct RequestHandler {
     shutdown_reason: Arc<StdMutex<Option<PendingShutdownReason>>>,
     shutdown_retry_scheduled: Arc<AtomicBool>,
     active_detached_connections: Arc<StdMutex<HashSet<u64>>>,
+    active_detached_requester_access: Arc<StdMutex<HashMap<u32, DetachedRequesterAccess>>>,
     active_detached_requests: Arc<AtomicUsize>,
     shutdown_handle: Arc<StdMutex<Option<ShutdownHandle>>>,
     config_loading_depth: Arc<AtomicUsize>,
@@ -208,6 +225,7 @@ impl Clone for RequestHandler {
             shutdown_reason: self.shutdown_reason.clone(),
             shutdown_retry_scheduled: self.shutdown_retry_scheduled.clone(),
             active_detached_connections: self.active_detached_connections.clone(),
+            active_detached_requester_access: self.active_detached_requester_access.clone(),
             active_detached_requests: self.active_detached_requests.clone(),
             shutdown_handle: self.shutdown_handle.clone(),
             config_loading_depth: self.config_loading_depth.clone(),
@@ -249,6 +267,7 @@ pub(crate) struct WeakRequestHandler {
     shutdown_reason: Weak<StdMutex<Option<PendingShutdownReason>>>,
     shutdown_retry_scheduled: Weak<AtomicBool>,
     active_detached_connections: Weak<StdMutex<HashSet<u64>>>,
+    active_detached_requester_access: Weak<StdMutex<HashMap<u32, DetachedRequesterAccess>>>,
     active_detached_requests: Weak<AtomicUsize>,
     shutdown_handle: Weak<StdMutex<Option<ShutdownHandle>>>,
     config_loading_depth: Weak<AtomicUsize>,
@@ -287,6 +306,7 @@ impl WeakRequestHandler {
             shutdown_reason: self.shutdown_reason.upgrade()?,
             shutdown_retry_scheduled: self.shutdown_retry_scheduled.upgrade()?,
             active_detached_connections: self.active_detached_connections.upgrade()?,
+            active_detached_requester_access: self.active_detached_requester_access.upgrade()?,
             active_detached_requests: self.active_detached_requests.upgrade()?,
             shutdown_handle: self.shutdown_handle.upgrade()?,
             config_loading_depth: self.config_loading_depth.upgrade()?,
@@ -435,6 +455,7 @@ impl RequestHandler {
             shutdown_reason: Arc::new(StdMutex::new(None)),
             shutdown_retry_scheduled: Arc::new(AtomicBool::new(false)),
             active_detached_connections: Arc::new(StdMutex::new(HashSet::new())),
+            active_detached_requester_access: Arc::new(StdMutex::new(HashMap::new())),
             active_detached_requests: Arc::new(AtomicUsize::new(0)),
             shutdown_handle: Arc::new(StdMutex::new(None)),
             config_loading_depth: Arc::new(AtomicUsize::new(0)),
@@ -481,6 +502,9 @@ impl RequestHandler {
             shutdown_reason: Arc::downgrade(&self.shutdown_reason),
             shutdown_retry_scheduled: Arc::downgrade(&self.shutdown_retry_scheduled),
             active_detached_connections: Arc::downgrade(&self.active_detached_connections),
+            active_detached_requester_access: Arc::downgrade(
+                &self.active_detached_requester_access,
+            ),
             active_detached_requests: Arc::downgrade(&self.active_detached_requests),
             shutdown_handle: Arc::downgrade(&self.shutdown_handle),
             config_loading_depth: Arc::downgrade(&self.config_loading_depth),

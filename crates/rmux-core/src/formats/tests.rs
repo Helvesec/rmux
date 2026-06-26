@@ -1,7 +1,8 @@
 use super::{
-    format_skip, format_skip_delimiter, is_known_format_variable_name, is_truthy, render_template,
-    FormatContext, FormatVariable, FormatVariables, DEFAULT_DISPLAY_MESSAGE_FORMAT,
-    DEFAULT_LIST_PANES_FORMAT, DEFAULT_LIST_SESSIONS_FORMAT, DEFAULT_LIST_WINDOWS_FORMAT,
+    bounded_format_padding_width, format_skip, format_skip_delimiter,
+    is_known_format_variable_name, is_truthy, render_template, signed_i32_abs_usize, FormatContext,
+    FormatVariable, FormatVariables, DEFAULT_DISPLAY_MESSAGE_FORMAT, DEFAULT_LIST_PANES_FORMAT,
+    DEFAULT_LIST_SESSIONS_FORMAT, DEFAULT_LIST_WINDOWS_FORMAT, FORMAT_PADDING_LIMIT,
     FORMAT_VARIABLES, TMUX_FORMAT_TABLE_NAMES, TMUX_TIME_FORMAT_VARIABLE_NAMES,
 };
 use crate::Session;
