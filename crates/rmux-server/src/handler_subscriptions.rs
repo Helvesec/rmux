@@ -337,12 +337,12 @@ impl RequestHandler {
         })
     }
 
-    pub(crate) async fn cleanup_connection_subscriptions(&self, connection_id: u64) {
+    pub(crate) fn cleanup_connection_subscriptions_sync(&self, connection_id: u64) {
         {
             let mut subscriptions = self
                 .subscriptions
                 .lock()
-                .expect("subscription registry mutex must not be poisoned");
+                .unwrap_or_else(|error| error.into_inner());
             subscriptions.remove_connection(connection_id);
         }
         let _ = self.request_shutdown_if_pending();

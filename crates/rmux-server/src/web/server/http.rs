@@ -36,6 +36,7 @@ pub(super) async fn write_response(
     status: u16,
     content_type: &str,
     body: &[u8],
+    include_body: bool,
 ) -> io::Result<()> {
     let reason = match status {
         200 => "OK",
@@ -58,7 +59,10 @@ pub(super) async fn write_response(
         body.len()
     );
     stream.write_all(head.as_bytes()).await?;
-    stream.write_all(body).await
+    if include_body {
+        stream.write_all(body).await?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]

@@ -80,9 +80,9 @@ impl<'de> Visitor<'de> for DisplayMessageRequestVisitor {
         }
 
         Ok(DisplayMessageRequest {
-            target: target.ok_or_else(|| de::Error::missing_field("target"))?,
+            target: target.unwrap_or_default(),
             print: print.ok_or_else(|| de::Error::missing_field("print"))?,
-            message: message.ok_or_else(|| de::Error::missing_field("message"))?,
+            message: message.unwrap_or_default(),
             empty_target_context: empty_target_context.unwrap_or_default(),
         })
     }
@@ -178,11 +178,10 @@ impl<'de> Visitor<'de> for DisplayMessageExtRequestVisitor {
         }
 
         Ok(DisplayMessageExtRequest {
-            target: target.ok_or_else(|| de::Error::missing_field("target"))?,
+            target: target.unwrap_or_default(),
             print: print.ok_or_else(|| de::Error::missing_field("print"))?,
-            message: message.ok_or_else(|| de::Error::missing_field("message"))?,
-            target_client: target_client
-                .ok_or_else(|| de::Error::missing_field("target_client"))?,
+            message: message.unwrap_or_default(),
+            target_client: target_client.unwrap_or_default(),
             empty_target_context: empty_target_context.unwrap_or_default(),
         })
     }

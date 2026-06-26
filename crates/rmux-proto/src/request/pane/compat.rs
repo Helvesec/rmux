@@ -93,8 +93,8 @@ impl<'de> Visitor<'de> for SplitWindowExtRequestVisitor {
         Ok(SplitWindowExtRequest {
             target: target.ok_or_else(|| de::Error::missing_field("target"))?,
             direction: direction.ok_or_else(|| de::Error::missing_field("direction"))?,
-            before: before.ok_or_else(|| de::Error::missing_field("before"))?,
-            environment: environment.ok_or_else(|| de::Error::missing_field("environment"))?,
+            before: before.unwrap_or_default(),
+            environment: environment.unwrap_or_default(),
             command: command.unwrap_or_default(),
             process_command: process_command.unwrap_or_default(),
             start_directory: start_directory.unwrap_or_default(),
@@ -165,11 +165,10 @@ impl<'de> Visitor<'de> for RespawnPaneRequestVisitor {
 
         Ok(RespawnPaneRequest {
             target: target.ok_or_else(|| de::Error::missing_field("target"))?,
-            kill: kill.ok_or_else(|| de::Error::missing_field("kill"))?,
-            start_directory: start_directory
-                .ok_or_else(|| de::Error::missing_field("start_directory"))?,
-            environment: environment.ok_or_else(|| de::Error::missing_field("environment"))?,
-            command: command.ok_or_else(|| de::Error::missing_field("command"))?,
+            kill: kill.unwrap_or_default(),
+            start_directory: start_directory.unwrap_or_default(),
+            environment: environment.unwrap_or_default(),
+            command: command.unwrap_or_default(),
             process_command: process_command.unwrap_or_default(),
         })
     }

@@ -15,7 +15,7 @@ use crate::{connection::Connection, ClientError};
 pub struct SplitWindowOptions {
     /// The exact split target.
     pub target: SplitWindowTarget,
-    /// Axis on which to split (`Vertical` = side-by-side, `Horizontal` = stacked).
+    /// Axis on which to split (`Vertical` = stacked, `Horizontal` = side-by-side).
     pub direction: SplitDirection,
     /// `true` to insert the new pane *before* the target on the chosen axis
     /// (tmux `-b`); `false` to insert after (default).

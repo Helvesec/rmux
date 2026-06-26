@@ -371,9 +371,9 @@ impl<'de> Visitor<'de> for NewWindowRequestVisitor {
 
         Ok(NewWindowRequest {
             target: target.ok_or_else(|| de::Error::missing_field("target"))?,
-            name: name.ok_or_else(|| de::Error::missing_field("name"))?,
+            name: name.unwrap_or_default(),
             detached: detached.ok_or_else(|| de::Error::missing_field("detached"))?,
-            environment: environment.ok_or_else(|| de::Error::missing_field("environment"))?,
+            environment: environment.unwrap_or_default(),
             command: command.unwrap_or_default(),
             process_command: process_command.unwrap_or_default(),
             start_directory: start_directory.unwrap_or_default(),
@@ -451,7 +451,7 @@ impl<'de> Visitor<'de> for MoveWindowRequestVisitor {
         }
 
         Ok(MoveWindowRequest {
-            source: source.ok_or_else(|| de::Error::missing_field("source"))?,
+            source: source.unwrap_or_default(),
             target: target.ok_or_else(|| de::Error::missing_field("target"))?,
             renumber: renumber.ok_or_else(|| de::Error::missing_field("renumber"))?,
             kill_destination: kill_destination
@@ -522,8 +522,8 @@ impl<'de> Visitor<'de> for RespawnWindowRequestVisitor {
 
         Ok(RespawnWindowRequest {
             target: target.ok_or_else(|| de::Error::missing_field("target"))?,
-            kill: kill.ok_or_else(|| de::Error::missing_field("kill"))?,
-            environment: environment.ok_or_else(|| de::Error::missing_field("environment"))?,
+            kill: kill.unwrap_or_default(),
+            environment: environment.unwrap_or_default(),
             command: command.unwrap_or_default(),
             start_directory: start_directory.unwrap_or_default(),
         })

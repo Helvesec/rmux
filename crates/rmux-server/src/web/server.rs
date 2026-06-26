@@ -145,6 +145,7 @@ async fn serve_connection(
                 431,
                 "text/plain; charset=utf-8",
                 b"request headers too large or invalid\n",
+                true,
             )
             .await;
         }
@@ -157,6 +158,7 @@ async fn serve_connection(
             405,
             "text/plain; charset=utf-8",
             b"unsupported method\n",
+            true,
         )
         .await;
     }
@@ -168,6 +170,7 @@ async fn serve_connection(
         404,
         "text/plain; charset=utf-8",
         b"not found\n",
+        request.method != "HEAD",
     )
     .await
 }
@@ -184,6 +187,7 @@ async fn serve_websocket(
             400,
             "text/plain; charset=utf-8",
             b"missing websocket key\n",
+            true,
         )
         .await;
     };
@@ -197,6 +201,7 @@ async fn serve_websocket(
             400,
             "text/plain; charset=utf-8",
             b"unsupported websocket version\n",
+            true,
         )
         .await;
     }
@@ -206,6 +211,7 @@ async fn serve_websocket(
             400,
             "text/plain; charset=utf-8",
             b"invalid websocket key\n",
+            true,
         )
         .await;
     }

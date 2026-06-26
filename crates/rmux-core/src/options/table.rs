@@ -303,7 +303,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         0,
         SCOPE_SERVER,
         GlobalRoot::Server,
-        OptionValueType::Number { minimum: 1048576 },
+        OptionValueType::Number { minimum: 0 },
         DefaultValue::Scalar("1048576"),
         "",
         false,

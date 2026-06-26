@@ -149,7 +149,7 @@ impl<'de> Visitor<'de> for SetOptionByNameRequestVisitor {
         Ok(SetOptionByNameRequest {
             scope: scope.ok_or_else(|| serde::de::Error::missing_field("scope"))?,
             name: name.ok_or_else(|| serde::de::Error::missing_field("name"))?,
-            value: value.ok_or_else(|| serde::de::Error::missing_field("value"))?,
+            value: value.unwrap_or_default(),
             mode: mode.ok_or_else(|| serde::de::Error::missing_field("mode"))?,
             only_if_unset: only_if_unset
                 .ok_or_else(|| serde::de::Error::missing_field("only_if_unset"))?,

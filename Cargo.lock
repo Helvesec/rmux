@@ -1223,6 +1223,7 @@ dependencies = [
  "bincode",
  "rmux-types",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

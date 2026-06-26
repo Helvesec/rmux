@@ -186,6 +186,47 @@ fn numeric_and_flag_values_are_canonicalized_before_storage() {
 }
 
 #[test]
+fn input_buffer_size_can_be_lowered_below_default() {
+    let mut store = OptionStore::new();
+
+    store
+        .set_by_name(
+            OptionScopeSelector::ServerGlobal,
+            "input-buffer-size",
+            Some("0".to_owned()),
+            SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect("input-buffer-size accepts tmux-compatible zero minimum");
+
+    assert_eq!(store.global_value(OptionName::InputBufferSize), Some("0"));
+}
+
+#[test]
+fn bare_non_flag_choice_options_are_rejected() {
+    let mut store = OptionStore::new();
+
+    let error = store
+        .set_by_name(
+            OptionScopeSelector::WindowGlobal,
+            "mode-keys",
+            None,
+            SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect_err("bare mode-keys must not toggle between emacs and vi");
+
+    assert!(
+        error.to_string().contains("empty value"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn literal_style_options_reject_invalid_styles() {
     let mut store = OptionStore::new();
 

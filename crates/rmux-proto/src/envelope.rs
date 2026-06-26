@@ -33,8 +33,19 @@ pub(crate) fn decode_varint_u32(bytes: &[u8]) -> Result<Option<(u32, usize)>, Rm
     let mut shift = 0;
 
     for (index, byte) in bytes.iter().copied().enumerate().take(5) {
-        value |= u32::from(byte & 0x7f) << shift;
+        let payload = byte & 0x7f;
+        if index == 4 && payload > 0x0f {
+            return Err(RmuxError::Decode(
+                "wire-version varint overflows u32".to_owned(),
+            ));
+        }
+        value |= u32::from(payload) << shift;
         if byte & 0x80 == 0 {
+            if index > 0 && payload == 0 {
+                return Err(RmuxError::Decode(
+                    "wire-version varint is not minimally encoded".to_owned(),
+                ));
+            }
             return Ok(Some((value, index + 1)));
         }
         shift += 7;
@@ -68,5 +79,17 @@ mod tests {
     #[test]
     fn varint_reports_incomplete_values() {
         assert_eq!(decode_varint_u32(&[0x80]), Ok(None));
+    }
+
+    #[test]
+    fn varint_rejects_non_minimal_encodings() {
+        assert!(decode_varint_u32(&[0x82, 0x00]).is_err());
+        assert!(decode_varint_u32(&[0x80, 0x00]).is_err());
+    }
+
+    #[test]
+    fn varint_rejects_u32_overflow_bits() {
+        assert!(decode_varint_u32(&[0xff, 0xff, 0xff, 0xff, 0x10]).is_err());
+        assert!(decode_varint_u32(&[0xff, 0xff, 0xff, 0xff, 0x8f]).is_err());
     }
 }

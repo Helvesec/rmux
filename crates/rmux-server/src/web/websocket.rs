@@ -83,8 +83,7 @@ impl WebSocket {
     }
 
     pub(crate) async fn write_close_code(&mut self, code: u16, reason: &str) -> io::Result<()> {
-        let reason = reason.as_bytes();
-        let reason = &reason[..reason.len().min(123)];
+        let reason = close_reason_bytes(reason);
         let mut payload = Vec::with_capacity(2 + reason.len());
         payload.extend_from_slice(&code.to_be_bytes());
         payload.extend_from_slice(reason);
@@ -128,8 +127,7 @@ impl WebSocketWriter {
     }
 
     pub(crate) async fn write_close_code(&mut self, code: u16, reason: &str) -> io::Result<()> {
-        let reason = reason.as_bytes();
-        let reason = &reason[..reason.len().min(123)];
+        let reason = close_reason_bytes(reason);
         let mut payload = Vec::with_capacity(2 + reason.len());
         payload.extend_from_slice(&code.to_be_bytes());
         payload.extend_from_slice(reason);
@@ -143,6 +141,14 @@ impl WebSocketWriter {
     async fn write_frame(&mut self, opcode: u8, payload: &[u8]) -> io::Result<()> {
         write_frame(&mut self.stream, opcode, payload).await
     }
+}
+
+fn close_reason_bytes(reason: &str) -> &[u8] {
+    let mut end = reason.len().min(123);
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    &reason.as_bytes()[..end]
 }
 
 #[derive(Debug)]
@@ -314,8 +320,8 @@ pub(crate) fn fuzz_client_frame(data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        read_frame, read_frame_with_continuation_timeout, valid_client_key, websocket_accept_key,
-        OPCODE_CLOSE, OPCODE_PING, OPCODE_TEXT,
+        close_reason_bytes, read_frame, read_frame_with_continuation_timeout, valid_client_key,
+        websocket_accept_key, OPCODE_CLOSE, OPCODE_PING, OPCODE_TEXT,
     };
     use std::time::Duration;
     use tokio::io::AsyncWriteExt;
@@ -345,6 +351,18 @@ mod tests {
         assert!(valid_client_key("dGhlIHNhbXBsZSBub25jZQ=="));
         assert!(!valid_client_key("not-base64"));
         assert!(!valid_client_key("Zm9v"));
+    }
+
+    #[test]
+    fn close_reason_truncates_on_utf8_boundary() {
+        let reason = format!("{}é", "a".repeat(122));
+        let truncated = close_reason_bytes(&reason);
+
+        assert_eq!(truncated.len(), 122);
+        assert_eq!(
+            std::str::from_utf8(truncated).expect("valid utf-8"),
+            "a".repeat(122)
+        );
     }
 
     #[cfg(feature = "fuzzing")]
