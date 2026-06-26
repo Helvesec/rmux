@@ -103,12 +103,11 @@ fn conpty_console_ctrl_d_interrupts_timeout_when_supported(
     spawned.child().terminate_forcefully()?;
     let _ = spawned.child_mut().wait()?;
 
-    if !String::from_utf8_lossy(&output).contains("RMUX_READY>") {
-        eprintln!(
-            "skipping Ctrl-D timeout interruption assertion because this Windows ConPTY host left timeout.exe running; observed {:?}",
-            String::from_utf8_lossy(&output)
-        );
-    }
+    assert!(
+        String::from_utf8_lossy(&output).contains("RMUX_READY>"),
+        "Ctrl-D should interrupt timeout.exe and return to the prompt; observed {:?}",
+        String::from_utf8_lossy(&output)
+    );
     Ok(())
 }
 

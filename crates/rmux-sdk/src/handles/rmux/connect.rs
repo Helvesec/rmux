@@ -454,7 +454,7 @@ fn timeout_error(operation: &str, timeout: Duration) -> io::Error {
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
@@ -471,6 +471,23 @@ mod tests {
             "rmux-sdk-daemon-candidate-{name}-{}-{timestamp}",
             std::process::id()
         ))
+    }
+
+    fn expected_public_binary_daemon_candidates(public: &Path, daemon: &Path) -> Vec<OsString> {
+        let mut candidates = vec![
+            OsString::from("rmux-daemon"),
+            daemon.as_os_str().to_os_string(),
+        ];
+        if let Ok(resolved_public) = std::fs::canonicalize(public) {
+            let mut resolved_daemon = resolved_public;
+            resolved_daemon.set_file_name("rmux-daemon");
+            let candidate = resolved_daemon.into_os_string();
+            if !candidates.iter().any(|existing| existing == &candidate) {
+                candidates.push(candidate);
+            }
+        }
+        candidates.push(OsString::from("rmux"));
+        candidates
     }
 
     #[test]
@@ -500,11 +517,7 @@ mod tests {
 
         assert_eq!(
             hidden_daemon_binary_candidates_from_sources(None, Some(public)),
-            vec![
-                OsString::from("rmux-daemon"),
-                daemon.into_os_string(),
-                OsString::from("rmux"),
-            ]
+            expected_public_binary_daemon_candidates(&root.join("rmux"), &daemon)
         );
 
         let _ = std::fs::remove_dir_all(&root);

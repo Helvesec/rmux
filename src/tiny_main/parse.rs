@@ -797,6 +797,8 @@ pub(super) fn parse_resize_pane(args: &[OsString]) -> Option<ResizePaneTargetAct
     let mut columns = None;
     let mut rows = None;
     let mut adjustment = ResizePaneAdjustment::NoOp;
+    let mut saw_absolute_resize = false;
+    let mut saw_relative_resize = false;
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].to_str()?;
@@ -806,16 +808,28 @@ pub(super) fn parse_resize_pane(args: &[OsString]) -> Option<ResizePaneTargetAct
                 target = Some(args.get(index)?.to_str()?.to_owned());
             }
             "-x" => {
+                if saw_relative_resize {
+                    return None;
+                }
+                saw_absolute_resize = true;
                 index += 1;
                 columns = Some(args.get(index)?.to_str()?.parse::<u16>().ok()?);
                 adjustment = resize_absolute_adjustment(columns, rows);
             }
             "-y" => {
+                if saw_relative_resize {
+                    return None;
+                }
+                saw_absolute_resize = true;
                 index += 1;
                 rows = Some(args.get(index)?.to_str()?.parse::<u16>().ok()?);
                 adjustment = resize_absolute_adjustment(columns, rows);
             }
             "-L" => {
+                if saw_absolute_resize {
+                    return None;
+                }
+                saw_relative_resize = true;
                 let (cells, consumed) = parse_optional_relative_cells(args, index)?;
                 if reject_trailing_args_after_direction_delta(args, index, consumed) {
                     return None;
@@ -824,6 +838,10 @@ pub(super) fn parse_resize_pane(args: &[OsString]) -> Option<ResizePaneTargetAct
                 index += consumed;
             }
             "-R" => {
+                if saw_absolute_resize {
+                    return None;
+                }
+                saw_relative_resize = true;
                 let (cells, consumed) = parse_optional_relative_cells(args, index)?;
                 if reject_trailing_args_after_direction_delta(args, index, consumed) {
                     return None;
@@ -832,6 +850,10 @@ pub(super) fn parse_resize_pane(args: &[OsString]) -> Option<ResizePaneTargetAct
                 index += consumed;
             }
             "-U" => {
+                if saw_absolute_resize {
+                    return None;
+                }
+                saw_relative_resize = true;
                 let (cells, consumed) = parse_optional_relative_cells(args, index)?;
                 if reject_trailing_args_after_direction_delta(args, index, consumed) {
                     return None;
@@ -840,6 +862,10 @@ pub(super) fn parse_resize_pane(args: &[OsString]) -> Option<ResizePaneTargetAct
                 index += consumed;
             }
             "-D" => {
+                if saw_absolute_resize {
+                    return None;
+                }
+                saw_relative_resize = true;
                 let (cells, consumed) = parse_optional_relative_cells(args, index)?;
                 if reject_trailing_args_after_direction_delta(args, index, consumed) {
                     return None;
