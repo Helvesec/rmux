@@ -161,6 +161,16 @@ async fn attached_command_prompt_can_create_window_from_same_read() {
         sleep(Duration::from_millis(25)).await;
     }
 
+    let target = PaneTarget::with_window(alpha.clone(), 1, 0);
+    wait_for_capture_containing(
+        &handler,
+        target,
+        "ISSUE8_WINDOW_READY",
+        "prompt-created window should publish its first output",
+    )
+    .await;
+    handler.refresh_attached_session(&alpha).await;
+
     let frame = wait_for_attach_output_containing(&mut control_rx, "ISSUE8_WINDOW_READY").await;
     assert!(
         frame.contains("ISSUE8_WINDOW_READY"),
