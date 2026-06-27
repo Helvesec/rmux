@@ -72,6 +72,7 @@ pub(super) fn parse_set_option_invocation(
             }
             "-q" => {
                 let _ = args.optional();
+                flags.quiet = true;
             }
             "-w" if force_window => {
                 let _ = args.optional();
@@ -123,7 +124,7 @@ pub(super) fn parse_set_option_invocation(
     args.no_extra("set-option")?;
 
     let effective_target = target.clone().or(default_target.clone());
-    let scope = resolve_set_option_scope(
+    let scope = match resolve_set_option_scope(
         &option,
         flags.global,
         flags.server,
@@ -131,7 +132,16 @@ pub(super) fn parse_set_option_invocation(
         flags.pane,
         flags.append,
         effective_target.clone(),
-    )?;
+    ) {
+        Ok(scope) => scope,
+        // tmux's `set -q` suppresses errors about unknown/ambiguous options, which configs
+        // like oh-my-tmux rely on to silently skip options removed in newer tmux
+        // (e.g. `set -q -g status-utf8 on`). Drop the command instead of aborting the file.
+        Err(error) if flags.quiet && show_options_quiet_suppresses(&error) => {
+            return Ok(ParsedSetOptionCommand::NoOp);
+        }
+        Err(error) => return Err(error),
+    };
     let Some(scope) = scope.into_scope() else {
         return Ok(ParsedSetOptionCommand::NoOp);
     };
@@ -184,6 +194,7 @@ struct SetOptionFlags {
     only_if_unset: bool,
     unset: bool,
     unset_pane_overrides: bool,
+    quiet: bool,
 }
 
 impl SetOptionFlags {
@@ -198,6 +209,7 @@ impl SetOptionFlags {
             only_if_unset: false,
             unset: false,
             unset_pane_overrides: false,
+            quiet: false,
         }
     }
 
@@ -215,7 +227,7 @@ impl SetOptionFlags {
                 's' => self.server = true,
                 'w' => self.window = true,
                 'p' => self.pane = true,
-                'q' => {}
+                'q' => self.quiet = true,
                 'a' => self.append = true,
                 'F' => self.format = true,
                 'o' => self.only_if_unset = true,
