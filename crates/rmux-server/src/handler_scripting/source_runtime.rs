@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::time::Duration;
 
 use rmux_core::{
     command_parser::{CommandParser, ParsedCommand, ParsedCommands, SOURCE_FILE_MAX_COMMAND_BYTES},
@@ -35,6 +36,21 @@ use crate::{ConfigFileSelection, ConfigLoadOptions};
 
 const SOURCE_PARSE_RECOVERY_ERROR_LIMIT: usize = 256;
 
+/// How long startup config execution may hold up client readiness before the
+/// daemon reports itself ready anyway. A config's `run-shell` commands run
+/// synchronously and can block (e.g. oh-my-tmux shells out to the `tmux` binary
+/// against rmux's socket and stalls for ~20s); without this bound a single slow
+/// command makes `rmux` startup appear to hang. Normal configs finish far inside
+/// this window, so they are never delayed; only a pathologically slow config
+/// releases readiness early and keeps executing in the background.
+// ponytail: drop-guard-early flips config_loading_active() for the remaining
+// (already-slow) config commands; move to a separate readiness signal if that
+// ever matters for a real config.
+#[cfg(not(test))]
+const STARTUP_READINESS_BUDGET: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const STARTUP_READINESS_BUDGET: Duration = Duration::from_millis(100);
+
 impl RequestHandler {
     #[cfg(test)]
     pub(crate) async fn load_startup_config(&self, config_load: ConfigLoadOptions) {
@@ -46,7 +62,7 @@ impl RequestHandler {
     pub(crate) async fn load_startup_config_with_guard(
         &self,
         config_load: ConfigLoadOptions,
-        _guard: ConfigLoadingGuard,
+        guard: ConfigLoadingGuard,
     ) {
         let (paths, tmux_fallback_paths) = match config_load.selection() {
             ConfigFileSelection::Disabled => return,
@@ -102,14 +118,27 @@ impl RequestHandler {
         if let Some(error) = loaded.take_error() {
             errors.push(error);
         }
-        let execution = self
-            .execute_loaded_source_file(
-                std::process::id(),
-                loaded,
-                QueueExecutionContext::new(command.caller_cwd.clone()),
-                1,
-            )
-            .await;
+        // Executing the config runs its `run-shell` commands synchronously, which
+        // can block. Release the readiness guard after a short budget so clients
+        // stop waiting, but keep executing in the background so the commands still
+        // complete (and aren't cancelled/orphaned). See STARTUP_READINESS_BUDGET.
+        let exec = self.execute_loaded_source_file(
+            std::process::id(),
+            loaded,
+            QueueExecutionContext::new(command.caller_cwd.clone()),
+            1,
+        );
+        tokio::pin!(exec);
+        let mut guard = Some(guard);
+        let execution = tokio::select! {
+            biased;
+            execution = &mut exec => execution,
+            _ = tokio::time::sleep(STARTUP_READINESS_BUDGET) => {
+                drop(guard.take());
+                exec.await
+            }
+        };
+        drop(guard);
         if let Some(error) = execution.error {
             errors.push(error);
         }
@@ -992,7 +1021,7 @@ fn config_error_lines(error: &RmuxError) -> Vec<String> {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::super::super::RequestHandler;
     use crate::test_env::EnvVarGuard;
@@ -1017,6 +1046,52 @@ mod tests {
             !handler.config_loading_active(),
             "dropping guard should clear startup config loading"
         );
+    }
+
+    #[tokio::test]
+    async fn startup_readiness_clears_before_a_blocking_run_shell_finishes() {
+        let _lock = crate::test_env::lock_async().await;
+        let root = unique_temp_root("slow-run-shell-readiness");
+        let config_path = root.join("slow.conf");
+        // A run-shell that blocks far longer than STARTUP_READINESS_BUDGET, mimicking
+        // an oh-my-tmux config that shells out and stalls.
+        write_test_config(config_path.clone(), "run-shell 'sleep 3'\n");
+        let handler = RequestHandler::new();
+        let config = DaemonConfig::new(root.join("rmux.sock")).with_config_files(
+            vec![config_path],
+            false,
+            Some(root.clone()),
+        );
+
+        let guard = handler.start_config_loading();
+        assert!(handler.config_loading_active());
+
+        let load_handler = handler.clone();
+        let load_config = config.config_load().clone();
+        let task = tokio::spawn(async move {
+            load_handler
+                .load_startup_config_with_guard(load_config, guard)
+                .await;
+        });
+
+        let cleared = async {
+            while handler.config_loading_active() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(1), cleared)
+            .await
+            .expect("readiness should clear within the budget, not wait out the run-shell");
+
+        // The budget released readiness while execution continued — the load task is
+        // still running the slow command, proving this exercised the budget path.
+        assert!(
+            !task.is_finished(),
+            "the blocking run-shell should still be executing after readiness cleared"
+        );
+
+        task.abort();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
