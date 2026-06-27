@@ -398,8 +398,11 @@ fn open_strict_source_entry(entry: &Path) -> io::Result<File> {
 }
 
 fn read_tmux_compat_source_entry(entry: &Path) -> io::Result<String> {
-    let preopen_metadata = fs::symlink_metadata(entry)?;
-    validate_tmux_compat_preopen_metadata(&preopen_metadata)?;
+    // Follow symlinks (the popular oh-my-tmux setup symlinks ~/.config/tmux/tmux.conf),
+    // but stat the final target so we still skip FIFOs/dirs/devices. stat() never blocks
+    // on a FIFO, and the open below keeps O_NONBLOCK as a second line of defense.
+    let preopen_metadata = fs::metadata(entry)?;
+    validate_tmux_compat_regular_metadata(&preopen_metadata)?;
 
     let file = open_tmux_compat_regular_file(entry)?;
     let metadata = file.metadata()?;
@@ -412,16 +415,6 @@ fn read_tmux_compat_source_entry(entry: &Path) -> io::Result<String> {
         return Err(oversized_source_config_error());
     }
     Ok(contents)
-}
-
-fn validate_tmux_compat_preopen_metadata(metadata: &fs::Metadata) -> io::Result<()> {
-    if metadata.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "tmux fallback config is not a regular file",
-        ));
-    }
-    validate_tmux_compat_regular_metadata(metadata)
 }
 
 fn validate_tmux_compat_regular_metadata(metadata: &fs::Metadata) -> io::Result<()> {
@@ -443,7 +436,7 @@ fn open_tmux_compat_regular_file(entry: &Path) -> io::Result<File> {
 
     let fd = open(
         entry,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
     )
     .map_err(io::Error::from)?;
@@ -780,6 +773,31 @@ mod tests {
         let _ = std::fs::remove_file(&fifo_path);
 
         assert!(inputs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_best_effort_source_follows_symlink_to_regular_file() {
+        // oh-my-tmux symlinks ~/.config/tmux/tmux.conf to its bundled config; the
+        // fallback must follow that symlink rather than silently skip it.
+        let target_path = temp_source_path("symlink-target-regular-tmux-fallback");
+        let symlink_path = temp_source_path("symlink-regular-tmux-fallback");
+        std::fs::write(&target_path, "set -g base-index 1\n").expect("write source target");
+        std::os::unix::fs::symlink(&target_path, &symlink_path).expect("create source symlink");
+
+        let inputs = source_inputs_for_path(
+            &symlink_path.to_string_lossy(),
+            None,
+            false,
+            None,
+            SourceReadPolicy::BestEffort,
+        )
+        .expect("best-effort tmux source should follow symlink to regular file");
+        let _ = std::fs::remove_file(&symlink_path);
+        let _ = std::fs::remove_file(&target_path);
+
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].contents, "set -g base-index 1\n");
     }
 
     #[test]
