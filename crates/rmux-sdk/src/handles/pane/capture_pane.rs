@@ -67,7 +67,9 @@ impl<'a> PaneCaptureBuilder<'a> {
     /// Sets the absolute inclusive start line (`capture-pane -S -` form).
     ///
     /// The daemon-side absolute form matches tmux's `-S -` sentinel; it does
-    /// not carry a numeric line value. Use [`Self::start`] for numeric bounds.
+    /// not carry a numeric line value, so `line` is intentionally ignored and
+    /// kept only for builder symmetry/backwards compatibility. Use
+    /// [`Self::start`] for numeric bounds.
     pub const fn start_absolute(mut self, _line: i64) -> Self {
         self.start = None;
         self.start_is_absolute = true;
@@ -84,7 +86,9 @@ impl<'a> PaneCaptureBuilder<'a> {
     /// Sets the absolute inclusive end line (`capture-pane -E -` form).
     ///
     /// The daemon-side absolute form matches tmux's `-E -` sentinel; it does
-    /// not carry a numeric line value. Use [`Self::end`] for numeric bounds.
+    /// not carry a numeric line value, so `line` is intentionally ignored and
+    /// kept only for builder symmetry/backwards compatibility. Use
+    /// [`Self::end`] for numeric bounds.
     pub const fn end_absolute(mut self, _line: i64) -> Self {
         self.end = None;
         self.end_is_absolute = true;

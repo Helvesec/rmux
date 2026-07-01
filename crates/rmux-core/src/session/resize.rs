@@ -41,6 +41,22 @@ impl Session {
                 let _ = window.resize_pane_width(pane_index, columns);
                 let _ = window.resize_pane_height(pane_index, rows);
             }
+            ResizePaneAdjustment::Composite {
+                columns,
+                rows,
+                relative,
+                cells,
+            } => {
+                if let Some(columns) = columns {
+                    let _ = window.resize_pane_width(pane_index, columns);
+                }
+                if let Some(rows) = rows {
+                    let _ = window.resize_pane_height(pane_index, rows);
+                }
+                if let Some(relative) = relative {
+                    let _ = window.resize_pane_by(pane_index, relative.to_adjustment(cells));
+                }
+            }
             ResizePaneAdjustment::Up { cells } => {
                 let _ = window.resize_pane_by(pane_index, ResizePaneAdjustment::Up { cells });
             }

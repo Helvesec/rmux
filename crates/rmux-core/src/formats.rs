@@ -35,7 +35,7 @@ mod time;
 #[path = "formats/transforms.rs"]
 mod transforms;
 
-use condition::{format_bool_op_n, format_conditional};
+use condition::{format_bool_op, format_conditional};
 pub use context::{
     is_known_format_variable_name, FormatContext, FormatVariable, FormatVariables,
     DEFAULT_DISPLAY_MESSAGE_FORMAT, DEFAULT_LIST_PANES_ALL_FORMAT, DEFAULT_LIST_PANES_FORMAT,
@@ -312,7 +312,7 @@ where
     if let Some(op) = bool_op_n {
         // N-ary boolean operator.
         let is_and = op.modifier == "&&";
-        value = format_bool_op_n(state, body, is_and, variables);
+        value = format_bool_op(state, body, is_and, variables);
     } else if let Some(cmp_mod) = cmp {
         // Comparison.
         value = match format_choose(state, body, variables) {

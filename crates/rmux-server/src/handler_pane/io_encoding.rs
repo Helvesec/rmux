@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use rmux_core::key_string_lookup_string;
 use rmux_core::{key_code_lookup_bits, key_string_lookup_key};
 use rmux_proto::{
     ErrorResponse, OptionName, PaneTarget, Response, RmuxError, SendKeysResponse, SessionName,
@@ -8,6 +10,8 @@ use rmux_pty::{ProcessId, WindowsConsoleKeyEvent};
 
 use crate::input_keys::{encode_key, encode_mouse_event, ExtendedKeyFormat};
 use crate::keys::parse_key_code;
+#[cfg(windows)]
+use crate::pane_terminals::DeferredInitialPaneConsoleInputAction;
 use crate::pane_terminals::{session_not_found, HandlerState};
 
 #[cfg(unix)]
@@ -44,12 +48,40 @@ pub(super) struct PaneConsoleInputWrite {
 }
 
 #[cfg(windows)]
+impl PaneConsoleInputWrite {
+    pub(super) fn session_name(&self) -> &SessionName {
+        &self.session_name
+    }
+}
+
+#[cfg(windows)]
 enum PaneConsoleInputSink {
     ConsolePid(ProcessId),
     Disabled,
     QueuedStarting,
     #[cfg(test)]
     CapturedForTest,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WindowsConsoleInputAction {
+    Key(WindowsConsoleKeyEvent),
+    KeyThenInterrupt(WindowsConsoleKeyEvent),
+    Interrupt,
+}
+
+#[cfg(windows)]
+impl WindowsConsoleInputAction {
+    const fn deferred(self) -> DeferredInitialPaneConsoleInputAction {
+        match self {
+            Self::Key(key) => DeferredInitialPaneConsoleInputAction::Key(key),
+            Self::KeyThenInterrupt(key) => {
+                DeferredInitialPaneConsoleInputAction::KeyThenInterrupt(key)
+            }
+            Self::Interrupt => DeferredInitialPaneConsoleInputAction::Interrupt,
+        }
+    }
 }
 
 pub(super) fn prepare_pane_input_write(
@@ -113,18 +145,20 @@ pub(super) fn prepare_attached_pane_console_input_writes(
     state: &mut HandlerState,
     target: &PaneTarget,
     bytes: &[u8],
+    action: WindowsConsoleInputAction,
 ) -> Result<Vec<PaneConsoleInputWrite>, RmuxError> {
     synchronized_input_targets(state, target)?
         .into_iter()
-        .map(|target| prepare_pane_console_input_write(state, &target, bytes))
+        .map(|target| prepare_pane_console_input_write(state, &target, bytes, action))
         .collect()
 }
 
 #[cfg(windows)]
-fn prepare_pane_console_input_write(
+pub(super) fn prepare_pane_console_input_write(
     state: &mut HandlerState,
     target: &PaneTarget,
     bytes: &[u8],
+    action: WindowsConsoleInputAction,
 ) -> Result<PaneConsoleInputWrite, RmuxError> {
     let session_name = target.session_name().clone();
     let window_index = target.window_index();
@@ -148,7 +182,13 @@ fn prepare_pane_console_input_write(
             sink: PaneConsoleInputSink::CapturedForTest,
         });
     }
-    if state.queue_starting_pane_input(&session_name, window_index, pane_index, bytes)? {
+    if state.queue_starting_pane_console_input(
+        &session_name,
+        window_index,
+        pane_index,
+        action.deferred(),
+        bytes.len(),
+    )? {
         return Ok(PaneConsoleInputWrite {
             session_name,
             window_index,
@@ -164,6 +204,246 @@ fn prepare_pane_console_input_write(
         pane_index,
         sink: PaneConsoleInputSink::ConsolePid(pid),
     })
+}
+
+#[cfg(windows)]
+pub(super) fn windows_console_input_for_attached_key(
+    console_key: WindowsConsoleKeyEvent,
+) -> WindowsConsoleInputAction {
+    if console_key.virtual_key_code() == b'C' as u16 && console_key.unicode_char() == 0x03 {
+        WindowsConsoleInputAction::KeyThenInterrupt(console_key)
+    } else {
+        WindowsConsoleInputAction::Key(console_key)
+    }
+}
+
+#[cfg(windows)]
+pub(super) fn windows_console_input_for_tokens(
+    tokens: &[String],
+    repeat_count: usize,
+) -> Option<(WindowsConsoleInputAction, Vec<u8>)> {
+    let [token] = tokens else {
+        return None;
+    };
+    windows_console_input_for_token(token, repeat_count)
+}
+
+#[cfg(windows)]
+pub(super) fn windows_console_input_for_token(
+    token: &str,
+    repeat_count: usize,
+) -> Option<(WindowsConsoleInputAction, Vec<u8>)> {
+    let key = key_code_lookup_bits(parse_key_code(token)?);
+    let repeat_count = repeat_count.min(usize::from(u16::MAX)).max(1);
+    let repeat_count_u16 = repeat_count as u16;
+    let (key_event, byte) = windows_console_ctrl_letter_for_key(key)?;
+    let key_event = key_event.with_repeat_count(repeat_count_u16);
+    let action = if key_matches_name(key, "C-c") {
+        WindowsConsoleInputAction::KeyThenInterrupt(key_event)
+    } else {
+        WindowsConsoleInputAction::Key(key_event)
+    };
+    Some((action, vec![byte; repeat_count]))
+}
+
+#[cfg(windows)]
+pub(super) fn tokens_contain_windows_console_interrupt(tokens: &[String]) -> bool {
+    tokens.iter().any(|token| {
+        windows_console_input_for_token(token, 1).is_some_and(|(action, _)| {
+            matches!(action, WindowsConsoleInputAction::KeyThenInterrupt(_))
+        })
+    })
+}
+
+#[cfg(windows)]
+fn windows_console_ctrl_letter_for_key(
+    key: rmux_core::KeyCode,
+) -> Option<(WindowsConsoleKeyEvent, u8)> {
+    for letter in b'A'..=b'Z' {
+        let name = format!("C-{}", char::from(letter.to_ascii_lowercase()));
+        if Some(key) == key_string_lookup_string(&name).map(key_code_lookup_bits) {
+            let event = match letter {
+                b'C' => WindowsConsoleKeyEvent::ctrl_c(),
+                b'D' => WindowsConsoleKeyEvent::ctrl_d(),
+                b'Z' => WindowsConsoleKeyEvent::ctrl_z(),
+                _ => WindowsConsoleKeyEvent::ctrl_letter(letter)?,
+            };
+            return Some((event, letter - b'A' + 1));
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+pub(super) fn should_emulate_windows_cmd_select_all(
+    state: &HandlerState,
+    target: &PaneTarget,
+    key: rmux_core::KeyCode,
+) -> bool {
+    key_matches_name(key, "C-a") && target_uses_windows_cmd_shell(state, target)
+}
+
+#[cfg(windows)]
+pub(super) fn tokens_emulate_windows_cmd_select_all(
+    state: &HandlerState,
+    target: &PaneTarget,
+    tokens: &[String],
+) -> bool {
+    let [token] = tokens else {
+        return false;
+    };
+    parse_key_code(token)
+        .is_some_and(|key| should_emulate_windows_cmd_select_all(state, target, key))
+}
+
+#[cfg(windows)]
+pub(super) fn should_route_windows_control_as_pty_bytes(
+    state: &HandlerState,
+    target: &PaneTarget,
+    key: rmux_core::KeyCode,
+) -> bool {
+    (key_matches_name(key, "C-c") || key_matches_name(key, "C-d"))
+        && target_uses_wsl_host_process(state, target)
+}
+
+#[cfg(windows)]
+pub(super) fn tokens_route_windows_control_as_pty_bytes(
+    state: &HandlerState,
+    target: &PaneTarget,
+    tokens: &[String],
+) -> bool {
+    let [token] = tokens else {
+        return false;
+    };
+    parse_key_code(token)
+        .is_some_and(|key| should_route_windows_control_as_pty_bytes(state, target, key))
+}
+
+#[cfg(windows)]
+fn target_uses_windows_cmd_shell(state: &HandlerState, target: &PaneTarget) -> bool {
+    let profile_shell_is_cmd = state
+        .pane_profile_in_window(
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+        )
+        .ok()
+        .and_then(|profile| profile.shell().file_name())
+        .and_then(|name| name.to_str())
+        .is_some_and(is_windows_cmd_name);
+    if profile_shell_is_cmd {
+        return true;
+    }
+
+    state
+        .pane_pid_in_window(
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+        )
+        .ok()
+        .and_then(rmux_os::process::command_name)
+        .as_deref()
+        .is_some_and(is_windows_cmd_name)
+}
+
+#[cfg(windows)]
+fn target_uses_wsl_host_process(state: &HandlerState, target: &PaneTarget) -> bool {
+    let lifecycle_command = pane_id_for_input_target(state, target)
+        .ok()
+        .and_then(|pane_id| state.pane_start_command_for_id(pane_id));
+    let lifecycle_matches = lifecycle_command.is_some_and(command_invokes_wsl);
+    let process_name = state
+        .pane_pid_in_window(
+            target.session_name(),
+            target.window_index(),
+            target.pane_index(),
+        )
+        .ok()
+        .and_then(rmux_os::process::command_name);
+    let process_matches = process_name.as_deref().is_some_and(is_wsl_host_name);
+    trace_windows_wsl_detection(process_name.as_deref(), lifecycle_matches, process_matches);
+    if lifecycle_matches {
+        return true;
+    }
+
+    process_matches
+}
+
+#[cfg(windows)]
+fn trace_windows_wsl_detection(
+    process_name: Option<&str>,
+    lifecycle_matches: bool,
+    process_matches: bool,
+) {
+    if std::env::var_os("RMUX_TRACE_WINDOWS_KEYS").is_none() {
+        return;
+    }
+    tracing::debug!(
+        target: "rmux::windows_keys",
+        process_name,
+        lifecycle_matches,
+        process_matches,
+        "detect Windows WSL control-key routing"
+    );
+}
+
+#[cfg(windows)]
+fn command_invokes_wsl(command: &[String]) -> bool {
+    command.iter().any(|part| {
+        part.split_whitespace()
+            .next()
+            .is_some_and(is_wsl_command_head)
+            || part.to_ascii_lowercase().contains("wsl.exe")
+    })
+}
+
+#[cfg(windows)]
+fn is_wsl_command_head(head: &str) -> bool {
+    let trimmed = head.trim_matches(['"', '\'']);
+    std::path::Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_wsl_host_name)
+        || is_wsl_host_name(trimmed)
+}
+
+#[cfg(windows)]
+fn is_wsl_host_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == "wsl.exe"
+        || lower == "wsl"
+        || lower.ends_with("\\wsl.exe")
+        || lower.ends_with("/wsl.exe")
+}
+
+#[cfg(windows)]
+fn is_windows_cmd_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("cmd.exe") || name.eq_ignore_ascii_case("cmd")
+}
+
+#[cfg(windows)]
+fn windows_cmd_select_all_sequence(
+    state: &HandlerState,
+    target: &PaneTarget,
+) -> Result<Option<Vec<u8>>, RmuxError> {
+    let mut bytes = Vec::new();
+    for key_name in ["C-Home", "S-End"] {
+        let Some(key) = key_string_lookup_string(key_name) else {
+            return Ok(None);
+        };
+        let Some(encoded) = encode_key_for_target(state, target, key)? else {
+            return Ok(None);
+        };
+        bytes.extend_from_slice(&encoded);
+    }
+    Ok(Some(bytes))
+}
+
+#[cfg(windows)]
+fn key_matches_name(key: rmux_core::KeyCode, name: &str) -> bool {
+    key_string_lookup_string(name)
+        .is_some_and(|candidate| key_code_lookup_bits(candidate) == key_code_lookup_bits(key))
 }
 
 pub(super) fn prepare_synchronized_pane_input_writes(
@@ -281,9 +561,9 @@ pub(super) async fn write_bytes_to_target_io(
 }
 
 #[cfg(windows)]
-pub(super) async fn write_windows_console_key_to_target_io(
+pub(super) async fn write_windows_console_input_action_to_target_io(
     write: PaneConsoleInputWrite,
-    key: WindowsConsoleKeyEvent,
+    action: WindowsConsoleInputAction,
 ) -> Result<(), RmuxError> {
     let PaneConsoleInputWrite {
         session_name,
@@ -295,21 +575,70 @@ pub(super) async fn write_windows_console_key_to_target_io(
         PaneConsoleInputSink::Disabled => Ok(()),
         PaneConsoleInputSink::QueuedStarting => Ok(()),
         PaneConsoleInputSink::ConsolePid(pid) => {
-            tokio::task::spawn_blocking(move || rmux_pty::write_windows_console_key(pid, key))
-                .await
-                .map_err(|error| {
-                    RmuxError::Server(format!("pane console input task failed: {error}"))
-                })?
-                .map_err(|error| {
-                    RmuxError::Server(format!(
-                        "failed to write console input to pane {}:{}.{}: {}",
-                        session_name, window_index, pane_index, error
-                    ))
-                })
+            trace_windows_console_input(
+                &session_name,
+                window_index,
+                pane_index,
+                pid,
+                action,
+                "dispatch",
+            );
+            tokio::task::spawn_blocking(move || match action {
+                WindowsConsoleInputAction::Key(key) => {
+                    rmux_pty::write_windows_console_key(pid, key)
+                }
+                WindowsConsoleInputAction::KeyThenInterrupt(key) => {
+                    rmux_pty::write_windows_console_key_then_interrupt_if_processed(pid, key)
+                }
+                WindowsConsoleInputAction::Interrupt => {
+                    rmux_pty::send_windows_console_interrupt(pid)
+                }
+            })
+            .await
+            .map_err(|error| RmuxError::Server(format!("pane console input task failed: {error}")))?
+            .map_err(|error| {
+                RmuxError::Server(format!(
+                    "failed to write console input to pane {}:{}.{}: {}",
+                    session_name, window_index, pane_index, error
+                ))
+            })
         }
         #[cfg(test)]
         PaneConsoleInputSink::CapturedForTest => Ok(()),
     }
+}
+
+#[cfg(windows)]
+pub(super) async fn write_windows_console_key_to_target_io(
+    write: PaneConsoleInputWrite,
+    key: WindowsConsoleKeyEvent,
+) -> Result<(), RmuxError> {
+    write_windows_console_input_action_to_target_io(write, WindowsConsoleInputAction::Key(key))
+        .await
+}
+
+#[cfg(windows)]
+fn trace_windows_console_input(
+    session_name: &SessionName,
+    window_index: u32,
+    pane_index: u32,
+    pid: ProcessId,
+    action: WindowsConsoleInputAction,
+    stage: &'static str,
+) {
+    if std::env::var_os("RMUX_TRACE_WINDOWS_KEYS").is_none() {
+        return;
+    }
+    tracing::debug!(
+        target: "rmux::windows_keys",
+        %session_name,
+        window_index,
+        pane_index,
+        pid = pid.as_u32(),
+        ?action,
+        stage,
+        "Windows console input action"
+    );
 }
 
 pub(super) fn pane_id_for_input_target(
@@ -430,6 +759,11 @@ pub(super) fn encode_key_for_target(
     target: &PaneTarget,
     key: rmux_core::KeyCode,
 ) -> Result<Option<Vec<u8>>, RmuxError> {
+    #[cfg(windows)]
+    if should_emulate_windows_cmd_select_all(state, target, key) {
+        return windows_cmd_select_all_sequence(state, target);
+    }
+
     let pane_id = state
         .sessions
         .session(target.session_name())
@@ -508,5 +842,82 @@ mod tests {
         assert!(!super::should_try_immediate_pane_input(
             super::IMMEDIATE_PANE_INPUT_MAX_BYTES + 1
         ));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use crate::pane_terminals::DeferredInitialPaneConsoleInputAction;
+    use rmux_pty::WindowsConsoleKeyEvent;
+
+    #[test]
+    fn windows_console_key_mapping_covers_control_signals() {
+        assert_eq!(
+            super::windows_console_input_for_tokens(&["C-a".to_owned()], 1),
+            Some((
+                super::WindowsConsoleInputAction::Key(
+                    WindowsConsoleKeyEvent::ctrl_letter(b'A').unwrap()
+                ),
+                vec![0x01]
+            ))
+        );
+        assert_eq!(
+            super::windows_console_input_for_tokens(&["C-c".to_owned()], 1),
+            Some((
+                super::WindowsConsoleInputAction::KeyThenInterrupt(WindowsConsoleKeyEvent::ctrl_c()),
+                vec![0x03]
+            ))
+        );
+        assert_eq!(
+            super::windows_console_input_for_attached_key(WindowsConsoleKeyEvent::ctrl_c()),
+            super::WindowsConsoleInputAction::KeyThenInterrupt(WindowsConsoleKeyEvent::ctrl_c())
+        );
+        assert_eq!(
+            super::windows_console_input_for_tokens(&["C-d".to_owned()], 1),
+            Some((
+                super::WindowsConsoleInputAction::Key(WindowsConsoleKeyEvent::ctrl_d()),
+                vec![0x04]
+            ))
+        );
+        assert_eq!(
+            super::windows_console_input_for_tokens(&["C-z".to_owned()], 2),
+            Some((
+                super::WindowsConsoleInputAction::Key(
+                    WindowsConsoleKeyEvent::ctrl_z().with_repeat_count(2)
+                ),
+                vec![0x1a, 0x1a]
+            ))
+        );
+        assert!(super::tokens_contain_windows_console_interrupt(&[
+            "Enter".to_owned(),
+            "C-c".to_owned()
+        ]));
+        assert!(super::tokens_contain_windows_console_interrupt(&[
+            "C-c".to_owned(),
+            "Enter".to_owned()
+        ]));
+        assert!(!super::tokens_contain_windows_console_interrupt(&[
+            "C-d".to_owned(),
+            "Enter".to_owned()
+        ]));
+    }
+
+    #[test]
+    fn deferred_windows_console_actions_preserve_control_semantics() {
+        assert_eq!(
+            super::WindowsConsoleInputAction::Key(WindowsConsoleKeyEvent::ctrl_d()).deferred(),
+            DeferredInitialPaneConsoleInputAction::Key(WindowsConsoleKeyEvent::ctrl_d())
+        );
+        assert_eq!(
+            super::WindowsConsoleInputAction::KeyThenInterrupt(WindowsConsoleKeyEvent::ctrl_c())
+                .deferred(),
+            DeferredInitialPaneConsoleInputAction::KeyThenInterrupt(
+                WindowsConsoleKeyEvent::ctrl_c()
+            )
+        );
+        assert_eq!(
+            super::WindowsConsoleInputAction::Interrupt.deferred(),
+            DeferredInitialPaneConsoleInputAction::Interrupt
+        );
     }
 }

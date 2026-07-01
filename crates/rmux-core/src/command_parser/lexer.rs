@@ -33,6 +33,7 @@ pub(super) struct Lexer<'a> {
     offset: usize,
     ungot: Vec<char>,
     pending_backslashes: usize,
+    hash_format_mode: HashFormatMode,
     local_environment: Vec<(String, String)>,
     condition: bool,
     eol: bool,
@@ -43,11 +44,24 @@ pub(super) struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     pub(super) fn new(input: &str, context: &'a CommandParser) -> Self {
+        Self::with_hash_format_mode(input, context, HashFormatMode::TokenOutsideCondition)
+    }
+
+    pub(super) fn new_source_file(input: &str, context: &'a CommandParser) -> Self {
+        Self::with_hash_format_mode(input, context, HashFormatMode::CommentOutsideCondition)
+    }
+
+    fn with_hash_format_mode(
+        input: &str,
+        context: &'a CommandParser,
+        hash_format_mode: HashFormatMode,
+    ) -> Self {
         Self {
             input: Self::normalize_newlines(input),
             offset: 0,
             ungot: Vec::new(),
             pending_backslashes: 0,
+            hash_format_mode,
             local_environment: Vec::new(),
             condition: false,
             eol: false,
@@ -124,7 +138,9 @@ impl<'a> Lexer<'a> {
                         let token = self.read_format()?;
                         return Ok(self.spanned(token));
                     }
-                    if next == Some('{') {
+                    if next == Some('{')
+                        && self.hash_format_mode == HashFormatMode::TokenOutsideCondition
+                    {
                         let token = match self.read_format()? {
                             LexToken::Format(value) => LexToken::Token(value),
                             _ => unreachable!("read_format returns a format token"),
@@ -323,4 +339,10 @@ impl<'a> Lexer<'a> {
             value.push(ch);
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HashFormatMode {
+    TokenOutsideCondition,
+    CommentOutsideCondition,
 }

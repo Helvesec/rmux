@@ -380,11 +380,19 @@ pub(super) fn attach_with_connection(
     let attach_windows_console_key = connection
         .supports_capability(CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY)
         .map_err(ExitFailure::from_client)?;
-    let transition = if attach_render {
+    let mut attach_capabilities = Vec::new();
+    if attach_render {
+        attach_capabilities.push(CAPABILITY_ATTACH_RENDER.to_owned());
+    }
+    #[cfg(windows)]
+    if attach_windows_console_key {
+        attach_capabilities.push(CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY.to_owned());
+    }
+    let transition = if !attach_capabilities.is_empty() {
         connection
             .begin_attach_with_capabilities(AttachSessionExt3Request::from_ext2(
                 request,
-                vec![CAPABILITY_ATTACH_RENDER.to_owned()],
+                attach_capabilities,
             ))
             .map_err(ExitFailure::from_client)?
     } else {

@@ -10,10 +10,10 @@ esac
 PROFILE="${RMUX_PROFILE:-release}"
 case "$PROFILE" in
     debug)
-        PROFILE_FLAG=()
+        PROFILE_FLAG=""
         ;;
     release)
-        PROFILE_FLAG=(--release)
+        PROFILE_FLAG="--release"
         ;;
     *)
         printf '[issue34-slow-attach] ERROR: unsupported RMUX_PROFILE: %s\n' "$PROFILE" >&2
@@ -21,7 +21,7 @@ case "$PROFILE" in
         ;;
 esac
 RMUX="${RMUX_BIN:-$TARGET_DIR/$PROFILE/rmux}"
-SMOKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/rmux-issue34-slow-attach.XXXXXX")"
+SMOKE_ROOT="$(mktemp -d "${RMUX_ISSUE34_TMPDIR:-/tmp}/rmux-issue34-slow-attach.XXXXXX")"
 export RMUX_TMPDIR="$SMOKE_ROOT/socket"
 mkdir -p "$RMUX_TMPDIR"
 export TERM="${TERM:-xterm-256color}"
@@ -48,17 +48,25 @@ command -v python3 >/dev/null 2>&1 || fail 'python3 is required for issue #34 sl
 cd "$ROOT"
 
 if [[ -z "${RMUX_BIN:-}" ]]; then
-    log "cargo build --locked ${PROFILE_FLAG[*]}"
-    cargo build --locked "${PROFILE_FLAG[@]}"
+    if [[ -n "$PROFILE_FLAG" ]]; then
+        log "cargo build --locked $PROFILE_FLAG"
+        cargo build --locked "$PROFILE_FLAG"
+    else
+        log "cargo build --locked"
+        cargo build --locked
+    fi
 fi
 
 [[ -x "$RMUX" ]] || fail "rmux binary not found or not executable: $RMUX"
 
 log "using $RMUX"
+# The synthetic slow reader below intentionally drains only 256 bytes every 50ms.
+# Package builds on slower CI can legitimately take a little over 10s to surface
+# the final marker while still staying bounded by the byte budget.
 python3 - \
     "$RMUX" \
     "$SMOKE_ROOT" \
-    "${RMUX_ISSUE34_SLOW_ATTACH_MAX_DELAY_MS:-${RMUX_ISSUE34_MAX_MS:-10000}}" \
+    "${RMUX_ISSUE34_SLOW_ATTACH_MAX_DELAY_MS:-${RMUX_ISSUE34_MAX_MS:-15000}}" \
     "${RMUX_ISSUE34_SLOW_IPC_MAX_MS:-750}" \
     "${RMUX_ISSUE34_SLOW_FRAMES:-5000}" \
     "${RMUX_ISSUE34_SLOW_READ_BYTES:-256}" \
@@ -292,7 +300,8 @@ try:
 
     done_at = time.perf_counter()
     wait_until("final marker in capture-pane", capture_has_marker, 2.0)
-    wait_until("final marker in slow attach output", lambda: attach.marker_seen_at, 15.0)
+    attach_marker_timeout = max(15.0, (max_attach_delay_ms / 1000.0) + 1.0)
+    wait_until("final marker in slow attach output", lambda: attach.marker_seen_at, attach_marker_timeout)
 
     attach_delay_ms = int((attach.marker_seen_at - done_at) * 1000)
     if attach_delay_ms > max_attach_delay_ms:

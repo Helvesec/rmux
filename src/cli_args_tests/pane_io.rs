@@ -247,6 +247,38 @@ fn select_pane_accepts_directional_flags_with_optional_target() {
 }
 
 #[test]
+fn select_pane_directional_flags_follow_tmux_priority() {
+    for argv in [
+        ["select-pane", "-L", "-R", "-t", "alpha:5.2"],
+        ["select-pane", "-R", "-L", "-t", "alpha:5.2"],
+    ] {
+        let cli = parse_args(&argv).unwrap();
+        match cli.command.expect("parsed command") {
+            super::super::Command::SelectPane(args) => {
+                assert_eq!(
+                    args.direction(),
+                    Some(rmux_proto::SelectPaneDirection::Left)
+                );
+            }
+            _ => panic!("expected SelectPane command"),
+        }
+    }
+
+    for argv in [
+        ["select-pane", "-U", "-D", "-t", "alpha:5.2"],
+        ["select-pane", "-D", "-U", "-t", "alpha:5.2"],
+    ] {
+        let cli = parse_args(&argv).unwrap();
+        match cli.command.expect("parsed command") {
+            super::super::Command::SelectPane(args) => {
+                assert_eq!(args.direction(), Some(rmux_proto::SelectPaneDirection::Up));
+            }
+            _ => panic!("expected SelectPane command"),
+        }
+    }
+}
+
+#[test]
 fn select_pane_accepts_last_keep_zoom_and_input_flags() {
     let cli = parse_args(&["select-pane", "-l", "-Z", "-t", "%1"]).unwrap();
     match cli.command.expect("parsed command") {

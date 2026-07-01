@@ -16,6 +16,8 @@ mod capabilities;
 mod capture_pane;
 #[path = "cli/claude_launcher.rs"]
 mod claude_launcher;
+#[path = "cli/claude_skill.rs"]
+mod claude_skill;
 #[path = "cli/client_commands.rs"]
 mod client_commands;
 #[path = "cli/command_inventory.rs"]
@@ -138,6 +140,9 @@ where
     }
     if let Some(invocation) = tmux_dropin::parse_invocation(args.get(1..).unwrap_or(&[]))? {
         return tmux_dropin::run(invocation, args.first());
+    }
+    if let Some(invocation) = claude_skill::parse_invocation(args.get(1..).unwrap_or(&[]))? {
+        return claude_skill::run(invocation);
     }
     if let Some(invocation) = claude_launcher::parse_invocation(args.get(1..).unwrap_or(&[])) {
         return claude_launcher::run(invocation);
@@ -409,7 +414,7 @@ mod tests {
             top_level_parse_failure(&args(&["--help"]))
                 .expect("expected --help to fail before clap")
                 .message(),
-            "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n\nRMUX extensions:\n  capabilities [--human|--json]\n  claude [claude-args...]\n  diagnose [--human|--json]\n  doctor tmux-dropin\n  setup tmux-shim\n  wait-pane [flags]\n  pane-snapshot [flags]\n  stream-pane [--raw|--lines]\n  collect-pane-output --until-pane-exit --max-bytes bytes\n  locator|expect-pane [flags]\n  find-panes|find-sessions [flags]\n  broadcast-keys -t target... -- key ...\n  with-session session-name -- command ...\n  web-share [flags]\n  web-share list|lookup|stop|disconnect|off|config\n\nUse `rmux list-commands` for the tmux-compatible command surface."
+            "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n\nRMUX extensions:\n  capabilities [--human|--json]\n  claude [install-skill|claude-args...]\n  diagnose [--human|--json]\n  doctor tmux-dropin\n  setup tmux-shim\n  wait-pane [flags]\n  pane-snapshot [flags]\n  stream-pane [--raw|--lines]\n  collect-pane-output --until-pane-exit --max-bytes bytes\n  locator|expect-pane [flags]\n  find-panes|find-sessions [flags]\n  broadcast-keys -t target... -- key ...\n  with-session session-name -- command ...\n  web-share [flags]\n  web-share list|lookup|stop|disconnect|off|config\n\nUse `rmux list-commands` for the tmux-compatible command surface."
         );
         assert_eq!(
             top_level_parse_failure(&args(&["--not-a-tmux-flag", "-h"]))

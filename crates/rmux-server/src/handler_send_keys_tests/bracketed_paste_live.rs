@@ -78,6 +78,94 @@ async fn live_attach_bracketed_paste_preserves_wrappers_when_pane_mode_is_enable
 }
 
 #[tokio::test]
+async fn live_attach_bracketed_paste_is_consumed_without_pane_leak_in_copy_mode() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let entered = handler
+        .handle(Request::CopyMode(CopyModeRequest {
+            target: Some(PaneTarget::new(alpha.clone(), 0)),
+            page_down: false,
+            exit_on_scroll: false,
+            hide_position: false,
+            mouse_drag_start: false,
+            cancel_mode: false,
+            scrollbar_scroll: false,
+            source: None,
+            page_up: false,
+        }))
+        .await;
+    assert!(matches!(entered, Response::CopyMode(_)));
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let capture =
+        RawPaneInputProbe::start(&handler, &alpha, "live-attach-bracketed-paste-copy-mode", 0)
+            .await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[200~secret\x1b[201~")
+        .await
+        .expect("bracketed paste in copy-mode is consumed");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, b"").await;
+}
+
+#[tokio::test]
+async fn live_attach_chunked_bracketed_paste_is_consumed_without_pane_leak_in_copy_mode() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let entered = handler
+        .handle(Request::CopyMode(CopyModeRequest {
+            target: Some(PaneTarget::new(alpha.clone(), 0)),
+            page_down: false,
+            exit_on_scroll: false,
+            hide_position: false,
+            mouse_drag_start: false,
+            cancel_mode: false,
+            scrollbar_scroll: false,
+            source: None,
+            page_up: false,
+        }))
+        .await;
+    assert!(matches!(entered, Response::CopyMode(_)));
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let capture = RawPaneInputProbe::start(
+        &handler,
+        &alpha,
+        "live-attach-chunked-bracketed-paste-copy-mode",
+        0,
+    )
+    .await;
+
+    let mut pending_input = Vec::new();
+    for chunk in [b"\x1b[200~sec".as_slice(), b"ret", b"\x1b[201~"] {
+        handler
+            .handle_attached_live_input(requester_pid, &mut pending_input, chunk)
+            .await
+            .expect("chunked bracketed paste in copy-mode is consumed");
+    }
+    assert!(pending_input.is_empty());
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, b"").await;
+}
+
+#[tokio::test]
 async fn live_attach_bracketed_paste_preserves_multiline_special_payload() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");

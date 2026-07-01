@@ -68,6 +68,60 @@ async fn background_if_shell_keeps_detached_write_access_after_response() {
 }
 
 #[tokio::test]
+async fn queued_background_if_shell_keeps_detached_write_access_after_response() {
+    let handler = RequestHandler::new();
+    use_platform_test_shell(&handler).await;
+    let requester_pid = 424_007;
+    let parsed = CommandParser::new()
+        .parse(&format!(
+            "if-shell -b {} 'set-buffer -b bg-queued-if-shell ok'",
+            command_quote(&delayed_true_shell_condition())
+        ))
+        .expect("background if-shell command parses");
+
+    {
+        let _access = handler.begin_detached_requester_access(requester_pid, true);
+        let output = handler
+            .execute_parsed_commands_for_test(requester_pid, parsed)
+            .await
+            .expect("background if-shell dispatch succeeds");
+        assert!(output.stdout().is_empty());
+    }
+
+    wait_for_named_buffer(&handler, "bg-queued-if-shell", b"ok").await;
+}
+
+#[tokio::test]
+async fn background_if_shell_is_tracked_as_detached_request_until_finished() {
+    let handler = RequestHandler::new();
+    use_platform_test_shell(&handler).await;
+
+    #[cfg(unix)]
+    let condition = "sleep 0.2; true".to_owned();
+    #[cfg(windows)]
+    let condition = "Start-Sleep -Milliseconds 200; exit 0".to_owned();
+
+    let response = handler
+        .handle(Request::IfShell(Box::new(IfShellRequest {
+            condition,
+            format_mode: false,
+            then_command: "display-message done".to_owned(),
+            else_command: None,
+            target: None,
+            caller_cwd: None,
+            background: true,
+        })))
+        .await;
+
+    assert_eq!(
+        response,
+        Response::IfShell(rmux_proto::IfShellResponse::no_output())
+    );
+    wait_for_detached_request_count(&handler, 1).await;
+    wait_for_detached_request_count(&handler, 0).await;
+}
+
+#[tokio::test]
 async fn if_shell_format_mode_expands_socket_path_without_target() {
     let handler = RequestHandler::new();
     handler.set_socket_path("/tmp/rmux-test.sock");

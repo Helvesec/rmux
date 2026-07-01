@@ -12,11 +12,11 @@ use std::time::Duration;
 use rmux_proto::{
     CancelSdkWaitRequest, PaneOutputSubscriptionStart, Request, Response, RmuxError as ProtoError,
     SdkWaitForOutputRefRequest, SdkWaitForOutputRequest, SdkWaitId, SdkWaitOutcome,
-    CAPABILITY_SDK_PANE_BY_ID,
+    CAPABILITY_SDK_PANE_BY_ID, CAPABILITY_SDK_WAITS_ARMED,
 };
 
 use crate::handles::{connect_transport_to_endpoint, Pane};
-use crate::transport::{DropGuard, PendingResponse};
+use crate::transport::{DropGuard, PendingResponse, TransportClient};
 use crate::{Result, RmuxError};
 
 pub use visible::{VisibleTextExpectation, VisibleTextWait, WaitTimeoutError};
@@ -41,6 +41,7 @@ const SDK_WAIT_ARM_DISPATCH_SETTLE: Duration = Duration::from_millis(250);
 #[must_use = "armed waits do nothing useful unless awaited or explicitly dropped"]
 pub struct ArmedWait {
     response: PendingResponse,
+    _wait_client: TransportClient,
     wait_id: SdkWaitId,
     cancel_guard: DropGuard,
     timeout: Option<Pin<Box<tokio::time::Sleep>>>,
@@ -51,6 +52,7 @@ pub struct ArmedWait {
 impl ArmedWait {
     fn new(
         response: PendingResponse,
+        wait_client: TransportClient,
         wait_id: SdkWaitId,
         cancel_guard: DropGuard,
         operation: &'static str,
@@ -58,6 +60,7 @@ impl ArmedWait {
     ) -> Self {
         Self {
             response,
+            _wait_client: wait_client,
             wait_id,
             cancel_guard,
             timeout: timeout.map(|duration| Box::pin(tokio::time::sleep(duration))),
@@ -186,49 +189,8 @@ async fn wait_for_bytes_without_timeout(
     bytes: Vec<u8>,
     timeout: Option<Duration>,
 ) -> Result<()> {
-    let owner_id = pane.transport().sdk_wait_owner_id();
-    let wait_id = pane.transport().allocate_sdk_wait_id();
-    let cancel_request = Request::CancelSdkWait(CancelSdkWaitRequest { owner_id, wait_id });
-    let cancel_client = connect_transport_to_endpoint(pane.endpoint(), timeout).await?;
-    let mut cancel_guard = DropGuard::best_effort(cancel_client, cancel_request);
-
-    let response = if pane.is_stable_id() {
-        crate::capabilities::require(pane.transport(), &[CAPABILITY_SDK_PANE_BY_ID]).await?;
-        pane.transport()
-            .request(Request::SdkWaitForOutputRef(SdkWaitForOutputRefRequest {
-                owner_id,
-                wait_id,
-                target: pane.proto_target_ref(),
-                bytes,
-                start: PaneOutputSubscriptionStart::Now,
-            }))
-            .await
-    } else {
-        pane.transport()
-            .request(Request::SdkWaitForOutput(SdkWaitForOutputRequest {
-                owner_id,
-                wait_id,
-                target: pane.target().into(),
-                bytes,
-                start: PaneOutputSubscriptionStart::Now,
-            }))
-            .await
-    };
-
-    let response = match response {
-        Ok(response) => response,
-        Err(error) => {
-            if sdk_wait_error_disarms_cancel(&error) {
-                cancel_guard.disarm();
-            }
-            return Err(error);
-        }
-    };
-
-    if sdk_wait_response_disarms_cancel(&response, wait_id) {
-        cancel_guard.disarm();
-    }
-    sdk_wait_response_to_result(response, wait_id)
+    let armed_wait = arm_sdk_wait(pane, bytes, WAIT_FOR_BYTES_OPERATION, timeout).await?;
+    armed_wait.await
 }
 
 async fn arm_sdk_wait(
@@ -240,22 +202,26 @@ async fn arm_sdk_wait(
     let wait_client = connect_transport_to_endpoint(pane.endpoint(), timeout).await?;
     let cancel_client = connect_transport_to_endpoint(pane.endpoint(), timeout).await?;
     let owner_id = wait_client.sdk_wait_owner_id();
+    crate::capabilities::require_with_handshake(
+        &wait_client,
+        &[CAPABILITY_SDK_WAITS_ARMED],
+        &[CAPABILITY_SDK_WAITS_ARMED],
+    )
+    .await?;
     let wait_id = wait_client.allocate_sdk_wait_id();
     let cancel_request = Request::CancelSdkWait(CancelSdkWaitRequest { owner_id, wait_id });
     let cancel_guard = DropGuard::best_effort(cancel_client, cancel_request);
+    let request = sdk_wait_request_for_pane(pane, owner_id, wait_id, bytes).await?;
 
-    let response = with_wait_timeout(
-        operation,
-        timeout,
-        wait_client.armed_request(sdk_wait_request_for_pane(pane, owner_id, wait_id, bytes).await?),
-    )
-    .await?;
+    let response =
+        with_wait_timeout(operation, timeout, wait_client.armed_request(request)).await?;
 
     #[cfg(windows)]
     tokio::time::sleep(SDK_WAIT_ARM_DISPATCH_SETTLE).await;
 
     Ok(ArmedWait::new(
         response,
+        wait_client,
         wait_id,
         cancel_guard,
         operation,

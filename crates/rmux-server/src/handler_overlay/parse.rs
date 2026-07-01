@@ -35,6 +35,7 @@ pub(super) struct ParsedMenuItem {
     pub(super) label: String,
     pub(super) shortcut: String,
     pub(super) command: String,
+    pub(super) separator: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -194,12 +195,22 @@ pub(super) fn parse_display_menu(
     let mut items = Vec::new();
     while !args.is_empty() {
         let label = args.pop("display-menu item label")?;
+        if label.is_empty() || label == "-" {
+            items.push(ParsedMenuItem {
+                label,
+                shortcut: String::new(),
+                command: String::new(),
+                separator: true,
+            });
+            continue;
+        }
         let shortcut = args.pop("display-menu item shortcut")?;
         let command = args.pop("display-menu item command")?;
         items.push(ParsedMenuItem {
             label,
             shortcut,
             command,
+            separator: false,
         });
     }
     if items.is_empty() {
@@ -356,15 +367,11 @@ pub(super) fn parse_menu_shortcut(value: &str) -> Option<PromptInputEvent> {
     if value.is_empty() {
         return None;
     }
-    rmux_core::key_string_lookup_string(value)
-        .map(decode_prompt_key)
-        .or_else(|| {
-            let mut chars = value.chars();
-            match (chars.next(), chars.next(), chars.next()) {
-                (Some(ch), None, None) => Some(PromptInputEvent::Char(ch)),
-                _ => None,
-            }
-        })
+    let mut chars = value.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next()) {
+        return Some(PromptInputEvent::Char(ch));
+    }
+    rmux_core::key_string_lookup_string(value).map(decode_prompt_key)
 }
 
 pub(super) fn parse_popup_size_spec(value: &str) -> Result<PopupSizeSpec, RmuxError> {
@@ -408,7 +415,8 @@ fn rebuild_shell_command(command_parts: Vec<String>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_display_menu;
+    use super::{parse_display_menu, parse_menu_shortcut};
+    use crate::handler::prompt_support::PromptInputEvent;
     use rmux_proto::RmuxError;
 
     #[test]
@@ -420,6 +428,80 @@ mod tests {
             RmuxError::Message(
                 "command display-menu: too few arguments (need at least 1)".to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn display_menu_single_empty_label_parses_as_separator() {
+        let parsed = parse_display_menu(vec![
+            "-T".to_owned(),
+            "Menu".to_owned(),
+            "One".to_owned(),
+            "o".to_owned(),
+            "display-message one".to_owned(),
+            String::new(),
+            "Two".to_owned(),
+            "t".to_owned(),
+            "display-message two".to_owned(),
+        ])
+        .expect("display-menu with a single-token separator should parse");
+
+        assert_eq!(parsed.items.len(), 3);
+        assert_eq!(parsed.items[1].label, "");
+        assert_eq!(parsed.items[1].shortcut, "");
+        assert_eq!(parsed.items[1].command, "");
+        assert!(parsed.items[1].separator);
+        assert_eq!(parsed.items[2].label, "Two");
+    }
+
+    #[test]
+    fn display_menu_single_dash_label_parses_as_separator() {
+        let parsed = parse_display_menu(vec![
+            "-T".to_owned(),
+            "Menu".to_owned(),
+            "One".to_owned(),
+            "o".to_owned(),
+            "display-message one".to_owned(),
+            "-".to_owned(),
+            "Two".to_owned(),
+            "t".to_owned(),
+            "display-message two".to_owned(),
+        ])
+        .expect("display-menu with a dash separator should parse");
+
+        assert_eq!(parsed.items.len(), 3);
+        assert_eq!(parsed.items[1].label, "-");
+        assert!(parsed.items[1].separator);
+        assert_eq!(parsed.items[2].label, "Two");
+    }
+
+    #[test]
+    fn display_menu_hyphen_prefixed_label_with_command_is_actionable() {
+        let parsed = parse_display_menu(vec![
+            "-T".to_owned(),
+            "Menu".to_owned(),
+            "--".to_owned(),
+            "-Danger".to_owned(),
+            "d".to_owned(),
+            "display-message danger".to_owned(),
+        ])
+        .expect("hyphen-prefixed menu label with command should parse");
+
+        assert_eq!(parsed.items.len(), 1);
+        assert_eq!(parsed.items[0].label, "-Danger");
+        assert_eq!(parsed.items[0].shortcut, "d");
+        assert_eq!(parsed.items[0].command, "display-message danger");
+        assert!(!parsed.items[0].separator);
+    }
+
+    #[test]
+    fn menu_shortcut_prefers_literal_single_character_events() {
+        assert_eq!(parse_menu_shortcut("n"), Some(PromptInputEvent::Char('n')));
+        assert_eq!(parse_menu_shortcut("X"), Some(PromptInputEvent::Char('X')));
+        assert_eq!(parse_menu_shortcut("<"), Some(PromptInputEvent::Char('<')));
+        assert_eq!(
+            parse_menu_shortcut("C-r"),
+            Some(PromptInputEvent::KeyName("C-r".to_owned()))
         );
     }
 }

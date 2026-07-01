@@ -279,7 +279,13 @@ impl RequestHandler {
 
         match client {
             ManagedClient::Attach(attach_pid) => {
-                let Some((terminal_context, client_size, client_pixels, render_stream)) = self
+                let Some((
+                    terminal_context,
+                    client_size,
+                    client_pixels,
+                    render_stream,
+                    client_flags,
+                )) = self
                     .terminal_context_and_size_for_attached_client(attach_pid)
                     .await
                 else {
@@ -294,6 +300,7 @@ impl RequestHandler {
                             size: client_size,
                             pixels: client_pixels,
                         }),
+                        client_flags,
                     )
                     .await
                 {

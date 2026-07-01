@@ -239,8 +239,13 @@ impl ConsoleRestorePoint {
 }
 
 static CTRL_HANDLER_STATE: Mutex<Option<ConsoleModeSnapshot>> = Mutex::new(None);
+static PENDING_CTRL_C_EVENT: AtomicBool = AtomicBool::new(false);
 
 unsafe extern "system" fn raw_terminal_ctrl_handler(event: u32) -> i32 {
+    if event == CTRL_C_EVENT {
+        PENDING_CTRL_C_EVENT.store(true, Ordering::SeqCst);
+        return 1;
+    }
     if should_restore_for_console_event(event) {
         if let Ok(state) = CTRL_HANDLER_STATE.lock() {
             if let Some(snapshot) = *state {
@@ -249,6 +254,10 @@ unsafe extern "system" fn raw_terminal_ctrl_handler(event: u32) -> i32 {
         }
     }
     0
+}
+
+pub(super) fn take_pending_ctrl_c_event() -> bool {
+    PENDING_CTRL_C_EVENT.swap(false, Ordering::SeqCst)
 }
 
 const fn should_restore_for_console_event(event: u32) -> bool {
@@ -605,7 +614,8 @@ const fn raw_input_mode_with_mouse(original: u32, mouse_enabled: bool) -> u32 {
         (original | ENABLE_EXTENDED_FLAGS | ENABLE_MOUSE_INPUT)
             & !(line_editing | ENABLE_QUICK_EDIT_MODE)
     } else {
-        (original | ENABLE_EXTENDED_FLAGS) & !(line_editing | ENABLE_MOUSE_INPUT)
+        (original | ENABLE_EXTENDED_FLAGS)
+            & !(line_editing | ENABLE_MOUSE_INPUT | ENABLE_QUICK_EDIT_MODE)
     }
 }
 

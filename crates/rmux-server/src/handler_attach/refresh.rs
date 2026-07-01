@@ -13,8 +13,15 @@ impl RequestHandler {
             .with_str("session", session_name.as_str());
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
-        let attached_count = { self.attached_count(session_name).await };
-        let (refresh_contexts, mode_tree_pids, overlay_pids) = {
+        let removed_stale_clients = self
+            .prune_stale_attached_clients_for_session(session_name)
+            .await;
+        if !removed_stale_clients.is_empty() {
+            let _ = self
+                .reconcile_attached_session_size_and_emit(session_name)
+                .await;
+        }
+        let (refresh_contexts, mode_tree_pids, overlay_pids, stale_pids) = {
             let mut active_attach = self.active_attach.lock().await;
             let mut refresh_contexts = Vec::new();
             let mut mode_tree_pids = Vec::new();
@@ -58,11 +65,17 @@ impl RequestHandler {
                     active.key_table_name.clone(),
                 ));
             }
-            for pid in stale_pids {
-                active_attach.by_pid.remove(&pid);
-            }
-            (refresh_contexts, mode_tree_pids, overlay_pids)
+            (refresh_contexts, mode_tree_pids, overlay_pids, stale_pids)
         };
+        let removed_stale_clients = self
+            .remove_attached_clients_for_session(session_name, stale_pids)
+            .await;
+        if !removed_stale_clients.is_empty() {
+            let _ = self
+                .reconcile_attached_session_size_and_emit(session_name)
+                .await;
+        }
+        let attached_count = { self.attached_count(session_name).await };
         let targets = {
             let state = self.state.lock().await;
             let _lock_span = crate::perf_instrument::span("state_lock_hold")
@@ -116,10 +129,15 @@ impl RequestHandler {
                 stale_pids.push(*pid);
             }
         }
-        for pid in stale_pids {
-            active_attach.by_pid.remove(&pid);
-        }
         drop(active_attach);
+        let removed_stale_clients = self
+            .remove_attached_clients_for_session(session_name, stale_pids)
+            .await;
+        if !removed_stale_clients.is_empty() {
+            let _ = self
+                .reconcile_attached_session_size_and_emit(session_name)
+                .await;
+        }
         self.refresh_clock_overlays_for_session(session_name).await;
         for attach_pid in mode_tree_pids {
             let _ = self.refresh_mode_tree_overlay_if_active(attach_pid).await;
@@ -141,18 +159,26 @@ impl RequestHandler {
         &self,
         session_name: &rmux_proto::SessionName,
     ) {
-        let mut active_attach = self.active_attach.lock().await;
-        let mut stale_pids = Vec::new();
-        for (pid, active) in &mut active_attach.by_pid {
-            if &active.session_name != session_name || active.suspended {
-                continue;
+        let stale_pids = {
+            let mut active_attach = self.active_attach.lock().await;
+            let mut stale_pids = Vec::new();
+            for (pid, active) in &mut active_attach.by_pid {
+                if &active.session_name != session_name || active.suspended {
+                    continue;
+                }
+                if !enqueue_tracked_interactive_input_control(active) {
+                    stale_pids.push(*pid);
+                }
             }
-            if !enqueue_tracked_interactive_input_control(active) {
-                stale_pids.push(*pid);
-            }
-        }
-        for pid in stale_pids {
-            active_attach.by_pid.remove(&pid);
+            stale_pids
+        };
+        let removed_stale_clients = self
+            .remove_attached_clients_for_session(session_name, stale_pids)
+            .await;
+        if !removed_stale_clients.is_empty() {
+            let _ = self
+                .reconcile_attached_session_size_and_emit(session_name)
+                .await;
         }
     }
 
@@ -232,10 +258,17 @@ impl RequestHandler {
             }
             _ => false,
         };
-        if remove {
-            active_attach.by_pid.remove(&attach_pid);
-        }
         drop(active_attach);
+        if remove {
+            let removed_stale_clients = self
+                .remove_attached_clients_for_session(session_name, vec![attach_pid])
+                .await;
+            if !removed_stale_clients.is_empty() {
+                let _ = self
+                    .reconcile_attached_session_size_and_emit(session_name)
+                    .await;
+            }
+        }
         self.refresh_clock_overlays_for_session(session_name).await;
         let _ = self.refresh_mode_tree_overlay_if_active(attach_pid).await;
         let _ = self.refresh_interactive_overlay_if_active(attach_pid).await;
@@ -315,10 +348,17 @@ impl RequestHandler {
             }
             _ => false,
         };
-        if remove {
-            active_attach.by_pid.remove(&attach_pid);
-        }
         drop(active_attach);
+        if remove {
+            let removed_stale_clients = self
+                .remove_attached_clients_for_session(session_name, vec![attach_pid])
+                .await;
+            if !removed_stale_clients.is_empty() {
+                let _ = self
+                    .reconcile_attached_session_size_and_emit(session_name)
+                    .await;
+            }
+        }
         self.refresh_clock_overlays_for_session(session_name).await;
     }
 

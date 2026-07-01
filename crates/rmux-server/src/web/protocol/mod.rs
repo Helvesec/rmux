@@ -14,7 +14,9 @@
 use serde::Deserialize;
 use std::time::Duration;
 
-use rmux_proto::{ResizePaneAdjustment, SplitDirection, TerminalSize};
+use rmux_proto::{AttachedWindowsConsoleKey, ResizePaneAdjustment, SplitDirection, TerminalSize};
+#[cfg(windows)]
+use rmux_pty::WindowsConsoleKeyEvent;
 
 use crate::input_keys::{encode_key, ExtendedKeyFormat};
 use crate::keys::parse_key_code;
@@ -188,4 +190,44 @@ fn valid_window_name(name: &str) -> bool {
 fn encode_session_key(token: &str) -> Option<Vec<u8>> {
     let key = parse_key_code(token)?;
     encode_key(0, ExtendedKeyFormat::Xterm, key)
+}
+
+fn encode_session_windows_console_key(token: &str) -> Option<(Vec<u8>, AttachedWindowsConsoleKey)> {
+    #[cfg(not(windows))]
+    {
+        let _ = token;
+        None
+    }
+
+    #[cfg(windows)]
+    {
+        let key = rmux_core::key_code_lookup_bits(parse_key_code(token)?);
+        let (bytes, key_event) = session_windows_ctrl_letter_for_key(key)?;
+        Some((bytes, key_event))
+    }
+}
+
+#[cfg(windows)]
+fn session_windows_ctrl_letter_for_key(
+    key: rmux_core::KeyCode,
+) -> Option<(Vec<u8>, AttachedWindowsConsoleKey)> {
+    for letter in b'A'..=b'Z' {
+        let name = format!("C-{}", char::from(letter.to_ascii_lowercase()));
+        if Some(key)
+            == rmux_core::key_string_lookup_string(&name).map(rmux_core::key_code_lookup_bits)
+        {
+            let event = WindowsConsoleKeyEvent::ctrl_letter(letter)?;
+            return Some((
+                vec![letter - b'A' + 1],
+                AttachedWindowsConsoleKey::new(
+                    event.virtual_key_code(),
+                    event.virtual_scan_code(),
+                    event.unicode_char(),
+                    event.control_key_state(),
+                    event.repeat_count(),
+                ),
+            ));
+        }
+    }
+    None
 }

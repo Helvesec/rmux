@@ -249,10 +249,16 @@ impl CopyModeState {
             "search-forward-incremental" => self.incremental_search(args, SearchDirection::Forward),
             "search-reverse" => self.search_reverse(),
             "select-line" => {
+                if let Some(mouse) = context.mouse {
+                    self.move_cursor_to_mouse(mouse.content_x, mouse.content_y);
+                }
                 self.select_line();
                 Ok(self.finish_policy(CopyModeCommandOutcome::nothing(), ClearPolicy::Always))
             }
             "select-word" => {
+                if let Some(mouse) = context.mouse {
+                    self.move_cursor_to_mouse(mouse.content_x, mouse.content_y);
+                }
                 self.select_word();
                 Ok(self.finish_policy(CopyModeCommandOutcome::nothing(), ClearPolicy::Always))
             }

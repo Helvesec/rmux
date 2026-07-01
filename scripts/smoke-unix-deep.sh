@@ -2,6 +2,29 @@
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+REQUIRE_EXPECT="${RMUX_REQUIRE_EXPECT:-0}"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --require-expect)
+            REQUIRE_EXPECT=1
+            shift
+            ;;
+        -h|--help)
+            cat <<'USAGE'
+Usage: scripts/smoke-unix-deep.sh [--require-expect]
+
+Run a deep Unix smoke against the debug rmux binary. By default, the
+interactive attach probe is skipped when expect is unavailable; pass
+--require-expect or set RMUX_REQUIRE_EXPECT=1 to make that a failure.
+USAGE
+            exit 0
+            ;;
+        *)
+            printf '[deep-smoke] ERROR: unknown argument: %s\n' "$1" >&2
+            exit 1
+            ;;
+    esac
+done
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 case "$TARGET_DIR" in
     /*) ;;
@@ -131,6 +154,9 @@ no_rmux_processes_for_root() {
 
 attach_mode_tree_smoke() {
     command -v expect >/dev/null 2>&1 || {
+        if [[ "$REQUIRE_EXPECT" == 1 ]]; then
+            fail 'interactive deep smoke requires expect, but expect was not found'
+        fi
         log 'SKIP interactive deep smoke: expect not found'
         return 0
     }

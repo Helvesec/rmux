@@ -1,7 +1,10 @@
 use rmux_core::command_parser::{CommandArgument, ParsedCommand, ParsedCommands};
 use rmux_proto::{RmuxError, SessionName, Target};
 
+use crate::mouse::AttachedMouseEvent;
+
 use super::super::super::{
+    attached_client_name,
     scripting_support::{spawn_background_async, QueueExecutionContext},
     RequestHandler,
 };
@@ -13,6 +16,7 @@ pub(super) struct AttachedBindingCommandContext {
     pub(super) attached_live_input: bool,
     pub(super) dispatch_target: Target,
     pub(super) mouse_target: Option<Target>,
+    pub(super) mouse_event: Option<AttachedMouseEvent>,
     pub(super) commands: ParsedCommands,
 }
 
@@ -28,12 +32,15 @@ pub(super) async fn execute_attached_binding_commands(
         attached_live_input,
         dispatch_target,
         mouse_target,
+        mouse_event,
         commands,
     } = command_context;
 
     let context = QueueExecutionContext::without_caller_cwd()
         .with_current_target(Some(dispatch_target.clone()))
-        .with_mouse_target(mouse_target);
+        .with_client_name(Some(attached_client_name(attach_pid)))
+        .with_mouse_target(mouse_target)
+        .with_mouse_event(mouse_event);
 
     if parsed_commands_block_for_prompt(&commands) {
         if attached_live_input

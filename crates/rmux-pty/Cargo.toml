@@ -10,12 +10,12 @@ keywords = ["terminal", "multiplexer", "pty"]
 categories = ["command-line-interface", "os"]
 
 [dependencies]
-rmux-types = { path = "../rmux-types", version = "0.7.1" }
+rmux-types = { path = "../rmux-types", version = "0.8.0" }
 tracing = "0.1.44"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.185"
-rmux-os = { path = "../rmux-os", version = "0.7.1" }
+rmux-os = { path = "../rmux-os", version = "0.8.0" }
 rustix = { version = "1.1.4", features = ["process", "termios", "pty", "fs"] }
 
 [target.'cfg(windows)'.dependencies]

@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,8 +7,8 @@ use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
 
 use super::{
-    ensure_control_newline, extract_complete_control_lines, forward_control, ControlLifecycle,
-    ControlOutputQueue, ControlServerEvent,
+    ensure_control_newline, extract_complete_control_lines, forward_control, ActiveControlCommand,
+    ControlCommandResult, ControlLifecycle, ControlOutputQueue, ControlServerEvent,
 };
 use crate::daemon::ShutdownHandle;
 use crate::handler::RequestHandler;
@@ -253,6 +253,46 @@ async fn eof_after_command_block_appends_exit() {
         last_line, "%exit",
         "EOF after a command block must terminate with %exit: {rendered:?}"
     );
+}
+
+#[tokio::test]
+async fn dropping_active_control_command_aborts_inflight_task() {
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let started = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let task_started = Arc::clone(&started);
+    let task_dropped = Arc::clone(&dropped);
+    let task = tokio::spawn(async move {
+        let _probe = DropProbe(task_dropped);
+        task_started.store(true, Ordering::SeqCst);
+        std::future::pending::<ControlCommandResult>().await
+    });
+
+    while !started.load(Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
+
+    drop(ActiveControlCommand {
+        timestamp: 0,
+        command_number: 1,
+        guard_flag: 0,
+        task,
+    });
+
+    for _ in 0..50 {
+        if dropped.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("dropping an in-flight control command must abort its task");
 }
 
 async fn read_control_to_end(client_stream: &mut UnixStream, output: &mut Vec<u8>) {

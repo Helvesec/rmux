@@ -127,8 +127,9 @@ function WritePackageChecksums([string]$Root, [string]$Output) {
     WriteAsciiLfFile $Output $lines
 }
 
-$repoRoot = Split-Path -Parent $PSScriptRoot
-Set-Location $repoRoot
+$repoRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+Set-Location -LiteralPath $repoRoot
+[System.IO.Directory]::SetCurrentDirectory($repoRoot)
 
 if ($SkipBuild -and -not $AllowStaleBinary) {
     Fail "-SkipBuild is local-only packaging; pass -AllowStaleBinary to acknowledge that"
@@ -223,12 +224,16 @@ try {
         if ($LASTEXITCODE -ne 0) {
             Fail "failed to generate shell completions"
         }
-        if (Test-Path -LiteralPath $completionCache) {
-            Remove-Item -LiteralPath $completionCache -Recurse -Force
-        }
-        New-Item -ItemType Directory -Force -Path $completionCache | Out-Null
-        foreach ($completionFile in $completionFiles) {
-            Copy-Item -LiteralPath (Join-Path $completionDir $completionFile) -Destination (Join-Path $completionCache $completionFile)
+        try {
+            if (Test-Path -LiteralPath $completionCache) {
+                Remove-Item -LiteralPath $completionCache -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            New-Item -ItemType Directory -Force -Path $completionCache -ErrorAction Stop | Out-Null
+            foreach ($completionFile in $completionFiles) {
+                Copy-Item -LiteralPath (Join-Path $completionDir $completionFile) -Destination (Join-Path $completionCache $completionFile) -Force -ErrorAction Stop
+            }
+        } catch {
+            Write-Warning "unable to refresh completion cache ${completionCache}: $_"
         }
     } else {
         foreach ($completionFile in $completionFiles) {

@@ -36,6 +36,7 @@ impl RequestHandler {
                 requester_pid,
                 current_target: Some(Target::Pane(target.clone())),
                 mouse_target: None,
+                mouse_event: None,
                 key,
                 attached_live_input: false,
             },
@@ -55,6 +56,7 @@ impl RequestHandler {
             requester_pid,
             current_target,
             mouse_target,
+            mouse_event,
             key,
             attached_live_input,
         } = dispatch;
@@ -307,6 +309,7 @@ impl RequestHandler {
                 attached_live_input,
                 dispatch_target,
                 mouse_target,
+                mouse_event,
                 commands: binding.commands().clone(),
             },
         ))

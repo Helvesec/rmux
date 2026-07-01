@@ -1,7 +1,8 @@
 use super::{
-    classify_mouse_event, copy_mode_mouse_context, MouseDragHandler, MouseForwardEvent,
-    MouseLayout, MouseLocation, PaneBorderStatus, PaneMouseTarget, PaneScrollbar,
-    PaneScrollbarsMode, ScrollbarPosition, StatusLineLayout, StatusRange, StatusRangeType,
+    classify_mouse_event, classify_mouse_events, copy_mode_mouse_context, MouseDragHandler,
+    MouseForwardEvent, MouseLayout, MouseLocation, PaneBorderStatus, PaneMouseTarget,
+    PaneScrollbar, PaneScrollbarsMode, ScrollbarPosition, StatusLineLayout, StatusRange,
+    StatusRangeType,
 };
 use rmux_core::{key_string_lookup_string, PaneGeometry, PaneId};
 use rmux_proto::{PaneTarget, SessionName};
@@ -226,6 +227,45 @@ fn second_click_timeout_yields_double_click_and_third_click_has_no_timer() {
     assert!(
         state.click_deadline.is_none(),
         "triple click skips the timer"
+    );
+}
+
+#[test]
+fn late_third_click_does_not_drop_pending_double_click() {
+    let mut state = super::ClientMouseState::default();
+    let base = Instant::now();
+    let layout = layout();
+
+    let _ = classify_mouse_event(&mut state, &layout, raw(0, 5, 5), base);
+    let _ = classify_mouse_event(
+        &mut state,
+        &layout,
+        MouseForwardEvent {
+            lx: 5,
+            ly: 5,
+            ..raw(0, 5, 5)
+        },
+        base + std::time::Duration::from_millis(100),
+    );
+
+    let events = classify_mouse_events(
+        &mut state,
+        &layout,
+        MouseForwardEvent {
+            lx: 5,
+            ly: 5,
+            ..raw(0, 5, 5)
+        },
+        base + std::time::Duration::from_millis(500),
+    );
+
+    assert_eq!(
+        events.iter().map(|event| event.key).collect::<Vec<_>>(),
+        vec![
+            key_string_lookup_string("DoubleClick1Pane").unwrap(),
+            key_string_lookup_string("MouseDown1Pane").unwrap(),
+        ],
+        "the first two clicks should still dispatch DoubleClick1Pane before the late click"
     );
 }
 

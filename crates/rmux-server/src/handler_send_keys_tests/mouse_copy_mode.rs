@@ -45,6 +45,7 @@ async fn copy_mode_begin_selection_with_mouse_context_preserves_the_original_anc
         (window.id(), pane.id())
     };
 
+    let mut original_anchor = None;
     for (x, expected_key_count) in [(1, 1usize), (4, 1usize)] {
         let mut active_attach = handler.active_attach.lock().await;
         let active = active_attach
@@ -94,15 +95,42 @@ async fn copy_mode_begin_selection_with_mouse_context_preserves_the_original_anc
                 key_count: expected_key_count,
             })
         );
-    }
 
-    let summary = {
-        let state = handler.state.lock().await;
-        state
-            .pane_copy_mode_summary(&alpha, pane_id)
-            .expect("copy mode summary")
-    };
-    assert_eq!(summary.selection_start, Some(CopyPosition { x: 1, y: 1 }));
-    assert_eq!(summary.selection_end, Some(CopyPosition { x: 4, y: 1 }));
-    assert!(summary.selection_active);
+        let summary = {
+            let state = handler.state.lock().await;
+            state
+                .pane_copy_mode_summary(&alpha, pane_id)
+                .expect("copy mode summary")
+        };
+        assert!(summary.selection_active);
+        let selection_start = summary
+            .selection_start
+            .expect("begin-selection should set a selection anchor");
+        let selection_end = summary
+            .selection_end
+            .expect("begin-selection should set a selection end");
+
+        if let Some(anchor) = original_anchor {
+            assert_eq!(
+                selection_start, anchor,
+                "a second mouse-backed begin-selection must preserve the original anchor"
+            );
+            assert_eq!(
+                selection_end.x,
+                u32::from(x),
+                "a second mouse-backed begin-selection should extend to the new mouse column"
+            );
+        } else {
+            assert_eq!(
+                selection_start.x,
+                u32::from(x),
+                "the first mouse-backed begin-selection should anchor at the mouse column"
+            );
+            assert_eq!(
+                selection_end, selection_start,
+                "the first mouse-backed begin-selection should start with a collapsed selection"
+            );
+            original_anchor = Some(selection_start);
+        }
+    }
 }

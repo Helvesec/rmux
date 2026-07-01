@@ -182,6 +182,74 @@ async fn parsed_queue_select_window_navigation_flags_use_window_session() {
 }
 
 #[tokio::test]
+async fn parsed_queue_select_window_repeated_navigation_flags_follow_tmux_priority() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha-select-priority");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                target: alpha.clone(),
+                name: Some("w1".to_owned()),
+                detached: true,
+                start_directory: None,
+                environment: None,
+                command: None,
+                process_command: None,
+                target_window_index: Some(1),
+                insert_at_target: false,
+            })))
+            .await,
+        Response::NewWindow(_)
+    ));
+
+    let current_pane = PaneTarget::with_window(alpha.clone(), 0, 0);
+    let context = TargetFindContext::from_target(Target::Pane(current_pane));
+    let state = handler.state.lock().await;
+    for arguments in [
+        vec![
+            "-n".to_owned(),
+            "-p".to_owned(),
+            "-t".to_owned(),
+            "alpha-select-priority:1".to_owned(),
+        ],
+        vec![
+            "-p".to_owned(),
+            "-n".to_owned(),
+            "-t".to_owned(),
+            "alpha-select-priority:1".to_owned(),
+        ],
+    ] {
+        let parsed = crate::handler::scripting_support::parse_request_from_parts(
+            "select-window".to_owned(),
+            arguments,
+            None,
+            &state.sessions,
+            &state.options,
+            &context,
+        )
+        .expect("select-window repeated navigation flags should parse");
+        assert_eq!(
+            parsed,
+            Request::NextWindow(NextWindowRequest {
+                target: alpha.clone(),
+                alerts_only: false,
+            })
+        );
+    }
+}
+
+#[tokio::test]
 async fn parsed_queue_list_panes_resolves_bare_window_name_in_current_session() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -239,6 +307,57 @@ async fn parsed_queue_list_panes_resolves_bare_window_name_in_current_session() 
         .expect("list-panes should resolve editor as a window name");
 
     assert_eq!(String::from_utf8_lossy(&output.stdout), "0\n1\n");
+}
+
+#[tokio::test]
+async fn parsed_queue_join_move_swap_without_source_fall_back_to_current_pane() {
+    for command in [
+        "join-pane -t alpha-transfer-default:0.0",
+        "move-pane -t alpha-transfer-default:0.0",
+        "swap-pane -t alpha-transfer-default:0.0",
+    ] {
+        let handler = RequestHandler::new();
+        let alpha = session_name("alpha-transfer-default");
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: alpha.clone(),
+                    detached: true,
+                    size: Some(TerminalSize {
+                        cols: 100,
+                        rows: 24
+                    }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+        assert!(matches!(
+            handler
+                .handle(Request::SplitWindow(SplitWindowRequest {
+                    target: SplitWindowTarget::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
+                    direction: SplitDirection::Vertical,
+                    environment: None,
+                    before: false,
+                }))
+                .await,
+            Response::SplitWindow(_)
+        ));
+
+        let parsed = CommandParser::new().parse(command).expect("command parses");
+        let output = handler
+            .execute_parsed_commands(
+                std::process::id(),
+                parsed,
+                QueueExecutionContext::without_caller_cwd()
+                    .with_current_target(Some(Target::Pane(PaneTarget::with_window(alpha, 0, 1)))),
+            )
+            .await;
+        assert!(
+            output.is_ok(),
+            "{command} should use the current pane when -s is omitted: {output:?}"
+        );
+    }
 }
 
 #[tokio::test]

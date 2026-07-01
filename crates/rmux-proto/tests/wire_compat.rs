@@ -4,36 +4,56 @@ const HAS_SESSION_REQUEST_V1: &str =
     include_str!("../../../tests/reference/wire/v1/has_session_request.hex");
 const NEW_SESSION_RESPONSE_V1: &str =
     include_str!("../../../tests/reference/wire/v1/new_session_response.hex");
+const HAS_SESSION_REQUEST_V2: &str =
+    include_str!("../../../tests/reference/wire/v2/has_session_request.hex");
+const NEW_SESSION_RESPONSE_V2: &str =
+    include_str!("../../../tests/reference/wire/v2/new_session_response.hex");
 
 #[test]
-fn v1_has_session_request_fixture_is_rejected_after_wire_v2_bump() {
+fn v1_has_session_request_fixture_is_rejected_by_current_wire() {
     let bytes = decode_hex(HAS_SESSION_REQUEST_V1);
-    assert_v1_envelope(&bytes);
+    assert_wire_envelope(&bytes, 1);
 
-    assert_v1_is_unsupported(decode_frame::<Request>(&bytes));
+    assert_wire_is_unsupported(decode_frame::<Request>(&bytes), 1);
 }
 
 #[test]
-fn v1_new_session_response_fixture_is_rejected_after_wire_v2_bump() {
+fn v1_new_session_response_fixture_is_rejected_by_current_wire() {
     let bytes = decode_hex(NEW_SESSION_RESPONSE_V1);
-    assert_v1_envelope(&bytes);
+    assert_wire_envelope(&bytes, 1);
 
-    assert_v1_is_unsupported(decode_frame::<Response>(&bytes));
+    assert_wire_is_unsupported(decode_frame::<Response>(&bytes), 1);
 }
 
-fn assert_v1_envelope(bytes: &[u8]) {
+#[test]
+fn v2_has_session_request_fixture_is_rejected_by_current_wire() {
+    let bytes = decode_hex(HAS_SESSION_REQUEST_V2);
+    assert_wire_envelope(&bytes, 2);
+
+    assert_wire_is_unsupported(decode_frame::<Request>(&bytes), 2);
+}
+
+#[test]
+fn v2_new_session_response_fixture_is_rejected_by_current_wire() {
+    let bytes = decode_hex(NEW_SESSION_RESPONSE_V2);
+    assert_wire_envelope(&bytes, 2);
+
+    assert_wire_is_unsupported(decode_frame::<Response>(&bytes), 2);
+}
+
+fn assert_wire_envelope(bytes: &[u8], version: u32) {
     assert_eq!(bytes.first().copied(), Some(RMUX_FRAME_MAGIC));
-    assert_eq!(bytes.get(1).copied(), Some(1));
+    assert_eq!(bytes.get(1).copied(), Some(version as u8));
 }
 
-fn assert_v1_is_unsupported<T>(result: Result<T, RmuxError>) {
+fn assert_wire_is_unsupported<T>(result: Result<T, RmuxError>, version: u32) {
     assert!(matches!(
         result,
         Err(RmuxError::UnsupportedWireVersion {
-            got: 1,
+            got,
             minimum: RMUX_WIRE_VERSION,
             maximum: RMUX_WIRE_VERSION,
-        })
+        }) if got == version
     ));
 }
 

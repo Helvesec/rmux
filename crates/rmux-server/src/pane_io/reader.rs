@@ -567,6 +567,7 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
             session_name: session_name.clone(),
             pane_id,
             bell_count: append_result.bell_count,
+            title_changed: append_result.title_changed,
             queue_activity_alert: emit_no_bell_alert || append_result.bell_count > 0,
             generation,
         });

@@ -217,6 +217,7 @@ impl RequestHandler {
         );
         let print_target = request.print_target;
         let print_format = request.format.clone();
+        let explicit_name = request.name.is_some();
         let (response, removed_source_sessions) = {
             let mut state = self.state.lock().await;
             let source_group_members = state.sessions.session_group_members(&source_session_name);
@@ -262,6 +263,12 @@ impl RequestHandler {
             }
             if source_session_name != target_session_name {
                 self.refresh_attached_session(&target_session_name).await;
+            }
+            if !explicit_name {
+                if let Response::BreakPane(success) = &response {
+                    self.refresh_automatic_window_name_for_pane_target(&success.target)
+                        .await;
+                }
             }
         }
 
@@ -505,15 +512,6 @@ impl RequestHandler {
                 .unwrap_or_default();
             match state.kill_pane_with_options(request.target, request.kill_all_except) {
                 Ok(result) => {
-                    let queued_pane = prepare_lifecycle_event(
-                        &mut state,
-                        &LifecycleEvent::PaneExited {
-                            target: result.hook_context.target.clone(),
-                            pane_id: Some(result.hook_context.pane_id),
-                            window_id: Some(result.hook_context.window_id),
-                            window_name: Some(result.hook_context.window_name.clone()),
-                        },
-                    );
                     let queued_session = if result.session_destroyed {
                         let _ = state.hooks.remove_session(&session_name);
                         result.removed_session_id.map(|session_id| {
@@ -537,7 +535,7 @@ impl RequestHandler {
                     };
                     (
                         Response::KillPane(result.response),
-                        Some(queued_pane),
+                        None,
                         queued_session,
                         result.session_destroyed,
                         result

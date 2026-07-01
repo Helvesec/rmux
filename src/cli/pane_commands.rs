@@ -6,8 +6,8 @@ use rmux_core::formats::{
     DEFAULT_LIST_PANES_WINDOW_FORMAT,
 };
 use rmux_proto::{
-    CommandOutput, ResizePaneAdjustment, ResizePaneTargetActionRequest, ResolveTargetType,
-    RespawnPaneRequest,
+    CommandOutput, ResizePaneAdjustment, ResizePaneRelativeDirection,
+    ResizePaneTargetActionRequest, ResolveTargetType, RespawnPaneRequest,
 };
 
 #[path = "pane_commands/split.rs"]
@@ -407,30 +407,50 @@ fn resize_pane_adjustment(
     if args.trim_below {
         return ResizePaneAdjustment::TrimBelow;
     }
+    if args.zoom {
+        return ResizePaneAdjustment::Zoom;
+    }
     let columns = args
         .columns
         .and_then(|size| size.resolve(window_size.map_or(0, |(width, _)| width)));
     let rows = args
         .rows
         .and_then(|size| size.resolve(window_size.map_or(0, |(_, height)| height)));
-    if let Some(cells) = args.down {
-        ResizePaneAdjustment::Down { cells }
-    } else if let Some(cells) = args.up {
-        ResizePaneAdjustment::Up { cells }
-    } else if let Some(cells) = args.left {
-        ResizePaneAdjustment::Left { cells }
+    let relative = if let Some(cells) = args.left {
+        Some((ResizePaneRelativeDirection::Left, cells))
     } else if let Some(cells) = args.right {
-        ResizePaneAdjustment::Right { cells }
-    } else if let (Some(columns), Some(rows)) = (columns, rows) {
-        ResizePaneAdjustment::AbsoluteSize { columns, rows }
-    } else if let Some(columns) = columns {
-        ResizePaneAdjustment::AbsoluteWidth { columns }
-    } else if let Some(rows) = rows {
-        ResizePaneAdjustment::AbsoluteHeight { rows }
-    } else if args.zoom {
-        ResizePaneAdjustment::Zoom
+        Some((ResizePaneRelativeDirection::Right, cells))
+    } else if let Some(cells) = args.up {
+        Some((ResizePaneRelativeDirection::Up, cells))
     } else {
-        ResizePaneAdjustment::NoOp
+        args.down
+            .map(|cells| (ResizePaneRelativeDirection::Down, cells))
+    };
+
+    match (columns, rows, relative) {
+        (Some(columns), Some(rows), Some((relative, cells))) => ResizePaneAdjustment::Composite {
+            columns: Some(columns),
+            rows: Some(rows),
+            relative: Some(relative),
+            cells,
+        },
+        (Some(columns), None, Some((relative, cells))) => ResizePaneAdjustment::Composite {
+            columns: Some(columns),
+            rows: None,
+            relative: Some(relative),
+            cells,
+        },
+        (None, Some(rows), Some((relative, cells))) => ResizePaneAdjustment::Composite {
+            columns: None,
+            rows: Some(rows),
+            relative: Some(relative),
+            cells,
+        },
+        (Some(columns), Some(rows), None) => ResizePaneAdjustment::AbsoluteSize { columns, rows },
+        (Some(columns), None, None) => ResizePaneAdjustment::AbsoluteWidth { columns },
+        (None, Some(rows), None) => ResizePaneAdjustment::AbsoluteHeight { rows },
+        (None, None, Some((relative, cells))) => relative.to_adjustment(cells),
+        (None, None, None) => ResizePaneAdjustment::NoOp,
     }
 }
 

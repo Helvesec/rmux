@@ -4,7 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rmux_ipc::{wait_for_peer_close, LocalListener, LocalStream, PeerIdentity};
-use rmux_proto::{encode_frame, ErrorResponse, FrameDecoder, Request, Response, WaitForMode};
+use rmux_proto::{
+    encode_frame, ErrorResponse, FrameDecoder, Request, Response, WaitForMode,
+    CAPABILITY_SDK_WAITS_ARMED,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinError, JoinSet};
@@ -12,7 +15,10 @@ use tracing::{debug, warn};
 
 use crate::control::{self, ControlLifecycle, ControlServerEvent};
 use crate::daemon::ShutdownHandle;
-use crate::handler::{attach_support::AttachRegistration, ControlRegistration, RequestHandler};
+use crate::handler::{
+    attach_support::AttachRegistration, ControlRegistration, DetachedRequestGuard, PreparedSdkWait,
+    RequestHandler,
+};
 use crate::listener_options::ServeOptions;
 use crate::listener_signals::handle_server_signal;
 use crate::listener_signals::poll_server_signal;
@@ -172,6 +178,7 @@ async fn serve_connection(
     };
     let mut conn = Connection::new(stream);
     let detached_connection_guard = handler.begin_detached_connection(connection_id);
+    let mut sdk_wait_armed_ack_enabled = false;
 
     loop {
         tokio::select! {
@@ -199,20 +206,65 @@ async fn serve_connection(
                 let mut detached_request_guard = request_counts_as_detached_activity(&request)
                     .then(|| handler.begin_detached_request());
 
+                if request_enables_sdk_wait_armed_ack(&request) {
+                    sdk_wait_armed_ack_enabled = true;
+                }
                 let cancel_on_peer_disconnect = request_cancels_on_peer_disconnect(&request);
                 debug!("dispatching {}", request.command_name());
-                let outcome = tokio::select! {
-                    outcome = handler.dispatch_for_connection(requester.pid, connection_id, request) => outcome,
-                    result = shutdown.changed() => {
-                        if result.is_ok() {
-                            debug!("closing client connection during shutdown");
+                let outcome = match request {
+                    Request::SdkWaitForOutput(request) => {
+                        let prepared = handler
+                            .prepare_sdk_wait_for_output(connection_id, request)
+                            .await;
+                        if write_prepared_sdk_wait(
+                            &mut conn,
+                            prepared,
+                            &mut shutdown,
+                            &handler,
+                            connection_id,
+                            &mut detached_request_guard,
+                            sdk_wait_armed_ack_enabled,
+                        )
+                        .await?
+                        {
+                            return Ok(());
                         }
-                        return Ok(());
+                        continue;
                     }
-                    result = wait_for_peer_close(&conn.stream), if cancel_on_peer_disconnect => {
-                        result?;
-                        debug!("closing client connection after peer disconnect");
-                        return Ok(());
+                    Request::SdkWaitForOutputRef(request) => {
+                        let prepared = handler
+                            .prepare_sdk_wait_for_output_ref(connection_id, request)
+                            .await;
+                        if write_prepared_sdk_wait(
+                            &mut conn,
+                            prepared,
+                            &mut shutdown,
+                            &handler,
+                            connection_id,
+                            &mut detached_request_guard,
+                            sdk_wait_armed_ack_enabled,
+                        )
+                        .await?
+                        {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                    request => {
+                        tokio::select! {
+                            outcome = handler.dispatch_for_connection(requester.pid, connection_id, request) => outcome,
+                            result = shutdown.changed() => {
+                                if result.is_ok() {
+                                    debug!("closing client connection during shutdown");
+                                }
+                                return Ok(());
+                            }
+                            result = wait_for_peer_close(&conn.stream), if cancel_on_peer_disconnect => {
+                                result?;
+                                debug!("closing client connection after peer disconnect");
+                                return Ok(());
+                            }
+                        }
                     }
                 };
                 if let Err(error) = conn.write_response(&outcome.response).await {
@@ -332,6 +384,50 @@ async fn serve_connection(
     }
 }
 
+async fn write_prepared_sdk_wait(
+    conn: &mut Connection,
+    prepared: PreparedSdkWait,
+    shutdown: &mut watch::Receiver<()>,
+    handler: &Arc<RequestHandler>,
+    connection_id: u64,
+    detached_request_guard: &mut Option<DetachedRequestGuard>,
+    send_armed_ack: bool,
+) -> io::Result<bool> {
+    let response = match prepared {
+        PreparedSdkWait::Immediate(response) => response,
+        PreparedSdkWait::Armed(wait) => {
+            if send_armed_ack {
+                conn.write_response(&wait.armed_response()).await?;
+            }
+            tokio::select! {
+                response = wait.wait() => response,
+                result = shutdown.changed() => {
+                    if result.is_ok() {
+                        debug!("closing client connection during shutdown");
+                    }
+                    return Ok(true);
+                }
+                result = wait_for_peer_close(&conn.stream) => {
+                    result?;
+                    debug!("closing client connection after peer disconnect");
+                    return Ok(true);
+                }
+            }
+        }
+    };
+
+    if let Err(error) = conn.write_response(&response).await {
+        drop(detached_request_guard.take());
+        #[cfg(windows)]
+        let _ =
+            handler.request_shutdown_if_pending_excluding_detached_connection(Some(connection_id));
+        return Err(error);
+    }
+
+    drop(detached_request_guard.take());
+    Ok(handler.request_shutdown_if_pending_excluding_detached_connection(Some(connection_id)))
+}
+
 async fn run_connection_with_cleanup(
     stream: LocalStream,
     requester: PeerIdentity,
@@ -385,6 +481,17 @@ impl Drop for ConnectionCleanupGuard {
     fn drop(&mut self) {
         self.cleanup_now();
     }
+}
+
+fn request_enables_sdk_wait_armed_ack(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Handshake(handshake)
+            if handshake
+                .required_capabilities
+                .iter()
+                .any(|capability| capability == CAPABILITY_SDK_WAITS_ARMED)
+    )
 }
 
 fn request_cancels_on_peer_disconnect(request: &Request) -> bool {
@@ -471,9 +578,12 @@ mod tests {
     use super::*;
     use crate::server_access::AccessMode;
     use rmux_proto::{
-        DaemonStatusRequest, ErrorResponse, HandshakeRequest, ListSessionsRequest,
-        RenameSessionRequest, RmuxError, SessionName, ShutdownIfIdleRequest,
-        ShutdownIfIdleResponse, WaitForMode, WaitForRequest, WaitForResponse, RMUX_WIRE_VERSION,
+        CancelSdkWaitResponse, DaemonStatusRequest, ErrorResponse, HandshakeRequest,
+        ListSessionsRequest, NewSessionRequest, PaneOutputSubscriptionStart, PaneTarget,
+        RenameSessionRequest, RmuxError, SdkWaitForOutputRequest, SdkWaitForOutputResponse,
+        SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId, SessionName, ShutdownIfIdleRequest,
+        ShutdownIfIdleResponse, TerminalSize, WaitForMode, WaitForRequest, WaitForResponse,
+        RMUX_WIRE_VERSION,
     };
 
     #[tokio::test]
@@ -650,6 +760,126 @@ mod tests {
             })
         );
 
+        drop(client);
+        connection_task.await.expect("connection task")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sdk_wait_connection_writes_armed_ack_before_final_match() -> io::Result<()> {
+        let handler = Arc::new(RequestHandler::new());
+        let session = SessionName::new("sdkack").expect("valid session");
+        let target = PaneTarget::new(session.clone(), 0);
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+        let (mut client, _shutdown_tx, connection_task) = spawn_test_connection(&handler)?;
+
+        write_test_request(
+            &mut client,
+            Request::Handshake(HandshakeRequest::requiring([CAPABILITY_SDK_WAITS_ARMED])),
+        )
+        .await?;
+        assert!(matches!(
+            read_test_response(&mut client).await?,
+            Response::Handshake(_)
+        ));
+
+        write_test_request(
+            &mut client,
+            Request::SdkWaitForOutput(SdkWaitForOutputRequest {
+                target: target.clone(),
+                bytes: b"needle".to_vec(),
+                start: PaneOutputSubscriptionStart::Now,
+                owner_id: SdkWaitOwnerId::new(7),
+                wait_id: SdkWaitId::new(11),
+            }),
+        )
+        .await?;
+
+        assert_eq!(
+            read_test_response(&mut client).await?,
+            Response::CancelSdkWait(CancelSdkWaitResponse::armed_ack(SdkWaitId::new(11)))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), read_test_response(&mut client))
+                .await
+                .is_err(),
+            "SDK wait must remain pending after the daemon-side armed ack"
+        );
+
+        handler
+            .send_pane_output_for_test(&target, b"needle".to_vec())
+            .await;
+
+        assert_eq!(
+            read_test_response(&mut client).await?,
+            Response::SdkWaitForOutput(SdkWaitForOutputResponse {
+                wait_id: SdkWaitId::new(11),
+                outcome: SdkWaitOutcome::Matched,
+            })
+        );
+        drop(client);
+        connection_task.await.expect("connection task")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_sdk_wait_connection_does_not_receive_armed_ack() -> io::Result<()> {
+        let handler = Arc::new(RequestHandler::new());
+        let session = SessionName::new("sdklegacy").expect("valid session");
+        let target = PaneTarget::new(session.clone(), 0);
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+        let (mut client, _shutdown_tx, connection_task) = spawn_test_connection(&handler)?;
+
+        write_test_request(
+            &mut client,
+            Request::SdkWaitForOutput(SdkWaitForOutputRequest {
+                target: target.clone(),
+                bytes: b"needle".to_vec(),
+                start: PaneOutputSubscriptionStart::Now,
+                owner_id: SdkWaitOwnerId::new(7),
+                wait_id: SdkWaitId::new(11),
+            }),
+        )
+        .await?;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), read_test_response(&mut client))
+                .await
+                .is_err(),
+            "legacy SDK wait clients must not receive the two-phase armed ack"
+        );
+
+        handler
+            .send_pane_output_for_test(&target, b"needle".to_vec())
+            .await;
+
+        assert_eq!(
+            read_test_response(&mut client).await?,
+            Response::SdkWaitForOutput(SdkWaitForOutputResponse {
+                wait_id: SdkWaitId::new(11),
+                outcome: SdkWaitOutcome::Matched,
+            })
+        );
         drop(client);
         connection_task.await.expect("connection task")?;
         Ok(())

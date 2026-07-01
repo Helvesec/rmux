@@ -521,6 +521,7 @@ impl RequestHandler {
         let mut pending = completed.input_writer.map(|input_writer| {
             crate::pane_terminals::DeferredInitialPaneInputFlush {
                 input_writer,
+                pane_pid: completed.pane_pid,
                 queued_input: completed.queued_input,
             }
         });
@@ -613,8 +614,29 @@ impl RequestHandler {
             return Ok(());
         }
         tokio::task::spawn_blocking(move || {
-            for bytes in flush.queued_input {
-                flush.input_writer.write_all(&bytes)?;
+            let pane_pid = rmux_pty::ProcessId::new(flush.pane_pid)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            for input in flush.queued_input {
+                match input {
+                    crate::pane_terminals::DeferredInitialPaneInput::Bytes(bytes) => {
+                        flush.input_writer.write_all(&bytes)?;
+                    }
+                    crate::pane_terminals::DeferredInitialPaneInput::Console { action, .. } => {
+                        match action {
+                            crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Key(key) => {
+                                rmux_pty::write_windows_console_key(pane_pid, key)?;
+                            }
+                            crate::pane_terminals::DeferredInitialPaneConsoleInputAction::KeyThenInterrupt(key) => {
+                                rmux_pty::write_windows_console_key_then_interrupt_if_processed(
+                                    pane_pid, key,
+                                )?;
+                            }
+                            crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Interrupt => {
+                                rmux_pty::send_windows_console_interrupt(pane_pid)?;
+                            }
+                        }
+                    }
+                }
             }
             Ok::<(), std::io::Error>(())
         })

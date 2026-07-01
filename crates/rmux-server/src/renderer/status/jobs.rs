@@ -15,6 +15,9 @@ use std::os::unix::process::CommandExt;
 
 use crate::terminal::TerminalProfile;
 
+#[cfg(windows)]
+const STATUS_JOB_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(windows))]
 const STATUS_JOB_TIMEOUT: Duration = Duration::from_millis(750);
 const STATUS_JOB_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const STATUS_JOB_CACHE_LIMIT: usize = 256;

@@ -24,10 +24,13 @@ mod key_table;
 mod refresh;
 #[path = "handler_attach/registration.rs"]
 mod registration;
+#[path = "handler_attach/resize_policy.rs"]
+mod resize_policy;
 #[path = "handler_attach/state.rs"]
 mod state;
 
 pub(crate) use crate::client_flags::ClientFlags;
+pub(in crate::handler) use resize_policy::AttachedWindowSizePolicy;
 pub(crate) use state::AttachRegistration;
 pub(super) use state::{
     ActiveAttach, ActiveAttachState, DisplayPanesClientState, DisplayPanesLabel,
@@ -84,6 +87,7 @@ impl RequestHandler {
         TerminalSize,
         Option<rmux_proto::TerminalPixels>,
         bool,
+        ClientFlags,
     )> {
         let active_attach = self.active_attach.lock().await;
         active_attach.by_pid.get(&attach_pid).map(|active| {
@@ -92,6 +96,7 @@ impl RequestHandler {
                 active.client_size,
                 active.client_pixels,
                 active.render_stream,
+                active.flags,
             )
         })
     }

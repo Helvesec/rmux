@@ -1234,7 +1234,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         DefaultValue::Scalar("off"),
         "",
         false,
-        EFFECT_NONE,
+        EFFECT_LAYOUT,
     ),
     option(
         OptionName::AllowPassthrough,
@@ -1819,7 +1819,7 @@ pub(super) const OPTIONS: &[OptionMetadata] = &[
         DefaultValue::Scalar("latest"),
         "",
         false,
-        EFFECT_NONE,
+        EFFECT_LAYOUT,
     ),
     option(
         OptionName::WindowStyle,

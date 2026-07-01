@@ -1,6 +1,5 @@
 use super::super::RequestHandler;
 use super::session_name;
-use crate::copy_mode::CopyPosition;
 use crate::input_keys::{encode_key, encode_mouse_event, ExtendedKeyFormat, MouseForwardEvent};
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
 use rmux_core::{input::mode, key_string_lookup_string};

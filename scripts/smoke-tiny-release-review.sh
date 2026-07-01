@@ -281,7 +281,7 @@ run_rmux_smoke() {
   done
   run_capture resize_relative_absolute -L "$sock" resize-pane -R -x 80 -t alpha:0.0
   assert_rc resize_relative_absolute 0
-  assert_trace resize_relative_absolute "rmux tiny: fallback: unsupported invocation"
+  assert_trace resize_relative_absolute "rmux tiny: direct: resize-pane"
   RMUX_DISABLE_TINY_CLI=1 "$RMUX" -L "$sock" resize-pane -R -L -t alpha:0.0 \
     >"$SMOKE_ROOT/full_resize_lastwins.out" 2>"$SMOKE_ROOT/full_resize_lastwins.err" ||
     die "full helper rejected tmux-compatible resize-pane valueless adjustment last-wins"

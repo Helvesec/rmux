@@ -139,6 +139,11 @@ pub(in crate::pane_terminals) struct PaneLifecycleSpawn {
 
 impl HandlerState {
     #[cfg(windows)]
+    pub(crate) fn pane_start_command_for_id(&self, pane_id: PaneId) -> Option<&[String]> {
+        self.pane_lifecycle.get(&pane_id)?.command.as_deref()
+    }
+
+    #[cfg(windows)]
     pub(in crate::pane_terminals) fn record_pane_lifecycle_starting(
         &mut self,
         spawn: PaneLifecycleSpawn,

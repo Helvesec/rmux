@@ -6,6 +6,8 @@ use std::{
 
 use super::super::RequestHandler;
 use super::session_name;
+use crate::outer_terminal::OuterTerminalContext;
+use crate::pane_io::AttachControl;
 use rmux_core::{input::InputParser, Screen};
 use rmux_proto::{
     CapturePaneRequest, CopyModeRequest, ListPanesRequest, NewSessionExtRequest,
@@ -182,6 +184,32 @@ async fn send_copy_mode_command_values(
         .await
 }
 
+async fn send_copy_mode_command_values_as(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    target: &PaneTarget,
+    tokens: Vec<String>,
+) -> Response {
+    handler
+        .dispatch(
+            requester_pid,
+            Request::SendKeysExt(SendKeysExtRequest {
+                target: Some(target.clone()),
+                keys: tokens,
+                expand_formats: false,
+                hex: false,
+                literal: false,
+                dispatch_key_table: false,
+                copy_mode_command: true,
+                forward_mouse_event: false,
+                reset_terminal: false,
+                repeat_count: None,
+            }),
+        )
+        .await
+        .response
+}
+
 fn platform_copy_mode_arg(arg: &str) -> String {
     match arg {
         "cat >/dev/null" => crate::test_shell::stdin_discard_command(),
@@ -205,6 +233,11 @@ fn stdin_to_file_command(path: &Path) -> String {
     format!("cat > {}", crate::test_shell::sh_quote_path(path))
 }
 
+#[cfg(unix)]
+fn stdin_to_relative_file_command(name: &str) -> String {
+    format!("cat > {}", crate::test_shell::sh_quote(name))
+}
+
 #[cfg(windows)]
 fn stdin_to_file_command(path: &Path) -> String {
     let quoted_path = crate::test_shell::powershell_quote_path(path);
@@ -213,6 +246,11 @@ fn stdin_to_file_command(path: &Path) -> String {
          $output=[System.IO.File]::Create({quoted_path}); \
          try {{ $inputStream.CopyTo($output) }} finally {{ $output.Dispose() }}"
     ))
+}
+
+#[cfg(unix)]
+fn file_url_path(path: &Path) -> String {
+    path.to_string_lossy().replace(' ', "%20")
 }
 
 async fn set_copy_command(handler: &RequestHandler, command: String) {
@@ -233,6 +271,33 @@ async fn set_copy_command(handler: &RequestHandler, command: String) {
         matches!(response, Response::SetOptionByName(_)),
         "set-option copy-command returned {response:?}"
     );
+}
+
+async fn set_set_clipboard(handler: &RequestHandler, value: &str) {
+    let response = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::ServerGlobal,
+            name: "set-clipboard".to_owned(),
+            value: Some(value.to_owned()),
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: false,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    assert!(
+        matches!(response, Response::SetOptionByName(_)),
+        "set-option set-clipboard returned {response:?}"
+    );
+}
+
+fn take_write(control: AttachControl) -> Option<Vec<u8>> {
+    match control {
+        AttachControl::Write(bytes) => Some(bytes),
+        _ => None,
+    }
 }
 
 async fn prepare_transfer_selection(handler: &RequestHandler, target: &PaneTarget) {
@@ -607,4 +672,137 @@ async fn copy_pipe_explicit_command_overrides_copy_command_option() {
         fallback_output.is_none(),
         "copy-command fallback should not run when copy-pipe has an explicit command"
     );
+}
+
+#[tokio::test]
+async fn copy_mode_buffer_yank_emits_clipboard_when_set_clipboard_enabled() {
+    let handler = RequestHandler::new();
+    let target = create_session(
+        &handler,
+        "copy-mode-clipboard",
+        TerminalSize { cols: 40, rows: 4 },
+    )
+    .await;
+    let requester_pid = 42;
+    set_set_clipboard(&handler, "external").await;
+
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach_with_terminal_context(
+            requester_pid,
+            target.session_name().clone(),
+            control_tx,
+            OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+        )
+        .await;
+
+    replace_transcript_contents(
+        &handler,
+        &target,
+        TerminalSize { cols: 40, rows: 4 },
+        b"alpha\r\nneedle clipboard\r\nomega\r\n",
+    )
+    .await;
+    wait_for_capture(&handler, &target, "needle clipboard", false).await;
+
+    assert!(matches!(
+        enter_copy_mode(&handler, &target, false).await,
+        Response::CopyMode(_)
+    ));
+    assert!(matches!(
+        send_copy_mode_command(&handler, &target, &["search-backward", "--", "needle"]).await,
+        Response::SendKeys(_)
+    ));
+    assert!(matches!(
+        send_copy_mode_command(&handler, &target, &["select-line"]).await,
+        Response::SendKeys(_)
+    ));
+    assert!(matches!(
+        send_copy_mode_command_values_as(
+            &handler,
+            requester_pid,
+            &target,
+            vec!["copy-selection".to_owned()],
+        )
+        .await,
+        Response::SendKeys(_)
+    ));
+
+    let mut bytes = None;
+    while let Ok(control) = control_rx.try_recv() {
+        bytes = take_write(control).or(bytes);
+        if bytes.is_some() {
+            break;
+        }
+    }
+    let bytes = bytes.expect("clipboard write");
+    assert_eq!(bytes, b"\x1b]52;;bmVlZGxlIGNsaXBib2FyZA==\x07");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn copy_pipe_uses_local_osc7_file_url_as_working_directory() {
+    let handler = RequestHandler::new();
+    let target = create_session(
+        &handler,
+        "copy-pipe-osc7-cwd",
+        TerminalSize { cols: 40, rows: 4 },
+    )
+    .await;
+    let temp_dir = std::env::temp_dir().join(format!("rmux copy pipe cwd {}", std::process::id()));
+    fs::create_dir_all(&temp_dir).expect("temp dir exists");
+    let output_path = temp_dir.join("copied.txt");
+
+    replace_transcript_contents(
+        &handler,
+        &target,
+        TerminalSize { cols: 40, rows: 4 },
+        b"alpha\r\nneedle osc7 cwd\r\nomega\r\n",
+    )
+    .await;
+    {
+        let mut state = handler.state.lock().await;
+        let osc7 = format!("\x1b]7;file://localhost{}\x07", file_url_path(&temp_dir));
+        state
+            .append_bytes_to_pane_transcript_for_test(
+                target.session_name(),
+                target.window_index(),
+                target.pane_index(),
+                osc7.as_bytes(),
+            )
+            .expect("OSC7 bytes append to pane transcript");
+    }
+    wait_for_capture(&handler, &target, "needle osc7 cwd", false).await;
+
+    assert!(matches!(
+        enter_copy_mode(&handler, &target, false).await,
+        Response::CopyMode(_)
+    ));
+    assert!(matches!(
+        send_copy_mode_command(&handler, &target, &["search-backward", "--", "needle"]).await,
+        Response::SendKeys(_)
+    ));
+    assert!(matches!(
+        send_copy_mode_command(&handler, &target, &["select-line"]).await,
+        Response::SendKeys(_)
+    ));
+    assert!(matches!(
+        send_copy_mode_command_values(
+            &handler,
+            &target,
+            vec![
+                "copy-pipe-and-cancel".to_owned(),
+                "--".to_owned(),
+                stdin_to_relative_file_command("copied.txt"),
+            ],
+        )
+        .await,
+        Response::SendKeys(_)
+    ));
+
+    let output = fs::read_to_string(&output_path)
+        .expect("relative copy-pipe command should write inside OSC7 cwd");
+    let _ = fs::remove_file(&output_path);
+    let _ = fs::remove_dir(&temp_dir);
+    assert!(output.contains("needle osc7 cwd"));
 }

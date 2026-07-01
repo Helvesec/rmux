@@ -278,10 +278,12 @@ impl RequestHandler {
         &self,
         session_name: &rmux_proto::SessionName,
         client_size: Option<TerminalSize>,
+        client_flags: ClientFlags,
     ) -> Result<(), RmuxError> {
         self.resize_session_geometry_for_attach_client(
             session_name,
             client_size.map(TerminalGeometry::from_size),
+            client_flags,
         )
         .await
     }
@@ -290,6 +292,7 @@ impl RequestHandler {
         &self,
         session_name: &rmux_proto::SessionName,
         client_geometry: Option<TerminalGeometry>,
+        client_flags: ClientFlags,
     ) -> Result<(), RmuxError> {
         let Some(client_geometry) =
             client_geometry.filter(|geometry| geometry.size.cols > 0 && geometry.size.rows > 0)
@@ -300,11 +303,18 @@ impl RequestHandler {
 
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
+        let selected_size = self
+            .selected_attached_session_size_for_new_client(session_name, client_size, client_flags)
+            .await?;
         let mut state = self.state.lock().await;
-        state.set_attached_terminal_pixels(session_name, client_geometry.pixels);
+        if !client_flags.contains(ClientFlags::IGNORESIZE) {
+            state.set_attached_terminal_pixels(session_name, client_geometry.pixels);
+        }
         state.mutate_session_and_resize_terminals(session_name, |session| {
             session.touch_attached();
-            session.resize_terminal(client_size);
+            if let Some(selected_size) = selected_size {
+                session.resize_terminal(selected_size);
+            }
             Ok(())
         })
     }
@@ -409,8 +419,18 @@ impl RequestHandler {
             });
         };
         active.suspended = true;
-        if active.control_tx.send(AttachControl::Suspend).is_err() {
-            active_attach.by_pid.remove(&attach_pid);
+        let session_name = active.session_name.clone();
+        let remove = active.control_tx.send(AttachControl::Suspend).is_err();
+        drop(active_attach);
+        if remove {
+            let removed_stale_clients = self
+                .remove_attached_clients_for_session(&session_name, vec![attach_pid])
+                .await;
+            if !removed_stale_clients.is_empty() {
+                let _ = self
+                    .reconcile_attached_session_size_and_emit(&session_name)
+                    .await;
+            }
         }
 
         Response::SuspendClient(SuspendClientResponse {

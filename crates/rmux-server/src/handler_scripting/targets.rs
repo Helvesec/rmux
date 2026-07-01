@@ -32,6 +32,31 @@ pub(super) fn resolve_queue_target_arguments(
             break;
         }
 
+        if let Some((bare_flags, flag, attached_value)) =
+            compact_queue_target_argument_parts(command_name, &argument)
+        {
+            resolved.extend(bare_flags.into_iter().map(|flag| format!("-{flag}")));
+            let value = if let Some(value) = attached_value {
+                value.to_owned()
+            } else {
+                let Some(value) = arguments.pop_front() else {
+                    resolved.push(argument);
+                    break;
+                };
+                value
+            };
+            resolved.push(format!("-{flag}"));
+            let spec = queue_target_spec_for_flag(command_name, flag, &value, &all_arguments)
+                .expect("prevalidated target flag must have a queue target spec");
+            resolved.push(resolve_target_argument_with_spec(
+                value,
+                spec,
+                sessions,
+                find_context,
+            )?);
+            continue;
+        }
+
         let Some((flag, attached_value)) = short_flag_argument_parts(&argument) else {
             resolved.push(argument);
             continue;
@@ -265,6 +290,18 @@ fn queue_target_spec_for_flag(
     arguments: &[String],
 ) -> Option<CommandTargetSpec> {
     let mut spec = target_spec_for_flag(command_name, flag)?;
+    if command_target_metadata(command_name)
+        .and_then(|metadata| metadata.source)
+        .is_some_and(|source| {
+            source.flag == flag && source.flags.contains(TargetFindFlags::DEFAULT_MARKED)
+        })
+    {
+        // DEFAULT_MARKED is tmux's fallback for omitted source targets (for
+        // example bare `join-pane`/`swap-pane`).  An explicit `-s` value must
+        // resolve normally; otherwise the queue/source-file path silently
+        // throws the user-supplied source away and falls back to `{marked}`.
+        spec.flags = TargetFindFlags::NONE;
+    }
     if command_name == "move-window"
         && flag == 't'
         && arguments.iter().any(|arg| arg == "-r")
@@ -378,12 +415,63 @@ fn short_flag_argument_parts(argument: &str) -> Option<(char, Option<&str>)> {
     Some((flag, (!attached.is_empty()).then_some(attached)))
 }
 
+fn compact_queue_target_argument_parts<'a>(
+    command_name: &str,
+    argument: &'a str,
+) -> Option<(Vec<char>, char, Option<&'a str>)> {
+    let bare_flags = queue_compact_bare_flags(command_name)?;
+    let metadata = command_target_metadata(command_name)?;
+    let target_flags = [metadata.source, metadata.target]
+        .into_iter()
+        .flatten()
+        .map(|spec| spec.flag)
+        .collect::<Vec<_>>();
+
+    let body = argument.strip_prefix('-')?;
+    if body.starts_with('-') {
+        return None;
+    }
+
+    for (index, flag) in body.char_indices() {
+        if index == 0 || !target_flags.contains(&flag) {
+            continue;
+        }
+        let prefix = &body[..index];
+        if !prefix
+            .chars()
+            .all(|prefix_flag| bare_flags.contains(prefix_flag))
+        {
+            continue;
+        }
+        let attached = &body[index + flag.len_utf8()..];
+        return Some((
+            prefix.chars().collect(),
+            flag,
+            (!attached.is_empty()).then_some(attached),
+        ));
+    }
+
+    None
+}
+
+fn queue_compact_bare_flags(command_name: &str) -> Option<&'static str> {
+    match command_name {
+        "copy-mode" => Some("deHMSqu"),
+        "join-pane" | "move-pane" => Some("bdfhv"),
+        "send-keys" | "send" => Some("FHlKMRX"),
+        "split-window" => Some("bdfhIPvZP"),
+        "swap-pane" => Some("dDUZ"),
+        _ => None,
+    }
+}
+
 fn queue_target_resolution_enabled(command_name: &str) -> bool {
     matches!(
         command_name,
         "attach-session"
             | "break-pane"
             | "capture-pane"
+            | "copy-mode"
             | "display-message"
             | "display-menu"
             | "display-popup"
@@ -572,6 +660,25 @@ pub(super) fn marked_pane_target(
         .map_err(|error| {
             RmuxError::Server(format!("{command_name} requires a marked pane: {error}"))
         })
+}
+
+pub(super) fn marked_pane_target_or_current(
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+    command_name: &str,
+) -> Result<PaneTarget, RmuxError> {
+    sessions
+        .resolve_unresolved_target(
+            &UnresolvedTarget::none(),
+            TargetFindType::Pane,
+            TargetFindFlags::DEFAULT_MARKED,
+            find_context,
+        )
+        .map(|target| match target {
+            Target::Pane(target) => target,
+            _ => unreachable!("default marked pane lookup must return a pane"),
+        })
+        .map_err(|_| missing_argument(command_name, "-s target"))
 }
 
 pub(super) fn implicit_split_target(
@@ -865,5 +972,66 @@ mod tests {
         .expect("queue targets resolve");
 
         assert_eq!(resolved, ["-s", "alpha:0", "-t", "beta"]);
+    }
+
+    #[test]
+    fn queue_resolves_default_mouse_binding_compact_copy_mode_target() {
+        let sessions = session_store_with_alpha_beta();
+        let mouse_target = Target::Pane(PaneTarget::with_window(session_name("alpha"), 0, 0));
+        let context = TargetFindContext::new(None).with_mouse_target(Some(mouse_target));
+
+        let resolved = resolve_queue_target_arguments(
+            "copy-mode",
+            vec!["-Ht=".to_owned()],
+            &sessions,
+            &context,
+        )
+        .expect("copy-mode mouse target resolves");
+
+        assert_eq!(resolved, ["-H", "-t", "alpha:0.0"]);
+    }
+
+    #[test]
+    fn queue_resolves_default_mouse_binding_compact_send_keys_target() {
+        let sessions = session_store_with_alpha_beta();
+        let mouse_target = Target::Pane(PaneTarget::with_window(session_name("alpha"), 0, 0));
+        let context = TargetFindContext::new(None).with_mouse_target(Some(mouse_target));
+
+        let resolved = resolve_queue_target_arguments(
+            "send-keys",
+            vec!["-Xt=".to_owned(), "select-word".to_owned()],
+            &sessions,
+            &context,
+        )
+        .expect("send-keys mouse target resolves");
+
+        assert_eq!(resolved, ["-X", "-t", "alpha:0.0", "select-word"]);
+    }
+
+    #[test]
+    fn queue_resolves_explicit_default_marked_source_without_falling_back_to_marked() {
+        let sessions = session_store_with_alpha_beta();
+        let marked_target = Target::Pane(PaneTarget::with_window(session_name("beta"), 0, 0));
+        let context = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+            session_name("beta"),
+            0,
+            0,
+        ))))
+        .with_marked_target(Some(marked_target));
+
+        let resolved = resolve_queue_target_arguments(
+            "join-pane",
+            vec![
+                "-s".to_owned(),
+                "alpha:0.0".to_owned(),
+                "-t".to_owned(),
+                "beta:0.0".to_owned(),
+            ],
+            &sessions,
+            &context,
+        )
+        .expect("queue targets resolve");
+
+        assert_eq!(resolved, ["-s", "alpha:0.0", "-t", "beta:0.0"]);
     }
 }

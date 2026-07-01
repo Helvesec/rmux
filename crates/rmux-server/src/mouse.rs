@@ -48,6 +48,10 @@ const MOUSE_BUTTON_10: u16 = 130;
 const MOUSE_BUTTON_11: u16 = 131;
 
 impl ClientMouseState {
+    pub(crate) fn click_deadline(&self) -> Option<Instant> {
+        self.click_deadline
+    }
+
     pub(crate) fn expire_click_timer(
         &mut self,
         now: Instant,
@@ -194,8 +198,28 @@ pub(crate) fn classify_mouse_event(
     raw: MouseForwardEvent,
     now: Instant,
 ) -> Option<ClassifiedMouseEvent> {
-    let _ = state.expire_click_timer(now, layout);
+    classify_mouse_events(state, layout, raw, now)
+        .into_iter()
+        .next()
+}
 
+pub(crate) fn classify_mouse_events(
+    state: &mut ClientMouseState,
+    layout: &MouseLayout,
+    raw: MouseForwardEvent,
+    now: Instant,
+) -> Vec<ClassifiedMouseEvent> {
+    let expired = state.expire_click_timer(now, layout);
+    let current = classify_current_mouse_event(state, layout, raw, now);
+    expired.into_iter().chain(current).collect()
+}
+
+fn classify_current_mouse_event(
+    state: &mut ClientMouseState,
+    layout: &MouseLayout,
+    raw: MouseForwardEvent,
+    now: Instant,
+) -> Option<ClassifiedMouseEvent> {
     let (kind, x, y, mut button_bits, ignore) = if is_mouse_move(raw) {
         (MouseEventKind::MouseMove, raw.x, raw.y, 0, false)
     } else if mouse_drag(raw.b) {

@@ -256,7 +256,7 @@ impl RequestHandler {
         &self,
         event: PaneAlertEvent,
     ) -> Vec<SessionName> {
-        let (target, inactive_output_refresh) = {
+        let (target, pane_target, inactive_output_refresh) = {
             let state = self.state.lock().await;
             let Some(runtime_session_name) = state.resolve_pane_event_runtime_session(
                 &event.session_name,
@@ -285,9 +285,16 @@ impl RequestHandler {
             };
             (
                 WindowTarget::with_window(pane_target.session_name().clone(), window_index),
+                pane_target,
                 inactive_output_refresh,
             )
         };
+        if event.title_changed {
+            self.emit(LifecycleEvent::PaneTitleChanged {
+                target: pane_target,
+            })
+            .await;
+        }
         if !event.queue_activity_alert && event.bell_count == 0 {
             return inactive_output_refresh;
         }

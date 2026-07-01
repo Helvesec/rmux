@@ -52,6 +52,18 @@ pub(in crate::handler::scripting_support) fn parse_set_hook(
                 let _ = args.optional();
                 window = true;
             }
+            token if is_compact_hook_flag_cluster(token, true) => {
+                let token = args.optional().expect("peeked token exists");
+                apply_set_hook_flag_cluster(
+                    &token,
+                    &mut global,
+                    &mut window,
+                    &mut pane,
+                    &mut append,
+                    &mut run_immediately,
+                    &mut unset,
+                );
+            }
             _ => break,
         }
     }
@@ -107,6 +119,10 @@ pub(in crate::handler::scripting_support) fn parse_show_hooks(
                 let _ = args.optional();
                 window = true;
             }
+            token if is_compact_hook_flag_cluster(token, false) => {
+                let token = args.optional().expect("peeked token exists");
+                apply_show_hooks_flag_cluster(&token, &mut global, &mut window, &mut pane);
+            }
             _ => break,
         }
     }
@@ -124,6 +140,64 @@ pub(in crate::handler::scripting_support) fn parse_show_hooks(
         pane,
         hook,
     }))
+}
+
+fn is_compact_hook_flag_cluster(token: &str, set_hook: bool) -> bool {
+    let Some(flags) = token.strip_prefix('-') else {
+        return false;
+    };
+    if flags.len() <= 1 || flags.starts_with('-') {
+        return false;
+    }
+    flags
+        .chars()
+        .all(|flag| matches!(flag, 'g' | 'p' | 'w') || set_hook && matches!(flag, 'a' | 'R' | 'u'))
+}
+
+fn apply_set_hook_flag_cluster(
+    token: &str,
+    global: &mut bool,
+    window: &mut bool,
+    pane: &mut bool,
+    append: &mut bool,
+    run_immediately: &mut bool,
+    unset: &mut bool,
+) {
+    for flag in token
+        .strip_prefix('-')
+        .expect("compact flag cluster starts with '-'")
+        .chars()
+    {
+        match flag {
+            'a' => *append = true,
+            'g' => *global = true,
+            'p' => *pane = true,
+            'R' => *run_immediately = true,
+            'u' => *unset = true,
+            'w' => *window = true,
+            _ => unreachable!("validated compact set-hook flag"),
+        }
+    }
+}
+
+fn apply_show_hooks_flag_cluster(
+    token: &str,
+    global: &mut bool,
+    window: &mut bool,
+    pane: &mut bool,
+) {
+    for flag in token
+        .strip_prefix('-')
+        .expect("compact flag cluster starts with '-'")
+        .chars()
+    {
+        match flag {
+            'g' => *global = true,
+            'p' => *pane = true,
+            'w' => *window = true,
+            _ => unreachable!("validated compact show-hooks flag"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

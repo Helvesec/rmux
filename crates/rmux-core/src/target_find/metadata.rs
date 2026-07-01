@@ -15,6 +15,10 @@ pub fn command_target_metadata(command_name: &str) -> Option<CommandTargetMetada
         | "respawn-pane" | "select-pane" | "send-keys" | "split-window" => {
             Some(metadata(None, Some(spec('t', Type::Pane, Flags::NONE))))
         }
+        "copy-mode" => Some(metadata(
+            Some(spec('s', Type::Pane, Flags::NONE)),
+            Some(spec('t', Type::Pane, Flags::NONE)),
+        )),
         "display-menu" | "display-message" | "display-popup" | "if-shell" | "show-hooks"
         | "show-options" | "run-shell" | "source-file" => {
             Some(metadata(None, Some(spec('t', Type::Pane, Flags::CANFAIL))))

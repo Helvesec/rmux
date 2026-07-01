@@ -34,7 +34,7 @@ fn screen_with(bytes: &[u8], size: TerminalSize) -> Screen {
 }
 
 fn render_until_contains(session: &Session, options: &OptionStore, needle: &str) -> String {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + status_job_test_deadline();
     loop {
         let frame = String::from_utf8(render(session, options)).expect("frame is utf-8");
         assert!(!frame.contains("#("), "{frame}");
@@ -46,6 +46,14 @@ fn render_until_contains(session: &Session, options: &OptionStore, needle: &str)
             "render never contained {needle:?}; last frame was {frame:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn status_job_test_deadline() -> std::time::Duration {
+    if cfg!(windows) {
+        std::time::Duration::from_secs(10)
+    } else {
+        std::time::Duration::from_secs(2)
     }
 }
 

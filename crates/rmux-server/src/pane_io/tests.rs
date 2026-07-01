@@ -561,7 +561,15 @@ fn test_attach_target_with_protocols(
 }
 
 fn test_render_only_attach_target(session_name: &SessionName, render_frame: &[u8]) -> AttachTarget {
-    let mut target = test_attach_target(session_name, render_frame, None);
+    test_render_only_attach_target_with_state(session_name, render_frame, None)
+}
+
+fn test_render_only_attach_target_with_state(
+    session_name: &SessionName,
+    render_frame: &[u8],
+    persistent_overlay_state_id: Option<u64>,
+) -> AttachTarget {
+    let mut target = test_attach_target(session_name, render_frame, persistent_overlay_state_id);
     target.pane_master = None;
     target
 }
@@ -586,7 +594,7 @@ fn render_only_switches_coalesce_before_reliable_controls() {
         .expect("queue reliable detach");
 
     let control_backlog = AtomicUsize::new(0);
-    let coalesced = coalesce_render_switches(
+    let (coalesced, switch_count) = coalesce_render_switches(
         Box::new(first),
         &mut deferred_controls,
         Some(&mut control_rx),
@@ -594,6 +602,7 @@ fn render_only_switches_coalesce_before_reliable_controls() {
     );
 
     assert_eq!(coalesced.render_frame, b"third");
+    assert_eq!(switch_count, 3);
     assert!(matches!(
         deferred_controls.pop_front(),
         Some(AttachControl::Detach)
@@ -616,7 +625,7 @@ fn render_only_switch_coalescing_preserves_deferred_control_order() {
         .expect("queue reliable detach");
 
     let control_backlog = AtomicUsize::new(0);
-    let coalesced = coalesce_render_switches(
+    let (coalesced, switch_count) = coalesce_render_switches(
         Box::new(first),
         &mut deferred_controls,
         Some(&mut control_rx),
@@ -624,6 +633,7 @@ fn render_only_switch_coalescing_preserves_deferred_control_order() {
     );
 
     assert_eq!(coalesced.render_frame, b"second");
+    assert_eq!(switch_count, 2);
     assert!(matches!(
         deferred_controls.pop_front(),
         Some(AttachControl::Refresh)
@@ -743,6 +753,54 @@ async fn pending_refresh_after_switch_preserves_target_change() {
         String::from_utf8_lossy(&refresh).contains("BASE-B"),
         "switch should render before the refresh is scheduled"
     );
+}
+
+#[tokio::test]
+async fn stale_persistent_switches_still_advance_render_generation() {
+    let alpha = SessionName::new("alpha").expect("valid session name");
+    let beta = SessionName::new("beta").expect("valid session name");
+    let (stream, _peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let stream = AttachTransport::from(stream);
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let mut current_target =
+        open_attach_target(test_attach_target(&alpha, b"BASE-A", Some(10)), false)
+            .expect("open target");
+    let mut render_generation = 41_u64;
+    let mut overlay_generation = 0_u64;
+    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay_visible = false;
+    let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
+    let mut locked = false;
+    let mut deferred_controls = VecDeque::new();
+
+    control_tx
+        .send(AttachControl::switch(test_attach_target(
+            &beta,
+            b"STALE-B",
+            Some(9),
+        )))
+        .expect("send stale switch control");
+
+    let control_backlog = AtomicUsize::new(0);
+    let action = apply_pending_attach_controls(
+        &mut deferred_controls,
+        Some(&mut control_rx),
+        &control_backlog,
+        &mut current_target,
+        &stream,
+        &mut render_generation,
+        &mut overlay_generation,
+        &mut persistent_overlay,
+        &mut persistent_overlay_visible,
+        &mut persistent_overlay_state_id,
+        &mut locked,
+    )
+    .await
+    .expect("apply stale pending switch");
+
+    assert!(matches!(action, PendingAttachAction::Write));
+    assert_eq!(current_target.session_name, alpha);
+    assert_eq!(render_generation, 42);
 }
 
 #[tokio::test]
@@ -1031,6 +1089,79 @@ async fn forward_attach_preserves_persistent_overlay_across_stateful_switch_refr
             !refresh_text.contains("\x1b[2J"),
             "stateful choose-tree refresh must not clear to the base pane before the replacement overlay: {refresh_text:?}"
         );
+
+    shutdown_tx.send(()).expect("request attach shutdown");
+    let result = attach_task.await.expect("attach task join");
+    assert!(
+        result.is_ok(),
+        "forward_attach should stay healthy: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn forward_attach_counts_coalesced_switches_before_persistent_overlay() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name = SessionName::new("alpha").expect("valid session name");
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let live_input = LiveAttachInputContext {
+        handler,
+        attach_pid: std::process::id(),
+    };
+
+    let attach_task = tokio::spawn(forward_attach(
+        stream,
+        test_render_only_attach_target(&session_name, b"BASE-0"),
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        Arc::new(AtomicUsize::new(0)),
+        closing,
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+        false,
+    ));
+
+    let initial = read_attach_data_until(&mut peer, b"BASE-0").await;
+    assert!(
+        String::from_utf8_lossy(&initial).contains("BASE-0"),
+        "initial attach should render the base pane"
+    );
+
+    control_tx
+        .send(AttachControl::switch(test_render_only_attach_target(
+            &session_name,
+            b"BASE-1",
+        )))
+        .expect("send prompt close refresh");
+    control_tx
+        .send(AttachControl::switch(test_render_only_attach_target(
+            &session_name,
+            b"BASE-2",
+        )))
+        .expect("send session mutation refresh");
+    control_tx
+        .send(AttachControl::switch(
+            test_render_only_attach_target_with_state(&session_name, b"BASE-3", Some(8)),
+        ))
+        .expect("send mode-tree switch");
+    control_tx
+        .send(AttachControl::Overlay(OverlayFrame::persistent_with_state(
+            b"MENU-NEW".to_vec(),
+            3,
+            1,
+            8,
+        )))
+        .expect("send mode-tree overlay");
+
+    let refresh = read_attach_data_until(&mut peer, b"MENU-NEW").await;
+    let refresh_text = String::from_utf8_lossy(&refresh);
+    assert!(
+        refresh_text.contains("BASE-3") && refresh_text.contains("MENU-NEW"),
+        "coalesced switch generation must still match the pending overlay: {refresh_text:?}"
+    );
 
     shutdown_tx.send(()).expect("request attach shutdown");
     let result = attach_task.await.expect("attach task join");

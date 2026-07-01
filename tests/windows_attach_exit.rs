@@ -1,26 +1,121 @@
 #![cfg(windows)]
 
 use std::error::Error;
+use std::fs;
 use std::io;
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rmux_pty::{
     write_windows_console_key, ChildCommand, SpawnedPty, TerminalSize, WindowsConsoleKeyEvent,
 };
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
+};
+use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 
 const SETUP_TIMEOUT: Duration = Duration::from_secs(6);
+const PYTHON_FOREGROUND_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+const CTRL_C_SYNTHETIC_ATTEMPTS: usize = 3;
+const CTRL_C_SYNTHETIC_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
 const EXIT_LATENCY_TIMEOUT: Duration = Duration::from_secs(2);
 const EXIT_LATENCY_BUDGET: Duration = Duration::from_millis(250);
+const EXIT_LATENCY_REGRESSION_BUDGET: Duration = Duration::from_millis(750);
+const EXIT_LATENCY_REGRESSION_REPETITIONS: usize = 3;
+const WINDOWS_CONSOLE_TEST_LOCK_TIMEOUT_MS: u32 = 120_000;
+
+static WINDOWS_CONSOLE_TEST_LOCK: Mutex<()> = Mutex::new(());
+static NEXT_LABEL_ID: AtomicUsize = AtomicUsize::new(0);
+
+struct WindowsConsoleTestLock {
+    handle: HANDLE,
+    _thread_guard: MutexGuard<'static, ()>,
+}
+
+fn lock_windows_console_test() -> WindowsConsoleTestLock {
+    let thread_guard = WINDOWS_CONSOLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let name = wide_null("Local\\RMUXWindowsConsoleTestLock");
+    let handle = unsafe {
+        // SAFETY: The name is a NUL-terminated UTF-16 string and the default
+        // security attributes are intentionally null for a per-user test mutex.
+        CreateMutexW(std::ptr::null(), 0, name.as_ptr())
+    };
+    assert!(
+        !handle.is_null(),
+        "failed to create Windows console test mutex: {}",
+        io::Error::from_raw_os_error(unsafe { GetLastError() } as i32)
+    );
+    let wait = unsafe {
+        // SAFETY: `handle` is a valid mutex handle returned by CreateMutexW.
+        WaitForSingleObject(handle, WINDOWS_CONSOLE_TEST_LOCK_TIMEOUT_MS)
+    };
+    assert!(
+        matches!(wait, WAIT_OBJECT_0 | WAIT_ABANDONED),
+        "timed out waiting for Windows console test mutex: wait={wait}"
+    );
+    WindowsConsoleTestLock {
+        handle,
+        _thread_guard: thread_guard,
+    }
+}
+
+impl Drop for WindowsConsoleTestLock {
+    fn drop(&mut self) {
+        unsafe {
+            // SAFETY: The guard only stores handles after a successful wait.
+            let _ = ReleaseMutex(self.handle);
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
+fn wide_null(value: &str) -> Vec<u16> {
+    std::ffi::OsStr::new(value)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+fn unique_label(prefix: &str) -> String {
+    let sequence = NEXT_LABEL_ID.fetch_add(1, Ordering::Relaxed);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    format!("{prefix}-{}-{now}-{sequence}", std::process::id())
+}
+
+#[derive(Debug)]
+struct ControlKeyOutcome {
+    returned_to_prompt: bool,
+    saw_keyboard_interrupt: bool,
+    output: Vec<u8>,
+}
+
+impl ControlKeyOutcome {
+    fn from_output(returned_to_prompt: bool, output: Vec<u8>) -> Self {
+        let saw_keyboard_interrupt = output_contains(&output, b"KeyboardInterrupt");
+        Self {
+            returned_to_prompt,
+            saw_keyboard_interrupt,
+            output,
+        }
+    }
+}
 
 #[test]
 fn windows_attach_exit_emits_exited_banner() -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
-    let label = format!("win-exit-{}", std::process::id());
+    let label = unique_label("win-exit");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
     run_rmux(
@@ -55,8 +150,9 @@ fn windows_attach_exit_emits_exited_banner() -> Result<(), Box<dyn Error>> {
 #[test]
 #[ignore = "timing-sensitive Windows attach latency probe"]
 fn windows_attach_exit_command_returns_under_latency_budget() -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
-    let label = format!("win-exit-latency-{}", std::process::id());
+    let label = unique_label("win-exit-latency");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
     run_rmux(
@@ -94,6 +190,7 @@ fn windows_attach_exit_command_returns_under_latency_budget() -> Result<(), Box<
 #[ignore = "timing-sensitive Windows attach latency probe"]
 fn windows_attach_ctrl_d_returns_under_latency_budget_when_pwsh_available(
 ) -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
     if !pwsh_available() {
         eprintln!("skipping Ctrl-D latency probe because pwsh.exe is unavailable");
         return Ok(());
@@ -106,7 +203,7 @@ fn windows_attach_ctrl_d_returns_under_latency_budget_when_pwsh_available(
     }
 
     let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
-    let label = format!("win-ctrl-d-latency-{}", std::process::id());
+    let label = unique_label("win-ctrl-d-latency");
     let _guard = RmuxServerGuard::new(&binary, label.clone());
 
     run_rmux(
@@ -131,10 +228,7 @@ fn windows_attach_ctrl_d_returns_under_latency_budget_when_pwsh_available(
 
     wait_for_needle_or_error(&mut attach, b"PS ", SETUP_TIMEOUT)?;
     let started = Instant::now();
-    write_windows_console_key(
-        attach.child().pid(),
-        WindowsConsoleKeyEvent::new(0x44, 0x20, 0x04, 0x0008, 1),
-    )?;
+    write_windows_console_key(attach.child().pid(), WindowsConsoleKeyEvent::ctrl_d())?;
     let exited = wait_for_spawned_exit_or_terminate(&mut attach, EXIT_LATENCY_TIMEOUT)?;
     let elapsed = started.elapsed();
 
@@ -146,6 +240,894 @@ fn windows_attach_ctrl_d_returns_under_latency_budget_when_pwsh_available(
         elapsed <= EXIT_LATENCY_BUDGET,
         "attached Windows Ctrl-D took {elapsed:?}, budget is {EXIT_LATENCY_BUDGET:?}"
     );
+
+    Ok(())
+}
+
+#[test]
+fn windows_attach_exit_latency_regression_stays_bounded_across_repeats(
+) -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let label = unique_label("win-exit-latency-regression");
+    let _guard = RmuxServerGuard::new(&binary, label.clone());
+    let mut samples = Vec::new();
+
+    for iteration in 0..EXIT_LATENCY_REGRESSION_REPETITIONS {
+        let session = format!("exitlat{iteration}");
+        run_rmux(
+            &binary,
+            &label,
+            [
+                "new-session",
+                "-d",
+                "-s",
+                session.as_str(),
+                "cmd.exe",
+                "/D",
+                "/K",
+            ],
+        )?;
+        run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
+
+        let mut attach = ChildCommand::new(&binary)
+            .args(["-L", &label, "attach-session", "-t", session.as_str()])
+            .size(TerminalSize::new(100, 30))
+            .spawn()?;
+        let io = attach.master().try_clone_io()?;
+
+        wait_for_needle_or_error(&mut attach, b">", SETUP_TIMEOUT)?;
+        let started = Instant::now();
+        io.write_all(b"exit\r\n")?;
+        let exited = wait_for_spawned_exit_or_terminate(&mut attach, EXIT_LATENCY_TIMEOUT)?;
+        let elapsed = started.elapsed();
+        samples.push(elapsed);
+
+        assert!(
+            exited,
+            "attached Windows exit command did not return before timeout; samples={samples:?}"
+        );
+        assert!(
+            elapsed <= EXIT_LATENCY_REGRESSION_BUDGET,
+            "attached Windows exit command took {elapsed:?}, regression budget is {EXIT_LATENCY_REGRESSION_BUDGET:?}; samples={samples:?}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn windows_deferred_initial_pane_accepts_immediate_control_actions_and_mutations(
+) -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let label = unique_label("win-deferred-controls");
+    let _guard = RmuxServerGuard::new(&binary, label.clone());
+
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "new-session",
+            "-d",
+            "-s",
+            "deferredctl",
+            "cmd.exe",
+            "/D",
+            "/Q",
+            "/K",
+        ],
+    )?;
+
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "send-keys",
+            "-t",
+            "deferredctl:0.0",
+            "C-c",
+            "C-d",
+            "Enter",
+            "echo DEFERRED_CONTROL_AFTER",
+            "Enter",
+        ],
+    )?;
+    wait_for_capture_contains(
+        &binary,
+        &label,
+        "deferredctl:0.0",
+        b"DEFERRED_CONTROL_AFTER",
+        SETUP_TIMEOUT,
+    )?;
+
+    let panes = run_rmux_output(
+        &binary,
+        &label,
+        [
+            "list-panes",
+            "-t",
+            "deferredctl",
+            "-F",
+            "#{pane_pid}:#{pane_current_command}",
+        ],
+    )?;
+    let panes = String::from_utf8_lossy(&panes.stdout);
+    let first_pid = panes
+        .lines()
+        .next()
+        .and_then(|line| line.split_once(':'))
+        .map(|(pid, _)| pid)
+        .unwrap_or_default();
+    assert!(
+        first_pid.bytes().all(|byte| byte.is_ascii_digit()) && first_pid != "0",
+        "deferred pane did not publish a running pane_pid; list-panes output: {panes:?}"
+    );
+
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "split-window",
+            "-h",
+            "-t",
+            "deferredctl:0.0",
+            "cmd.exe /D /Q /K echo DEFERRED_SPLIT_READY",
+        ],
+    )?;
+    wait_for_capture_contains(
+        &binary,
+        &label,
+        "deferredctl:0.1",
+        b"DEFERRED_SPLIT_READY",
+        SETUP_TIMEOUT,
+    )?;
+    let panes = run_rmux_output(
+        &binary,
+        &label,
+        ["list-panes", "-t", "deferredctl", "-F", "#{pane_index}"],
+    )?;
+    assert_eq!(
+        String::from_utf8_lossy(&panes.stdout).lines().count(),
+        2,
+        "split-window after deferred startup should leave two panes"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn windows_conpty_stress_survives_large_output_resize_mouse_toggles_and_detach(
+) -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
+    if !pwsh_available() {
+        eprintln!("skipping ConPTY stress probe because pwsh.exe is unavailable");
+        return Ok(());
+    }
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let label = unique_label("win-conpty-stress");
+    let _guard = RmuxServerGuard::new(&binary, label.clone());
+
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "new-session",
+            "-d",
+            "-x",
+            "100",
+            "-y",
+            "30",
+            "-s",
+            "stress",
+            "pwsh.exe -NoLogo -NoProfile",
+        ],
+    )?;
+    run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
+    wait_for_capture_contains(&binary, &label, "stress:0.0", b"PS ", SETUP_TIMEOUT)?;
+
+    let command = "Write-Output RMUX_STRESS_BEGIN; 1..800 | ForEach-Object { Write-Output ('RMUX_STRESS_LINE_' + $_) }; $e=[char]27; [Console]::Write($e + '[?1000h' + $e + '[?1006h'); Write-Output RMUX_STRESS_MOUSE_ON; [Console]::Write($e + '[?1006l' + $e + '[?1000l'); Write-Output RMUX_STRESS_DONE";
+    run_rmux(
+        &binary,
+        &label,
+        ["send-keys", "-t", "stress:0.0", command, "Enter"],
+    )?;
+
+    for (columns, rows) in [(120, 36), (80, 24), (132, 40), (100, 30)] {
+        let columns = columns.to_string();
+        let rows = rows.to_string();
+        run_rmux(
+            &binary,
+            &label,
+            [
+                "resize-window",
+                "-t",
+                "stress:0",
+                "-x",
+                columns.as_str(),
+                "-y",
+                rows.as_str(),
+            ],
+        )?;
+    }
+
+    wait_for_capture_contains(
+        &binary,
+        &label,
+        "stress:0.0",
+        b"RMUX_STRESS_DONE",
+        EXIT_TIMEOUT,
+    )?;
+
+    let mut attach = ChildCommand::new(&binary)
+        .args(["-L", &label, "attach-session", "-t", "stress"])
+        .size(TerminalSize::new(100, 30))
+        .spawn()?;
+    wait_for_needle_or_error(&mut attach, b"RMUX_STRESS_DONE", SETUP_TIMEOUT)?;
+    run_rmux(&binary, &label, ["detach-client"])?;
+    let detached = wait_for_spawned_exit_or_terminate(&mut attach, EXIT_LATENCY_TIMEOUT)?;
+    assert!(
+        detached,
+        "attached client did not exit after detach-client during ConPTY stress"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn windows_attach_ctrl_c_interrupts_pwsh_foreground_python_when_available(
+) -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
+    if !pwsh_available() || !python_available() {
+        eprintln!(
+            "skipping Ctrl-C foreground interrupt probe because pwsh.exe or python.exe is unavailable"
+        );
+        return Ok(());
+    }
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let label = unique_label("win-ctrl-c-interrupt");
+    let _guard = RmuxServerGuard::new(&binary, label.clone());
+
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "new-session",
+            "-d",
+            "-s",
+            "ctrlccase",
+            "pwsh.exe -NoLogo -NoProfile",
+        ],
+    )?;
+    run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
+
+    let mut attach = ChildCommand::new(&binary)
+        .args(["-L", &label, "attach-session", "-t", "ctrlccase"])
+        .size(TerminalSize::new(100, 30))
+        .spawn()?;
+    let io = attach.master().try_clone_io()?;
+
+    wait_for_needle_or_error(&mut attach, b"PS ", SETUP_TIMEOUT)?;
+    io.write_all(
+        b"python -c \"import time; print('RMUX_CTRL_C_READY', flush=True); time.sleep(10**6)\"\r\n",
+    )?;
+    wait_for_needle_or_error(
+        &mut attach,
+        b"RMUX_CTRL_C_READY",
+        PYTHON_FOREGROUND_READY_TIMEOUT,
+    )?;
+    let rmux = send_attach_ctrl_c_and_wait_for_marker(
+        &binary,
+        &label,
+        "ctrlccase:0.0",
+        &attach,
+        &io,
+        "RMUX_CTRL_C_DONE",
+    )?;
+    terminate_spawned(&mut attach);
+    assert!(
+        rmux.returned_to_prompt,
+        "attached Ctrl-C did not return to the PowerShell prompt\n{}",
+        String::from_utf8_lossy(&rmux.output)
+    );
+    assert_foreground_ctrl_c_observed("attached Ctrl-C", &rmux);
+
+    Ok(())
+}
+
+#[test]
+fn windows_attach_ctrl_c_interrupts_foreground_python_descendant_when_available(
+) -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
+    if !pwsh_available() || !python_available() {
+        eprintln!(
+            "skipping Ctrl-C descendant interrupt probe because pwsh.exe or python.exe is unavailable"
+        );
+        return Ok(());
+    }
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let label = unique_label("win-ctrl-c-descendant");
+    let _guard = RmuxServerGuard::new(&binary, label.clone());
+    let script = write_python_descendant_sleep_script(&label)?;
+
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "new-session",
+            "-d",
+            "-s",
+            "descctrlc",
+            "pwsh.exe -NoLogo -NoProfile",
+        ],
+    )?;
+    run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
+
+    let mut attach = ChildCommand::new(&binary)
+        .args(["-L", &label, "attach-session", "-t", "descctrlc"])
+        .size(TerminalSize::new(100, 30))
+        .spawn()?;
+    let io = attach.master().try_clone_io()?;
+
+    wait_for_needle_or_error(&mut attach, b"PS ", SETUP_TIMEOUT)?;
+    io.write_all(format!("python \"{}\"\r\n", script.display()).as_bytes())?;
+    wait_for_needle_or_error(
+        &mut attach,
+        b"RMUX_DESC_CHILD_READY",
+        PYTHON_FOREGROUND_READY_TIMEOUT,
+    )?;
+    let rmux = send_attach_ctrl_c_and_wait_for_marker(
+        &binary,
+        &label,
+        "descctrlc:0.0",
+        &attach,
+        &io,
+        "RMUX_DESC_CTRL_C_DONE",
+    )?;
+    terminate_spawned(&mut attach);
+    assert!(
+        rmux.returned_to_prompt,
+        "attached Ctrl-C did not return after descendant foreground process\n{}",
+        String::from_utf8_lossy(&rmux.output)
+    );
+    assert_foreground_ctrl_c_observed("attached descendant Ctrl-C", &rmux);
+
+    Ok(())
+}
+
+#[test]
+fn windows_send_keys_ctrl_c_interrupts_pwsh_foreground_python_when_available(
+) -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
+    if !pwsh_available() || !python_available() {
+        eprintln!("skipping send-keys Ctrl-C foreground interrupt probe because pwsh.exe or python.exe is unavailable");
+        return Ok(());
+    }
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let label = unique_label("win-send-ctrl-c");
+    let _guard = RmuxServerGuard::new(&binary, label.clone());
+
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "new-session",
+            "-d",
+            "-s",
+            "sendctrlc",
+            "pwsh.exe -NoLogo -NoProfile",
+        ],
+    )?;
+    run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
+    wait_for_capture_contains(&binary, &label, "sendctrlc:0.0", b"PS ", SETUP_TIMEOUT)?;
+
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "send-keys",
+            "-t",
+            "sendctrlc:0.0",
+            "python -c \"import time; print('RMUX_PY_READY', flush=True); time.sleep(10**6)\"",
+            "Enter",
+        ],
+    )?;
+    wait_for_capture_contains(
+        &binary,
+        &label,
+        "sendctrlc:0.0",
+        b"RMUX_PY_READY",
+        SETUP_TIMEOUT,
+    )?;
+    run_rmux(&binary, &label, ["send-keys", "-t", "sendctrlc:0.0", "C-c"])?;
+    thread::sleep(Duration::from_millis(500));
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "send-keys",
+            "-t",
+            "sendctrlc:0.0",
+            "Write-Output RMUX_SEND_KEYS_CTRL_C_DONE",
+            "Enter",
+        ],
+    )?;
+
+    let (returned, output) = capture_until_contains(
+        &binary,
+        &label,
+        "sendctrlc:0.0",
+        b"RMUX_SEND_KEYS_CTRL_C_DONE",
+        EXIT_TIMEOUT,
+    )?;
+    let rmux = ControlKeyOutcome::from_output(returned, output);
+    assert!(
+        rmux.returned_to_prompt,
+        "send-keys Ctrl-C did not return to the PowerShell prompt\n{}",
+        String::from_utf8_lossy(&rmux.output)
+    );
+    assert_foreground_ctrl_c_observed("send-keys Ctrl-C", &rmux);
+
+    Ok(())
+}
+
+#[test]
+fn windows_send_keys_ctrl_c_targets_only_selected_pane_and_preserves_sibling_and_daemon(
+) -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
+    if !pwsh_available() {
+        eprintln!("skipping target-only Ctrl-C probe because pwsh.exe is unavailable");
+        return Ok(());
+    }
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let label = unique_label("win-ctrl-c-target-only");
+    let _guard = RmuxServerGuard::new(&binary, label.clone());
+
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "new-session",
+            "-d",
+            "-s",
+            "targetonly",
+            "pwsh.exe -NoLogo -NoProfile",
+        ],
+    )?;
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "split-window",
+            "-h",
+            "-t",
+            "targetonly:0.0",
+            "pwsh.exe -NoLogo -NoProfile",
+        ],
+    )?;
+    run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
+    wait_for_capture_contains(&binary, &label, "targetonly:0.0", b"PS ", SETUP_TIMEOUT)?;
+    wait_for_capture_contains(&binary, &label, "targetonly:0.1", b"PS ", SETUP_TIMEOUT)?;
+
+    for target in ["targetonly:0.0", "targetonly:0.1"] {
+        run_rmux(
+            &binary,
+            &label,
+            ["send-keys", "-t", target, "ping -t 127.0.0.1", "Enter"],
+        )?;
+        wait_for_capture_contains(&binary, &label, target, b"TTL=", SETUP_TIMEOUT)?;
+    }
+
+    run_rmux(
+        &binary,
+        &label,
+        ["send-keys", "-t", "targetonly:0.0", "C-c"],
+    )?;
+    thread::sleep(Duration::from_millis(500));
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "send-keys",
+            "-t",
+            "targetonly:0.0",
+            "Write-Output RMUX_TARGET_CTRL_C_DONE",
+            "Enter",
+        ],
+    )?;
+    wait_for_capture_contains(
+        &binary,
+        &label,
+        "targetonly:0.0",
+        b"RMUX_TARGET_CTRL_C_DONE",
+        EXIT_TIMEOUT,
+    )?;
+
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "send-keys",
+            "-t",
+            "targetonly:0.1",
+            "Write-Output RMUX_SIBLING_SHOULD_NOT_RUN",
+            "Enter",
+        ],
+    )?;
+    let (sibling_returned, sibling_output) = capture_until_contains(
+        &binary,
+        &label,
+        "targetonly:0.1",
+        b"RMUX_SIBLING_SHOULD_NOT_RUN",
+        Duration::from_millis(900),
+    )?;
+    assert!(
+        !sibling_returned,
+        "Ctrl-C sent to pane 0 also released sibling pane 1\n{}",
+        String::from_utf8_lossy(&sibling_output)
+    );
+
+    let sessions = run_rmux_output(&binary, &label, ["list-sessions", "-F", "#{session_name}"])?;
+    assert!(
+        String::from_utf8_lossy(&sessions.stdout).contains("targetonly"),
+        "daemon/session should remain alive after target-only Ctrl-C"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn windows_attach_ctrl_c_stops_ping_when_available() -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
+    if !pwsh_available() {
+        eprintln!("skipping attach ping Ctrl-C probe because pwsh.exe is unavailable");
+        return Ok(());
+    }
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let label = unique_label("win-attach-ping-ctrl-c");
+    let _guard = RmuxServerGuard::new(&binary, label.clone());
+
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "new-session",
+            "-d",
+            "-s",
+            "pingattach",
+            "pwsh.exe -NoLogo -NoProfile",
+        ],
+    )?;
+    run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
+
+    let mut attach = ChildCommand::new(&binary)
+        .args(["-L", &label, "attach-session", "-t", "pingattach"])
+        .size(TerminalSize::new(100, 30))
+        .spawn()?;
+    let io = attach.master().try_clone_io()?;
+
+    wait_for_needle_or_error(&mut attach, b"PS ", SETUP_TIMEOUT)?;
+    io.write_all(b"ping -t 127.0.0.1\r\n")?;
+    wait_for_needle_or_error(&mut attach, b"TTL=", SETUP_TIMEOUT)?;
+    write_windows_console_key(attach.child().pid(), WindowsConsoleKeyEvent::ctrl_c())?;
+    thread::sleep(Duration::from_millis(500));
+    io.write_all(b"\r\nWrite-Output RMUX_PING_CTRL_C_DONE\r\n")?;
+
+    let (returned, output) =
+        wait_for_needle_or_terminate(&mut attach, b"RMUX_PING_CTRL_C_DONE", EXIT_TIMEOUT)?;
+    terminate_spawned(&mut attach);
+    assert!(
+        returned,
+        "attached Ctrl-C did not stop ping and return to PowerShell\n{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn windows_send_keys_ctrl_c_multi_token_stops_ping_when_available() -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
+    if !pwsh_available() {
+        eprintln!("skipping send-keys ping Ctrl-C probe because pwsh.exe is unavailable");
+        return Ok(());
+    }
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let label = unique_label("win-send-ping-ctrl-c");
+    let _guard = RmuxServerGuard::new(&binary, label.clone());
+
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "new-session",
+            "-d",
+            "-s",
+            "sendping",
+            "pwsh.exe -NoLogo -NoProfile",
+        ],
+    )?;
+    run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
+    wait_for_capture_contains(&binary, &label, "sendping:0.0", b"PS ", SETUP_TIMEOUT)?;
+
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "send-keys",
+            "-t",
+            "sendping:0.0",
+            "ping -t 127.0.0.1",
+            "Enter",
+        ],
+    )?;
+    wait_for_capture_contains(&binary, &label, "sendping:0.0", b"TTL=", SETUP_TIMEOUT)?;
+    run_rmux(
+        &binary,
+        &label,
+        ["send-keys", "-t", "sendping:0.0", "C-c", "Enter"],
+    )?;
+    thread::sleep(Duration::from_millis(500));
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "send-keys",
+            "-t",
+            "sendping:0.0",
+            "Write-Output RMUX_PING_CTRL_C_DONE",
+            "Enter",
+        ],
+    )?;
+
+    let (returned, output) = capture_until_contains(
+        &binary,
+        &label,
+        "sendping:0.0",
+        b"RMUX_PING_CTRL_C_DONE",
+        EXIT_TIMEOUT,
+    )?;
+    assert!(
+        returned,
+        "send-keys Ctrl-C did not stop ping and return to PowerShell\n{}",
+        String::from_utf8_lossy(&output)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn windows_send_keys_ctrl_c_double_token_interrupts_synchronized_panes_when_available(
+) -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
+    if !pwsh_available() {
+        eprintln!("skipping synchronized Ctrl-C probe because pwsh.exe is unavailable");
+        return Ok(());
+    }
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let label = unique_label("win-sync-ping-ctrl-c");
+    let _guard = RmuxServerGuard::new(&binary, label.clone());
+
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "new-session",
+            "-d",
+            "-s",
+            "syncping",
+            "pwsh.exe -NoLogo -NoProfile",
+        ],
+    )?;
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "split-window",
+            "-h",
+            "-t",
+            "syncping:0.0",
+            "pwsh.exe -NoLogo -NoProfile",
+        ],
+    )?;
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "set-window-option",
+            "-t",
+            "syncping:0",
+            "synchronize-panes",
+            "on",
+        ],
+    )?;
+    wait_for_capture_contains(&binary, &label, "syncping:0.0", b"PS ", SETUP_TIMEOUT)?;
+    wait_for_capture_contains(&binary, &label, "syncping:0.1", b"PS ", SETUP_TIMEOUT)?;
+
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "send-keys",
+            "-t",
+            "syncping:0.0",
+            "ping -t 127.0.0.1",
+            "Enter",
+        ],
+    )?;
+    wait_for_capture_contains(&binary, &label, "syncping:0.0", b"TTL=", SETUP_TIMEOUT)?;
+    wait_for_capture_contains(&binary, &label, "syncping:0.1", b"TTL=", SETUP_TIMEOUT)?;
+
+    run_rmux(
+        &binary,
+        &label,
+        ["send-keys", "-t", "syncping:0.0", "C-c", "C-c"],
+    )?;
+    thread::sleep(Duration::from_millis(500));
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "send-keys",
+            "-t",
+            "syncping:0.0",
+            "Write-Output RMUX_SYNC_CTRL_C_DONE",
+            "Enter",
+        ],
+    )?;
+    wait_for_capture_contains(
+        &binary,
+        &label,
+        "syncping:0.0",
+        b"RMUX_SYNC_CTRL_C_DONE",
+        EXIT_TIMEOUT,
+    )?;
+    wait_for_capture_contains(
+        &binary,
+        &label,
+        "syncping:0.1",
+        b"RMUX_SYNC_CTRL_C_DONE",
+        EXIT_TIMEOUT,
+    )?;
+
+    Ok(())
+}
+
+#[test]
+fn windows_attach_ctrl_c_preserves_raw_console_character_when_processed_input_is_off(
+) -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
+    if !pwsh_available() {
+        eprintln!("skipping raw Ctrl-C attach probe because pwsh.exe is unavailable");
+        return Ok(());
+    }
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let label = unique_label("win-attach-raw-ctrl-c");
+    let _guard = RmuxServerGuard::new(&binary, label.clone());
+    let script = write_raw_console_probe_script(&label)?;
+    let command = format!("pwsh.exe -NoLogo -NoProfile -File {}", script.display());
+
+    run_rmux(
+        &binary,
+        &label,
+        ["new-session", "-d", "-s", "rawattach", command.as_str()],
+    )?;
+    run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
+
+    let mut attach = ChildCommand::new(&binary)
+        .args(["-L", &label, "attach-session", "-t", "rawattach"])
+        .size(TerminalSize::new(100, 30))
+        .spawn()?;
+    let io = attach.master().try_clone_io()?;
+
+    wait_for_needle_or_error(&mut attach, b"RAW_READY", SETUP_TIMEOUT)?;
+    write_windows_console_key(attach.child().pid(), WindowsConsoleKeyEvent::ctrl_c())?;
+    thread::sleep(Duration::from_millis(150));
+    io.write_all(b"x")?;
+
+    let (returned, output) =
+        wait_for_needle_or_terminate(&mut attach, b"CHAR_0078", EXIT_LATENCY_TIMEOUT)?;
+    terminate_spawned(&mut attach);
+    assert_raw_ctrl_c_character_observed("attached raw Ctrl-C", returned, &output);
+
+    Ok(())
+}
+
+#[test]
+fn windows_send_keys_ctrl_c_preserves_raw_console_character_when_processed_input_is_off(
+) -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
+    if !pwsh_available() {
+        eprintln!("skipping raw Ctrl-C send-keys probe because pwsh.exe is unavailable");
+        return Ok(());
+    }
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let label = unique_label("win-send-raw-ctrl-c");
+    let _guard = RmuxServerGuard::new(&binary, label.clone());
+    let script = write_raw_console_probe_script(&label)?;
+    let command = format!("pwsh.exe -NoLogo -NoProfile -File {}", script.display());
+
+    run_rmux(
+        &binary,
+        &label,
+        ["new-session", "-d", "-s", "rawsend", command.as_str()],
+    )?;
+    run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
+    wait_for_capture_contains(&binary, &label, "rawsend:0.0", b"RAW_READY", SETUP_TIMEOUT)?;
+
+    run_rmux(
+        &binary,
+        &label,
+        ["send-keys", "-t", "rawsend:0.0", "C-c", "x"],
+    )?;
+
+    let (returned, output) = capture_until_contains(
+        &binary,
+        &label,
+        "rawsend:0.0",
+        b"CHAR_0078",
+        EXIT_LATENCY_TIMEOUT,
+    )?;
+    assert_raw_ctrl_c_character_observed("send-keys raw Ctrl-C", returned, &output);
+
+    Ok(())
+}
+
+#[test]
+fn windows_attach_ctrl_d_matches_direct_pwsh_foreground_python_behavior_when_available(
+) -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
+    if !pwsh_available() || !python_available() {
+        eprintln!(
+            "skipping Ctrl-D foreground parity probe because pwsh.exe or python.exe is unavailable"
+        );
+        return Ok(());
+    }
+    let native = direct_python_stdin_ctrl_d_outcome()?;
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let label = unique_label("win-ctrl-d-python-eof");
+    let _guard = RmuxServerGuard::new(&binary, label.clone());
+
+    run_rmux(
+        &binary,
+        &label,
+        [
+            "new-session",
+            "-d",
+            "-s",
+            "ctrldpython",
+            "pwsh.exe -NoLogo -NoProfile",
+        ],
+    )?;
+    run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
+
+    let mut attach = ChildCommand::new(&binary)
+        .args(["-L", &label, "attach-session", "-t", "ctrldpython"])
+        .size(TerminalSize::new(100, 30))
+        .spawn()?;
+    let io = attach.master().try_clone_io()?;
+
+    wait_for_needle_or_error(&mut attach, b"PS ", SETUP_TIMEOUT)?;
+    io.write_all(b"python -c \"import sys; sys.stdin.read(); print('EOF_DONE')\"\r\n")?;
+    thread::sleep(Duration::from_millis(500));
+    write_windows_console_key(attach.child().pid(), WindowsConsoleKeyEvent::ctrl_d())?;
+
+    let (returned, output) =
+        wait_for_needle_or_terminate(&mut attach, b"EOF_DONE", EXIT_LATENCY_TIMEOUT)?;
+    terminate_spawned(&mut attach);
+    let rmux = ControlKeyOutcome::from_output(returned, output);
+    assert_control_key_parity("attached Ctrl-D", &native, &rmux);
 
     Ok(())
 }
@@ -189,6 +1171,115 @@ fn run_rmux<const N: usize>(
     Ok(())
 }
 
+fn run_rmux_output<const N: usize>(
+    binary: &Path,
+    label: &str,
+    args: [&str; N],
+) -> Result<std::process::Output, Box<dyn Error>> {
+    let output = Command::new(binary)
+        .arg("-L")
+        .arg(label)
+        .args(args)
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "rmux command failed with {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+        .into());
+    }
+    Ok(output)
+}
+
+fn wait_for_capture_contains(
+    binary: &Path,
+    label: &str,
+    target: &str,
+    needle: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut last = Vec::new();
+    while Instant::now() < deadline {
+        let output = run_rmux_output(binary, label, ["capture-pane", "-p", "-t", target])?;
+        last = output.stdout;
+        if last.windows(needle.len()).any(|window| window == needle) {
+            return Ok(last);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!(
+            "timed out waiting for {:?} in capture-pane; last capture: {}",
+            String::from_utf8_lossy(needle),
+            escaped_output(&last)
+        ),
+    )
+    .into())
+}
+
+fn capture_until_contains(
+    binary: &Path,
+    label: &str,
+    target: &str,
+    needle: &[u8],
+    timeout: Duration,
+) -> Result<(bool, Vec<u8>), Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    let mut last = Vec::new();
+    while Instant::now() < deadline {
+        let output = run_rmux_output(binary, label, ["capture-pane", "-p", "-t", target])?;
+        last = output.stdout;
+        if output_contains(&last, needle) {
+            return Ok((true, last));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Ok((false, last))
+}
+
+fn send_attach_ctrl_c_and_wait_for_marker(
+    binary: &Path,
+    label: &str,
+    target: &str,
+    attach: &SpawnedPty,
+    io: &rmux_pty::PtyIo,
+    marker: &str,
+) -> Result<ControlKeyOutcome, Box<dyn Error>> {
+    let marker_command = format!("\r\nWrite-Output {marker}\r\n");
+    let marker_bytes = marker.as_bytes();
+    let mut last_capture = Vec::new();
+
+    for _ in 0..CTRL_C_SYNTHETIC_ATTEMPTS {
+        // WriteConsoleInput-based Ctrl-C injection is the host-dependent part of
+        // this probe: under suite load Windows can occasionally drop one
+        // synthetic outer-terminal key event even though the attach/runtime path
+        // is healthy. Keep the oracle strict by requiring the pane to execute the
+        // marker and to show KeyboardInterrupt/^C, but allow a small number of
+        // synthetic injection attempts before declaring the attach path broken.
+        write_windows_console_key(attach.child().pid(), WindowsConsoleKeyEvent::ctrl_c())?;
+        thread::sleep(Duration::from_millis(500));
+        io.write_all(marker_command.as_bytes())?;
+
+        let (found, capture) = capture_until_contains(
+            binary,
+            label,
+            target,
+            marker_bytes,
+            CTRL_C_SYNTHETIC_ATTEMPT_TIMEOUT,
+        )?;
+        last_capture = capture;
+        if found {
+            return Ok(ControlKeyOutcome::from_output(true, last_capture));
+        }
+    }
+
+    Ok(ControlKeyOutcome::from_output(false, last_capture))
+}
+
 fn pwsh_available() -> bool {
     Command::new("pwsh.exe")
         .args([
@@ -203,6 +1294,86 @@ fn pwsh_available() -> bool {
         .is_ok_and(|status| status.success())
 }
 
+fn python_available() -> bool {
+    Command::new("python.exe")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn write_raw_console_probe_script(label: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let path = std::env::temp_dir().join(format!("{label}.ps1"));
+    fs::write(&path, RAW_CONSOLE_PROBE_SCRIPT)?;
+    Ok(path)
+}
+
+fn write_python_descendant_sleep_script(label: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let path = std::env::temp_dir().join(format!("{label}.py"));
+    fs::write(&path, PYTHON_DESCENDANT_SLEEP_SCRIPT)?;
+    Ok(path)
+}
+
+const RAW_CONSOLE_PROBE_SCRIPT: &str = r#"
+Add-Type @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public static class RmuxRawConsoleProbe {
+    private const int STD_INPUT_HANDLE = -10;
+    private const uint ENABLE_PROCESSED_INPUT = 0x0001;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GetStdHandle(int nStdHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+
+    public static void DisableProcessedInput() {
+        IntPtr handle = GetStdHandle(STD_INPUT_HANDLE);
+        uint mode;
+        if (!GetConsoleMode(handle, out mode)) {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+        if (!SetConsoleMode(handle, mode & ~ENABLE_PROCESSED_INPUT)) {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+    }
+}
+"@
+
+[RmuxRawConsoleProbe]::DisableProcessedInput()
+[Console]::Out.WriteLine("RAW_READY")
+[Console]::Out.Flush()
+while ($true) {
+    $key = [Console]::ReadKey($true)
+    $code = [int][char]$key.KeyChar
+    [Console]::Out.WriteLine(("CHAR_{0:X4}" -f $code))
+    [Console]::Out.Flush()
+    if ($key.KeyChar -eq 'x') {
+        Start-Sleep -Seconds 5
+        break
+    }
+}
+"#;
+
+const PYTHON_DESCENDANT_SLEEP_SCRIPT: &str = r#"
+import subprocess
+import sys
+
+print("RMUX_DESC_PARENT_READY", flush=True)
+subprocess.call([
+    sys.executable,
+    "-c",
+    "import time; print('RMUX_DESC_CHILD_READY', flush=True); time.sleep(10**6)",
+])
+"#;
+
 fn direct_pwsh_ctrl_d_exits() -> Result<bool, Box<dyn Error>> {
     let mut spawned = ChildCommand::new("pwsh.exe")
         .args(["-NoLogo", "-NoProfile"])
@@ -210,11 +1381,65 @@ fn direct_pwsh_ctrl_d_exits() -> Result<bool, Box<dyn Error>> {
         .spawn()?;
 
     wait_for_needle_or_error(&mut spawned, b"PS ", SETUP_TIMEOUT)?;
-    write_windows_console_key(
-        spawned.child().pid(),
-        WindowsConsoleKeyEvent::new(0x44, 0x20, 0x04, 0x0008, 1),
-    )?;
+    write_windows_console_key(spawned.child().pid(), WindowsConsoleKeyEvent::ctrl_d())?;
     wait_for_spawned_exit_or_terminate(&mut spawned, Duration::from_secs(1))
+}
+
+fn direct_python_stdin_ctrl_d_outcome() -> Result<ControlKeyOutcome, Box<dyn Error>> {
+    let mut spawned = ChildCommand::new("pwsh.exe")
+        .args(["-NoLogo", "-NoProfile"])
+        .size(TerminalSize::new(100, 30))
+        .spawn()?;
+    let io = spawned.master().try_clone_io()?;
+
+    wait_for_needle_or_error(&mut spawned, b"PS ", SETUP_TIMEOUT)?;
+    io.write_all(b"python -c \"import sys; sys.stdin.read(); print('EOF_DONE')\"\r\n")?;
+    thread::sleep(Duration::from_millis(500));
+    write_windows_console_key(spawned.child().pid(), WindowsConsoleKeyEvent::ctrl_d())?;
+    let (returned, output) =
+        wait_for_needle_or_terminate(&mut spawned, b"EOF_DONE", EXIT_LATENCY_TIMEOUT)?;
+    terminate_spawned(&mut spawned);
+    Ok(ControlKeyOutcome::from_output(returned, output))
+}
+
+fn assert_control_key_parity(kind: &str, native: &ControlKeyOutcome, rmux: &ControlKeyOutcome) {
+    assert_eq!(
+        rmux.returned_to_prompt, native.returned_to_prompt,
+        "{kind} changed native Windows ConPTY completion behavior\nnative output: {}\nrmux output: {}",
+        escaped_output(&native.output),
+        escaped_output(&rmux.output)
+    );
+    assert_eq!(
+        rmux.saw_keyboard_interrupt, native.saw_keyboard_interrupt,
+        "{kind} changed native Windows Ctrl-C KeyboardInterrupt behavior\nnative output: {}\nrmux output: {}",
+        escaped_output(&native.output),
+        escaped_output(&rmux.output)
+    );
+}
+
+fn assert_foreground_ctrl_c_observed(kind: &str, outcome: &ControlKeyOutcome) {
+    let output = String::from_utf8_lossy(&outcome.output);
+    assert!(
+        outcome.saw_keyboard_interrupt || output.contains("^C"),
+        "{kind} did not show a foreground Ctrl-C interruption\n{}",
+        output
+    );
+}
+
+fn assert_raw_ctrl_c_character_observed(kind: &str, returned: bool, output: &[u8]) {
+    let output = String::from_utf8_lossy(output);
+    assert!(
+        returned,
+        "{kind} raw console probe did not finish after x\n{output}"
+    );
+    assert!(
+        output.contains("CHAR_0003"),
+        "{kind} should deliver Ctrl-C as a raw character when processed input is off\n{output}"
+    );
+    assert!(
+        !output.contains("KeyboardInterrupt") && !output.contains("SIGINT"),
+        "{kind} should not synthesize an interrupt for a raw console app\n{output}"
+    );
 }
 
 fn wait_for_needle_or_error(
@@ -301,6 +1526,10 @@ fn wait_for_spawned_exit_or_terminate(
         }
         thread::sleep(Duration::from_millis(5));
     }
+}
+
+fn output_contains(output: &[u8], needle: &[u8]) -> bool {
+    output.windows(needle.len()).any(|window| window == needle)
 }
 
 fn escaped_output(output: &[u8]) -> String {

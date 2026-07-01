@@ -1131,7 +1131,8 @@ fn powershell_quote(value: &str) -> String {
 }
 
 async fn wait_for_file_contents(path: &Path, expected: &str) -> Result<(), Box<dyn Error>> {
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + test_process_deadline();
+    while std::time::Instant::now() < deadline {
         match fs::read_to_string(path) {
             Ok(contents) if contents == expected => return Ok(()),
             Ok(_) | Err(_) => sleep(Duration::from_millis(20)).await,
@@ -1143,6 +1144,14 @@ async fn wait_for_file_contents(path: &Path, expected: &str) -> Result<(), Box<d
         path.display()
     ))
     .into())
+}
+
+fn test_process_deadline() -> Duration {
+    if cfg!(windows) {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(2)
+    }
 }
 
 #[cfg(windows)]

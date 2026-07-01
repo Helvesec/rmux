@@ -280,6 +280,7 @@ pub(super) fn command_from_parsed(command: ParsedCommand) -> Result<Command, cla
         }
         "display-message" => {
             parse_queue_command_args::<DisplayMessageArgs>("display-message", arguments)
+                .and_then(DisplayMessageArgs::validate)
                 .map(|args| Command::DisplayMessage(with_queue_command(args, queue_command)))
         }
         "show-messages" => {

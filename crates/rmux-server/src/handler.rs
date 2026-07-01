@@ -60,6 +60,7 @@ mod session_lease_support;
 mod session_support;
 #[path = "handler_shutdown.rs"]
 mod shutdown_support;
+pub(crate) use shutdown_support::DetachedRequestGuard;
 #[path = "handler_subscriptions.rs"]
 mod subscription_support;
 #[path = "handler_target_actions.rs"]
@@ -68,6 +69,7 @@ mod target_action_support;
 mod target_support;
 #[path = "handler_waits.rs"]
 mod wait_support;
+pub(crate) use wait_support::PreparedSdkWait;
 #[cfg(all(any(unix, windows), feature = "web"))]
 #[path = "handler_web.rs"]
 mod web_support;
@@ -95,11 +97,12 @@ pub(in crate::handler) use client_environment_support::{
     client_spawn_environment, initial_session_spawn_environment,
 };
 pub(in crate::handler) use client_runtime_support::{
-    attached_client_matches_target, client_environment_snapshot, command_output_from_lines,
-    effective_client_terminal_context, format_client_uid, format_client_user, format_requester_uid,
-    normalize_target_client, parse_client_flags, parse_session_sort_order,
-    session_selection_prefers_live_process, sort_list_clients, switch_target_selector_count,
-    update_environment_from_client, ListClientSnapshot, SessionSortOrder, LIST_CLIENTS_TEMPLATE,
+    attached_client_matches_target, attached_client_name, client_environment_snapshot,
+    command_output_from_lines, effective_client_terminal_context, format_client_uid,
+    format_client_user, format_requester_uid, normalize_target_client, parse_client_flags,
+    parse_session_sort_order, session_selection_prefers_live_process, sort_list_clients,
+    switch_target_selector_count, update_environment_from_client, ListClientSnapshot,
+    SessionSortOrder, LIST_CLIENTS_TEMPLATE,
 };
 use client_runtime_support::{
     current_process_environment_display_snapshot, current_process_environment_snapshot,

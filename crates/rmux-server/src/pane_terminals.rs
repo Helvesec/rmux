@@ -12,6 +12,8 @@ use rmux_proto::{
     KillPaneResponse, KillWindowResponse, OptionName, PaneTarget, ProcessCommand, RmuxError,
     SessionName, TerminalPixels, WindowTarget,
 };
+#[cfg(windows)]
+use rmux_pty::WindowsConsoleKeyEvent;
 
 #[cfg(unix)]
 use crate::pane_io::PaneOutputReaderTask;
@@ -116,14 +118,44 @@ pub(crate) struct CompletedDeferredInitialPane {
     pub(crate) visible_session_name: SessionName,
     pub(crate) runtime_session_name: SessionName,
     pub(crate) pane_id: PaneId,
+    pub(crate) pane_pid: u32,
     pub(crate) input_writer: Option<rmux_pty::PtyMaster>,
-    pub(crate) queued_input: Vec<Vec<u8>>,
+    pub(crate) queued_input: Vec<DeferredInitialPaneInput>,
 }
 
 #[cfg(windows)]
 pub(crate) struct DeferredInitialPaneInputFlush {
     pub(crate) input_writer: rmux_pty::PtyMaster,
-    pub(crate) queued_input: Vec<Vec<u8>>,
+    pub(crate) pane_pid: u32,
+    pub(crate) queued_input: Vec<DeferredInitialPaneInput>,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeferredInitialPaneConsoleInputAction {
+    Key(WindowsConsoleKeyEvent),
+    KeyThenInterrupt(WindowsConsoleKeyEvent),
+    Interrupt,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DeferredInitialPaneInput {
+    Bytes(Vec<u8>),
+    Console {
+        action: DeferredInitialPaneConsoleInputAction,
+        byte_len: usize,
+    },
+}
+
+#[cfg(windows)]
+impl DeferredInitialPaneInput {
+    fn byte_len(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::Console { byte_len, .. } => *byte_len,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -132,7 +164,7 @@ struct StartingPane {
     profile: TerminalProfile,
     runtime_window_name: Option<String>,
     generation: u64,
-    queued_input: VecDeque<Vec<u8>>,
+    queued_input: VecDeque<DeferredInitialPaneInput>,
     queued_input_bytes: usize,
 }
 

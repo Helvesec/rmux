@@ -11,7 +11,7 @@
 //! 2. The checked-in ledger fixtures under
 //!    `tests/wire-fixtures/ledger-v1-current-wire/`
 //!    decode through both `decode_frame` and `FrameDecoder` using the current
-//!    wire envelope (currently `RMUX_WIRE_VERSION = 2`), asserting stable
+//!    wire envelope (currently `RMUX_WIRE_VERSION = 3`), asserting stable
 //!    semantic fields rather than enum source order. Encoding canonical inputs
 //!    reproduces each fixture byte-for-byte to guard against silent codec drift.
 
@@ -305,10 +305,10 @@ fn fixture_envelope_uses_current_wire_version() {
             fixture.name
         );
         // Pin the canonical single-byte varint encoding for the current wire
-        // version: a multi-byte varint such as `[0x82, 0x00]` would also
-        // decode to 2 but would drift the envelope layout silently. Every
-        // fixture must use exactly one byte for the wire-version varint while
-        // this build supports a single version.
+        // version: a multi-byte varint with the same logical value would drift
+        // the envelope layout silently. Every fixture must use exactly one byte
+        // for the wire-version varint while this build supports a single
+        // version.
         assert_eq!(
             bytes.get(1).copied(),
             Some(RMUX_WIRE_VERSION as u8),

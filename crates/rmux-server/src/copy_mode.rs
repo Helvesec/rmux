@@ -237,6 +237,17 @@ impl CopyModeState {
         }
     }
 
+    pub(crate) fn summary_for_mouse(
+        backing: Screen,
+        context: &CopyModeCommandContext,
+    ) -> CopyModeSummary {
+        let mut state = Self::new(backing, None, false, context, false, false);
+        if let Some(mouse) = context.mouse {
+            state.move_cursor_to_mouse(mouse.content_x, mouse.content_y);
+        }
+        state.summary()
+    }
+
     fn current_word(&self) -> Option<String> {
         let range = self.word_selection_range(self.cursor);
         let line = self.line(range.start.y);

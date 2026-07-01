@@ -9,11 +9,16 @@ use rmux_proto::{
     PaneTarget, Request, RmuxError, ShowMessagesRequest, Target,
 };
 
-use super::tokens::CommandTokens;
-use super::values::{missing_argument, unsupported_flag};
+use super::targets::implicit_pane_target;
+use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
+use super::values::unsupported_flag;
 use super::{parse_pane_target, parse_target_arg};
 
-pub(super) fn parse_capture_pane(mut args: CommandTokens) -> Result<Request, RmuxError> {
+pub(super) fn parse_capture_pane(
+    mut args: CommandTokens,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Result<Request, RmuxError> {
     let mut target = None;
     let mut start = None;
     let mut end = None;
@@ -76,7 +81,11 @@ pub(super) fn parse_capture_pane(mut args: CommandTokens) -> Result<Request, Rmu
     }
 
     Ok(Request::CapturePane(Box::new(CapturePaneRequest {
-        target: target.ok_or_else(|| missing_argument("capture-pane", "-t target"))?,
+        target: target.unwrap_or(implicit_pane_target(
+            sessions,
+            find_context,
+            "capture-pane",
+        )?),
         start,
         end,
         print,
@@ -101,7 +110,11 @@ fn parse_capture_pane_bound(flag: &str, value: &str) -> Result<i64, RmuxError> {
         .map_err(|_| RmuxError::Server(format!("command capture-pane: {flag} expects a number")))
 }
 
-pub(super) fn parse_clear_history(mut args: CommandTokens) -> Result<Request, RmuxError> {
+pub(super) fn parse_clear_history(
+    mut args: CommandTokens,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Result<Request, RmuxError> {
     let mut target = None;
     let mut reset_hyperlinks = false;
 
@@ -124,7 +137,11 @@ pub(super) fn parse_clear_history(mut args: CommandTokens) -> Result<Request, Rm
     }
 
     Ok(Request::ClearHistory(ClearHistoryRequest {
-        target: target.ok_or_else(|| missing_argument("clear-history", "-t target"))?,
+        target: target.unwrap_or(implicit_pane_target(
+            sessions,
+            find_context,
+            "clear-history",
+        )?),
         reset_hyperlinks,
     }))
 }
@@ -236,22 +253,42 @@ fn parse_display_message_args(
             flag if flag.starts_with("-d") && flag.len() > 2 => {
                 let _ = args.optional();
             }
-            flag if is_display_message_boolean_cluster(flag) => {
-                let flag = args
+            flag if is_display_message_compact_cluster(flag) => {
+                let cluster = parse_compact_flag_cluster(flag, "aIlNpv", "cdFt")
+                    .expect("display-message compact cluster was prevalidated");
+                let _ = args
                     .optional()
                     .expect("peeked display-message flag must still exist");
-                for flag in flag[1..].chars() {
+                for flag in cluster {
                     match flag {
-                        'a' => {
+                        CompactFlag::Bare('a') => {
                             all_formats = true;
                             print = true;
                         }
-                        'I' => stdin = true,
-                        'l' => no_expand = true,
-                        'N' => {}
-                        'p' => print = true,
-                        'v' => verbose = true,
-                        _ => unreachable!("cluster predicate only accepts boolean flags"),
+                        CompactFlag::Bare('I') => stdin = true,
+                        CompactFlag::Bare('l') => no_expand = true,
+                        CompactFlag::Bare('N') => {}
+                        CompactFlag::Bare('p') => print = true,
+                        CompactFlag::Bare('v') => verbose = true,
+                        CompactFlag::Bare(flag) => {
+                            return Err(unsupported_flag("display-message", &format!("-{flag}")));
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'F', .. } => {
+                            message = Some(compact_flag.value_or_next(&mut args, "-F format")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'c', .. } => {
+                            target_client =
+                                Some(compact_flag.value_or_next(&mut args, "-c target-client")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'd', .. } => {
+                            let _ = compact_flag.value_or_next(&mut args, "-d delay")?;
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target = Some(compact_flag.value_or_next(&mut args, "-t target")?);
+                        }
+                        CompactFlag::Value { flag, .. } => {
+                            return Err(unsupported_flag("display-message", &format!("-{flag}")));
+                        }
                     }
                 }
             }
@@ -286,7 +323,15 @@ fn parse_display_message_args(
         message = Some(display_all_formats_template());
         args.no_extra("display-message")?;
     } else if message.is_none() && !args.is_empty() {
-        message = Some(args.remaining_joined());
+        let remaining = args.remaining();
+        match remaining.as_slice() {
+            [single] => message = Some(single.clone()),
+            _ => {
+                return Err(RmuxError::Server(
+                    "command display-message: too many arguments (need at most 1)".to_owned(),
+                ));
+            }
+        }
     } else if message.is_some() && !args.is_empty() {
         return Err(RmuxError::Server(
             "only one of -F or argument must be given".to_owned(),
@@ -510,12 +555,8 @@ fn verbose_token_is_simple_variable(token: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-fn is_display_message_boolean_cluster(flag: &str) -> bool {
-    flag.len() > 2
-        && flag.starts_with('-')
-        && flag[1..]
-            .chars()
-            .all(|flag| matches!(flag, 'a' | 'I' | 'l' | 'N' | 'p' | 'v'))
+fn is_display_message_compact_cluster(flag: &str) -> bool {
+    parse_compact_flag_cluster(flag, "aIlNpv", "cdFt").is_some()
 }
 
 fn display_all_formats_template() -> String {

@@ -90,6 +90,69 @@ enum SdkWaitRegistration {
     CancelledBeforeRegistration,
 }
 
+pub(crate) enum PreparedSdkWait {
+    Immediate(Response),
+    Armed(ArmedSdkWait),
+}
+
+pub(crate) struct ArmedSdkWait {
+    state: Arc<StdMutex<SdkWaitState>>,
+    owner_id: SdkWaitOwnerId,
+    wait_id: SdkWaitId,
+    receiver: PaneOutputReceiver,
+    bytes: Vec<u8>,
+    cancel_receiver: oneshot::Receiver<()>,
+}
+
+impl PreparedSdkWait {
+    pub(crate) async fn response(self) -> Response {
+        match self {
+            Self::Immediate(response) => response,
+            Self::Armed(wait) => wait.wait().await,
+        }
+    }
+}
+
+impl ArmedSdkWait {
+    pub(crate) fn armed_response(&self) -> Response {
+        Response::CancelSdkWait(CancelSdkWaitResponse::armed_ack(self.wait_id))
+    }
+
+    pub(crate) async fn wait(mut self) -> Response {
+        let mut guard =
+            RegisteredSdkWaitGuard::new(Arc::clone(&self.state), self.owner_id, self.wait_id);
+        let outcome = wait_for_bytes(&mut self.receiver, &self.bytes, self.cancel_receiver).await;
+        match outcome {
+            SdkWaitOutcome::Matched => {
+                let removed = self
+                    .state
+                    .lock()
+                    .expect("SDK wait registry mutex must not be poisoned")
+                    .complete(self.owner_id, self.wait_id);
+                guard.disarm();
+                if removed {
+                    Response::SdkWaitForOutput(SdkWaitForOutputResponse {
+                        wait_id: self.wait_id,
+                        outcome: SdkWaitOutcome::Matched,
+                    })
+                } else {
+                    Response::SdkWaitForOutput(SdkWaitForOutputResponse {
+                        wait_id: self.wait_id,
+                        outcome: SdkWaitOutcome::Cancelled,
+                    })
+                }
+            }
+            SdkWaitOutcome::Cancelled => {
+                guard.disarm();
+                Response::SdkWaitForOutput(SdkWaitForOutputResponse {
+                    wait_id: self.wait_id,
+                    outcome: SdkWaitOutcome::Cancelled,
+                })
+            }
+        }
+    }
+}
+
 impl SdkWaitState {
     fn register(
         &mut self,
@@ -201,7 +264,18 @@ impl RequestHandler {
         connection_id: u64,
         request: SdkWaitForOutputRequest,
     ) -> Response {
-        self.sdk_wait_for_output(
+        self.prepare_sdk_wait_for_output(connection_id, request)
+            .await
+            .response()
+            .await
+    }
+
+    pub(crate) async fn prepare_sdk_wait_for_output(
+        &self,
+        connection_id: u64,
+        request: SdkWaitForOutputRequest,
+    ) -> PreparedSdkWait {
+        self.prepare_sdk_wait_for_output_inner(
             connection_id,
             request.owner_id,
             request.wait_id,
@@ -217,7 +291,18 @@ impl RequestHandler {
         connection_id: u64,
         request: SdkWaitForOutputRefRequest,
     ) -> Response {
-        self.sdk_wait_for_output(
+        self.prepare_sdk_wait_for_output_ref(connection_id, request)
+            .await
+            .response()
+            .await
+    }
+
+    pub(crate) async fn prepare_sdk_wait_for_output_ref(
+        &self,
+        connection_id: u64,
+        request: SdkWaitForOutputRefRequest,
+    ) -> PreparedSdkWait {
+        self.prepare_sdk_wait_for_output_inner(
             connection_id,
             request.owner_id,
             request.wait_id,
@@ -228,7 +313,7 @@ impl RequestHandler {
         .await
     }
 
-    async fn sdk_wait_for_output(
+    async fn prepare_sdk_wait_for_output_inner(
         &self,
         connection_id: u64,
         owner_id: SdkWaitOwnerId,
@@ -236,18 +321,20 @@ impl RequestHandler {
         target_ref: PaneTargetRef,
         bytes: Vec<u8>,
         start: PaneOutputSubscriptionStart,
-    ) -> Response {
+    ) -> PreparedSdkWait {
         if bytes.is_empty() {
-            return Response::Error(ErrorResponse {
+            return PreparedSdkWait::Immediate(Response::Error(ErrorResponse {
                 error: RmuxError::Server("SDK wait bytes must not be empty".to_owned()),
-            });
+            }));
         }
 
-        let mut receiver = {
+        let receiver = {
             let state = self.state.lock().await;
             let target = match resolve_pane_target_ref(&state, &target_ref) {
                 Ok(target) => target,
-                Err(error) => return Response::Error(ErrorResponse { error }),
+                Err(error) => {
+                    return PreparedSdkWait::Immediate(Response::Error(ErrorResponse { error }))
+                }
             };
             let output = match state.pane_output_for_target(
                 target.session_name(),
@@ -255,7 +342,9 @@ impl RequestHandler {
                 target.pane_index(),
             ) {
                 Ok(output) => output,
-                Err(error) => return Response::Error(ErrorResponse { error }),
+                Err(error) => {
+                    return PreparedSdkWait::Immediate(Response::Error(ErrorResponse { error }))
+                }
             };
 
             match start {
@@ -272,45 +361,27 @@ impl RequestHandler {
             match waits.register(connection_id, owner_id, wait_id) {
                 Ok(SdkWaitRegistration::Registered(receiver)) => receiver,
                 Ok(SdkWaitRegistration::CancelledBeforeRegistration) => {
-                    return Response::SdkWaitForOutput(SdkWaitForOutputResponse {
-                        wait_id,
-                        outcome: SdkWaitOutcome::Cancelled,
-                    });
+                    return PreparedSdkWait::Immediate(Response::SdkWaitForOutput(
+                        SdkWaitForOutputResponse {
+                            wait_id,
+                            outcome: SdkWaitOutcome::Cancelled,
+                        },
+                    ));
                 }
-                Err(error) => return Response::Error(ErrorResponse { error }),
+                Err(error) => {
+                    return PreparedSdkWait::Immediate(Response::Error(ErrorResponse { error }))
+                }
             }
         };
 
-        let mut guard = RegisteredSdkWaitGuard::new(Arc::clone(&self.sdk_waits), owner_id, wait_id);
-        let outcome = wait_for_bytes(&mut receiver, &bytes, cancel_receiver).await;
-        match outcome {
-            SdkWaitOutcome::Matched => {
-                let removed = self
-                    .sdk_waits
-                    .lock()
-                    .expect("SDK wait registry mutex must not be poisoned")
-                    .complete(owner_id, wait_id);
-                guard.disarm();
-                if removed {
-                    Response::SdkWaitForOutput(SdkWaitForOutputResponse {
-                        wait_id,
-                        outcome: SdkWaitOutcome::Matched,
-                    })
-                } else {
-                    Response::SdkWaitForOutput(SdkWaitForOutputResponse {
-                        wait_id,
-                        outcome: SdkWaitOutcome::Cancelled,
-                    })
-                }
-            }
-            SdkWaitOutcome::Cancelled => {
-                guard.disarm();
-                Response::SdkWaitForOutput(SdkWaitForOutputResponse {
-                    wait_id,
-                    outcome: SdkWaitOutcome::Cancelled,
-                })
-            }
-        }
+        PreparedSdkWait::Armed(ArmedSdkWait {
+            state: Arc::clone(&self.sdk_waits),
+            owner_id,
+            wait_id,
+            receiver,
+            bytes,
+            cancel_receiver,
+        })
     }
 
     pub(in crate::handler) async fn handle_cancel_sdk_wait(
@@ -333,6 +404,21 @@ impl RequestHandler {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove_connection(connection_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn send_pane_output_for_test(&self, target: &PaneTarget, bytes: Vec<u8>) {
+        let output = {
+            let state = self.state.lock().await;
+            state
+                .pane_output_for_target(
+                    target.session_name(),
+                    target.window_index(),
+                    target.pane_index(),
+                )
+                .expect("test pane has output channel")
+        };
+        let _ = output.send_for_generation(None, bytes);
     }
 }
 

@@ -45,6 +45,18 @@ fn session_key_tokens_encode_to_terminal_bytes() {
     assert_eq!(encode_session_key("not-a-key"), None);
 }
 
+#[cfg(windows)]
+#[test]
+fn session_key_tokens_can_carry_windows_console_metadata() {
+    let (bytes, key) =
+        super::encode_session_windows_console_key("C-a").expect("C-a maps to console key");
+
+    assert_eq!(bytes, vec![0x01]);
+    assert_eq!(key.virtual_key_code(), b'A' as u16);
+    assert_eq!(key.unicode_char(), 0x01);
+    assert_eq!(key.control_key_state(), 0x0008);
+}
+
 #[test]
 fn pane_scroll_wire_decodes_targeted_request() {
     let message = r#"{"type":"pane_scroll","pane_id":7,"delta":-3}"#;

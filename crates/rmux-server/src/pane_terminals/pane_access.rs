@@ -270,10 +270,10 @@ impl HandlerState {
         self.clear_attached_submitted_line(runtime_session_name, pane_id);
         self.clear_marked_pane_if_id(pane_id);
         self.remove_pane_lifecycle(pane_id);
-        let Some(mut terminal) = self.terminals.remove_pane(runtime_session_name, pane_id) else {
+        let Some(terminal) = self.terminals.remove_pane(runtime_session_name, pane_id) else {
             return false;
         };
-        terminal.terminate_with_bounded_grace();
+        terminal.terminate_in_background();
         true
     }
 

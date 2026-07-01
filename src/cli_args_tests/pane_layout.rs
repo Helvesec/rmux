@@ -84,27 +84,21 @@ fn split_window_accepts_horizontal_direction() {
 }
 
 #[test]
-fn split_window_direction_flags_follow_tmux_last_wins() {
-    let vertical = parse_args(&["split-window", "-h", "-v", "-t", "alpha"]).unwrap();
-    match vertical.command.expect("parsed command") {
-        super::super::Command::SplitWindow(args) => {
-            assert!(matches!(
-                args.direction(),
-                rmux_proto::SplitDirection::Vertical
-            ));
+fn split_window_direction_flags_follow_tmux_priority() {
+    for argv in [
+        ["split-window", "-h", "-v", "-t", "alpha"],
+        ["split-window", "-v", "-h", "-t", "alpha"],
+    ] {
+        let horizontal = parse_args(&argv).unwrap();
+        match horizontal.command.expect("parsed command") {
+            super::super::Command::SplitWindow(args) => {
+                assert!(matches!(
+                    args.direction(),
+                    rmux_proto::SplitDirection::Horizontal
+                ));
+            }
+            _ => panic!("expected SplitWindow command"),
         }
-        _ => panic!("expected SplitWindow command"),
-    }
-
-    let horizontal = parse_args(&["split-window", "-v", "-h", "-t", "alpha"]).unwrap();
-    match horizontal.command.expect("parsed command") {
-        super::super::Command::SplitWindow(args) => {
-            assert!(matches!(
-                args.direction(),
-                rmux_proto::SplitDirection::Horizontal
-            ));
-        }
-        _ => panic!("expected SplitWindow command"),
     }
 }
 
@@ -129,32 +123,136 @@ fn split_window_attached_cluster_values_preserve_target_and_size() {
         _ => panic!("expected SplitWindow command"),
     }
 
-    let percentage = parse_args(&["split-window", "-hp50", "-t", "alpha"]).unwrap();
-    match percentage.command.expect("parsed command") {
-        super::super::Command::SplitWindow(args) => {
-            assert_eq!(args.direction(), rmux_proto::SplitDirection::Horizontal);
-            assert_eq!(args.size_spec().as_deref(), Some("50%"));
-        }
-        _ => panic!("expected SplitWindow command"),
-    }
+    assert!(parse_args(&["split-window", "-hp50", "-t", "alpha"]).is_err());
 }
 
 #[test]
-fn split_window_size_flags_follow_tmux_last_wins() {
-    let percentage = parse_args(&["split-window", "-l", "5", "-p", "50", "-t", "alpha"]).unwrap();
-    match percentage.command.expect("parsed command") {
-        super::super::Command::SplitWindow(args) => {
-            assert_eq!(args.size_spec().as_deref(), Some("50%"));
-        }
-        _ => panic!("expected SplitWindow command"),
-    }
+fn split_window_legacy_percentage_modifier_requires_and_preserves_size() {
+    assert!(parse_args(&["split-window", "-p", "50", "-t", "alpha"]).is_err());
 
-    let cells = parse_args(&["split-window", "-p", "50", "-l", "5", "-t", "alpha"]).unwrap();
-    match cells.command.expect("parsed command") {
+    let size_first = parse_args(&["split-window", "-l", "5", "-p", "50", "-t", "alpha"]).unwrap();
+    match size_first.command.expect("parsed command") {
         super::super::Command::SplitWindow(args) => {
             assert_eq!(args.size_spec().as_deref(), Some("5"));
         }
         _ => panic!("expected SplitWindow command"),
+    }
+
+    let size_last = parse_args(&["split-window", "-p", "50", "-l", "5", "-t", "alpha"]).unwrap();
+    match size_last.command.expect("parsed command") {
+        super::super::Command::SplitWindow(args) => {
+            assert_eq!(args.size_spec().as_deref(), Some("5"));
+        }
+        _ => panic!("expected SplitWindow command"),
+    }
+
+    for legacy in [
+        &["-pabc"][..],
+        &["-p", "abc"][..],
+        &["-p", "-1"][..],
+        &["-p", "256"][..],
+    ] {
+        let mut args = vec!["split-window"];
+        args.extend(legacy);
+        args.extend(["-l", "5", "-t", "alpha"]);
+        let cli = parse_args(&args).unwrap();
+        match cli.command.expect("parsed command") {
+            super::super::Command::SplitWindow(args) => {
+                assert_eq!(args.size_spec().as_deref(), Some("5"));
+            }
+            _ => panic!("expected SplitWindow command"),
+        }
+    }
+}
+
+#[test]
+fn resize_pane_direction_clusters_and_trailing_adjustment_follow_tmux() {
+    let cluster = parse_args(&["resize-pane", "-RL", "-t", "alpha:0.0"]).unwrap();
+    match cluster.command.expect("parsed command") {
+        super::super::Command::ResizePane(args) => {
+            assert_eq!(args.left, Some(1));
+            assert!(args.right.is_none());
+        }
+        _ => panic!("expected ResizePane command"),
+    }
+
+    let trailing = parse_args(&["resize-pane", "-R", "-L", "-t", "alpha:0.0", "3"]).unwrap();
+    match trailing.command.expect("parsed command") {
+        super::super::Command::ResizePane(args) => {
+            assert_eq!(args.left, Some(3));
+            assert!(args.right.is_none());
+        }
+        _ => panic!("expected ResizePane command"),
+    }
+}
+
+#[test]
+fn join_pane_legacy_percentage_modifier_requires_and_preserves_size() {
+    assert!(parse_args(&[
+        "join-pane",
+        "-s",
+        "alpha:0.1",
+        "-t",
+        "alpha:0.0",
+        "-p",
+        "50"
+    ])
+    .is_err());
+
+    let size_first = parse_args(&[
+        "join-pane",
+        "-s",
+        "alpha:0.1",
+        "-t",
+        "alpha:0.0",
+        "-l",
+        "5",
+        "-p",
+        "50",
+    ])
+    .unwrap();
+    match size_first.command.expect("parsed command") {
+        super::super::Command::JoinPane(args) => {
+            assert_eq!(args.size_spec().as_deref(), Some("5"));
+        }
+        _ => panic!("expected JoinPane command"),
+    }
+
+    let size_last = parse_args(&[
+        "join-pane",
+        "-s",
+        "alpha:0.1",
+        "-t",
+        "alpha:0.0",
+        "-p",
+        "50",
+        "-l",
+        "5",
+    ])
+    .unwrap();
+    match size_last.command.expect("parsed command") {
+        super::super::Command::JoinPane(args) => {
+            assert_eq!(args.size_spec().as_deref(), Some("5"));
+        }
+        _ => panic!("expected JoinPane command"),
+    }
+
+    for legacy in [
+        &["-pabc"][..],
+        &["-p", "abc"][..],
+        &["-p", "-1"][..],
+        &["-p", "256"][..],
+    ] {
+        let mut args = vec!["join-pane", "-s", "alpha:0.1", "-t", "alpha:0.0"];
+        args.extend(legacy);
+        args.extend(["-l", "5"]);
+        let cli = parse_args(&args).unwrap();
+        match cli.command.expect("parsed command") {
+            super::super::Command::JoinPane(args) => {
+                assert_eq!(args.size_spec().as_deref(), Some("5"));
+            }
+            _ => panic!("expected JoinPane command"),
+        }
     }
 }
 
@@ -280,22 +378,16 @@ fn split_window_accepts_tmux_compat_flags_before_command() {
 }
 
 #[test]
-fn split_window_accepts_percentage_size() {
-    let cli = parse_args(&["split-window", "-p25", "-f", "-t", "alpha:0.0"]).unwrap();
+fn split_window_legacy_percentage_modifier_requires_size_like_tmux() {
+    let error = parse_args(&["split-window", "-p25", "-f", "-t", "alpha:0.0"]).unwrap_err();
 
-    match cli.command.expect("parsed command") {
-        super::super::Command::SplitWindow(args) => {
-            assert!(args.full_size);
-            assert_eq!(args.percentage, Some(25));
-            assert_eq!(args.size_spec().as_deref(), Some("25%"));
-        }
-        _ => panic!("expected SplitWindow command"),
-    }
+    assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    assert!(error.to_string().contains("size missing"));
 }
 
 #[test]
-fn join_pane_accepts_percentage_size() {
-    let cli = parse_args(&[
+fn join_pane_legacy_percentage_modifier_requires_size_like_tmux() {
+    let error = parse_args(&[
         "join-pane",
         "-p",
         "50",
@@ -304,15 +396,10 @@ fn join_pane_accepts_percentage_size() {
         "-t",
         "alpha:0.0",
     ])
-    .unwrap();
+    .unwrap_err();
 
-    match cli.command.expect("parsed command") {
-        super::super::Command::JoinPane(args) => {
-            assert_eq!(args.percentage, Some(50));
-            assert_eq!(args.size_spec().as_deref(), Some("50%"));
-        }
-        _ => panic!("expected JoinPane command"),
-    }
+    assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    assert!(error.to_string().contains("size missing"));
 }
 
 #[test]
@@ -321,7 +408,6 @@ fn split_window_accepts_full_size_flag() {
 
     match cli.command.expect("parsed command") {
         super::super::Command::SplitWindow(args) => {
-            assert_eq!(args.percentage, None);
             assert_eq!(args.size_spec(), None);
             assert!(args.full_size);
             assert_eq!(
@@ -388,6 +474,23 @@ fn swap_pane_accepts_relative_direction_without_a_source() {
 }
 
 #[test]
+fn swap_pane_relative_flags_follow_tmux_priority() {
+    for argv in [
+        ["swap-pane", "-D", "-U", "-t", "alpha:2.3"],
+        ["swap-pane", "-U", "-D", "-t", "alpha:2.3"],
+    ] {
+        let cli = parse_args(&argv).unwrap();
+        match cli.command.expect("parsed command") {
+            super::super::Command::SwapPane(args) => {
+                assert!(args.down);
+                assert!(!args.up);
+            }
+            _ => panic!("expected SwapPane command"),
+        }
+    }
+}
+
+#[test]
 fn swap_pane_accepts_explicit_source_and_target_panes() {
     let cli = parse_args(&["swap-pane", "-s", "alpha:0.1", "-t", "beta:3.2", "-d"]).unwrap();
 
@@ -442,6 +545,71 @@ fn join_pane_defaults_to_vertical_direction() {
             assert_eq!(args.direction(), rmux_proto::SplitDirection::Vertical);
         }
         _ => panic!("expected JoinPane command"),
+    }
+}
+
+#[test]
+fn join_and_move_pane_direction_flags_follow_tmux_priority() {
+    for argv in [
+        &[
+            "join-pane",
+            "-h",
+            "-v",
+            "-s",
+            "alpha:0.1",
+            "-t",
+            "alpha:1.0",
+        ][..],
+        &[
+            "join-pane",
+            "-v",
+            "-h",
+            "-s",
+            "alpha:0.1",
+            "-t",
+            "alpha:1.0",
+        ][..],
+        &["join-pane", "-hv", "-s", "alpha:0.1", "-t", "alpha:1.0"][..],
+        &["join-pane", "-vh", "-s", "alpha:0.1", "-t", "alpha:1.0"][..],
+    ] {
+        let cli = parse_args(argv).unwrap();
+        match cli.command.expect("parsed command") {
+            super::super::Command::JoinPane(args) => {
+                assert_eq!(args.direction(), rmux_proto::SplitDirection::Horizontal);
+            }
+            _ => panic!("expected JoinPane command"),
+        }
+    }
+
+    for argv in [
+        &[
+            "move-pane",
+            "-h",
+            "-v",
+            "-s",
+            "alpha:0.1",
+            "-t",
+            "alpha:1.0",
+        ][..],
+        &[
+            "move-pane",
+            "-v",
+            "-h",
+            "-s",
+            "alpha:0.1",
+            "-t",
+            "alpha:1.0",
+        ][..],
+        &["move-pane", "-hv", "-s", "alpha:0.1", "-t", "alpha:1.0"][..],
+        &["move-pane", "-vh", "-s", "alpha:0.1", "-t", "alpha:1.0"][..],
+    ] {
+        let cli = parse_args(argv).unwrap();
+        match cli.command.expect("parsed command") {
+            super::super::Command::MovePane(args) => {
+                assert_eq!(args.direction(), rmux_proto::SplitDirection::Horizontal);
+            }
+            _ => panic!("expected MovePane command"),
+        }
     }
 }
 
@@ -518,16 +686,33 @@ fn move_pane_parses_the_full_join_pane_flag_surface() {
 }
 
 #[test]
-fn move_pane_accepts_percentage_size() {
-    let cli = parse_args(&["move-pane", "-p", "35", "-s", "alpha:0.1", "-t", "beta:1.2"]).unwrap();
-
-    match cli.command.expect("parsed command") {
-        super::super::Command::MovePane(args) => {
-            assert_eq!(args.percentage, Some(35));
-            assert_eq!(args.size_spec().as_deref(), Some("35%"));
+fn move_pane_legacy_percentage_modifier_preserves_size() {
+    for legacy in [
+        &["-pabc"][..],
+        &["-p", "abc"][..],
+        &["-p", "-1"][..],
+        &["-p", "256"][..],
+    ] {
+        let mut args = vec!["move-pane", "-s", "alpha:0.1", "-t", "beta:1.2"];
+        args.extend(legacy);
+        args.extend(["-l", "5"]);
+        let cli = parse_args(&args).unwrap();
+        match cli.command.expect("parsed command") {
+            super::super::Command::MovePane(args) => {
+                assert_eq!(args.size_spec().as_deref(), Some("5"));
+            }
+            _ => panic!("expected MovePane command"),
         }
-        _ => panic!("expected MovePane command"),
     }
+}
+
+#[test]
+fn move_pane_legacy_percentage_modifier_requires_size_like_tmux() {
+    let error =
+        parse_args(&["move-pane", "-p", "35", "-s", "alpha:0.1", "-t", "beta:1.2"]).unwrap_err();
+
+    assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+    assert!(error.to_string().contains("size missing"));
 }
 
 #[test]

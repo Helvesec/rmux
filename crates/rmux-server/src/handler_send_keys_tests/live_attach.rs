@@ -235,6 +235,161 @@ async fn live_attach_prefix_ctrl_b_is_not_forwarded_as_windows_console_key() {
     capture.assert_contents(&handler, &[]).await;
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn live_attach_windows_console_ctrl_semicolon_dispatches_root_binding() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let rebound = handler
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
+            table_name: "root".to_owned(),
+            key: "C-;".to_owned(),
+            note: Some("live-attach-ctrl-semicolon".to_owned()),
+            repeat: false,
+            command: Some(vec![
+                "send-keys".to_owned(),
+                "-l".to_owned(),
+                "R".to_owned(),
+            ]),
+        })))
+        .await;
+    assert!(matches!(rebound, Response::BindKey(_)));
+
+    let capture =
+        RawPaneInputProbe::start(&handler, &alpha, "live-attach-c-semicolon-root", 1).await;
+    let mut pending_input = Vec::new();
+    let keystroke = rmux_proto::AttachedKeystroke::new(b";".to_vec()).with_windows_console_key(
+        rmux_proto::AttachedWindowsConsoleKey::new(0xba, 0x27, b';' as u16, 0x0008, 1),
+    );
+    let forwarded = handler
+        .handle_attached_keystroke_input(requester_pid, &mut pending_input, &keystroke)
+        .await
+        .expect("Ctrl+; attached input succeeds");
+
+    assert!(!forwarded);
+    assert!(pending_input.is_empty());
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, b"R").await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn live_attach_windows_console_ctrl_semicolon_enters_prefix_table() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let set_prefix = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::Prefix,
+            value: "C-;".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(set_prefix, Response::SetOption(_)));
+
+    let rebound = handler
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
+            table_name: "prefix".to_owned(),
+            key: "X".to_owned(),
+            note: Some("live-attach-ctrl-semicolon-prefix".to_owned()),
+            repeat: false,
+            command: Some(vec![
+                "send-keys".to_owned(),
+                "-l".to_owned(),
+                "P".to_owned(),
+            ]),
+        })))
+        .await;
+    assert!(matches!(rebound, Response::BindKey(_)));
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let capture =
+        RawPaneInputProbe::start(&handler, &alpha, "live-attach-c-semicolon-prefix", 1).await;
+
+    let mut pending_input = Vec::new();
+    let keystroke = rmux_proto::AttachedKeystroke::new(b";".to_vec()).with_windows_console_key(
+        rmux_proto::AttachedWindowsConsoleKey::new(0xba, 0x27, b';' as u16, 0x0008, 1),
+    );
+    let forwarded = handler
+        .handle_attached_keystroke_input(requester_pid, &mut pending_input, &keystroke)
+        .await
+        .expect("Ctrl+; attached input succeeds");
+    assert!(!forwarded);
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"X")
+        .await
+        .expect("prefix X dispatches after Ctrl+;");
+
+    assert!(pending_input.is_empty());
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, b"P").await;
+}
+
+#[tokio::test]
+async fn live_attach_csi_u_ctrl_semicolon_enters_prefix_table() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let set_prefix = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::Prefix,
+            value: "C-;".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(set_prefix, Response::SetOption(_)));
+
+    let rebound = handler
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
+            table_name: "prefix".to_owned(),
+            key: "X".to_owned(),
+            note: Some("live-attach-csi-u-ctrl-semicolon".to_owned()),
+            repeat: false,
+            command: Some(vec![
+                "send-keys".to_owned(),
+                "-l".to_owned(),
+                "U".to_owned(),
+            ]),
+        })))
+        .await;
+    assert!(matches!(rebound, Response::BindKey(_)));
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+    let capture =
+        RawPaneInputProbe::start(&handler, &alpha, "live-attach-csi-u-c-semicolon-prefix", 1).await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[59;5uX")
+        .await
+        .expect("CSI-u Ctrl+; prefix dispatches");
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, b"U").await;
+}
+
 #[tokio::test]
 async fn send_keys_m_forwards_the_current_mouse_event_to_the_pane() {
     let handler = RequestHandler::new();
@@ -1179,6 +1334,138 @@ async fn live_attach_sgr_wheel_forwards_when_pane_mouse_any_is_enabled() {
         .expect("current wheel event");
     assert_eq!(event.location, MouseLocation::Pane);
     assert_eq!(event.raw.b, 64);
+    drop(active_attach);
+
+    let state = handler.state.lock().await;
+    assert!(
+        state
+            .pane_copy_mode_summary(&alpha, PaneId::new(0))
+            .is_none(),
+        "mouse-aware applications should receive the wheel event without entering copy-mode"
+    );
+}
+
+#[tokio::test]
+async fn live_attach_default_wheel_binding_enters_copy_mode() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    enable_mouse(&handler).await;
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[<64;2;2M")
+        .await
+        .expect("live attach wheel input");
+
+    let summary = {
+        let state = handler.state.lock().await;
+        state.pane_copy_mode_summary(&alpha, PaneId::new(0))
+    };
+    assert!(
+        summary.is_some(),
+        "default WheelUpPane binding should enter copy-mode when mouse is on"
+    );
+}
+
+#[tokio::test]
+async fn live_attach_second_click_dispatches_double_click_after_timer() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    enable_mouse(&handler).await;
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let rebound = handler
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
+            table_name: "root".to_owned(),
+            key: "DoubleClick1Pane".to_owned(),
+            note: Some("double-click-timer".to_owned()),
+            repeat: false,
+            command: Some(vec![
+                "set-buffer".to_owned(),
+                "-b".to_owned(),
+                "double-click-timer".to_owned(),
+                "ok".to_owned(),
+            ]),
+        })))
+        .await;
+    assert!(matches!(rebound, Response::BindKey(_)));
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[<0;2;2M")
+        .await
+        .expect("first click");
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[<0;2;2M")
+        .await
+        .expect("second click");
+    tokio::time::sleep(Duration::from_millis(350)).await;
+
+    let contents = {
+        let state = handler.state.lock().await;
+        state.buffers.get("double-click-timer").map(Vec::from)
+    };
+    assert_eq!(contents.as_deref(), Some(b"ok".as_slice()));
+}
+
+#[tokio::test]
+async fn live_attach_default_double_click_copies_word_from_mouse_pane() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    enable_mouse(&handler).await;
+
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(
+                &alpha,
+                0,
+                0,
+                b"\x1b[2J\x1b[Halpha beta gamma\n",
+            )
+            .expect("test transcript update");
+    }
+
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[<0;2;1M")
+        .await
+        .expect("first click");
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[<0;2;1M")
+        .await
+        .expect("second click");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let copied = {
+        let state = handler.state.lock().await;
+        state
+            .buffers
+            .top_unnamed()
+            .and_then(|name| state.buffers.get(name))
+            .map(Vec::from)
+    };
+    assert_eq!(copied.as_deref(), Some(b"alpha".as_slice()));
 }
 
 #[tokio::test]

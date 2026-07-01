@@ -9,7 +9,7 @@
 
 **Browser sharing for RMUX terminal panes and sessions.**
 
-[![rmux 0.7.1](https://img.shields.io/badge/rmux-0.7.1-informational.svg)](https://github.com/Helvesec/rmux/releases/tag/v0.7.1)
+[![rmux 0.8.0](https://img.shields.io/badge/rmux-0.8.0-informational.svg)](https://github.com/Helvesec/rmux/releases/tag/v0.8.0)
 [![E2EE](https://img.shields.io/badge/E2EE-ChaCha20--Poly1305-success.svg)](#cryptography)
 [![Hybrid Post-Quantum](https://img.shields.io/badge/Hybrid%20Post--Quantum-X25519%20%2B%20ML--KEM--768-blue.svg)](#cryptography)
 [![Frontend](https://img.shields.io/badge/frontend-decoupled-lightgrey.svg)](#architecture)

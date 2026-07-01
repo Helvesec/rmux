@@ -6,9 +6,11 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use rmux_proto::{
-    encode_frame, ErrorResponse, HandshakeRequest, HandshakeResponse, HasSessionRequest,
-    HasSessionResponse, ListSessionsRequest, ListSessionsResponse, Request, Response, SdkWaitId,
-    SessionName, CAPABILITY_HANDSHAKE, CAPABILITY_SDK_PANE_BY_ID,
+    encode_frame, CancelSdkWaitResponse, ErrorResponse, HandshakeRequest, HandshakeResponse,
+    HasSessionRequest, HasSessionResponse, ListSessionsRequest, ListSessionsResponse,
+    PaneOutputSubscriptionStart, PaneTarget, Request, Response, SdkWaitForOutputRequest,
+    SdkWaitForOutputResponse, SdkWaitId, SdkWaitOutcome, SessionName, CAPABILITY_HANDSHAKE,
+    CAPABILITY_SDK_PANE_BY_ID,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::task::JoinHandle;
@@ -38,6 +40,16 @@ fn handshake_request() -> Request {
     Request::Handshake(HandshakeRequest::requiring(["capability.future"]))
 }
 
+fn sdk_wait_request(wait_id: SdkWaitId) -> Request {
+    Request::SdkWaitForOutput(SdkWaitForOutputRequest {
+        owner_id: rmux_proto::SdkWaitOwnerId::new(7),
+        wait_id,
+        target: PaneTarget::new(alpha(), 0),
+        bytes: b"needle".to_vec(),
+        start: PaneOutputSubscriptionStart::Now,
+    })
+}
+
 fn has_session_response(exists: bool) -> Response {
     Response::HasSession(HasSessionResponse { exists })
 }
@@ -46,6 +58,10 @@ fn list_sessions_response(stdout: &[u8]) -> Response {
     Response::ListSessions(ListSessionsResponse {
         output: rmux_proto::CommandOutput::from_stdout(stdout),
     })
+}
+
+fn sdk_wait_response(wait_id: SdkWaitId, outcome: SdkWaitOutcome) -> Response {
+    Response::SdkWaitForOutput(SdkWaitForOutputResponse { wait_id, outcome })
 }
 
 fn session_not_found_response() -> Response {
@@ -188,6 +204,130 @@ fn spawn_request(
 
 async fn join_request(handle: JoinHandle<crate::Result<Response>>) -> crate::Result<Response> {
     handle.await.expect("request task must not panic")
+}
+
+#[tokio::test]
+async fn armed_request_waits_for_daemon_armed_ack_and_keeps_final_pending() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let client = TransportClient::spawn(client_stream);
+    let wait_id = SdkWaitId::new(42);
+    let client_for_wait = client.clone();
+    let mut arm = tokio::spawn(async move {
+        client_for_wait
+            .armed_request(sdk_wait_request(wait_id))
+            .await
+    });
+
+    assert_eq!(
+        read_request(&mut server_stream).await,
+        sdk_wait_request(wait_id)
+    );
+    assert!(
+        timeout(Duration::from_millis(50), &mut arm).await.is_err(),
+        "armed_request must not complete when only the client frame was written"
+    );
+
+    write_response(
+        &mut server_stream,
+        &Response::CancelSdkWait(CancelSdkWaitResponse::armed_ack(wait_id)),
+    )
+    .await;
+    let mut pending = arm
+        .await
+        .expect("armed task must not panic")
+        .expect("daemon armed ack succeeds");
+    assert!(
+        timeout(Duration::from_millis(50), &mut pending)
+            .await
+            .is_err(),
+        "Armed ack must not complete the final SDK wait response"
+    );
+
+    write_response(
+        &mut server_stream,
+        &sdk_wait_response(wait_id, SdkWaitOutcome::Matched),
+    )
+    .await;
+    assert_eq!(
+        pending.await.expect("final wait response succeeds"),
+        sdk_wait_response(wait_id, SdkWaitOutcome::Matched)
+    );
+}
+
+#[tokio::test]
+async fn armed_request_rejects_duplicate_armed_ack_as_protocol_drift() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let client = TransportClient::spawn(client_stream);
+    let wait_id = SdkWaitId::new(42);
+    let client_for_wait = client.clone();
+    let arm = tokio::spawn(async move {
+        client_for_wait
+            .armed_request(sdk_wait_request(wait_id))
+            .await
+    });
+
+    assert_eq!(
+        read_request(&mut server_stream).await,
+        sdk_wait_request(wait_id)
+    );
+    write_response(
+        &mut server_stream,
+        &Response::CancelSdkWait(CancelSdkWaitResponse::armed_ack(wait_id)),
+    )
+    .await;
+    let pending = arm
+        .await
+        .expect("armed task must not panic")
+        .expect("daemon armed ack succeeds");
+
+    write_response(
+        &mut server_stream,
+        &Response::CancelSdkWait(CancelSdkWaitResponse::armed_ack(wait_id)),
+    )
+    .await;
+
+    assert_transport_message(
+        pending.await,
+        io::ErrorKind::InvalidData,
+        "sent `cancel-sdk-wait` response for pending `sdk-wait-output` request",
+    );
+}
+
+#[tokio::test]
+async fn armed_request_rejects_wrong_wait_id_ack_without_rearming() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let client = TransportClient::spawn(client_stream);
+    let wait_id = SdkWaitId::new(42);
+    let client_for_wait = client.clone();
+    let arm = tokio::spawn(async move {
+        client_for_wait
+            .armed_request(sdk_wait_request(wait_id))
+            .await
+    });
+
+    assert_eq!(
+        read_request(&mut server_stream).await,
+        sdk_wait_request(wait_id)
+    );
+    write_response(
+        &mut server_stream,
+        &Response::CancelSdkWait(CancelSdkWaitResponse::armed_ack(SdkWaitId::new(43))),
+    )
+    .await;
+
+    match arm.await.expect("armed task must not panic") {
+        Err(RmuxError::Transport { source, .. }) => {
+            assert_eq!(source.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                source
+                    .to_string()
+                    .contains("armed ack id 43 for pending wait id 42"),
+                "unexpected error: {source}"
+            );
+        }
+        Err(error) => panic!("expected transport error for invalid armed ack, got {error:?}"),
+        Ok(_) => panic!("expected invalid armed ack to fail, got pending response"),
+    }
 }
 
 #[tokio::test]

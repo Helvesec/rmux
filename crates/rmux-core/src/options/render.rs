@@ -38,7 +38,7 @@ fn render_show_value(value: &str) -> String {
     let escaped = value
         .chars()
         .flat_map(|character| match character {
-            '"' | '\\' => ['\\', character].into_iter().collect::<Vec<_>>(),
+            '"' | '$' | '\\' => ['\\', character].into_iter().collect::<Vec<_>>(),
             other => [other].into_iter().collect::<Vec<_>>(),
         })
         .collect::<String>();
@@ -48,7 +48,7 @@ fn render_show_value(value: &str) -> String {
 fn show_value_needs_quotes(value: &str) -> bool {
     value
         .chars()
-        .any(|character| character.is_whitespace() || matches!(character, '#' | '"' | '\\'))
+        .any(|character| character.is_whitespace() || matches!(character, '#' | '$' | '"' | '\\'))
 }
 
 pub(super) fn show_option_name(name: &str, index: Option<u32>) -> String {

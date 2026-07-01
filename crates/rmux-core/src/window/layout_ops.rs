@@ -38,6 +38,23 @@ impl Window {
                 self.resize_main_pane(ResizePaneAdjustment::AbsoluteHeight { rows });
                 return;
             }
+            ResizePaneAdjustment::Composite {
+                columns,
+                rows,
+                relative,
+                cells,
+            } => {
+                if let Some(columns) = columns {
+                    self.resize_main_pane(ResizePaneAdjustment::AbsoluteWidth { columns });
+                }
+                if let Some(rows) = rows {
+                    self.resize_main_pane(ResizePaneAdjustment::AbsoluteHeight { rows });
+                }
+                if let Some(relative) = relative {
+                    self.resize_main_pane(relative.to_adjustment(cells));
+                }
+                return;
+            }
             ResizePaneAdjustment::Zoom => {
                 self.toggle_zoom(self.active_pane);
                 return;
@@ -159,6 +176,7 @@ impl Window {
             ResizePaneAdjustment::AbsoluteWidth { .. }
             | ResizePaneAdjustment::AbsoluteHeight { .. }
             | ResizePaneAdjustment::AbsoluteSize { .. }
+            | ResizePaneAdjustment::Composite { .. }
             | ResizePaneAdjustment::TrimBelow
             | ResizePaneAdjustment::Zoom
             | ResizePaneAdjustment::NoOp => return false,

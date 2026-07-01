@@ -44,6 +44,28 @@ async fn run_shell_background_returns_immediately_without_output() {
 }
 
 #[tokio::test]
+async fn background_run_shell_is_tracked_as_detached_request_until_finished() {
+    let handler = RequestHandler::new();
+
+    let response = handler
+        .handle(Request::RunShell(Box::new(RunShellRequest {
+            command: String::new(),
+            background: true,
+            as_commands: false,
+            show_stderr: false,
+            delay_seconds: Some(RunShellDelaySeconds(0.2)),
+            start_directory: None,
+            target: None,
+            source_depth: None,
+        })))
+        .await;
+
+    assert_eq!(response, Response::RunShell(RunShellResponse::background()));
+    wait_for_detached_request_count(&handler, 1).await;
+    wait_for_detached_request_count(&handler, 0).await;
+}
+
+#[tokio::test]
 async fn background_run_shell_commands_keep_detached_write_access_after_response() {
     let handler = RequestHandler::new();
     let requester_pid = 424_005;
@@ -61,6 +83,68 @@ async fn background_run_shell_commands_keep_detached_write_access_after_response
     }
 
     wait_for_named_buffer(&handler, "bg-run-shell", b"ok").await;
+}
+
+#[tokio::test]
+async fn background_run_shell_commands_still_emit_after_hooks_outside_hook_context() {
+    let handler = RequestHandler::new();
+    create_named_session(&handler, "run-shell-after-hooks").await;
+    execute_test_command(
+        &handler,
+        "set-hook -g after-new-window 'set-buffer -b after-run-shell yes'",
+    )
+    .await;
+
+    execute_test_command(&handler, "run-shell -b -C 'new-window -d -n bg'").await;
+
+    wait_for_named_buffer(&handler, "after-run-shell", b"yes").await;
+}
+
+#[tokio::test]
+async fn background_if_shell_still_emits_after_hooks_outside_hook_context() {
+    let handler = RequestHandler::new();
+    create_named_session(&handler, "if-shell-after-hooks").await;
+    execute_test_command(
+        &handler,
+        "set-hook -g after-new-window 'set-buffer -b after-if-shell yes'",
+    )
+    .await;
+
+    execute_test_command(&handler, "if-shell -b -F '1' 'new-window -d -n ifbg'").await;
+
+    wait_for_named_buffer(&handler, "after-if-shell", b"yes").await;
+}
+
+#[tokio::test]
+async fn background_run_shell_preserves_hook_formats_after_hook_scope_exits() {
+    let handler = RequestHandler::new();
+    use_platform_test_shell(&handler).await;
+    let root = temp_root("run-shell-background-hook-formats");
+    std::fs::create_dir_all(&root).expect("temp output root");
+    let output_path = root.join("hook-pane.txt");
+    let command = write_literal_format_command(&output_path, "#{hook_pane}");
+
+    let response = crate::hook_runtime::with_hook_execution(
+        vec![("hook_pane".to_owned(), "%1".to_owned())],
+        async {
+            handler
+                .handle(Request::RunShell(Box::new(RunShellRequest {
+                    command,
+                    background: true,
+                    as_commands: false,
+                    show_stderr: true,
+                    delay_seconds: None,
+                    start_directory: None,
+                    target: None,
+                    source_depth: None,
+                })))
+                .await
+        },
+    )
+    .await;
+
+    assert_eq!(response, Response::RunShell(RunShellResponse::background()));
+    wait_for_file_text(&output_path, "%1").await;
 }
 
 #[tokio::test]
@@ -94,6 +178,64 @@ async fn run_shell_expands_socket_path_without_target() {
         std::fs::read_to_string(output_path).expect("socket path output"),
         "/tmp/rmux-test.sock"
     );
+}
+
+async fn create_named_session(handler: &RequestHandler, name: &str) {
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session_name(name),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+}
+
+async fn execute_test_command(handler: &RequestHandler, command: &str) {
+    let parsed = CommandParser::new()
+        .parse(command)
+        .unwrap_or_else(|error| panic!("{command:?} should parse: {error}"));
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .unwrap_or_else(|error| panic!("{command:?} should execute: {error}"));
+}
+
+async fn wait_for_file_text(path: &std::path::Path, expected: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if text == expected {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("file {path:?} did not become {expected:?}"));
+}
+
+fn write_literal_format_command(path: &std::path::Path, text: &str) -> String {
+    #[cfg(unix)]
+    {
+        format!(
+            "printf '%s' {} > {}",
+            command_quote(text),
+            shell_quote(path)
+        )
+    }
+    #[cfg(windows)]
+    {
+        format!(
+            "[IO.File]::WriteAllText({}, {})",
+            crate::test_shell::powershell_quote_path(path),
+            crate::test_shell::powershell_quote(text)
+        )
+    }
 }
 
 fn write_text_command(path: &std::path::Path, text: &str) -> String {

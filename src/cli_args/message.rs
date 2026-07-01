@@ -37,3 +37,15 @@ impl QueuedCommand for DisplayMessageArgs {
         self.queue_command = queue_command;
     }
 }
+
+impl DisplayMessageArgs {
+    pub(crate) fn validate(self) -> Result<Self, clap::Error> {
+        if self.message.len() > 1 {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::TooManyValues,
+                "command display-message: too many arguments (need at most 1)",
+            ));
+        }
+        Ok(self)
+    }
+}

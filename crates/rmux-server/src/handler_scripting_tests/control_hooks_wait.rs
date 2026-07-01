@@ -46,6 +46,25 @@ async fn parsed_queue_display_message_consumes_neutral_compat_flags_before_messa
 }
 
 #[tokio::test]
+async fn parsed_queue_display_message_rejects_multiple_message_arguments() {
+    let handler = RequestHandler::new();
+    let parsed = CommandParser::new()
+        .parse("display-message a b c")
+        .expect("command parser keeps queue validation for execution");
+    let error = handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect_err("display-message must accept at most one message argument");
+
+    assert!(
+        error
+            .to_string()
+            .contains("command display-message: too many arguments (need at most 1)"),
+        "unexpected error: {error}"
+    );
+}
+
+#[tokio::test]
 async fn parsed_queue_display_message_consumes_compact_delay_before_message() {
     let handler = RequestHandler::new();
 
@@ -58,6 +77,33 @@ async fn parsed_queue_display_message_consumes_compact_delay_before_message() {
         .expect("display-message compact delay flag executes");
 
     assert_eq!(output.stdout(), b"hello\n");
+}
+
+#[tokio::test]
+async fn parsed_queue_display_message_accepts_compact_print_target_cluster() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let parsed = CommandParser::new()
+        .parse("display-message -pt alpha:0.0 'hi-#{pane_index}'")
+        .expect("display-message -pt cluster parses");
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("display-message -pt cluster executes");
+
+    assert_eq!(output.stdout(), b"hi-0\n");
 }
 
 #[tokio::test]

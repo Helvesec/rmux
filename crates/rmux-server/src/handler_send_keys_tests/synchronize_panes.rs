@@ -180,6 +180,56 @@ async fn send_keys_synchronize_panes_writes_to_each_live_pane() {
     );
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn pane_input_ref_multi_token_ctrl_c_stays_on_referenced_pane_when_synchronized() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+
+    create_synchronized_two_pane_session(&handler, &alpha).await;
+
+    let pane_zero = PaneTarget::with_window(alpha.clone(), 0, 0);
+    let pane_one = PaneTarget::with_window(alpha.clone(), 0, 1);
+    let pane_zero_id = {
+        let state = handler.state.lock().await;
+        state.start_pane_input_capture_for_test(&pane_zero);
+        state.start_pane_input_capture_for_test(&pane_one);
+        state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .map(|pane| pane.id())
+            .expect("test pane exists")
+    };
+
+    let response = handler
+        .handle(Request::PaneInput(rmux_proto::PaneInputRequest {
+            target: PaneTargetRef::by_id(alpha.clone(), pane_zero_id),
+            keys: vec!["C-c".to_owned(), "Enter".to_owned()],
+            literal: false,
+        }))
+        .await;
+    assert!(matches!(
+        response,
+        Response::SendKeys(SendKeysResponse { key_count: 2 })
+    ));
+
+    let mut expected = vec![0x03];
+    let enter = key_string_lookup_string("Enter").expect("Enter key exists");
+    expected.extend_from_slice(&encode_key(0, ExtendedKeyFormat::Xterm, enter).unwrap());
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.pane_input_capture_for_test(&pane_zero),
+        Some(expected)
+    );
+    assert_eq!(
+        state.pane_input_capture_for_test(&pane_one),
+        Some(Vec::new())
+    );
+}
+
 #[tokio::test]
 async fn send_prefix_synchronize_panes_writes_to_each_live_pane() {
     let handler = RequestHandler::new();

@@ -54,6 +54,13 @@ impl AttachInput {
     }
 }
 
+pub(super) fn synthetic_ctrl_c_input() -> AttachInput {
+    AttachInput::with_windows_console_key(
+        vec![0x03],
+        AttachedWindowsConsoleKey::new(b'C' as u16, 0x2e, 0x03, LEFT_CTRL_PRESSED, 1),
+    )
+}
+
 pub(super) struct ConsoleInputReader {
     handle: HANDLE,
     pending_high_surrogate: Option<u16>,
@@ -107,7 +114,10 @@ impl ConsoleInputReader {
                     }
                     let input = windows_console_key_for_event(event, &bytes).map_or_else(
                         || AttachInput::bytes(bytes.clone()),
-                        |key| AttachInput::with_windows_console_key(bytes.clone(), key),
+                        |key| {
+                            trace_windows_console_key(key, &bytes);
+                            AttachInput::with_windows_console_key(bytes.clone(), key)
+                        },
                     );
                     inputs.push(input);
                 }
@@ -264,25 +274,29 @@ fn windows_console_key_for_event(
         return None;
     }
 
-    let unicode_char = if event.unicode_char == 0
-        && encoded_bytes.len() == 1
-        && is_windows_ctrl_key_byte(encoded_bytes[0])
-    {
-        u16::from(encoded_bytes[0])
-    } else {
-        event.unicode_char
-    };
     Some(AttachedWindowsConsoleKey::new(
         event.virtual_key_code,
         event.virtual_scan_code,
-        unicode_char,
+        event.unicode_char,
         event.control_key_state,
         event.repeat_count.max(1),
     ))
 }
 
-fn is_windows_ctrl_key_byte(byte: u8) -> bool {
-    matches!(byte, 0x00..=0x1a | 0x1c..=0x1f | 0x7f)
+fn trace_windows_console_key(key: AttachedWindowsConsoleKey, bytes: &[u8]) {
+    if std::env::var_os("RMUX_TRACE_WINDOWS_KEYS").is_none() {
+        return;
+    }
+    tracing::debug!(
+        target: "rmux::windows_keys",
+        virtual_key_code = key.virtual_key_code(),
+        virtual_scan_code = key.virtual_scan_code(),
+        unicode_char = key.unicode_char(),
+        control_key_state = key.control_key_state(),
+        repeat_count = key.repeat_count(),
+        ?bytes,
+        "read Windows attach console key"
+    );
 }
 
 fn encode_key_event(event: ConsoleKeyEvent, pending_high_surrogate: &mut Option<u16>) -> Vec<u8> {
@@ -729,6 +743,19 @@ mod tests {
         assert_eq!(bytes, vec![0x10]);
         assert_eq!(key.virtual_key_code(), 'P' as u16);
         assert_eq!(key.unicode_char(), 0x10);
+    }
+
+    #[test]
+    fn console_key_events_do_not_invent_metadata_unicode_char() {
+        let event = key_event('D' as u16, 0, LEFT_CTRL_PRESSED);
+        let bytes = encode(&event);
+
+        let key = windows_console_key_for_event(event, &bytes)
+            .expect("virtual Ctrl-D should still preserve Windows console metadata");
+
+        assert_eq!(bytes, vec![0x04]);
+        assert_eq!(key.virtual_key_code(), 'D' as u16);
+        assert_eq!(key.unicode_char(), 0);
     }
 
     #[test]

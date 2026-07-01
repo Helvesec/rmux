@@ -7,6 +7,8 @@ use rmux_core::{
 };
 use rmux_proto::{CommandOutput, ErrorResponse, Request, Response, RmuxError, Target};
 
+use crate::mouse::AttachedMouseEvent;
+
 use super::list_parse::ParsedListPanesAllCommand;
 use super::pane_parse::ParsedSplitWindowCommand;
 use super::prompt_parse::{
@@ -22,7 +24,9 @@ pub(in crate::handler) struct QueueExecutionContext {
     pub(super) current_file: Option<String>,
     pub(super) current_target: Option<Target>,
     pub(super) current_target_allows_canfail_fallback: bool,
+    pub(super) client_name: Option<String>,
     pub(super) mouse_target: Option<Target>,
+    pub(super) mouse_event: Option<AttachedMouseEvent>,
 }
 
 impl QueueExecutionContext {
@@ -33,7 +37,9 @@ impl QueueExecutionContext {
             current_file: None,
             current_target: None,
             current_target_allows_canfail_fallback: false,
+            client_name: None,
             mouse_target: None,
+            mouse_event: None,
         }
     }
 
@@ -44,7 +50,9 @@ impl QueueExecutionContext {
             current_file: None,
             current_target: None,
             current_target_allows_canfail_fallback: false,
+            client_name: None,
             mouse_target: None,
+            mouse_event: None,
         }
     }
 
@@ -59,7 +67,9 @@ impl QueueExecutionContext {
             current_file,
             current_target: self.current_target.clone(),
             current_target_allows_canfail_fallback: self.current_target_allows_canfail_fallback,
+            client_name: self.client_name.clone(),
             mouse_target: self.mouse_target.clone(),
+            mouse_event: self.mouse_event.clone(),
         }
     }
 
@@ -85,8 +95,21 @@ impl QueueExecutionContext {
         self.current_target_allows_canfail_fallback
     }
 
+    pub(in crate::handler) fn with_client_name(mut self, client_name: Option<String>) -> Self {
+        self.client_name = client_name;
+        self
+    }
+
     pub(in crate::handler) fn with_mouse_target(mut self, mouse_target: Option<Target>) -> Self {
         self.mouse_target = mouse_target;
+        self
+    }
+
+    pub(in crate::handler) fn with_mouse_event(
+        mut self,
+        mouse_event: Option<AttachedMouseEvent>,
+    ) -> Self {
+        self.mouse_event = mouse_event;
         self
     }
 
@@ -132,6 +155,7 @@ pub(super) enum QueueInvocation {
     SourceFile(ParsedSourceFileCommand),
     ListPanesAll(ParsedListPanesAllCommand),
     SplitWindow(ParsedSplitWindowCommand),
+    MouseResizePane(rmux_proto::PaneTarget),
     CommandPrompt(ParsedCommandPromptCommand),
     ConfirmBefore(ParsedConfirmBeforeCommand),
     ModeTree(super::super::mode_tree_support::ParsedModeTreeCommand),
@@ -164,7 +188,7 @@ pub(super) fn queue_action_from_response(
                 .filter(|output| !output.stdout().is_empty())
                 .cloned(),
             error: None,
-            exit_status: response.exit_status().filter(|status| *status != 0),
+            exit_status: response.exit_status(),
         }),
         response => Ok(QueueCommandAction::Normal {
             output: response

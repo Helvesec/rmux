@@ -29,6 +29,7 @@ pub(crate) struct PaneTranscript {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct PaneAppendResult {
     pub(crate) bell_count: u64,
+    pub(crate) title_changed: bool,
     pub(crate) passthroughs: Vec<TerminalPassthrough>,
     pub(crate) dropped_passthrough_count: u64,
     pub(crate) replies: Vec<u8>,
@@ -91,12 +92,15 @@ impl PaneTranscript {
         if !bytes.is_empty() {
             self.output_sequence = self.output_sequence.saturating_add(1);
         }
+        let title_before = self.terminal.screen().title().to_owned();
         self.terminal.feed(bytes);
+        let title_changed = self.terminal.screen().title() != title_before;
         let passthroughs = self.terminal.take_terminal_passthrough();
         let dropped_passthrough_count = self.terminal.take_terminal_passthrough_dropped_count();
         let replies = self.terminal.take_replies();
         PaneAppendResult {
             bell_count: self.terminal.screen_mut().take_bell_count(),
+            title_changed,
             passthroughs,
             dropped_passthrough_count,
             replies,
@@ -730,5 +734,19 @@ mod tests {
 
         let result = transcript.append_bytes_and_take_replies(b"");
         assert!(result.replies.is_empty());
+    }
+
+    #[test]
+    fn append_bytes_reports_title_changes_once_per_change() {
+        let mut transcript = transcript(8, 2, 10);
+
+        let result = transcript.append_bytes_and_take_replies(b"\x1b]2;alpha\x07");
+        assert!(result.title_changed);
+
+        let result = transcript.append_bytes_and_take_replies(b"\x1b]2;alpha\x07");
+        assert!(!result.title_changed);
+
+        let result = transcript.append_bytes_and_take_replies(b"\x1b]2;beta\x07");
+        assert!(result.title_changed);
     }
 }

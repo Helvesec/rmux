@@ -80,7 +80,7 @@ impl HandlerState {
                 .ok_or_else(|| session_not_found(&session_name))
                 .and_then(|session| pane_id_for_target(session, &request.source))?;
             let direction = join_pane_internal_direction(request.direction);
-            return self.mutate_session_and_resize_terminals(&session_name, |session| {
+            let response = self.mutate_session_and_resize_terminals(&session_name, |session| {
                 session.join_pane(
                     SessionPaneTarget::from(&request.source),
                     SessionPaneTarget::from(&request.target),
@@ -103,7 +103,9 @@ impl HandlerState {
                         moved_index,
                     ),
                 })
-            });
+            })?;
+            self.clear_marked_pane_if_id(moved_pane_id);
+            return Ok(response);
         }
 
         self.join_pane_across_sessions(request)
@@ -138,6 +140,11 @@ impl HandlerState {
 
         if request.source.session_name() == &destination_session_name {
             let session_name = request.source.session_name().clone();
+            let source_pane_id = self
+                .sessions
+                .session(&session_name)
+                .ok_or_else(|| session_not_found(&session_name))
+                .and_then(|session| pane_id_for_target(session, &request.source))?;
             let destination_index =
                 self.mutate_session_and_resize_terminals(&session_name, |session| {
                     session.break_pane(
@@ -151,6 +158,7 @@ impl HandlerState {
                         ),
                     )
                 })?;
+            self.clear_marked_pane_if_id(source_pane_id);
 
             return Ok(BreakPaneResponse {
                 target: PaneTarget::with_window(destination_session_name, destination_index, 0),

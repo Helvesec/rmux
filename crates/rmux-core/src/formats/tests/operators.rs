@@ -165,21 +165,45 @@ fn expression_arithmetic_defaults_to_integer_output() {
     assert_eq!(render_template("#{e|-|:2,3}", &StaticWindowValues), "-1");
     assert_eq!(render_template("#{e|*|:2,3}", &StaticWindowValues), "6");
     assert_eq!(render_template("#{e|/|:5,2}", &StaticWindowValues), "2");
-    assert_eq!(render_template("#{e|%|:5,2}", &StaticWindowValues), "1");
+    assert_eq!(render_template("#{e|%|:5,2}", &StaticWindowValues), "");
     assert_eq!(render_template("#{e|+|:2.9,3.9}", &StaticWindowValues), "5");
     assert_eq!(render_template("#{e|*|:2.9,3.9}", &StaticWindowValues), "6");
     assert_eq!(render_template("#{e|m|:7,2}", &StaticWindowValues), "1");
 }
 
 #[test]
-fn expression_integer_overflow_saturates() {
+fn expression_integer_overflow_matches_tmux() {
     assert_eq!(
         render_template("#{e|+|:999999999999999999999,1}", &StaticWindowValues),
-        i64::MAX.to_string()
+        "9223372036854775808"
     );
     assert_eq!(
         render_template("#{e|+|:9223372036854775807,1}", &StaticWindowValues),
-        i64::MAX.to_string()
+        "9223372036854775808"
+    );
+    assert_eq!(
+        render_template("#{e|+|:9223372036854775807,2}", &StaticWindowValues),
+        "9223372036854775808"
+    );
+    assert_eq!(
+        render_template("#{e|-|:-9223372036854775808,1}", &StaticWindowValues),
+        i64::MIN.to_string()
+    );
+    assert_eq!(
+        render_template("#{e|-|:0,9223372036854775806}", &StaticWindowValues),
+        i64::MIN.to_string()
+    );
+    assert_eq!(
+        render_template("#{e|*|:4611686018427387904,2}", &StaticWindowValues),
+        "9223372036854775808"
+    );
+    assert_eq!(
+        render_template("#{e|*|:3037000500,3037000500}", &StaticWindowValues),
+        "9223372036854775808"
+    );
+    assert_eq!(
+        render_template("#{e|*|:3037000499,3037000499}", &StaticWindowValues),
+        "9223372030926248960"
     );
 }
 
@@ -187,20 +211,44 @@ fn expression_integer_overflow_saturates() {
 fn expression_integer_minimum_division_overflow_does_not_panic() {
     assert_eq!(
         render_template("#{e|/|:-9223372036854775808,-1}", &StaticWindowValues),
-        i64::MAX.to_string()
+        "9223372036854775808"
+    );
+    assert_eq!(
+        render_template("#{e|m|:-9223372036854775808,-1}", &StaticWindowValues),
+        "0"
     );
     assert_eq!(
         render_template("#{e|%|:-9223372036854775808,-1}", &StaticWindowValues),
-        "0"
+        ""
     );
 }
 
 #[test]
-fn expression_division_by_zero_is_invalid_not_tmux_sentinel() {
-    assert_eq!(render_template("#{e|/|:5,0}", &StaticWindowValues), "");
+fn expression_division_by_zero_matches_tmux_sentinel() {
+    assert_eq!(
+        render_template("#{e|/|:5,0}", &StaticWindowValues),
+        "9223372036854775808"
+    );
+    assert_eq!(render_template("#{e|%|:5,2}", &StaticWindowValues), "");
     assert_eq!(render_template("#{e|%|:5,0}", &StaticWindowValues), "");
-    assert_eq!(render_template("#{e|m|:5,0}", &StaticWindowValues), "");
-    assert_eq!(render_template("#{e|/|f:5,0}", &StaticWindowValues), "");
+    assert_eq!(render_template("#{e|m|:5,0}", &StaticWindowValues), "0");
+    assert_eq!(render_template("#{e|/|f:5,0}", &StaticWindowValues), "inf");
+    assert_eq!(render_template("#{e|m|f:5,0}", &StaticWindowValues), "nan");
+}
+
+#[test]
+fn expression_empty_and_prefixed_integer_operands_match_tmux() {
+    assert_eq!(render_template("#{e|+|:5,}", &StaticWindowValues), "5");
+    assert_eq!(render_template("#{e|+|:0x10,1}", &StaticWindowValues), "17");
+    assert_eq!(
+        render_template("#{e|+|:-0x10,1}", &StaticWindowValues),
+        "-15"
+    );
+    assert_eq!(
+        render_template("#{e|+|:inf,1}", &StaticWindowValues),
+        "9223372036854775808"
+    );
+    assert_eq!(render_template("#{e|q|:inf,1}", &StaticWindowValues), "");
 }
 
 #[test]
@@ -229,7 +277,31 @@ fn expression_numeric_comparisons() {
 }
 
 #[test]
-fn boolean_and_matches_tmux_binary_first_comma_split() {
+fn expression_non_finite_comparisons_match_tmux_sentinel() {
+    assert_eq!(render_template("#{e|>|:inf,1}", &StaticWindowValues), "1");
+    assert_eq!(render_template("#{e|<|:inf,1}", &StaticWindowValues), "0");
+    assert_eq!(
+        render_template("#{e|==|:inf,inf}", &StaticWindowValues),
+        "1"
+    );
+    assert_eq!(
+        render_template("#{e|!=|:inf,inf}", &StaticWindowValues),
+        "0"
+    );
+    assert_eq!(
+        render_template("#{e|==|:nan,nan}", &StaticWindowValues),
+        "1"
+    );
+    assert_eq!(
+        render_template("#{e|!=|:nan,nan}", &StaticWindowValues),
+        "0"
+    );
+    assert_eq!(render_template("#{e|>|:nan,1}", &StaticWindowValues), "0");
+    assert_eq!(render_template("#{e|<=|:nan,1}", &StaticWindowValues), "1");
+}
+
+#[test]
+fn boolean_and_matches_tmux_3_4_binary_semantics() {
     assert_eq!(
         render_template(
             "#{&&:#{window_active},#{session_name},#{window_panes}}",
@@ -251,10 +323,17 @@ fn boolean_and_matches_tmux_binary_first_comma_split() {
         ),
         "0"
     );
+    assert_eq!(render_template("#{&&:1}", &StaticWindowValues), "");
+    assert_eq!(render_template("#{&&:1,1,1}", &StaticWindowValues), "1");
+    assert_eq!(render_template("#{&&:1,1,0}", &StaticWindowValues), "1");
+    assert_eq!(
+        render_template("#{&&:1,#{&&:1,0},1}", &StaticWindowValues),
+        "1"
+    );
 }
 
 #[test]
-fn boolean_or_matches_tmux_binary_first_comma_split() {
+fn boolean_or_matches_tmux_3_4_binary_semantics() {
     assert_eq!(
         render_template(
             "#{||:#{window_last_flag},#{missing},#{missing2}}",
@@ -267,6 +346,14 @@ fn boolean_or_matches_tmux_binary_first_comma_split() {
             "#{||:#{window_last_flag},#{window_active},#{missing}}",
             &StaticWindowValues
         ),
+        "1"
+    );
+    assert_eq!(render_template("#{||:0}", &StaticWindowValues), "");
+    assert_eq!(render_template("#{||:1}", &StaticWindowValues), "");
+    assert_eq!(render_template("#{||:0,0,0}", &StaticWindowValues), "1");
+    assert_eq!(render_template("#{||:0,1,0}", &StaticWindowValues), "1");
+    assert_eq!(
+        render_template("#{||:0,#{||:0,0},0}", &StaticWindowValues),
         "1"
     );
 }

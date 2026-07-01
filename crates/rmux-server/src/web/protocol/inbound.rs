@@ -6,10 +6,11 @@ use std::io;
 use rmux_core::PaneId;
 
 use super::{
-    encode_session_key, parse_pane_resize_body, parse_resize_body, session_logout_allowed,
-    valid_window_name, ClientMessage, SessionClientTextOutcome, SessionOperatorBinaryOutcome,
-    SessionScrollRequest, OPERATOR_INPUT_FRAME_MAX, WS_ATTACH_INPUT, WS_INPUT_KEY, WS_INPUT_TEXT,
-    WS_RESIZE_REQUEST, WS_SESSION_RESIZE_PANE,
+    encode_session_key, encode_session_windows_console_key, parse_pane_resize_body,
+    parse_resize_body, session_logout_allowed, valid_window_name, ClientMessage,
+    SessionClientTextOutcome, SessionOperatorBinaryOutcome, SessionScrollRequest,
+    OPERATOR_INPUT_FRAME_MAX, WS_ATTACH_INPUT, WS_INPUT_KEY, WS_INPUT_TEXT, WS_RESIZE_REQUEST,
+    WS_SESSION_RESIZE_PANE,
 };
 use crate::handler::{RequestHandler, WebPaneStream, WebSessionStream};
 use crate::web::outbound::WebSocketOutbound;
@@ -321,6 +322,11 @@ async fn send_session_key(
     let Some(key) = validate_key_token(socket, body).await? else {
         return Ok(());
     };
+    if let Some((bytes, windows_key)) = encode_session_windows_console_key(key) {
+        return session
+            .send_attach_windows_console_key(bytes, windows_key)
+            .await;
+    }
     let Some(bytes) = encode_session_key(key) else {
         let _ = socket.write_close_code(4006, "unsupported_key_token").await;
         return Ok(());
