@@ -230,7 +230,7 @@ const LIST_COMMAND_SIGNATURES: &[(&str, &str)] = &[
     ("unlink-window", "(unlinkw) [-k] [-t target-window]"),
     ("wait-for", "(wait) [-L|-S|-U] channel"),
     ("capabilities", "[--human|--json]"),
-    ("claude", "[claude-args...]"),
+    ("claude", "[install-skill|claude-args...]"),
     ("doctor", "tmux-dropin"),
     ("setup", "tmux-shim"),
     (

@@ -450,6 +450,74 @@ fn join_pane_before_target_honours_requested_size() {
 }
 
 #[test]
+fn join_pane_within_window_horizontal_size_matches_tmux_target_side() {
+    let mut session = Session::new(
+        session_name("alpha"),
+        TerminalSize {
+            cols: 100,
+            rows: 24,
+        },
+    );
+    session
+        .split_active_pane_with_direction(SplitDirection::Horizontal)
+        .expect("split succeeds");
+
+    session
+        .join_pane(
+            SessionPaneTarget::new(0, 1),
+            SessionPaneTarget::new(0, 0),
+            PaneJoinOptions::new(
+                SplitDirection::Horizontal,
+                false,
+                false,
+                false,
+                Some(PaneSplitSize::Absolute(5)),
+            ),
+        )
+        .expect("same-window join succeeds");
+
+    let window = session.window_at(0).expect("window 0 exists");
+    let first = window.pane(0).expect("pane 0 exists").geometry();
+    let second = window.pane(1).expect("pane 1 exists").geometry();
+    assert_eq!(first.rows(), 6);
+    assert_eq!(second.rows(), 17);
+}
+
+#[test]
+fn join_pane_within_window_before_size_matches_tmux_moved_side() {
+    let mut session = Session::new(
+        session_name("alpha"),
+        TerminalSize {
+            cols: 100,
+            rows: 24,
+        },
+    );
+    session
+        .split_active_pane_with_direction(SplitDirection::Horizontal)
+        .expect("split succeeds");
+
+    session
+        .join_pane(
+            SessionPaneTarget::new(0, 1),
+            SessionPaneTarget::new(0, 0),
+            PaneJoinOptions::new(
+                SplitDirection::Horizontal,
+                true,
+                false,
+                false,
+                Some(PaneSplitSize::Absolute(5)),
+            ),
+        )
+        .expect("same-window before join succeeds");
+
+    let window = session.window_at(0).expect("window 0 exists");
+    let first = window.pane(0).expect("pane 0 exists").geometry();
+    let second = window.pane(1).expect("pane 1 exists").geometry();
+    assert_eq!(first.rows(), 6);
+    assert_eq!(second.rows(), 17);
+}
+
+#[test]
 fn break_pane_moves_a_single_pane_window_without_recreating_it() {
     let mut session = Session::new(
         session_name("alpha"),

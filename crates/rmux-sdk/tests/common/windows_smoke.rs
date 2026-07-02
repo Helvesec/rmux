@@ -27,6 +27,7 @@ pub type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 // real prompt/output transitions without making successful tests slower.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 pub const OUTPUT_BUDGET: usize = 64 * 1024;
+const RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN_ENV: &str = "RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN";
 
 pub static LIVE_DAEMON_LOCK: Mutex<()> = Mutex::const_new(());
 
@@ -276,6 +277,18 @@ fn rmux_binary() -> TestResult<&'static Path> {
 }
 
 fn resolve_rmux_binary() -> TestResult<PathBuf> {
+    if let Some(path) = std::env::var_os(RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN_ENV) {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "{RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN_ENV} points to a missing rmux binary: {}",
+            path.display()
+        )
+        .into());
+    }
+
     if let Some(path) = option_env!("CARGO_BIN_EXE_rmux") {
         let path = PathBuf::from(path);
         if path.is_file() {

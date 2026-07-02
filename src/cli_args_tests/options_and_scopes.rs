@@ -302,7 +302,7 @@ fn resize_pane_accepts_target_only_noop_like_tmux() {
 }
 
 #[test]
-fn resize_pane_valueless_adjustment_groups_follow_tmux_last_wins() {
+fn resize_pane_valueless_adjustment_groups_follow_tmux_priority_and_composition() {
     let relative = parse_args(&["resize-pane", "-R", "-L", "-t", "alpha:0.0"]).unwrap();
     match relative.command.expect("parsed command") {
         super::super::Command::ResizePane(args) => {
@@ -315,7 +315,7 @@ fn resize_pane_valueless_adjustment_groups_follow_tmux_last_wins() {
     let absolute = parse_args(&["resize-pane", "-R", "-x", "80", "-t", "alpha:0.0"]).unwrap();
     match absolute.command.expect("parsed command") {
         super::super::Command::ResizePane(args) => {
-            assert_eq!(args.right, None);
+            assert_eq!(args.right, Some(1));
             assert!(args.columns.is_some());
         }
         _ => panic!("expected ResizePane command"),
@@ -324,7 +324,7 @@ fn resize_pane_valueless_adjustment_groups_follow_tmux_last_wins() {
     let zoom = parse_args(&["resize-pane", "-Z", "-R", "-t", "alpha:0.0"]).unwrap();
     match zoom.command.expect("parsed command") {
         super::super::Command::ResizePane(args) => {
-            assert!(!args.zoom);
+            assert!(args.zoom);
             assert_eq!(args.right, Some(1));
         }
         _ => panic!("expected ResizePane command"),
@@ -332,7 +332,7 @@ fn resize_pane_valueless_adjustment_groups_follow_tmux_last_wins() {
 }
 
 #[test]
-fn resize_pane_explicit_last_adjustment_groups_follow_tmux_last_wins() {
+fn resize_pane_explicit_adjustment_groups_follow_tmux_priority_and_composition() {
     let relative = parse_args(&["resize-pane", "-t", "alpha:0.0", "-R", "-L", "5"]).unwrap();
     match relative.command.expect("parsed command") {
         super::super::Command::ResizePane(args) => {
@@ -346,7 +346,7 @@ fn resize_pane_explicit_last_adjustment_groups_follow_tmux_last_wins() {
     match absolute.command.expect("parsed command") {
         super::super::Command::ResizePane(args) => {
             assert_eq!(args.right, Some(5));
-            assert_eq!(args.columns, None);
+            assert!(args.columns.is_some());
         }
         _ => panic!("expected ResizePane command"),
     }
@@ -354,7 +354,7 @@ fn resize_pane_explicit_last_adjustment_groups_follow_tmux_last_wins() {
     let zoom = parse_args(&["resize-pane", "-t", "alpha:0.0", "-Z", "-R", "5"]).unwrap();
     match zoom.command.expect("parsed command") {
         super::super::Command::ResizePane(args) => {
-            assert!(!args.zoom);
+            assert!(args.zoom);
             assert_eq!(args.right, Some(5));
         }
         _ => panic!("expected ResizePane command"),

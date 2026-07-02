@@ -65,6 +65,19 @@ fn punctuation_word_context() -> CopyModeCommandContext {
     }
 }
 
+fn mouse_context(x: u32, y: u16) -> CopyModeCommandContext {
+    CopyModeCommandContext {
+        mouse: Some(CopyModeMouseContext {
+            content_x: x,
+            content_y: y,
+            selection_anchor: None,
+            scroll_y: y,
+            slider_mpos: -1,
+        }),
+        ..test_context()
+    }
+}
+
 #[test]
 fn cursor_down_and_cancel_only_cancels_at_bottom() {
     let screen = build_screen(20, 3, "line1\r\nline2\r\nline3");
@@ -714,6 +727,32 @@ fn line_selection_omits_trailing_newline() {
 
     let outcome = state.execute_command("copy-selection", &[], &ctx).unwrap();
     assert_eq!(outcome.transfer.unwrap().data, b"alpha");
+}
+
+#[test]
+fn line_selection_uses_mouse_position_when_available() {
+    let screen = build_screen(20, 3, "alpha beta\r\ngamma delta\r\n");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = mouse_context(6, 1);
+
+    let _ = state.execute_command("history-top", &[], &ctx);
+    let _ = state.execute_command("select-line", &[], &ctx);
+
+    let outcome = state.execute_command("copy-selection", &[], &ctx).unwrap();
+    assert_eq!(outcome.transfer.unwrap().data, b"gamma delta");
+}
+
+#[test]
+fn word_selection_uses_mouse_position_when_available() {
+    let screen = build_screen(20, 3, "alpha beta\r\ngamma delta\r\n");
+    let mut state = CopyModeState::for_test(screen);
+    let ctx = mouse_context(6, 1);
+
+    let _ = state.execute_command("history-top", &[], &ctx);
+    let _ = state.execute_command("select-word", &[], &ctx);
+
+    let outcome = state.execute_command("copy-selection", &[], &ctx).unwrap();
+    assert_eq!(outcome.transfer.unwrap().data, b"delta");
 }
 
 #[test]

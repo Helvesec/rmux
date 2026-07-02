@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{ArgAction, ArgGroup, Args};
+use rmux_core::tmux_precedence;
 use rmux_proto::{SelectPaneDirection, SplitDirection};
 
 use super::{parse_command_args, parse_target_spec, TargetSpec};
@@ -34,14 +35,14 @@ pub(super) fn parse_select_layout_args(
 pub(super) fn parse_resize_pane_args(
     arguments: Vec<String>,
 ) -> Result<ResizePaneArgs, clap::Error> {
+    let arguments = tmux_precedence::normalize_tmux_precedence("resize-pane", arguments);
     validate_required_absolute_resize_arguments(&arguments)?;
     validate_resize_pane_tmux_direction_delta_syntax(&arguments)?;
     validate_resize_pane_absolute_size_values(&arguments)?;
-    parse_command_args::<ResizePaneArgs>(
-        "resize-pane",
-        normalize_resize_pane_optional_delta(arguments),
-    )
-    .and_then(ResizePaneArgs::validate)
+    let arguments = normalize_resize_pane_optional_delta(arguments);
+    let arguments = normalize_resize_pane_no_direction_trailing_adjustment(arguments)?;
+    parse_command_args::<ResizePaneArgs>("resize-pane", arguments)
+        .and_then(ResizePaneArgs::validate)
 }
 
 fn validate_required_size_argument(
@@ -136,20 +137,31 @@ fn parse_resize_pane_size(value: &str) -> Result<ResizePaneSize, String> {
 }
 
 fn parse_resize_pane_delta(value: &str) -> Result<u16, String> {
-    let cells = value
-        .parse::<i64>()
-        .map_err(|error| format!("adjustment invalid: {error}"))?;
+    let cells = parse_resize_pane_adjustment_integer(value)?;
     if cells <= 0 {
         return Err("adjustment too small".to_owned());
     }
-    if cells > i64::from(i32::MAX) {
+    if cells > i128::from(i32::MAX) {
         return Err("adjustment too large".to_owned());
     }
-    Ok(clamp_resize_pane_cells(cells))
+    Ok(clamp_resize_pane_cells(cells as i64))
 }
 
 fn clamp_resize_pane_cells(cells: i64) -> u16 {
     u16::try_from(cells).unwrap_or(u16::MAX)
+}
+
+fn parse_resize_pane_adjustment_integer(value: &str) -> Result<i128, String> {
+    match value.parse::<i128>() {
+        Ok(value) => Ok(value),
+        Err(_) if integer_like_resize_pane_adjustment(value) && value.starts_with('-') => {
+            Err("adjustment too small".to_owned())
+        }
+        Err(_) if integer_like_resize_pane_adjustment(value) => {
+            Err("adjustment too large".to_owned())
+        }
+        Err(error) => Err(format!("adjustment invalid: {error}")),
+    }
 }
 
 fn validate_resize_pane_tmux_direction_delta_syntax(
@@ -329,7 +341,7 @@ fn normalize_resize_pane_optional_delta(arguments: Vec<String>) -> Vec<String> {
 
     if arguments
         .last()
-        .is_some_and(|last| parse_resize_pane_delta(last).is_ok())
+        .is_some_and(|last| resize_pane_delta_candidate(last))
         && arguments.len() > direction_index + 1
         && resize_pane_has_standalone_trailing_delta(&arguments, direction_index)
     {
@@ -342,9 +354,51 @@ fn normalize_resize_pane_optional_delta(arguments: Vec<String>) -> Vec<String> {
     arguments
 }
 
+fn resize_pane_delta_candidate(value: &str) -> bool {
+    integer_like_resize_pane_adjustment(value)
+}
+
+fn integer_like_resize_pane_adjustment(value: &str) -> bool {
+    let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn normalize_resize_pane_no_direction_trailing_adjustment(
+    arguments: Vec<String>,
+) -> Result<Vec<String>, clap::Error> {
+    if arguments
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-D" | "-U" | "-L" | "-R"))
+    {
+        return Ok(arguments);
+    }
+    if !arguments
+        .last()
+        .is_some_and(|last| resize_pane_delta_candidate(last))
+        || !resize_pane_has_standalone_trailing_delta_from(&arguments, 0)
+    {
+        return Ok(arguments);
+    }
+
+    let mut normalized = arguments;
+    let value = normalized
+        .pop()
+        .expect("last resize-pane adjustment must exist");
+    parse_resize_pane_delta(&value)
+        .map_err(|message| clap::Error::raw(clap::error::ErrorKind::ValueValidation, message))?;
+    Ok(normalized)
+}
+
 fn resize_pane_has_standalone_trailing_delta(arguments: &[String], direction_index: usize) -> bool {
+    resize_pane_has_standalone_trailing_delta_from(arguments, direction_index + 1)
+}
+
+fn resize_pane_has_standalone_trailing_delta_from(
+    arguments: &[String],
+    start_index: usize,
+) -> bool {
     let last_index = arguments.len().saturating_sub(1);
-    let mut index = direction_index + 1;
+    let mut index = start_index;
     while index <= last_index {
         if index == last_index {
             return true;
@@ -380,12 +434,7 @@ fn resize_pane_has_standalone_trailing_delta(arguments: &[String], direction_ind
         .required(false)
         .multiple(false)
         .args(["horizontal", "vertical"])
-), group(
-    ArgGroup::new("size_spec")
-        .required(false)
-        .multiple(false)
-        .args(["size", "percentage"])
-))]
+    ))]
 pub(crate) struct SplitWindowArgs {
     #[arg(short = 'b', action = ArgAction::SetTrue)]
     pub(crate) before: bool,
@@ -403,8 +452,8 @@ pub(crate) struct SplitWindowArgs {
     pub(crate) start_directory: Option<PathBuf>,
     #[arg(short = 'l', allow_hyphen_values = true, group = "size_spec")]
     pub(crate) size: Option<String>,
-    #[arg(short = 'p', group = "size_spec")]
-    pub(crate) percentage: Option<u8>,
+    #[arg(short = 'p', hide = true, allow_hyphen_values = true)]
+    pub(crate) percentage: Option<String>,
     #[arg(short = 'F', allow_hyphen_values = true)]
     pub(crate) format: Option<String>,
     #[arg(short = 'P', action = ArgAction::SetTrue)]
@@ -447,11 +496,6 @@ pub(crate) struct SwapPaneArgs {
         .required(false)
         .multiple(false)
         .args(["horizontal", "vertical"])
-), group(
-    ArgGroup::new("size_spec")
-        .required(false)
-        .multiple(false)
-        .args(["size", "percentage"])
 ))]
 pub(crate) struct JoinPaneArgs {
     #[arg(short = 'b', action = ArgAction::SetTrue)]
@@ -464,8 +508,8 @@ pub(crate) struct JoinPaneArgs {
     pub(crate) horizontal: bool,
     #[arg(short = 'l', allow_hyphen_values = true)]
     pub(crate) size: Option<String>,
-    #[arg(short = 'p')]
-    pub(crate) percentage: Option<u8>,
+    #[arg(short = 'p', hide = true, allow_hyphen_values = true)]
+    pub(crate) percentage: Option<String>,
     #[arg(short = 'v', action = ArgAction::SetTrue, group = "direction")]
     pub(crate) vertical: bool,
     #[arg(short = 's', value_parser = parse_target_spec, allow_hyphen_values = true)]
@@ -618,15 +662,11 @@ impl ResizePaneArgs {
         .into_iter()
         .filter(|present| *present)
         .count();
-        let absolute_count = usize::from(self.columns.is_some()) + usize::from(self.rows.is_some());
-        let invalid = relative_count > 1
-            || (self.zoom && (relative_count > 0 || absolute_count > 0))
-            || (self.trim_below && (relative_count > 0 || absolute_count > 0 || self.zoom))
-            || (relative_count > 0 && absolute_count > 0);
+        let invalid = !self.zoom && !self.trim_below && relative_count > 1;
         if invalid {
             return Err(clap::Error::raw(
                 clap::error::ErrorKind::ArgumentConflict,
-                "resize-pane accepts only one relative adjustment, trim, zoom, or absolute size",
+                "resize-pane accepts only one relative adjustment",
             ));
         }
         Ok(self)
@@ -766,6 +806,12 @@ pub(crate) struct ListPanesArgs {
 
 impl SplitWindowArgs {
     fn validate(self) -> Result<Self, clap::Error> {
+        if self.percentage.is_some() && self.size.is_none() {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ValueValidation,
+                "size missing",
+            ));
+        }
         Ok(self)
     }
 
@@ -778,9 +824,7 @@ impl SplitWindowArgs {
     }
 
     pub(crate) fn size_spec(&self) -> Option<String> {
-        self.percentage
-            .map(|value| format!("{value}%"))
-            .or_else(|| self.size.clone())
+        self.size.clone()
     }
 }
 
@@ -791,7 +835,13 @@ impl SwapPaneArgs {
 }
 
 impl JoinPaneArgs {
-    fn validate(self, _command_name: &'static str) -> Result<Self, clap::Error> {
+    fn validate(self, command_name: &'static str) -> Result<Self, clap::Error> {
+        if self.percentage.is_some() && self.size.is_none() {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ValueValidation,
+                format!("command {command_name}: size missing"),
+            ));
+        }
         Ok(self)
     }
 
@@ -804,9 +854,7 @@ impl JoinPaneArgs {
     }
 
     pub(crate) fn size_spec(&self) -> Option<String> {
-        self.percentage
-            .map(|value| format!("{value}%"))
-            .or_else(|| self.size.clone())
+        self.size.clone()
     }
 }
 

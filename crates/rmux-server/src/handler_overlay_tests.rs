@@ -138,6 +138,101 @@ async fn display_menu_accepts_parsed_command_list_items_from_queue() {
     assert!(rendered.contains("First"));
 }
 
+#[tokio::test]
+async fn display_menu_renders_mouse_word_and_line_from_clicked_pane() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("menu-mouse-word");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_quiet_attached_session(&handler, &alpha, requester_pid).await;
+    enable_mouse(&handler).await;
+
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"alpha beta gamma")
+            .expect("transcript append succeeds");
+    }
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, &sgr_mouse(0, 6, 0))
+        .await
+        .expect("mouse input records current mouse event");
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r##"display-menu -xM -yM -T Menu "#{mouse_word}:#{mouse_line}" w "display-message word""##,
+    )
+    .await;
+
+    let frame = next_overlay_frame(&mut control_rx).await;
+    let rendered = String::from_utf8(frame.frame).expect("menu frame is utf-8");
+    assert!(
+        rendered.contains("beta:alpha beta gamma"),
+        "menu should render mouse formats from clicked pane, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn display_menu_single_character_shortcut_executes_item() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha-shortcut");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-menu -xM -yM -T Menu "First" "f" { display-message first }"#,
+    )
+    .await;
+    let _ = next_overlay_frame(&mut control_rx).await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"f")
+        .await
+        .expect("menu shortcut");
+
+    let active_attach = handler.active_attach.lock().await;
+    let active = active_attach
+        .by_pid
+        .get(&requester_pid)
+        .expect("attached client");
+    assert!(active.overlay.is_none());
+}
+
+#[tokio::test]
+async fn display_menu_hyphen_prefixed_label_with_command_is_actionable() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha-hyphen-menu");
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-menu -xM -yM -T Menu -- "-Danger" "d" { display-message danger }"#,
+    )
+    .await;
+    let frame = next_overlay_frame(&mut control_rx).await;
+    let rendered = String::from_utf8(frame.frame).expect("menu frame is utf-8");
+    assert!(
+        rendered.contains("-Danger"),
+        "hyphen-prefixed label should render as an actionable item, got {rendered:?}"
+    );
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"d")
+        .await
+        .expect("menu shortcut");
+
+    let active_attach = handler.active_attach.lock().await;
+    let active = active_attach
+        .by_pid
+        .get(&requester_pid)
+        .expect("attached client");
+    assert!(active.overlay.is_none());
+}
+
 async fn next_overlay_frame(
     control_rx: &mut mpsc::UnboundedReceiver<AttachControl>,
 ) -> crate::pane_io::OverlayFrame {
@@ -205,7 +300,7 @@ async fn display_menu_keyboard_navigation_wraps_around_separators() {
     run_overlay_command(
         &handler,
         requester_pid,
-        r#"display-menu -T Menu "First" "f" "display-message first" "" "" "" "Second" "s" "display-message second""#,
+        r#"display-menu -T Menu "First" "f" "display-message first" "" "Second" "s" "display-message second""#,
     )
     .await;
 

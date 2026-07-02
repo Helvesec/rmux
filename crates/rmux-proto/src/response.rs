@@ -874,6 +874,28 @@ pub struct CancelSdkWaitResponse {
     pub removed: bool,
 }
 
+impl CancelSdkWaitResponse {
+    /// Returns the compatibility-preserving ACK used by armed SDK waits.
+    ///
+    /// `SdkWaitOutcome` is a published exhaustive enum whose terminal outcomes
+    /// must stay source-compatible across patch releases. The daemon therefore
+    /// acknowledges an armed wait with this existing response shape instead of
+    /// adding a third `SdkWaitOutcome` variant.
+    #[must_use]
+    pub const fn armed_ack(wait_id: SdkWaitId) -> Self {
+        Self {
+            wait_id,
+            removed: false,
+        }
+    }
+
+    /// Returns whether this response is the compatibility ACK for `wait_id`.
+    #[must_use]
+    pub const fn is_armed_ack_for(&self, wait_id: SdkWaitId) -> bool {
+        self.wait_id.as_u64() == wait_id.as_u64() && !self.removed
+    }
+}
+
 /// Error response payload for detached RPC failures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorResponse {
@@ -955,6 +977,18 @@ mod tests {
             Response::WaitFor(WaitForResponse).command_name(),
             "wait-for"
         );
+    }
+
+    #[test]
+    fn sdk_wait_outcome_patch_surface_stays_terminal_only() {
+        fn is_terminal(outcome: SdkWaitOutcome) -> bool {
+            match outcome {
+                SdkWaitOutcome::Matched | SdkWaitOutcome::Cancelled => true,
+            }
+        }
+
+        assert!(is_terminal(SdkWaitOutcome::Matched));
+        assert!(is_terminal(SdkWaitOutcome::Cancelled));
     }
 
     #[test]

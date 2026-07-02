@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use rmux_proto::request::{AttachSessionExt2Request, NewSessionExtRequest};
 use rmux_proto::{
     CapturePaneTargetActionRequest, OptionScopeSelector, PaneTarget, ResizePaneAdjustment,
-    ResizePaneTargetActionRequest, SessionName, SplitDirection, SplitWindowTargetActionRequest,
-    Target, TerminalSize, WindowTarget,
+    ResizePaneRelativeDirection, ResizePaneTargetActionRequest, SessionName, SplitDirection,
+    SplitWindowTargetActionRequest, Target, TerminalSize, WindowTarget,
 };
 
 use crate::client_terminal::client_terminal_context_from_parts;
@@ -793,12 +793,20 @@ pub(super) fn parse_resize_pane(args: &[OsString]) -> Option<ResizePaneTargetAct
         return None;
     }
 
+    let normalized = args
+        .iter()
+        .map(|arg| arg.to_str().map(ToOwned::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    let args = rmux_core::tmux_precedence::normalize_tmux_precedence("resize-pane", normalized)
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+
     let mut target = None;
     let mut columns = None;
     let mut rows = None;
-    let mut adjustment = ResizePaneAdjustment::NoOp;
-    let mut saw_absolute_resize = false;
-    let mut saw_relative_resize = false;
+    let mut relative = None;
+    let mut zoom = false;
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].to_str()?;
@@ -808,77 +816,68 @@ pub(super) fn parse_resize_pane(args: &[OsString]) -> Option<ResizePaneTargetAct
                 target = Some(args.get(index)?.to_str()?.to_owned());
             }
             "-x" => {
-                if saw_relative_resize {
-                    return None;
-                }
-                saw_absolute_resize = true;
                 index += 1;
                 columns = Some(args.get(index)?.to_str()?.parse::<u16>().ok()?);
-                adjustment = resize_absolute_adjustment(columns, rows);
             }
             "-y" => {
-                if saw_relative_resize {
-                    return None;
-                }
-                saw_absolute_resize = true;
                 index += 1;
                 rows = Some(args.get(index)?.to_str()?.parse::<u16>().ok()?);
-                adjustment = resize_absolute_adjustment(columns, rows);
             }
             "-L" => {
-                if saw_absolute_resize {
+                if relative.is_some() {
                     return None;
                 }
-                saw_relative_resize = true;
-                let (cells, consumed) = parse_optional_relative_cells(args, index)?;
-                if reject_trailing_args_after_direction_delta(args, index, consumed) {
+                let (cells, consumed) = parse_optional_relative_cells(&args, index)?;
+                if reject_trailing_args_after_direction_delta(&args, index, consumed) {
                     return None;
                 }
-                adjustment = ResizePaneAdjustment::Left { cells };
+                relative = Some((ResizePaneRelativeDirection::Left, cells));
                 index += consumed;
             }
             "-R" => {
-                if saw_absolute_resize {
+                if relative.is_some() {
                     return None;
                 }
-                saw_relative_resize = true;
-                let (cells, consumed) = parse_optional_relative_cells(args, index)?;
-                if reject_trailing_args_after_direction_delta(args, index, consumed) {
+                let (cells, consumed) = parse_optional_relative_cells(&args, index)?;
+                if reject_trailing_args_after_direction_delta(&args, index, consumed) {
                     return None;
                 }
-                adjustment = ResizePaneAdjustment::Right { cells };
+                relative = Some((ResizePaneRelativeDirection::Right, cells));
                 index += consumed;
             }
             "-U" => {
-                if saw_absolute_resize {
+                if relative.is_some() {
                     return None;
                 }
-                saw_relative_resize = true;
-                let (cells, consumed) = parse_optional_relative_cells(args, index)?;
-                if reject_trailing_args_after_direction_delta(args, index, consumed) {
+                let (cells, consumed) = parse_optional_relative_cells(&args, index)?;
+                if reject_trailing_args_after_direction_delta(&args, index, consumed) {
                     return None;
                 }
-                adjustment = ResizePaneAdjustment::Up { cells };
+                relative = Some((ResizePaneRelativeDirection::Up, cells));
                 index += consumed;
             }
             "-D" => {
-                if saw_absolute_resize {
+                if relative.is_some() {
                     return None;
                 }
-                saw_relative_resize = true;
-                let (cells, consumed) = parse_optional_relative_cells(args, index)?;
-                if reject_trailing_args_after_direction_delta(args, index, consumed) {
+                let (cells, consumed) = parse_optional_relative_cells(&args, index)?;
+                if reject_trailing_args_after_direction_delta(&args, index, consumed) {
                     return None;
                 }
-                adjustment = ResizePaneAdjustment::Down { cells };
+                relative = Some((ResizePaneRelativeDirection::Down, cells));
                 index += consumed;
             }
-            "-Z" => adjustment = ResizePaneAdjustment::Zoom,
+            "-Z" => zoom = true,
             _ => return None,
         }
         index += 1;
     }
 
+    let adjustment = if zoom {
+        ResizePaneAdjustment::Zoom
+    } else {
+        resize_adjustment(columns, rows, relative)
+    };
     Some(ResizePaneTargetActionRequest { target, adjustment })
 }
 
@@ -1011,12 +1010,35 @@ fn reject_trailing_args_after_direction_delta(
     consumed != 0 && flag_index + 1 + consumed < args.len()
 }
 
-fn resize_absolute_adjustment(columns: Option<u16>, rows: Option<u16>) -> ResizePaneAdjustment {
-    match (columns, rows) {
-        (Some(columns), Some(rows)) => ResizePaneAdjustment::AbsoluteSize { columns, rows },
-        (Some(columns), None) => ResizePaneAdjustment::AbsoluteWidth { columns },
-        (None, Some(rows)) => ResizePaneAdjustment::AbsoluteHeight { rows },
-        (None, None) => ResizePaneAdjustment::NoOp,
+fn resize_adjustment(
+    columns: Option<u16>,
+    rows: Option<u16>,
+    relative: Option<(ResizePaneRelativeDirection, u16)>,
+) -> ResizePaneAdjustment {
+    match (columns, rows, relative) {
+        (Some(columns), Some(rows), Some((relative, cells))) => ResizePaneAdjustment::Composite {
+            columns: Some(columns),
+            rows: Some(rows),
+            relative: Some(relative),
+            cells,
+        },
+        (Some(columns), None, Some((relative, cells))) => ResizePaneAdjustment::Composite {
+            columns: Some(columns),
+            rows: None,
+            relative: Some(relative),
+            cells,
+        },
+        (None, Some(rows), Some((relative, cells))) => ResizePaneAdjustment::Composite {
+            columns: None,
+            rows: Some(rows),
+            relative: Some(relative),
+            cells,
+        },
+        (Some(columns), Some(rows), None) => ResizePaneAdjustment::AbsoluteSize { columns, rows },
+        (Some(columns), None, None) => ResizePaneAdjustment::AbsoluteWidth { columns },
+        (None, Some(rows), None) => ResizePaneAdjustment::AbsoluteHeight { rows },
+        (None, None, Some((relative, cells))) => relative.to_adjustment(cells),
+        (None, None, None) => ResizePaneAdjustment::NoOp,
     }
 }
 
@@ -1059,6 +1081,8 @@ fn infer_client_utf8_from_env() -> bool {
 #[cfg(windows)]
 const RMUX_CLIENT_SHELL_ENV: &str = "RMUX_CLIENT_SHELL";
 #[cfg(windows)]
+const INTERNAL_CLIENT_SHELL_ENV: &str = "RMUX_INTERNAL_CLIENT_SHELL";
+#[cfg(windows)]
 const INTERNAL_TMUX_COMPAT_ENV: &str = "RMUX_INTERNAL_INVOKED_AS_TMUX";
 
 #[cfg(windows)]
@@ -1084,6 +1108,7 @@ where
         })
         .filter(|(name, _)| !name.starts_with('='))
         .filter(|(name, _)| !name.eq_ignore_ascii_case(RMUX_CLIENT_SHELL_ENV))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_CLIENT_SHELL_ENV))
         .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TMUX_COMPAT_ENV))
         .map(|(name, value)| format!("{name}={value}"))
         .collect::<Vec<_>>();
@@ -1096,7 +1121,7 @@ where
 }
 
 #[cfg(windows)]
-fn invoking_client_shell() -> Option<String> {
+pub(super) fn invoking_client_shell() -> Option<String> {
     let parent_pid = rmux_os::process::parent_pid(std::process::id())?;
     let parent_name = rmux_os::process::command_name(parent_pid)?;
     windows_client_shell_for_parent_name(&parent_name)

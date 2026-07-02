@@ -5,10 +5,12 @@ use rmux_proto::{
     Target,
 };
 
-use super::queue::{queue_action_from_response, QueueCommandAction};
+use super::format_context_for_target_with_server_values;
+use super::queue::{queue_action_from_response, QueueCommandAction, QueueExecutionContext};
 use super::queue_parse::ParsedNewWindowCommand;
 use super::render_start_directory_template;
 use super::targets::NewWindowTargetIndex;
+use crate::format_runtime::render_runtime_template;
 use crate::handler::{client_environment_snapshot, client_spawn_environment, RequestHandler};
 use crate::hook_runtime::{capture_inline_hooks, PendingInlineHookFormat};
 use crate::pane_terminals::{NewWindowOptions, WindowSpawnOptions};
@@ -18,6 +20,7 @@ impl RequestHandler {
         &self,
         requester_pid: u32,
         command: ParsedNewWindowCommand,
+        context: &QueueExecutionContext,
     ) -> Result<QueueCommandAction, RmuxError> {
         let ParsedNewWindowCommand {
             target,
@@ -51,10 +54,20 @@ impl RequestHandler {
         )?;
 
         let socket_path = self.socket_path();
-        let process_command = crate::legacy_command::from_legacy_command(command.as_deref());
+        let attached_count = self.attached_count(&target).await;
+        let rendered_command = self
+            .render_queued_new_window_command(
+                command.as_deref(),
+                &target,
+                context,
+                attached_count,
+                &socket_path,
+            )
+            .await?;
+        let process_command =
+            crate::legacy_command::from_legacy_command(rendered_command.as_deref());
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
-        let attached_count = self.attached_count(&target).await;
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
         let (response, inline_hooks) = capture_inline_hooks(async {
@@ -134,6 +147,43 @@ impl RequestHandler {
         .await;
 
         queue_action_from_response(response)
+    }
+    async fn render_queued_new_window_command(
+        &self,
+        command: Option<&[String]>,
+        target: &rmux_proto::SessionName,
+        context: &QueueExecutionContext,
+        attached_count: usize,
+        socket_path: &std::path::Path,
+    ) -> Result<Option<Vec<String>>, RmuxError> {
+        let Some(command) = command else {
+            return Ok(None);
+        };
+        if !command.iter().any(|argument| argument.contains("#{")) {
+            return Ok(Some(command.to_vec()));
+        }
+
+        let format_target = context
+            .current_target()
+            .cloned()
+            .unwrap_or_else(|| Target::Session(target.clone()));
+        let state = self.state.lock().await;
+        let mut runtime = format_context_for_target_with_server_values(
+            &state,
+            &format_target,
+            attached_count,
+            socket_path,
+        )?;
+        if let Some(client_name) = context.client_name.as_ref() {
+            runtime = runtime.with_named_value("client_name", client_name.clone());
+        }
+
+        Ok(Some(
+            command
+                .iter()
+                .map(|argument| render_runtime_template(argument, &runtime, false))
+                .collect(),
+        ))
     }
 }
 

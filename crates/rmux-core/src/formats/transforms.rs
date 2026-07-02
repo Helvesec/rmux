@@ -62,36 +62,139 @@ pub(super) fn apply_substitution(value: &str, modifier: &FormatModifier) -> Stri
     let Some(replacement) = modifier.argv.get(1) else {
         return value.to_owned();
     };
+    if pattern.is_empty() {
+        return value.to_owned();
+    }
+    if pattern == "^" {
+        return value
+            .chars()
+            .next()
+            .map_or_else(String::new, |first| value[first.len_utf8()..].to_owned());
+    }
+    if pattern == "$" {
+        if value.is_empty() {
+            return String::new();
+        }
+        let mut output = String::with_capacity(value.len() + replacement.len());
+        output.push_str(value);
+        push_tmux_replacement_without_captures(replacement, &mut output);
+        return output;
+    }
     let case_insensitive = modifier
         .argv
         .get(2)
         .is_some_and(|flags| flags.contains('i'));
 
     match cached_regex(pattern, case_insensitive) {
-        Ok(regex) => regex
-            .replace_all(value, tmux_regex_replacement(replacement).as_str())
-            .into_owned(),
+        Ok(regex) => substitute_regex(value, &regex, replacement),
         Err(_) => value.replace(pattern, replacement),
     }
 }
 
-fn tmux_regex_replacement(replacement: &str) -> String {
-    let mut translated = String::with_capacity(replacement.len());
+fn substitute_regex(value: &str, regex: &regex::Regex, replacement: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut offset = 0;
+
+    while offset < value.len() {
+        if !value.is_char_boundary(offset) {
+            let byte = value.as_bytes()[offset];
+            push_tmux_byte(byte, &mut output);
+            push_tmux_replacement_without_captures(replacement, &mut output);
+            offset += 1;
+            continue;
+        }
+
+        let suffix = &value[offset..];
+        let Some(captures) = regex.captures(suffix) else {
+            output.push_str(suffix);
+            return output;
+        };
+        let Some(match_) = captures.get(0) else {
+            output.push_str(suffix);
+            return output;
+        };
+
+        let match_start = offset + match_.start();
+        let match_end = offset + match_.end();
+        output.push_str(&value[offset..match_start]);
+
+        if match_.is_empty() {
+            if match_start >= value.len() {
+                push_tmux_replacement(&captures, replacement, &mut output);
+                offset = value.len();
+                continue;
+            }
+            let byte = value.as_bytes()[match_start];
+            push_tmux_byte(byte, &mut output);
+            let next_offset = match_start + 1;
+            if !has_non_empty_match_at(regex, value, next_offset) {
+                push_tmux_replacement(&captures, replacement, &mut output);
+            }
+            offset = next_offset;
+            continue;
+        }
+
+        push_tmux_replacement(&captures, replacement, &mut output);
+        offset = match_end;
+    }
+
+    output
+}
+
+fn has_non_empty_match_at(regex: &regex::Regex, value: &str, offset: usize) -> bool {
+    if offset >= value.len() {
+        return false;
+    }
+    if !value.is_char_boundary(offset) {
+        return false;
+    }
+
+    regex
+        .captures(&value[offset..])
+        .and_then(|captures| captures.get(0))
+        .is_some_and(|match_| match_.start() == 0 && !match_.is_empty())
+}
+
+fn push_tmux_replacement(captures: &regex::Captures<'_>, replacement: &str, output: &mut String) {
     let mut chars = replacement.chars().peekable();
 
     while let Some(character) = chars.next() {
         match character {
             '\\' if chars.peek().is_some_and(char::is_ascii_digit) => {
-                translated.push_str("${");
-                translated.push(chars.next().expect("peeked digit exists"));
-                translated.push('}');
+                let digit = chars.next().expect("peeked digit exists");
+                let capture_index = digit.to_digit(10).expect("ascii digit") as usize;
+                match captures.get(capture_index) {
+                    Some(capture) if !capture.as_str().is_empty() => {
+                        output.push_str(capture.as_str())
+                    }
+                    _ => output.push(digit),
+                }
             }
-            '$' => translated.push_str("$$"),
-            _ => translated.push(character),
+            _ => output.push(character),
         }
     }
+}
 
-    translated
+fn push_tmux_replacement_without_captures(replacement: &str, output: &mut String) {
+    let mut chars = replacement.chars().peekable();
+
+    while let Some(character) = chars.next() {
+        match character {
+            '\\' if chars.peek().is_some_and(char::is_ascii_digit) => {
+                output.push(chars.next().expect("peeked digit exists"));
+            }
+            _ => output.push(character),
+        }
+    }
+}
+
+fn push_tmux_byte(byte: u8, output: &mut String) {
+    if byte.is_ascii() {
+        output.push(char::from(byte));
+    } else {
+        output.push('\\');
+        output.push_str(&format!("{byte:03o}"));
+    }
 }
 
 pub(super) fn truncate_left(s: &str, max: usize) -> String {

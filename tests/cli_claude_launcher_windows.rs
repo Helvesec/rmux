@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 
 use rmux_pty::{ChildCommand, SpawnedPty, TerminalSize};
 
+#[path = "support/windows_cli_serial.rs"]
+mod windows_cli_serial;
+
 static UNIQUE_TEST_ID: AtomicUsize = AtomicUsize::new(0);
 
 #[test]
@@ -56,6 +59,7 @@ fn run_attached_probe(
     bin: PathBuf,
     mode: FakeClaudeMode,
 ) -> Result<(), Box<dyn Error>> {
+    let _serial_guard = windows_cli_serial::acquire("claude-launcher-windows")?;
     let rmux = std::env::var_os("RMUX_CLAUDE_TEST_RMUX")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_rmux")));

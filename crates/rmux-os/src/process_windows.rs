@@ -13,6 +13,9 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
 use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -156,6 +159,26 @@ pub(super) fn command_name(pid: u32) -> io::Result<Option<String>> {
     buffer.truncate(usize::try_from(len).map_err(|_| io::ErrorKind::InvalidData)?);
     let path = wide_to_string_lossy(&buffer);
     Ok(super::executable_name(&path))
+}
+
+pub(super) fn descendant_command_names(pid: u32) -> io::Result<Vec<String>> {
+    let entries = process_snapshot_entries()?;
+    let mut pending = vec![pid];
+    let mut names = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(pid);
+
+    while let Some(parent) = pending.pop() {
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.parent_pid == parent && seen.insert(entry.pid))
+        {
+            names.push(entry.name.clone());
+            pending.push(entry.pid);
+        }
+    }
+
+    Ok(names)
 }
 
 pub(super) fn fd_path(_pid: u32, _fd: i32) -> io::Result<Option<PathBuf>> {
@@ -417,6 +440,48 @@ impl Drop for WindowsHandle {
     }
 }
 
+struct ProcessSnapshotEntry {
+    pid: u32,
+    parent_pid: u32,
+    name: String,
+}
+
+fn process_snapshot_entries() -> io::Result<Vec<ProcessSnapshotEntry>> {
+    let handle = unsafe {
+        // SAFETY: The flags request a read-only process snapshot and the pid
+        // argument is ignored for TH32CS_SNAPPROCESS.
+        CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    };
+    if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let _guard = WindowsHandle(handle);
+
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..PROCESSENTRY32W::default()
+    };
+    let mut entries = Vec::new();
+    let mut ok = unsafe {
+        // SAFETY: `entry` is initialized and its dwSize field is set as
+        // required by the ToolHelp API.
+        Process32FirstW(handle, &mut entry)
+    };
+    while ok != 0 {
+        entries.push(ProcessSnapshotEntry {
+            pid: entry.th32ProcessID,
+            parent_pid: entry.th32ParentProcessID,
+            name: wide_nul_to_string(&entry.szExeFile),
+        });
+        ok = unsafe {
+            // SAFETY: `entry` remains valid and initialized across iterations.
+            Process32NextW(handle, &mut entry)
+        };
+    }
+
+    Ok(entries)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ProcessBasicInformationRecord {
@@ -535,6 +600,14 @@ fn unavailable_or_error<T>(error: io::Error) -> io::Result<Option<T>> {
 
 fn wide_to_string_lossy(value: &[u16]) -> String {
     String::from_utf16_lossy(value)
+}
+
+fn wide_nul_to_string(value: &[u16]) -> String {
+    let len = value
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(value.len());
+    wide_to_string_lossy(&value[..len])
 }
 
 #[cfg(test)]

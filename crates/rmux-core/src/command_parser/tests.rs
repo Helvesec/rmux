@@ -1,6 +1,6 @@
 use super::{
-    lookup_command, parse_command_arguments, CommandArgument, CommandParser, COMMAND_TABLE,
-    SOURCE_FILE_MAX_COMMAND_BYTES,
+    lookup_command, parse_command_arguments, CommandArgument, CommandParseErrorKind, CommandParser,
+    COMMAND_TABLE, SOURCE_FILE_MAX_COMMAND_BYTES,
 };
 
 fn command_names(input: &str) -> Vec<String> {
@@ -325,6 +325,21 @@ fn lookup_errors_report_command_start_line() {
 }
 
 #[test]
+fn alias_lookup_errors_report_invocation_line() {
+    let error = CommandParser::new()
+        .with_command_alias("badalias=definitely-not-a-command")
+        .expect("valid alias")
+        .parse("list-sessions\nbadalias\nlist-windows")
+        .unwrap_err();
+
+    assert_eq!(error.line(), 2);
+    assert_eq!(error.kind(), CommandParseErrorKind::Lookup);
+    assert!(error
+        .to_string()
+        .starts_with("unknown command: definitely-not-a-command"));
+}
+
+#[test]
 fn parses_brace_delimited_command_arguments() {
     let commands = CommandParser::new()
         .parse("if-shell true { display-message yes ; list-sessions }")
@@ -416,6 +431,44 @@ fn strips_comments_and_accepts_format_after_condition_keyword() {
             .map(|command| command.name())
             .collect::<Vec<_>>(),
         ["list-sessions", "display-message"]
+    );
+}
+
+#[test]
+fn source_file_comments_unquoted_hash_formats_like_tmux() {
+    let commands = CommandParser::new()
+        .with_format_value("version", "3.4")
+        .parse_source_file(
+            "%if #{>=:#{version},3.2}\n\
+             set-option -g extended-keys #{?#{||:0,0},on,off}\n\
+             %endif\n",
+        )
+        .unwrap();
+
+    assert_eq!(commands.commands().len(), 1);
+    assert_eq!(commands.commands()[0].name(), "set-option");
+    let args = commands.commands()[0].arguments();
+    assert_eq!(args.len(), 2);
+    assert_eq!(args[0].as_string(), Some("-g"));
+    assert_eq!(args[1].as_string(), Some("extended-keys"));
+}
+
+#[test]
+fn source_file_preserves_quoted_hash_formats_and_condition_formats() {
+    let commands = CommandParser::new()
+        .with_format_value("pane_active", "1")
+        .parse_source_file(
+            "%if #{pane_active}\n\
+             list-sessions -F '#{session_name}'\n\
+             %endif\n",
+        )
+        .unwrap();
+
+    assert_eq!(commands.commands().len(), 1);
+    assert_eq!(commands.commands()[0].name(), "list-sessions");
+    assert_eq!(
+        commands.commands()[0].arguments()[1].as_string(),
+        Some("#{session_name}")
     );
 }
 

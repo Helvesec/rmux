@@ -1,8 +1,8 @@
 use std::io;
 
 use rmux_proto::{
-    encode_attach_message, AttachFrameDecoder, AttachMessage, AttachedKeystroke, PaneTargetRef,
-    TerminalSize, WebTerminalPalette,
+    encode_attach_message, AttachFrameDecoder, AttachMessage, AttachedKeystroke,
+    AttachedWindowsConsoleKey, PaneTargetRef, TerminalSize, WebTerminalPalette,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 
@@ -268,6 +268,17 @@ impl WebSessionStream {
     pub(crate) async fn send_attach_keystroke(&mut self, bytes: Vec<u8>) -> io::Result<()> {
         self.write_attach_message(AttachMessage::Keystroke(AttachedKeystroke::new(bytes)))
             .await
+    }
+
+    pub(crate) async fn send_attach_windows_console_key(
+        &mut self,
+        bytes: Vec<u8>,
+        key: AttachedWindowsConsoleKey,
+    ) -> io::Result<()> {
+        self.write_attach_message(AttachMessage::Keystroke(
+            AttachedKeystroke::new(bytes).with_windows_console_key(key),
+        ))
+        .await
     }
 
     pub(crate) async fn send_attach_resize(&mut self, size: TerminalSize) -> io::Result<()> {

@@ -4,7 +4,7 @@ use std::os::unix::process::ExitStatusExt;
 use rmux_core::{command_parser::ParsedCommands, formats::is_truthy, PaneId};
 use rmux_proto::{
     CommandOutput, ErrorResponse, IfShellRequest, IfShellResponse, PaneTarget, Response, RmuxError,
-    RunShellRequest, RunShellResponse, Target,
+    RunShellRequest, RunShellResponse, SessionName, Target,
 };
 
 use super::super::RequestHandler;
@@ -17,6 +17,7 @@ use super::runtime::{
 };
 use super::targets::active_session_target;
 use crate::format_runtime::render_runtime_template;
+use crate::hook_runtime::current_hook_formats;
 use crate::terminal::{SessionBaseEnvironment, TerminalProfile};
 
 impl RequestHandler {
@@ -25,6 +26,16 @@ impl RequestHandler {
         requester_pid: u32,
         request: RunShellRequest,
     ) -> Response {
+        self.handle_run_shell_with_client_name(requester_pid, request, None)
+            .await
+    }
+
+    pub(in crate::handler) async fn handle_run_shell_with_client_name(
+        &self,
+        requester_pid: u32,
+        request: RunShellRequest,
+        client_name: Option<String>,
+    ) -> Response {
         if request.background {
             if let Some(delay_seconds) = request.delay_seconds {
                 if let Err(error) = run_shell_delay_duration(delay_seconds.as_secs_f64()) {
@@ -32,18 +43,35 @@ impl RequestHandler {
                 }
             }
             let can_write = self.requester_can_write(requester_pid).await;
+            let detached_request_guard = self.begin_detached_request();
+            let requester_access_guard =
+                self.begin_detached_requester_access(requester_pid, can_write);
             let handler = self.clone();
+            let hook_formats = current_hook_formats();
+            let hook_context_active = crate::hook_runtime::hooks_disabled();
             if let Err(error) = spawn_background_async("rmux-run-shell", move || async move {
-                let _requester_access_guard =
-                    handler.begin_detached_requester_access(requester_pid, can_write);
-                let _ = handler.run_shell_task(requester_pid, request).await;
+                let task = async move {
+                    let _detached_request_guard = detached_request_guard;
+                    let _requester_access_guard = requester_access_guard;
+                    let _ = handler
+                        .run_shell_task(requester_pid, request, client_name)
+                        .await;
+                };
+                if hook_context_active {
+                    crate::hook_runtime::with_hook_execution(hook_formats, task).await;
+                } else {
+                    task.await;
+                }
             }) {
                 return Response::Error(ErrorResponse { error });
             }
             return Response::RunShell(RunShellResponse::background());
         }
 
-        match self.run_shell_task(requester_pid, request).await {
+        match self
+            .run_shell_task(requester_pid, request, client_name)
+            .await
+        {
             Ok(RunShellTaskOutput::CommandOutput(output)) => {
                 Response::RunShell(RunShellResponse::from_output(output))
             }
@@ -68,20 +96,47 @@ impl RequestHandler {
         requester_pid: u32,
         request: IfShellRequest,
     ) -> Response {
+        self.handle_if_shell_with_client_name(requester_pid, request, None)
+            .await
+    }
+
+    pub(in crate::handler) async fn handle_if_shell_with_client_name(
+        &self,
+        requester_pid: u32,
+        request: IfShellRequest,
+        client_name: Option<String>,
+    ) -> Response {
         if request.background {
             let can_write = self.requester_can_write(requester_pid).await;
+            let detached_request_guard = self.begin_detached_request();
+            let requester_access_guard =
+                self.begin_detached_requester_access(requester_pid, can_write);
             let handler = self.clone();
+            let hook_formats = current_hook_formats();
+            let hook_context_active = crate::hook_runtime::hooks_disabled();
             if let Err(error) = spawn_background_async("rmux-if-shell", move || async move {
-                let _requester_access_guard =
-                    handler.begin_detached_requester_access(requester_pid, can_write);
-                let _ = handler.if_shell_task(requester_pid, request).await;
+                let task = async move {
+                    let _detached_request_guard = detached_request_guard;
+                    let _requester_access_guard = requester_access_guard;
+                    let _ = handler
+                        .if_shell_task(requester_pid, request, client_name)
+                        .await;
+                };
+                if hook_context_active {
+                    crate::hook_runtime::with_hook_execution(hook_formats, task).await;
+                } else {
+                    task.await;
+                }
             }) {
                 return Response::Error(ErrorResponse { error });
             }
             return Response::IfShell(IfShellResponse::no_output());
         }
 
-        match self.if_shell_task(requester_pid, request).await {
+        match self
+            .if_shell_task(requester_pid, request, client_name)
+            .await
+        {
             Ok(Some(output)) if !output.stdout().is_empty() => {
                 Response::IfShell(IfShellResponse::from_output(output))
             }
@@ -94,6 +149,7 @@ impl RequestHandler {
         &self,
         requester_pid: u32,
         request: RunShellRequest,
+        client_name: Option<String>,
     ) -> Result<RunShellTaskOutput, RmuxError> {
         if let Some(delay_seconds) = request.delay_seconds {
             tokio::time::sleep(run_shell_delay_duration(delay_seconds.as_secs_f64())?).await;
@@ -111,7 +167,8 @@ impl RequestHandler {
                 .run_shell_commands_current_target(requester_pid, request.target)
                 .await;
             let context = QueueExecutionContext::new(request.start_directory.clone())
-                .with_current_target(current_target);
+                .with_current_target(current_target)
+                .with_client_name(client_name.clone());
             let context = match request.source_depth {
                 Some(depth) => context.for_sourced_commands(depth, None),
                 None => context,
@@ -128,7 +185,11 @@ impl RequestHandler {
 
         let profile = self.run_shell_profile(&request).await?;
         let command = self
-            .expand_run_shell_command(&request.command, request.target.as_ref())
+            .expand_run_shell_command(
+                &request.command,
+                request.target.as_ref(),
+                client_name.as_deref(),
+            )
             .await?;
         let output = run_shell_foreground(command, &profile, request.show_stderr).await?;
         let exit_status = shell_exit_status(&output.status);
@@ -159,8 +220,11 @@ impl RequestHandler {
         &self,
         requester_pid: u32,
         request: IfShellRequest,
+        client_name: Option<String>,
     ) -> Result<Option<CommandOutput>, RmuxError> {
-        let expanded_condition = self.expand_if_shell_condition(&request).await?;
+        let expanded_condition = self
+            .expand_if_shell_condition(&request, client_name.as_deref())
+            .await?;
 
         let condition_is_true = if request.format_mode {
             if_shell_format_condition_is_true(&expanded_condition)
@@ -185,7 +249,9 @@ impl RequestHandler {
             .execute_parsed_commands(
                 requester_pid,
                 parsed,
-                QueueExecutionContext::new(request.caller_cwd).with_current_target(request.target),
+                QueueExecutionContext::new(request.caller_cwd)
+                    .with_current_target(request.target)
+                    .with_client_name(client_name),
             )
             .await?;
         Ok((!output.stdout().is_empty()).then_some(output))
@@ -195,6 +261,7 @@ impl RequestHandler {
         &self,
         command: &str,
         target: Option<&PaneTarget>,
+        client_name: Option<&str>,
     ) -> Result<String, RmuxError> {
         let attached_count = if let Some(target) = target {
             self.attached_count(target.session_name()).await
@@ -202,6 +269,7 @@ impl RequestHandler {
             0
         };
 
+        let hook_formats = current_hook_formats();
         let socket_path = self.socket_path();
         let state = self.state.lock().await;
         let context = match target {
@@ -211,8 +279,28 @@ impl RequestHandler {
                 attached_count,
                 &socket_path,
             )?,
-            None => global_format_context(&state, &socket_path),
+            None => match hook_formats
+                .iter()
+                .rev()
+                .find(|(name, _)| name == "hook_session_name")
+                .and_then(|(_, value)| SessionName::new(value.clone()).ok())
+                .and_then(|session_name| hook_session_default_target(&state, &session_name))
+            {
+                Some(target) => {
+                    format_context_for_target_with_server_values(&state, &target, 0, &socket_path)?
+                }
+                None => global_format_context(&state, &socket_path),
+            },
         };
+        let context = match client_name {
+            Some(client_name) => context.with_named_value("client_name", client_name.to_owned()),
+            None => context,
+        };
+        let context = hook_formats
+            .into_iter()
+            .fold(context, |context, (name, value)| {
+                context.with_named_value(name, value)
+            });
         Ok(render_runtime_template(command, &context, false))
     }
 
@@ -296,6 +384,7 @@ impl RequestHandler {
     async fn expand_if_shell_condition(
         &self,
         request: &IfShellRequest,
+        client_name: Option<&str>,
     ) -> Result<String, RmuxError> {
         let fallback_target = if request.target.is_none() {
             self.preferred_session_name().await.ok()
@@ -331,6 +420,10 @@ impl RequestHandler {
                 .transpose()?
                 .unwrap_or_else(|| global_format_context(&state, &socket_path)),
         };
+        let context = match client_name {
+            Some(client_name) => context.with_named_value("client_name", client_name.to_owned()),
+            None => context,
+        };
 
         Ok(render_runtime_template(&request.condition, &context, false))
     }
@@ -342,13 +435,28 @@ impl RequestHandler {
         context: &QueueExecutionContext,
     ) -> Result<QueueCommandAction, RmuxError> {
         if command.background {
+            let can_write = self.requester_can_write(requester_pid).await;
+            let detached_request_guard = self.begin_detached_request();
+            let requester_access_guard =
+                self.begin_detached_requester_access(requester_pid, can_write);
             let handler = self.clone();
             let command = command.clone();
             let context = context.clone();
+            let hook_formats = current_hook_formats();
+            let hook_context_active = crate::hook_runtime::hooks_disabled();
             if let Err(error) = spawn_background_async("rmux-if-shell-queue", move || async move {
-                let _ = handler
-                    .execute_queued_if_shell_background(requester_pid, command, context)
-                    .await;
+                let task = async move {
+                    let _detached_request_guard = detached_request_guard;
+                    let _requester_access_guard = requester_access_guard;
+                    let _ = handler
+                        .execute_queued_if_shell_background(requester_pid, command, context)
+                        .await;
+                };
+                if hook_context_active {
+                    crate::hook_runtime::with_hook_execution(hook_formats, task).await;
+                } else {
+                    task.await;
+                }
             }) {
                 return Ok(QueueCommandAction::Normal {
                     output: None,
@@ -376,15 +484,18 @@ impl RequestHandler {
             )
         };
         let expanded_condition = self
-            .expand_if_shell_condition(&IfShellRequest {
-                condition: command.condition.clone(),
-                format_mode: command.format_mode,
-                then_command: String::new(),
-                else_command: None,
-                target: effective_target,
-                caller_cwd: command.caller_cwd.clone(),
-                background: false,
-            })
+            .expand_if_shell_condition(
+                &IfShellRequest {
+                    condition: command.condition.clone(),
+                    format_mode: command.format_mode,
+                    then_command: String::new(),
+                    else_command: None,
+                    target: effective_target,
+                    caller_cwd: command.caller_cwd.clone(),
+                    background: false,
+                },
+                context.client_name.as_deref(),
+            )
             .await?;
 
         let condition_is_true = if command.format_mode {
@@ -450,15 +561,18 @@ impl RequestHandler {
             )
         };
         let expanded_condition = self
-            .expand_if_shell_condition(&IfShellRequest {
-                condition: command.condition.clone(),
-                format_mode: command.format_mode,
-                then_command: String::new(),
-                else_command: None,
-                target: effective_target,
-                caller_cwd: command.caller_cwd.clone(),
-                background: false,
-            })
+            .expand_if_shell_condition(
+                &IfShellRequest {
+                    condition: command.condition.clone(),
+                    format_mode: command.format_mode,
+                    then_command: String::new(),
+                    else_command: None,
+                    target: effective_target,
+                    caller_cwd: command.caller_cwd.clone(),
+                    background: false,
+                },
+                context.client_name.as_deref(),
+            )
             .await?;
 
         let condition_is_true = if command.format_mode {
@@ -565,6 +679,27 @@ fn base_environment_for_target(
             state.session_base_environment_for_active_pane(session_name)
         }
     }
+}
+
+fn hook_session_default_target(
+    state: &crate::pane_terminals::HandlerState,
+    session_name: &SessionName,
+) -> Option<Target> {
+    active_session_target(&state.sessions, session_name).or_else(|| {
+        let session = state.sessions.session(session_name)?;
+        session.windows().iter().find_map(|(window_index, window)| {
+            window
+                .active_pane()
+                .or_else(|| window.panes().first())
+                .map(|pane| {
+                    Target::Pane(PaneTarget::with_window(
+                        session_name.clone(),
+                        *window_index,
+                        pane.index(),
+                    ))
+                })
+        })
+    })
 }
 
 fn if_shell_format_condition_is_true(value: &str) -> bool {

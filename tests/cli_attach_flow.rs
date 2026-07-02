@@ -786,10 +786,10 @@ fn prefix_x_during_display_panes_opens_kill_pane_prompt() -> Result<(), Box<dyn 
     drain_attach_output(attach.master_mut())?;
 
     attach.send_bytes(b"\x02q")?;
-    let overlay = read_until_contains(attach.master_mut(), "\x1b[?25l", IO_TIMEOUT)?;
+    let overlay = read_until_contains_all(attach.master_mut(), &["40x23", "39x23"], IO_TIMEOUT)?;
     assert!(
-        overlay.contains("\x1b[?25l"),
-        "prefix q should enter display-panes before the prefix x transition, got: {overlay:?}"
+        overlay.contains("40x23") && overlay.contains("39x23"),
+        "prefix q should render the display-panes labels before the prefix x transition, got: {overlay:?}"
     );
 
     attach.send_bytes(b"\x02x")?;

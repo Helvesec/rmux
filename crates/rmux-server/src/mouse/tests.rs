@@ -1,7 +1,8 @@
 use super::{
-    classify_mouse_event, copy_mode_mouse_context, MouseDragHandler, MouseForwardEvent,
-    MouseLayout, MouseLocation, PaneBorderStatus, PaneMouseTarget, PaneScrollbar,
-    PaneScrollbarsMode, ScrollbarPosition, StatusLineLayout, StatusRange, StatusRangeType,
+    classify_mouse_event, classify_mouse_events, copy_mode_mouse_context, MouseDragHandler,
+    MouseForwardEvent, MouseLayout, MouseLocation, PaneBorderStatus, PaneMouseTarget,
+    PaneScrollbar, PaneScrollbarsMode, ScrollbarPosition, StatusLineLayout, StatusRange,
+    StatusRangeType,
 };
 use rmux_core::{key_string_lookup_string, PaneGeometry, PaneId};
 use rmux_proto::{PaneTarget, SessionName};
@@ -230,6 +231,45 @@ fn second_click_timeout_yields_double_click_and_third_click_has_no_timer() {
 }
 
 #[test]
+fn late_third_click_does_not_drop_pending_double_click() {
+    let mut state = super::ClientMouseState::default();
+    let base = Instant::now();
+    let layout = layout();
+
+    let _ = classify_mouse_event(&mut state, &layout, raw(0, 5, 5), base);
+    let _ = classify_mouse_event(
+        &mut state,
+        &layout,
+        MouseForwardEvent {
+            lx: 5,
+            ly: 5,
+            ..raw(0, 5, 5)
+        },
+        base + std::time::Duration::from_millis(100),
+    );
+
+    let events = classify_mouse_events(
+        &mut state,
+        &layout,
+        MouseForwardEvent {
+            lx: 5,
+            ly: 5,
+            ..raw(0, 5, 5)
+        },
+        base + std::time::Duration::from_millis(500),
+    );
+
+    assert_eq!(
+        events.iter().map(|event| event.key).collect::<Vec<_>>(),
+        vec![
+            key_string_lookup_string("DoubleClick1Pane").unwrap(),
+            key_string_lookup_string("MouseDown1Pane").unwrap(),
+        ],
+        "the first two clicks should still dispatch DoubleClick1Pane before the late click"
+    );
+}
+
+#[test]
 fn drag_update_uses_dragging_sentinel_and_release_synthesizes_drag_end() {
     let mut state = super::ClientMouseState {
         drag_handler: Some(MouseDragHandler::CopyModeSelection {
@@ -258,6 +298,12 @@ fn drag_update_uses_dragging_sentinel_and_release_synthesizes_drag_end() {
     )
     .expect("drag start");
     assert_eq!(start.key, super::KEYC_DRAGGING);
+    assert_eq!(start.event.raw.x, 5);
+    assert_eq!(start.event.raw.y, 5);
+    let context = copy_mode_mouse_context(&start.event, layout.panes[0].geometry, -1)
+        .expect("copy-mode drag start context");
+    assert_eq!(context.content_x, 5);
+    assert_eq!(context.content_y, 4);
     assert_eq!(state.drag_flag, 1);
 
     let end = classify_mouse_event(
@@ -283,6 +329,38 @@ fn drag_update_uses_dragging_sentinel_and_release_synthesizes_drag_end() {
     );
     assert_eq!(state.drag_flag, 0);
     assert_eq!(state.slider_mpos, -1);
+}
+
+#[test]
+fn plain_mouse_drag_keeps_current_coordinates_for_bindings() {
+    let mut state = super::ClientMouseState::default();
+    let now = Instant::now();
+    let layout = layout();
+
+    let drag = classify_mouse_event(
+        &mut state,
+        &layout,
+        MouseForwardEvent {
+            b: 32,
+            lb: 0,
+            x: 6,
+            y: 6,
+            lx: 5,
+            ly: 5,
+            sgr_b: 32,
+            sgr_type: 'M',
+            ignore: false,
+        },
+        now,
+    )
+    .expect("drag event");
+
+    assert_eq!(
+        drag.key,
+        key_string_lookup_string("MouseDrag1Pane").unwrap()
+    );
+    assert_eq!(drag.event.raw.x, 6);
+    assert_eq!(drag.event.raw.y, 6);
 }
 
 #[test]

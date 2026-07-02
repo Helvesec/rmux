@@ -5,14 +5,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::RequestHandler;
 use crate::pane_io::AttachControl;
 use crate::pane_terminals::PaneLifecycleProcessState;
-use rmux_core::LifecycleEvent;
 use rmux_proto::{
     BreakPaneRequest, DisplayPanesRequest, KillPaneRequest, ListPanesRequest, ListWindowsRequest,
-    MovePaneRequest, NewSessionExtRequest, NewSessionRequest, OptionName, PaneSnapshotRequest,
-    PaneTarget, PipePaneRequest, ProcessCommand, RenameWindowRequest, Request, RespawnPaneRequest,
-    Response, ScopeSelector, SelectPaneRequest, SessionName, SetHookMutationRequest, SetOptionMode,
-    SetOptionRequest, SplitDirection, SplitWindowExtRequest, SplitWindowRequest, SplitWindowTarget,
-    TerminalSize, WindowTarget,
+    MovePaneRequest, NewSessionExtRequest, NewSessionRequest, OptionName, PaneKillRequest,
+    PaneRespawnRequest, PaneSnapshotRequest, PaneTarget, PaneTargetRef, PipePaneRequest,
+    ProcessCommand, RenameWindowRequest, Request, RespawnPaneRequest, Response, ScopeSelector,
+    SelectPaneRequest, SessionName, SetHookMutationRequest, SetOptionMode, SetOptionRequest,
+    SplitDirection, SplitWindowExtRequest, SplitWindowRequest, SplitWindowTarget, TerminalSize,
+    WindowTarget,
 };
 use rmux_proto::{HookLifecycle, HookName};
 use tokio::sync::mpsc;
@@ -906,6 +906,56 @@ async fn break_pane_print_target_uses_custom_format() {
 }
 
 #[tokio::test]
+async fn break_pane_print_target_refreshes_automatic_window_name() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha-break-name");
+    create_session(&handler, &alpha).await;
+
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(alpha.clone()),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        rmux_proto::Response::SplitWindow(_)
+    ));
+
+    let response = handler
+        .handle(Request::BreakPane(Box::new(BreakPaneRequest {
+            source: PaneTarget::with_window(alpha.clone(), 0, 1),
+            target: Some(WindowTarget::with_window(alpha.clone(), 1)),
+            name: None,
+            detached: true,
+            after: false,
+            before: false,
+            print_target: true,
+            format: Some("#{window_name}:#{pane_current_command}".to_owned()),
+        })))
+        .await;
+
+    let rmux_proto::Response::BreakPane(success) = response else {
+        panic!("expected break-pane response");
+    };
+    let output = success.command_output().expect("break-pane -P output");
+    let output = String::from_utf8(output.stdout().to_vec()).expect("utf-8 output");
+    let (window_name, current_command) = output
+        .trim_end()
+        .split_once(':')
+        .expect("window name and current command");
+    assert!(
+        !window_name.is_empty(),
+        "break-pane -P should expose a tmux-style automatic window name, got {output:?}"
+    );
+    assert!(
+        !current_command.is_empty(),
+        "pane_current_command sanity check, got {output:?}"
+    );
+}
+
+#[tokio::test]
 async fn pipe_pane_rejects_dead_panes() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -1007,7 +1057,7 @@ async fn respawn_pane_with_kill_flag_applies_directory_environment_and_command()
 }
 
 #[tokio::test]
-async fn respawn_pane_with_kill_flag_emits_replaced_pane_exit() {
+async fn respawn_pane_with_kill_flag_does_not_emit_pane_exited_like_tmux() {
     let handler = RequestHandler::new();
     let alpha = session_name("respawn-exit");
     create_session(&handler, &alpha).await;
@@ -1039,22 +1089,11 @@ async fn respawn_pane_with_kill_flag_emits_replaced_pane_exit() {
         .await;
     assert!(matches!(response, rmux_proto::Response::RespawnPane(_)));
 
-    let queued = timeout(Duration::from_millis(500), lifecycle_events.recv())
-        .await
-        .expect("forced respawn should emit pane-exited")
-        .expect("lifecycle channel should stay open");
-    match queued.event {
-        LifecycleEvent::PaneExited {
-            target: event_target,
-            pane_id: Some(event_pane_id),
-            window_id: Some(_),
-            ..
-        } => {
-            assert_eq!(event_target, target);
-            assert_eq!(event_pane_id, pane_id.as_u32());
-        }
-        event => panic!("expected pane-exited for replaced process, got {event:?}"),
-    }
+    let maybe_event = timeout(Duration::from_millis(150), lifecycle_events.recv()).await;
+    assert!(
+        maybe_event.is_err(),
+        "forced respawn must not synthesize pane-exited like tmux 3.4/3.6: {maybe_event:?}"
+    );
 
     let state = handler.state.lock().await;
     let pane = state
@@ -1073,6 +1112,119 @@ async fn respawn_pane_with_kill_flag_emits_replaced_pane_exit() {
         PaneLifecycleProcessState::Running { .. }
     ));
     assert!(lifecycle.exit_state.is_none());
+}
+
+#[tokio::test]
+async fn pane_id_kill_does_not_emit_pane_exited_like_tmux() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("pane-id-kill-exit");
+    create_session(&handler, &alpha).await;
+    let split = handler
+        .handle(Request::SplitWindow(SplitWindowRequest {
+            target: SplitWindowTarget::Session(alpha.clone()),
+            direction: SplitDirection::Vertical,
+            before: false,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(split, Response::SplitWindow(_)));
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(1))
+            .expect("second pane exists")
+            .id()
+    };
+    let mut lifecycle_events = handler.subscribe_lifecycle_events();
+
+    let response = handler
+        .handle(Request::PaneKill(PaneKillRequest {
+            target: PaneTargetRef::by_id(alpha, pane_id),
+            kill_all_except: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::KillPane(_)));
+
+    assert_no_pane_exited_event(&mut lifecycle_events, "stable pane-id kill").await;
+}
+
+#[tokio::test]
+async fn pane_id_respawn_with_kill_flag_does_not_emit_pane_exited_like_tmux() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("pane-id-respawn-exit");
+    create_session(&handler, &alpha).await;
+    let (pane_id, previous_generation) = {
+        let state = handler.state.lock().await;
+        let pane = state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0))
+            .expect("initial pane exists");
+        let lifecycle = state
+            .pane_lifecycle(pane.id())
+            .expect("initial lifecycle exists");
+        (pane.id(), lifecycle.generation)
+    };
+    let mut lifecycle_events = handler.subscribe_lifecycle_events();
+
+    let response = handler
+        .handle(Request::PaneRespawn(Box::new(PaneRespawnRequest {
+            target: PaneTargetRef::by_id(alpha.clone(), pane_id),
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: Some(vec![pipe_discard_command()]),
+            process_command: None,
+            keep_alive_on_exit: None,
+        })))
+        .await;
+    assert!(matches!(response, Response::RespawnPane(_)));
+
+    assert_no_pane_exited_event(&mut lifecycle_events, "stable pane-id respawn").await;
+
+    let state = handler.state.lock().await;
+    let pane = state
+        .sessions
+        .session(&alpha)
+        .and_then(|session| session.window_at(0))
+        .and_then(|window| window.pane(0))
+        .expect("respawned pane exists");
+    assert_eq!(pane.id(), pane_id);
+    let lifecycle = state
+        .pane_lifecycle(pane_id)
+        .expect("respawned lifecycle exists");
+    assert!(lifecycle.generation > previous_generation);
+    assert!(matches!(
+        lifecycle.process,
+        PaneLifecycleProcessState::Running { .. }
+    ));
+    assert!(lifecycle.exit_state.is_none());
+}
+
+async fn assert_no_pane_exited_event(
+    lifecycle_events: &mut tokio::sync::broadcast::Receiver<super::QueuedLifecycleEvent>,
+    context: &str,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        match timeout(deadline - now, lifecycle_events.recv()).await {
+            Ok(Ok(event)) => assert_ne!(
+                event.hook_name,
+                HookName::PaneExited,
+                "{context} must not synthesize pane-exited: {event:?}"
+            ),
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) | Err(_) => break,
+        }
+    }
 }
 
 #[tokio::test]

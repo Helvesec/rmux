@@ -141,7 +141,7 @@ async fn source_file_parse_only_validates_command_flags_without_executing() {
 }
 
 #[tokio::test]
-async fn source_file_parse_only_validates_nested_source_files_without_executing() {
+async fn source_file_parse_only_does_not_load_nested_source_files() {
     let handler = RequestHandler::new();
     let root = temp_root("parse-only-nested-source");
     write_config(
@@ -159,17 +159,9 @@ async fn source_file_parse_only_validates_nested_source_files_without_executing(
     };
     request.parse_only = true;
 
-    let Response::Error(response) = handler.handle(Request::SourceFile(request)).await else {
-        panic!("expected source-file -n to reject nested invalid command flags");
-    };
-    assert!(
-        response.error.to_string().contains("inner.conf:2:")
-            && response
-                .error
-                .to_string()
-                .contains("command new-window: unknown flag -Q"),
-        "{}",
-        response.error
+    assert_eq!(
+        handler.handle(Request::SourceFile(request)).await,
+        Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
     );
     for name in ["inner", "outer"] {
         assert!(matches!(
@@ -184,9 +176,39 @@ async fn source_file_parse_only_validates_nested_source_files_without_executing(
 }
 
 #[tokio::test]
-async fn source_file_parse_only_aggregates_command_validation_errors() {
+async fn source_file_parse_only_does_not_load_if_shell_nested_source_files() {
     let handler = RequestHandler::new();
-    let root = temp_root("parse-only-aggregate-errors");
+    let root = temp_root("parse-only-if-shell-nested-source");
+    let missing = root.join("missing.conf");
+    let missing = missing.display().to_string().replace('\\', "/");
+    write_config(
+        &root.join("main.conf"),
+        &format!(
+            "if-shell \"[ -f {} ]\" \"source-file {}\"\ndisplay-message -p after\n",
+            missing, missing
+        ),
+    );
+
+    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.parse_only = true;
+    request.verbose = true;
+
+    let response = handler.handle(Request::SourceFile(request)).await;
+    let output = response
+        .command_output()
+        .expect("parse-only verbose output");
+    let stdout = std::str::from_utf8(output.stdout()).expect("verbose output is UTF-8");
+    assert!(stdout.contains("if-shell"), "{stdout}");
+    assert!(stdout.contains("display-message -p after"), "{stdout}");
+}
+
+#[tokio::test]
+async fn source_file_parse_only_stops_at_first_command_validation_error() {
+    let handler = RequestHandler::new();
+    let root = temp_root("parse-only-first-error");
     write_config(
         &root.join("main.conf"),
         "new-window -Q\nserver-access --help\n",
@@ -199,7 +221,7 @@ async fn source_file_parse_only_aggregates_command_validation_errors() {
     request.parse_only = true;
 
     let Response::Error(response) = handler.handle(Request::SourceFile(request)).await else {
-        panic!("expected source-file -n to aggregate invalid command flags");
+        panic!("expected source-file -n to reject the first invalid command flag");
     };
     let message = response.error.to_string();
     assert!(
@@ -207,8 +229,86 @@ async fn source_file_parse_only_aggregates_command_validation_errors() {
         "{message}"
     );
     assert!(
-        message.contains("main.conf:2: command server-access: unknown flag --help"),
-        "{message}"
+        !message.contains("server-access"),
+        "source-file -n should stop at the first validation error like tmux; got {message}"
+    );
+}
+
+#[tokio::test]
+async fn source_file_parse_only_verbose_omits_commands_after_first_error() {
+    let handler = RequestHandler::new();
+    let root = temp_root("parse-only-verbose-first-error");
+    write_config(
+        &root.join("main.conf"),
+        "set -g @before yes\nnew-window -Q\nset -g @after yes\n",
+    );
+
+    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.parse_only = true;
+    request.verbose = true;
+
+    let Response::SourceFile(response) = handler.handle(Request::SourceFile(request)).await else {
+        panic!("expected source-file -n -v to return tmux-style stdout");
+    };
+    assert_eq!(response.exit_status(), Some(1));
+    let stdout = response
+        .command_output()
+        .expect("parse-only verbose output")
+        .stdout();
+    let stdout = std::str::from_utf8(stdout).expect("verbose output is UTF-8");
+    assert!(
+        stdout.contains("main.conf:1: set-option -g @before yes"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("main.conf:2: command new-window: unknown flag -Q"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("@after"),
+        "source-file -n -v should not print commands after the first error; got {stdout}"
+    );
+}
+
+#[tokio::test]
+async fn source_file_parse_only_verbose_omits_commands_after_first_parse_error() {
+    let handler = RequestHandler::new();
+    let root = temp_root("parse-only-verbose-first-parse-error");
+    write_config(
+        &root.join("main.conf"),
+        "set -g @before yes\nbogus\nset -g @after yes\n",
+    );
+
+    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.parse_only = true;
+    request.verbose = true;
+
+    let Response::SourceFile(response) = handler.handle(Request::SourceFile(request)).await else {
+        panic!("expected source-file -n -v to return tmux-style stdout");
+    };
+    assert_eq!(response.exit_status(), Some(1));
+    let stdout = response
+        .command_output()
+        .expect("parse-only verbose output")
+        .stdout();
+    let stdout = std::str::from_utf8(stdout).expect("verbose output is UTF-8");
+    assert!(
+        stdout.contains("main.conf:1: set-option -g @before yes"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("main.conf:2: unknown command: bogus"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("@after"),
+        "source-file -n -v should not print commands after the first parse error; got {stdout}"
     );
 }
 
@@ -272,8 +372,8 @@ async fn source_file_parse_only_validates_embedded_binding_and_hook_commands() {
         "{message}"
     );
     assert!(
-        message.contains("main.conf:1: command server-access: unknown flag --help"),
-        "{message}"
+        !message.contains("server-access"),
+        "source-file -n should stop at the first embedded validation error like tmux; got {message}"
     );
 }
 
@@ -322,8 +422,8 @@ async fn source_file_parse_only_rejects_server_access_help_and_bare_dash() {
         "{message}"
     );
     assert!(
-        message.contains("main.conf:2: command server-access: invalid flag -"),
-        "{message}"
+        !message.contains("invalid flag -"),
+        "source-file -n should stop at the first server-access flag error like tmux; got {message}"
     );
 }
 
@@ -788,5 +888,131 @@ async fn source_file_continues_after_runtime_errors_and_reports_error() {
             .expect("show-options output")
             .stdout(),
         b"yes\n"
+    );
+}
+
+#[tokio::test]
+async fn source_file_continues_after_non_quiet_legacy_option_lookup_errors() {
+    let handler = RequestHandler::new();
+    let root = temp_root("non-quiet-legacy-options");
+    write_config(
+        &root.join("legacy.conf"),
+        "set -g @before_legacy_error yes\n\
+         set -g status-utf8 on\n\
+         set -g @after_legacy_error yes\n",
+    );
+
+    let response = handler
+        .handle(source_file_request(
+            vec!["legacy.conf".to_owned()],
+            Some(root),
+        ))
+        .await;
+
+    let Response::Error(error) = response else {
+        panic!("non-quiet legacy option should report an error, got {response:?}");
+    };
+    assert!(
+        error
+            .error
+            .to_string()
+            .contains("invalid option: status-utf8"),
+        "{}",
+        error.error
+    );
+
+    for name in ["@before_legacy_error", "@after_legacy_error"] {
+        assert_eq!(
+            handler
+                .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
+                    scope: OptionScopeSelector::SessionGlobal,
+                    name: Some(name.to_owned()),
+                    value_only: true,
+                    include_inherited: false,
+                    quiet: false,
+                }))
+                .await
+                .command_output()
+                .expect("show-options output")
+                .stdout(),
+            b"yes\n",
+            "{name} should remain applied after a recoverable source-file option lookup error"
+        );
+    }
+}
+
+#[tokio::test]
+async fn source_file_set_option_quiet_ignores_legacy_option_lookup_errors() {
+    let handler = RequestHandler::new();
+    let root = temp_root("quiet-legacy-options");
+    write_config(
+        &root.join("legacy.conf"),
+        "set -q -g status-utf8 on\n\
+         set -gq utf8 on\n\
+         setw -qg utf8 on\n\
+         set -qg status-utf8 on\n\
+         set -g base-index 1\n\
+         setw -g pane-base-index 1\n",
+    );
+
+    let response = handler
+        .handle(source_file_request(
+            vec!["legacy.conf".to_owned()],
+            Some(root),
+        ))
+        .await;
+
+    assert_eq!(
+        response,
+        Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
+    );
+    let state = handler.state.lock().await;
+    assert_eq!(state.options.global_value(OptionName::BaseIndex), Some("1"));
+    assert_eq!(
+        state.options.global_value(OptionName::PaneBaseIndex),
+        Some("1")
+    );
+    assert!(
+        state.message_log.iter().all(|entry| {
+            !entry.msg.contains("status-utf8") && !entry.msg.contains("invalid option: utf8")
+        }),
+        "quiet legacy option lookups should not leak into show-messages: {:?}",
+        state
+            .message_log
+            .iter()
+            .map(|entry| entry.msg.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn source_file_set_option_quiet_does_not_suppress_bad_values() {
+    let handler = RequestHandler::new();
+    let root = temp_root("quiet-bad-value");
+    write_config(
+        &root.join("bad-value.conf"),
+        "set -q -g status maybe\nset -g base-index 1\n",
+    );
+
+    let response = handler
+        .handle(source_file_request(
+            vec!["bad-value.conf".to_owned()],
+            Some(root),
+        ))
+        .await;
+
+    let Response::Error(error) = response else {
+        panic!("bad option value should remain an error, got {response:?}");
+    };
+    assert!(
+        error.error.to_string().contains("unknown value: maybe"),
+        "{}",
+        error.error
+    );
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.options.global_value(OptionName::BaseIndex),
+        Some("1"),
+        "later commands should still run after a recoverable command error"
     );
 }

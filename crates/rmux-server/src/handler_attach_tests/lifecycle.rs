@@ -1,4 +1,8 @@
 use super::*;
+#[cfg(windows)]
+use crate::input_keys::{encode_key, ExtendedKeyFormat};
+#[cfg(windows)]
+use rmux_core::key_string_lookup_string;
 
 #[cfg(windows)]
 const ATTACHED_EXIT_INPUT: &[u8] = b"RMUX_EXIT\r\n";
@@ -284,6 +288,36 @@ async fn attached_control_space_prefix_c_creates_window() {
 }
 
 #[tokio::test]
+async fn attached_printable_space_prefix_c_creates_window() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let alpha = session_name("alpha");
+    let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Session(alpha.clone()),
+                option: OptionName::Prefix,
+                value: "Space".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b" c")
+        .await
+        .expect("Space c prefix input");
+
+    assert_eq!(
+        active_windows(&handler, &alpha).await,
+        "0:0\n1:1\n",
+        "Space c must dispatch the prefix table's new-window binding"
+    );
+}
+
+#[tokio::test]
 async fn attached_prefix_prefix_dispatches_send_prefix_once_and_returns_to_root() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
@@ -333,7 +367,22 @@ async fn attached_send_prefix_emits_the_configured_prefix_byte() {
         .expect("configured prefix send-prefix input");
 
     capture.finish(&handler, &alpha).await;
-    capture.assert_contents(&handler, b"\x01").await;
+    #[cfg(not(windows))]
+    let expected = b"\x01".to_vec();
+    #[cfg(windows)]
+    let expected = windows_cmd_select_all_bytes();
+    capture.assert_contents(&handler, &expected).await;
+}
+
+#[cfg(windows)]
+fn windows_cmd_select_all_bytes() -> Vec<u8> {
+    ["C-Home", "S-End"]
+        .into_iter()
+        .flat_map(|key_name| {
+            let key = key_string_lookup_string(key_name).expect("test key must exist");
+            encode_key(0, ExtendedKeyFormat::Xterm, key).expect("test key must encode")
+        })
+        .collect()
 }
 
 #[tokio::test]

@@ -1,7 +1,7 @@
 use std::io::Write as _;
 use std::sync::Arc;
 
-use rmux_core::{GridRenderOptions, OptionStore, Pane, Screen, Session};
+use rmux_core::{input::mode, GridRenderOptions, OptionStore, Pane, Screen, Session};
 use rmux_proto::OptionName;
 
 use crate::pane_transcript::PaneTranscript;
@@ -53,6 +53,7 @@ pub(crate) struct PaneRenderSnapshot {
     rows: u16,
     cols: u16,
     terminal_cols: u16,
+    terminal_rows: u16,
     lines: Vec<Arc<Vec<u8>>>,
     cursor: Vec<u8>,
     cursor_row: u16,
@@ -67,6 +68,23 @@ pub(crate) struct PaneRenderSnapshot {
 impl PaneRenderSnapshot {
     pub(crate) const fn cursor_style(&self) -> u32 {
         self.cursor_style
+    }
+
+    fn cursor_visible(&self) -> bool {
+        self.mode & mode::MODE_CURSOR != 0
+    }
+
+    fn cursor_visibility_changed(&self, next: &Self) -> bool {
+        self.cursor_visible() != next.cursor_visible()
+    }
+
+    fn append_final_cursor_state(&self, frame: &mut Vec<u8>) {
+        frame.extend_from_slice(&self.cursor);
+        if self.cursor_visible() {
+            frame.extend_from_slice(b"\x1b[?25h");
+        } else {
+            frame.extend_from_slice(b"\x1b[?25l");
+        }
     }
 
     pub(crate) fn capture(
@@ -109,7 +127,8 @@ impl PaneRenderSnapshot {
             y: pane_geometry.y().saturating_add(geometry.content_y_offset),
             rows: pane_geometry.rows(),
             cols: pane_geometry.cols(),
-            terminal_cols: session.terminal_size().cols,
+            terminal_cols: geometry.terminal_size.cols,
+            terminal_rows: geometry.terminal_size.rows,
             lines,
             cursor,
             cursor_row,
@@ -198,7 +217,8 @@ impl PaneRenderSnapshot {
             y: pane_geometry.y().saturating_add(geometry.content_y_offset),
             rows: pane_geometry.rows(),
             cols: pane_geometry.cols(),
-            terminal_cols: session.terminal_size().cols,
+            terminal_cols: geometry.terminal_size.cols,
+            terminal_rows: geometry.terminal_size.rows,
             lines,
             cursor,
             cursor_row,
@@ -241,7 +261,7 @@ impl PaneRenderSnapshot {
                 continue;
             }
             if frame.is_empty() {
-                frame.extend_from_slice(b"\x1b[s");
+                frame.extend_from_slice(b"\x1b[s\x1b[?25l");
             }
             frame.extend_from_slice(
                 cursor_position_bytes(next.y.saturating_add(row as u16), next.x).as_slice(),
@@ -258,8 +278,10 @@ impl PaneRenderSnapshot {
 
         if !frame.is_empty() {
             frame.extend_from_slice(b"\x1b[0m\x1b[u");
-        }
-        if self.cursor != next.cursor {
+            next.append_final_cursor_state(&mut frame);
+        } else if self.cursor_visibility_changed(next) {
+            next.append_final_cursor_state(&mut frame);
+        } else if self.cursor != next.cursor {
             frame.extend_from_slice(&next.cursor);
         }
 
@@ -271,7 +293,7 @@ impl PaneRenderSnapshot {
 
     pub(crate) fn full_frame(&self) -> Vec<u8> {
         let mut frame = Vec::with_capacity(self.frame_capacity_hint());
-        frame.extend_from_slice(b"\x1b[s\x1b[0m");
+        frame.extend_from_slice(b"\x1b[s\x1b[?25l\x1b[0m");
         for (row, line) in self.lines.iter().enumerate() {
             if row >= usize::from(self.rows) {
                 break;
@@ -283,7 +305,7 @@ impl PaneRenderSnapshot {
             frame.extend_from_slice(line);
         }
         frame.extend_from_slice(b"\x1b[0m\x1b[u");
-        frame.extend_from_slice(&self.cursor);
+        self.append_final_cursor_state(&mut frame);
         frame
     }
 
@@ -291,17 +313,29 @@ impl PaneRenderSnapshot {
         if self.x != 0 || self.cols != self.terminal_cols {
             return false;
         }
-        self.can_apply_plain_bytes_to_snapshot(bytes)
+        let Some(would_scroll) = self.plain_bytes_would_scroll(bytes) else {
+            return false;
+        };
+        !would_scroll || self.covers_full_terminal_height()
     }
 
     fn can_apply_plain_bytes_to_snapshot(&self, bytes: &[u8]) -> bool {
+        self.plain_bytes_would_scroll(bytes).is_some()
+    }
+
+    fn covers_full_terminal_height(&self) -> bool {
+        self.y == 0 && self.rows == self.terminal_rows
+    }
+
+    fn plain_bytes_would_scroll(&self, bytes: &[u8]) -> Option<bool> {
         let mut row = self.cursor_row.saturating_sub(self.y);
         let mut col = self.cursor_col.saturating_sub(self.x);
         if row >= self.rows || col >= self.cols {
-            return false;
+            return None;
         }
 
         let mut index = 0;
+        let mut would_scroll = false;
         while index < bytes.len() {
             match bytes[index] {
                 b'\r' => {
@@ -311,21 +345,23 @@ impl PaneRenderSnapshot {
                 b'\n' => {
                     if row.saturating_add(1) < self.rows {
                         row = row.saturating_add(1);
+                    } else {
+                        would_scroll = true;
                     }
                     index += 1;
                 }
                 b' '..=b'~' => {
                     if col >= self.cols {
-                        return false;
+                        return None;
                     }
                     col = col.saturating_add(1);
                     index += 1;
                 }
-                _ => return false,
+                _ => return None,
             }
         }
 
-        true
+        Some(would_scroll)
     }
 
     pub(crate) fn positioned_plain_echo_frame(&self, bytes: &[u8]) -> Option<Vec<u8>> {
@@ -369,7 +405,7 @@ impl PaneRenderSnapshot {
         let mut row = self.cursor_row.checked_sub(self.y)?;
         let mut col = self.cursor_col.checked_sub(self.x)?;
         let mut frame = Vec::with_capacity(bytes.len().saturating_add(64));
-        frame.extend_from_slice(b"\x1b[s\x1b[0m");
+        frame.extend_from_slice(b"\x1b[s\x1b[?25l\x1b[0m");
         let mut touched_rows = Vec::new();
         let mut index = 0;
         let original = self.clone();
@@ -430,7 +466,7 @@ impl PaneRenderSnapshot {
         self.cursor_col = self.x.saturating_add(col);
         replace_cursor_position_bytes(&mut self.cursor, self.cursor_row, self.cursor_col);
         frame.extend_from_slice(b"\x1b[0m\x1b[u");
-        frame.extend_from_slice(&self.cursor);
+        self.append_final_cursor_state(&mut frame);
         Some(frame)
     }
 
@@ -577,6 +613,9 @@ impl PaneRenderSnapshot {
         if next_line_cursor {
             frame.extend_from_slice(b"\r\n");
         }
+        if self.cursor_visibility_changed(next) {
+            next.append_final_cursor_state(&mut frame);
+        }
         Some(PaneRenderDeltaFrame {
             frame,
             cursor_style: None,
@@ -611,7 +650,7 @@ impl PaneRenderSnapshot {
         }
 
         let mut frame = Vec::new();
-        frame.extend_from_slice(b"\x1b[s");
+        frame.extend_from_slice(b"\x1b[s\x1b[?25l");
         write!(
             &mut frame,
             "\x1b[{};{}r\x1b[{}S\x1b[r",
@@ -635,9 +674,7 @@ impl PaneRenderSnapshot {
             }
         }
         frame.extend_from_slice(b"\x1b[0m\x1b[u");
-        if self.cursor != next.cursor {
-            frame.extend_from_slice(&next.cursor);
-        }
+        next.append_final_cursor_state(&mut frame);
 
         Some(PaneRenderDeltaFrame {
             frame,
@@ -811,6 +848,7 @@ mod tests {
             rows: 3,
             cols: 10,
             terminal_cols: 10,
+            terminal_rows: 3,
             lines: render_lines(&[b"", b"", b""]),
             cursor: b"\x1b[1;1H".to_vec(),
             cursor_row: 0,
@@ -847,6 +885,7 @@ mod tests {
             rows: 2,
             cols: 10,
             terminal_cols: 10,
+            terminal_rows: 2,
             lines: render_lines(&[b"", b""]),
             cursor: b"\x1b[1;1H".to_vec(),
             cursor_row: 0,
@@ -928,10 +967,32 @@ mod tests {
     }
 
     #[test]
-    fn pane_snapshot_raw_forwarding_allows_plain_bottom_scroll() {
+    fn pane_snapshot_raw_forwarding_rejects_plain_bottom_scroll_with_status_line() {
         let session = Session::new(session_name("alpha"), TerminalSize { cols: 10, rows: 4 });
         let pane = session.window().active_pane().expect("active pane");
         let options = OptionStore::new();
+        let screen = screen_with(b"\x1b[3;1H");
+        let snapshot =
+            PaneRenderSnapshot::capture(&session, &options, pane, &screen).expect("snapshot");
+
+        assert!(!snapshot.can_forward_plain_bytes(b"x\r\n"));
+        assert!(snapshot.can_forward_plain_bytes(b"x"));
+        assert!(!snapshot.can_forward_plain_bytes(b"\x1b[31m"));
+    }
+
+    #[test]
+    fn pane_snapshot_raw_forwarding_allows_plain_bottom_scroll_without_status_line() {
+        let session = Session::new(session_name("alpha"), TerminalSize { cols: 10, rows: 3 });
+        let pane = session.window().active_pane().expect("active pane");
+        let mut options = OptionStore::new();
+        options
+            .set(
+                ScopeSelector::Global,
+                OptionName::Status,
+                "off".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("status option can be disabled");
         let screen = screen_with(b"\x1b[3;1H");
         let snapshot =
             PaneRenderSnapshot::capture(&session, &options, pane, &screen).expect("snapshot");
@@ -949,6 +1010,7 @@ mod tests {
             rows: 3,
             cols: 20,
             terminal_cols: 80,
+            terminal_rows: 24,
             lines: render_lines(&[b"prompt>             ", b"", b""]),
             cursor: b"\x1b[3;18H".to_vec(),
             cursor_row: 2,
@@ -975,6 +1037,7 @@ mod tests {
             rows: 1,
             cols: 4,
             terminal_cols: 80,
+            terminal_rows: 24,
             lines: render_lines(&[b"\x1b[31mred"]),
             cursor: b"\x1b[3;14H".to_vec(),
             cursor_row: 2,
@@ -1020,6 +1083,7 @@ mod tests {
             rows: 3,
             cols: 20,
             terminal_cols: 80,
+            terminal_rows: 24,
             lines: render_lines(&[b"prompt>             ", b"", b""]),
             cursor: b"\x1b[3;18H".to_vec(),
             cursor_row: 2,
@@ -1071,6 +1135,7 @@ mod tests {
             rows: 1,
             cols: 5,
             terminal_cols: 10,
+            terminal_rows: 1,
             lines: render_lines(&[b"abcde"]),
             cursor: b"\x1b[1;6H".to_vec(),
             cursor_row: 0,
@@ -1142,7 +1207,7 @@ mod tests {
 
         assert!(text.contains("\u{1b}[2;1H"));
         assert!(text.contains("def"));
-        assert!(text.ends_with("\u{1b}[2;4H"));
+        assert!(text.ends_with("\u{1b}[2;4H\u{1b}[?25h"));
     }
 
     #[test]
@@ -1176,9 +1241,17 @@ mod tests {
 
     #[test]
     fn pane_snapshot_plain_forwarding_handles_bottom_scroll() {
-        let session = Session::new(session_name("alpha"), TerminalSize { cols: 10, rows: 4 });
+        let session = Session::new(session_name("alpha"), TerminalSize { cols: 10, rows: 3 });
         let pane = session.window().active_pane().expect("active pane");
-        let options = OptionStore::new();
+        let mut options = OptionStore::new();
+        options
+            .set(
+                ScopeSelector::Global,
+                OptionName::Status,
+                "off".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("status option can be disabled");
         let mut screen = Screen::new(TerminalSize { cols: 10, rows: 3 }, 100);
         let mut parser = InputParser::new();
         parser.parse(b"one\r\ntwo\r\nthree", &mut screen);
@@ -1329,7 +1402,42 @@ mod tests {
 
         assert!(text.contains("\u{1b}[1;1H\u{1b}[0mabc"));
         assert!(text.contains("\u{1b}[2;1H\u{1b}[0mdef"));
-        assert!(text.ends_with("\u{1b}[2;4H"));
+        assert!(text.starts_with("\u{1b}[s\u{1b}[?25l\u{1b}[0m"));
+        assert!(text.ends_with("\u{1b}[2;4H\u{1b}[?25h"));
+    }
+
+    #[test]
+    fn pane_snapshot_full_frame_restores_hidden_cursor_state() {
+        let session = Session::new(session_name("alpha"), TerminalSize { cols: 10, rows: 4 });
+        let pane = session.window().active_pane().expect("active pane");
+        let options = OptionStore::new();
+        let screen = screen_with(b"\x1b[?25labc");
+        let snapshot =
+            PaneRenderSnapshot::capture(&session, &options, pane, &screen).expect("snapshot");
+
+        let text = String::from_utf8(snapshot.full_frame()).expect("frame is utf8");
+
+        assert!(text.starts_with("\u{1b}[s\u{1b}[?25l\u{1b}[0m"));
+        assert!(text.ends_with("\u{1b}[1;4H\u{1b}[?25l"));
+    }
+
+    #[test]
+    fn pane_delta_emits_cursor_visibility_only_change() {
+        let session = Session::new(session_name("alpha"), TerminalSize { cols: 10, rows: 4 });
+        let pane = session.window().active_pane().expect("active pane");
+        let options = OptionStore::new();
+        let before = screen_with(b"abc");
+        let after = screen_with(b"abc\x1b[?25l");
+        let before = PaneRenderSnapshot::capture(&session, &options, pane, &before)
+            .expect("before snapshot");
+        let after =
+            PaneRenderSnapshot::capture(&session, &options, pane, &after).expect("after snapshot");
+
+        let PaneRenderDelta::Incremental(delta) = before.diff_to(&after) else {
+            panic!("cursor visibility change should stay incremental");
+        };
+
+        assert_eq!(delta.frame(), b"\x1b[1;4H\x1b[?25l");
     }
 
     #[test]

@@ -3,7 +3,8 @@ use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
-use rmux_client::resolve_socket_path;
+use rmux_client::{connect, resolve_socket_path};
+use rmux_proto::Response;
 
 use super::ExitFailure;
 
@@ -40,6 +41,7 @@ struct DiagnoseReport {
     shell: String,
     config_mode: String,
     config_paths: Vec<String>,
+    config_messages: Vec<String>,
     socket_path: String,
     conpty: String,
     terminal_features: Vec<String>,
@@ -231,6 +233,7 @@ impl DiagnoseReport {
             .iter()
             .map(|path| redact_path(path))
             .collect::<Vec<_>>();
+        let config_messages = collect_config_messages(&socket_path);
         let osc52 = if terminal_looks_clipboard_capable(&term, &term_program, &terminal_features) {
             "available-when-requested"
         } else {
@@ -252,6 +255,7 @@ impl DiagnoseReport {
                 "custom".to_owned()
             },
             config_paths,
+            config_messages,
             socket_path: redact_path(&socket_path),
             conpty: conpty_status().to_owned(),
             terminal_features,
@@ -275,6 +279,14 @@ impl DiagnoseReport {
         for path in &self.config_paths {
             output.push_str(&format!("  - {path}\n"));
         }
+        output.push_str("config_messages:\n");
+        if self.config_messages.is_empty() {
+            output.push_str("  - none\n");
+        } else {
+            for message in &self.config_messages {
+                output.push_str(&format!("  - {message}\n"));
+            }
+        }
         output.push_str("capabilities:\n");
         output.push_str(&format!("  conpty: {}\n", self.conpty));
         output.push_str(&format!("  osc52: {}\n", self.osc52));
@@ -295,7 +307,7 @@ impl DiagnoseReport {
                 "  \"terminal\": {{\"host\": {}, \"term\": {}, \"term_program\": {}}},\n",
                 "  \"shell\": {},\n",
                 "  \"socket_path\": {},\n",
-                "  \"config\": {{\"mode\": {}, \"paths\": {}}},\n",
+                "  \"config\": {{\"mode\": {}, \"paths\": {}, \"messages\": {}}},\n",
                 "  \"capabilities\": {{\"conpty\": {}, \"osc52\": {}, \"terminal_features\": {}}},\n",
                 "  \"privacy\": {{\"environment_values\": \"summarized-or-redacted\"}}\n",
                 "}}\n"
@@ -311,11 +323,104 @@ impl DiagnoseReport {
             json_string(&self.socket_path),
             json_string(&self.config_mode),
             json_array(&self.config_paths),
+            json_array(&self.config_messages),
             json_string(&self.conpty),
             json_string(&self.osc52),
             json_array(&self.terminal_features),
         )
     }
+}
+
+fn collect_config_messages(socket_path: &Path) -> Vec<String> {
+    let Ok(mut connection) = connect(socket_path) else {
+        return Vec::new();
+    };
+    let Ok(Response::ShowMessages(response)) = connection.show_messages(false, false, None) else {
+        return Vec::new();
+    };
+    let Ok(output) = std::str::from_utf8(response.command_output().stdout()) else {
+        return Vec::new();
+    };
+    output
+        .lines()
+        .filter_map(config_message_from_show_messages_line)
+        .collect()
+}
+
+fn config_message_from_show_messages_line(line: &str) -> Option<String> {
+    let message = line
+        .split_once(": ")
+        .map(|(_, message)| message)
+        .unwrap_or(line);
+    if !is_config_diagnostic_message(message) {
+        return None;
+    }
+    Some(truncate_diagnose_line(&redact_text_paths(line), 512))
+}
+
+fn is_config_diagnostic_message(message: &str) -> bool {
+    message.starts_with("config ignored:")
+        || message.starts_with("config error:")
+        || source_location_config_diagnostic(message)
+}
+
+fn source_location_config_diagnostic(message: &str) -> bool {
+    for (colon_index, _) in message.match_indices(':') {
+        let after_colon = &message[colon_index + 1..];
+        let digits_len = after_colon
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit())
+            .map(char::len_utf8)
+            .sum::<usize>();
+        if digits_len == 0 || !after_colon[digits_len..].starts_with(':') {
+            continue;
+        }
+        let path = &message[..colon_index];
+        if path.trim().is_empty() {
+            continue;
+        }
+        let detail = after_colon[digits_len + 1..].trim_start();
+        if source_location_config_detail(detail) {
+            return true;
+        }
+    }
+    false
+}
+
+fn source_location_config_detail(detail: &str) -> bool {
+    detail == "unmatched }"
+        || detail == "missing }"
+        || detail.starts_with("unknown command:")
+        || detail.starts_with("unknown option:")
+        || detail.starts_with("invalid option:")
+        || detail.starts_with("ambiguous option:")
+        || detail.starts_with("No such file or directory")
+}
+
+fn redact_text_paths(text: &str) -> String {
+    let mut redacted = text.to_owned();
+    for name in ["HOME", "USERPROFILE"] {
+        let Some(home) = nonempty_env_os(name) else {
+            continue;
+        };
+        let home = home.to_string_lossy();
+        if !home.is_empty() {
+            redacted = redacted.replace(home.as_ref(), "~");
+            redacted = redacted.replace("~\\", "~/");
+        }
+    }
+    redacted
+}
+
+fn truncate_diagnose_line(line: &str, max_bytes: usize) -> String {
+    if line.len() <= max_bytes {
+        return line.to_owned();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &line[..end])
 }
 
 fn push_terminal_features(features: &mut Vec<String>, raw: &str) {

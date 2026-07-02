@@ -91,6 +91,50 @@ impl RequestHandler {
     }
 
     #[async_recursion::async_recursion]
+    pub(crate) async fn dispatch_captured_with_client_name(
+        &self,
+        requester_pid: u32,
+        connection_id: u64,
+        request: Request,
+        client_name: Option<String>,
+    ) -> (HandleOutcome, Vec<PendingInlineHook>) {
+        capture_inline_hooks(Box::pin(self.dispatch_request_with_client_name(
+            requester_pid,
+            connection_id,
+            request,
+            client_name,
+        )))
+        .await
+    }
+
+    async fn dispatch_request_with_client_name(
+        &self,
+        requester_pid: u32,
+        connection_id: u64,
+        request: Request,
+        client_name: Option<String>,
+    ) -> HandleOutcome {
+        match (request, client_name) {
+            (Request::RunShell(request), Some(client_name)) => HandleOutcome::response(
+                self.handle_run_shell_with_client_name(requester_pid, *request, Some(client_name))
+                    .await,
+            ),
+            (Request::IfShell(request), Some(client_name)) => HandleOutcome::response(
+                self.handle_if_shell_with_client_name(requester_pid, *request, Some(client_name))
+                    .await,
+            ),
+            (Request::SetOptionByName(request), Some(client_name)) => HandleOutcome::response(
+                self.handle_set_option_by_name_with_client_name(*request, Some(client_name))
+                    .await,
+            ),
+            (request, _) => {
+                self.dispatch_request(requester_pid, connection_id, request)
+                    .await
+            }
+        }
+    }
+
+    #[async_recursion::async_recursion]
     async fn dispatch_request(
         &self,
         requester_pid: u32,

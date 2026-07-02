@@ -48,6 +48,10 @@ const MOUSE_BUTTON_10: u16 = 130;
 const MOUSE_BUTTON_11: u16 = 131;
 
 impl ClientMouseState {
+    pub(crate) fn click_deadline(&self) -> Option<Instant> {
+        self.click_deadline
+    }
+
     pub(crate) fn expire_click_timer(
         &mut self,
         now: Instant,
@@ -194,8 +198,28 @@ pub(crate) fn classify_mouse_event(
     raw: MouseForwardEvent,
     now: Instant,
 ) -> Option<ClassifiedMouseEvent> {
-    let _ = state.expire_click_timer(now, layout);
+    classify_mouse_events(state, layout, raw, now)
+        .into_iter()
+        .next()
+}
 
+pub(crate) fn classify_mouse_events(
+    state: &mut ClientMouseState,
+    layout: &MouseLayout,
+    raw: MouseForwardEvent,
+    now: Instant,
+) -> Vec<ClassifiedMouseEvent> {
+    let expired = state.expire_click_timer(now, layout);
+    let current = classify_current_mouse_event(state, layout, raw, now);
+    expired.into_iter().chain(current).collect()
+}
+
+fn classify_current_mouse_event(
+    state: &mut ClientMouseState,
+    layout: &MouseLayout,
+    raw: MouseForwardEvent,
+    now: Instant,
+) -> Option<ClassifiedMouseEvent> {
     let (kind, x, y, mut button_bits, ignore) = if is_mouse_move(raw) {
         (MouseEventKind::MouseMove, raw.x, raw.y, 0, false)
     } else if mouse_drag(raw.b) {
@@ -244,7 +268,20 @@ pub(crate) fn classify_mouse_event(
         state.current_event.as_ref(),
     );
     let slider_mpos = hit.slider_mpos;
-    let mut attached_event = hit_to_attached_event(layout, raw, hit, ignore)?;
+    let attached_raw = if matches!(kind, MouseEventKind::MouseDrag)
+        && state.drag_flag == 0
+        && state.drag_handler.is_some()
+    {
+        MouseForwardEvent {
+            b: button_bits,
+            x,
+            y,
+            ..raw
+        }
+    } else {
+        raw
+    };
+    let mut attached_event = hit_to_attached_event(layout, attached_raw, hit, ignore)?;
 
     let mut kind = kind;
 
@@ -373,9 +410,32 @@ pub(crate) fn copy_mode_mouse_context(
     Some(CopyModeMouseContext {
         content_x,
         content_y,
+        selection_anchor: None,
         scroll_y,
         slider_mpos,
     })
+}
+
+pub(crate) fn copy_mode_mouse_drag_start_context(
+    event: &AttachedMouseEvent,
+    pane: PaneGeometry,
+    slider_mpos: i32,
+) -> Option<CopyModeMouseContext> {
+    const MOUSE_MASK_DRAG: u16 = 32;
+
+    let mut current = copy_mode_mouse_context(event, pane, slider_mpos)?;
+    if event.raw.b & MOUSE_MASK_DRAG == 0 {
+        return Some(current);
+    }
+
+    let mut anchor_event = event.clone();
+    anchor_event.raw.b = event.raw.lb;
+    anchor_event.raw.sgr_b = event.raw.lb;
+    anchor_event.raw.x = event.raw.lx;
+    anchor_event.raw.y = event.raw.ly;
+    let anchor = copy_mode_mouse_context(&anchor_event, pane, slider_mpos)?;
+    current.selection_anchor = Some((anchor.content_x, anchor.content_y));
+    Some(current)
 }
 
 fn is_mouse_move(raw: MouseForwardEvent) -> bool {

@@ -39,6 +39,84 @@ fn substitution_basic() {
 }
 
 #[test]
+fn substitution_empty_pattern_is_noop_and_zero_width_patterns_match_tmux() {
+    assert_eq!(
+        render_template("#{s//Z/:session_name}", &StaticWindowValues),
+        "alpha"
+    );
+    assert_eq!(
+        render_template("#{s/^/>/:session_name}", &StaticWindowValues),
+        "lpha"
+    );
+    assert_eq!(
+        render_template("#{s/$/Z/:session_name}", &StaticWindowValues),
+        "alphaZ"
+    );
+    assert_eq!(
+        render_template("#{s/[0-9]*/Z/:session_name}", &StaticWindowValues),
+        "aZlZpZhZaZ"
+    );
+    assert_eq!(
+        render_template("#{s/[0-9]?/Z/:session_name}", &StaticWindowValues),
+        "aZlZpZhZaZ"
+    );
+    assert_eq!(
+        render_template("#{s/(^|$)/Z/:session_name}", &StaticWindowValues),
+        "aZlZpZhZaZ"
+    );
+    assert_eq!(
+        render_template("#{s/ *$//:session_name}", &StaticWindowValues),
+        "alpha"
+    );
+    assert_eq!(
+        render_template("#{s/ *$/X/:session_name}", &StaticWindowValues),
+        "alphaX"
+    );
+
+    let context = FormatContext::new()
+        .with_named_value("aba", "aba")
+        .with_named_value("baa", "baa")
+        .with_named_value("abc", "abc")
+        .with_named_value("empty", "");
+    assert_eq!(render_template("#{s/a*/Z/:aba}", &context), "ZbZ");
+    assert_eq!(render_template("#{s/b*/Z/:aba}", &context), "aZaZ");
+    assert_eq!(render_template("#{s/a*/Z/:baa}", &context), "bZ");
+    assert_eq!(render_template("#{s/b*/Z/:abc}", &context), "aZcZ");
+    assert_eq!(render_template("#{s/$/Z/:empty}", &context), "");
+}
+
+#[test]
+fn substitution_zero_width_backrefs_match_tmux() {
+    assert_eq!(
+        render_template(r"#{s/(a*)/<\1>/:session_name}", &StaticWindowValues),
+        "<a>l<1>p<1>h<a>"
+    );
+    assert_eq!(
+        render_template(r"#{s/(b*)/<\1>/:session_name}", &StaticWindowValues),
+        "a<1>l<1>p<1>h<1>a<1>"
+    );
+    assert_eq!(
+        render_template(r"#{s/$/\1/:session_name}", &StaticWindowValues),
+        "alpha1"
+    );
+}
+
+#[test]
+fn substitution_zero_width_matches_non_ascii_bytes_like_tmux_3_4() {
+    let context = FormatContext::new().with_named_value("unicode", "éx");
+
+    assert_eq!(render_template("#{s//Z/:unicode}", &context), "éx");
+    assert_eq!(
+        render_template("#{s/[0-9]*/Z/:unicode}", &context),
+        "\\303Z\\251ZxZ"
+    );
+    assert_eq!(
+        render_template("#{s/(^|$)/Z/:unicode}", &context),
+        "\\303Z\\251ZxZ"
+    );
+}
+
+#[test]
 fn substitution_uses_regex_and_case_insensitive_flag() {
     assert_eq!(
         render_template("#{s/AL.HA/beta/i:session_name}", &StaticWindowValues),
@@ -155,7 +233,7 @@ fn escaped_comma_inside_conditional_value() {
 
 #[test]
 fn escaped_comma_in_boolean_operand() {
-    // An escaped comma leaves the boolean operator without a real delimiter.
+    // tmux 3.4 requires a real top-level comma for boolean operators.
     assert_eq!(
         render_template("#{||:hello#,world}", &StaticWindowValues),
         ""

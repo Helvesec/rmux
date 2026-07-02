@@ -216,7 +216,7 @@ fn windows_powershell_path(environment: &HashMap<String, String>) -> Option<Path
 }
 
 #[cfg(windows)]
-fn cmd_shell_path(environment: &HashMap<String, String>) -> Option<PathBuf> {
+pub(super) fn cmd_shell_path(environment: &HashMap<String, String>) -> Option<PathBuf> {
     environment_or_process_os_value(environment, "COMSPEC")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)

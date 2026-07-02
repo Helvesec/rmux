@@ -41,11 +41,11 @@ pub(super) fn lookup_command_at(
             .map(|entry| entry.name)
             .collect::<Vec<_>>()
             .join(", ");
-        return Err(CommandParseError::new(
+        return Err(CommandParseError::lookup(
             line,
             format!("ambiguous command: {name}, could be: {candidates}"),
         ));
     }
 
-    found.ok_or_else(|| CommandParseError::new(line, format!("unknown command: {name}")))
+    found.ok_or_else(|| CommandParseError::lookup(line, format!("unknown command: {name}")))
 }

@@ -35,7 +35,7 @@ fn resize_pane_zoom_after_columns_follows_tmux_last_wins() {
         Command::ResizePane(args) => {
             assert_eq!(target_text(&args.target), "alpha:0.1");
             assert!(args.zoom);
-            assert_eq!(args.columns, None);
+            assert_eq!(args.columns, Some(super::ResizePaneSize::Cells(34)));
         }
         _ => panic!("expected ResizePane command"),
     }

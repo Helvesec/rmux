@@ -251,6 +251,38 @@ fn resize_pane_recalculates_all_geometry() {
 }
 
 #[test]
+fn split_size_on_non_last_pane_preserves_unrelated_neighbour_like_tmux() {
+    let mut session = Session::new(
+        session_name("alpha"),
+        TerminalSize {
+            cols: 200,
+            rows: 50,
+        },
+    );
+    session.split_active_pane().expect("first split succeeds");
+    let new_index = session
+        .split_pane_in_window_with_direction(0, 0, SplitDirection::Vertical)
+        .expect("second split succeeds");
+
+    session
+        .resize_new_split_pane_to_in_window(0, new_index, SplitDirection::Vertical, 30, false)
+        .expect("new split can be sized");
+
+    assert_eq!(
+        session.window().pane(0).expect("pane 0 exists").geometry(),
+        PaneGeometry::new(0, 0, 69, 50)
+    );
+    assert_eq!(
+        session.window().pane(1).expect("pane 1 exists").geometry(),
+        PaneGeometry::new(70, 0, 30, 50)
+    );
+    assert_eq!(
+        session.window().pane(2).expect("pane 2 exists").geometry(),
+        PaneGeometry::new(101, 0, 99, 50)
+    );
+}
+
+#[test]
 fn resize_pane_rejects_nonexistent_pane_index() {
     let mut session = Session::new(
         session_name("alpha"),

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -126,13 +127,58 @@ pub(super) fn default_tmux_fallback_paths() -> Vec<String> {
         return Vec::new();
     }
 
+    let paths = {
+        #[cfg(windows)]
+        {
+            windows_tmux_fallback_paths()
+        }
+        #[cfg(not(windows))]
+        {
+            unix_tmux_fallback_paths()
+        }
+    };
+
+    dedupe_existing_source_paths(paths)
+}
+
+fn dedupe_existing_source_paths(paths: Vec<String>) -> Vec<String> {
+    let mut deduped = Vec::with_capacity(paths.len());
+    let mut seen_text = HashSet::new();
+    let mut seen_identity = HashSet::new();
+
+    for path in paths {
+        if !seen_text.insert(path.clone()) {
+            continue;
+        }
+        if let Some(identity) = existing_source_path_identity(Path::new(&path)) {
+            if !seen_identity.insert(identity) {
+                continue;
+            }
+        }
+        deduped.push(path);
+    }
+
+    deduped
+}
+
+#[cfg(unix)]
+fn existing_source_path_identity(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path).ok()?;
+    Some(format!("{}:{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn existing_source_path_identity(path: &Path) -> Option<String> {
+    let canonical = fs::canonicalize(path).ok()?;
     #[cfg(windows)]
     {
-        windows_tmux_fallback_paths()
+        Some(canonical.to_string_lossy().to_ascii_lowercase())
     }
     #[cfg(not(windows))]
     {
-        unix_tmux_fallback_paths()
+        Some(canonical.to_string_lossy().into_owned())
     }
 }
 
@@ -306,8 +352,12 @@ pub(super) fn source_inputs_for_path(
         return Err(no_such_source_file(path));
     }
 
+    let skip_glob_directories = source_path_has_glob_metachars(path);
     let mut inputs = Vec::new();
     for entry in entries {
+        if skip_glob_directories && source_entry_is_directory(&entry) {
+            continue;
+        }
         match read_source_entry(&entry, read_policy) {
             Ok(contents) => inputs.push(SourceInput {
                 current_file: source_entry_display_path(&entry),
@@ -326,6 +376,16 @@ pub(super) fn source_inputs_for_path(
     }
 
     Ok(inputs)
+}
+
+fn source_path_has_glob_metachars(path: &str) -> bool {
+    path.chars().any(|ch| matches!(ch, '*' | '?' | '[' | ']'))
+}
+
+fn source_entry_is_directory(entry: &Path) -> bool {
+    fs::metadata(entry)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
 }
 
 fn source_io_error_message(error: &io::Error) -> String {
@@ -398,8 +458,8 @@ fn open_strict_source_entry(entry: &Path) -> io::Result<File> {
 }
 
 fn read_tmux_compat_source_entry(entry: &Path) -> io::Result<String> {
-    let preopen_metadata = fs::symlink_metadata(entry)?;
-    validate_tmux_compat_preopen_metadata(&preopen_metadata)?;
+    let preopen_metadata = fs::metadata(entry)?;
+    validate_tmux_compat_regular_metadata(&preopen_metadata)?;
 
     let file = open_tmux_compat_regular_file(entry)?;
     let metadata = file.metadata()?;
@@ -412,16 +472,6 @@ fn read_tmux_compat_source_entry(entry: &Path) -> io::Result<String> {
         return Err(oversized_source_config_error());
     }
     Ok(contents)
-}
-
-fn validate_tmux_compat_preopen_metadata(metadata: &fs::Metadata) -> io::Result<()> {
-    if metadata.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "tmux fallback config is not a regular file",
-        ));
-    }
-    validate_tmux_compat_regular_metadata(metadata)
 }
 
 fn validate_tmux_compat_regular_metadata(metadata: &fs::Metadata) -> io::Result<()> {
@@ -443,7 +493,7 @@ fn open_tmux_compat_regular_file(entry: &Path) -> io::Result<File> {
 
     let fd = open(
         entry,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
     )
     .map_err(io::Error::from)?;
@@ -699,6 +749,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn strict_source_glob_skips_directories_and_reads_regular_entries() {
+        let root = temp_source_path("glob-with-directory-strict-source");
+        std::fs::create_dir(&root).expect("create glob source root");
+        let first = root.join("a.conf");
+        let second = root.join("b.conf");
+        let directory = root.join("nested");
+        std::fs::write(&first, "set -g @a yes\n").expect("write first source");
+        std::fs::write(&second, "set -g @b yes\n").expect("write second source");
+        std::fs::create_dir(&directory).expect("create directory glob match");
+
+        let inputs = source_inputs_for_path(
+            &format!("{}/*", root.to_string_lossy()),
+            None,
+            false,
+            None,
+            SourceReadPolicy::Strict,
+        )
+        .expect("strict glob source should skip matched directories");
+        let _ = std::fs::remove_file(&first);
+        let _ = std::fs::remove_file(&second);
+        let _ = std::fs::remove_dir(&directory);
+        let _ = std::fs::remove_dir(&root);
+
+        let contents = inputs
+            .iter()
+            .map(|input| input.contents.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(inputs.len(), 2);
+        assert!(contents.contains(&"set -g @a yes\n"));
+        assert!(contents.contains(&"set -g @b yes\n"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn strict_source_rejects_fifo_without_blocking() {
@@ -780,6 +863,56 @@ mod tests {
         let _ = std::fs::remove_file(&fifo_path);
 
         assert!(inputs.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_best_effort_source_accepts_symlink_to_regular_file() {
+        let target_path = temp_source_path("symlink-target-regular-tmux-fallback");
+        let symlink_path = temp_source_path("regular-symlink-tmux-fallback");
+        std::fs::write(&target_path, "set -g status off\n").expect("write target config");
+        std::os::unix::fs::symlink(&target_path, &symlink_path).expect("create source symlink");
+
+        let inputs = source_inputs_for_path(
+            &symlink_path.to_string_lossy(),
+            None,
+            false,
+            None,
+            SourceReadPolicy::BestEffort,
+        )
+        .expect("best-effort tmux source should accept regular-file symlinks");
+        let _ = std::fs::remove_file(&symlink_path);
+        let _ = std::fs::remove_file(&target_path);
+
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].contents, "set -g status off\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fallback_path_dedupe_collapses_symlinked_entries() {
+        let target_path = temp_source_path("fallback-dedupe-target");
+        let symlink_path = temp_source_path("fallback-dedupe-symlink");
+        let missing_path = temp_source_path("fallback-dedupe-missing");
+        std::fs::write(&target_path, "set -g status off\n").expect("write target config");
+        std::os::unix::fs::symlink(&target_path, &symlink_path).expect("create source symlink");
+
+        let deduped = super::dedupe_existing_source_paths(vec![
+            target_path.to_string_lossy().into_owned(),
+            symlink_path.to_string_lossy().into_owned(),
+            missing_path.to_string_lossy().into_owned(),
+        ]);
+        let _ = std::fs::remove_file(&symlink_path);
+        let _ = std::fs::remove_file(&target_path);
+
+        assert_eq!(
+            deduped,
+            vec![
+                target_path.to_string_lossy().into_owned(),
+                missing_path.to_string_lossy().into_owned()
+            ],
+            "fallback discovery must not source the same real file twice"
+        );
     }
 
     #[test]

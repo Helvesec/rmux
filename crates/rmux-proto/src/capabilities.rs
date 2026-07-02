@@ -28,6 +28,8 @@ pub const CAPABILITY_DAEMON_STATUS: &str = "daemon.status";
 pub const CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE: &str = "daemon.shutdown_if_idle";
 /// Stable feature id for daemon-backed SDK waits and cancellation.
 pub const CAPABILITY_SDK_WAITS: &str = "sdk.waits";
+/// Stable feature id for two-phase SDK waits that acknowledge the armed state.
+pub const CAPABILITY_SDK_WAITS_ARMED: &str = "sdk.waits.armed";
 /// Stable feature id for SDK pane operations that target stable pane ids.
 pub const CAPABILITY_SDK_PANE_BY_ID: &str = "sdk.pane.by_id";
 /// Stable feature id for daemon-side SDK pane input broadcast.
@@ -62,6 +64,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     CAPABILITY_DAEMON_STATUS,
     CAPABILITY_DAEMON_SHUTDOWN_IF_IDLE,
     CAPABILITY_SDK_WAITS,
+    CAPABILITY_SDK_WAITS_ARMED,
     CAPABILITY_SDK_PANE_BY_ID,
     CAPABILITY_SDK_PANE_BROADCAST,
     CAPABILITY_SDK_SESSION_LEASE,
@@ -166,6 +169,7 @@ mod tests {
     use super::{
         HandshakeResponse, CAPABILITY_ATTACH_RENDER, CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY,
         CAPABILITY_CLI_CAPTURE_TARGET_ACTION, CAPABILITY_CLI_TARGET_ACTIONS,
+        CAPABILITY_SDK_WAITS_ARMED,
     };
 
     #[test]
@@ -189,6 +193,7 @@ mod tests {
         for expected in [
             CAPABILITY_CLI_TARGET_ACTIONS,
             CAPABILITY_CLI_CAPTURE_TARGET_ACTION,
+            CAPABILITY_SDK_WAITS_ARMED,
         ] {
             assert!(
                 response

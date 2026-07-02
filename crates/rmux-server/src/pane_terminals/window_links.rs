@@ -54,6 +54,38 @@ impl HandlerState {
         self.window_linked_session_family_list(session_name, window_index)
     }
 
+    pub(crate) fn window_linked_current_sessions_list(
+        &self,
+        session_name: &SessionName,
+        window_index: u32,
+    ) -> Vec<SessionName> {
+        let slots = self.window_link_slots_for(session_name, window_index);
+        let mut seen = HashSet::new();
+        let mut sessions = Vec::new();
+        for slot in slots {
+            let mut candidates = vec![slot.session_name.clone()];
+            candidates.extend(
+                self.sessions
+                    .session_group_members(&slot.session_name)
+                    .into_iter()
+                    .filter(|member| member != &slot.session_name),
+            );
+            for candidate in candidates {
+                if !seen.insert(candidate.clone()) {
+                    continue;
+                }
+                let is_current = self
+                    .sessions
+                    .session(&candidate)
+                    .is_some_and(|session| session.active_window_index() == slot.window_index);
+                if is_current {
+                    sessions.push(candidate);
+                }
+            }
+        }
+        sessions
+    }
+
     pub(crate) fn window_linked_session_family_list(
         &self,
         session_name: &SessionName,

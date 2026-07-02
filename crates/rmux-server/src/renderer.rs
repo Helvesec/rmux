@@ -53,7 +53,10 @@ pub(crate) use overlay::{
     PopupRenderSpec,
 };
 pub(crate) use pane_delta::{PaneRenderDelta, PaneRenderDeltaFrame, PaneRenderSnapshot};
-pub(crate) use pane_screen::{render_pane_screen, styled_pane_screen, truncate_rendered_pane_line};
+pub(crate) use pane_screen::{
+    render_pane_screen, render_pane_screen_preserving_prompt_cursor, styled_pane_screen,
+    truncate_rendered_pane_line,
+};
 #[cfg(test)]
 use status::status_bar_runs;
 use status::{
@@ -170,10 +173,6 @@ pub(crate) fn render_pane_cursor(
     if pane_geometry.cols() == 0 || pane_geometry.rows() == 0 {
         return Vec::new();
     }
-    if screen.mode() & mode::MODE_CURSOR == 0 {
-        return b"\x1b[?25l".to_vec();
-    }
-
     let (cursor_x, cursor_y) = screen.cursor_position();
     let x = pane_geometry
         .x()
@@ -183,7 +182,11 @@ pub(crate) fn render_pane_cursor(
         .saturating_add(geometry.content_y_offset)
         .saturating_add(cursor_y.min(u32::from(pane_geometry.rows().saturating_sub(1))) as u16);
     let mut frame = cursor_position_bytes(y, x);
-    frame.extend_from_slice(b"\x1b[?25h");
+    if screen.mode() & mode::MODE_CURSOR == 0 {
+        frame.extend_from_slice(b"\x1b[?25l");
+    } else {
+        frame.extend_from_slice(b"\x1b[?25h");
+    }
     frame
 }
 

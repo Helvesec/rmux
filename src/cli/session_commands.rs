@@ -127,11 +127,28 @@ fn current_working_directory_string() -> Option<String> {
 #[cfg(windows)]
 const RMUX_CLIENT_SHELL_ENV: &str = "RMUX_CLIENT_SHELL";
 #[cfg(windows)]
+const INTERNAL_CLIENT_SHELL_ENV: &str = "RMUX_INTERNAL_CLIENT_SHELL";
+#[cfg(windows)]
+const PUBLIC_BINARY_OVERRIDE_ENV: &str = "RMUX_INTERNAL_PUBLIC_BINARY_PATH";
+#[cfg(windows)]
 const INTERNAL_TMUX_COMPAT_ENV: &str = "RMUX_INTERNAL_INVOKED_AS_TMUX";
 
 #[cfg(windows)]
 fn invoking_client_environment() -> Option<Vec<String>> {
-    let mut environment = std::env::vars_os()
+    let shell = invoking_client_shell().or_else(internal_client_shell_handoff);
+    Some(windows_invoking_client_environment(
+        std::env::vars_os(),
+        shell,
+    ))
+}
+
+#[cfg(windows)]
+fn windows_invoking_client_environment<I>(vars: I, shell: Option<String>) -> Vec<String>
+where
+    I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+{
+    let mut environment = vars
+        .into_iter()
         .map(|(name, value)| {
             (
                 name.to_string_lossy().into_owned(),
@@ -140,15 +157,16 @@ fn invoking_client_environment() -> Option<Vec<String>> {
         })
         .filter(|(name, _)| !name.starts_with('='))
         .filter(|(name, _)| !name.eq_ignore_ascii_case(RMUX_CLIENT_SHELL_ENV))
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_CLIENT_SHELL_ENV))
         .filter(|(name, _)| !name.eq_ignore_ascii_case(INTERNAL_TMUX_COMPAT_ENV))
         .map(|(name, value)| format!("{name}={value}"))
         .collect::<Vec<_>>();
 
-    if let Some(shell) = invoking_client_shell() {
+    if let Some(shell) = shell {
         environment.push(format!("{RMUX_CLIENT_SHELL_ENV}={shell}"));
     }
 
-    Some(environment)
+    environment
 }
 
 #[cfg(windows)]
@@ -156,6 +174,30 @@ fn invoking_client_shell() -> Option<String> {
     let parent_pid = rmux_os::process::parent_pid(std::process::id())?;
     let parent_name = rmux_os::process::command_name(parent_pid)?;
     windows_client_shell_for_parent_name(&parent_name)
+}
+
+#[cfg(windows)]
+fn internal_client_shell_handoff() -> Option<String> {
+    internal_client_shell_handoff_from_vars(std::env::vars_os())
+}
+
+#[cfg(windows)]
+fn internal_client_shell_handoff_from_vars<I>(vars: I) -> Option<String>
+where
+    I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+{
+    let mut public_binary_seen = false;
+    let mut shell = None;
+
+    for (name, value) in vars {
+        if name.eq_ignore_ascii_case(PUBLIC_BINARY_OVERRIDE_ENV) && !value.is_empty() {
+            public_binary_seen = true;
+        } else if name.eq_ignore_ascii_case(INTERNAL_CLIENT_SHELL_ENV) && !value.is_empty() {
+            shell = Some(value.to_string_lossy().into_owned());
+        }
+    }
+
+    public_binary_seen.then_some(shell).flatten()
 }
 
 #[cfg(windows)]
@@ -315,4 +357,76 @@ pub(super) fn run_list_sessions(
             reversed: args.reversed,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(windows)]
+    use std::ffi::OsString;
+
+    #[cfg(windows)]
+    use super::{
+        internal_client_shell_handoff_from_vars, windows_invoking_client_environment,
+        INTERNAL_CLIENT_SHELL_ENV, INTERNAL_TMUX_COMPAT_ENV, PUBLIC_BINARY_OVERRIDE_ENV,
+        RMUX_CLIENT_SHELL_ENV,
+    };
+
+    #[cfg(windows)]
+    fn env_pair(name: &str, value: &str) -> (OsString, OsString) {
+        (OsString::from(name), OsString::from(value))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_full_cli_uses_trusted_tiny_client_shell_handoff() {
+        let vars = [
+            env_pair("Path", r"C:\bin"),
+            env_pair(PUBLIC_BINARY_OVERRIDE_ENV, r"C:\rmux\rmux.exe"),
+            env_pair(INTERNAL_CLIENT_SHELL_ENV, "pwsh.exe"),
+        ];
+
+        assert_eq!(
+            internal_client_shell_handoff_from_vars(vars).as_deref(),
+            Some("pwsh.exe")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_full_cli_ignores_untrusted_client_shell_handoff() {
+        let vars = [
+            env_pair("Path", r"C:\bin"),
+            env_pair(INTERNAL_CLIENT_SHELL_ENV, "pwsh.exe"),
+        ];
+
+        assert_eq!(internal_client_shell_handoff_from_vars(vars), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_full_cli_filters_internal_handoff_environment() {
+        let environment = windows_invoking_client_environment(
+            [
+                env_pair("Path", r"C:\bin"),
+                env_pair(RMUX_CLIENT_SHELL_ENV, "stale.exe"),
+                env_pair(INTERNAL_CLIENT_SHELL_ENV, "pwsh.exe"),
+                env_pair(INTERNAL_TMUX_COMPAT_ENV, "1"),
+            ],
+            Some("pwsh.exe".to_owned()),
+        );
+
+        assert!(environment.iter().any(|entry| entry == r"Path=C:\bin"));
+        assert!(environment
+            .iter()
+            .any(|entry| entry == "RMUX_CLIENT_SHELL=pwsh.exe"));
+        assert!(!environment
+            .iter()
+            .any(|entry| entry == "RMUX_CLIENT_SHELL=stale.exe"));
+        assert!(!environment
+            .iter()
+            .any(|entry| entry.starts_with("RMUX_INTERNAL_CLIENT_SHELL=")));
+        assert!(!environment
+            .iter()
+            .any(|entry| entry.starts_with("RMUX_INTERNAL_INVOKED_AS_TMUX=")));
+    }
 }

@@ -34,7 +34,7 @@ fn screen_with(bytes: &[u8], size: TerminalSize) -> Screen {
 }
 
 fn render_until_contains(session: &Session, options: &OptionStore, needle: &str) -> String {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + status_job_test_deadline();
     loop {
         let frame = String::from_utf8(render(session, options)).expect("frame is utf-8");
         assert!(!frame.contains("#("), "{frame}");
@@ -46,6 +46,14 @@ fn render_until_contains(session: &Session, options: &OptionStore, needle: &str)
             "render never contained {needle:?}; last frame was {frame:?}"
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn status_job_test_deadline() -> std::time::Duration {
+    if cfg!(windows) {
+        std::time::Duration::from_secs(10)
+    } else {
+        std::time::Duration::from_secs(2)
     }
 }
 
@@ -363,7 +371,21 @@ fn attach_render_golden_normal_idle_pane_is_byte_stable() {
 
     assert_eq!(
         super::render_pane_screen(&session, &options, pane, &screen),
-        b"\x1b[s\x1b[0m\x1b[1;1H\x1b[0mD\x1b[0m\x1b[K\x1b[0m\x1b[u"
+        b"\x1b[s\x1b[?25l\x1b[0m\x1b[1;1H\x1b[0mD\x1b[0m\x1b[K\x1b[0m\x1b[u\x1b[1;2H\x1b[?25h"
+    );
+}
+
+#[test]
+fn attach_render_pane_screen_with_prompt_preserves_prompt_cursor() {
+    let size = TerminalSize { cols: 6, rows: 2 };
+    let session = Session::new(session_name("alpha"), size);
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let screen = screen_with(b"D", size);
+    let options = OptionStore::new();
+
+    assert_eq!(
+        super::render_pane_screen_preserving_prompt_cursor(&session, &options, pane, &screen),
+        b"\x1b[s\x1b[?25l\x1b[0m\x1b[1;1H\x1b[0mD\x1b[0m\x1b[K\x1b[0m\x1b[u\x1b[?25h"
     );
 }
 
@@ -944,7 +966,7 @@ fn pane_cursor_render_hides_terminal_cursor_when_screen_cursor_is_hidden() {
     ))
     .expect("cursor frame is utf-8");
 
-    assert_eq!(frame, "\u{1b}[?25l");
+    assert_eq!(frame, "\u{1b}[1;1H\u{1b}[?25l");
 }
 
 #[test]

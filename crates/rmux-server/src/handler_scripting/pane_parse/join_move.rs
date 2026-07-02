@@ -3,9 +3,9 @@ use rmux_proto::{
     JoinPaneRequest, MovePaneRequest, PaneSplitSize, Request, RmuxError, SplitDirection,
 };
 
-use super::super::tokens::CommandTokens;
-use super::super::values::{missing_argument, parse_percentage, parse_u32};
-use super::super::{marked_pane_target, parse_pane_target};
+use super::super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
+use super::super::values::{missing_argument, parse_percentage, parse_u32, unsupported_flag};
+use super::super::{marked_pane_target_or_current, parse_pane_target};
 
 pub(in crate::handler::scripting_support) fn parse_join_pane(
     mut args: CommandTokens,
@@ -34,8 +34,8 @@ fn parse_join_or_move_pane(
     let mut before = false;
     let mut full_size = false;
     let mut direction = SplitDirection::Vertical;
-    let mut direction_set = false;
     let mut size = None;
+    let mut legacy_percentage = false;
     let mut source = None;
     let mut target = None;
 
@@ -59,20 +59,12 @@ fn parse_join_or_move_pane(
             }
             "-h" => {
                 let _ = args.optional();
-                if direction_set {
-                    return Err(RmuxError::Server(format!(
-                        "{command} accepts only one of -h or -v"
-                    )));
-                }
                 direction = SplitDirection::Horizontal;
-                direction_set = true;
             }
             "-l" => {
                 let _ = args.optional();
                 if size.is_some() {
-                    return Err(RmuxError::Server(format!(
-                        "{command} accepts only one of -l or -p"
-                    )));
+                    return Err(RmuxError::Server(format!("{command} accepts only one -l")));
                 }
                 size = Some(parse_pane_split_size(
                     command,
@@ -82,26 +74,18 @@ fn parse_join_or_move_pane(
             }
             "-p" => {
                 let _ = args.optional();
-                if size.is_some() {
-                    return Err(RmuxError::Server(format!(
-                        "{command} accepts only one of -l or -p"
-                    )));
-                }
-                size = Some(PaneSplitSize::Percentage(parse_percentage(
-                    command,
-                    "-p",
-                    &args.required("-p percentage")?,
-                )?));
+                let _ = args.required("-p size")?;
+                legacy_percentage = true;
+            }
+            token if legacy_percentage_attached_value(token) => {
+                let _ = args.optional();
+                legacy_percentage = true;
             }
             "-v" => {
                 let _ = args.optional();
-                if direction_set {
-                    return Err(RmuxError::Server(format!(
-                        "{command} accepts only one of -h or -v"
-                    )));
+                if direction != SplitDirection::Horizontal {
+                    direction = SplitDirection::Vertical;
                 }
-                direction = SplitDirection::Vertical;
-                direction_set = true;
             }
             "-s" => {
                 let _ = args.optional();
@@ -111,13 +95,74 @@ fn parse_join_or_move_pane(
                 let _ = args.optional();
                 target = Some(parse_pane_target(command, args.required("-t target")?)?);
             }
-            _ => break,
+            token => {
+                let Some(cluster) = parse_compact_flag_cluster(token, "bdfhv", "lpst") else {
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('b') => before = true,
+                        CompactFlag::Bare('d') => detached = true,
+                        CompactFlag::Bare('f') => full_size = true,
+                        CompactFlag::Bare('h') => {
+                            direction = SplitDirection::Horizontal;
+                        }
+                        CompactFlag::Bare('v') => {
+                            if direction != SplitDirection::Horizontal {
+                                direction = SplitDirection::Vertical;
+                            }
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'l', .. } => {
+                            if size.is_some() {
+                                return Err(RmuxError::Server(format!(
+                                    "{command} accepts only one -l"
+                                )));
+                            }
+                            size = Some(parse_pane_split_size(
+                                command,
+                                "-l",
+                                &compact_flag.value_or_next(args, "-l size")?,
+                            )?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'p', .. } => {
+                            let _ = compact_flag.value_or_next(args, "-p size")?;
+                            legacy_percentage = true;
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 's', .. } => {
+                            source = Some(parse_pane_target(
+                                command,
+                                compact_flag.value_or_next(args, "-s target")?,
+                            )?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target = Some(parse_pane_target(
+                                command,
+                                compact_flag.value_or_next(args, "-t target")?,
+                            )?);
+                        }
+                        CompactFlag::Bare(flag) | CompactFlag::Value { flag, .. } => {
+                            return Err(unsupported_flag(command, &format!("-{flag}")));
+                        }
+                    }
+                }
+            }
         }
     }
     args.no_extra(command)?;
+    if size.is_none() && legacy_percentage {
+        // tmux treats the legacy -p argument as a modifier for -l, not as a
+        // size source by itself.
+        return Err(RmuxError::Server("size missing".to_owned()));
+    }
+
+    let source = match source {
+        Some(source) => source,
+        None => marked_pane_target_or_current(sessions, find_context, command)?,
+    };
 
     let request = JoinPaneRequest {
-        source: source.unwrap_or(marked_pane_target(sessions, find_context, command)?),
+        source,
         target: target.ok_or_else(|| missing_argument(command, "-t target"))?,
         direction,
         detached,
@@ -139,6 +184,10 @@ fn parse_join_or_move_pane(
     } else {
         Ok(Request::JoinPane(request))
     }
+}
+
+fn legacy_percentage_attached_value(token: &str) -> bool {
+    token.starts_with("-p") && token != "-p" && !token.starts_with("--")
 }
 
 fn parse_pane_split_size(

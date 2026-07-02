@@ -147,6 +147,22 @@ async fn wait_for_named_buffer(handler: &RequestHandler, name: &str, expected: &
     .unwrap_or_else(|_| panic!("buffer {name:?} did not become {expected:?}"));
 }
 
+async fn wait_for_detached_request_count(handler: &RequestHandler, expected: usize) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let active = handler
+                .active_detached_requests
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if active == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("detached request count did not become {expected}"));
+}
+
 #[cfg(unix)]
 fn delayed_true_shell_condition() -> String {
     "sleep 0.05; true".to_owned()

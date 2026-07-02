@@ -284,11 +284,24 @@ where
         if lock_state.is_closed() || input_tx.is_closed() {
             return Ok(());
         }
+        if terminal::take_pending_ctrl_c_event() && !lock_state.is_locked() {
+            let input = input::synthetic_ctrl_c_input();
+            if input_tx.blocking_send(input).is_err() {
+                return Ok(());
+            }
+            continue;
+        }
 
         let locked = lock_state.is_locked();
         if !terminal::wait_for_key_input(input_handle, 50).map_err(ClientError::Io)? {
             if lock_state.is_closed() || input_tx.is_closed() {
                 return Ok(());
+            }
+            if terminal::take_pending_ctrl_c_event() && !lock_state.is_locked() {
+                let input = input::synthetic_ctrl_c_input();
+                if input_tx.blocking_send(input).is_err() {
+                    return Ok(());
+                }
             }
             continue;
         }

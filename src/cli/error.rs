@@ -144,7 +144,10 @@ fn shell_quote_path(path: &Path) -> String {
 fn tmux_compat_clap_message(error: &clap::Error) -> String {
     let message = error.to_string().trim_end().to_owned();
     let first_line = message.lines().next().unwrap_or(message.as_str());
-    if message == "error: size missing" || message == "error: command join-pane: size missing" {
+    if message == "error: size missing"
+        || message == "error: command join-pane: size missing"
+        || message == "error: command move-pane: size missing"
+    {
         return "size missing".to_owned();
     }
     if first_line.contains("invalid session name: session names must be non-empty") {

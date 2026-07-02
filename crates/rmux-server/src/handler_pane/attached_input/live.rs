@@ -1,6 +1,8 @@
 use std::io;
 
 use rmux_core::{input::mode, key_code_lookup_bits};
+#[cfg(windows)]
+use rmux_core::{key_string_lookup_string, KEYC_CTRL, KEYC_IMPLIED_META, KEYC_META, KEYC_SHIFT};
 use rmux_proto::{AttachedKeystroke, PaneTarget, Response};
 #[cfg(unix)]
 use rmux_pty::PtyMaster;
@@ -83,23 +85,29 @@ impl RequestHandler {
         bytes: &[u8],
         windows_console_key: Option<rmux_proto::AttachedWindowsConsoleKey>,
     ) -> io::Result<bool> {
-        let mut forwarded_to_pane = false;
-        if let Some(forwarded) = self
-            .try_forward_plain_attached_bytes_fast(attach_pid, pending_input, bytes)
-            .await?
-        {
-            return Ok(forwarded);
-        }
-        if self.attached_client_input_is_read_only(attach_pid).await? {
-            pending_input.clear();
-            return Ok(false);
-        }
         #[cfg(not(windows))]
         let _ = windows_console_key;
         #[cfg(windows)]
         let windows_console_key = windows_console_key
             .filter(|_| pending_input.is_empty() && !bytes.is_empty())
             .map(windows_console_key_event);
+        let mut forwarded_to_pane = false;
+        #[cfg(windows)]
+        let try_plain_fast_path = windows_console_key.is_none();
+        #[cfg(not(windows))]
+        let try_plain_fast_path = true;
+        if try_plain_fast_path {
+            if let Some(forwarded) = self
+                .try_forward_plain_attached_bytes_fast(attach_pid, pending_input, bytes)
+                .await?
+            {
+                return Ok(forwarded);
+            }
+        }
+        if self.attached_client_input_is_read_only(attach_pid).await? {
+            pending_input.clear();
+            return Ok(false);
+        }
         self.clear_attached_focus_alerts(attach_pid).await;
         if self.prompt_active(attach_pid).await {
             self.handle_attached_prompt_input(attach_pid, pending_input, bytes)
@@ -145,6 +153,45 @@ impl RequestHandler {
         let target_focus_events = target_mode & mode::MODE_FOCUSON != 0;
         let backspace = self.attached_backspace_byte().await;
 
+        #[cfg(windows)]
+        if pending_input.is_empty() && bytes == b"\x04" {
+            if let Some(key) = windows_key_code_named("C-d") {
+                let handled = self
+                    .handle_attached_live_key_inner(
+                        attach_pid,
+                        key,
+                        super::AttachedPaneForward::WindowsConsoleKey {
+                            key: WindowsConsoleKeyEvent::ctrl_d(),
+                            bytes,
+                        },
+                    )
+                    .await?;
+                return Ok(!handled);
+            }
+        }
+
+        #[cfg(windows)]
+        if let Some(key_event) = windows_console_key.filter(|_| pending_input.is_empty()) {
+            if let AttachedKeyDecode::Matched { size, key } = decode_attached_key(bytes, backspace)
+            {
+                if size == bytes.len() {
+                    if let Some(key) = windows_console_binding_override_key(key, key_event) {
+                        let handled = self
+                            .handle_attached_live_key_inner(
+                                attach_pid,
+                                key,
+                                super::AttachedPaneForward::WindowsConsoleKey {
+                                    key: key_event,
+                                    bytes,
+                                },
+                            )
+                            .await?;
+                        return Ok(!handled);
+                    }
+                }
+            }
+        }
+
         if pending_input.is_empty()
             && !self.attached_prefix_table_active(attach_pid).await
             && self
@@ -166,6 +213,11 @@ impl RequestHandler {
                     body_start,
                     body_end,
                 } => {
+                    if target_in_copy_mode {
+                        offset += size;
+                        raw_start = offset;
+                        continue;
+                    }
                     if raw_start < offset {
                         self.write_attached_bytes(attach_pid, &pending_input[raw_start..offset])
                             .await?;
@@ -291,12 +343,16 @@ impl RequestHandler {
                             .await?;
                         }
                         #[cfg(windows)]
-                        let handled = if let Some(key_event) = windows_console_key.filter(|_| {
-                            raw_start == offset
-                                && offset == 0
-                                && size == pending_input.len()
-                                && size == bytes.len()
-                        }) {
+                        let handled = if let Some(key_event) = windows_console_key
+                            .filter(|_| {
+                                raw_start == offset
+                                    && offset == 0
+                                    && size == pending_input.len()
+                                    && size == bytes.len()
+                            })
+                            .or_else(|| windows_synthetic_console_key_for_decoded_key(key))
+                        {
+                            let key = windows_console_binding_key(key, key_event);
                             self.handle_attached_live_key_inner(
                                 attach_pid,
                                 key,
@@ -347,8 +403,14 @@ impl RequestHandler {
                 && !prefix_table_active
                 && !target_in_copy_mode
             {
-                offset += 1;
-                continue;
+                let matches_prefix = {
+                    let state = self.state.lock().await;
+                    first_byte_matches_prefix(slice, &target, &state)
+                };
+                if !matches_prefix {
+                    offset += 1;
+                    continue;
+                }
             }
             if !prefix_table_active
                 && !target_in_copy_mode
@@ -386,12 +448,16 @@ impl RequestHandler {
                         forwarded_to_pane = true;
                     }
                     #[cfg(windows)]
-                    let handled = if let Some(key_event) = windows_console_key.filter(|_| {
-                        raw_start == offset
-                            && offset == 0
-                            && size == pending_input.len()
-                            && size == bytes.len()
-                    }) {
+                    let handled = if let Some(key_event) = windows_console_key
+                        .filter(|_| {
+                            raw_start == offset
+                                && offset == 0
+                                && size == pending_input.len()
+                                && size == bytes.len()
+                        })
+                        .or_else(|| windows_synthetic_console_key_for_decoded_key(key))
+                    {
+                        let key = windows_console_binding_key(key, key_event);
                         self.handle_attached_live_key_inner(
                             attach_pid,
                             key,
@@ -877,4 +943,123 @@ fn windows_console_key_event(key: rmux_proto::AttachedWindowsConsoleKey) -> Wind
         key.control_key_state(),
         key.repeat_count(),
     )
+}
+
+#[cfg(windows)]
+fn windows_console_binding_key(
+    decoded: rmux_core::KeyCode,
+    key: WindowsConsoleKeyEvent,
+) -> rmux_core::KeyCode {
+    windows_console_binding_override_key(decoded, key).unwrap_or(decoded)
+}
+
+#[cfg(windows)]
+fn windows_synthetic_console_key_for_decoded_key(
+    decoded: rmux_core::KeyCode,
+) -> Option<WindowsConsoleKeyEvent> {
+    key_matches_name(decoded, "C-d").then(WindowsConsoleKeyEvent::ctrl_d)
+}
+
+#[cfg(windows)]
+fn windows_console_binding_override_key(
+    decoded: rmux_core::KeyCode,
+    key: WindowsConsoleKeyEvent,
+) -> Option<rmux_core::KeyCode> {
+    const RIGHT_ALT_PRESSED: u32 = 0x0001;
+    const LEFT_ALT_PRESSED: u32 = 0x0002;
+    const LEFT_CTRL_PRESSED: u32 = 0x0008;
+    const RIGHT_CTRL_PRESSED: u32 = 0x0004;
+    const CTRL_PRESSED: u32 = LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED;
+
+    let control_key_state = key.control_key_state();
+    if decoded & KEYC_CTRL != 0 || control_key_state & CTRL_PRESSED == 0 {
+        return None;
+    }
+
+    if control_key_state & RIGHT_ALT_PRESSED != 0 {
+        return None;
+    }
+    if control_key_state & LEFT_ALT_PRESSED != 0 && control_key_state & RIGHT_CTRL_PRESSED == 0 {
+        return None;
+    }
+
+    let character = char::from_u32(u32::from(key.unicode_char()))?;
+    if !character.is_ascii() || character.is_ascii_control() {
+        return None;
+    }
+
+    let preserved_modifiers = decoded & (KEYC_META | KEYC_IMPLIED_META | KEYC_SHIFT);
+    Some(character.to_ascii_lowercase() as rmux_core::KeyCode | KEYC_CTRL | preserved_modifiers)
+}
+
+#[cfg(windows)]
+fn key_matches_name(key: rmux_core::KeyCode, name: &str) -> bool {
+    windows_key_code_named(name).is_some_and(|expected| expected == key)
+}
+
+#[cfg(windows)]
+fn windows_key_code_named(name: &str) -> Option<rmux_core::KeyCode> {
+    key_string_lookup_string(name).map(key_code_lookup_bits)
+}
+
+#[cfg(all(test, windows))]
+mod windows_console_binding_tests {
+    use rmux_core::{KEYC_CTRL, KEYC_IMPLIED_META, KEYC_META, KEYC_SHIFT};
+    use rmux_pty::WindowsConsoleKeyEvent;
+
+    use super::windows_console_binding_override_key;
+
+    const RIGHT_ALT_PRESSED: u32 = 0x0001;
+    const LEFT_ALT_PRESSED: u32 = 0x0002;
+    const RIGHT_CTRL_PRESSED: u32 = 0x0004;
+    const LEFT_CTRL_PRESSED: u32 = 0x0008;
+
+    fn key(unicode_char: char, control_key_state: u32) -> WindowsConsoleKeyEvent {
+        WindowsConsoleKeyEvent::new(0, 0, unicode_char as u16, control_key_state, 1)
+    }
+
+    #[test]
+    fn alt_gr_is_not_promoted_to_control_binding() {
+        assert_eq!(
+            windows_console_binding_override_key(
+                b'[' as u64,
+                key('[', RIGHT_ALT_PRESSED | LEFT_CTRL_PRESSED),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn plain_left_control_promotes_printable_character() {
+        assert_eq!(
+            windows_console_binding_override_key(b';' as u64, key(';', LEFT_CTRL_PRESSED)),
+            Some(b';' as u64 | KEYC_CTRL)
+        );
+    }
+
+    #[test]
+    fn meta_and_shift_modifiers_survive_control_promotion() {
+        let decoded = b';' as u64 | KEYC_META | KEYC_IMPLIED_META | KEYC_SHIFT;
+
+        assert_eq!(
+            windows_console_binding_override_key(decoded, key(';', LEFT_CTRL_PRESSED)),
+            Some(b';' as u64 | KEYC_CTRL | KEYC_META | KEYC_IMPLIED_META | KEYC_SHIFT)
+        );
+    }
+
+    #[test]
+    fn left_alt_without_right_ctrl_is_not_alt_gr_or_control_override() {
+        assert_eq!(
+            windows_console_binding_override_key(b'q' as u64, key('q', LEFT_ALT_PRESSED)),
+            None
+        );
+    }
+
+    #[test]
+    fn right_control_still_promotes_printable_character() {
+        assert_eq!(
+            windows_console_binding_override_key(b'a' as u64, key('A', RIGHT_CTRL_PRESSED)),
+            Some(b'a' as u64 | KEYC_CTRL)
+        );
+    }
 }

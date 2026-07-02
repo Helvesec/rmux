@@ -193,7 +193,7 @@ fn endpoint_from_parts(
     Ok(LocalEndpoint::from_path(path_buf_from_bytes(path)))
 }
 
-/// Resolves the top-level endpoint from `-L`, `-S`, `$RMUX`, or defaults.
+/// Resolves the top-level endpoint from `-L`, `-S`, `$RMUX`, RMUX-owned `$TMUX`, or defaults.
 ///
 /// `-S` wins over `-L`; both command-line forms win over inherited
 /// multiplexer environment.
@@ -208,6 +208,11 @@ pub fn resolve_endpoint(
         return endpoint_for_label(socket_name);
     }
     if let Some(socket_path) = socket_path_from_rmux_env(std::env::var_os(RMUX_ENV).as_deref()) {
+        return Ok(LocalEndpoint::from_path(socket_path));
+    }
+    if let Some(socket_path) =
+        socket_path_from_rmux_owned_tmux_env(std::env::var_os(TMUX_ENV).as_deref())
+    {
         return Ok(LocalEndpoint::from_path(socket_path));
     }
     default_endpoint()
@@ -338,6 +343,11 @@ fn socket_path_from_tmux_env(tmux: Option<&OsStr>) -> Option<PathBuf> {
     socket_path_from_env(tmux)
 }
 
+fn socket_path_from_rmux_owned_tmux_env(tmux: Option<&OsStr>) -> Option<PathBuf> {
+    let path = socket_path_from_tmux_env(tmux)?;
+    inherited_tmux_socket_path_is_rmux_owned(&path).then_some(path)
+}
+
 fn socket_path_from_env(value: Option<&OsStr>) -> Option<PathBuf> {
     let value = value?;
     let bytes = os_str_bytes(value);
@@ -364,6 +374,26 @@ fn inherited_socket_path(path: PathBuf) -> Option<PathBuf> {
         .ok()
         .filter(|owned| *owned)
         .map(|_| path)
+}
+
+#[cfg(unix)]
+fn inherited_tmux_socket_path_is_rmux_owned(path: &Path) -> bool {
+    let Some(label) = path.file_name() else {
+        return false;
+    };
+    if label.is_empty() {
+        return false;
+    }
+    let Some(parent) = path.parent().and_then(Path::file_name) else {
+        return false;
+    };
+    let expected_parent = format!("{SOCKET_DIR_PREFIX}-{}", rmux_os::identity::real_user_id());
+    parent == OsStr::new(&expected_parent)
+}
+
+#[cfg(windows)]
+fn inherited_tmux_socket_path_is_rmux_owned(path: &Path) -> bool {
+    socket_path_is_rmux_owned(path).unwrap_or(false)
 }
 
 #[cfg(windows)]
@@ -738,17 +768,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn resolve_endpoint_ignores_tmux_env_when_no_cli_endpoint_is_set() {
+    fn resolve_endpoint_uses_rmux_owned_tmux_env_when_no_cli_endpoint_is_set() {
         let _lock = ENV_LOCK.lock().expect("env lock");
         let _rmux = EnvGuard::remove(RMUX_ENV);
-        let _tmux = EnvGuard::set(TMUX_ENV, OsStr::new("/tmp/rmux-1000/custom,123,0"));
+        let tmux_socket = format!(
+            "/tmp/rmux-{}/custom,123,0",
+            rmux_os::identity::real_user_id()
+        );
+        let expected = PathBuf::from(tmux_socket.split(',').next().expect("socket path"));
+        let _tmux = EnvGuard::set(TMUX_ENV, OsStr::new(&tmux_socket));
+
+        let path = resolve_endpoint(None, None)
+            .expect("tmux env endpoint")
+            .into_path();
+
+        assert_eq!(path, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_endpoint_ignores_foreign_tmux_env_when_no_cli_endpoint_is_set() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _rmux = EnvGuard::remove(RMUX_ENV);
+        let _tmux = EnvGuard::set(TMUX_ENV, OsStr::new("/tmp/tmux-1000/default,123,0"));
 
         let path = resolve_endpoint(None, None)
             .expect("default endpoint")
             .into_path();
 
         assert!(path.ends_with("default"));
-        assert_ne!(path, PathBuf::from("/tmp/rmux-1000/custom"));
+        assert_ne!(path, PathBuf::from("/tmp/tmux-1000/default"));
     }
 
     #[cfg(unix)]

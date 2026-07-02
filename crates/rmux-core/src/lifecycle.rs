@@ -24,6 +24,13 @@ pub enum LifecycleEvent {
         /// The best available rmux client identifier.
         client_name: Option<String>,
     },
+    /// A client changed its terminal size.
+    ClientResized {
+        /// The session associated with the event.
+        session_name: SessionName,
+        /// The best available rmux client identifier.
+        client_name: Option<String>,
+    },
     /// A session was created.
     SessionCreated {
         /// The session associated with the event.
@@ -126,6 +133,21 @@ pub enum LifecycleEvent {
         /// The targeted pane.
         target: PaneTarget,
     },
+    /// A pane gained focus.
+    PaneFocusIn {
+        /// The targeted pane.
+        target: PaneTarget,
+    },
+    /// A pane lost focus.
+    PaneFocusOut {
+        /// The targeted pane.
+        target: PaneTarget,
+    },
+    /// A pane title changed.
+    PaneTitleChanged {
+        /// The targeted pane.
+        target: PaneTarget,
+    },
     /// A paste buffer was created or replaced.
     PasteBufferChanged {
         /// The affected paste buffer name.
@@ -166,6 +188,7 @@ impl LifecycleEvent {
             Self::ClientAttached { .. } => HookName::ClientAttached,
             Self::ClientDetached { .. } => HookName::ClientDetached,
             Self::ClientSessionChanged { .. } => HookName::ClientSessionChanged,
+            Self::ClientResized { .. } => HookName::ClientResized,
             Self::SessionCreated { .. } => HookName::SessionCreated,
             Self::SessionClosed { .. } => HookName::SessionClosed,
             Self::SessionRenamed { .. } => HookName::SessionRenamed,
@@ -182,6 +205,9 @@ impl LifecycleEvent {
             Self::PaneExited { .. } => HookName::PaneExited,
             Self::PaneDied { .. } => HookName::PaneDied,
             Self::PaneModeChanged { .. } => HookName::PaneModeChanged,
+            Self::PaneFocusIn { .. } => HookName::PaneFocusIn,
+            Self::PaneFocusOut { .. } => HookName::PaneFocusOut,
+            Self::PaneTitleChanged { .. } => HookName::PaneTitleChanged,
             Self::PasteBufferChanged { .. } => HookName::PasteBufferChanged,
             Self::PasteBufferDeleted { .. } => HookName::PasteBufferDeleted,
             Self::AfterSelectWindow { .. } => HookName::AfterSelectWindow,
@@ -198,6 +224,7 @@ impl LifecycleEvent {
             Self::ClientAttached { session_name, .. }
             | Self::ClientDetached { session_name, .. }
             | Self::ClientSessionChanged { session_name, .. }
+            | Self::ClientResized { session_name, .. }
             | Self::SessionCreated { session_name }
             | Self::SessionClosed { session_name, .. }
             | Self::SessionRenamed { session_name }
@@ -217,6 +244,9 @@ impl LifecycleEvent {
             Self::PaneExited { target, .. }
             | Self::PaneDied { target, .. }
             | Self::PaneModeChanged { target }
+            | Self::PaneFocusIn { target }
+            | Self::PaneFocusOut { target }
+            | Self::PaneTitleChanged { target }
             | Self::AfterSelectPane { target }
             | Self::AfterSendKeys { target } => ScopeSelector::Pane(target.clone()),
             Self::PasteBufferChanged { .. } | Self::PasteBufferDeleted { .. } => {
@@ -236,6 +266,7 @@ impl LifecycleEvent {
             Self::ClientAttached { session_name, .. }
             | Self::ClientDetached { session_name, .. }
             | Self::ClientSessionChanged { session_name, .. }
+            | Self::ClientResized { session_name, .. }
             | Self::SessionCreated { session_name }
             | Self::SessionClosed { session_name, .. }
             | Self::SessionRenamed { session_name }
@@ -253,6 +284,9 @@ impl LifecycleEvent {
             Self::PaneExited { target, .. }
             | Self::PaneDied { target, .. }
             | Self::PaneModeChanged { target }
+            | Self::PaneFocusIn { target }
+            | Self::PaneFocusOut { target }
+            | Self::PaneTitleChanged { target }
             | Self::AfterSelectPane { target }
             | Self::AfterSendKeys { target } => Some(target.session_name()),
             Self::AfterSetOption { session_name } => session_name.as_ref(),
@@ -266,7 +300,8 @@ impl LifecycleEvent {
         match self {
             Self::ClientAttached { client_name, .. }
             | Self::ClientDetached { client_name, .. }
-            | Self::ClientSessionChanged { client_name, .. } => client_name.as_deref(),
+            | Self::ClientSessionChanged { client_name, .. }
+            | Self::ClientResized { client_name, .. } => client_name.as_deref(),
             _ => None,
         }
     }
@@ -289,6 +324,9 @@ impl LifecycleEvent {
             Self::PaneExited { target, .. }
             | Self::PaneDied { target, .. }
             | Self::PaneModeChanged { target }
+            | Self::PaneFocusIn { target }
+            | Self::PaneFocusOut { target }
+            | Self::PaneTitleChanged { target }
             | Self::AfterSelectPane { target }
             | Self::AfterSendKeys { target } => Some(WindowTarget::with_window(
                 target.session_name().clone(),
@@ -305,6 +343,9 @@ impl LifecycleEvent {
             Self::PaneExited { target, .. }
             | Self::PaneDied { target, .. }
             | Self::PaneModeChanged { target }
+            | Self::PaneFocusIn { target }
+            | Self::PaneFocusOut { target }
+            | Self::PaneTitleChanged { target }
             | Self::AfterSelectPane { target }
             | Self::AfterSendKeys { target } => Some(target),
             _ => None,
@@ -383,6 +424,7 @@ impl LifecycleEvent {
             | Self::ClientAttached { session_name, .. }
             | Self::ClientDetached { session_name, .. }
             | Self::ClientSessionChanged { session_name, .. }
+            | Self::ClientResized { session_name, .. }
             | Self::SessionCreated { session_name }
             | Self::SessionClosed { session_name, .. }
             | Self::SessionRenamed { session_name }
@@ -400,6 +442,9 @@ impl LifecycleEvent {
             Self::PaneExited { target, .. }
             | Self::PaneDied { target, .. }
             | Self::PaneModeChanged { target }
+            | Self::PaneFocusIn { target }
+            | Self::PaneFocusOut { target }
+            | Self::PaneTitleChanged { target }
             | Self::AfterSelectPane { target }
             | Self::AfterSendKeys { target } => Some(Target::Pane(target.clone())),
             Self::AfterSetOption {

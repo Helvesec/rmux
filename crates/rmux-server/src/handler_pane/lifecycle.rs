@@ -33,6 +33,7 @@ enum PaneExitPlan {
         window_destroyed: bool,
         removed_pane_ids: Vec<rmux_core::PaneId>,
         pane_event: super::super::QueuedLifecycleEvent,
+        window_event: Option<super::super::QueuedLifecycleEvent>,
         output: ExitedPaneOutput,
     },
     RemoveSession {
@@ -171,6 +172,22 @@ impl RequestHandler {
                         let window_id = window.id();
                         let window_name = window.name().unwrap_or_default().to_owned();
                         let _ = (session, window);
+                        let window_event = if only_pane_remaining && !only_window_remaining {
+                            Some(prepare_lifecycle_event(
+                                &mut state,
+                                &LifecycleEvent::WindowUnlinked {
+                                    session_name: target.session_name().clone(),
+                                    target: Some(WindowTarget::with_window(
+                                        target.session_name().clone(),
+                                        target.window_index(),
+                                    )),
+                                    window_id: Some(window_id.as_u32()),
+                                    window_name: Some(window_name.clone()),
+                                },
+                            ))
+                        } else {
+                            None
+                        };
                         let pane_event = prepare_lifecycle_event(
                             &mut state,
                             &LifecycleEvent::PaneExited {
@@ -249,6 +266,7 @@ impl RequestHandler {
                                         window_destroyed: result.response.window_destroyed,
                                         removed_pane_ids: result.removed_pane_ids,
                                         pane_event,
+                                        window_event,
                                         output,
                                     })
                                 }
@@ -328,6 +346,7 @@ impl RequestHandler {
                 window_destroyed,
                 removed_pane_ids,
                 pane_event,
+                window_event,
                 output,
             } => {
                 self.retain_removed_pane_output(
@@ -343,6 +362,9 @@ impl RequestHandler {
                 self.cleanup_exited_pane_output_subscription(&runtime_session_name, event.pane_id)
                     .await;
                 self.emit_prepared(pane_event);
+                if let Some(window_event) = window_event {
+                    self.emit_prepared(window_event);
+                }
                 self.sync_session_silence_timers(&session_name).await;
                 if !window_destroyed {
                     self.emit(LifecycleEvent::WindowLayoutChanged {

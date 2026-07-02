@@ -104,6 +104,42 @@ pub struct OptionQuery {
     index: Option<u32>,
 }
 
+/// Error returned when resolving an option name before validating its value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OptionLookupError {
+    /// The option name does not match any known option or user option.
+    InvalidName(String),
+    /// The option prefix matches more than one known option.
+    AmbiguousPrefix(String),
+    /// The option array index syntax is malformed.
+    InvalidIndexSyntax(String),
+    /// User options do not support array indexes.
+    UserOptionArrayIndex(String),
+}
+
+impl OptionLookupError {
+    /// Returns whether tmux `set-option -q` should suppress this lookup error.
+    #[must_use]
+    pub const fn is_quiet_set_option_lookup_error(&self) -> bool {
+        matches!(self, Self::InvalidName(_) | Self::AmbiguousPrefix(_))
+    }
+
+    /// Converts the typed lookup error into the existing user-facing RMUX error.
+    #[must_use]
+    pub fn into_rmux_error(self) -> RmuxError {
+        match self {
+            Self::InvalidName(name) => RmuxError::Server(format!("invalid option: {name}")),
+            Self::AmbiguousPrefix(name) => RmuxError::Server(format!("ambiguous option: {name}")),
+            Self::InvalidIndexSyntax(name) => {
+                RmuxError::Server(format!("invalid option index syntax: {name}"))
+            }
+            Self::UserOptionArrayIndex(name) => RmuxError::Server(format!(
+                "user option does not support array indexes: {name}"
+            )),
+        }
+    }
+}
+
 #[path = "table.rs"]
 mod table;
 use table::OPTIONS;
@@ -251,14 +287,17 @@ pub(crate) fn option_metadata(option: OptionName) -> &'static OptionMetadata {
 
 /// Resolves a known option name using tmux-style aliasing and prefix matching.
 pub fn resolve_option_name(name: &str) -> Result<OptionQuery, RmuxError> {
-    let (base_name, index) = split_array_index(name)?;
+    resolve_option_name_typed(name).map_err(OptionLookupError::into_rmux_error)
+}
+
+/// Resolves an option name and preserves typed lookup failures.
+pub fn resolve_option_name_typed(name: &str) -> Result<OptionQuery, OptionLookupError> {
+    let (base_name, index) = split_array_index_typed(name)?;
     let lookup = option_lookup();
 
     if base_name.starts_with('@') {
         if index.is_some() {
-            return Err(RmuxError::Server(format!(
-                "user option does not support array indexes: {name}"
-            )));
+            return Err(OptionLookupError::UserOptionArrayIndex(name.to_owned()));
         }
         return Ok(OptionQuery {
             name: base_name.to_owned(),
@@ -301,8 +340,8 @@ pub fn resolve_option_name(name: &str) -> Result<OptionQuery, RmuxError> {
             metadata: Some(metadata),
             index,
         }),
-        [] => Err(RmuxError::Server(format!("invalid option: {base_name}"))),
-        _ => Err(RmuxError::Server(format!("ambiguous option: {base_name}"))),
+        [] => Err(OptionLookupError::InvalidName(base_name.to_owned())),
+        _ => Err(OptionLookupError::AmbiguousPrefix(base_name.to_owned())),
     }
 }
 
@@ -398,31 +437,29 @@ fn option_lookup() -> &'static OptionLookup {
 }
 
 fn split_array_index(name: &str) -> Result<(&str, Option<u32>), RmuxError> {
+    split_array_index_typed(name).map_err(OptionLookupError::into_rmux_error)
+}
+
+fn split_array_index_typed(name: &str) -> Result<(&str, Option<u32>), OptionLookupError> {
     let Some(start) = name.rfind('[') else {
         if name.contains(']') {
-            return Err(RmuxError::Server(format!(
-                "invalid option index syntax: {name}"
-            )));
+            return Err(OptionLookupError::InvalidIndexSyntax(name.to_owned()));
         }
         return Ok((name, None));
     };
 
     if !name.ends_with(']') {
-        return Err(RmuxError::Server(format!(
-            "invalid option index syntax: {name}"
-        )));
+        return Err(OptionLookupError::InvalidIndexSyntax(name.to_owned()));
     }
 
     let base_name = &name[..start];
     let index_text = &name[start + 1..name.len() - 1];
     if base_name.is_empty() || index_text.is_empty() {
-        return Err(RmuxError::Server(format!(
-            "invalid option index syntax: {name}"
-        )));
+        return Err(OptionLookupError::InvalidIndexSyntax(name.to_owned()));
     }
 
     let index = index_text
         .parse::<u32>()
-        .map_err(|_| RmuxError::Server(format!("invalid option index syntax: {name}")))?;
+        .map_err(|_| OptionLookupError::InvalidIndexSyntax(name.to_owned()))?;
     Ok((base_name, Some(index)))
 }

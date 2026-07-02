@@ -1,406 +1,391 @@
 platform,commit,operation,scenario,tool,sample_index,sample_ms,p50_ms,p95_ms
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,0,12.754,5.625,12.754
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,1,10.203,5.625,12.754
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,2,11.792,5.625,12.754
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,3,5.625,5.625,12.754
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,4,5.487,5.625,12.754
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,5,5.069,5.625,12.754
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,6,5.658,5.625,12.754
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,7,5.183,5.625,12.754
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,8,5.526,5.625,12.754
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,9,5.63,5.625,12.754
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,10,5.48,5.625,12.754
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,11,5.536,5.625,12.754
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,12,6.002,5.625,12.754
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,13,5.565,5.625,12.754
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),rmux,14,5.698,5.625,12.754
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,0,11.62,11.52,11.794
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,1,11.548,11.52,11.794
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,2,11.794,11.52,11.794
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,3,11.338,11.52,11.794
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,4,11.56,11.52,11.794
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,5,11.677,11.52,11.794
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,6,11.083,11.52,11.794
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,7,10.322,11.52,11.794
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,8,11.681,11.52,11.794
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,9,11.52,11.52,11.794
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,10,11.491,11.52,11.794
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,11,11.504,11.52,11.794
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,12,10.575,11.52,11.794
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,13,11.621,11.52,11.794
-macos,141086030d27560190dc516344ced618b016b6ce,new_session_warm_sh,Create background session (default shell),tmux,14,11.487,11.52,11.794
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,0,5.488,5.455,5.65
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,1,5.424,5.455,5.65
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,2,5.385,5.455,5.65
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,3,5.455,5.455,5.65
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,4,5.65,5.455,5.65
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,5,5.614,5.455,5.65
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,6,5.45,5.455,5.65
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,7,5.606,5.455,5.65
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,8,5.608,5.455,5.65
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,9,5.43,5.455,5.65
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,10,5.584,5.455,5.65
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,11,5.348,5.455,5.65
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,12,4.822,5.455,5.65
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,13,5.53,5.455,5.65
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,rmux,14,5.405,5.455,5.65
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,0,5.535,5.58,5.693
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,1,5.599,5.58,5.693
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,2,5.622,5.58,5.693
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,3,5.527,5.58,5.693
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,4,5.585,5.58,5.693
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,5,5.693,5.58,5.693
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,6,5.605,5.58,5.693
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,7,5.029,5.58,5.693
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,8,5.546,5.58,5.693
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,9,5.58,5.58,5.693
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,10,4.747,5.58,5.693
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,11,5.673,5.58,5.693
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,12,5.665,5.58,5.693
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,13,5.354,5.58,5.693
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,tmux,14,5.541,5.58,5.693
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,0,11.792,11.665,21.738
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,1,11.565,11.665,21.738
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,2,11.713,11.665,21.738
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,3,11.72,11.665,21.738
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,4,11.765,11.665,21.738
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,5,10.862,11.665,21.738
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,6,11.608,11.665,21.738
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,7,11.665,11.665,21.738
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,8,11.739,11.665,21.738
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,9,21.738,11.665,21.738
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,10,11.625,11.665,21.738
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,11,10.742,11.665,21.738
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,12,11.653,11.665,21.738
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,13,10.348,11.665,21.738
-macos,141086030d27560190dc516344ced618b016b6ce,list_sessions_default,List sessions,zellij,14,11.727,11.665,21.738
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,0,5.506,5.511,5.671
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,1,5.633,5.511,5.671
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,2,5.532,5.511,5.671
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,3,5.456,5.511,5.671
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,4,5.511,5.511,5.671
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,5,5.605,5.511,5.671
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,6,5.469,5.511,5.671
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,7,5.594,5.511,5.671
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,8,5.605,5.511,5.671
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,9,5.178,5.511,5.671
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,10,5.04,5.511,5.671
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,11,5.671,5.511,5.671
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,12,5.417,5.511,5.671
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,13,5.489,5.511,5.671
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,rmux,14,5.576,5.511,5.671
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,0,5.583,5.57,5.667
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,1,4.934,5.57,5.667
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,2,5.621,5.57,5.667
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,3,5.597,5.57,5.667
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,4,5.444,5.57,5.667
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,5,5.501,5.57,5.667
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,6,5.662,5.57,5.667
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,7,5.667,5.57,5.667
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,8,5.537,5.57,5.667
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,9,5.61,5.57,5.667
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,10,5.609,5.57,5.667
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,11,5.463,5.57,5.667
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,12,5.507,5.57,5.667
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,13,5.57,5.57,5.667
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,tmux,14,5.566,5.57,5.667
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,0,23.808,23.046,23.808
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,1,23.691,23.046,23.808
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,2,23.046,23.046,23.808
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,3,11.614,23.046,23.808
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,4,22.453,23.046,23.808
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,5,22.004,23.046,23.808
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,6,23.549,23.046,23.808
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,7,23.393,23.046,23.808
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,8,21.785,23.046,23.808
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,9,23.687,23.046,23.808
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,10,20.144,23.046,23.808
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,11,23.313,23.046,23.808
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,12,23.605,23.046,23.808
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,13,20.298,23.046,23.808
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_h_detached_sh,Split pane left/right,zellij,14,21.025,23.046,23.808
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,0,5.552,5.518,5.754
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,1,5.446,5.518,5.754
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,2,5.685,5.518,5.754
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,3,5.754,5.518,5.754
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,4,4.855,5.518,5.754
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,5,5.599,5.518,5.754
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,6,5.417,5.518,5.754
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,7,5.513,5.518,5.754
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,8,5.453,5.518,5.754
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,9,5.592,5.518,5.754
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,10,5.537,5.518,5.754
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,11,5.496,5.518,5.754
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,12,5.518,5.518,5.754
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,13,5.564,5.518,5.754
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,rmux,14,5.462,5.518,5.754
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,0,5.473,5.55,5.688
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,1,5.566,5.55,5.688
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,2,5.572,5.55,5.688
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,3,5.5,5.55,5.688
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,4,5.529,5.55,5.688
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,5,5.688,5.55,5.688
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,6,5.566,5.55,5.688
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,7,5.55,5.55,5.688
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,8,5.55,5.55,5.688
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,9,5.59,5.55,5.688
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,10,5.514,5.55,5.688
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,11,5.51,5.55,5.688
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,12,5.644,5.55,5.688
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,13,5.672,5.55,5.688
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,tmux,14,5.306,5.55,5.688
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,0,23.789,23.074,24.335
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,1,23.737,23.074,24.335
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,2,21.347,23.074,24.335
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,3,23.525,23.074,24.335
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,4,23.711,23.074,24.335
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,5,21.85,23.074,24.335
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,6,23.02,23.074,24.335
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,7,23.074,23.074,24.335
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,8,21.568,23.074,24.335
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,9,24.034,23.074,24.335
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,10,23.017,23.074,24.335
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,11,20.262,23.074,24.335
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,12,20.894,23.074,24.335
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,13,24.335,23.074,24.335
-macos,141086030d27560190dc516344ced618b016b6ce,split_window_v_detached_sh,Split pane top/bottom,zellij,14,23.692,23.074,24.335
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,0,5.502,5.502,5.662
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,1,5.27,5.502,5.662
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,2,5.417,5.502,5.662
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,3,5.541,5.502,5.662
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,4,5.609,5.502,5.662
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,5,5.573,5.502,5.662
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,6,5.546,5.502,5.662
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,7,5.401,5.502,5.662
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,8,5.542,5.502,5.662
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,9,5.476,5.502,5.662
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,10,5.467,5.502,5.662
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,11,5.607,5.502,5.662
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,12,5.662,5.502,5.662
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,13,5.42,5.502,5.662
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,rmux,14,5.127,5.502,5.662
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,0,5.455,5.4,5.678
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,1,5.543,5.4,5.678
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,2,5.624,5.4,5.678
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,3,5.074,5.4,5.678
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,4,4.597,5.4,5.678
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,5,5.614,5.4,5.678
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,6,5.406,5.4,5.678
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,7,4.553,5.4,5.678
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,8,5.298,5.4,5.678
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,9,5.4,5.4,5.678
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,10,5.173,5.4,5.678
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,11,5.678,5.4,5.678
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,12,5.194,5.4,5.678
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,13,5.479,5.4,5.678
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,tmux,14,5.295,5.4,5.678
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,0,11.773,11.646,21.619
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,1,11.959,11.646,21.619
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,2,11.567,11.646,21.619
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,3,11.484,11.646,21.619
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,4,11.829,11.646,21.619
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,5,11.798,11.646,21.619
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,6,11.739,11.646,21.619
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,7,10.782,11.646,21.619
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,8,11.716,11.646,21.619
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,9,21.619,11.646,21.619
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,10,11.646,11.646,21.619
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,11,11.627,11.646,21.619
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,12,11.636,11.646,21.619
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,13,11.51,11.646,21.619
-macos,141086030d27560190dc516344ced618b016b6ce,send_keys_detached_round_trip,Send keys to pane/window,zellij,14,10.519,11.646,21.619
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,0,5.394,5.52,5.655
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,1,5.52,5.52,5.655
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,2,5.55,5.52,5.655
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,3,5.132,5.52,5.655
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,4,5.488,5.52,5.655
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,5,5.448,5.52,5.655
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,6,5.584,5.52,5.655
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,7,5.621,5.52,5.655
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,8,5.4,5.52,5.655
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,9,5.534,5.52,5.655
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,10,5.438,5.52,5.655
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,11,5.556,5.52,5.655
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,12,5.655,5.52,5.655
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,13,5.46,5.52,5.655
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,rmux,14,5.584,5.52,5.655
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,0,5.665,5.53,5.665
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,1,5.525,5.53,5.665
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,2,5.566,5.53,5.665
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,3,5.554,5.53,5.665
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,4,4.569,5.53,5.665
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,5,5.583,5.53,5.665
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,6,5.184,5.53,5.665
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,7,5.11,5.53,5.665
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,8,5.508,5.53,5.665
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,9,5.531,5.53,5.665
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,10,5.427,5.53,5.665
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,11,5.532,5.53,5.665
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,12,5.572,5.53,5.665
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,13,5.53,5.53,5.665
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,tmux,14,5.488,5.53,5.665
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,0,12.066,11.708,23.135
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,1,23.135,11.708,23.135
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,2,22.87,11.708,23.135
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,3,11.648,11.708,23.135
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,4,22.28,11.708,23.135
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,5,11.775,11.708,23.135
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,6,11.696,11.708,23.135
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,7,10.632,11.708,23.135
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,8,11.558,11.708,23.135
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,9,11.316,11.708,23.135
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,10,22.194,11.708,23.135
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,11,11.708,11.708,23.135
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,12,18.933,11.708,23.135
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,13,11.309,11.708,23.135
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_80x24,Capture visible output,zellij,14,11.657,11.708,23.135
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,0,5.549,5.33,5.677
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,1,5.55,5.33,5.677
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,2,5.229,5.33,5.677
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,3,5.677,5.33,5.677
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,4,5.554,5.33,5.677
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,5,5.328,5.33,5.677
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,6,5.228,5.33,5.677
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,7,4.472,5.33,5.677
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,8,5.33,5.33,5.677
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,9,4.526,5.33,5.677
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,10,5.607,5.33,5.677
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,11,5.398,5.33,5.677
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,12,5.557,5.33,5.677
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,13,4.526,5.33,5.677
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,14,5.218,5.33,5.677
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,0,4.752,5.565,5.647
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,1,5.629,5.565,5.647
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,2,5.51,5.565,5.647
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,3,5.621,5.565,5.647
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,4,5.612,5.565,5.647
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,5,5.565,5.565,5.647
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,6,5.465,5.565,5.647
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,7,5.561,5.565,5.647
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,8,5.631,5.565,5.647
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,9,5.409,5.565,5.647
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,10,5.527,5.565,5.647
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,11,5.647,5.565,5.647
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,12,5.34,5.565,5.647
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,13,5.634,5.565,5.647
-macos,141086030d27560190dc516344ced618b016b6ce,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,14,5.572,5.565,5.647
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,0,10.16,5.964,12.4
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,1,8.169,5.964,12.4
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,2,12.4,5.964,12.4
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,3,9.304,5.964,12.4
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,4,7.994,5.964,12.4
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,5,6.611,5.964,12.4
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,6,6.581,5.964,12.4
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,7,5.809,5.964,12.4
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,8,5.408,5.964,12.4
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,9,5.964,5.964,12.4
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,10,4.583,5.964,12.4
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,11,5.577,5.964,12.4
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,12,5.85,5.964,12.4
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,13,5.139,5.964,12.4
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,rmux,14,5.597,5.964,12.4
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,0,11.438,6.165,11.438
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,1,10.354,6.165,11.438
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,2,10.366,6.165,11.438
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,3,6.165,6.165,11.438
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,4,7.161,6.165,11.438
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,5,7.819,6.165,11.438
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,6,6.503,6.165,11.438
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,7,4.847,6.165,11.438
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,8,6.421,6.165,11.438
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,9,5.763,6.165,11.438
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,10,5.674,6.165,11.438
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,11,5.364,6.165,11.438
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,12,5.762,6.165,11.438
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,13,5.708,6.165,11.438
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,tmux,14,5.745,6.165,11.438
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,0,24.359,22.955,40.015
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,1,21.639,22.955,40.015
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,2,24.756,22.955,40.015
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,3,38.431,22.955,40.015
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,4,24.355,22.955,40.015
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,5,20.565,22.955,40.015
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,6,21.515,22.955,40.015
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,7,40.015,22.955,40.015
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,8,24.056,22.955,40.015
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,9,11.802,22.955,40.015
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,10,22.955,22.955,40.015
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,11,23.717,22.955,40.015
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,12,11.357,22.955,40.015
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,13,11.678,22.955,40.015
-macos,141086030d27560190dc516344ced618b016b6ce,list_windows_20,List tabs/windows,zellij,14,11.626,22.955,40.015
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,0,5.668,5.324,5.668
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,1,5.292,5.324,5.668
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,2,5.309,5.324,5.668
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,3,5.607,5.324,5.668
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,4,5.104,5.324,5.668
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,5,5.475,5.324,5.668
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,6,5.303,5.324,5.668
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,7,4.51,5.324,5.668
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,8,5.342,5.324,5.668
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,9,5.648,5.324,5.668
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,10,5.409,5.324,5.668
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,11,5.495,5.324,5.668
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,12,5.324,5.324,5.668
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,13,5.249,5.324,5.668
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,rmux,14,5.101,5.324,5.668
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,0,5.566,5.615,5.711
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,1,5.669,5.615,5.711
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,2,5.711,5.615,5.711
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,3,5.679,5.615,5.711
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,4,5.08,5.615,5.711
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,5,5.691,5.615,5.711
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,6,5.665,5.615,5.711
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,7,5.615,5.615,5.711
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,8,5.653,5.615,5.711
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,9,5.581,5.615,5.711
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,10,5.635,5.615,5.711
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,11,5.467,5.615,5.711
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,12,5.541,5.615,5.711
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,13,5.561,5.615,5.711
-macos,141086030d27560190dc516344ced618b016b6ce,resize_pane_right_1,Grow pane by 1 cell,tmux,14,5.115,5.615,5.711
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,0,5.6,5.585,10.801
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,1,5.697,5.585,10.801
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,2,5.543,5.585,10.801
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,3,5.462,5.585,10.801
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,4,5.169,5.585,10.801
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,5,5.496,5.585,10.801
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,6,5.68,5.585,10.801
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,7,10.801,5.585,10.801
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,8,5.83,5.585,10.801
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,9,5.585,5.585,10.801
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,10,5.542,5.585,10.801
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,11,5.767,5.585,10.801
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,12,5.602,5.585,10.801
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,13,5.582,5.585,10.801
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,rmux,14,5.584,5.585,10.801
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,0,5.662,5.366,5.781
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,1,5.366,5.366,5.781
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,2,5.207,5.366,5.781
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,3,5.649,5.366,5.781
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,4,5.606,5.366,5.781
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,5,5.024,5.366,5.781
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,6,5.574,5.366,5.781
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,7,5.655,5.366,5.781
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,8,5.156,5.366,5.781
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,9,5.707,5.366,5.781
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,10,5.317,5.366,5.781
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,11,4.884,5.366,5.781
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,12,5.781,5.366,5.781
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,13,5.325,5.366,5.781
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,tmux,14,5.133,5.366,5.781
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,0,11.586,11.646,22.204
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,1,11.625,11.646,22.204
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,2,11.654,11.646,22.204
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,3,11.646,11.646,22.204
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,4,11.405,11.646,22.204
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,5,10.475,11.646,22.204
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,6,22.204,11.646,22.204
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,7,11.67,11.646,22.204
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,8,11.491,11.646,22.204
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,9,11.813,11.646,22.204
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,10,11.809,11.646,22.204
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,11,11.795,11.646,22.204
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,12,11.11,11.646,22.204
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,13,11.81,11.646,22.204
-macos,141086030d27560190dc516344ced618b016b6ce,kill_session,Terminate session,zellij,14,10.603,11.646,22.204
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),rmux,0,12.161,9.939,12.161
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),rmux,1,10.278,9.939,12.161
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),rmux,2,9.319,9.939,12.161
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),rmux,3,9.939,9.939,12.161
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),rmux,4,9.961,9.939,12.161
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),rmux,5,9.861,9.939,12.161
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),rmux,6,10.085,9.939,12.161
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),rmux,7,9.962,9.939,12.161
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),rmux,8,4.806,9.939,12.161
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),rmux,9,10.011,9.939,12.161
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),rmux,10,9.98,9.939,12.161
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),rmux,11,9.892,9.939,12.161
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),rmux,12,9.854,9.939,12.161
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),rmux,13,4.823,9.939,12.161
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),rmux,14,4.805,9.939,12.161
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),tmux,0,19.816,19.127,19.986
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),tmux,1,19.127,19.127,19.986
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),tmux,2,19.352,19.127,19.986
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),tmux,3,19.306,19.127,19.986
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),tmux,4,18.6,19.127,19.986
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),tmux,5,18.456,19.127,19.986
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),tmux,6,19.902,19.127,19.986
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),tmux,7,19.906,19.127,19.986
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),tmux,8,9.858,19.127,19.986
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),tmux,9,19.878,19.127,19.986
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),tmux,10,18.816,19.127,19.986
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),tmux,11,9.855,19.127,19.986
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),tmux,12,9.815,19.127,19.986
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),tmux,13,9.796,19.127,19.986
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,new_session_warm_sh,Create background session (default shell),tmux,14,19.986,19.127,19.986
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,rmux,0,4.82,4.858,5.008
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,rmux,1,4.927,4.858,5.008
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,rmux,2,4.867,4.858,5.008
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,rmux,3,4.918,4.858,5.008
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,rmux,4,4.819,4.858,5.008
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,rmux,5,4.95,4.858,5.008
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,rmux,6,4.8,4.858,5.008
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,rmux,7,4.858,4.858,5.008
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,rmux,8,4.32,4.858,5.008
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,rmux,9,4.756,4.858,5.008
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,rmux,10,4.822,4.858,5.008
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,rmux,11,4.879,4.858,5.008
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,rmux,12,5.008,4.858,5.008
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,rmux,13,4.625,4.858,5.008
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,rmux,14,4.932,4.858,5.008
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,tmux,0,4.801,4.825,4.953
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,tmux,1,4.893,4.825,4.953
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,tmux,2,4.813,4.825,4.953
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,tmux,3,4.897,4.825,4.953
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,tmux,4,4.773,4.825,4.953
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,tmux,5,4.922,4.825,4.953
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,tmux,6,4.83,4.825,4.953
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,tmux,7,4.79,4.825,4.953
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,tmux,8,4.419,4.825,4.953
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,tmux,9,4.953,4.825,4.953
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,tmux,10,4.686,4.825,4.953
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,tmux,11,4.825,4.825,4.953
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,tmux,12,4.787,4.825,4.953
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,tmux,13,4.833,4.825,4.953
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,tmux,14,4.852,4.825,4.953
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,zellij,0,20.069,19.389,20.14
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,zellij,1,20.14,19.389,20.14
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,zellij,2,20.112,19.389,20.14
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,zellij,3,19.992,19.389,20.14
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,zellij,4,18.986,19.389,20.14
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,zellij,5,19.999,19.389,20.14
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,zellij,6,18.661,19.389,20.14
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,zellij,7,19.55,19.389,20.14
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,zellij,8,19.463,19.389,20.14
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,zellij,9,19.389,19.389,20.14
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,zellij,10,19.313,19.389,20.14
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,zellij,11,18.657,19.389,20.14
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,zellij,12,18.435,19.389,20.14
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,zellij,13,19.089,19.389,20.14
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_sessions_default,List sessions,zellij,14,19.168,19.389,20.14
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,rmux,0,4.937,4.932,9.599
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,rmux,1,5.001,4.932,9.599
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,rmux,2,4.869,4.932,9.599
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,rmux,3,4.896,4.932,9.599
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,rmux,4,4.932,4.932,9.599
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,rmux,5,9.346,4.932,9.599
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,rmux,6,4.75,4.932,9.599
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,rmux,7,4.699,4.932,9.599
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,rmux,8,4.956,4.932,9.599
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,rmux,9,4.831,4.932,9.599
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,rmux,10,4.873,4.932,9.599
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,rmux,11,9.599,4.932,9.599
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,rmux,12,4.844,4.932,9.599
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,rmux,13,4.961,4.932,9.599
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,rmux,14,9.499,4.932,9.599
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,tmux,0,4.86,4.884,4.991
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,tmux,1,4.945,4.884,4.991
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,tmux,2,4.897,4.884,4.991
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,tmux,3,4.822,4.884,4.991
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,tmux,4,4.977,4.884,4.991
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,tmux,5,4.984,4.884,4.991
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,tmux,6,4.704,4.884,4.991
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,tmux,7,4.853,4.884,4.991
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,tmux,8,4.991,4.884,4.991
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,tmux,9,4.893,4.884,4.991
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,tmux,10,4.851,4.884,4.991
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,tmux,11,4.884,4.884,4.991
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,tmux,12,4.784,4.884,4.991
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,tmux,13,4.937,4.884,4.991
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,tmux,14,4.876,4.884,4.991
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,zellij,0,17.836,19.197,20.143
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,zellij,1,19.115,19.197,20.143
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,zellij,2,20.016,19.197,20.143
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,zellij,3,18.891,19.197,20.143
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,zellij,4,19.192,19.197,20.143
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,zellij,5,19.11,19.197,20.143
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,zellij,6,20.073,19.197,20.143
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,zellij,7,19.079,19.197,20.143
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,zellij,8,19.693,19.197,20.143
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,zellij,9,18.806,19.197,20.143
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,zellij,10,19.448,19.197,20.143
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,zellij,11,20.143,19.197,20.143
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,zellij,12,19.918,19.197,20.143
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,zellij,13,19.197,19.197,20.143
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_h_detached_sh,Split pane left/right,zellij,14,19.67,19.197,20.143
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,rmux,0,4.983,4.861,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,rmux,1,4.885,4.861,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,rmux,2,4.857,4.861,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,rmux,3,4.833,4.861,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,rmux,4,4.83,4.861,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,rmux,5,4.861,4.861,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,rmux,6,4.825,4.861,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,rmux,7,4.861,4.861,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,rmux,8,4.861,4.861,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,rmux,9,4.871,4.861,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,rmux,10,4.835,4.861,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,rmux,11,4.929,4.861,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,rmux,12,4.838,4.861,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,rmux,13,4.93,4.861,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,rmux,14,4.835,4.861,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,tmux,0,4.885,4.83,4.969
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,tmux,1,4.844,4.83,4.969
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,tmux,2,4.83,4.83,4.969
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,tmux,3,4.572,4.83,4.969
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,tmux,4,4.762,4.83,4.969
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,tmux,5,4.889,4.83,4.969
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,tmux,6,4.366,4.83,4.969
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,tmux,7,4.861,4.83,4.969
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,tmux,8,4.969,4.83,4.969
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,tmux,9,4.806,4.83,4.969
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,tmux,10,4.758,4.83,4.969
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,tmux,11,4.896,4.83,4.969
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,tmux,12,4.597,4.83,4.969
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,tmux,13,4.808,4.83,4.969
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,tmux,14,4.86,4.83,4.969
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,zellij,0,20.051,20.018,20.227
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,zellij,1,19.376,20.018,20.227
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,zellij,2,19.663,20.018,20.227
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,zellij,3,19.784,20.018,20.227
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,zellij,4,19.786,20.018,20.227
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,zellij,5,19.404,20.018,20.227
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,zellij,6,20.087,20.018,20.227
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,zellij,7,20.121,20.018,20.227
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,zellij,8,20.018,20.018,20.227
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,zellij,9,19.042,20.018,20.227
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,zellij,10,20.03,20.018,20.227
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,zellij,11,20.028,20.018,20.227
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,zellij,12,20.227,20.018,20.227
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,zellij,13,20.065,20.018,20.227
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,split_window_v_detached_sh,Split pane top/bottom,zellij,14,18.599,20.018,20.227
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,rmux,0,4.742,4.873,4.974
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,rmux,1,4.873,4.873,4.974
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,rmux,2,4.872,4.873,4.974
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,rmux,3,4.849,4.873,4.974
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,rmux,4,4.852,4.873,4.974
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,rmux,5,4.889,4.873,4.974
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,rmux,6,4.964,4.873,4.974
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,rmux,7,4.897,4.873,4.974
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,rmux,8,4.839,4.873,4.974
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,rmux,9,4.884,4.873,4.974
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,rmux,10,4.786,4.873,4.974
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,rmux,11,4.881,4.873,4.974
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,rmux,12,4.841,4.873,4.974
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,rmux,13,4.974,4.873,4.974
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,rmux,14,4.89,4.873,4.974
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,tmux,0,4.876,4.8,5.029
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,tmux,1,4.768,4.8,5.029
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,tmux,2,4.713,4.8,5.029
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,tmux,3,4.945,4.8,5.029
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,tmux,4,4.876,4.8,5.029
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,tmux,5,5.029,4.8,5.029
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,tmux,6,4.784,4.8,5.029
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,tmux,7,5.011,4.8,5.029
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,tmux,8,4.793,4.8,5.029
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,tmux,9,4.739,4.8,5.029
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,tmux,10,4.842,4.8,5.029
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,tmux,11,4.783,4.8,5.029
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,tmux,12,4.636,4.8,5.029
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,tmux,13,4.8,4.8,5.029
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,send_keys_detached_round_trip,Send keys to pane/window,tmux,14,4.886,4.8,5.029
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,rmux,0,4.992,4.883,5.055
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,rmux,1,4.883,4.883,5.055
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,rmux,2,5.014,4.883,5.055
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,rmux,3,4.836,4.883,5.055
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,rmux,4,5.055,4.883,5.055
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,rmux,5,4.799,4.883,5.055
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,rmux,6,4.934,4.883,5.055
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,rmux,7,4.853,4.883,5.055
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,rmux,8,4.902,4.883,5.055
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,rmux,9,4.857,4.883,5.055
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,rmux,10,4.9,4.883,5.055
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,rmux,11,4.738,4.883,5.055
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,rmux,12,5.045,4.883,5.055
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,rmux,13,4.814,4.883,5.055
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,rmux,14,4.867,4.883,5.055
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,tmux,0,4.978,4.899,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,tmux,1,4.819,4.899,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,tmux,2,4.929,4.899,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,tmux,3,4.983,4.899,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,tmux,4,4.89,4.899,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,tmux,5,4.67,4.899,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,tmux,6,4.965,4.899,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,tmux,7,4.873,4.899,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,tmux,8,4.946,4.899,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,tmux,9,4.832,4.899,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,tmux,10,4.899,4.899,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,tmux,11,4.899,4.899,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,tmux,12,4.967,4.899,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,tmux,13,4.878,4.899,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,tmux,14,4.889,4.899,4.983
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,zellij,0,20.075,19.788,20.187
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,zellij,1,19.788,19.788,20.187
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,zellij,2,18.656,19.788,20.187
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,zellij,3,19.646,19.788,20.187
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,zellij,4,19.956,19.788,20.187
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,zellij,5,19.429,19.788,20.187
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,zellij,6,20.028,19.788,20.187
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,zellij,7,18.997,19.788,20.187
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,zellij,8,18.562,19.788,20.187
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,zellij,9,20.145,19.788,20.187
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,zellij,10,20.187,19.788,20.187
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,zellij,11,18.734,19.788,20.187
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,zellij,12,18.116,19.788,20.187
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,zellij,13,20.064,19.788,20.187
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_80x24,Capture visible output,zellij,14,20.061,19.788,20.187
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,0,4.936,4.748,5.096
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,1,4.315,4.748,5.096
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,2,4.823,4.748,5.096
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,3,4.748,4.748,5.096
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,4,4.528,4.748,5.096
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,5,4.629,4.748,5.096
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,6,5.096,4.748,5.096
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,7,5.003,4.748,5.096
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,8,4.701,4.748,5.096
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,9,4.648,4.748,5.096
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,10,5.006,4.748,5.096
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,11,4.993,4.748,5.096
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,12,4.636,4.748,5.096
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,13,4.605,4.748,5.096
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,rmux,14,4.967,4.748,5.096
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,0,4.512,4.96,5.038
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,1,4.96,4.96,5.038
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,2,4.924,4.96,5.038
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,3,4.963,4.96,5.038
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,4,4.944,4.96,5.038
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,5,5.006,4.96,5.038
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,6,4.988,4.96,5.038
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,7,4.937,4.96,5.038
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,8,4.902,4.96,5.038
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,9,4.934,4.96,5.038
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,10,5.038,4.96,5.038
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,11,5.011,4.96,5.038
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,12,5.026,4.96,5.038
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,13,4.938,4.96,5.038
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,capture_pane_200x50_scrollback_10k,Capture full scrollback,tmux,14,4.984,4.96,5.038
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,rmux,0,11.763,5.716,11.763
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,rmux,1,6.009,5.716,11.763
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,rmux,2,5.716,5.716,11.763
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,rmux,3,6.127,5.716,11.763
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,rmux,4,5.962,5.716,11.763
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,rmux,5,5.626,5.716,11.763
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,rmux,6,7.298,5.716,11.763
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,rmux,7,5.637,5.716,11.763
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,rmux,8,9.903,5.716,11.763
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,rmux,9,11.271,5.716,11.763
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,rmux,10,5.332,5.716,11.763
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,rmux,11,5.253,5.716,11.763
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,rmux,12,5.165,5.716,11.763
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,rmux,13,5.159,5.716,11.763
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,rmux,14,5.064,5.716,11.763
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,tmux,0,11.29,5.175,11.348
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,tmux,1,10.376,5.175,11.348
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,tmux,2,6.447,5.175,11.348
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,tmux,3,5.914,5.175,11.348
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,tmux,4,9.431,5.175,11.348
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,tmux,5,11.348,5.175,11.348
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,tmux,6,5.709,5.175,11.348
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,tmux,7,5.137,5.175,11.348
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,tmux,8,5.073,5.175,11.348
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,tmux,9,4.762,5.175,11.348
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,tmux,10,5.065,5.175,11.348
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,tmux,11,5.104,5.175,11.348
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,tmux,12,4.84,5.175,11.348
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,tmux,13,5.175,5.175,11.348
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,tmux,14,5.125,5.175,11.348
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,zellij,0,19.682,20.098,40.101
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,zellij,1,20.563,20.098,40.101
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,zellij,2,18.107,20.098,40.101
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,zellij,3,19.956,20.098,40.101
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,zellij,4,19.28,20.098,40.101
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,zellij,5,21.096,20.098,40.101
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,zellij,6,23.095,20.098,40.101
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,zellij,7,40.101,20.098,40.101
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,zellij,8,36.519,20.098,40.101
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,zellij,9,18.633,20.098,40.101
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,zellij,10,19.086,20.098,40.101
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,zellij,11,20.098,20.098,40.101
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,zellij,12,20.198,20.098,40.101
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,zellij,13,20.254,20.098,40.101
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,list_windows_20,List tabs/windows,zellij,14,19.807,20.098,40.101
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,rmux,0,4.925,4.867,4.982
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,rmux,1,4.871,4.867,4.982
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,rmux,2,4.957,4.867,4.982
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,rmux,3,4.771,4.867,4.982
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,rmux,4,4.814,4.867,4.982
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,rmux,5,4.746,4.867,4.982
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,rmux,6,4.535,4.867,4.982
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,rmux,7,4.875,4.867,4.982
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,rmux,8,4.86,4.867,4.982
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,rmux,9,4.882,4.867,4.982
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,rmux,10,4.867,4.867,4.982
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,rmux,11,4.982,4.867,4.982
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,rmux,12,4.843,4.867,4.982
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,rmux,13,4.959,4.867,4.982
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,rmux,14,4.828,4.867,4.982
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,tmux,0,4.826,4.885,5.026
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,tmux,1,4.963,4.885,5.026
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,tmux,2,4.821,4.885,5.026
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,tmux,3,5.021,4.885,5.026
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,tmux,4,4.779,4.885,5.026
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,tmux,5,4.915,4.885,5.026
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,tmux,6,4.885,4.885,5.026
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,tmux,7,4.948,4.885,5.026
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,tmux,8,4.882,4.885,5.026
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,tmux,9,4.947,4.885,5.026
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,tmux,10,4.841,4.885,5.026
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,tmux,11,4.918,4.885,5.026
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,tmux,12,4.826,4.885,5.026
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,tmux,13,5.026,4.885,5.026
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,resize_pane_right_1,Grow pane by 1 cell,tmux,14,4.825,4.885,5.026
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,rmux,0,4.648,4.904,5.044
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,rmux,1,4.904,4.904,5.044
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,rmux,2,4.909,4.904,5.044
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,rmux,3,4.904,4.904,5.044
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,rmux,4,5.034,4.904,5.044
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,rmux,5,5.044,4.904,5.044
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,rmux,6,4.628,4.904,5.044
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,rmux,7,5.01,4.904,5.044
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,rmux,8,4.857,4.904,5.044
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,rmux,9,4.614,4.904,5.044
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,rmux,10,4.864,4.904,5.044
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,rmux,11,5.035,4.904,5.044
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,rmux,12,4.988,4.904,5.044
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,rmux,13,4.916,4.904,5.044
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,rmux,14,4.882,4.904,5.044
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,tmux,0,5.0,4.879,5.0
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,tmux,1,4.894,4.879,5.0
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,tmux,2,4.929,4.879,5.0
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,tmux,3,4.784,4.879,5.0
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,tmux,4,4.929,4.879,5.0
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,tmux,5,4.857,4.879,5.0
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,tmux,6,4.891,4.879,5.0
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,tmux,7,4.836,4.879,5.0
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,tmux,8,4.713,4.879,5.0
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,tmux,9,4.97,4.879,5.0
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,tmux,10,4.879,4.879,5.0
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,tmux,11,4.34,4.879,5.0
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,tmux,12,4.934,4.879,5.0
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,tmux,13,4.876,4.879,5.0
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,tmux,14,4.698,4.879,5.0
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,zellij,0,19.008,19.445,20.153
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,zellij,1,20.153,19.445,20.153
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,zellij,2,18.668,19.445,20.153
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,zellij,3,18.666,19.445,20.153
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,zellij,4,20.074,19.445,20.153
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,zellij,5,18.672,19.445,20.153
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,zellij,6,18.42,19.445,20.153
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,zellij,7,20.096,19.445,20.153
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,zellij,8,18.979,19.445,20.153
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,zellij,9,20.009,19.445,20.153
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,zellij,10,19.492,19.445,20.153
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,zellij,11,19.469,19.445,20.153
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,zellij,12,20.085,19.445,20.153
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,zellij,13,18.525,19.445,20.153
+macos,e41a1867dec0a5c9db76a98b6b14229f15a2464b,kill_session,Terminate session,zellij,14,19.445,19.445,20.153

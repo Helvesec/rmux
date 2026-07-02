@@ -70,12 +70,20 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$rmux" ] || die "rmux binary is required"
+case "$rmux" in
+  */*)
+    rmux_command="$(cd "$(dirname "$rmux")" && pwd -P)/$(basename "$rmux")"
+    ;;
+  *)
+    rmux_command="$rmux"
+    ;;
+esac
 
 # `--help` is intentionally outside the tiny direct path. It proves that the
 # installed public CLI can reach the complete command surface: directly for full
 # CLIs, or through the private helper for tiny dispatchers.
 assert_helper_fallback
-"$rmux" diagnose --json >/dev/null
+"$rmux_command" diagnose --json >/dev/null
 
 if [ "$require_daemon_command" -eq 1 ]; then
   command -v rmux-daemon >/dev/null 2>&1 ||
@@ -83,18 +91,36 @@ if [ "$require_daemon_command" -eq 1 ]; then
 fi
 
 if [ "$skip_daemon" -eq 0 ]; then
+  smoke_root="$(mktemp -d "${TMPDIR:-/tmp}/rmux-installed-smoke.XXXXXX")"
   label="installed-smoke-$$-$(date +%s)"
   session="installed_smoke_$$"
-  "$rmux" -L "$label" kill-server >/dev/null 2>&1 || true
+  "$rmux_command" -L "$label" kill-server >/dev/null 2>&1 || true
   cleanup() {
-    "$rmux" -L "$label" kill-server >/dev/null 2>&1 || true
+    "$rmux_command" -L "$label" kill-server >/dev/null 2>&1 || true
+    rm -rf "$smoke_root"
   }
   trap cleanup EXIT
 
-  "$rmux" -L "$label" new-session -d -s "$session" >/dev/null ||
+  "$rmux_command" -L "$label" new-session -d -s "$session" >/dev/null ||
     die "rmux failed to create a session through its daemon"
-  "$rmux" -L "$label" has-session -t "$session" >/dev/null ||
+  "$rmux_command" -L "$label" has-session -t "$session" >/dev/null ||
     die "rmux failed to find the session created through its daemon"
+  config_dir="$smoke_root/config dir"
+  mkdir -p "$config_dir"
+  cat >"$config_dir/rmux installed smoke.conf" <<'CONFIG'
+set-option -g status off
+set-environment -g RMUX_INSTALLED_SMOKE ok
+CONFIG
+  (
+    cd "$config_dir"
+    "$rmux_command" -L "$label" source-file "rmux installed smoke.conf"
+  ) >/dev/null || die "rmux installed smoke failed to source a relative config path"
+  status_value="$("$rmux_command" -L "$label" show-options -gqv status)"
+  [ "$status_value" = "off" ] ||
+    die "source-file did not apply installed smoke status option: $status_value"
+  env_value="$("$rmux_command" -L "$label" show-environment -g RMUX_INSTALLED_SMOKE)"
+  [ "$env_value" = "RMUX_INSTALLED_SMOKE=ok" ] ||
+    die "source-file did not apply installed smoke environment option: $env_value"
   cleanup
   trap - EXIT
 fi
@@ -102,3 +128,4 @@ fi
 printf 'rmux=%s\n' "$rmux"
 printf 'helper_fallback=ok\n'
 printf 'daemon_smoke=%s\n' "$([ "$skip_daemon" -eq 0 ] && printf ok || printf skipped)"
+printf 'source_file=%s\n' "$([ "$skip_daemon" -eq 0 ] && printf ok || printf skipped)"

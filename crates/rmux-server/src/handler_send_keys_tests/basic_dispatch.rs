@@ -60,6 +60,39 @@ async fn send_keys_marks_attached_session_input_as_interactive() {
 }
 
 #[tokio::test]
+async fn pane_input_ref_marks_attached_session_input_as_interactive() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    handler.register_attach(77, alpha.clone(), control_tx).await;
+
+    let response = handler
+        .handle(Request::PaneInput(rmux_proto::PaneInputRequest {
+            target: PaneTargetRef::slot(PaneTarget::new(alpha, 0)),
+            keys: vec!["hello".to_owned()],
+            literal: false,
+        }))
+        .await;
+
+    assert_eq!(
+        response,
+        Response::SendKeys(SendKeysResponse { key_count: 1 })
+    );
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(control) = control_rx.recv().await {
+            if matches!(control, crate::pane_io::AttachControl::InteractiveInput) {
+                return;
+            }
+        }
+        panic!("attach control channel should remain open");
+    })
+    .await
+    .expect("interactive input control should arrive");
+}
+
+#[tokio::test]
 async fn send_keys_plain_input_uses_copy_mode_until_copy_mode_exits() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
@@ -161,6 +194,179 @@ async fn send_keys_control_question_and_noop_digits_match_tmux_bytes() {
         Response::SendKeys(SendKeysResponse { key_count: 6 })
     );
     capture.assert_contents(&handler, &[0x7f]).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn pane_input_ctrl_z_uses_windows_console_key_mapping() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "pane-input-c-z", 1).await;
+    let response = handler
+        .handle(Request::PaneInput(rmux_proto::PaneInputRequest {
+            target: PaneTargetRef::slot(PaneTarget::new(alpha.clone(), 0)),
+            keys: vec!["C-z".to_owned()],
+            literal: false,
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::SendKeys(SendKeysResponse { key_count: 1 })
+    );
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, &[0x1a]).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn pane_input_ctrl_c_inside_multi_token_payload_uses_windows_console_sequence() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "pane-input-multi-token-c-c", 1).await;
+    let response = handler
+        .handle(Request::PaneInput(rmux_proto::PaneInputRequest {
+            target: PaneTargetRef::slot(PaneTarget::new(alpha.clone(), 0)),
+            keys: vec![
+                "Write-Output BEFORE".to_owned(),
+                "Enter".to_owned(),
+                "C-c".to_owned(),
+                "Enter".to_owned(),
+            ],
+            literal: false,
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::SendKeys(SendKeysResponse { key_count: 4 })
+    );
+
+    let mut expected = b"Write-Output BEFORE".to_vec();
+    expected.extend_from_slice(&encoded_windows_key_bytes("Enter"));
+    expected.push(0x03);
+    expected.extend_from_slice(&encoded_windows_key_bytes("Enter"));
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, &expected).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn pane_input_ctrl_a_to_cmd_uses_select_all_sequence() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+
+    set_windows_test_shell(&handler, "cmd.exe").await;
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "pane-input-cmd-c-a", 1).await;
+    let response = handler
+        .handle(Request::PaneInput(rmux_proto::PaneInputRequest {
+            target: PaneTargetRef::slot(PaneTarget::new(alpha.clone(), 0)),
+            keys: vec!["C-a".to_owned()],
+            literal: false,
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::SendKeys(SendKeysResponse { key_count: 1 })
+    );
+
+    capture
+        .assert_contents(&handler, &windows_cmd_select_all_bytes())
+        .await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn send_keys_ctrl_a_to_cmd_uses_select_all_sequence() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let target = PaneTarget::new(alpha.clone(), 0);
+
+    set_windows_test_shell(&handler, "cmd.exe").await;
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "send-keys-cmd-c-a", 1).await;
+    let response = handler
+        .handle(Request::SendKeys(SendKeysRequest {
+            target,
+            keys: vec!["C-a".to_owned()],
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::SendKeys(SendKeysResponse { key_count: 1 })
+    );
+
+    capture
+        .assert_contents(&handler, &windows_cmd_select_all_bytes())
+        .await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn send_keys_ext_ctrl_a_to_cmd_uses_select_all_sequence() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    let target = PaneTarget::new(alpha.clone(), 0);
+
+    set_windows_test_shell(&handler, "cmd.exe").await;
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "send-keys-ext-cmd-c-a", 1).await;
+    let response = handler
+        .handle(Request::SendKeysExt(SendKeysExtRequest {
+            target: Some(target),
+            keys: vec!["C-a".to_owned()],
+            expand_formats: false,
+            hex: false,
+            literal: false,
+            dispatch_key_table: false,
+            copy_mode_command: false,
+            forward_mouse_event: false,
+            reset_terminal: false,
+            repeat_count: None,
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::SendKeys(SendKeysResponse { key_count: 1 })
+    );
+
+    capture
+        .assert_contents(&handler, &windows_cmd_select_all_bytes())
+        .await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn pane_input_literal_ctrl_c_bytes_remain_literal() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+
+    create_send_keys_test_session(&handler, &alpha).await;
+
+    let capture = RawPaneInputProbe::start(&handler, &alpha, "pane-input-literal-c-c", 1).await;
+    let response = handler
+        .handle(Request::PaneInput(rmux_proto::PaneInputRequest {
+            target: PaneTargetRef::slot(PaneTarget::new(alpha.clone(), 0)),
+            keys: vec!["\u{3}".to_owned()],
+            literal: true,
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::SendKeys(SendKeysResponse { key_count: 1 })
+    );
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, &[0x03]).await;
 }
 
 #[tokio::test]
@@ -266,6 +472,34 @@ async fn send_keys_empty_keys_to_missing_session_returns_error() {
             error: RmuxError::SessionNotFound(_),
         })
     ));
+}
+
+#[cfg(windows)]
+async fn set_windows_test_shell(handler: &RequestHandler, shell: &str) {
+    let mut state = handler.state.lock().await;
+    state
+        .options
+        .set(
+            ScopeSelector::Global,
+            OptionName::DefaultShell,
+            shell.to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("test default-shell is valid");
+}
+
+#[cfg(windows)]
+fn windows_cmd_select_all_bytes() -> Vec<u8> {
+    ["C-Home", "S-End"]
+        .into_iter()
+        .flat_map(encoded_windows_key_bytes)
+        .collect()
+}
+
+#[cfg(windows)]
+fn encoded_windows_key_bytes(key_name: &str) -> Vec<u8> {
+    let key = key_string_lookup_string(key_name).expect("test key must exist");
+    encode_key(0, ExtendedKeyFormat::Xterm, key).expect("test key must encode")
 }
 
 #[tokio::test]

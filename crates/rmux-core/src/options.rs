@@ -27,7 +27,7 @@ use mutation::{
 pub use mutation::{validate_option_mutation, validate_option_name_mutation};
 pub use registry::{
     option_affects_alerts, option_affects_rendering, option_name_by_name, resolve_option_name,
-    OptionQuery,
+    resolve_option_name_typed, OptionLookupError, OptionQuery,
 };
 use registry::{option_metadata, OptionChangeMask, OptionValueType};
 pub use scope::default_global_scope_for_option_name;

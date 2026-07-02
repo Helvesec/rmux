@@ -361,7 +361,7 @@ async fn session_closed_hooks_fire_before_session_scope_is_removed() {
 }
 
 #[tokio::test]
-async fn pane_exited_hooks_fire_with_removed_pane_context_before_pane_hooks_are_cleared() {
+async fn kill_pane_does_not_synthesize_pane_exited_hook_like_tmux() {
     let handler = RequestHandler::new();
     create_session(&handler, "alpha").await;
 
@@ -376,25 +376,12 @@ async fn pane_exited_hooks_fire_with_removed_pane_context_before_pane_hooks_are_
     assert!(matches!(split, Response::SplitWindow(_)));
 
     let pane_target = rmux_proto::PaneTarget::with_window(session_name("alpha"), 0, 1);
-    let (pane_id, window_id) = {
-        let state = handler.state.lock().await;
-        let session = state
-            .sessions
-            .session(&session_name("alpha"))
-            .expect("alpha session exists");
-        let window = session.window_at(0).expect("window 0 exists");
-        let pane = window.pane(1).expect("pane 1 exists");
-        (pane.id().as_u32(), window.id().as_u32())
-    };
-
     assert!(matches!(
         handler
             .handle(Request::SetHook(SetHookRequest {
                 scope: ScopeSelector::Pane(pane_target.clone()),
                 hook: HookName::PaneExited,
-                command: format!(
-                    "if-shell -F '#{{==:#{{hook_pane}} #{{hook_window}},%{pane_id} @{window_id}}}' 'set-buffer -b exited ok' 'set-buffer -b exited bad'"
-                ),
+                command: "set-buffer -b exited bad".to_owned(),
                 lifecycle: HookLifecycle::Persistent,
             }))
             .await,
@@ -412,11 +399,10 @@ async fn pane_exited_hooks_fire_with_removed_pane_context_before_pane_hooks_are_
     ));
 
     let state = handler.state.lock().await;
-    let (_, content) = state
-        .buffers
-        .show(Some("exited"))
-        .expect("exited buffer exists");
-    assert_eq!(String::from_utf8_lossy(content), "ok");
+    assert!(
+        state.buffers.show(Some("exited")).is_err(),
+        "kill-pane must use after-kill-pane, not synthesize pane-exited"
+    );
 }
 
 #[tokio::test]

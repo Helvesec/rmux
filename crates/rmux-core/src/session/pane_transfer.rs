@@ -241,8 +241,20 @@ impl Session {
             .map(|pane| pane.index())
             .expect("moved pane must survive cross-window join");
         if let Some(requested_size) = requested_size {
-            let _ =
-                target_window.resize_pane_to(moved_pane_index, options.direction, requested_size);
+            if options.full_size {
+                let _ = target_window.resize_pane_to(
+                    moved_pane_index,
+                    options.direction,
+                    requested_size,
+                );
+            } else {
+                let _ = target_window.resize_new_split_pane_to(
+                    moved_pane_index,
+                    options.direction,
+                    requested_size,
+                    options.before,
+                );
+            }
         }
 
         let source_was_empty = source_window.pane_count() == 0;
@@ -318,6 +330,14 @@ impl Session {
             .window_at_mut(window_index)
             .expect("window must exist for in-window swap");
         window.push_zoom(options.preserve_zoom);
+        let active_before_id = window
+            .active_pane()
+            .expect("validated window must have an active pane before swap")
+            .id();
+        let source_pane_id = window
+            .pane(source_pane_index)
+            .expect("validated source pane must exist before swap")
+            .id();
         let target_pane_id = window
             .pane(target_pane_index)
             .expect("validated target pane must exist before swap")
@@ -325,7 +345,15 @@ impl Session {
         let swapped = window.swap_panes(source_pane_index, target_pane_index);
         debug_assert!(swapped, "validated in-window swap must succeed");
 
-        if !options.detached {
+        if options.detached {
+            let active_after_id =
+                if active_before_id == source_pane_id || active_before_id == target_pane_id {
+                    source_pane_id
+                } else {
+                    active_before_id
+                };
+            window.select_pane_by_id(active_after_id);
+        } else {
             window.select_pane_by_id(target_pane_id);
         }
         window.pop_zoom();
@@ -368,12 +396,21 @@ impl Session {
             .pane(source.pane_index)
             .cloned()
             .expect("validated source pane must exist");
+        let source_geometry = source_pane.geometry();
         let source_pane_id = source_pane.id();
-        let target_pane_id = window
+        let target_pane = window
             .pane(target.pane_index)
-            .expect("validated target pane must exist")
-            .id();
+            .expect("validated target pane must exist");
+        let target_geometry = target_pane.geometry();
+        let target_pane_id = target_pane.id();
         window.ensure_accepts_pane(&source_pane, Some(source_position))?;
+        let source_axis_size = join_axis_for_size(
+            rmux_proto::TerminalSize {
+                cols: source_geometry.cols(),
+                rows: source_geometry.rows(),
+            },
+            options.direction,
+        );
         let requested_size = join_requested_size(
             window,
             target.pane_index,
@@ -464,7 +501,30 @@ impl Session {
             .map(|pane| pane.index())
             .expect("moved pane must survive in-window join");
         if let Some(requested_size) = requested_size {
-            let _ = window.resize_pane_to(moved_pane_index, options.direction, requested_size);
+            let size_existing_target_side = !options.full_size
+                && !options.before
+                && same_axis_source_after_target(
+                    source_geometry,
+                    target_geometry,
+                    options.direction,
+                );
+            let (sized_pane_index, size_to_apply) = if size_existing_target_side {
+                window
+                    .panes()
+                    .iter()
+                    .find(|pane| pane.id() == target_pane_id)
+                    .map(|pane| pane.index())
+                    .map(|pane_index| {
+                        (
+                            pane_index,
+                            source_axis_size.saturating_sub(requested_size).max(1),
+                        )
+                    })
+                    .expect("target pane must survive in-window join")
+            } else {
+                (moved_pane_index, requested_size)
+            };
+            let _ = window.resize_pane_to(sized_pane_index, options.direction, size_to_apply);
         }
 
         Ok(())
@@ -511,5 +571,20 @@ fn join_axis_for_size(size: rmux_proto::TerminalSize, direction: SplitDirection)
     match direction {
         SplitDirection::Vertical => u32::from(size.cols),
         SplitDirection::Horizontal => u32::from(size.rows),
+    }
+}
+
+fn same_axis_source_after_target(
+    source: crate::PaneGeometry,
+    target: crate::PaneGeometry,
+    direction: SplitDirection,
+) -> bool {
+    match direction {
+        SplitDirection::Vertical => {
+            source.y() == target.y() && source.rows() == target.rows() && source.x() > target.x()
+        }
+        SplitDirection::Horizontal => {
+            source.x() == target.x() && source.cols() == target.cols() && source.y() > target.y()
+        }
     }
 }

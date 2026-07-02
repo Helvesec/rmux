@@ -1,16 +1,16 @@
 use super::super::RequestHandler;
 use super::session_name;
-use crate::copy_mode::CopyPosition;
 use crate::input_keys::{encode_key, encode_mouse_event, ExtendedKeyFormat, MouseForwardEvent};
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
 use rmux_core::{input::mode, key_string_lookup_string};
 use rmux_proto::{
     BindKeyRequest, CopyModeRequest, ErrorResponse, ListKeysRequest, ListPanesRequest,
-    NewSessionRequest, OptionName, PaneBroadcastInputRequest, PaneId, PaneTarget, PaneTargetRef,
-    Request, Response, RmuxError, ScopeSelector, SelectPaneRequest, SendKeysExtRequest,
-    SendKeysRequest, SendKeysResponse, SendPrefixRequest, SendPrefixResponse, SetOptionMode,
-    SetOptionRequest, ShowBufferRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget,
-    SwitchClientExtRequest, TerminalSize, UnbindKeyRequest, WindowTarget, DEFAULT_MAX_FRAME_LENGTH,
+    NewSessionExtRequest, NewSessionRequest, OptionName, PaneBroadcastInputRequest, PaneId,
+    PaneTarget, PaneTargetRef, Request, Response, RmuxError, ScopeSelector, SelectPaneRequest,
+    SendKeysExtRequest, SendKeysRequest, SendKeysResponse, SendPrefixRequest, SendPrefixResponse,
+    SetOptionMode, SetOptionRequest, ShowBufferRequest, SplitDirection, SplitWindowRequest,
+    SplitWindowTarget, SwitchClientExtRequest, TerminalSize, UnbindKeyRequest, WindowTarget,
+    DEFAULT_MAX_FRAME_LENGTH,
 };
 use std::time::Duration;
 use tokio::sync::mpsc;

@@ -88,15 +88,52 @@ async fn parsed_queue_split_window_applies_stateful_compat_flags() {
 
     let parsed = CommandParser::new()
         .parse("split-window -I -t alpha:0.0")
-        .expect("split-window unsupported flag parses at core layer");
-    let error = handler
+        .expect("split-window stdin flag parses at core layer");
+    handler
         .execute_parsed_commands_for_test(std::process::id(), parsed)
         .await
-        .expect_err("split-window -I should be rejected before spawn");
+        .expect("split-window -I creates an empty keep-alive pane");
 
-    assert_eq!(
-        error,
-        rmux_proto::RmuxError::Server("command split-window: unknown flag -I".to_owned())
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("session exists");
+    let window = session.window_at(0).expect("window exists");
+    assert!(
+        window.pane(2).is_some(),
+        "split-window -I should create a third pane after the earlier split"
+    );
+}
+
+#[tokio::test]
+async fn parsed_queue_split_window_direction_flags_follow_tmux_priority() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("split-priority");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let parsed = CommandParser::new()
+        .parse("split-window -h -v -t split-priority:0.0")
+        .expect("split-window direction flags parse");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("split-window repeated direction flags execute");
+
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("session exists");
+    let window = session.window_at(0).expect("window exists");
+    let new_geometry = window.pane(1).expect("new pane exists").geometry();
+    assert!(
+        new_geometry.cols() < 80,
+        "tmux-priority -h should produce a horizontal/left-right split, got {new_geometry:?}"
     );
 }
 

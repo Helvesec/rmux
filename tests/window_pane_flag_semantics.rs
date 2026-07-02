@@ -9,7 +9,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use common::{assert_success, stderr, stdout, terminate_child, CliHarness};
+use common::{assert_success, stderr, stdout, terminate_child, CliHarness, BINARY_OVERRIDE_ENV};
 
 const SETTLE: Duration = Duration::from_millis(150);
 
@@ -51,28 +51,29 @@ fn split_window_stdin_flag_feeds_the_created_pane() -> Result<(), Box<dyn Error>
         ));
     })?;
     assert_success(&split);
-    std::thread::sleep(SETTLE);
 
-    let panes = harness.run(&["list-panes", "-t", "s", "-F", "#{pane_index}:#{pane_id}"])?;
-    assert_eq!(panes.status.code(), Some(0));
-    assert!(stdout(&panes).contains("1:%"));
-    assert!(stderr(&panes).is_empty());
+    let panes_stdout = wait_for_stdout_contains(
+        &harness,
+        &["list-panes", "-t", "s", "-F", "#{pane_index}:#{pane_id}"],
+        "1:%",
+    )?;
+    assert!(
+        panes_stdout.contains("1:%"),
+        "split-window -I should create pane 1: {panes_stdout:?}"
+    );
 
-    let capture = harness.run(&["capture-pane", "-p", "-t", "s:0.1"])?;
-    assert_eq!(capture.status.code(), Some(0));
-    let payload_count = stdout(&capture).matches("hello").count();
+    let capture_stdout = wait_for_capture_contains(&harness, "s:0.1", "hello\nworld")?;
+    let payload_count = capture_stdout.matches("hello").count();
     assert_eq!(
-        payload_count,
-        1,
+        payload_count, 1,
         "capture should contain exactly one stdin payload: {:?}",
-        stdout(&capture)
+        capture_stdout
     );
     assert!(
-        stdout(&capture).contains("hello\nworld"),
+        capture_stdout.contains("hello\nworld"),
         "LF stdin should render as separate terminal lines without indentation: {:?}",
-        stdout(&capture)
+        capture_stdout
     );
-    assert!(stderr(&capture).is_empty());
 
     let commands = harness.run(&[
         "list-panes",
@@ -88,15 +89,21 @@ fn split_window_stdin_flag_feeds_the_created_pane() -> Result<(), Box<dyn Error>
         stdout(&commands)
     );
 
-    let dead_metadata = harness.run(&[
-        "list-panes",
-        "-t",
-        "s",
-        "-F",
-        "#{pane_index}:dead=#{pane_dead}:status=#{pane_dead_status}:time=#{pane_dead_time}:cmd=#{pane_current_command}",
-    ])?;
-    assert_eq!(dead_metadata.status.code(), Some(0));
-    let dead_metadata_stdout = stdout(&dead_metadata);
+    let dead_metadata_stdout = wait_for_stdout_matching(
+        &harness,
+        &[
+            "list-panes",
+            "-t",
+            "s",
+            "-F",
+            "#{pane_index}:dead=#{pane_dead}:status=#{pane_dead_status}:time=#{pane_dead_time}:cmd=#{pane_current_command}",
+        ],
+        |stdout| {
+            ["bash", "zsh", "sh"].iter().any(|shell| {
+                stdout.contains(&format!("1:dead=1:status=:time=:cmd={shell}"))
+            })
+        },
+    )?;
     assert!(
         ["bash", "zsh", "sh"]
             .iter()
@@ -105,7 +112,6 @@ fn split_window_stdin_flag_feeds_the_created_pane() -> Result<(), Box<dyn Error>
         "split-window -I synthetic pane should not expose exit status or time: {:?}",
         dead_metadata_stdout
     );
-    assert!(stderr(&dead_metadata).is_empty());
 
     let binary_path = harness.tmpdir().join("split-stdin-binary.bin");
     fs::write(&binary_path, b"a\xffb\n")?;
@@ -153,6 +159,39 @@ fn split_window_stdin_flag_feeds_the_created_pane() -> Result<(), Box<dyn Error>
             stdout(&command_capture)
         );
     }
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn source_file_split_window_stdin_flag_creates_empty_pane() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("source-file-split-window-stdin-flag")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-x", "40", "-y", "12", "-s", "s"])?);
+    let source = harness.tmpdir().join("split-stdin.conf");
+    fs::write(&source, "split-window -I -t s:0.0\n")?;
+
+    let output = harness.run(&["source-file", source.to_str().expect("utf-8 path")])?;
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "source-file split-window -I should succeed; stdout={:?}, stderr={:?}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(stderr(&output).is_empty());
+
+    let panes_stdout = wait_for_stdout_contains(
+        &harness,
+        &["list-panes", "-t", "s", "-F", "#{pane_index}:#{pane_id}"],
+        "1:%",
+    )?;
+    assert!(
+        panes_stdout.contains("1:%"),
+        "source-file split-window -I should create pane 1: {panes_stdout:?}"
+    );
 
     terminate_child(daemon.child_mut())?;
     Ok(())
@@ -500,6 +539,845 @@ fn resize_pane_absolute_height_preserves_vertical_chain_layout() -> Result<(), B
 }
 
 #[test]
+fn resize_pane_compact_direction_and_trailing_adjustment_match_tmux() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("resize-pane-compact-trailing")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-x", "80", "-y", "24", "-s", "s"])?);
+    assert_success(&harness.run(&["split-window", "-h", "-t", "s:0.0"])?);
+    assert_success(&harness.run(&["resize-pane", "-R", "-L", "-t", "s:0.0", "3"])?);
+
+    let panes = harness.run(&[
+        "list-panes",
+        "-t",
+        "s",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(panes.status.code(), Some(0));
+    assert_eq!(stdout(&panes), "0:37x24\n1:42x24\n");
+    assert!(stderr(&panes).is_empty());
+
+    let source = harness.tmpdir().join("resize.conf");
+    fs::write(&source, "resize-pane -RL -t s:0.0\n")?;
+    assert_success(&harness.run(&["source-file", source.to_str().expect("utf-8 path")])?);
+
+    let sourced = harness.run(&[
+        "list-panes",
+        "-t",
+        "s",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(sourced.status.code(), Some(0));
+    assert_eq!(stdout(&sourced), "0:36x24\n1:43x24\n");
+    assert!(stderr(&sourced).is_empty());
+
+    let before_no_direction = stdout(&sourced);
+    assert_success(&harness.run(&["resize-pane", "-t", "s:0.0", "3"])?);
+    let after_no_direction = harness.run(&[
+        "list-panes",
+        "-t",
+        "s",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(after_no_direction.status.code(), Some(0));
+    assert_eq!(stdout(&after_no_direction), before_no_direction);
+
+    let no_direction_source = harness.tmpdir().join("resize-no-direction.conf");
+    fs::write(&no_direction_source, "resize-pane -t s:0.0 3\n")?;
+    assert_success(&harness.run(&[
+        "source-file",
+        no_direction_source.to_str().expect("utf-8 path"),
+    ])?);
+    let sourced_no_direction = harness.run(&[
+        "list-panes",
+        "-t",
+        "s",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(sourced_no_direction.status.code(), Some(0));
+    assert_eq!(stdout(&sourced_no_direction), before_no_direction);
+
+    let zero = harness.run(&["resize-pane", "-L", "-t", "s:0.0", "0"])?;
+    assert_eq!(zero.status.code(), Some(1));
+    assert!(stderr(&zero).contains("adjustment too small"));
+
+    let zero_source = harness.tmpdir().join("resize-zero.conf");
+    fs::write(&zero_source, "resize-pane -L -t s:0.0 0\n")?;
+    let sourced_zero = harness.run(&["source-file", zero_source.to_str().expect("utf-8 path")])?;
+    assert_eq!(sourced_zero.status.code(), Some(1));
+    assert!(
+        format!("{}{}", stdout(&sourced_zero), stderr(&sourced_zero))
+            .contains("adjustment too small")
+    );
+
+    let huge = "999999999999999999999999999999";
+    let overflow = harness.run(&["resize-pane", "-R", "-t", "s:0.0", huge])?;
+    assert_eq!(overflow.status.code(), Some(1));
+    assert!(stderr(&overflow).contains("adjustment too large"));
+
+    let overflow_source = harness.tmpdir().join("resize-overflow.conf");
+    fs::write(
+        &overflow_source,
+        format!("resize-pane -R -t s:0.0 {huge}\n"),
+    )?;
+    let sourced_overflow =
+        harness.run(&["source-file", overflow_source.to_str().expect("utf-8 path")])?;
+    assert_eq!(sourced_overflow.status.code(), Some(1));
+    assert!(
+        format!("{}{}", stdout(&sourced_overflow), stderr(&sourced_overflow))
+            .contains("adjustment too large")
+    );
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn split_window_legacy_percentage_modifier_matches_tmux_compat() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("split-window-legacy-percentage")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-x", "100", "-y", "24", "-s", "s"])?);
+    let missing_size = harness.run(&["split-window", "-p", "50", "-t", "s:0"])?;
+    assert_eq!(missing_size.status.code(), Some(1));
+
+    assert_success(&harness.run(&["split-window", "-l", "5", "-p", "50", "-t", "s:0"])?);
+    let panes = harness.run(&[
+        "list-panes",
+        "-t",
+        "s",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(panes.status.code(), Some(0));
+    assert_eq!(stdout(&panes), "0:100x18\n1:100x5\n");
+    assert!(stderr(&panes).is_empty());
+
+    assert_success(&harness.run(&["new-session", "-d", "-x", "100", "-y", "24", "-s", "r"])?);
+    assert_success(&harness.run(&["split-window", "-pabc", "-l", "5", "-t", "r:0"])?);
+    let direct_opaque = harness.run(&[
+        "list-panes",
+        "-t",
+        "r",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(direct_opaque.status.code(), Some(0));
+    assert_eq!(stdout(&direct_opaque), "0:100x18\n1:100x5\n");
+    assert!(stderr(&direct_opaque).is_empty());
+
+    let move_missing = harness.run(&["move-pane", "-p", "35", "-s", "r:0.1", "-t", "r:0.0"])?;
+    assert_eq!(move_missing.status.code(), Some(1));
+    assert_eq!(stderr(&move_missing), "size missing\n");
+
+    assert_success(&harness.run(&["new-session", "-d", "-x", "100", "-y", "24", "-s", "j"])?);
+    assert_success(&harness.run(&["split-window", "-h", "-t", "j:0.0"])?);
+    let join_source = harness.tmpdir().join("join.conf");
+    fs::write(
+        &join_source,
+        "select-pane -t j:0.1 -m\njoin-pane -pabc -l 5 -t j:0.0\n",
+    )?;
+    assert_success(&harness.run(&["source-file", join_source.to_str().expect("utf-8 path")])?);
+    let joined = harness.run(&[
+        "list-panes",
+        "-t",
+        "j",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(joined.status.code(), Some(0));
+    assert_eq!(stdout(&joined), "0:100x18\n1:100x5\n");
+    assert!(stderr(&joined).is_empty());
+
+    assert_success(&harness.run(&["new-session", "-d", "-x", "100", "-y", "24", "-s", "m"])?);
+    assert_success(&harness.run(&["split-window", "-h", "-t", "m:0.0"])?);
+    let move_source = harness.tmpdir().join("move.conf");
+    fs::write(
+        &move_source,
+        "select-pane -t m:0.1 -m\nmove-pane -pabc -l 5 -t m:0.0\n",
+    )?;
+    assert_success(&harness.run(&["source-file", move_source.to_str().expect("utf-8 path")])?);
+    let moved = harness.run(&[
+        "list-panes",
+        "-t",
+        "m",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(moved.status.code(), Some(0));
+    assert_eq!(stdout(&moved), "0:100x18\n1:100x5\n");
+    assert!(stderr(&moved).is_empty());
+
+    assert_success(&harness.run(&["new-session", "-d", "-x", "100", "-y", "24", "-s", "jx"])?);
+    assert_success(&harness.run(&["split-window", "-h", "-t", "jx:0.0"])?);
+    let explicit_join_source = harness.tmpdir().join("join-explicit-source.conf");
+    fs::write(
+        &explicit_join_source,
+        "join-pane -l 5 -s jx:0.1 -t jx:0.0\n",
+    )?;
+    assert_success(&harness.run(&[
+        "source-file",
+        explicit_join_source.to_str().expect("utf-8 path"),
+    ])?);
+    let explicit_joined = harness.run(&[
+        "list-panes",
+        "-t",
+        "jx",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(explicit_joined.status.code(), Some(0));
+    assert_eq!(stdout(&explicit_joined), "0:100x18\n1:100x5\n");
+    assert!(stderr(&explicit_joined).is_empty());
+
+    assert_success(&harness.run(&["new-session", "-d", "-x", "100", "-y", "24", "-s", "mx"])?);
+    assert_success(&harness.run(&["split-window", "-h", "-t", "mx:0.0"])?);
+    let explicit_move_source = harness.tmpdir().join("move-explicit-source.conf");
+    fs::write(
+        &explicit_move_source,
+        "move-pane -l 5 -s mx:0.1 -t mx:0.0\n",
+    )?;
+    assert_success(&harness.run(&[
+        "source-file",
+        explicit_move_source.to_str().expect("utf-8 path"),
+    ])?);
+    let explicit_moved = harness.run(&[
+        "list-panes",
+        "-t",
+        "mx",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(explicit_moved.status.code(), Some(0));
+    assert_eq!(stdout(&explicit_moved), "0:100x18\n1:100x5\n");
+    assert!(stderr(&explicit_moved).is_empty());
+
+    assert_success(&harness.run(&["new-session", "-d", "-x", "100", "-y", "24", "-s", "sx"])?);
+    assert_success(&harness.run(&["split-window", "-h", "-t", "sx:0.0"])?);
+    let explicit_swap_source = harness.tmpdir().join("swap-explicit-source.conf");
+    fs::write(&explicit_swap_source, "swap-pane -s sx:0.1 -t sx:0.0\n")?;
+    assert_success(&harness.run(&[
+        "source-file",
+        explicit_swap_source.to_str().expect("utf-8 path"),
+    ])?);
+    let explicit_swapped = harness.run(&[
+        "list-panes",
+        "-t",
+        "sx",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(explicit_swapped.status.code(), Some(0));
+    assert_eq!(stdout(&explicit_swapped), "0:50x24\n1:49x24\n");
+    assert!(stderr(&explicit_swapped).is_empty());
+
+    assert_success(&harness.run(&["new-session", "-d", "-x", "100", "-y", "24", "-s", "q"])?);
+    let source = harness.tmpdir().join("split.conf");
+    fs::write(&source, "split-window -pabc -l 5 -t q:0\n")?;
+    assert_success(&harness.run(&["source-file", source.to_str().expect("utf-8 path")])?);
+    let sourced = harness.run(&[
+        "list-panes",
+        "-t",
+        "q",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(sourced.status.code(), Some(0));
+    assert_eq!(stdout(&sourced), "0:100x18\n1:100x5\n");
+    assert!(stderr(&sourced).is_empty());
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn source_file_explicit_pane_sources_do_not_require_marked_pane() -> Result<(), Box<dyn Error>> {
+    for (label, command) in [
+        ("join", "join-pane -l 5 -s s:0.1 -t s:0.0\n"),
+        ("move", "move-pane -l 5 -s s:0.1 -t s:0.0\n"),
+        ("swap", "swap-pane -s s:0.1 -t s:0.0\n"),
+        ("join-legacy-p", "join-pane -pabc -l 5 -s s:0.1 -t s:0.0\n"),
+        ("move-legacy-p", "move-pane -pabc -l 5 -s s:0.1 -t s:0.0\n"),
+    ] {
+        let harness = CliHarness::new(&format!("source-file-explicit-pane-source-{label}"))?;
+        let mut daemon = harness.start_hidden_daemon()?;
+
+        assert_success(&harness.run(&["new-session", "-d", "-x", "100", "-y", "24", "-s", "s"])?);
+        assert_success(&harness.run(&["split-window", "-h", "-t", "s:0.0"])?);
+        let source = harness.tmpdir().join(format!("{label}.conf"));
+        fs::write(&source, command)?;
+
+        let output = harness.run(&["source-file", source.to_str().expect("utf-8 path")])?;
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{label} should source successfully; stdout={:?}, stderr={:?}",
+            stdout(&output),
+            stderr(&output)
+        );
+        assert!(
+            !stdout(&output).contains("requires a marked pane"),
+            "{label} must not fall back to marked pane: {:?}",
+            stdout(&output)
+        );
+        assert!(
+            stderr(&output).is_empty(),
+            "{label} stderr: {:?}",
+            stderr(&output)
+        );
+
+        terminate_child(daemon.child_mut())?;
+    }
+
+    Ok(())
+}
+
+#[test]
+fn source_file_omitted_pane_sources_fall_back_to_current_pane() -> Result<(), Box<dyn Error>> {
+    for (label, command) in [
+        ("join", "join-pane -t s:0.0\n"),
+        ("move", "move-pane -t s:0.0\n"),
+        ("swap", "swap-pane -t s:0.0\n"),
+    ] {
+        let harness = CliHarness::new(&format!("source-file-omitted-pane-source-{label}"))?;
+        let _cleanup = harness.auto_start_cleanup()?;
+        let run = |args: &[&str]| {
+            harness.run_with(args, |process| {
+                process.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+            })
+        };
+
+        assert_success(&run(&[
+            "new-session",
+            "-d",
+            "-x",
+            "100",
+            "-y",
+            "24",
+            "-s",
+            "s",
+        ])?);
+        assert_success(&run(&["split-window", "-t", "s:0.0"])?);
+        assert_success(&run(&["select-pane", "-t", "s:0.1"])?);
+
+        let source = harness.tmpdir().join(format!("{label}.conf"));
+        fs::write(&source, command)?;
+        let output = run(&["source-file", source.to_str().expect("utf-8 path")])?;
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{label} should source successfully; stdout={:?}, stderr={:?}",
+            stdout(&output),
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).is_empty(),
+            "{label} stderr: {:?}",
+            stderr(&output)
+        );
+
+        let panes = run(&[
+            "list-panes",
+            "-t",
+            "s",
+            "-F",
+            "#{pane_index}:#{pane_width}x#{pane_height}:#{pane_active}",
+        ])?;
+        assert_eq!(panes.status.code(), Some(0));
+        assert!(stderr(&panes).is_empty());
+        if label != "swap" {
+            assert!(
+                !stdout(&panes).contains("0:100x12:0\n1:100x11:1"),
+                "{label} should mutate the layout using current pane as source: {:?}",
+                stdout(&panes)
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn same_window_join_and_move_pane_size_matches_tmux_target_side() -> Result<(), Box<dyn Error>> {
+    for command in ["join-pane", "move-pane"] {
+        let harness = CliHarness::new(&format!("same-window-{command}-size-target-side"))?;
+        let _cleanup = harness.auto_start_cleanup()?;
+
+        let run = |args: &[&str]| {
+            harness.run_with(args, |process| {
+                process.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+            })
+        };
+
+        assert_success(&run(&[
+            "new-session",
+            "-d",
+            "-x",
+            "100",
+            "-y",
+            "24",
+            "-s",
+            "s",
+        ])?);
+        assert_success(&run(&["split-window", "-t", "s:0"])?);
+        assert_success(&run(&[command, "-l", "5", "-s", "s:0.1", "-t", "s:0.0"])?);
+
+        let panes = run(&[
+            "list-panes",
+            "-t",
+            "s:0",
+            "-F",
+            "#{pane_index}:#{pane_width}x#{pane_height}:#{pane_active}",
+        ])?;
+        assert_eq!(panes.status.code(), Some(0), "{command}");
+        assert_eq!(stdout(&panes), "0:100x6:0\n1:100x17:1\n", "{command}");
+        assert!(stderr(&panes).is_empty(), "{command}");
+
+        assert_success(&run(&[
+            "new-session",
+            "-d",
+            "-x",
+            "100",
+            "-y",
+            "24",
+            "-s",
+            "b",
+        ])?);
+        assert_success(&run(&["split-window", "-t", "b:0"])?);
+        assert_success(&run(&[
+            command, "-b", "-l", "5", "-s", "b:0.1", "-t", "b:0.0",
+        ])?);
+
+        let before_panes = run(&[
+            "list-panes",
+            "-t",
+            "b:0",
+            "-F",
+            "#{pane_index}:#{pane_width}x#{pane_height}:#{pane_active}",
+        ])?;
+        assert_eq!(before_panes.status.code(), Some(0), "{command} -b");
+        assert_eq!(
+            stdout(&before_panes),
+            "0:100x5:1\n1:100x18:0\n",
+            "{command} -b"
+        );
+        assert!(stderr(&before_panes).is_empty(), "{command} -b");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn cross_window_join_and_move_pane_size_preserves_non_target_neighbor() -> Result<(), Box<dyn Error>>
+{
+    for command in ["join-pane", "move-pane"] {
+        let harness = CliHarness::new(&format!("cross-window-{command}-non-target-neighbor-size"))?;
+        let _cleanup = harness.auto_start_cleanup()?;
+
+        let run = |args: &[&str]| {
+            harness.run_with(args, |process| {
+                process.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+            })
+        };
+
+        assert_success(&run(&[
+            "new-session",
+            "-d",
+            "-x",
+            "200",
+            "-y",
+            "50",
+            "-s",
+            "s",
+            "-n",
+            "target",
+        ])?);
+        assert_success(&run(&["split-window", "-h", "-t", "s:0.0"])?);
+        assert_success(&run(&["new-window", "-d", "-t", "s:1", "-n", "source"])?);
+
+        assert_success(&run(&[
+            command, "-h", "-l", "30", "-s", "s:1.0", "-t", "s:0.0",
+        ])?);
+
+        let panes = run(&[
+            "list-panes",
+            "-t",
+            "s:0",
+            "-F",
+            "#{pane_index}:#{pane_width}x#{pane_height}:#{pane_active}",
+        ])?;
+        assert_eq!(panes.status.code(), Some(0), "{command}");
+        assert_eq!(
+            stdout(&panes),
+            "0:69x50:0\n1:30x50:1\n2:99x50:0\n",
+            "{command}"
+        );
+        assert!(stderr(&panes).is_empty(), "{command}");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn detached_swap_pane_selects_source_at_target_position_like_tmux() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("detached-swap-pane-active-target")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+    let run = |args: &[&str]| {
+        harness.run_with(args, |process| {
+            process.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        })
+    };
+
+    assert_success(&run(&[
+        "new-session",
+        "-d",
+        "-x",
+        "120",
+        "-y",
+        "40",
+        "-s",
+        "s",
+    ])?);
+    assert_success(&run(&["split-window", "-d", "-h", "-t", "s:0.0"])?);
+    assert_success(&run(&["select-pane", "-t", "s:0.0"])?);
+    assert_success(&run(&["swap-pane", "-d", "-s", "s:0.1", "-t", "s:0.0"])?);
+
+    let panes = run(&[
+        "list-panes",
+        "-t",
+        "s",
+        "-F",
+        "#{pane_index}:#{pane_active}:#{pane_id}",
+    ])?;
+    assert_eq!(panes.status.code(), Some(0));
+    let pane_output = stdout(&panes);
+    let lines = pane_output.lines().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines[0].starts_with("0:1:%"),
+        "target position should stay active after detached swap: {:?}",
+        pane_output
+    );
+    assert!(
+        lines[1].starts_with("1:0:%"),
+        "source position should become inactive after detached swap: {:?}",
+        pane_output
+    );
+    assert!(stderr(&panes).is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn detached_swap_pane_preserves_unrelated_active_pane_like_tmux() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("detached-swap-pane-active-unrelated")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+    let run = |args: &[&str]| {
+        harness.run_with(args, |process| {
+            process.env(BINARY_OVERRIDE_ENV, harness.launcher_path());
+        })
+    };
+
+    assert_success(&run(&[
+        "new-session",
+        "-d",
+        "-x",
+        "100",
+        "-y",
+        "24",
+        "-s",
+        "s",
+    ])?);
+    assert_success(&run(&["split-window", "-h", "-t", "s:0.0"])?);
+    assert_success(&run(&["split-window", "-h", "-t", "s:0.1"])?);
+    assert_success(&run(&["select-pane", "-t", "s:0.2"])?);
+    assert_success(&run(&["swap-pane", "-d", "-s", "s:0.1", "-t", "s:0.0"])?);
+
+    let panes = run(&[
+        "list-panes",
+        "-t",
+        "s",
+        "-F",
+        "#{pane_index}:#{pane_active}",
+    ])?;
+    assert_eq!(panes.status.code(), Some(0));
+    assert_eq!(stdout(&panes), "0:0\n1:0\n2:1\n");
+    assert!(stderr(&panes).is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn pane_transfer_clears_mark_when_marked_source_is_consumed() -> Result<(), Box<dyn Error>> {
+    for (label, command, format) in [
+        (
+            "join",
+            "join-pane -pabc -l 5 -s s:0.1 -t s:0.0",
+            "#{pane_index}:#{pane_active}:#{pane_marked}:#{pane_id}",
+        ),
+        (
+            "move",
+            "move-pane -pabc -l 5 -s s:0.1 -t s:0.0",
+            "#{pane_index}:#{pane_active}:#{pane_marked}:#{pane_id}",
+        ),
+        (
+            "break",
+            "break-pane -d -s s:0.1",
+            "#{session_name}:#{window_index}.#{pane_index}:#{pane_marked}:#{pane_id}",
+        ),
+    ] {
+        let harness = CliHarness::new(&format!("pane-transfer-clears-mark-{label}"))?;
+        let mut daemon = harness.start_hidden_daemon()?;
+
+        assert_success(&harness.run(&["new-session", "-d", "-x", "120", "-y", "40", "-s", "s"])?);
+        assert_success(&harness.run(&["split-window", "-d", "-h", "-t", "s:0.0"])?);
+        assert_success(&harness.run(&["select-pane", "-t", "s:0.1", "-m"])?);
+        let argv = command.split_whitespace().collect::<Vec<_>>();
+        assert_success(&harness.run(&argv)?);
+
+        let panes = harness.run(&["list-panes", "-a", "-F", format])?;
+        assert_eq!(panes.status.code(), Some(0), "{label}");
+        assert!(
+            stdout(&panes).lines().all(|line| !line.contains(":1:%")),
+            "{label} should clear a mark on the consumed source pane: {:?}",
+            stdout(&panes)
+        );
+        assert!(stderr(&panes).is_empty(), "{label}");
+
+        terminate_child(daemon.child_mut())?;
+    }
+
+    Ok(())
+}
+
+#[test]
+fn source_file_join_and_move_direction_flags_follow_tmux_priority() -> Result<(), Box<dyn Error>> {
+    for (label, command) in [
+        ("join-hv", "join-pane -h -v -s s:0.1 -t s:1.0\n"),
+        ("join-vh", "join-pane -v -h -s s:0.1 -t s:1.0\n"),
+        ("join-cluster-hv", "join-pane -hv -s s:0.1 -t s:1.0\n"),
+        ("join-cluster-vh", "join-pane -vh -s s:0.1 -t s:1.0\n"),
+        ("move-hv", "move-pane -h -v -s s:0.1 -t s:1.0\n"),
+        ("move-vh", "move-pane -v -h -s s:0.1 -t s:1.0\n"),
+        ("move-cluster-hv", "move-pane -hv -s s:0.1 -t s:1.0\n"),
+        ("move-cluster-vh", "move-pane -vh -s s:0.1 -t s:1.0\n"),
+    ] {
+        let harness = CliHarness::new(&format!("source-file-pane-direction-priority-{label}"))?;
+        let mut daemon = harness.start_hidden_daemon()?;
+
+        assert_success(&harness.run(&["new-session", "-d", "-x", "80", "-y", "24", "-s", "s"])?);
+        assert_success(&harness.run(&["split-window", "-h", "-t", "s:0.0"])?);
+        assert_success(&harness.run(&["new-window", "-d", "-t", "s:"])?);
+
+        let source = harness.tmpdir().join(format!("{label}.conf"));
+        fs::write(&source, command)?;
+        let output = harness.run(&["source-file", source.to_str().expect("utf-8 path")])?;
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{label} should source successfully; stdout={:?}, stderr={:?}",
+            stdout(&output),
+            stderr(&output)
+        );
+        assert!(stderr(&output).is_empty(), "{label} stderr");
+
+        let panes = harness.run(&[
+            "list-panes",
+            "-t",
+            "s:1",
+            "-F",
+            "#{pane_index}:#{pane_width}x#{pane_height}",
+        ])?;
+        assert_eq!(panes.status.code(), Some(0), "{label} panes status");
+        assert_eq!(
+            stdout(&panes),
+            "0:40x24\n1:39x24\n",
+            "{label} should use horizontal split geometry"
+        );
+
+        terminate_child(daemon.child_mut())?;
+    }
+
+    Ok(())
+}
+
+#[test]
+fn source_file_resize_pane_accepts_absolute_percentages() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("source-file-resize-pane-percent")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-x", "80", "-y", "24", "-s", "s"])?);
+    assert_success(&harness.run(&["split-window", "-h", "-t", "s:0.0"])?);
+
+    let source = harness.tmpdir().join("resize-percent.conf");
+    fs::write(&source, "resize-pane -x 25% -y 50% -t s:0.0\n")?;
+    let output = harness.run(&["source-file", source.to_str().expect("utf-8 path")])?;
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "source-file should accept resize-pane percentages; stdout={:?}, stderr={:?}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(stderr(&output).is_empty());
+
+    let panes = harness.run(&[
+        "list-panes",
+        "-t",
+        "s:0",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(panes.status.code(), Some(0));
+    assert_eq!(stdout(&panes), "0:20x24\n1:59x24\n");
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn source_file_resize_pane_clamps_large_absolute_sizes() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("source-file-resize-pane-large-absolute")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-x", "80", "-y", "24", "-s", "s"])?);
+    assert_success(&harness.run(&["split-window", "-h", "-t", "s:0.0"])?);
+
+    let source = harness.tmpdir().join("resize-large.conf");
+    fs::write(
+        &source,
+        "resize-pane -x 70000 -t s:0.0\nresize-pane -y 70000 -t s:0.0\n",
+    )?;
+    let output = harness.run(&["source-file", source.to_str().expect("utf-8 path")])?;
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "source-file should clamp large resize-pane sizes; stdout={:?}, stderr={:?}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(stderr(&output).is_empty());
+
+    let panes = harness.run(&[
+        "list-panes",
+        "-t",
+        "s:0",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(panes.status.code(), Some(0));
+    assert_eq!(stdout(&panes), "0:78x24\n1:1x24\n");
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn source_file_compact_pane_flags_match_cli_surface() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("source-file-compact-pane-flags")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    for (session, command) in [
+        ("si", "split-window -Id -t si:0.0\n"),
+        ("sv", "split-window -vf -t sv:0.0\n"),
+        ("sb", "split-window -bd -t sb:0.0\n"),
+    ] {
+        assert_success(&harness.run(&[
+            "new-session",
+            "-d",
+            "-x",
+            "100",
+            "-y",
+            "24",
+            "-s",
+            session,
+        ])?);
+        let source = harness.tmpdir().join(format!("{session}.conf"));
+        fs::write(&source, command)?;
+        assert_success(&harness.run(&["source-file", source.to_str().expect("utf-8 path")])?);
+        let panes = harness.run(&[
+            "list-panes",
+            "-t",
+            session,
+            "-F",
+            "#{pane_index}:#{pane_width}x#{pane_height}",
+        ])?;
+        assert_eq!(panes.status.code(), Some(0), "session={session}");
+        assert_eq!(
+            stdout(&panes),
+            "0:100x12\n1:100x11\n",
+            "session={session}, command={command:?}"
+        );
+        assert!(stderr(&panes).is_empty(), "session={session}");
+    }
+
+    for (session, command) in [
+        ("jds", "join-pane -ds jds:0.1 -t jds:0.0\n"),
+        ("mds", "move-pane -ds mds:0.1 -t mds:0.0\n"),
+    ] {
+        assert_success(&harness.run(&[
+            "new-session",
+            "-d",
+            "-x",
+            "100",
+            "-y",
+            "24",
+            "-s",
+            session,
+        ])?);
+        assert_success(&harness.run(&["split-window", "-h", "-t", &format!("{session}:0.0")])?);
+        let source = harness.tmpdir().join(format!("{session}.conf"));
+        fs::write(&source, command)?;
+        assert_success(&harness.run(&["source-file", source.to_str().expect("utf-8 path")])?);
+        let panes = harness.run(&[
+            "list-panes",
+            "-t",
+            session,
+            "-F",
+            "#{pane_index}:#{pane_width}x#{pane_height}",
+        ])?;
+        assert_eq!(panes.status.code(), Some(0), "session={session}");
+        assert_eq!(
+            stdout(&panes),
+            "0:100x12\n1:100x11\n",
+            "session={session}, command={command:?}"
+        );
+        assert!(stderr(&panes).is_empty(), "session={session}");
+    }
+
+    assert_success(&harness.run(&["new-session", "-d", "-x", "100", "-y", "24", "-s", "swds"])?);
+    assert_success(&harness.run(&["split-window", "-h", "-t", "swds:0.0"])?);
+    let before_swap =
+        harness.run(&["list-panes", "-t", "swds", "-F", "#{pane_index}:#{pane_id}"])?;
+    assert_eq!(before_swap.status.code(), Some(0));
+    let before_ids = stdout(&before_swap)
+        .lines()
+        .map(|line| line.split_once(':').expect("pane id line").1.to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(before_ids.len(), 2);
+
+    let source = harness.tmpdir().join("swap-ds.conf");
+    fs::write(&source, "swap-pane -ds swds:0.1 -t swds:0.0\n")?;
+    assert_success(&harness.run(&["source-file", source.to_str().expect("utf-8 path")])?);
+    let after_swap =
+        harness.run(&["list-panes", "-t", "swds", "-F", "#{pane_index}:#{pane_id}"])?;
+    assert_eq!(after_swap.status.code(), Some(0));
+    assert_eq!(
+        stdout(&after_swap),
+        format!("0:{}\n1:{}\n", before_ids[1], before_ids[0])
+    );
+    assert!(stderr(&after_swap).is_empty());
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
 fn resize_pane_absolute_extremes_are_validated_or_clamped() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("resize-pane-absolute-extremes")?;
     let mut daemon = harness.start_hidden_daemon()?;
@@ -685,14 +1563,30 @@ fn wait_for_capture_contains(
     target: &str,
     needle: &str,
 ) -> Result<String, Box<dyn Error>> {
+    wait_for_stdout_contains(harness, &["capture-pane", "-p", "-t", target], needle)
+}
+
+fn wait_for_stdout_contains(
+    harness: &CliHarness,
+    args: &[&str],
+    needle: &str,
+) -> Result<String, Box<dyn Error>> {
+    wait_for_stdout_matching(harness, args, |stdout| stdout.contains(needle))
+}
+
+fn wait_for_stdout_matching(
+    harness: &CliHarness,
+    args: &[&str],
+    mut predicate: impl FnMut(&str) -> bool,
+) -> Result<String, Box<dyn Error>> {
     let deadline = Instant::now() + SETTLE * 12;
 
     loop {
-        let output = harness.run(&["capture-pane", "-p", "-t", target])?;
+        let output = harness.run(args)?;
         assert_eq!(output.status.code(), Some(0));
         assert!(stderr(&output).is_empty());
         let stdout = stdout(&output);
-        if stdout.contains(needle) || Instant::now() >= deadline {
+        if predicate(&stdout) || Instant::now() >= deadline {
             return Ok(stdout);
         }
         std::thread::sleep(Duration::from_millis(25));

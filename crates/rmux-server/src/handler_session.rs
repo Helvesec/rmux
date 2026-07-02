@@ -37,6 +37,10 @@ mod output;
 const DEFERRED_INITIAL_PANE_READY_TIMEOUT: Duration = Duration::from_millis(250);
 #[cfg(windows)]
 const DEFERRED_INITIAL_PANE_READY_SETTLE: Duration = Duration::from_millis(100);
+#[cfg(windows)]
+const DEFERRED_INITIAL_PANE_CONSOLE_INPUT_RETRIES: usize = 8;
+#[cfg(windows)]
+const DEFERRED_INITIAL_PANE_CONSOLE_INPUT_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 use client_environment::{
     new_session_client_environment, new_session_raw_client_environment,
@@ -521,6 +525,7 @@ impl RequestHandler {
         let mut pending = completed.input_writer.map(|input_writer| {
             crate::pane_terminals::DeferredInitialPaneInputFlush {
                 input_writer,
+                pane_pid: completed.pane_pid,
                 queued_input: completed.queued_input,
             }
         });
@@ -613,14 +618,61 @@ impl RequestHandler {
             return Ok(());
         }
         tokio::task::spawn_blocking(move || {
-            for bytes in flush.queued_input {
-                flush.input_writer.write_all(&bytes)?;
+            let pane_pid = rmux_pty::ProcessId::new(flush.pane_pid)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            for input in flush.queued_input {
+                match input {
+                    crate::pane_terminals::DeferredInitialPaneInput::Bytes(bytes) => {
+                        flush.input_writer.write_all(&bytes)?;
+                    }
+                    crate::pane_terminals::DeferredInitialPaneInput::Console { action, .. } => {
+                        Self::write_deferred_initial_console_input(pane_pid, action)?;
+                    }
+                }
             }
             Ok::<(), std::io::Error>(())
         })
         .await
         .map_err(|error| RmuxError::Server(format!("deferred pane input task failed: {error}")))?
         .map_err(|error| RmuxError::Server(format!("failed to flush deferred pane input: {error}")))
+    }
+
+    #[cfg(windows)]
+    fn write_deferred_initial_console_input(
+        pane_pid: rmux_pty::ProcessId,
+        action: crate::pane_terminals::DeferredInitialPaneConsoleInputAction,
+    ) -> std::io::Result<()> {
+        for attempt in 0..=DEFERRED_INITIAL_PANE_CONSOLE_INPUT_RETRIES {
+            let result = match action {
+                crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Key(key) => {
+                    rmux_pty::write_windows_console_key(pane_pid, key)
+                }
+                crate::pane_terminals::DeferredInitialPaneConsoleInputAction::KeyThenInterrupt(
+                    key,
+                ) => rmux_pty::write_windows_console_key_then_interrupt_if_processed(pane_pid, key),
+                crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Interrupt => {
+                    rmux_pty::send_windows_console_interrupt(pane_pid)
+                }
+                crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Noop => Ok(()),
+            };
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error)
+                    if attempt < DEFERRED_INITIAL_PANE_CONSOLE_INPUT_RETRIES
+                        && Self::is_transient_deferred_initial_console_input_error(&error) =>
+                {
+                    std::thread::sleep(DEFERRED_INITIAL_PANE_CONSOLE_INPUT_RETRY_DELAY);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn is_transient_deferred_initial_console_input_error(error: &std::io::Error) -> bool {
+        const ERROR_GEN_FAILURE: i32 = 31;
+        error.raw_os_error() == Some(ERROR_GEN_FAILURE)
     }
 
     #[cfg(windows)]

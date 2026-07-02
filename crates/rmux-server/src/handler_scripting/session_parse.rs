@@ -8,7 +8,7 @@ use rmux_proto::{
 
 use super::super::DEFAULT_SESSION_SIZE;
 use super::tokens::CommandTokens;
-use super::values::{missing_argument, parse_u16, unsupported_flag};
+use super::values::{parse_u16, unsupported_flag};
 use super::{implicit_session_name, parse_session_name};
 
 pub(super) fn parse_new_session(mut args: CommandTokens) -> Result<Request, RmuxError> {
@@ -143,7 +143,11 @@ pub(super) fn parse_session_request(
     }
 }
 
-pub(super) fn parse_kill_session(mut args: CommandTokens) -> Result<Request, RmuxError> {
+pub(super) fn parse_kill_session(
+    mut args: CommandTokens,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Result<Request, RmuxError> {
     let mut target = None;
     let mut kill_all_except_target = false;
     let mut clear_alerts = false;
@@ -163,7 +167,11 @@ pub(super) fn parse_kill_session(mut args: CommandTokens) -> Result<Request, Rmu
     }
 
     Ok(Request::KillSession(KillSessionRequest {
-        target: target.ok_or_else(|| missing_argument("kill-session", "-t target"))?,
+        target: target.unwrap_or(implicit_session_name(
+            sessions,
+            find_context,
+            "kill-session",
+        )?),
         kill_all_except_target,
         clear_alerts,
     }))

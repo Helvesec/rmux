@@ -1,7 +1,7 @@
 use rmux_proto::{Request, RmuxError};
 
 use super::parse_pane_target;
-use super::tokens::CommandTokens;
+use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
 use super::values::unsupported_flag;
 
 pub(super) fn parse_copy_mode(mut args: CommandTokens) -> Result<Request, RmuxError> {
@@ -54,7 +54,38 @@ pub(super) fn parse_copy_mode(mut args: CommandTokens) -> Result<Request, RmuxEr
                 let _ = args.optional();
                 page_up = true;
             }
-            _ => break,
+            token => {
+                let Some(cluster) = parse_compact_flag_cluster(token, "deHMSqu", "st") else {
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('d') => return Err(unsupported_flag("copy-mode", "-d")),
+                        CompactFlag::Bare('e') => exit_on_scroll = true,
+                        CompactFlag::Bare('H') => hide_position = true,
+                        CompactFlag::Bare('M') => mouse_drag_start = true,
+                        CompactFlag::Bare('q') => cancel_mode = true,
+                        CompactFlag::Bare('S') => return Err(unsupported_flag("copy-mode", "-S")),
+                        compact_flag @ CompactFlag::Value { flag: 's', .. } => {
+                            source = Some(parse_pane_target(
+                                "copy-mode",
+                                compact_flag.value_or_next(&mut args, "-s src-pane")?,
+                            )?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target = Some(parse_pane_target(
+                                "copy-mode",
+                                compact_flag.value_or_next(&mut args, "-t target")?,
+                            )?);
+                        }
+                        CompactFlag::Bare('u') => page_up = true,
+                        CompactFlag::Bare(flag) | CompactFlag::Value { flag, .. } => {
+                            return Err(unsupported_flag("copy-mode", &format!("-{flag}")));
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -94,4 +125,28 @@ pub(super) fn parse_clock_mode(mut args: CommandTokens) -> Result<Request, RmuxE
 
     args.no_extra("clock-mode")?;
     Ok(Request::ClockMode(rmux_proto::ClockModeRequest { target }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token(value: &str) -> String {
+        value.to_owned()
+    }
+
+    #[test]
+    fn parse_copy_mode_accepts_tmux_compact_hidden_target() {
+        let request = parse_copy_mode(CommandTokens::new(vec![token("-Ht=")]))
+            .expect("compact hidden-position target parses");
+
+        let Request::CopyMode(request) = request else {
+            panic!("compact target must parse as copy-mode request");
+        };
+        assert!(request.hide_position);
+        assert_eq!(
+            request.target,
+            Some(parse_pane_target("copy-mode", "=".to_owned()).unwrap())
+        );
+    }
 }

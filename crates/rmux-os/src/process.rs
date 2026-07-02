@@ -61,6 +61,12 @@ impl ProcessInspector {
     pub fn raw_environment(&self, pid: u32) -> io::Result<Option<Vec<(OsString, OsString)>>> {
         raw_environment_impl(pid)
     }
+
+    /// Returns executable names for live descendants of `pid`, when available.
+    #[cfg(windows)]
+    pub fn descendant_command_names(&self, pid: u32) -> io::Result<Vec<String>> {
+        descendant_command_names_impl(pid)
+    }
 }
 
 /// Returns the parent process id for `pid`, when available.
@@ -108,6 +114,14 @@ pub fn environment(pid: u32) -> Option<HashMap<String, String>> {
 #[must_use]
 pub fn raw_environment(pid: u32) -> Option<Vec<(OsString, OsString)>> {
     ProcessInspector.raw_environment(pid).ok().flatten()
+}
+
+/// Returns executable names for live descendants of `pid`, when available.
+#[cfg(windows)]
+pub fn descendant_command_names(pid: u32) -> Vec<String> {
+    ProcessInspector
+        .descendant_command_names(pid)
+        .unwrap_or_default()
 }
 
 /// Unix-only process helpers.
@@ -400,6 +414,11 @@ fn raw_environment_impl(pid: u32) -> io::Result<Option<Vec<(OsString, OsString)>
             .map(|(name, value)| (OsString::from(name), OsString::from(value)))
             .collect()
     }))
+}
+
+#[cfg(windows)]
+fn descendant_command_names_impl(pid: u32) -> io::Result<Vec<String>> {
+    windows_process::descendant_command_names(pid)
 }
 
 #[cfg(target_os = "macos")]

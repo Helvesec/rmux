@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
-use rmux_proto::{CommandOutput, RmuxError, Target};
+use rmux_proto::{CommandOutput, OptionName, RmuxError, Target};
 
 use super::super::scripting_support::{
     format_context_for_target, QueueCommandAction, QueueExecutionContext,
@@ -20,8 +20,12 @@ use super::parse::{
 use super::popup_job::{spawn_popup_job, PopupDragMode, PopupSurface};
 use super::state::{ClientOverlayState, PopupOverlayState};
 use super::support::popup_shell_command;
+use crate::copy_mode::{CopyModeCommandContext, CopyModeState, ModeKeys};
 use crate::format_runtime::render_runtime_template;
+use crate::format_runtime::RuntimeFormatContext;
 use crate::handler_support::attached_client_required;
+use crate::mouse::{copy_mode_mouse_context, AttachedMouseEvent};
+use crate::pane_terminals::HandlerState;
 use crate::renderer::resolve_overlay_rect;
 use crate::terminal::TerminalProfile;
 
@@ -301,6 +305,7 @@ impl RequestHandler {
         };
         let state = self.state.lock().await;
         let runtime = format_context_for_target(&state, &target, attached_count)?;
+        let runtime = runtime_with_mouse_values(runtime, &state, &target, mouse.as_ref());
         let title = render_runtime_template(&command.title, &runtime, true);
         let options = menu_styles_for_target(&state, &target, &command, &runtime);
 
@@ -309,7 +314,9 @@ impl RequestHandler {
             .into_iter()
             .map(|item| {
                 let rendered_label = render_runtime_template(&item.label, &runtime, true);
-                let separator = rendered_label.is_empty() || rendered_label.starts_with('-');
+                let dynamically_disabled =
+                    rendered_label.starts_with('-') && rendered_label != item.label;
+                let separator = item.separator || rendered_label.is_empty() || dynamically_disabled;
                 if separator {
                     return MenuOverlayItem {
                         label: String::new(),
@@ -498,4 +505,71 @@ fn popup_output_bytes(output: &CommandOutput) -> Vec<u8> {
         previous_was_cr = *byte == b'\r';
     }
     normalized
+}
+
+fn runtime_with_mouse_values<'a>(
+    mut runtime: RuntimeFormatContext<'a>,
+    state: &'a HandlerState,
+    target: &Target,
+    mouse: Option<&AttachedMouseEvent>,
+) -> RuntimeFormatContext<'a> {
+    let Some(mouse) = mouse else {
+        return runtime;
+    };
+    runtime = runtime
+        .with_named_value("mouse_x", mouse.raw.x.to_string())
+        .with_named_value("mouse_y", mouse.raw.y.to_string());
+
+    let Target::Pane(pane_target) = target else {
+        return runtime;
+    };
+    let Some(session) = state.sessions.session(pane_target.session_name()) else {
+        return runtime;
+    };
+    let Some(window) = session.window_at(pane_target.window_index()) else {
+        return runtime;
+    };
+    let Some(pane) = window.pane(pane_target.pane_index()) else {
+        return runtime;
+    };
+    let Some(mouse_context) = copy_mode_mouse_context(mouse, pane.geometry(), -1) else {
+        return runtime;
+    };
+    let Ok(transcript) = state.transcript_handle(pane_target) else {
+        return runtime;
+    };
+    let screen = transcript
+        .lock()
+        .expect("pane transcript mutex must not be poisoned")
+        .clone_screen();
+    let word_separators = state
+        .options
+        .resolve(Some(pane_target.session_name()), OptionName::WordSeparators)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(" -_@")
+        .to_owned();
+    let context = CopyModeCommandContext {
+        mode_keys: ModeKeys::parse(state.options.resolve_for_pane(
+            pane_target.session_name(),
+            pane_target.window_index(),
+            pane_target.pane_index(),
+            OptionName::ModeKeys,
+        )),
+        wrap_search: state.options.resolve_for_pane(
+            pane_target.session_name(),
+            pane_target.window_index(),
+            pane_target.pane_index(),
+            OptionName::WrapSearch,
+        ) != Some("off"),
+        word_separators,
+        default_shell: String::new(),
+        working_directory: None,
+        refresh_screen: None,
+        mouse: Some(mouse_context),
+    };
+    let summary = CopyModeState::summary_for_mouse(screen, &context);
+    runtime
+        .with_named_value("mouse_word", summary.copy_cursor_word)
+        .with_named_value("mouse_line", summary.copy_cursor_line)
+        .with_named_value("mouse_hyperlink", summary.copy_cursor_hyperlink)
 }

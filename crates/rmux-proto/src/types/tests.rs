@@ -273,6 +273,16 @@ fn resize_pane_adjustment_bincode_tags_keep_existing_order_append_only() {
             },
             8,
         ),
+        (ResizePaneAdjustment::TrimBelow, 9),
+        (
+            ResizePaneAdjustment::Composite {
+                columns: Some(1),
+                rows: Some(1),
+                relative: Some(crate::ResizePaneRelativeDirection::Right),
+                cells: 1,
+            },
+            10,
+        ),
     ];
 
     for (adjustment, expected_tag) in cases {

@@ -655,6 +655,45 @@ async fn parsed_queue_accepts_compact_new_window_flags() {
 }
 
 #[tokio::test]
+async fn parsed_queue_new_window_before_beats_after_like_tmux() {
+    for flags in ["-b -a", "-ba"] {
+        let handler = RequestHandler::new();
+        let session = session_name("alpha");
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+
+        let parsed = CommandParser::new()
+            .parse(&format!("new-window {flags} -t alpha:0 -n inserted"))
+            .expect("new-window command parses");
+        handler
+            .execute_parsed_commands_for_test(std::process::id(), parsed)
+            .await
+            .unwrap_or_else(|error| panic!("new-window {flags} should execute: {error}"));
+
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&session).expect("session exists");
+        assert_eq!(
+            session.window_at(0).and_then(|window| window.name()),
+            Some("inserted"),
+            "{flags} must insert before the target like tmux"
+        );
+        assert!(
+            session.window_at(1).is_some(),
+            "{flags} must push the original target window to index 1"
+        );
+    }
+}
+
+#[tokio::test]
 async fn parsed_queue_accepts_compact_break_pane_flag_clusters() {
     for (session, flags) in [
         ("breakdprint", "-dP"),

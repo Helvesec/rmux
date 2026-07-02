@@ -17,15 +17,17 @@ use super::pane_io_encoding::{
 };
 #[cfg(windows)]
 use super::pane_io_encoding::{
-    prepare_attached_pane_console_input_writes, write_windows_console_key_to_target_io,
-    PaneConsoleInputWrite,
+    prepare_attached_pane_console_input_writes, should_emulate_windows_cmd_select_all,
+    should_route_windows_control_as_pty_bytes, windows_console_input_for_attached_key,
+    write_windows_console_input_action_to_target_io, PaneConsoleInputWrite,
+    WindowsConsoleInputAction,
 };
 use super::pane_prompt_input::{decode_prompt_input_event, is_extended_key_prefix};
 use super::{io_other, resolve_input_target, AttachedKeyDispatch};
 use crate::client_flags::ClientFlags;
 use crate::input_keys::{decode_extended_key, decode_mouse, ExtendedKeyDecode, MouseDecode};
 use crate::key_table::{decode_attached_key, AttachedKeyDecode};
-use crate::mouse::{classify_mouse_event, layout_for_session};
+use crate::mouse::{classify_mouse_events, layout_for_session, ClassifiedMouseEvent};
 use crate::pane_io::{AttachControl, OverlayFrame};
 
 #[path = "attached_input/bracketed_paste.rs"]
@@ -56,7 +58,7 @@ enum PreparedAttachedPaneForward {
     #[cfg(windows)]
     WindowsConsoleKey {
         writes: Vec<PaneConsoleInputWrite>,
-        key: WindowsConsoleKeyEvent,
+        action: WindowsConsoleInputAction,
     },
 }
 
@@ -97,6 +99,7 @@ impl RequestHandler {
                     requester_pid: attach_pid,
                     current_target: Some(Target::Pane(target.clone())),
                     mouse_target: None,
+                    mouse_event: None,
                     key,
                     attached_live_input: true,
                 },
@@ -160,6 +163,7 @@ impl RequestHandler {
                     requester_pid: attach_pid,
                     current_target: Some(Target::Pane(target.clone())),
                     mouse_target: None,
+                    mouse_event: None,
                     key,
                     attached_live_input: true,
                 },
@@ -169,7 +173,6 @@ impl RequestHandler {
         if handled {
             return Ok(true);
         }
-
         let prepared = {
             let mut state = self.state.lock().await;
             match forward {
@@ -187,11 +190,37 @@ impl RequestHandler {
                     }
                 }
                 #[cfg(windows)]
-                AttachedPaneForward::WindowsConsoleKey { key, bytes } => {
-                    let writes =
-                        prepare_attached_pane_console_input_writes(&mut state, &target, bytes)
-                            .map_err(io_other)?;
-                    PreparedAttachedPaneForward::WindowsConsoleKey { writes, key }
+                AttachedPaneForward::WindowsConsoleKey {
+                    key: console_key,
+                    bytes,
+                } => {
+                    let route_raw = should_route_windows_control_as_pty_bytes(&state, &target, key);
+                    if should_emulate_windows_cmd_select_all(&state, &target, key) || route_raw {
+                        let Some(encoded) = encode_attached_key_for_target(&state, &target, key)
+                            .map_err(io_other)?
+                        else {
+                            return Ok(false);
+                        };
+                        let writes =
+                            prepare_attached_pane_input_writes(&mut state, &target, &encoded)
+                                .map_err(io_other)?;
+                        PreparedAttachedPaneForward::EncodedKey {
+                            writes,
+                            bytes: encoded,
+                        }
+                    } else {
+                        let action = windows_console_input_for_attached_key(
+                            &state,
+                            &target,
+                            key,
+                            console_key,
+                        );
+                        let writes = prepare_attached_pane_console_input_writes(
+                            &mut state, &target, bytes, action,
+                        )
+                        .map_err(io_other)?;
+                        PreparedAttachedPaneForward::WindowsConsoleKey { writes, action }
+                    }
                 }
             }
         };
@@ -204,9 +233,9 @@ impl RequestHandler {
                 }
             }
             #[cfg(windows)]
-            PreparedAttachedPaneForward::WindowsConsoleKey { writes, key } => {
+            PreparedAttachedPaneForward::WindowsConsoleKey { writes, action } => {
                 for write in writes {
-                    write_windows_console_key_to_target_io(write, key)
+                    write_windows_console_input_action_to_target_io(write, action)
                         .await
                         .map_err(io_other)?;
                 }
@@ -411,17 +440,79 @@ impl RequestHandler {
         let Some(layout) = layout else {
             return Ok(());
         };
-        let classified = {
+        let (classified, click_deadline) = {
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
                 .get_mut(&attach_pid)
                 .ok_or_else(|| io_other("attached client disappeared"))?;
-            classify_mouse_event(&mut active.mouse, &layout, raw, Instant::now())
+            let classified = classify_mouse_events(&mut active.mouse, &layout, raw, Instant::now());
+            (classified, active.mouse.click_deadline())
         };
-        let Some(classified) = classified else {
+        if let Some(deadline) = click_deadline {
+            self.schedule_attached_mouse_click_timer(attach_pid, session_name, deadline);
+        }
+        if classified.is_empty() {
+            return Ok(());
+        }
+        for classified in classified {
+            self.dispatch_attached_mouse_classified(attach_pid, classified)
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn schedule_attached_mouse_click_timer(
+        &self,
+        attach_pid: u32,
+        session_name: rmux_proto::SessionName,
+        deadline: Instant,
+    ) {
+        let handler = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            let _ = handler
+                .dispatch_expired_attached_mouse_click(attach_pid, session_name)
+                .await;
+        });
+    }
+
+    async fn dispatch_expired_attached_mouse_click(
+        &self,
+        attach_pid: u32,
+        session_name: rmux_proto::SessionName,
+    ) -> io::Result<()> {
+        match self.attached_session_name(attach_pid).await {
+            Ok(current) if current == session_name => {}
+            _ => return Ok(()),
+        }
+        let attached_count = self.attached_count(&session_name).await;
+        let layout = {
+            let state = self.state.lock().await;
+            layout_for_session(&state, &session_name, attached_count)
+        };
+        let Some(layout) = layout else {
             return Ok(());
         };
+        let classified = {
+            let mut active_attach = self.active_attach.lock().await;
+            let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
+                return Ok(());
+            };
+            active.mouse.expire_click_timer(Instant::now(), &layout)
+        };
+        if let Some(classified) = classified {
+            self.dispatch_attached_mouse_classified(attach_pid, classified)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn dispatch_attached_mouse_classified(
+        &self,
+        attach_pid: u32,
+        classified: ClassifiedMouseEvent,
+    ) -> io::Result<()> {
         let target = if let Some(target) = classified.event.pane_target.clone() {
             target
         } else {
@@ -443,6 +534,7 @@ impl RequestHandler {
                     requester_pid: attach_pid,
                     current_target,
                     mouse_target,
+                    mouse_event: Some(classified.event.clone()),
                     key: classified.key,
                     attached_live_input: true,
                 },
@@ -687,64 +779,7 @@ fn encode_attached_key_for_target(
     target: &PaneTarget,
     key: rmux_core::KeyCode,
 ) -> Result<Option<Vec<u8>>, RmuxError> {
-    #[cfg(windows)]
-    if should_emulate_windows_cmd_select_all(state, target, key) {
-        return windows_cmd_select_all_sequence(state, target);
-    }
-
     encode_key_for_target(state, target, key)
-}
-
-#[cfg(windows)]
-fn should_emulate_windows_cmd_select_all(
-    state: &crate::pane_terminals::HandlerState,
-    target: &PaneTarget,
-    key: rmux_core::KeyCode,
-) -> bool {
-    key_matches_name(key, "C-a") && target_uses_windows_cmd_shell(state, target)
-}
-
-#[cfg(windows)]
-fn target_uses_windows_cmd_shell(
-    state: &crate::pane_terminals::HandlerState,
-    target: &PaneTarget,
-) -> bool {
-    state
-        .pane_profile_in_window(
-            target.session_name(),
-            target.window_index(),
-            target.pane_index(),
-        )
-        .ok()
-        .and_then(|profile| profile.shell().file_name())
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            name.eq_ignore_ascii_case("cmd.exe") || name.eq_ignore_ascii_case("cmd")
-        })
-}
-
-#[cfg(windows)]
-fn windows_cmd_select_all_sequence(
-    state: &crate::pane_terminals::HandlerState,
-    target: &PaneTarget,
-) -> Result<Option<Vec<u8>>, RmuxError> {
-    let mut bytes = Vec::new();
-    for key_name in ["C-Home", "S-End"] {
-        let Some(key) = key_string_lookup_string(key_name) else {
-            return Ok(None);
-        };
-        let Some(encoded) = encode_key_for_target(state, target, key)? else {
-            return Ok(None);
-        };
-        bytes.extend_from_slice(&encoded);
-    }
-    Ok(Some(bytes))
-}
-
-#[cfg(windows)]
-fn key_matches_name(key: rmux_core::KeyCode, name: &str) -> bool {
-    key_string_lookup_string(name)
-        .is_some_and(|candidate| key_code_lookup_bits(candidate) == key_code_lookup_bits(key))
 }
 
 fn is_mouse_prefix(bytes: &[u8]) -> bool {

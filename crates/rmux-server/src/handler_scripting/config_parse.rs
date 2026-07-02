@@ -2,7 +2,7 @@ use rmux_core::{SessionStore, TargetFindContext};
 use rmux_proto::request::Request;
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
-    RmuxError, ScopeSelector, SessionName, SetEnvironmentMode, SetEnvironmentRequest,
+    OptionName, RmuxError, ScopeSelector, SessionName, SetEnvironmentMode, SetEnvironmentRequest,
     SetOptionByNameRequest, SetOptionMode, ShowEnvironmentRequest, ShowOptionsRequest, Target,
     WindowTarget,
 };
@@ -19,6 +19,7 @@ pub(super) use hooks::{parse_set_hook, parse_show_hooks};
 
 pub(super) enum ParsedSetOptionCommand {
     Request(Box<Request>),
+    Ignored(String),
     NoOp,
 }
 
@@ -29,6 +30,7 @@ pub(super) fn parse_set_option(
 ) -> Result<Request, RmuxError> {
     match parse_set_option_invocation(args, force_window, default_target)? {
         ParsedSetOptionCommand::Request(request) => Ok(*request),
+        ParsedSetOptionCommand::Ignored(message) => Err(RmuxError::Server(message)),
         ParsedSetOptionCommand::NoOp => Err(RmuxError::Server(
             "server scope is not supported for this option".to_owned(),
         )),
@@ -72,6 +74,7 @@ pub(super) fn parse_set_option_invocation(
             }
             "-q" => {
                 let _ = args.optional();
+                flags.quiet = true;
             }
             "-w" if force_window => {
                 let _ = args.optional();
@@ -122,6 +125,15 @@ pub(super) fn parse_set_option_invocation(
     let value = args.optional();
     args.no_extra("set-option")?;
 
+    if let Err(error) = rmux_core::resolve_option_name_typed(&option) {
+        if flags.quiet && error.is_quiet_set_option_lookup_error() {
+            return Ok(ParsedSetOptionCommand::Ignored(
+                error.into_rmux_error().to_string(),
+            ));
+        }
+        return Err(error.into_rmux_error());
+    }
+
     let effective_target = target.clone().or(default_target.clone());
     let scope = resolve_set_option_scope(
         &option,
@@ -140,7 +152,7 @@ pub(super) fn parse_set_option_invocation(
     } else {
         SetOptionMode::Replace
     };
-    if !flags.format {
+    if !flags.format && !should_defer_set_option_value_validation(&option, value.as_deref()) {
         rmux_core::validate_option_name_mutation(
             &option,
             &scope,
@@ -165,6 +177,16 @@ pub(super) fn parse_set_option_invocation(
     )))
 }
 
+fn should_defer_set_option_value_validation(option: &str, value: Option<&str>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    if !value.contains("#{") {
+        return false;
+    }
+    rmux_core::option_name_by_name(option) == Some(OptionName::ExtendedKeys)
+}
+
 pub(super) fn default_set_option_target(
     sessions: &SessionStore,
     find_context: &TargetFindContext,
@@ -184,6 +206,7 @@ struct SetOptionFlags {
     only_if_unset: bool,
     unset: bool,
     unset_pane_overrides: bool,
+    quiet: bool,
 }
 
 impl SetOptionFlags {
@@ -198,6 +221,7 @@ impl SetOptionFlags {
             only_if_unset: false,
             unset: false,
             unset_pane_overrides: false,
+            quiet: false,
         }
     }
 
@@ -215,7 +239,7 @@ impl SetOptionFlags {
                 's' => self.server = true,
                 'w' => self.window = true,
                 'p' => self.pane = true,
-                'q' => {}
+                'q' => self.quiet = true,
                 'a' => self.append = true,
                 'F' => self.format = true,
                 'o' => self.only_if_unset = true,

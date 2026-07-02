@@ -11,6 +11,7 @@ use windows_sys::Win32::Foundation::{
     ERROR_INVALID_PARAMETER, HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0,
     WAIT_TIMEOUT,
 };
+use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -24,7 +25,9 @@ use windows_sys::Win32::System::Threading::{
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
 };
 
-use crate::{ChildCommand, ProcessId, Result, Signal};
+use crate::{
+    windows_console_input::send_windows_console_interrupt, ChildCommand, ProcessId, Result, Signal,
+};
 
 use super::application::resolve_application_path;
 use super::command_line::{command_line, environment_block, wide_null};
@@ -182,6 +185,7 @@ fn create_suspended_process(
     // stack values, and handle inheritance is disabled.
     let created = {
         let _span = perf::span("conpty_create_process_w");
+        ensure_child_processes_inherit_ctrl_c();
         unsafe {
             CreateProcessW(
                 application.as_ptr(),
@@ -215,6 +219,23 @@ fn create_suspended_process(
         thread,
         pid: process_info.dwProcessId,
     })
+}
+
+fn ensure_child_processes_inherit_ctrl_c() {
+    let ok = unsafe {
+        // SAFETY: A null handler with `FALSE` clears this process' inheritable
+        // Ctrl-C ignore flag before spawning a console child. Some hosts launch
+        // hidden daemons with Ctrl-C ignored; Windows propagates that bit to
+        // descendants, which makes later `CTRL_C_EVENT` delivery a no-op.
+        SetConsoleCtrlHandler(None, 0)
+    };
+    if ok == 0 {
+        tracing::debug!(
+            target: "rmux::conpty",
+            error = ?last_os_error(),
+            "failed to clear inheritable Ctrl-C ignore flag before ConPTY spawn"
+        );
+    }
 }
 
 fn resume_as_child(
@@ -292,8 +313,7 @@ pub(crate) fn close_child_pseudoconsole(child: &WindowsChild) {
 }
 
 pub(crate) fn interrupt_child(child: &WindowsChild) -> Result<()> {
-    child.pty.write_all(b"\x03")?;
-    Ok(())
+    send_windows_console_interrupt(child.pid).map_err(Into::into)
 }
 
 pub(crate) fn kill_child(child: &WindowsChild, signal: Signal) -> Result<()> {

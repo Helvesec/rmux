@@ -134,8 +134,10 @@ where
     }
 }
 
-/// Boolean operator over the first comma-separated pair.
-pub(super) fn format_bool_op_n<V>(
+/// tmux 3.4 treats boolean operators as binary. Extra comma-separated text
+/// remains part of the right operand, even when newer tmux releases evaluate
+/// every operand independently.
+pub(super) fn format_bool_op<V>(
     state: &mut ExpandState,
     body: &str,
     and: bool,
@@ -144,16 +146,20 @@ pub(super) fn format_bool_op_n<V>(
 where
     V: FormatVariables + ?Sized,
 {
-    let bytes = body.as_bytes();
-    let Some(offset) = format_skip(bytes, b",") else {
+    if body.is_empty() {
+        return String::new();
+    }
+
+    let Some(split) = format_skip(body.as_bytes(), b",") else {
         return String::new();
     };
-    let left = format_expand1(state, &body[..offset], variables);
-    let right = format_expand1(state, &body[offset + 1..], variables);
+    let left = format_expand1(state, &body[..split], variables);
+    let right = format_expand1(state, &body[split + 1..], variables);
     let result = if and {
         is_truthy(&left) && is_truthy(&right)
     } else {
         is_truthy(&left) || is_truthy(&right)
     };
+
     if result { "1" } else { "0" }.to_owned()
 }

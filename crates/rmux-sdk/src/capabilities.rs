@@ -11,7 +11,15 @@ use rmux_proto::{
 };
 
 pub(crate) async fn require(client: &TransportClient, capabilities: &[&str]) -> Result<()> {
-    let supported = negotiated_capabilities(client).await?;
+    require_with_handshake(client, &[], capabilities).await
+}
+
+pub(crate) async fn require_with_handshake(
+    client: &TransportClient,
+    required_capabilities: &[&str],
+    capabilities: &[&str],
+) -> Result<()> {
+    let supported = negotiated_capabilities_requiring(client, required_capabilities).await?;
     for capability in capabilities {
         ensure_capability(&supported, capability)?;
     }
@@ -29,14 +37,24 @@ pub(crate) async fn require_process_command_if_present(
 }
 
 pub(crate) async fn negotiated_capabilities(client: &TransportClient) -> Result<Arc<[String]>> {
-    if let Some(capabilities) = client.cached_capabilities().await {
-        return Ok(capabilities);
+    negotiated_capabilities_requiring(client, &[]).await
+}
+
+async fn negotiated_capabilities_requiring(
+    client: &TransportClient,
+    required_capabilities: &[&str],
+) -> Result<Arc<[String]>> {
+    if required_capabilities.is_empty() {
+        if let Some(capabilities) = client.cached_capabilities().await {
+            return Ok(capabilities);
+        }
     }
 
+    let required = std::iter::once(CAPABILITY_HANDSHAKE)
+        .chain(required_capabilities.iter().copied())
+        .collect::<Vec<_>>();
     let response = client
-        .request(Request::Handshake(HandshakeRequest::requiring([
-            CAPABILITY_HANDSHAKE,
-        ])))
+        .request(Request::Handshake(HandshakeRequest::requiring(required)))
         .await
         .map_err(normalize_handshake_error)?;
 

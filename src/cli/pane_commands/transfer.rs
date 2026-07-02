@@ -122,15 +122,13 @@ fn resolve_pane_source_or_marked(
     connection: &mut rmux_client::Connection,
     source: Option<&TargetSpec>,
 ) -> Result<rmux_proto::PaneTarget, ExitFailure> {
-    let marked;
-    let source = match source {
-        Some(source) => source,
-        None => {
-            marked = parse_target_spec("{marked}").map_err(|error| ExitFailure::new(1, error))?;
-            &marked
-        }
-    };
-    resolve_pane_target_spec(connection, source)
+    if let Some(source) = source {
+        return resolve_pane_target_spec(connection, source);
+    }
+
+    let marked = parse_target_spec("{marked}").map_err(|error| ExitFailure::new(1, error))?;
+    resolve_pane_target_spec(connection, &marked)
+        .or_else(|_| resolve_pane_target_or_current(connection, None, "pane source"))
 }
 
 fn parse_pane_split_size(value: Option<&str>) -> Result<Option<PaneSplitSize>, ExitFailure> {

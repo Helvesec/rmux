@@ -1,14 +1,18 @@
 use rmux_core::{
     command_parser::{CommandParseError, ParsedCommand, ParsedCommands},
     command_queue::CommandQueue,
-    LifecycleEvent, ENVIRON_HIDDEN,
+    LifecycleEvent, PaneGeometry, ENVIRON_HIDDEN,
 };
 use rmux_proto::request::Request;
-use rmux_proto::{CommandOutput, Response, RmuxError, ScopeSelector, Target};
+use rmux_proto::{
+    CommandOutput, PaneTarget, ResizePaneAdjustment, ResizePaneRequest, Response, RmuxError,
+    ScopeSelector, Target,
+};
 use std::collections::VecDeque;
 
 use super::RequestHandler;
 use crate::control::ControlCommandResult;
+use crate::mouse::{AttachedMouseEvent, MouseLocation};
 
 #[path = "handler_scripting/buffer_parse.rs"]
 mod buffer_parse;
@@ -16,6 +20,8 @@ mod buffer_parse;
 mod client_parse;
 #[path = "handler_scripting/command_args.rs"]
 mod command_args;
+#[path = "handler_scripting/config_engine/mod.rs"]
+mod config_engine;
 #[path = "handler_scripting/config_parse.rs"]
 mod config_parse;
 #[path = "handler_scripting/display_parse.rs"]
@@ -89,10 +95,11 @@ pub(crate) use self::request_parse::parse_request_from_parts;
 pub(super) use self::runtime::spawn_background_async;
 use self::targets::{
     implicit_pane_target, implicit_session_name, implicit_split_target, implicit_window_target,
-    is_unsupported_named_layout, marked_pane_target, parse_layout_name, parse_move_window_target,
-    parse_new_window_target_argument, parse_pane_target, parse_select_layout_target,
-    parse_session_name, parse_split_window_target, parse_target_arg, parse_window_target,
-    queue_target_find_context, resolve_target_argument_with_spec, QueueTargetFindContextInput,
+    is_unsupported_named_layout, marked_pane_target, marked_pane_target_or_current,
+    parse_layout_name, parse_move_window_target, parse_new_window_target_argument,
+    parse_pane_target, parse_select_layout_target, parse_session_name, parse_split_window_target,
+    parse_target_arg, parse_window_target, queue_target_find_context,
+    resolve_target_argument_with_spec, QueueTargetFindContextInput,
 };
 use super::target_support::requester_environment_pane_id;
 
@@ -419,10 +426,11 @@ impl RequestHandler {
                 let request = apply_queue_context_to_request(request, context);
                 let request = crate::server_access::apply_access_policy(request, can_write)?;
                 let request_for_hooks = request.clone();
-                let (outcome, inline_hooks) = Box::pin(self.dispatch_captured(
+                let (outcome, inline_hooks) = Box::pin(self.dispatch_captured_with_client_name(
                     requester_pid,
                     u64::from(requester_pid),
                     request,
+                    context.client_name.clone(),
                 ))
                 .await;
                 let inline_hook_names = inline_hooks
@@ -457,7 +465,8 @@ impl RequestHandler {
                 exit_status: None,
             }),
             QueueInvocation::NewWindow(command) => {
-                self.execute_queued_new_window(requester_pid, command).await
+                self.execute_queued_new_window(requester_pid, command, context)
+                    .await
             }
             QueueInvocation::IfShell(command) => {
                 self.execute_queued_if_shell(requester_pid, command, context)
@@ -471,7 +480,16 @@ impl RequestHandler {
                 self.execute_queued_list_panes_all(command).await
             }
             QueueInvocation::SplitWindow(command) => {
-                self.execute_queued_split_window(requester_pid, &command_for_hooks, command)
+                self.execute_queued_split_window(
+                    requester_pid,
+                    &command_for_hooks,
+                    command,
+                    context,
+                )
+                .await
+            }
+            QueueInvocation::MouseResizePane(target) => {
+                self.execute_queued_mouse_resize_pane(requester_pid, target, context)
                     .await
             }
             QueueInvocation::CommandPrompt(command) => {
@@ -579,6 +597,71 @@ impl RequestHandler {
             exit_status: None,
         })
     }
+
+    async fn execute_queued_mouse_resize_pane(
+        &self,
+        requester_pid: u32,
+        target: PaneTarget,
+        context: &QueueExecutionContext,
+    ) -> Result<QueueCommandAction, RmuxError> {
+        let fallback_event;
+        let event = if let Some(event) = context.mouse_event.as_ref() {
+            event
+        } else if context.mouse_target.is_some() {
+            fallback_event = {
+                let active_attach = self.active_attach.lock().await;
+                active_attach
+                    .by_pid
+                    .get(&requester_pid)
+                    .and_then(|active| active.mouse.current_event.clone())
+            };
+            let Some(event) = fallback_event.as_ref() else {
+                return Ok(QueueCommandAction::Normal {
+                    output: None,
+                    error: None,
+                    exit_status: None,
+                });
+            };
+            event
+        } else {
+            return Ok(QueueCommandAction::Normal {
+                output: None,
+                error: None,
+                exit_status: None,
+            });
+        };
+        if event.location != MouseLocation::Border {
+            return Ok(QueueCommandAction::Normal {
+                output: None,
+                error: None,
+                exit_status: None,
+            });
+        }
+
+        let adjustment = {
+            let state = self.state.lock().await;
+            state
+                .sessions
+                .session(target.session_name())
+                .and_then(|session| session.window_at(target.window_index()))
+                .and_then(|window| window.pane(target.pane_index()))
+                .map(|pane| mouse_resize_adjustment(pane.geometry(), event))
+        }
+        .unwrap_or(ResizePaneAdjustment::NoOp);
+
+        if adjustment == ResizePaneAdjustment::NoOp {
+            return Ok(QueueCommandAction::Normal {
+                output: None,
+                error: None,
+                exit_status: None,
+            });
+        }
+
+        queue_action_from_response(
+            self.handle_resize_pane(ResizePaneRequest { target, adjustment })
+                .await,
+        )
+    }
 }
 
 fn queue_invocation_allowed_for_read_only(invocation: &QueueInvocation) -> bool {
@@ -591,6 +674,38 @@ fn queue_invocation_allowed_for_read_only(invocation: &QueueInvocation) -> bool 
             | QueueInvocation::ListPanesAll(_)
             | QueueInvocation::SplitWindow(_)
     )
+}
+
+fn mouse_resize_adjustment(
+    geometry: PaneGeometry,
+    event: &AttachedMouseEvent,
+) -> ResizePaneAdjustment {
+    let x = event.raw.x;
+    let y = adjusted_mouse_y(event);
+    let right_border = geometry.x().saturating_add(geometry.cols());
+    let bottom_border = geometry.y().saturating_add(geometry.rows());
+
+    if x >= right_border {
+        return ResizePaneAdjustment::AbsoluteWidth {
+            columns: x.saturating_sub(geometry.x()).max(1),
+        };
+    }
+    if y >= bottom_border {
+        return ResizePaneAdjustment::AbsoluteHeight {
+            rows: y.saturating_sub(geometry.y()).max(1),
+        };
+    }
+
+    ResizePaneAdjustment::NoOp
+}
+
+fn adjusted_mouse_y(event: &AttachedMouseEvent) -> u16 {
+    match event.status_at {
+        Some(0) if event.raw.y >= event.status_lines => {
+            event.raw.y.saturating_sub(event.status_lines)
+        }
+        _ => event.raw.y,
+    }
 }
 
 fn aggregate_rmux_errors(errors: Vec<RmuxError>) -> Option<RmuxError> {
@@ -627,15 +742,23 @@ fn apply_queue_context_to_request(
     mut request: Request,
     context: &QueueExecutionContext,
 ) -> Request {
-    if let Request::RunShell(run_shell) = &mut request {
-        if run_shell.target.is_none() {
-            if let Some(Target::Pane(target)) = context.current_target() {
-                run_shell.target = Some(target.clone());
+    match &mut request {
+        Request::RunShell(run_shell) => {
+            if run_shell.target.is_none() {
+                if let Some(Target::Pane(target)) = context.current_target() {
+                    run_shell.target = Some(target.clone());
+                }
+            }
+            if context.source_file_depth != 0 {
+                run_shell.source_depth = Some(context.source_file_depth);
             }
         }
-        if context.source_file_depth != 0 {
-            run_shell.source_depth = Some(context.source_file_depth);
+        Request::CopyMode(copy_mode) if copy_mode.target.is_none() => {
+            if let Some(Target::Pane(target)) = context.current_target() {
+                copy_mode.target = Some(target.clone());
+            }
         }
+        _ => {}
     }
     request
 }

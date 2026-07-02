@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use rmux_core::{SessionStore, TargetFindContext};
 use rmux_proto::{
-    BreakPaneRequest, KillPaneRequest, LastPaneRequest, PipePaneRequest, Request,
+    BreakPaneRequest, KillPaneRequest, LastPaneRequest, PipePaneRequest, ProcessCommand, Request,
     RespawnPaneRequest, RmuxError, SelectPaneAdjacentRequest, SelectPaneDirection,
     SelectPaneMarkRequest, SelectPaneRequest, SplitDirection, SplitWindowExtRequest,
     SplitWindowRequest, SwapPaneDirection, SwapPaneRequest, WindowTarget,
@@ -11,9 +11,9 @@ use rmux_proto::{
 use super::tokens::{
     parse_compact_flag_cluster, rebuild_shell_command, CommandTokens, CompactFlag,
 };
-use super::values::{missing_argument, parse_percentage, unsupported_flag};
+use super::values::unsupported_flag;
 use super::{
-    implicit_pane_target, implicit_split_target, marked_pane_target, parse_pane_target,
+    implicit_pane_target, implicit_split_target, marked_pane_target_or_current, parse_pane_target,
     parse_split_window_target, parse_window_target,
 };
 
@@ -261,10 +261,12 @@ fn parse_split_window_command(
     let mut start_directory: Option<std::path::PathBuf> = None;
     let mut detached = false;
     let mut size = None;
+    let mut legacy_percentage = false;
     let mut full_size = false;
     let mut preserve_zoom = false;
     let mut print_target = false;
     let mut format = None;
+    let mut stdin = false;
 
     while let Some(token) = args.peek() {
         match token {
@@ -314,9 +316,12 @@ fn parse_split_window_command(
             }
             "-p" => {
                 let _ = args.optional();
-                let percentage =
-                    parse_percentage("split-window", "-p", &args.required("-p size")?)?;
-                size = Some(format!("{percentage}%"));
+                let _ = args.required("-p size")?;
+                legacy_percentage = true;
+            }
+            token if legacy_percentage_attached_value(token) => {
+                let _ = args.optional();
+                legacy_percentage = true;
             }
             "-P" if allow_print_flags => {
                 let _ = args.optional();
@@ -326,7 +331,11 @@ fn parse_split_window_command(
                 let _ = args.optional();
                 format = Some(args.required("-F format")?);
             }
-            "-F" | "-I" | "-P" => {
+            "-I" => {
+                let _ = args.optional();
+                stdin = true;
+            }
+            "-F" | "-P" => {
                 return Err(unsupported_flag("split-window", token));
             }
             "-c" => {
@@ -343,10 +352,82 @@ fn parse_split_window_command(
                 let _ = args.optional();
                 environment.push(args.required("-e name=value")?);
             }
-            _ => break,
+            token => {
+                let Some(cluster) = parse_compact_flag_cluster(token, "bdfhIPvZP", "ceFltp") else {
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('b') => before = true,
+                        CompactFlag::Bare('d') => detached = true,
+                        CompactFlag::Bare('f') => full_size = true,
+                        CompactFlag::Bare('h') => {
+                            if direction_set {
+                                return Err(RmuxError::Server(
+                                    "split-window accepts only one of -h or -v".to_owned(),
+                                ));
+                            }
+                            direction = SplitDirection::Horizontal;
+                            direction_set = true;
+                        }
+                        CompactFlag::Bare('I') => stdin = true,
+                        CompactFlag::Bare('P') if allow_print_flags => print_target = true,
+                        CompactFlag::Bare('P') => {
+                            return Err(unsupported_flag("split-window", "-P"));
+                        }
+                        CompactFlag::Bare('v') => {
+                            if direction_set {
+                                return Err(RmuxError::Server(
+                                    "split-window accepts only one of -h or -v".to_owned(),
+                                ));
+                            }
+                            direction = SplitDirection::Vertical;
+                            direction_set = true;
+                        }
+                        CompactFlag::Bare('Z') => preserve_zoom = true,
+                        compact_flag @ CompactFlag::Value { flag: 'c', .. } => {
+                            start_directory = Some(std::path::PathBuf::from(
+                                compact_flag.value_or_next(&mut args, "-c start-directory")?,
+                            ));
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'e', .. } => {
+                            environment
+                                .push(compact_flag.value_or_next(&mut args, "-e name=value")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'F', .. }
+                            if allow_print_flags =>
+                        {
+                            format = Some(compact_flag.value_or_next(&mut args, "-F format")?);
+                        }
+                        CompactFlag::Value { flag: 'F', .. } => {
+                            return Err(unsupported_flag("split-window", "-F"));
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'l', .. } => {
+                            size = Some(compact_flag.value_or_next(&mut args, "-l size")?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 'p', .. } => {
+                            let _ = compact_flag.value_or_next(&mut args, "-p size")?;
+                            legacy_percentage = true;
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target = Some(parse_split_window_target(
+                                compact_flag.value_or_next(&mut args, "-t target")?,
+                            )?);
+                        }
+                        CompactFlag::Bare(flag) | CompactFlag::Value { flag, .. } => {
+                            return Err(unsupported_flag("split-window", &format!("-{flag}")));
+                        }
+                    }
+                }
+            }
         }
     }
     let command = (!args.is_empty()).then_some(args.remaining());
+    let stdin_to_empty_pane = stdin && command.is_none();
+    if size.is_none() && legacy_percentage {
+        return Err(RmuxError::Server("size missing".to_owned()));
+    }
     let target = target.unwrap_or(implicit_split_target(
         sessions,
         find_context,
@@ -359,6 +440,7 @@ fn parse_split_window_command(
         || size.is_some()
         || full_size
         || preserve_zoom
+        || stdin_to_empty_pane
     {
         Request::SplitWindowExt(Box::new(SplitWindowExtRequest {
             target,
@@ -366,14 +448,14 @@ fn parse_split_window_command(
             before,
             environment: (!environment.is_empty()).then_some(environment),
             command,
-            process_command: None,
+            process_command: stdin_to_empty_pane.then(|| ProcessCommand::Shell(String::new())),
             start_directory,
-            keep_alive_on_exit: None,
+            keep_alive_on_exit: stdin_to_empty_pane.then_some(true),
             detached,
             size,
             preserve_zoom,
             full_size,
-            stdin_payload: None,
+            stdin_payload: stdin_to_empty_pane.then(Vec::new),
         }))
     } else {
         Request::SplitWindow(SplitWindowRequest {
@@ -389,6 +471,10 @@ fn parse_split_window_command(
         print_target,
         format: format.unwrap_or_else(|| DEFAULT_SPLIT_WINDOW_PRINT_FORMAT.to_owned()),
     })
+}
+
+fn legacy_percentage_attached_value(token: &str) -> bool {
+    token.starts_with("-p") && token != "-p" && !token.starts_with("--")
 }
 
 pub(super) fn parse_swap_pane(
@@ -442,7 +528,49 @@ pub(super) fn parse_swap_pane(
                 let _ = args.optional();
                 target = Some(parse_pane_target("swap-pane", args.required("-t target")?)?);
             }
-            _ => break,
+            token => {
+                let Some(cluster) = parse_compact_flag_cluster(token, "dDUZ", "st") else {
+                    break;
+                };
+                let _ = args.optional();
+                for flag in cluster {
+                    match flag {
+                        CompactFlag::Bare('d') => detached = true,
+                        CompactFlag::Bare('D') => {
+                            if direction.is_some() {
+                                return Err(RmuxError::Server(
+                                    "swap-pane accepts only one of -D or -U".to_owned(),
+                                ));
+                            }
+                            direction = Some(SwapPaneDirection::Down);
+                        }
+                        CompactFlag::Bare('U') => {
+                            if direction.is_some() {
+                                return Err(RmuxError::Server(
+                                    "swap-pane accepts only one of -D or -U".to_owned(),
+                                ));
+                            }
+                            direction = Some(SwapPaneDirection::Up);
+                        }
+                        CompactFlag::Bare('Z') => preserve_zoom = true,
+                        compact_flag @ CompactFlag::Value { flag: 's', .. } => {
+                            source = Some(parse_pane_target(
+                                "swap-pane",
+                                compact_flag.value_or_next(&mut args, "-s target")?,
+                            )?);
+                        }
+                        compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                            target = Some(parse_pane_target(
+                                "swap-pane",
+                                compact_flag.value_or_next(&mut args, "-t target")?,
+                            )?);
+                        }
+                        CompactFlag::Bare(flag) | CompactFlag::Value { flag, .. } => {
+                            return Err(unsupported_flag("swap-pane", &format!("-{flag}")));
+                        }
+                    }
+                }
+            }
         }
     }
     args.no_extra("swap-pane")?;
@@ -455,7 +583,10 @@ pub(super) fn parse_swap_pane(
     }
     let source = match direction {
         Some(_) => target.clone(),
-        None => source.unwrap_or(marked_pane_target(sessions, find_context, "swap-pane")?),
+        None => match source {
+            Some(source) => source,
+            None => marked_pane_target_or_current(sessions, find_context, "swap-pane")?,
+        },
     };
 
     Ok(Request::SwapPane(SwapPaneRequest {
@@ -603,7 +734,11 @@ pub(super) fn parse_break_pane(
     })))
 }
 
-pub(super) fn parse_pipe_pane(mut args: CommandTokens) -> Result<Request, RmuxError> {
+pub(super) fn parse_pipe_pane(
+    mut args: CommandTokens,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Result<Request, RmuxError> {
     let mut target = None;
     let mut stdin = false;
     let mut stdout = false;
@@ -641,7 +776,7 @@ pub(super) fn parse_pipe_pane(mut args: CommandTokens) -> Result<Request, RmuxEr
     };
 
     Ok(Request::PipePane(PipePaneRequest {
-        target: target.ok_or_else(|| missing_argument("pipe-pane", "-t target"))?,
+        target: target.unwrap_or(implicit_pane_target(sessions, find_context, "pipe-pane")?),
         stdin,
         stdout: if stdin || stdout { stdout } else { true },
         once,

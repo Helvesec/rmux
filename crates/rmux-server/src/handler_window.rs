@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 
 use rmux_core::{LifecycleEvent, PaneId};
-use rmux_proto::{ErrorResponse, HookName, PaneTarget, Response, ScopeSelector, Target};
+use rmux_proto::{
+    ErrorResponse, HookName, PaneTarget, Response, ScopeSelector, SessionName, Target,
+};
 
 #[cfg(windows)]
 use super::pane_support::format_references_pane_pid;
@@ -23,7 +25,37 @@ struct UnlinkedWindowSnapshot {
     link_count: usize,
 }
 
+fn linked_resize_sessions_for_window_change(
+    state: &HandlerState,
+    session_name: &SessionName,
+    previous_window_index: u32,
+    next_window_index: u32,
+) -> Vec<SessionName> {
+    let mut seen = HashSet::new();
+    let mut sessions = Vec::new();
+    for window_index in [previous_window_index, next_window_index] {
+        for linked_session in state.window_linked_sessions_list(session_name, window_index) {
+            if seen.insert(linked_session.clone()) {
+                sessions.push(linked_session);
+            }
+        }
+    }
+    if sessions.is_empty() && seen.insert(session_name.clone()) {
+        sessions.push(session_name.clone());
+    }
+    sessions
+}
+
 impl RequestHandler {
+    async fn reconcile_and_refresh_attached_sessions(&self, sessions: Vec<SessionName>) {
+        for session_name in sessions {
+            let _ = self
+                .reconcile_attached_session_size_and_emit(&session_name)
+                .await;
+            self.refresh_attached_session(&session_name).await;
+        }
+    }
+
     pub(super) async fn handle_new_window(
         &self,
         requester_pid: u32,
@@ -163,15 +195,31 @@ impl RequestHandler {
     ) -> Response {
         let session_name = request.target.session_name().clone();
         let target_window_index = request.target.window_index();
-        let (response, window_changed) = {
+        let (response, window_changed, resize_sessions) = {
             let mut state = self.state.lock().await;
-            let window_changed = state
+            let previous_window_index = state
                 .sessions
                 .session(&session_name)
-                .is_some_and(|session| session.active_window_index() != target_window_index);
+                .map(|session| session.active_window_index());
+            let window_changed =
+                previous_window_index.is_some_and(|window| window != target_window_index);
+            let resize_sessions = previous_window_index
+                .map(|previous| {
+                    linked_resize_sessions_for_window_change(
+                        &state,
+                        &session_name,
+                        previous,
+                        target_window_index,
+                    )
+                })
+                .unwrap_or_else(|| vec![session_name.clone()]);
             match state.select_window(request.target) {
-                Ok(response) => (Response::SelectWindow(response), window_changed),
-                Err(error) => (Response::Error(ErrorResponse { error }), false),
+                Ok(response) => (
+                    Response::SelectWindow(response),
+                    window_changed,
+                    resize_sessions,
+                ),
+                Err(error) => (Response::Error(ErrorResponse { error }), false, Vec::new()),
             }
         };
 
@@ -191,7 +239,8 @@ impl RequestHandler {
                 ))),
                 PendingInlineHookFormat::AfterCommand,
             );
-            self.refresh_attached_session(&session_name).await;
+            self.reconcile_and_refresh_attached_sessions(resize_sessions)
+                .await;
         }
 
         response
@@ -231,11 +280,27 @@ impl RequestHandler {
         request: rmux_proto::NextWindowRequest,
     ) -> Response {
         let session_name = request.target;
-        let response = {
+        let (response, resize_sessions) = {
             let mut state = self.state.lock().await;
+            let previous_window_index = state
+                .sessions
+                .session(&session_name)
+                .map(|session| session.active_window_index());
             match state.next_window(&session_name, request.alerts_only) {
-                Ok(response) => Response::NextWindow(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+                Ok(response) => {
+                    let resize_sessions = previous_window_index
+                        .map(|previous| {
+                            linked_resize_sessions_for_window_change(
+                                &state,
+                                &session_name,
+                                previous,
+                                response.target.window_index(),
+                            )
+                        })
+                        .unwrap_or_else(|| vec![session_name.clone()]);
+                    (Response::NextWindow(response), resize_sessions)
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), Vec::new()),
             }
         };
 
@@ -252,7 +317,8 @@ impl RequestHandler {
                     PendingInlineHookFormat::AfterCommand,
                 );
             }
-            self.refresh_attached_session(&session_name).await;
+            self.reconcile_and_refresh_attached_sessions(resize_sessions)
+                .await;
         }
 
         response
@@ -263,11 +329,27 @@ impl RequestHandler {
         request: rmux_proto::PreviousWindowRequest,
     ) -> Response {
         let session_name = request.target;
-        let response = {
+        let (response, resize_sessions) = {
             let mut state = self.state.lock().await;
+            let previous_window_index = state
+                .sessions
+                .session(&session_name)
+                .map(|session| session.active_window_index());
             match state.previous_window(&session_name, request.alerts_only) {
-                Ok(response) => Response::PreviousWindow(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+                Ok(response) => {
+                    let resize_sessions = previous_window_index
+                        .map(|previous| {
+                            linked_resize_sessions_for_window_change(
+                                &state,
+                                &session_name,
+                                previous,
+                                response.target.window_index(),
+                            )
+                        })
+                        .unwrap_or_else(|| vec![session_name.clone()]);
+                    (Response::PreviousWindow(response), resize_sessions)
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), Vec::new()),
             }
         };
 
@@ -284,7 +366,8 @@ impl RequestHandler {
                     PendingInlineHookFormat::AfterCommand,
                 );
             }
-            self.refresh_attached_session(&session_name).await;
+            self.reconcile_and_refresh_attached_sessions(resize_sessions)
+                .await;
         }
 
         response
@@ -295,11 +378,27 @@ impl RequestHandler {
         request: rmux_proto::LastWindowRequest,
     ) -> Response {
         let session_name = request.target;
-        let response = {
+        let (response, resize_sessions) = {
             let mut state = self.state.lock().await;
+            let previous_window_index = state
+                .sessions
+                .session(&session_name)
+                .map(|session| session.active_window_index());
             match state.last_window(&session_name) {
-                Ok(response) => Response::LastWindow(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+                Ok(response) => {
+                    let resize_sessions = previous_window_index
+                        .map(|previous| {
+                            linked_resize_sessions_for_window_change(
+                                &state,
+                                &session_name,
+                                previous,
+                                response.target.window_index(),
+                            )
+                        })
+                        .unwrap_or_else(|| vec![session_name.clone()]);
+                    (Response::LastWindow(response), resize_sessions)
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), Vec::new()),
             }
         };
 
@@ -316,7 +415,8 @@ impl RequestHandler {
                     PendingInlineHookFormat::AfterCommand,
                 );
             }
-            self.refresh_attached_session(&session_name).await;
+            self.reconcile_and_refresh_attached_sessions(resize_sessions)
+                .await;
         }
 
         response

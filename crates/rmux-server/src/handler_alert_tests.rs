@@ -8,14 +8,15 @@ use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::AttachControl;
 use crate::server_access::current_owner_uid;
 use rmux_core::{WINLINK_ACTIVITY, WINLINK_BELL, WINLINK_SILENCE};
+#[cfg(unix)]
+use rmux_proto::SendKeysRequest;
 use rmux_proto::{
     DisplayMessageRequest, HookName, KillWindowRequest, NewSessionExtRequest, NewSessionRequest,
-    NewWindowRequest, NextWindowRequest, OptionName, PreviousWindowRequest, Request, Response,
-    ScopeSelector, SessionName, SetOptionMode, SetOptionRequest, ShowMessagesRequest,
-    SplitDirection, SplitWindowExtRequest, SplitWindowTarget, Target, TerminalSize, WindowTarget,
+    NewWindowRequest, NextWindowRequest, OptionName, PaneTarget, PreviousWindowRequest, Request,
+    Response, ScopeSelector, SelectPaneRequest, SessionName, SetOptionMode, SetOptionRequest,
+    ShowMessagesRequest, SplitDirection, SplitWindowExtRequest, SplitWindowTarget, Target,
+    TerminalSize, WindowTarget,
 };
-#[cfg(unix)]
-use rmux_proto::{PaneTarget, SendKeysRequest};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
@@ -183,6 +184,120 @@ async fn recv_lifecycle(
         .expect("lifecycle channel should stay open")
 }
 
+async fn recv_lifecycle_hook(
+    receiver: &mut broadcast::Receiver<QueuedLifecycleEvent>,
+    expected: HookName,
+) -> QueuedLifecycleEvent {
+    recv_lifecycle_hook_with_timeout(receiver, expected, ALERT_TEST_EVENT_TIMEOUT).await
+}
+
+async fn recv_lifecycle_hook_with_timeout(
+    receiver: &mut broadcast::Receiver<QueuedLifecycleEvent>,
+    expected: HookName,
+    wait_for: Duration,
+) -> QueuedLifecycleEvent {
+    let deadline = tokio::time::Instant::now() + wait_for;
+    let mut ignored = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for lifecycle hook {expected:?}; ignored {ignored:?}"
+        );
+        match timeout(remaining, receiver.recv()).await {
+            Err(_) => {
+                panic!("timed out waiting for lifecycle hook {expected:?}; ignored {ignored:?}")
+            }
+            Ok(Err(error)) => {
+                panic!("lifecycle channel closed while waiting for {expected:?}: {error:?}")
+            }
+            Ok(Ok(event)) if event.hook_name == expected => return event,
+            Ok(Ok(event)) if is_lifecycle_noise(event.hook_name) => ignored.push(event.hook_name),
+            Ok(Ok(event)) => panic!(
+                "expected lifecycle hook {expected:?}, got {:?}; ignored {ignored:?}",
+                event.hook_name
+            ),
+        }
+    }
+}
+
+async fn recv_lifecycle_hooks(
+    receiver: &mut broadcast::Receiver<QueuedLifecycleEvent>,
+    expected: &[HookName],
+) -> Vec<QueuedLifecycleEvent> {
+    let deadline = tokio::time::Instant::now() + ALERT_TEST_EVENT_TIMEOUT;
+    let mut pending = expected.to_vec();
+    let mut received = Vec::new();
+    let mut ignored = Vec::new();
+    while !pending.is_empty() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for lifecycle hooks {pending:?}; received {:?}; ignored {ignored:?}",
+            received
+                .iter()
+                .map(|event: &QueuedLifecycleEvent| event.hook_name)
+                .collect::<Vec<_>>()
+        );
+        match timeout(remaining, receiver.recv()).await {
+            Err(_) => panic!(
+                "timed out waiting for lifecycle hooks {pending:?}; received {:?}; ignored {ignored:?}",
+                received
+                    .iter()
+                    .map(|event: &QueuedLifecycleEvent| event.hook_name)
+                    .collect::<Vec<_>>()
+            ),
+            Ok(Err(error)) => panic!("lifecycle channel closed while waiting for {pending:?}: {error:?}"),
+            Ok(Ok(event)) => {
+                if let Some(index) = pending
+                    .iter()
+                    .position(|hook_name| *hook_name == event.hook_name)
+                {
+                    pending.remove(index);
+                    received.push(event);
+                } else if is_lifecycle_noise(event.hook_name) {
+                    ignored.push(event.hook_name);
+                } else {
+                    panic!(
+                        "unexpected lifecycle hook {:?}; still waiting for {pending:?}; ignored {ignored:?}",
+                        event.hook_name
+                    );
+                }
+            }
+        }
+    }
+    received
+}
+
+async fn assert_no_lifecycle_hooks(
+    receiver: &mut broadcast::Receiver<QueuedLifecycleEvent>,
+    forbidden: &[HookName],
+    wait_for: Duration,
+    message: &str,
+) {
+    let deadline = tokio::time::Instant::now() + wait_for;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match timeout(remaining, receiver.recv()).await {
+            Err(_) | Ok(Err(_)) => return,
+            Ok(Ok(event)) => {
+                assert!(
+                    !forbidden.contains(&event.hook_name),
+                    "{message}: unexpected lifecycle hook {:?}",
+                    event.hook_name
+                );
+            }
+        }
+    }
+}
+
+fn is_lifecycle_noise(hook_name: HookName) -> bool {
+    matches!(hook_name, HookName::PaneTitleChanged)
+}
+
 async fn recv_attach_control(
     receiver: &mut mpsc::UnboundedReceiver<AttachControl>,
 ) -> AttachControl {
@@ -320,6 +435,24 @@ async fn drain_attach_controls_until_idle(receiver: &mut mpsc::UnboundedReceiver
     }
 }
 
+async fn drain_attach_controls_until_quiet(
+    receiver: &mut mpsc::UnboundedReceiver<AttachControl>,
+    quiet_for: Duration,
+    timeout_after: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + timeout_after;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        match timeout(quiet_for.min(remaining), receiver.recv()).await {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return,
+        }
+    }
+}
+
 #[tokio::test]
 async fn pane_alert_event_sets_bell_and_activity_flags_and_emits_alert_hooks() {
     let handler = RequestHandler::new();
@@ -349,13 +482,20 @@ async fn pane_alert_event_sets_bell_and_activity_flags_and_emits_alert_hooks() {
         session_name: session.clone(),
         pane_id,
         bell_count: 1,
+        title_changed: false,
         queue_activity_alert: true,
         generation: None,
     });
 
-    let first = recv_lifecycle(&mut lifecycle).await;
-    let second = recv_lifecycle(&mut lifecycle).await;
-    let hook_names = [first.hook_name, second.hook_name];
+    let events = recv_lifecycle_hooks(
+        &mut lifecycle,
+        &[HookName::AlertBell, HookName::AlertActivity],
+    )
+    .await;
+    let hook_names = events
+        .iter()
+        .map(|event| event.hook_name)
+        .collect::<Vec<_>>();
     assert!(hook_names.contains(&HookName::AlertBell));
     assert!(hook_names.contains(&HookName::AlertActivity));
 
@@ -401,6 +541,7 @@ async fn pane_alert_callback_can_be_invoked_from_reader_thread() {
             session_name: session,
             pane_id,
             bell_count: 0,
+            title_changed: false,
             queue_activity_alert: true,
             generation: None,
         });
@@ -410,6 +551,76 @@ async fn pane_alert_callback_can_be_invoked_from_reader_thread() {
 
     let event = recv_lifecycle(&mut lifecycle).await;
     assert_eq!(event.hook_name, HookName::AlertActivity);
+}
+
+#[tokio::test]
+async fn pane_title_change_output_emits_lifecycle_hook_event() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "pane-title-hook").await;
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0).map(|pane| pane.id()))
+            .expect("window pane exists")
+    };
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+
+    handler.pane_alert_callback()(crate::pane_io::PaneAlertEvent {
+        session_name: session,
+        pane_id,
+        bell_count: 0,
+        title_changed: true,
+        queue_activity_alert: false,
+        generation: None,
+    });
+
+    let event = recv_lifecycle(&mut lifecycle).await;
+    assert_eq!(event.hook_name, HookName::PaneTitleChanged);
+}
+
+#[tokio::test]
+async fn select_pane_does_not_synthesize_focus_lifecycle_hooks() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "pane-focus-hooks").await;
+    split_quiet_window(&handler, &session).await;
+    assert!(matches!(
+        handler
+            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+                target: PaneTarget::with_window(session.clone(), 0, 0),
+                preserve_zoom: false,
+                title: None,
+                style: None,
+                input_disabled: None,
+            })))
+            .await,
+        Response::SelectPane(_)
+    ));
+
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    assert!(matches!(
+        handler
+            .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+                target: PaneTarget::with_window(session, 0, 1),
+                preserve_zoom: false,
+                title: None,
+                style: None,
+                input_disabled: None,
+            })))
+            .await,
+        Response::SelectPane(_)
+    ));
+
+    recv_lifecycle_hook(&mut lifecycle, HookName::WindowPaneChanged).await;
+    assert_no_lifecycle_hooks(
+        &mut lifecycle,
+        &[HookName::PaneFocusIn, HookName::PaneFocusOut],
+        Duration::from_millis(100),
+        "select-pane must not synthesize pane-focus-in/out hooks",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -463,7 +674,12 @@ async fn pane_alert_callback_coalesces_inactive_pane_refreshes_by_session() {
             },
         )
         .await;
-    drain_attach_controls_until_idle(&mut control_rx).await;
+    drain_attach_controls_until_quiet(
+        &mut control_rx,
+        Duration::from_millis(150),
+        Duration::from_secs(2),
+    )
+    .await;
     let baseline_backlog = control_backlog.load(Ordering::Acquire);
 
     let first_callback = handler.pane_alert_callback();
@@ -476,6 +692,7 @@ async fn pane_alert_callback_coalesces_inactive_pane_refreshes_by_session() {
             session_name: session.clone(),
             pane_id,
             bell_count: 0,
+            title_changed: false,
             queue_activity_alert: false,
             generation: None,
         });
@@ -554,6 +771,7 @@ async fn pane_alert_event_updates_automatic_window_name_without_disabling_auto_r
         session_name: session.clone(),
         pane_id,
         bell_count: 0,
+        title_changed: false,
         queue_activity_alert: true,
         generation: None,
     });
@@ -615,6 +833,7 @@ async fn pane_alert_event_respects_automatic_rename_off() {
             session_name: session.clone(),
             pane_id,
             bell_count: 0,
+            title_changed: false,
             queue_activity_alert: true,
             generation: None,
         })
@@ -679,6 +898,7 @@ async fn pane_alert_event_updates_grouped_session_window_names() {
             session_name: alpha.clone(),
             pane_id,
             bell_count: 0,
+            title_changed: false,
             queue_activity_alert: true,
             generation: None,
         })
@@ -847,11 +1067,12 @@ async fn silence_monitor_sets_flags_after_idle() {
     .await;
 
     let mut lifecycle = handler.subscribe_lifecycle_events();
-    let event = timeout(Duration::from_secs(4), lifecycle.recv())
-        .await
-        .expect("silence alert should fire")
-        .expect("lifecycle channel should stay open");
-    assert_eq!(event.hook_name, HookName::AlertSilence);
+    recv_lifecycle_hook_with_timeout(
+        &mut lifecycle,
+        HookName::AlertSilence,
+        Duration::from_secs(4),
+    )
+    .await;
 
     let state = handler.state.lock().await;
     let flags = state
@@ -1078,37 +1299,25 @@ async fn activity_deduplication_skips_second_alert_on_same_winlink() {
     handler
         .alerts_queue_window(window.clone(), rmux_core::WINDOW_ACTIVITY)
         .await;
-    let event = recv_lifecycle(&mut lifecycle).await;
-    assert_eq!(event.hook_name, HookName::AlertActivity);
+    recv_lifecycle_hook(&mut lifecycle, HookName::AlertActivity).await;
 
     // Second activity on the same winlink is suppressed (flag already set).
     handler
         .alerts_queue_window(window.clone(), rmux_core::WINDOW_ACTIVITY)
         .await;
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match timeout(remaining, lifecycle.recv()).await {
-            Err(_) | Ok(Err(_)) => break,
-            Ok(Ok(event)) => {
-                assert_ne!(
-                    event.hook_name,
-                    HookName::AlertActivity,
-                    "duplicate activity alert should not fire"
-                );
-            }
-        }
-    }
+    assert_no_lifecycle_hooks(
+        &mut lifecycle,
+        &[HookName::AlertActivity],
+        Duration::from_millis(100),
+        "duplicate activity alert should not fire",
+    )
+    .await;
 
     // Bell on the same winlink still fires (bells are never deduplicated).
     handler
         .alerts_queue_window(window.clone(), rmux_core::WINDOW_BELL)
         .await;
-    let bell_event = recv_lifecycle(&mut lifecycle).await;
-    assert_eq!(bell_event.hook_name, HookName::AlertBell);
+    recv_lifecycle_hook(&mut lifecycle, HookName::AlertBell).await;
 }
 
 #[tokio::test]
@@ -1331,30 +1540,19 @@ async fn silence_deduplication_skips_second_silence_on_same_winlink() {
     handler
         .alerts_queue_window(window.clone(), rmux_core::WINDOW_SILENCE)
         .await;
-    let event = recv_lifecycle(&mut lifecycle).await;
-    assert_eq!(event.hook_name, HookName::AlertSilence);
+    recv_lifecycle_hook(&mut lifecycle, HookName::AlertSilence).await;
 
     // Second silence on the same winlink is suppressed (flag already set).
     handler
         .alerts_queue_window(window.clone(), rmux_core::WINDOW_SILENCE)
         .await;
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match timeout(remaining, lifecycle.recv()).await {
-            Err(_) | Ok(Err(_)) => break,
-            Ok(Ok(event)) => {
-                assert_ne!(
-                    event.hook_name,
-                    HookName::AlertSilence,
-                    "duplicate silence alert should not fire"
-                );
-            }
-        }
-    }
+    assert_no_lifecycle_hooks(
+        &mut lifecycle,
+        &[HookName::AlertSilence],
+        Duration::from_millis(100),
+        "duplicate silence alert should not fire",
+    )
+    .await;
 }
 
 #[tokio::test]

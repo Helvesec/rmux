@@ -366,10 +366,10 @@ fn wait_for_child_process_baseline(
             return Ok(());
         }
 
-        assert!(
-            states.iter().all(|state| !state.starts_with('Z')),
-            "zombie child processes remained under daemon {parent_pid}: {states:?}"
-        );
+        // A child can appear as a zombie for a very short interval before the
+        // daemon observes SIGCHLD and reaps it. The release invariant is that
+        // zombies do not persist past the reap budget, not that /proc never
+        // exposes the transient state between polling ticks.
         std::thread::sleep(Duration::from_millis(50));
     }
 

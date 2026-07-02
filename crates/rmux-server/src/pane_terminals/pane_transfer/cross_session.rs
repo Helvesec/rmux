@@ -304,6 +304,7 @@ impl HandlerState {
                 RmuxError::Server("moved pane disappeared after cross-session join-pane".to_owned())
             })?;
 
+        self.clear_marked_pane_if_id(source_pane_id);
         Ok(JoinPaneResponse {
             target: PaneTarget::with_window(
                 target_session_name,
@@ -477,6 +478,7 @@ impl HandlerState {
             self.sync_pane_lifecycle_dimensions_for_session(&destination_session_name);
         }
 
+        self.clear_marked_pane_if_id(source_pane_id);
         Ok(BreakPaneResponse {
             target: PaneTarget::with_window(destination_session_name, destination_index, 0),
             output: None,

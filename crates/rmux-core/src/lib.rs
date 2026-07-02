@@ -36,6 +36,7 @@ mod terminal;
 mod terminal_passthrough;
 mod terminal_screen;
 mod terminal_sequences;
+pub mod tmux_precedence;
 mod transcript;
 mod utf8;
 mod vis;
@@ -68,9 +69,9 @@ pub use keys::{
 pub use lifecycle::LifecycleEvent;
 pub use options::{
     default_global_scope_for_option_name, option_affects_alerts, option_affects_rendering,
-    option_name_by_name, resolve_option_name, validate_option_mutation,
-    validate_option_name_mutation, OptionMutationOutcome, OptionNotification, OptionStore,
-    ShowOptionsMode,
+    option_name_by_name, resolve_option_name, resolve_option_name_typed, validate_option_mutation,
+    validate_option_name_mutation, OptionLookupError, OptionMutationOutcome, OptionNotification,
+    OptionStore, ShowOptionsMode,
 };
 pub use pane::{Pane, PaneGeometry};
 pub use screen::{Screen, ScreenCellRef, ScreenCellView, ScreenLineView};

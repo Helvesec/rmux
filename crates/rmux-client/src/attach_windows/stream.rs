@@ -1,6 +1,9 @@
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use rmux_proto::{
     encode_attach_message, AttachFrameDecoder, AttachMessage, AttachedKeystroke, RmuxError,
@@ -19,6 +22,11 @@ use super::screen::{
     DETACHED_BANNER_PREFIX, EXITED_BANNER,
 };
 
+const ATTACH_OUTPUT_QUEUE_CAPACITY: usize = 64;
+const ATTACH_OUTPUT_PENDING_MAX_BYTES: usize = 4 * 1024 * 1024;
+const ATTACH_OUTPUT_BACKPRESSURE_RETRY: Duration = Duration::from_millis(5);
+const ATTACH_OUTPUT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+
 pub(super) async fn drive_async_attach<Reader, Writer, Output>(
     reader: Reader,
     writer: Writer,
@@ -30,7 +38,7 @@ pub(super) async fn drive_async_attach<Reader, Writer, Output>(
 where
     Reader: tokio::io::AsyncRead + Unpin,
     Writer: tokio::io::AsyncWrite + Unpin,
-    Output: Write,
+    Output: Write + Send + 'static,
 {
     let mut metrics = AttachMetricsRecorder::from_env();
     let result = drive_async_attach_loop(
@@ -51,7 +59,7 @@ async fn drive_async_attach_loop<Reader, Writer, Output>(
     mut reader: Reader,
     mut writer: Writer,
     initial_bytes: Vec<u8>,
-    mut output: Output,
+    output: Output,
     screen_tracker: AttachScreenTracker,
     channels: AttachAsyncChannels,
     metrics: &mut AttachMetricsRecorder,
@@ -59,7 +67,7 @@ async fn drive_async_attach_loop<Reader, Writer, Output>(
 where
     Reader: tokio::io::AsyncRead + Unpin,
     Writer: tokio::io::AsyncWrite + Unpin,
-    Output: Write,
+    Output: Write + Send + 'static,
 {
     let AttachAsyncChannels {
         mut input_rx,
@@ -77,23 +85,40 @@ where
     let mut pending_actions = 0_usize;
     let mut input_open = true;
     let mut resize_open = true;
+    let mut output = AttachOutputQueue::spawn(output);
+    let mut output_failure_rx = output.take_failure_notifications();
 
     loop {
-        drain_attach_messages(
-            &mut decoder,
-            &mut output,
-            DrainContext {
-                screen_tracker: &screen_tracker,
-                stop_detector: &mut stop_detector,
-                mouse_tracker: &mut mouse_tracker,
-                action_tx: &action_tx,
-                locked: &locked,
-                pending_actions: &mut pending_actions,
-                metrics,
-            },
-        )?;
+        output.flush_pending()?;
+        if !output.is_backpressured() {
+            drain_attach_messages(
+                &mut decoder,
+                &mut output,
+                DrainContext {
+                    screen_tracker: &screen_tracker,
+                    stop_detector: &mut stop_detector,
+                    mouse_tracker: &mut mouse_tracker,
+                    action_tx: &action_tx,
+                    locked: &locked,
+                    pending_actions: &mut pending_actions,
+                    metrics,
+                },
+            )?;
+        }
+        output.check_failure()?;
+        let retry_output = output.is_backpressured();
 
         tokio::select! {
+            _ = tokio::time::sleep(ATTACH_OUTPUT_BACKPRESSURE_RETRY), if retry_output => {}
+            failure = output_failure_rx.recv() => {
+                if failure.is_none() {
+                    return Err(ClientError::Io(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "attach output writer stopped",
+                    )));
+                }
+                output.check_failure()?;
+            }
             input = input_rx.recv(), if input_open => {
                 let Some(input) = input else {
                     input_open = false;
@@ -157,7 +182,7 @@ where
                     }
                 }
             }
-            read = reader.read(&mut read_buffer) => {
+            read = reader.read(&mut read_buffer), if !output.is_backpressured() => {
                 let bytes_read = match read {
                     Ok(0) => {
                         if screen_tracker.was_stopped() {
@@ -187,14 +212,11 @@ where
     }
 }
 
-fn drain_attach_messages<Output>(
+fn drain_attach_messages(
     decoder: &mut AttachFrameDecoder,
-    output: &mut Output,
+    output: &mut AttachOutputQueue,
     context: DrainContext<'_>,
-) -> std::result::Result<(), ClientError>
-where
-    Output: Write,
-{
+) -> std::result::Result<(), ClientError> {
     let DrainContext {
         screen_tracker,
         stop_detector,
@@ -221,8 +243,10 @@ where
                 if locked.is_locked() {
                     continue;
                 }
-                output.write_all(&bytes).map_err(ClientError::Io)?;
-                output.flush().map_err(ClientError::Io)?;
+                output.write_frame(bytes)?;
+                if output.is_backpressured() {
+                    break;
+                }
             }
             AttachMessage::KeyDispatched(_) => {}
             AttachMessage::DetachKill => {
@@ -274,6 +298,126 @@ where
     }
 
     Ok(())
+}
+
+struct AttachOutputQueue {
+    command_tx: Option<std_mpsc::SyncSender<Vec<u8>>>,
+    failure_rx: std_mpsc::Receiver<io::Error>,
+    failure_wake_rx: Option<mpsc::UnboundedReceiver<()>>,
+    done_rx: std_mpsc::Receiver<()>,
+    worker: Option<thread::JoinHandle<()>>,
+    pending: VecDeque<Vec<u8>>,
+    pending_bytes: usize,
+}
+
+impl AttachOutputQueue {
+    fn spawn<Output>(mut output: Output) -> Self
+    where
+        Output: Write + Send + 'static,
+    {
+        let (command_tx, command_rx) =
+            std_mpsc::sync_channel::<Vec<u8>>(ATTACH_OUTPUT_QUEUE_CAPACITY);
+        let (failure_tx, failure_rx) = std_mpsc::channel();
+        let (failure_wake_tx, failure_wake_rx) = mpsc::unbounded_channel();
+        let (done_tx, done_rx) = std_mpsc::channel();
+        let worker = thread::spawn(move || {
+            while let Ok(bytes) = command_rx.recv() {
+                if let Err(error) = output.write_all(&bytes).and_then(|()| output.flush()) {
+                    let _ = failure_tx.send(error);
+                    let _ = failure_wake_tx.send(());
+                    break;
+                }
+            }
+            let _ = done_tx.send(());
+        });
+
+        Self {
+            command_tx: Some(command_tx),
+            failure_rx,
+            failure_wake_rx: Some(failure_wake_rx),
+            done_rx,
+            worker: Some(worker),
+            pending: VecDeque::new(),
+            pending_bytes: 0,
+        }
+    }
+
+    fn write_frame(&mut self, bytes: Vec<u8>) -> std::result::Result<(), ClientError> {
+        self.check_failure()?;
+        let next_pending_bytes = self.pending_bytes.saturating_add(bytes.len());
+        if next_pending_bytes > ATTACH_OUTPUT_PENDING_MAX_BYTES {
+            return Err(ClientError::Io(io::Error::other(format!(
+                "attach output writer is blocked and queued more than {ATTACH_OUTPUT_PENDING_MAX_BYTES} bytes"
+            ))));
+        }
+        self.pending_bytes = next_pending_bytes;
+        self.pending.push_back(bytes);
+        self.flush_pending()
+    }
+
+    fn flush_pending(&mut self) -> std::result::Result<(), ClientError> {
+        self.check_failure()?;
+        let Some(command_tx) = self.command_tx.as_ref() else {
+            return Err(ClientError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "attach output writer stopped",
+            )));
+        };
+
+        while let Some(bytes) = self.pending.pop_front() {
+            let len = bytes.len();
+            match command_tx.try_send(bytes) {
+                Ok(()) => {
+                    self.pending_bytes = self.pending_bytes.saturating_sub(len);
+                }
+                Err(std_mpsc::TrySendError::Full(bytes)) => {
+                    self.pending.push_front(bytes);
+                    break;
+                }
+                Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                    return Err(ClientError::Io(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "attach output writer stopped",
+                    )));
+                }
+            }
+        }
+
+        self.check_failure()
+    }
+
+    fn is_backpressured(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    fn check_failure(&mut self) -> std::result::Result<(), ClientError> {
+        match self.failure_rx.try_recv() {
+            Ok(error) => Err(ClientError::Io(error)),
+            Err(std_mpsc::TryRecvError::Empty) => Ok(()),
+            Err(std_mpsc::TryRecvError::Disconnected) => Ok(()),
+        }
+    }
+
+    fn take_failure_notifications(&mut self) -> mpsc::UnboundedReceiver<()> {
+        self.failure_wake_rx
+            .take()
+            .expect("attach output failure notifications should only be taken once")
+    }
+}
+
+impl Drop for AttachOutputQueue {
+    fn drop(&mut self) {
+        drop(self.command_tx.take());
+        if self
+            .done_rx
+            .recv_timeout(ATTACH_OUTPUT_SHUTDOWN_TIMEOUT)
+            .is_ok()
+        {
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+        }
+    }
 }
 
 pub(super) struct AttachAsyncChannels {

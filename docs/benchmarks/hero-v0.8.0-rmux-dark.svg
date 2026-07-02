@@ -11,5 +11,5 @@
   <text x="145" y="96" fill="#aeb8c6" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="21">Performance comparison between RMUX and tmux across common operations.</text>
   <text x="145" y="129" fill="#7dff58" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="21">Lower is faster.</text>
   <rect x="1268" y="38" width="205" height="54" rx="15" fill="#081522" stroke="#263848"/>
-  <text x="1370" y="72" fill="#f3f7fb" text-anchor="middle" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="20" font-weight="700">RMUX v0.7.0</text>
+  <text x="1370" y="72" fill="#f3f7fb" text-anchor="middle" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="20" font-weight="700">RMUX v0.8.0</text>
 </svg>

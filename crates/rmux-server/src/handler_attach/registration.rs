@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 #[cfg(test)]
 use std::sync::Arc;
 
+use rmux_core::LifecycleEvent;
 #[cfg(test)]
 use rmux_os::identity::UserIdentity;
 #[cfg(test)]
@@ -108,6 +109,8 @@ impl RequestHandler {
         let mut active_attach = self.active_attach.lock().await;
         let attach_id = active_attach.next_id;
         active_attach.next_id += 1;
+        let size_sequence = active_attach.next_size_sequence;
+        active_attach.next_size_sequence = active_attach.next_size_sequence.saturating_add(1);
         if let Some(mut previous) = active_attach.by_pid.insert(
             requester_pid,
             ActiveAttach {
@@ -130,6 +133,7 @@ impl RequestHandler {
                 terminal_context: registration.terminal_context,
                 client_size,
                 client_pixels: None,
+                size_sequence,
                 persistent_overlay_epoch: registration.persistent_overlay_epoch,
                 render_generation: 0,
                 overlay_generation: 0,
@@ -175,7 +179,7 @@ impl RequestHandler {
     }
 
     pub(crate) async fn finish_attach(&self, requester_pid: u32, attach_id: u64) {
-        let (removed_session, removed_key_table, removed_overlay) = {
+        let (removed_session, removed_key_table, removed_overlay, emit_detached) = {
             let mut active_attach = self.active_attach.lock().await;
             if active_attach
                 .by_pid
@@ -186,15 +190,17 @@ impl RequestHandler {
                     .by_pid
                     .remove(&requester_pid)
                     .map(|active| {
+                        let emit_detached = !active.closing.load(Ordering::SeqCst);
                         (
                             Some(active.session_name),
                             active.key_table_name,
                             active.overlay,
+                            emit_detached,
                         )
                     })
-                    .unwrap_or((None, None, None))
+                    .unwrap_or((None, None, None, false))
             } else {
-                (None, None, None)
+                (None, None, None, false)
             }
         };
         super::terminate_overlay_job(removed_overlay);
@@ -203,6 +209,16 @@ impl RequestHandler {
             state.key_bindings.unref_table(&table_name);
         }
         if let Some(session_name) = removed_session {
+            if emit_detached {
+                self.emit(LifecycleEvent::ClientDetached {
+                    session_name: session_name.clone(),
+                    client_name: Some(requester_pid.to_string()),
+                })
+                .await;
+            }
+            if let Ok(Some(target)) = self.reconcile_attached_session_size(&session_name).await {
+                self.emit(LifecycleEvent::WindowResized { target }).await;
+            }
             self.destroy_unattached_sessions(vec![session_name]).await;
         }
     }
