@@ -249,15 +249,19 @@ fn unresolved_target_needs_current_session(raw: &str, target_type: ResolveTarget
         || raw.starts_with('@')
         || raw.starts_with(':')
         || raw.starts_with(['+', '-'])
+        || (target_type == ResolveTargetType::Window
+            && raw.bytes().all(|byte| byte.is_ascii_digit()))
         || (raw.contains('.') && !raw.contains(':'))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pane_io::AttachControl;
     use rmux_proto::{
-        NewSessionRequest, PaneTarget, ResolveTargetRequest, Response, SelectPaneRequest,
-        SplitDirection, SplitWindowRequest, SplitWindowTarget, Target, TerminalSize,
+        NewSessionRequest, NewWindowRequest, PaneTarget, ResolveTargetRequest, Response,
+        SelectPaneRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget, Target,
+        TerminalSize,
     };
 
     fn session_name(value: &str) -> rmux_proto::SessionName {
@@ -355,6 +359,73 @@ mod tests {
             resolve_pane(&handler, "{down-of}").await,
             Target::Pane(PaneTarget::with_window(alpha, 0, 1))
         );
+    }
+
+    #[tokio::test]
+    async fn bare_numeric_window_targets_use_current_session_before_global_matches() {
+        let handler = RequestHandler::new();
+        let bg = session_name("bg");
+        let work = session_name("work");
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: bg.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+        assert!(matches!(
+            handler
+                .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                    target: bg,
+                    name: Some("bg1".to_owned()),
+                    detached: true,
+                    start_directory: None,
+                    environment: None,
+                    command: None,
+                    process_command: None,
+                    target_window_index: Some(1),
+                    insert_at_target: false,
+                })))
+                .await,
+            Response::NewWindow(_)
+        ));
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: work.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+        let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel::<AttachControl>();
+        handler
+            .register_attach(std::process::id(), work, control_tx)
+            .await;
+
+        let response = handler
+            .handle(Request::ResolveTarget(ResolveTargetRequest {
+                target: Some("1".to_owned()),
+                target_type: ResolveTargetType::Window,
+                window_index: false,
+                prefer_unattached: false,
+            }))
+            .await;
+
+        match response {
+            Response::Error(error) => assert!(
+                error.error.to_string().contains("can't find window: 1"),
+                "unexpected error: {}",
+                error.error
+            ),
+            other => panic!("bare numeric target must not resolve globally: {other:?}"),
+        }
     }
 
     #[test]

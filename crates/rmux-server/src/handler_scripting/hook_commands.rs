@@ -2,6 +2,9 @@ use rmux_core::command_parser::ParsedCommands;
 use rmux_proto::{RmuxError, SessionName, Target};
 
 use super::super::RequestHandler;
+use super::format_context::{
+    format_context_for_target_with_server_values, parser_with_parse_time_context,
+};
 use super::parser_context::command_parser_from_state;
 use super::queue::QueueExecutionContext;
 use crate::hook_runtime::current_hook_formats;
@@ -48,8 +51,15 @@ impl RequestHandler {
         current_target: Option<&Target>,
     ) -> Result<ParsedCommands, RmuxError> {
         let mut parser = {
+            let socket_path = self.socket_path();
             let state = self.state.lock().await;
-            command_parser_from_state(&state)
+            let mut parser = command_parser_from_state(&state);
+            if let Some(target) = current_target {
+                let context =
+                    format_context_for_target_with_server_values(&state, target, 0, &socket_path)?;
+                parser = parser_with_parse_time_context(parser, &context);
+            }
+            parser
         };
         for (name, value) in current_hook_formats() {
             parser = parser.with_format_value(name, value);

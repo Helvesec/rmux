@@ -35,6 +35,7 @@ use std::os::unix::process::CommandExt;
 const TEAMMATE_MODE_FLAG: &str = "--teammate-mode";
 const TEAMMATE_MODE: &str = "tmux";
 const AGENT_TEAMS_ENV: &str = "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS";
+const DISABLE_TMUX_SHIM_ENV: &str = "RMUX_DISABLE_TMUX_SHIM";
 #[cfg(any(unix, windows))]
 const PUBLIC_BINARY_OVERRIDE_ENV: &str = "RMUX_INTERNAL_PUBLIC_BINARY_PATH";
 const CLAUDE_MAIN_SOCKET_ENV: &str = "RMUX_INTERNAL_CLAUDE_MAIN_SOCKET";
@@ -157,18 +158,41 @@ fn run_direct(invocation: ClaudeInvocation) -> Result<i32, ExitFailure> {
 
 fn build_claude_command(
     args: Vec<OsString>,
-) -> Result<(ProcessCommand, PrivateTmuxShim), ExitFailure> {
-    let shim = ensure_private_tmux_shim()?;
-    let path = path_with_shim_first(shim.path())?;
+) -> Result<(ProcessCommand, Option<PrivateTmuxShim>), ExitFailure> {
     let mut command = claude_process_command()?;
     command
         .arg(TEAMMATE_MODE_FLAG)
         .arg(TEAMMATE_MODE)
         .args(args)
         .env(AGENT_TEAMS_ENV, "1");
-    set_command_path_with_shim(&mut command, path);
+    let shim = if private_tmux_shim_enabled() {
+        let shim = ensure_private_tmux_shim()?;
+        let path = path_with_shim_first(shim.path())?;
+        set_command_path_with_shim(&mut command, path);
+        Some(shim)
+    } else {
+        None
+    };
     configure_claude_process_environment(&mut command)?;
     Ok((command, shim))
+}
+
+fn private_tmux_shim_enabled() -> bool {
+    !env_flag_enabled(DISABLE_TMUX_SHIM_ENV)
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    let Ok(value) = env::var(name) else {
+        return false;
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return false;
+    }
+    !matches!(
+        value.to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
 }
 
 #[cfg(windows)]

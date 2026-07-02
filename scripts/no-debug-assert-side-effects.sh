@@ -29,7 +29,7 @@ scan_with_perl() {
 }
 
 set +e
-if command -v rg >/dev/null 2>&1; then
+if command -v rg >/dev/null 2>&1 && rg --version >/dev/null 2>&1; then
   rg -n --pcre2 "$pattern" src crates \
     --glob '*.rs' \
     --glob '!**/target/**' \

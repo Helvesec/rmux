@@ -9,8 +9,9 @@ use super::lifecycle_state::terminal_size_from_geometry;
 use super::pane_lifecycle::{clone_terminal_for_exit_watcher, clone_terminal_for_output_reader};
 use super::{
     pane_terminal_geometry_for_session, session_not_found, CompletedDeferredInitialPane,
-    DeferredInitialPaneInputFlush, DeferredInitialPaneSpawn, HandlerState, InitialPaneSpawnOptions,
-    PaneExitMetadata, PaneLifecycleSpawn, PaneOutputSpawn, StartingPane,
+    DeferredInitialPaneConsoleInputAction, DeferredInitialPaneInput, DeferredInitialPaneInputFlush,
+    DeferredInitialPaneSpawn, HandlerState, InitialPaneSpawnOptions, PaneExitMetadata,
+    PaneLifecycleSpawn, PaneOutputSpawn, StartingPane,
 };
 
 const STARTING_PANE_INPUT_MAX_BYTES: usize = 64 * 1024;
@@ -238,6 +239,7 @@ impl HandlerState {
             visible_session_name: target.session_name().clone(),
             runtime_session_name,
             pane_id: job.pane_id,
+            pane_pid: pid,
             input_writer,
             queued_input,
         }))
@@ -274,9 +276,16 @@ impl HandlerState {
             target.window_index(),
             target.pane_index(),
         )?;
+        let pane_pid = self.terminals.pane_pid(
+            runtime_session_name,
+            pane_id,
+            target.window_index(),
+            target.pane_index(),
+        )?;
 
         Ok(Some(DeferredInitialPaneInputFlush {
             input_writer,
+            pane_pid,
             queued_input,
         }))
     }
@@ -408,6 +417,40 @@ impl HandlerState {
         if bytes.is_empty() {
             return Ok(false);
         }
+        self.queue_starting_pane_input_entry(
+            session_name,
+            window_index,
+            pane_index,
+            DeferredInitialPaneInput::Bytes(bytes.to_vec()),
+        )
+    }
+
+    pub(crate) fn queue_starting_pane_console_input(
+        &mut self,
+        session_name: &SessionName,
+        window_index: u32,
+        pane_index: u32,
+        action: DeferredInitialPaneConsoleInputAction,
+        byte_len: usize,
+    ) -> Result<bool, RmuxError> {
+        self.queue_starting_pane_input_entry(
+            session_name,
+            window_index,
+            pane_index,
+            DeferredInitialPaneInput::Console {
+                action,
+                byte_len: byte_len.max(1),
+            },
+        )
+    }
+
+    fn queue_starting_pane_input_entry(
+        &mut self,
+        session_name: &SessionName,
+        window_index: u32,
+        pane_index: u32,
+        input: DeferredInitialPaneInput,
+    ) -> Result<bool, RmuxError> {
         let Some(pane_id) = self
             .sessions
             .session(session_name)
@@ -425,14 +468,14 @@ impl HandlerState {
         else {
             return Ok(false);
         };
-        let next_len = starting.queued_input_bytes.saturating_add(bytes.len());
+        let next_len = starting.queued_input_bytes.saturating_add(input.byte_len());
         if next_len > STARTING_PANE_INPUT_MAX_BYTES {
             return Err(RmuxError::Server(format!(
                 "pane {}:{window_index}.{pane_index} is still starting and its input queue is full",
                 session_name
             )));
         }
-        starting.queued_input.push_back(bytes.to_vec());
+        starting.queued_input.push_back(input);
         starting.queued_input_bytes = next_len;
         Ok(true)
     }

@@ -34,6 +34,9 @@ mod pane_send_keys;
 mod pane_snapshot;
 #[path = "handler_pane/split_effects.rs"]
 mod pane_split_effects;
+#[cfg(windows)]
+#[path = "handler_pane/windows_console_sequence.rs"]
+mod pane_windows_console_sequence;
 
 pub(super) use pane_attached_input::retain_partial_attached_control_input;
 pub(super) use pane_by_id::resolve_pane_target_ref;
@@ -56,6 +59,7 @@ pub(in crate::handler) use pane_snapshot::PaneSnapshotRevisionRegistry;
 use rmux_proto::{PaneTarget, RmuxError, Target};
 
 use super::RequestHandler;
+use crate::mouse::AttachedMouseEvent;
 use crate::pane_terminals::{session_not_found, HandlerState};
 
 struct AttachedKeyDispatch {
@@ -63,6 +67,7 @@ struct AttachedKeyDispatch {
     requester_pid: u32,
     current_target: Option<Target>,
     mouse_target: Option<Target>,
+    mouse_event: Option<AttachedMouseEvent>,
     key: rmux_core::KeyCode,
     attached_live_input: bool,
 }

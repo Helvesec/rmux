@@ -13,9 +13,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use rmux_proto::{
-    encode_frame, CancelSdkWaitResponse, ErrorResponse, FrameDecoder, HasSessionRequest,
-    PaneOutputSubscriptionStart, Request, Response, SdkWaitForOutputRequest,
-    SdkWaitForOutputResponse, SdkWaitOutcome,
+    encode_frame, CancelSdkWaitResponse, ErrorResponse, FrameDecoder, HandshakeResponse,
+    HasSessionRequest, PaneOutputSubscriptionStart, Request, Response, SdkWaitForOutputRequest,
+    SdkWaitForOutputResponse, SdkWaitOutcome, CAPABILITY_SDK_WAITS_ARMED,
 };
 use rmux_sdk::{ArmedWait, EnsureSession, Pane, PaneRef, RmuxBuilder, RmuxError, SessionName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -52,6 +52,7 @@ async fn wait_for_next_arms_before_returned_handle_completes() -> TestResult {
         let mut cancel = accept_peer(&listener).await?;
 
         let request = expect_sdk_wait(&mut wait, b"needle").await?;
+        write_armed(&mut wait, &request).await?;
         seen_sender
             .send(())
             .map_err(|_| "test dropped request observer")?;
@@ -90,6 +91,7 @@ async fn wait_for_text_next_arms_daemon_byte_wait_for_text_bytes() -> TestResult
         let mut cancel = accept_peer(&listener).await?;
 
         let request = expect_sdk_wait(&mut wait, b"hello text").await?;
+        write_armed(&mut wait, &request).await?;
         wait.write_response(Response::SdkWaitForOutput(SdkWaitForOutputResponse {
             wait_id: request.wait_id,
             outcome: SdkWaitOutcome::Matched,
@@ -115,11 +117,13 @@ async fn independent_armed_waits_can_be_stored_and_moved_across_tasks() -> TestR
         let _handle = accept_peer(&listener).await?;
         let mut first_wait = accept_peer(&listener).await?;
         let mut first_cancel = accept_peer(&listener).await?;
+        let first = expect_sdk_wait(&mut first_wait, b"first").await?;
+        write_armed(&mut first_wait, &first).await?;
+
         let mut second_wait = accept_peer(&listener).await?;
         let mut second_cancel = accept_peer(&listener).await?;
-
-        let first = expect_sdk_wait(&mut first_wait, b"first").await?;
         let second = expect_sdk_wait(&mut second_wait, b"second").await?;
+        write_armed(&mut second_wait, &second).await?;
         seen_sender
             .send(())
             .map_err(|_| "test dropped request observer")?;
@@ -172,6 +176,7 @@ async fn dropping_armed_wait_sends_best_effort_cancel() -> TestResult {
         let mut cancel = accept_peer(&listener).await?;
 
         let request = expect_sdk_wait(&mut wait, b"drop").await?;
+        write_armed(&mut wait, &request).await?;
         expect_cancel(&mut cancel, &request).await?;
         TestResult::Ok(())
     });
@@ -194,6 +199,7 @@ async fn armed_wait_timeout_sends_best_effort_cancel() -> TestResult {
         let mut cancel = accept_peer(&listener).await?;
 
         let request = expect_sdk_wait(&mut wait, b"never").await?;
+        write_armed(&mut wait, &request).await?;
         expect_cancel(&mut cancel, &request).await?;
         TestResult::Ok(())
     });
@@ -220,6 +226,7 @@ async fn armed_wait_preserves_cancelled_outcome() -> TestResult {
         let mut cancel = accept_peer(&listener).await?;
 
         let request = expect_sdk_wait(&mut wait, b"cancelled").await?;
+        write_armed(&mut wait, &request).await?;
         wait.write_response(Response::SdkWaitForOutput(SdkWaitForOutputResponse {
             wait_id: request.wait_id,
             outcome: SdkWaitOutcome::Cancelled,
@@ -257,6 +264,7 @@ async fn armed_wait_preserves_mismatched_id_failure_and_cancels_expected_wait() 
         let mut cancel = accept_peer(&listener).await?;
 
         let request = expect_sdk_wait(&mut wait, b"mismatch").await?;
+        write_armed(&mut wait, &request).await?;
         wait.write_response(Response::SdkWaitForOutput(SdkWaitForOutputResponse {
             wait_id: rmux_proto::SdkWaitId::new(request.wait_id.as_u64() + 1),
             outcome: SdkWaitOutcome::Matched,
@@ -431,7 +439,19 @@ async fn live_wait_for_next_ignores_history_and_matches_split_future_output() ->
 }
 
 async fn expect_sdk_wait(peer: &mut Peer, bytes: &[u8]) -> TestResult<SdkWaitForOutputRequest> {
-    let request = peer.expect_request().await?;
+    let mut request = peer.expect_request().await?;
+    if let Request::Handshake(handshake) = &request {
+        assert!(
+            handshake
+                .required_capabilities
+                .iter()
+                .any(|capability| capability == CAPABILITY_SDK_WAITS_ARMED),
+            "armed SDK wait handshake did not require {CAPABILITY_SDK_WAITS_ARMED}: {handshake:?}"
+        );
+        peer.write_response(Response::Handshake(HandshakeResponse::current()))
+            .await?;
+        request = peer.expect_request().await?;
+    }
     let Request::SdkWaitForOutput(request) = request else {
         panic!("armed wait must use server-side SDK byte wait, got {request:?}");
     };
@@ -439,6 +459,13 @@ async fn expect_sdk_wait(peer: &mut Peer, bytes: &[u8]) -> TestResult<SdkWaitFor
     assert_eq!(request.bytes, bytes);
     assert_eq!(request.start, PaneOutputSubscriptionStart::Now);
     Ok(request)
+}
+
+async fn write_armed(peer: &mut Peer, request: &SdkWaitForOutputRequest) -> TestResult {
+    peer.write_response(Response::CancelSdkWait(CancelSdkWaitResponse::armed_ack(
+        request.wait_id,
+    )))
+    .await
 }
 
 async fn expect_cancel(peer: &mut Peer, wait: &SdkWaitForOutputRequest) -> TestResult {

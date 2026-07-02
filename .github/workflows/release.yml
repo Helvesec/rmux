@@ -31,6 +31,7 @@ jobs:
       RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
       RUSTDOCFLAGS: -D warnings
       RUST_MIN_STACK: "8388608"
+      RUST_TEST_THREADS: "1"
     steps:
       - name: Validate release event ref
         shell: bash
@@ -64,7 +65,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace --locked --no-fail-fast
+        run: cargo test --workspace --locked --no-fail-fast -- --test-threads=1
 
       - name: rustdoc with warnings denied
         run: cargo doc --workspace --locked --no-deps
@@ -150,10 +151,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: stable
+          components: clippy
           targets: ${{ matrix.target }}
 
       - name: Fetch locked dependencies
         run: cargo fetch --locked
+
+      - name: Windows MSVC clippy
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build rmux
         shell: bash
@@ -207,6 +214,25 @@ jobs:
           $bin = "target/$env:TARGET/$env:PROFILE_DIR/$env:BINARY"
           & $bin -V
           & $bin list-commands | Out-Null
+
+      - name: Windows attach and daemon regression tests
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:CARGO_INCREMENTAL = "0"
+          $env:CARGO_BUILD_JOBS = "1"
+          $env:CARGO_PROFILE_DEV_DEBUG = "0"
+          $env:CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG = "0"
+          $env:CARGO_PROFILE_TEST_DEBUG = "0"
+          $env:RUSTFLAGS = "-Clink-arg=/DEBUG:NONE"
+          cargo test -p rmux-client --locked output_writer_failure_wakes -- --test-threads=1
+          cargo test -p rmux-client --locked blocked_console_output_does_not_block_input_forwarding -- --test-threads=1
+          ./scripts/windows_ctrl_matrix.ps1 -StaticMatrixSpec
+          cargo test -p rmux --locked --test windows_ctrl_matrix_spec -- --test-threads=1
+          cargo test -p rmux --locked --test windows_attach_exit -- --test-threads=1
+          cargo test -p rmux --locked --test automation_cli_windows -- --test-threads=1
+          cargo test -p rmux --locked --test internal_daemon_windows -- --nocapture --test-threads=1
 
       - name: Create Unix archive
         if: matrix.archive == 'tar.gz'
@@ -262,7 +288,10 @@ jobs:
             $archive.FullName `
             -Checksums dist/SHA256SUMS.txt `
             -RunBinary `
-            -RunDaemonSmoke
+            -RunDaemonSmoke `
+            -RunSdkSmoke `
+            -RunMouseBorderSmoke `
+            -RequireReleaseArtifact
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:

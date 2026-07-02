@@ -1,12 +1,15 @@
 use super::*;
 
 #[tokio::test]
-async fn source_file_skips_parse_error_file_and_continues_other_paths() {
+async fn source_file_recovers_lookup_parse_errors_and_continues_other_paths() {
     let handler = RequestHandler::new();
     let root = temp_root("multi-path-parse-error");
     let bad = root.join("bad.conf");
     let good = root.join("good.conf");
-    write_config(&bad, "set-buffer -b before-error ok\nnot-a-command\n");
+    write_config(
+        &bad,
+        "set-buffer -b before-error ok\nnot-a-command\nset-buffer -b after-error ok\n",
+    );
     write_config(&good, "set-buffer -b parsed-after ok\n");
 
     let response = handler
@@ -27,14 +30,19 @@ async fn source_file_skips_parse_error_file_and_continues_other_paths() {
         ),
         "unexpected source-file parse error: {error:?}"
     );
-    assert!(matches!(
-        handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("before-error".to_owned()),
-            }))
-            .await,
-        Response::Error(_)
-    ));
+    for name in ["before-error", "after-error"] {
+        assert_eq!(
+            handler
+                .handle(Request::ShowBuffer(ShowBufferRequest {
+                    name: Some(name.to_owned()),
+                }))
+                .await
+                .command_output()
+                .expect("recovered command should run")
+                .stdout(),
+            b"ok"
+        );
+    }
     assert_eq!(
         handler
             .handle(Request::ShowBuffer(ShowBufferRequest {
@@ -49,7 +57,64 @@ async fn source_file_skips_parse_error_file_and_continues_other_paths() {
 }
 
 #[tokio::test]
-async fn nested_source_file_continues_outer_after_parse_errors_without_recovered_commands() {
+async fn source_file_lookup_error_inside_block_does_not_corrupt_recovery() {
+    let handler = RequestHandler::new();
+    let root = temp_root("block-parse-error-recovery");
+    let config = root.join("block.conf");
+    write_config(
+        &config,
+        "if-shell -F 1 {\nnot-a-command\nset-buffer -b inside-block yes\n}\nsecond-bogus\nset-buffer -b after-block yes\n",
+    );
+
+    let response = handler
+        .handle(source_file_request(
+            vec!["block.conf".to_owned()],
+            Some(root),
+        ))
+        .await;
+
+    let Response::Error(error) = response else {
+        panic!("source-file should fail on nested lookup parse errors, got {response:?}");
+    };
+    let message = error.error.to_string();
+    assert!(
+        message.contains("block.conf:2: unknown command: not-a-command"),
+        "unexpected source-file parse error: {message}"
+    );
+    assert!(
+        message.contains("block.conf:5: unknown command: second-bogus"),
+        "recovered suffix diagnostics must keep physical source lines: {message}"
+    );
+    assert!(
+        !message.contains("missing }") && !message.contains("unmatched }"),
+        "lookup recovery must not invent structural brace errors: {message}"
+    );
+    assert!(
+        matches!(
+            handler
+                .handle(Request::ShowBuffer(ShowBufferRequest {
+                    name: Some("inside-block".to_owned()),
+                }))
+                .await,
+            Response::Error(_)
+        ),
+        "the corrupt block should be skipped instead of partially executed"
+    );
+    assert_eq!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("after-block".to_owned()),
+            }))
+            .await
+            .command_output()
+            .expect("command after corrupt block should run")
+            .stdout(),
+        b"yes"
+    );
+}
+
+#[tokio::test]
+async fn nested_source_file_continues_after_recoverable_lookup_parse_errors() {
     let handler = RequestHandler::new();
     let root = temp_root("nested-source-parse-error");
     write_config(
@@ -79,14 +144,17 @@ async fn nested_source_file_continues_outer_after_parse_errors_without_recovered
         ),
         "unexpected nested source-file parse error: {error:?}"
     );
-    assert!(matches!(
+    assert_eq!(
         handler
             .handle(Request::ShowBuffer(ShowBufferRequest {
                 name: Some("nested-after".to_owned()),
             }))
-            .await,
-        Response::Error(_)
-    ));
+            .await
+            .command_output()
+            .expect("nested command after lookup parse error should run")
+            .stdout(),
+        b"yes"
+    );
     assert_eq!(
         handler
             .handle(Request::ShowBuffer(ShowBufferRequest {
@@ -587,6 +655,39 @@ show-options -gqv @expanded\n"
             .unwrap_or_else(|| panic!("queued show-options output, got {response:?}"))
             .stdout(),
         b"#{session_name}\n"
+    );
+}
+
+#[tokio::test]
+async fn source_file_accepts_oh_my_tmux_extended_keys_format_value() {
+    let handler = RequestHandler::new();
+    let root = temp_root("set-option-extended-keys-format-value");
+    fs::create_dir_all(&root).expect("create temp root");
+
+    let response = handler
+        .handle(Request::SourceFile(Box::new(SourceFileRequest {
+            paths: vec!["-".to_owned()],
+            quiet: false,
+            parse_only: false,
+            verbose: false,
+            expand_paths: false,
+            target: None,
+            caller_cwd: Some(root),
+            stdin: Some(
+                "set-environment -g TERM_PROGRAM iTerm\n\
+set -g extended-keys #{?#{||:#{m/ri:mintty|iTerm,#{TERM_PROGRAM}},#{!=:#{XTERM_VERSION},}},on,off}\n\
+show-options -gqv extended-keys\n"
+                    .to_owned(),
+            ),
+        })))
+        .await;
+
+    assert_eq!(
+        response
+            .command_output()
+            .unwrap_or_else(|| panic!("queued show-options output, got {response:?}"))
+            .stdout(),
+        b"on\n"
     );
 }
 

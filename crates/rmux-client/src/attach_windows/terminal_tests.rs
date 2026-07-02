@@ -39,7 +39,7 @@ fn enter_applies_raw_input_and_vt_output_flags() -> Result<()> {
 }
 
 #[test]
-fn raw_modes_preserve_selection_flags_and_disable_line_editing() {
+fn raw_modes_disable_selection_mouse_and_line_editing() {
     let input_original = ENABLE_LINE_INPUT
         | ENABLE_ECHO_INPUT
         | ENABLE_PROCESSED_INPUT
@@ -50,7 +50,7 @@ fn raw_modes_preserve_selection_flags_and_disable_line_editing() {
     let input_mode = raw_input_mode(input_original);
 
     assert_ne!(input_mode & ENABLE_EXTENDED_FLAGS, 0);
-    assert_ne!(input_mode & ENABLE_QUICK_EDIT_MODE, 0);
+    assert_eq!(input_mode & ENABLE_QUICK_EDIT_MODE, 0);
     assert_eq!(input_mode & ENABLE_MOUSE_INPUT, 0);
     assert_ne!(input_mode & ENABLE_INSERT_MODE, 0);
     assert_eq!(input_mode & ENABLE_LINE_INPUT, 0);

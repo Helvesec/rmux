@@ -77,10 +77,13 @@ pub(super) fn parse_queued_new_window(
             }
             "-a" => {
                 let _ = args.pop_front();
-                after = true;
+                if !before {
+                    after = true;
+                }
             }
             "-b" => {
                 let _ = args.pop_front();
+                after = false;
                 before = true;
             }
             "-e" => {
@@ -112,8 +115,15 @@ pub(super) fn parse_queued_new_window(
                 let _ = args.pop_front();
                 for flag in cluster {
                     match flag {
-                        CompactFlag::Bare('a') => after = true,
-                        CompactFlag::Bare('b') => before = true,
+                        CompactFlag::Bare('a') => {
+                            if !before {
+                                after = true;
+                            }
+                        }
+                        CompactFlag::Bare('b') => {
+                            after = false;
+                            before = true;
+                        }
                         CompactFlag::Bare('d') => detached = true,
                         CompactFlag::Bare(flag) => {
                             return Err(unsupported_flag("new-window", &format!("-{flag}")))

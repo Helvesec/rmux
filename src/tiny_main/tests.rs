@@ -461,6 +461,10 @@ fn new_session_tiny_windows_replaces_inherited_client_shell_hint() {
                 OsString::from("1"),
             ),
             (
+                OsString::from("RMUX_INTERNAL_CLIENT_SHELL"),
+                OsString::from("stale-internal.exe"),
+            ),
+            (
                 OsString::from("USERPROFILE"),
                 OsString::from("C:\\Users\\Shadow"),
             ),
@@ -478,6 +482,9 @@ fn new_session_tiny_windows_replaces_inherited_client_shell_hint() {
     assert!(!environment
         .iter()
         .any(|entry| entry == "RMUX_CLIENT_SHELL=stale.exe"));
+    assert!(!environment
+        .iter()
+        .any(|entry| entry.starts_with("RMUX_INTERNAL_CLIENT_SHELL=")));
     assert!(!environment
         .iter()
         .any(|entry| entry.starts_with("RMUX_INTERNAL_INVOKED_AS_TMUX=")));
@@ -641,12 +648,7 @@ fn resize_pane_relative_numeric_delta_is_tiny_parseable() {
 
 #[test]
 fn resize_pane_conflicting_adjustments_fall_back_to_helper() {
-    for args in [
-        ["-R", "10", "-t", "0"].as_slice(),
-        ["-R", "0"].as_slice(),
-        ["-R", "-x", "80", "-t", "0"].as_slice(),
-        ["-x", "80", "-R", "-t", "0"].as_slice(),
-    ] {
+    for args in [["-R", "10", "-t", "0"].as_slice(), ["-R", "0"].as_slice()] {
         assert!(
             parse_resize_pane(&os_args(args)).is_none(),
             "{args:?} should stay on the canonical helper path"
@@ -655,16 +657,29 @@ fn resize_pane_conflicting_adjustments_fall_back_to_helper() {
 }
 
 #[test]
-fn resize_pane_repeated_adjustments_follow_tmux_last_wins() {
-    for args in [
-        ["-R", "-L", "-t", "0"].as_slice(),
-        ["-Z", "-R", "-t", "0"].as_slice(),
-    ] {
-        assert!(
-            parse_resize_pane(&os_args(args)).is_some(),
-            "{args:?} should stay on the tmux-compatible tiny path"
-        );
-    }
+fn resize_pane_composed_adjustments_stay_tiny_parseable() {
+    let relative = parse_resize_pane(&os_args(&["-R", "-L", "-t", "0"]))
+        .expect("priority-collapsed relative resize");
+    assert!(matches!(
+        relative.adjustment,
+        ResizePaneAdjustment::Left { cells: 1 }
+    ));
+
+    let composed = parse_resize_pane(&os_args(&["-x", "80", "-R", "-t", "0"]))
+        .expect("absolute plus relative resize");
+    assert!(matches!(
+        composed.adjustment,
+        ResizePaneAdjustment::Composite {
+            columns: Some(80),
+            rows: None,
+            relative: Some(rmux_proto::ResizePaneRelativeDirection::Right),
+            cells: 1
+        }
+    ));
+
+    let zoom =
+        parse_resize_pane(&os_args(&["-Z", "-R", "-t", "0"])).expect("zoom with extra adjustment");
+    assert_eq!(zoom.adjustment, ResizePaneAdjustment::Zoom);
 }
 
 #[test]

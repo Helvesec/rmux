@@ -139,7 +139,7 @@ impl RequestHandler {
             .await;
         }
         if let Err(error) = self
-            .resize_session_for_attach_client(&session_name, request.client_size)
+            .resize_session_for_attach_client(&session_name, request.client_size, flags)
             .await
         {
             return HandleOutcome::response(Response::Error(ErrorResponse { error }));

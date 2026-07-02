@@ -16,6 +16,8 @@ mod shell_resolver;
 mod shell_spec;
 
 #[cfg(windows)]
+use shell_resolver::cmd_shell_path;
+#[cfg(windows)]
 use shell_resolver::CLIENT_SHELL_ENV;
 use shell_resolver::{resolve_program_path, resolve_shell_path};
 use shell_spec::ShellSpec;
@@ -680,10 +682,43 @@ fn spawn_command(profile: &TerminalProfile, command: Option<&ProcessCommand>) ->
         Some(ProcessCommand::Argv(argv)) if !argv.is_empty() => {
             let environment = profile.environment_map();
             let program = resolve_program_path(Path::new(&argv[0]), &environment);
+            #[cfg(windows)]
+            if let Some(command) = windows_batch_child_command(&program, &argv[1..], &environment) {
+                return command;
+            }
             ChildCommand::new(program).args(&argv[1..])
         }
         Some(ProcessCommand::Argv(_)) | Some(_) | None => profile.interactive_child_command(),
     }
+}
+
+#[cfg(windows)]
+fn windows_batch_child_command(
+    program: &Path,
+    args: &[String],
+    environment: &HashMap<String, String>,
+) -> Option<ChildCommand> {
+    if !is_windows_batch_script(program) {
+        return None;
+    }
+
+    let shell = cmd_shell_path(environment).unwrap_or_else(|| PathBuf::from("cmd.exe"));
+    Some(
+        ChildCommand::new(shell)
+            .arg("/D")
+            .arg("/S")
+            .arg("/C")
+            .arg(program.as_os_str())
+            .args(args),
+    )
+}
+
+#[cfg(windows)]
+fn is_windows_batch_script(path: &Path) -> bool {
+    path.extension()
+        .and_then(OsStr::to_str)
+        .map(|extension| matches!(extension.to_ascii_lowercase().as_str(), "bat" | "cmd"))
+        .unwrap_or(false)
 }
 
 pub(crate) fn shell_child_command(shell: &Path, cwd: &Path, command: &str) -> ChildCommand {

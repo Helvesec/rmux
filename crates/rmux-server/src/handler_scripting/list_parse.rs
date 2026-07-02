@@ -8,9 +8,9 @@ use rmux_proto::{
 
 use crate::pane_terminals::session_not_found;
 
-use super::parse_session_name;
 use super::tokens::CommandTokens;
 use super::values::{missing_argument, unsupported_flag};
+use super::{implicit_session_name, parse_session_name};
 
 pub(super) fn parse_list_sessions(mut args: CommandTokens) -> Result<Request, RmuxError> {
     let mut format = None;
@@ -41,7 +41,11 @@ pub(super) fn parse_list_sessions(mut args: CommandTokens) -> Result<Request, Rm
     }))
 }
 
-pub(super) fn parse_list_windows(mut args: CommandTokens) -> Result<Request, RmuxError> {
+pub(super) fn parse_list_windows(
+    mut args: CommandTokens,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Result<Request, RmuxError> {
     let mut target = None;
     let mut format = None;
 
@@ -59,7 +63,11 @@ pub(super) fn parse_list_windows(mut args: CommandTokens) -> Result<Request, Rmu
     }
 
     Ok(Request::ListWindows(ListWindowsRequest {
-        target: target.ok_or_else(|| missing_argument("list-windows", "-t target"))?,
+        target: target.unwrap_or(implicit_session_name(
+            sessions,
+            find_context,
+            "list-windows",
+        )?),
         format,
     }))
 }

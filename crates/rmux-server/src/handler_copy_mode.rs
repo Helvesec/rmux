@@ -6,7 +6,9 @@ use crate::copy_mode::{
     CopyModeTransfer, ModeKeys,
 };
 use crate::limits::bounded_repeat_count;
-use crate::mouse::copy_mode_mouse_context;
+use crate::mouse::{copy_mode_mouse_context, copy_mode_mouse_drag_start_context};
+use crate::outer_terminal::OuterTerminal;
+use crate::pane_io::AttachControl;
 use crate::pane_terminals::HandlerState;
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
@@ -106,14 +108,17 @@ impl RequestHandler {
                 &target,
                 None,
                 attached_mouse.as_ref().and_then(|(event, slider_mpos, _)| {
+                    let mouse_context = if request.mouse_drag_start {
+                        copy_mode_mouse_drag_start_context
+                    } else {
+                        copy_mode_mouse_context
+                    };
                     state
                         .sessions
                         .session(target.session_name())
                         .and_then(|session| session.window_at(target.window_index()))
                         .and_then(|window| window.pane(target.pane_index()))
-                        .and_then(|pane| {
-                            copy_mode_mouse_context(event, pane.geometry(), *slider_mpos)
-                        })
+                        .and_then(|pane| mouse_context(event, pane.geometry(), *slider_mpos))
                 }),
             );
             (target_transcript, source_screen, context)
@@ -300,7 +305,10 @@ impl RequestHandler {
             None
         };
 
-        let attached_mouse = if matches!(command, "begin-selection" | "scroll-to-mouse") {
+        let attached_mouse = if matches!(
+            command,
+            "begin-selection" | "scroll-to-mouse" | "select-line" | "select-word"
+        ) {
             attached_mouse_context(self, requester_pid, &target).await
         } else {
             None
@@ -348,7 +356,8 @@ impl RequestHandler {
                 }
             };
             if let Some(transfer) = outcome.transfer {
-                self.apply_copy_mode_transfer(&context, transfer).await?;
+                self.apply_copy_mode_transfer(requester_pid, &context, transfer)
+                    .await?;
             }
             if outcome.cancel || stop_repeats {
                 break;
@@ -368,12 +377,18 @@ impl RequestHandler {
 
     async fn apply_copy_mode_transfer(
         &self,
+        requester_pid: u32,
         context: &CopyModeCommandContext,
         transfer: CopyModeTransfer,
     ) -> Result<(), RmuxError> {
+        let writes_buffer = transfer.buffer_target.is_some();
         if let Some(buffer_target) = transfer.buffer_target.clone() {
             self.store_copy_mode_buffer(buffer_target, transfer.append, &transfer.data)
                 .await?;
+        }
+        if writes_buffer {
+            self.copy_mode_bytes_to_attached_clipboard(requester_pid, &transfer.data)
+                .await;
         }
         if let Some(command) = self
             .resolve_copy_mode_pipe_command(transfer.pipe_command.as_ref())
@@ -388,6 +403,25 @@ impl RequestHandler {
             .await?;
         }
         Ok(())
+    }
+
+    async fn copy_mode_bytes_to_attached_clipboard(&self, requester_pid: u32, bytes: &[u8]) {
+        let Some((attach_pid, terminal_context)) = self
+            .clipboard_attach_for_requester(requester_pid, "copy-mode")
+            .await
+        else {
+            return;
+        };
+        let payload = {
+            let state = self.state.lock().await;
+            OuterTerminal::resolve(&state.options, terminal_context).encode_clipboard_set(bytes)
+        };
+        let Some(payload) = payload else {
+            return;
+        };
+        let _ = self
+            .send_attach_control(attach_pid, AttachControl::Write(payload), "copy-mode", None)
+            .await;
     }
 
     async fn resolve_copy_mode_pipe_command(
@@ -544,7 +578,7 @@ fn copy_mode_context(
         .and_then(|session| session.window_at(target.window_index()))
         .and_then(|window| window.pane(target.pane_index()))
         .and_then(|pane| state.pane_screen_state(target.session_name(), pane.id()))
-        .and_then(|screen_state| (!screen_state.path.is_empty()).then(|| screen_state.path.into()))
+        .and_then(|screen_state| working_directory_from_screen_path(&screen_state.path))
         .or(pane_cwd);
     let word_separators = state
         .options
@@ -572,6 +606,83 @@ fn copy_mode_context(
         refresh_screen,
         mouse,
     }
+}
+
+fn working_directory_from_screen_path(path: &str) -> Option<std::path::PathBuf> {
+    if path.is_empty() {
+        return None;
+    }
+    let Some(rest) = path.strip_prefix("file://") else {
+        return Some(path.into());
+    };
+    let (host, raw_path) = match rest.split_once('/') {
+        Some((host, tail)) => (host, format!("/{tail}")),
+        None => return None,
+    };
+    if !file_url_host_is_local(host) {
+        return None;
+    }
+    percent_decode_path(&raw_path).map(std::path::PathBuf::from)
+}
+
+fn file_url_host_is_local(host: &str) -> bool {
+    if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let Some(local) = crate::host_name::local_hostname() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case(&local)
+        || host
+            .split('.')
+            .next()
+            .is_some_and(|short| short.eq_ignore_ascii_case(&local))
+        || local
+            .split('.')
+            .next()
+            .is_some_and(|short| host.eq_ignore_ascii_case(short))
+}
+
+fn percent_decode_path(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = bytes.get(index + 1).and_then(|byte| hex_value(*byte))?;
+            let low = bytes.get(index + 2).and_then(|byte| hex_value(*byte))?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    let decoded = String::from_utf8(decoded).ok()?;
+    Some(normalize_file_url_path_for_platform(decoded))
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+fn normalize_file_url_path_for_platform(mut path: String) -> String {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+        path.remove(0);
+    }
+    path
+}
+
+#[cfg(not(windows))]
+fn normalize_file_url_path_for_platform(path: String) -> String {
+    path
 }
 
 #[cfg(unix)]

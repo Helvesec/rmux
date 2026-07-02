@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
-use std::process::{Output, Stdio};
+use std::process::{Child, ExitStatus, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -35,7 +35,7 @@ type SharedPipeBuffer = Arc<Mutex<Vec<u8>>>;
 type PipeCollector = JoinHandle<io::Result<Vec<u8>>>;
 const TOP_LEVEL_USAGE: &str = "usage: rmux [-2CDhlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n";
 const LONG_OPTION_USAGE: &str = "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n";
-const LONG_OPTION_HELP: &str = "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n\nRMUX extensions:\n  capabilities [--human|--json]\n  claude [claude-args...]\n  diagnose [--human|--json]\n  doctor tmux-dropin\n  setup tmux-shim\n  wait-pane [flags]\n  pane-snapshot [flags]\n  stream-pane [--raw|--lines]\n  collect-pane-output --until-pane-exit --max-bytes bytes\n  locator|expect-pane [flags]\n  find-panes|find-sessions [flags]\n  broadcast-keys -t target... -- key ...\n  with-session session-name -- command ...\n  web-share [flags]\n  web-share list|lookup|stop|disconnect|off|config\n\nUse `rmux list-commands` for the tmux-compatible command surface.\n";
+const LONG_OPTION_HELP: &str = "usage: rmux [-2CDlNuVv] [-c shell-command] [-f file] [-L socket-name]\n            [-S socket-path] [-T features] [command [flags]]\n\nRMUX extensions:\n  capabilities [--human|--json]\n  claude [install-skill|claude-args...]\n  diagnose [--human|--json]\n  doctor tmux-dropin\n  setup tmux-shim\n  wait-pane [flags]\n  pane-snapshot [flags]\n  stream-pane [--raw|--lines]\n  collect-pane-output --until-pane-exit --max-bytes bytes\n  locator|expect-pane [flags]\n  find-panes|find-sessions [flags]\n  broadcast-keys -t target... -- key ...\n  with-session session-name -- command ...\n  web-share [flags]\n  web-share list|lookup|stop|disconnect|off|config\n\nUse `rmux list-commands` for the tmux-compatible command surface.\n";
 
 fn assert_nested_switch_client_error(output: &Output) {
     let stderr = stderr(output);
@@ -1103,6 +1103,50 @@ fn control_mode_uses_tmux_text_protocol() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn control_mode_blocking_command_exits_on_server_shutdown() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("control-mode-shutdown-aborts")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let mut child = harness
+        .base_command()
+        .arg("-CC")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("control stdin");
+    let stdout = child.stdout.take().expect("control stdout");
+    let stderr = child.stderr.take().expect("control stderr");
+    let (stdout_buffer, stdout_thread) = spawn_pipe_collector(stdout);
+    let (_stderr_buffer, stderr_thread) = spawn_pipe_collector(stderr);
+
+    stdin.write_all(b"wait-for control-shutdown-abort\n")?;
+    stdin.flush()?;
+    wait_for_output_condition(
+        &stdout_buffer,
+        ATTACH_TIMEOUT,
+        "control %begin for blocking wait-for",
+        |rendered| rendered.contains("%begin "),
+    )?;
+
+    assert_success(&harness.run(&["kill-server"])?);
+    drop(stdin);
+
+    let status = wait_for_child_status(&mut child, ATTACH_TIMEOUT)?;
+    let rendered = String::from_utf8(read_pipe_output(stdout_thread, "stdout")?)?;
+    let stderr = String::from_utf8(read_pipe_output(stderr_thread, "stderr")?)?;
+
+    assert_eq!(status.code(), Some(0));
+    assert!(stderr.is_empty());
+    assert!(
+        rendered.contains("%begin "),
+        "control stream should have entered the blocking command before shutdown: {rendered:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn unsupported_subcommands_exit_one() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("unsupported-subcommand")?;
     let output = harness.run(&["bogus-command"])?;
@@ -1212,6 +1256,26 @@ fn tmux_environment_does_not_route_client_to_inherited_socket() -> Result<(), Bo
 
     assert_eq!(output.status.code(), Some(0));
     assert_eq!(stdout(&output), "alpha\n");
+    assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
+fn tmux_environment_routes_client_to_rmux_owned_socket() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("tmux-env-rmux-owned-socket")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let tmux_env = format!("{},0,0", harness.socket_path().display());
+    let other_tmpdir = harness.tmpdir().join("other-rmux-root");
+    let output = harness.run_with(&["has-session", "-t", "alpha"], |command| {
+        command.env("TMUX", &tmux_env);
+        command.env("RMUX_TMPDIR", &other_tmpdir);
+    })?;
+
+    assert_success(&output);
+    assert!(stdout(&output).is_empty());
     assert!(stderr(&output).is_empty());
     Ok(())
 }
@@ -2767,6 +2831,23 @@ fn wait_for_socket_cleanup(socket_path: &Path) -> Result<(), Box<dyn Error>> {
         socket_path.display()
     )
     .into())
+}
+
+fn wait_for_child_status(
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<ExitStatus, Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    let _ = terminate_child(child);
+    Err(format!("timed out waiting for child process {}", child.id()).into())
 }
 
 fn wait_for_file_contents(

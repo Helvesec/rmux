@@ -26,7 +26,7 @@ Verify the signed checksums with:
 ```sh
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity-regexp 'https://github.com/Helvesec/rmux/.github/workflows/release.yml@refs/tags/v0\.(6|7)\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+  --certificate-identity-regexp 'https://github.com/Helvesec/rmux/.github/workflows/release.yml@refs/tags/v0\.(6|7|8)\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 ```

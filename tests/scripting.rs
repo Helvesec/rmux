@@ -108,6 +108,22 @@ fn source_file_run_shell_nonzero_preserves_exit_status_without_stdout() -> Resul
 }
 
 #[test]
+fn source_file_later_successful_run_shell_clears_prior_run_shell_status(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("source-file-run-shell-clears-status")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let config = harness.tmpdir().join("run-shell-clears-status.conf");
+    fs::write(&config, "run-shell 'exit 7'\nrun-shell 'exit 0'\n")?;
+
+    let output = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
+
+    assert_success(&output);
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
 fn source_file_commands_follow_implicit_selected_window_context() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("source-file-implicit-window-context")?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -484,9 +500,67 @@ fn source_file_parse_errors_report_input_line_number() -> Result<(), Box<dyn Err
     );
     assert!(stderr(&output).is_empty());
     let before = harness.run(&["show-options", "-gqv", "@before"])?;
-    assert!(stdout(&before).is_empty());
+    assert_eq!(before.status.code(), Some(0));
+    assert_eq!(stdout(&before), "ok\n");
+    assert!(stderr(&before).is_empty());
     let after = harness.run(&["show-options", "-gqv", "@after"])?;
-    assert!(stdout(&after).is_empty());
+    assert_eq!(after.status.code(), Some(0));
+    assert_eq!(stdout(&after), "ok\n");
+    assert!(stderr(&after).is_empty());
+    Ok(())
+}
+
+#[test]
+fn source_file_config_errors_force_exit_one_even_after_command_status() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("source-file-error-status")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let config = harness.tmpdir().join("error-status.conf");
+    fs::write(
+        &config,
+        "run-shell 'exit 7'\ndefinitely-not-a-command\ndisplay-message -p after\n",
+    )?;
+
+    let output = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stdout(&output).contains("after\n"),
+        "source-file should preserve successful stdout, got {:?}",
+        stdout(&output)
+    );
+    assert!(
+        stdout(&output).contains("unknown command: definitely-not-a-command"),
+        "source-file should append config error output, got {:?}",
+        stdout(&output)
+    );
+    assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
+fn source_file_config_errors_are_logged_once() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("source-file-error-log-once")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let config = harness.tmpdir().join("error-log-once.conf");
+    fs::write(&config, "definitely-not-a-command\n")?;
+
+    let output = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
+    assert_eq!(output.status.code(), Some(1));
+
+    let messages = harness.run(&["show-messages"])?;
+    assert_eq!(messages.status.code(), Some(0));
+    let rendered = stdout(&messages);
+    let needle = format!(
+        "config error: {}:1: unknown command: definitely-not-a-command",
+        config.display()
+    );
+    assert_eq!(
+        rendered.matches(&needle).count(),
+        1,
+        "source-file config error should be logged exactly once, got {rendered:?}"
+    );
+    assert!(stderr(&messages).is_empty());
     Ok(())
 }
 
@@ -554,6 +628,53 @@ fn source_file_parse_only_validates_command_flags_like_tmux() -> Result<(), Box<
     Ok(())
 }
 
+#[test]
+fn source_file_parse_only_accepts_implicit_target_commands_like_tmux() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("source-file-parse-only-implicit-target")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "parseonly"])?);
+    let config = harness.tmpdir().join("parse-only-implicit-target.conf");
+    fs::write(&config, "clear-history\nset -g @after-parse-only yes\n")?;
+
+    let output = harness.run(&[
+        "source-file",
+        "-n",
+        "-v",
+        config.to_str().expect("utf-8 config path"),
+    ])?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout(&output),
+        format!(
+            "{}:1: clear-history\n{}:2: set-option -g @after-parse-only yes\n",
+            config.display(),
+            config.display()
+        )
+    );
+    assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
+fn source_file_clear_history_without_target_uses_implicit_pane() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("source-file-clear-history-implicit")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "clearhist"])?);
+    let config = harness.tmpdir().join("clear-history-implicit.conf");
+    fs::write(&config, "clear-history\nset -g @after-clear-history yes\n")?;
+
+    let output = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
+
+    assert_success(&output);
+    let option = harness.run(&["show-options", "-gqv", "@after-clear-history"])?;
+    assert_eq!(option.status.code(), Some(0));
+    assert_eq!(stdout(&option), "yes\n");
+    assert!(stderr(&option).is_empty());
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn source_file_recursion_through_tmux_shim_is_bounded() -> Result<(), Box<dyn Error>> {
@@ -596,8 +717,9 @@ fn startup_config_parse_errors_skip_bad_file_without_aborting_startup() -> Resul
     assert_success(&harness.run(&["has-session", "-t", "boot"])?);
 
     let option = harness.run(&["show-options", "-gqv", "@after-startup"])?;
-    assert_success(&option);
-    assert!(stdout(&option).is_empty());
+    assert_eq!(option.status.code(), Some(0));
+    assert_eq!(stdout(&option), "yes\n");
+    assert!(stderr(&option).is_empty());
     Ok(())
 }
 
@@ -628,6 +750,49 @@ fn startup_config_run_shell_can_call_back_into_daemon() -> Result<(), Box<dyn Er
 
     assert_success(&output);
     wait_for_file(&marker)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn tmux_fallback_nested_shim_missing_local_is_not_logged_as_config_error(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("tmux-fallback-missing-local-message")?;
+    let home = harness.tmpdir().join("home");
+    let fake_bin = harness.tmpdir().join("fake-bin");
+    fs::create_dir_all(&fake_bin)?;
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_rmux"), fake_bin.join("tmux"))?;
+    fs::write(
+        home.join(".tmux.conf"),
+        "run-shell 'tmux -S #{socket_path} source \"$HOME/.tmux.conf.local\"'\n\
+         set -g @after-missing-local yes\n",
+    )?;
+
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    assert_success(
+        &harness.run_with(&["new-session", "-d", "-s", "missinglocal"], |command| {
+            command.env_remove("RMUX_DISABLE_TMUX_FALLBACK");
+            command.env("PATH", &path);
+        })?,
+    );
+
+    wait_for_option_value(&harness, "@after-missing-local", "yes")?;
+    let messages = harness.run(&["show-messages"])?;
+    assert_eq!(messages.status.code(), Some(0));
+    let rendered = stdout(&messages);
+    assert!(
+        rendered.contains(".tmux.conf.local") && rendered.contains("No such file"),
+        "missing optional tmux local file should remain visible as a client-style message, got {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("config error:"),
+        "missing optional tmux local file should not be logged as a config error, got {rendered:?}"
+    );
+    assert!(stderr(&messages).is_empty());
     Ok(())
 }
 
@@ -1256,6 +1421,30 @@ fn if_shell_supports_representative_public_commands() -> Result<(), Box<dyn Erro
 }
 
 #[test]
+fn show_options_dollar_values_round_trip_through_source_file() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("show-options-dollar-roundtrip")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["set-option", "-g", "@path", "$HOME/bin"])?);
+    let shown = harness.run(&["show-options", "-g", "@path"])?;
+    assert_eq!(shown.status.code(), Some(0));
+    assert_eq!(stdout(&shown), "@path \"\\$HOME/bin\"\n");
+    assert!(stderr(&shown).is_empty());
+
+    let source = harness.tmpdir().join("roundtrip.conf");
+    fs::write(&source, format!("set-option -g {}", stdout(&shown)))?;
+    assert_success(&harness.run(&["set-option", "-g", "@path", "changed"])?);
+    assert_success(&harness.run(&["source-file", source.to_str().expect("utf-8 path")])?);
+
+    let value = harness.run(&["show-options", "-gqv", "@path"])?;
+    assert_eq!(value.status.code(), Some(0));
+    assert_eq!(stdout(&value), "$HOME/bin\n");
+    assert!(stderr(&value).is_empty());
+
+    Ok(())
+}
+
+#[test]
 fn hook_surface_smoke_matches_supported_cli_behavior() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("hook-surface-smoke")?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -1287,6 +1476,25 @@ fn hook_surface_smoke_matches_supported_cli_behavior() -> Result<(), Box<dyn Err
     assert_eq!(bindings.status.code(), Some(0));
     assert_eq!(stdout(&bindings), "bind-key -T prefix C-b send-prefix\n");
     assert!(stderr(&bindings).is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn source_file_set_hook_accepts_compact_flag_clusters() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("set-hook-compact-flags")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let config = harness.tmpdir().join("hooks.conf");
+    fs::write(
+        &config,
+        "set-hook -ga after-new-window 'set-option -g @compact-hook yes'\n",
+    )?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["source-file", config.to_str().expect("utf-8 config")])?);
+    assert_success(&harness.run(&["new-window", "-t", "alpha"])?);
+
+    wait_for_option_value(&harness, "@compact-hook", "yes")?;
 
     Ok(())
 }
@@ -1370,6 +1578,25 @@ fn pane_died_hook_fires_for_remain_on_exit_pane() -> Result<(), Box<dyn Error>> 
     assert_success(&harness.run(&["split-window", "-t", "alpha", "exit 0"])?);
 
     wait_for_buffer(&harness, "died", "yes")?;
+
+    Ok(())
+}
+
+#[test]
+fn window_unlinked_hook_fires_when_last_pane_exits() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("window-unlinked-last-pane-exit")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-n", "keep"])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "window-unlinked",
+        "set-buffer -b unlinked yes",
+    ])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:1", "-n", "gone", "exit 0"])?);
+
+    wait_for_buffer(&harness, "unlinked", "yes")?;
 
     Ok(())
 }

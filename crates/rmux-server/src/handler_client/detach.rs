@@ -27,8 +27,12 @@ impl RequestHandler {
         } else {
             AttachControl::Detach
         };
-        self.send_attach_control(attach_pid, control, command_name, None)
-            .await
+        let session_name = self
+            .send_attach_control(attach_pid, control, command_name, None)
+            .await?;
+        self.reconcile_attached_session_size_and_emit(&session_name)
+            .await?;
+        Ok(session_name)
     }
 
     pub(in crate::handler) async fn detach_other_attach_clients_for_session(

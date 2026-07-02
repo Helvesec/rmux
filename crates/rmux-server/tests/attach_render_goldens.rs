@@ -37,11 +37,11 @@ fn attach_render_golden_exact_frame_assertion_stays_exact() {
         "attach render golden must compare exact bytes, not only substrings"
     );
     assert!(
-        source.contains("\\x1b[s\\x1b[0m\\x1b[1;1H\\x1b[0mD\\x1b[0m\\x1b[K"),
-        "normal idle pane golden must keep cursor-save/reset/clear bytes pinned"
+        source.contains("\\x1b[s\\x1b[?25l\\x1b[0m\\x1b[1;1H\\x1b[0mD\\x1b[0m\\x1b[K"),
+        "normal idle pane golden must keep cursor hide/save/reset/clear bytes pinned"
     );
     assert!(
-        source.contains("\\x1b[0m\\x1b[u"),
-        "normal idle pane golden must keep cursor restore bytes pinned"
+        source.contains("\\x1b[0m\\x1b[u\\x1b[1;2H\\x1b[?25h"),
+        "normal idle pane golden must keep cursor restore and final pane cursor state pinned"
     );
 }

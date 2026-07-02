@@ -1,6 +1,8 @@
 use super::*;
+use crate::input_keys::MouseForwardEvent;
+use crate::mouse::{AttachedMouseEvent, MouseLocation};
 use crate::pane_terminals::PaneCaptureRequest;
-use rmux_core::{GridRenderOptions, ScreenCaptureRange};
+use rmux_core::{GridRenderOptions, PaneId, ScreenCaptureRange};
 
 #[tokio::test]
 async fn parsed_queue_resize_pane_trim_flag_trims_below_cursor() {
@@ -75,6 +77,98 @@ async fn parsed_queue_resize_pane_trim_flag_takes_precedence_over_size_flags() {
 }
 
 #[tokio::test]
+async fn parsed_queue_resize_pane_zoom_takes_precedence_over_other_adjustments() {
+    let handler = RequestHandler::new();
+    let session = session_name("resize-zoom-precedence");
+    create_test_session(
+        &handler,
+        session.clone(),
+        TerminalSize { cols: 80, rows: 24 },
+    )
+    .await;
+    execute(&handler, "split-window -h -t resize-zoom-precedence:0.0").await;
+
+    execute(&handler, "resize-pane -R -Z -t resize-zoom-precedence:0.0").await;
+
+    let state = handler.state.lock().await;
+    let window = state
+        .sessions
+        .session(&session)
+        .expect("session exists")
+        .window_at(0)
+        .expect("window exists");
+    assert!(window.is_zoomed());
+}
+
+#[tokio::test]
+async fn parsed_queue_resize_pane_repeated_directions_follow_tmux_priority() {
+    let handler = RequestHandler::new();
+    let session = session_name("resize-priority");
+    create_test_session(
+        &handler,
+        session.clone(),
+        TerminalSize { cols: 80, rows: 24 },
+    )
+    .await;
+    execute(&handler, "split-window -h -t resize-priority:0.0").await;
+
+    execute(&handler, "resize-pane -L -R -t resize-priority:0.0").await;
+
+    assert_eq!(
+        pane_sizes(&handler, &session).await,
+        vec![(39, 24), (40, 24)]
+    );
+}
+
+#[tokio::test]
+async fn parsed_queue_resize_pane_trailing_adjustment_after_target_matches_tmux() {
+    let handler = RequestHandler::new();
+    let session = session_name("resize-trailing-adjustment");
+    create_test_session(
+        &handler,
+        session.clone(),
+        TerminalSize { cols: 80, rows: 24 },
+    )
+    .await;
+    execute(
+        &handler,
+        "split-window -h -t resize-trailing-adjustment:0.0",
+    )
+    .await;
+
+    execute(
+        &handler,
+        "resize-pane -R -L -t resize-trailing-adjustment:0.0 3",
+    )
+    .await;
+
+    assert_eq!(
+        pane_sizes(&handler, &session).await,
+        vec![(37, 24), (42, 24)]
+    );
+}
+
+#[tokio::test]
+async fn parsed_queue_resize_pane_composes_absolute_then_relative_like_tmux() {
+    let handler = RequestHandler::new();
+    let session = session_name("resize-compose");
+    create_test_session(
+        &handler,
+        session.clone(),
+        TerminalSize { cols: 80, rows: 24 },
+    )
+    .await;
+    execute(&handler, "split-window -h -t resize-compose:0.0").await;
+
+    execute(&handler, "resize-pane -x 30 -R -t resize-compose:0.0").await;
+
+    assert_eq!(
+        pane_sizes(&handler, &session).await,
+        vec![(31, 24), (48, 24)]
+    );
+}
+
+#[tokio::test]
 async fn parsed_queue_resize_pane_mouse_flag_is_noop_without_mouse_context() {
     let handler = RequestHandler::new();
     let session = session_name("resize-mouse-noop");
@@ -91,6 +185,195 @@ async fn parsed_queue_resize_pane_mouse_flag_is_noop_without_mouse_context() {
     let after = pane_sizes(&handler, &session).await;
 
     assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn parsed_queue_resize_pane_mouse_flag_resizes_from_border_context() {
+    let handler = RequestHandler::new();
+    let session = session_name("resize-mouse-border");
+    let target = PaneTarget::with_window(session.clone(), 0, 0);
+    create_test_session(
+        &handler,
+        session.clone(),
+        TerminalSize { cols: 80, rows: 24 },
+    )
+    .await;
+    execute(&handler, "split-window -h -t resize-mouse-border:0.0").await;
+
+    let before = pane_sizes(&handler, &session).await;
+    let border_x = before.first().expect("first pane").0.saturating_add(5);
+    let mouse_event = AttachedMouseEvent {
+        raw: MouseForwardEvent {
+            b: 32,
+            lb: 32,
+            x: border_x,
+            y: 0,
+            lx: border_x.saturating_sub(1),
+            ly: 0,
+            sgr_b: 32,
+            sgr_type: 'M',
+            ignore: false,
+        },
+        session_id: 1,
+        window_id: Some(1),
+        pane_id: Some(PaneId::new(0)),
+        pane_target: Some(target.clone()),
+        location: MouseLocation::Border,
+        status_at: None,
+        status_lines: 0,
+        ignore: false,
+    };
+    let parsed = CommandParser::new()
+        .parse("resize-pane -M")
+        .expect("command parses");
+
+    handler
+        .execute_parsed_commands(
+            std::process::id(),
+            parsed,
+            QueueExecutionContext::without_caller_cwd()
+                .with_current_target(Some(Target::Pane(target.clone())))
+                .with_mouse_target(Some(Target::Pane(target.clone())))
+                .with_mouse_event(Some(mouse_event.clone())),
+        )
+        .await
+        .expect("mouse resize executes");
+
+    let after = pane_sizes(&handler, &session).await;
+    assert!(
+        after[0].0 > before[0].0,
+        "first pane should grow after mouse border resize: before={before:?} after={after:?}"
+    );
+}
+
+#[tokio::test]
+async fn parsed_queue_mouse_resize_survives_prior_command_in_pipeline() {
+    let handler = RequestHandler::new();
+    let session = session_name("resize-mouse-pipeline");
+    let target = PaneTarget::with_window(session.clone(), 0, 0);
+    create_test_session(
+        &handler,
+        session.clone(),
+        TerminalSize { cols: 80, rows: 24 },
+    )
+    .await;
+    execute(&handler, "split-window -h -t resize-mouse-pipeline:0.0").await;
+
+    let before = pane_sizes(&handler, &session).await;
+    let border_x = before.first().expect("first pane").0.saturating_add(5);
+    let mouse_event = AttachedMouseEvent {
+        raw: MouseForwardEvent {
+            b: 32,
+            lb: 32,
+            x: border_x,
+            y: 0,
+            lx: border_x.saturating_sub(1),
+            ly: 0,
+            sgr_b: 32,
+            sgr_type: 'M',
+            ignore: false,
+        },
+        session_id: 1,
+        window_id: Some(1),
+        pane_id: Some(PaneId::new(0)),
+        pane_target: Some(target.clone()),
+        location: MouseLocation::Border,
+        status_at: None,
+        status_lines: 0,
+        ignore: false,
+    };
+    let parsed = CommandParser::new()
+        .parse("display-message dragged ; resize-pane -M")
+        .expect("command pipeline parses");
+
+    handler
+        .execute_parsed_commands(
+            std::process::id(),
+            parsed,
+            QueueExecutionContext::without_caller_cwd()
+                .with_current_target(Some(Target::Pane(target.clone())))
+                .with_mouse_target(Some(Target::Pane(target)))
+                .with_mouse_event(Some(mouse_event)),
+        )
+        .await
+        .expect("mouse resize pipeline executes");
+
+    let after = pane_sizes(&handler, &session).await;
+    assert!(
+        after[0].0 > before[0].0,
+        "mouse_event must survive earlier pipeline commands: before={before:?} after={after:?}"
+    );
+}
+
+#[tokio::test]
+async fn parsed_queue_mouse_resize_can_recover_attached_current_mouse_event() {
+    let handler = RequestHandler::new();
+    let session = session_name("resize-mouse-fallback");
+    let target = PaneTarget::with_window(session.clone(), 0, 0);
+    let requester_pid = std::process::id();
+    create_test_session(
+        &handler,
+        session.clone(),
+        TerminalSize { cols: 80, rows: 24 },
+    )
+    .await;
+    execute(&handler, "split-window -h -t resize-mouse-fallback:0.0").await;
+    let (control_tx, _control_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, session.clone(), control_tx)
+        .await;
+
+    let before = pane_sizes(&handler, &session).await;
+    let border_x = before.first().expect("first pane").0.saturating_add(5);
+    let mouse_event = AttachedMouseEvent {
+        raw: MouseForwardEvent {
+            b: 32,
+            lb: 32,
+            x: border_x,
+            y: 0,
+            lx: border_x.saturating_sub(1),
+            ly: 0,
+            sgr_b: 32,
+            sgr_type: 'M',
+            ignore: false,
+        },
+        session_id: 1,
+        window_id: Some(1),
+        pane_id: Some(PaneId::new(0)),
+        pane_target: Some(target.clone()),
+        location: MouseLocation::Border,
+        status_at: None,
+        status_lines: 0,
+        ignore: false,
+    };
+    {
+        let mut active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get_mut(&requester_pid)
+            .expect("attach is registered");
+        active.mouse.current_event = Some(mouse_event);
+    }
+    let parsed = CommandParser::new()
+        .parse("display-message dragged ; resize-pane -M")
+        .expect("command pipeline parses");
+
+    handler
+        .execute_parsed_commands(
+            requester_pid,
+            parsed,
+            QueueExecutionContext::without_caller_cwd()
+                .with_current_target(Some(Target::Pane(target.clone())))
+                .with_mouse_target(Some(Target::Pane(target))),
+        )
+        .await
+        .expect("mouse resize fallback executes");
+
+    let after = pane_sizes(&handler, &session).await;
+    assert!(
+        after[0].0 > before[0].0,
+        "resize-pane -M should recover the active attach mouse event when queue context was truncated: before={before:?} after={after:?}"
+    );
 }
 
 async fn create_test_session(handler: &RequestHandler, session: SessionName, size: TerminalSize) {

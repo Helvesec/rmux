@@ -368,6 +368,13 @@ impl OuterTerminal {
         self.encode_clipboard_payload(bytes)
     }
 
+    pub(crate) fn encode_clipboard_set(&self, bytes: &[u8]) -> Option<Vec<u8>> {
+        if bytes.is_empty() || !self.clipboard_writes_enabled {
+            return None;
+        }
+        self.encode_clipboard_payload(bytes)
+    }
+
     fn encode_clipboard_payload(&self, bytes: &[u8]) -> Option<Vec<u8>> {
         let template = self.clipboard_template.as_deref()?;
         let encoded = encode_base64(bytes);

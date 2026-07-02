@@ -40,6 +40,23 @@ fn show_options_lines_render_names_or_values_for_the_selected_scope() {
 fn show_options_quotes_whitespace_and_renders_array_indexes() {
     let mut store = OptionStore::new();
 
+    store
+        .set_by_name(
+            OptionScopeSelector::SessionGlobal,
+            "@path",
+            Some("$HOME/bin".to_owned()),
+            rmux_proto::SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect("user option set succeeds");
+
+    let user_path = store
+        .show_options_lines_filtered(&OptionScopeSelector::SessionGlobal, Some("@path"), false)
+        .expect("user option show succeeds");
+    assert_eq!(user_path, vec!["@path \"\\$HOME/bin\"".to_owned()]);
+
     let status_left = store
         .show_options_lines_filtered(
             &OptionScopeSelector::SessionGlobal,

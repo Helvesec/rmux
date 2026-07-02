@@ -28,6 +28,11 @@ impl RequestHandler {
 
         let refresh_scope = option_affects_attached_rendering(request.option)
             .then(|| legacy_scope_to_refresh_scope(&request.scope));
+        let resize_policy_scope = matches!(
+            request.option,
+            OptionName::WindowSize | OptionName::AggressiveResize
+        )
+        .then(|| legacy_scope_to_refresh_scope(&request.scope));
         let destroy_unattached_scope = (request.option == OptionName::DestroyUnattached)
             .then(|| legacy_scope_to_refresh_scope(&request.scope));
         let alert_scope = legacy_scope_to_refresh_scope(&request.scope);
@@ -80,6 +85,9 @@ impl RequestHandler {
         };
 
         if matches!(response, Response::SetOption(_)) {
+            if let Some(scope) = resize_policy_scope.as_ref() {
+                self.reconcile_attached_sizes_for_option_scope(scope).await;
+            }
             match &refresh_scope {
                 Some(OptionScopeSelector::Session(session_name)) => {
                     self.refresh_attached_session(session_name).await;
@@ -119,9 +127,19 @@ impl RequestHandler {
         &self,
         request: rmux_proto::SetOptionByNameRequest,
     ) -> Response {
+        self.handle_set_option_by_name_with_client_name(request, None)
+            .await
+    }
+
+    pub(super) async fn handle_set_option_by_name_with_client_name(
+        &self,
+        request: rmux_proto::SetOptionByNameRequest,
+        client_name: Option<String>,
+    ) -> Response {
         let refresh_scope = request.scope.clone();
         let mut alerts_changed = false;
         let mut destroy_unattached_scope = None;
+        let mut resize_policy_scope = None;
         let response = {
             let mut state = self.state.lock().await;
 
@@ -130,12 +148,16 @@ impl RequestHandler {
             }
             let socket_path = self.socket_path();
             let value = match request.value.as_deref() {
-                Some(value) if request.format && !request.unset => {
+                Some(value)
+                    if !request.unset
+                        && should_expand_set_option_value(&request.name, request.format, value) =>
+                {
                     match format_option_value(
                         &state,
                         &request.scope,
                         request.format_target.as_ref(),
                         &socket_path,
+                        client_name.as_deref(),
                         value,
                     ) {
                         Ok(value) => Some(value),
@@ -172,6 +194,12 @@ impl RequestHandler {
                     if let Some(option) = outcome.known_option {
                         if option == OptionName::DestroyUnattached {
                             destroy_unattached_scope = Some(request.scope.clone());
+                        }
+                        if matches!(
+                            option,
+                            OptionName::WindowSize | OptionName::AggressiveResize
+                        ) {
+                            resize_policy_scope = Some(request.scope.clone());
                         }
                         if let Some(scope) = option_scope_to_legacy_scope(&request.scope) {
                             state.refresh_transcript_limits_for_scope(&scope, option);
@@ -218,6 +246,9 @@ impl RequestHandler {
         };
 
         if matches!(response, Response::SetOptionByName(_)) {
+            if let Some(scope) = resize_policy_scope.as_ref() {
+                self.reconcile_attached_sizes_for_option_scope(scope).await;
+            }
             match &refresh_scope {
                 OptionScopeSelector::Session(session_name) => {
                     self.refresh_attached_session(session_name).await;
@@ -251,6 +282,31 @@ impl RequestHandler {
         response
     }
 
+    async fn reconcile_attached_sizes_for_option_scope(&self, scope: &OptionScopeSelector) {
+        let session_names = match scope {
+            OptionScopeSelector::ServerGlobal
+            | OptionScopeSelector::SessionGlobal
+            | OptionScopeSelector::WindowGlobal => {
+                let state = self.state.lock().await;
+                state
+                    .sessions
+                    .iter()
+                    .map(|(session_name, _)| session_name.clone())
+                    .collect::<Vec<_>>()
+            }
+            OptionScopeSelector::Session(session_name) => vec![session_name.clone()],
+            OptionScopeSelector::Window(target) => vec![target.session_name().clone()],
+            OptionScopeSelector::Pane(target) => vec![target.session_name().clone()],
+        };
+
+        for session_name in session_names {
+            if let Ok(Some(target)) = self.reconcile_attached_session_size(&session_name).await {
+                self.emit(rmux_core::LifecycleEvent::WindowResized { target })
+                    .await;
+            }
+        }
+    }
+
     async fn refresh_automatic_names_after_option_change(&self, scope: OptionScopeSelector) {
         let targets = {
             let mut state = self.state.lock().await;
@@ -261,6 +317,13 @@ impl RequestHandler {
                 .await;
         }
     }
+}
+
+fn should_expand_set_option_value(name: &str, explicit_format: bool, value: &str) -> bool {
+    if explicit_format {
+        return true;
+    }
+    value.contains("#{") && rmux_core::option_name_by_name(name) == Some(OptionName::ExtendedKeys)
 }
 
 fn response_known_option_is_automatic_rename(response: &Response) -> bool {
@@ -276,6 +339,7 @@ fn format_option_value(
     scope: &OptionScopeSelector,
     target: Option<&rmux_proto::Target>,
     socket_path: &Path,
+    client_name: Option<&str>,
     value: &str,
 ) -> Result<String, rmux_proto::RmuxError> {
     let context = match target
@@ -289,6 +353,10 @@ fn format_option_value(
             socket_path,
         )?,
         None => super::scripting_support::global_format_context(state, socket_path),
+    };
+    let context = match client_name {
+        Some(client_name) => context.with_named_value("client_name", client_name.to_owned()),
+        None => context,
     };
     Ok(render_runtime_template(value, &context, false))
 }

@@ -46,7 +46,7 @@ impl<'a> GrammarParser<'a> {
         // blocks at the same nesting level from accumulating depth.
         self.depth += 1;
         if self.depth > MAX_NESTING_DEPTH {
-            return Err(CommandParseError::new(
+            return Err(CommandParseError::structural(
                 self.peek_line().unwrap_or(0),
                 "command nesting too deep",
             ));
@@ -58,13 +58,16 @@ impl<'a> GrammarParser<'a> {
                 LexToken::Eof => break,
                 LexToken::CloseBrace if stop_on_close_brace => break,
                 LexToken::CloseBrace => {
-                    return Err(CommandParseError::new(self.peek_line()?, "unmatched }"));
+                    return Err(CommandParseError::structural(
+                        self.peek_line()?,
+                        "unmatched }",
+                    ));
                 }
                 LexToken::Else if stop_directives.contains(&ConditionStop::Else) => break,
                 LexToken::Elif if stop_directives.contains(&ConditionStop::Elif) => break,
                 LexToken::Endif if stop_directives.contains(&ConditionStop::Endif) => break,
                 LexToken::Else | LexToken::Elif | LexToken::Endif => {
-                    return Err(CommandParseError::new(
+                    return Err(CommandParseError::structural(
                         self.peek_line()?,
                         "unexpected condition directive",
                     ));
@@ -98,10 +101,13 @@ impl<'a> GrammarParser<'a> {
                     }
                 }
                 LexToken::OpenBrace => {
-                    return Err(CommandParseError::new(self.peek_line()?, "unexpected {"));
+                    return Err(CommandParseError::structural(
+                        self.peek_line()?,
+                        "unexpected {",
+                    ));
                 }
                 LexToken::Format(_) => {
-                    return Err(CommandParseError::new(
+                    return Err(CommandParseError::structural(
                         self.peek_line()?,
                         "unexpected format",
                     ));
@@ -150,7 +156,7 @@ impl<'a> GrammarParser<'a> {
             | LexToken::Elif
             | LexToken::Endif => None,
             _ => {
-                return Err(CommandParseError::new(
+                return Err(CommandParseError::structural(
                     self.peek_line()?,
                     "name=value assignment must be followed by a command or statement boundary",
                 ))
@@ -240,7 +246,7 @@ impl<'a> GrammarParser<'a> {
                 | LexToken::Elif
                 | LexToken::Endif => break,
                 LexToken::Hidden | LexToken::If | LexToken::Format(_) => {
-                    return Err(CommandParseError::new(
+                    return Err(CommandParseError::structural(
                         self.peek_line()?,
                         "unexpected token in command",
                     ));
@@ -280,7 +286,7 @@ impl<'a> GrammarParser<'a> {
                 self.advance()?;
                 Ok(())
             }
-            _ => Err(CommandParseError::new(
+            _ => Err(CommandParseError::structural(
                 self.peek_line()?,
                 "expected %hidden",
             )),
@@ -293,7 +299,10 @@ impl<'a> GrammarParser<'a> {
                 self.advance()?;
                 Ok(())
             }
-            _ => Err(CommandParseError::new(self.peek_line()?, "expected %if")),
+            _ => Err(CommandParseError::structural(
+                self.peek_line()?,
+                "expected %if",
+            )),
         }
     }
 
@@ -303,7 +312,10 @@ impl<'a> GrammarParser<'a> {
                 self.advance()?;
                 Ok(())
             }
-            _ => Err(CommandParseError::new(self.peek_line()?, "expected %endif")),
+            _ => Err(CommandParseError::structural(
+                self.peek_line()?,
+                "expected %endif",
+            )),
         }
     }
 
@@ -313,7 +325,10 @@ impl<'a> GrammarParser<'a> {
                 self.advance()?;
                 Ok(())
             }
-            _ => Err(CommandParseError::new(self.peek_line()?, "missing }")),
+            _ => Err(CommandParseError::structural(
+                self.peek_line()?,
+                "missing }",
+            )),
         }
     }
 
@@ -323,7 +338,7 @@ impl<'a> GrammarParser<'a> {
                 self.advance()?;
                 Ok(value)
             }
-            _ => Err(CommandParseError::new(self.peek_line()?, error)),
+            _ => Err(CommandParseError::structural(self.peek_line()?, error)),
         }
     }
 
@@ -341,7 +356,7 @@ impl<'a> GrammarParser<'a> {
                 self.advance()?;
                 Ok((value, line))
             }
-            _ => Err(CommandParseError::new(line, error)),
+            _ => Err(CommandParseError::structural(line, error)),
         }
     }
 
@@ -351,7 +366,7 @@ impl<'a> GrammarParser<'a> {
                 self.advance()?;
                 Ok(value)
             }
-            _ => Err(CommandParseError::new(self.peek_line()?, error)),
+            _ => Err(CommandParseError::structural(self.peek_line()?, error)),
         }
     }
 
@@ -364,7 +379,7 @@ impl<'a> GrammarParser<'a> {
             | LexToken::Else
             | LexToken::Elif
             | LexToken::Endif => Ok(()),
-            _ => Err(CommandParseError::new(self.peek_line()?, error)),
+            _ => Err(CommandParseError::structural(self.peek_line()?, error)),
         }
     }
 }

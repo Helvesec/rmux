@@ -101,11 +101,15 @@ pub(crate) fn collect_control_notifications(
             )),
         ),
         LifecycleEvent::ClientAttached { .. }
+        | LifecycleEvent::ClientResized { .. }
         | LifecycleEvent::AlertBell { .. }
         | LifecycleEvent::AlertActivity { .. }
         | LifecycleEvent::AlertSilence { .. }
         | LifecycleEvent::PaneExited { .. }
         | LifecycleEvent::PaneDied { .. }
+        | LifecycleEvent::PaneFocusIn { .. }
+        | LifecycleEvent::PaneFocusOut { .. }
+        | LifecycleEvent::PaneTitleChanged { .. }
         | LifecycleEvent::WindowResized { .. }
         | LifecycleEvent::AfterSelectWindow { .. }
         | LifecycleEvent::AfterSelectPane { .. }

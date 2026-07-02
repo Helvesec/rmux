@@ -357,6 +357,37 @@ fn sync_wrapper_brackets_render_frames_when_supported() {
 }
 
 #[test]
+fn terminal_override_can_disable_sync_wrapper_after_feature_match() {
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::TerminalFeatures,
+            "xterm*:sync".to_owned(),
+            SetOptionMode::Append,
+        )
+        .expect("terminal-features append succeeds");
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::TerminalOverrides,
+            "xterm*:Sync@".to_owned(),
+            SetOptionMode::Append,
+        )
+        .expect("terminal-overrides append succeeds");
+    let terminal = OuterTerminal::resolve(
+        &options,
+        OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]),
+    );
+
+    assert_eq!(terminal.wrap_render_frame(b"frame"), b"frame");
+    assert!(!terminal
+        .features_string()
+        .split(',')
+        .any(|feature| feature == "sync"));
+}
+
+#[test]
 fn decode_capability_string_handles_octal_escapes() {
     assert_eq!(
         super::decode_capability_string("\\033[H"),

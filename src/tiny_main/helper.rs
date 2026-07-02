@@ -15,6 +15,8 @@ use std::os::unix::process::CommandExt;
 const FULL_HELPER_OVERRIDE_ENV: &str = "RMUX_FULL_BINARY_PATH";
 const PUBLIC_BINARY_OVERRIDE_ENV: &str = "RMUX_INTERNAL_PUBLIC_BINARY_PATH";
 #[cfg(windows)]
+const INTERNAL_CLIENT_SHELL_ENV: &str = "RMUX_INTERNAL_CLIENT_SHELL";
+#[cfg(windows)]
 const TMUX_COMPAT_OVERRIDE_ENV: &str = "RMUX_INTERNAL_INVOKED_AS_TMUX";
 
 pub(super) fn exec_full_helper(args: &[OsString]) -> Result<i32, String> {
@@ -24,6 +26,8 @@ pub(super) fn exec_full_helper(args: &[OsString]) -> Result<i32, String> {
     if let Ok(current) = env::current_exe() {
         command.env(PUBLIC_BINARY_OVERRIDE_ENV, current);
     }
+    #[cfg(windows)]
+    set_windows_client_shell_handoff(&mut command, super::parse::invoking_client_shell());
     #[cfg(windows)]
     if invoked_as_tmux(args) {
         command.env(TMUX_COMPAT_OVERRIDE_ENV, "1");
@@ -114,6 +118,14 @@ fn join_output_thread(thread: thread::JoinHandle<io::Result<()>>) -> Result<(), 
         .join()
         .map_err(|_| "private rmux helper output thread panicked".to_owned())?
         .map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+fn set_windows_client_shell_handoff(command: &mut Command, shell: Option<String>) {
+    command.env_remove(INTERNAL_CLIENT_SHELL_ENV);
+    if let Some(shell) = shell.filter(|shell| !shell.is_empty()) {
+        command.env(INTERNAL_CLIENT_SHELL_ENV, shell);
+    }
 }
 
 #[cfg(windows)]
@@ -222,6 +234,8 @@ mod tests {
     #[cfg(not(windows))]
     use super::{daemon_file_name, daemon_from_executable_path};
     use super::{helper_file_name, helper_from_executable_paths};
+    #[cfg(windows)]
+    use super::{set_windows_client_shell_handoff, INTERNAL_CLIENT_SHELL_ENV};
 
     fn temp_root(name: &str) -> PathBuf {
         let timestamp = SystemTime::now()
@@ -281,6 +295,37 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_full_helper_shell_handoff_replaces_stale_internal_hint() {
+        let mut command = std::process::Command::new("rmux.exe");
+        command.env(INTERNAL_CLIENT_SHELL_ENV, "stale.exe");
+
+        set_windows_client_shell_handoff(&mut command, Some("pwsh.exe".to_owned()));
+
+        let handoff = command
+            .get_envs()
+            .find(|(name, _)| name.eq_ignore_ascii_case(INTERNAL_CLIENT_SHELL_ENV))
+            .and_then(|(_, value)| value)
+            .expect("client shell handoff env");
+        assert_eq!(handoff, std::ffi::OsStr::new("pwsh.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_full_helper_shell_handoff_removes_stale_hint_without_parent_shell() {
+        let mut command = std::process::Command::new("rmux.exe");
+        command.env(INTERNAL_CLIENT_SHELL_ENV, "stale.exe");
+
+        set_windows_client_shell_handoff(&mut command, None);
+
+        let handoff = command
+            .get_envs()
+            .find(|(name, _)| name.eq_ignore_ascii_case(INTERNAL_CLIENT_SHELL_ENV))
+            .expect("client shell handoff env override");
+        assert!(handoff.1.is_none());
     }
 
     #[cfg(not(windows))]

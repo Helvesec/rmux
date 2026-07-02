@@ -101,6 +101,7 @@ pub(crate) struct PaneAlertEvent {
     pub(crate) session_name: rmux_proto::SessionName,
     pub(crate) pane_id: PaneId,
     pub(crate) bell_count: u64,
+    pub(crate) title_changed: bool,
     pub(crate) queue_activity_alert: bool,
     pub(crate) generation: Option<u64>,
 }

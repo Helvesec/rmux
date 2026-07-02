@@ -125,6 +125,15 @@ impl PaneTerminal {
         let _ = self.wait_for_exit(HARD_TERMINATION_ATTEMPTS, HARD_TERMINATION_SLEEP);
     }
 
+    pub(crate) fn terminate_in_background(self) {
+        let _ = std::thread::Builder::new()
+            .name("rmux-pane-terminate".to_owned())
+            .spawn(move || {
+                let mut terminal = self;
+                terminal.terminate_with_bounded_grace();
+            });
+    }
+
     fn signal_process_tree(&self, signal: Signal) {
         let _ = self.child.kill(signal);
         let _ = self.child.kill_session_leader(signal);

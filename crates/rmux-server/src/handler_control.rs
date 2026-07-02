@@ -443,6 +443,7 @@ impl RequestHandler {
             | LifecycleEvent::WindowLinked { .. }
             | LifecycleEvent::WindowRenamed { .. }
             | LifecycleEvent::ClientSessionChanged { .. }
+            | LifecycleEvent::ClientResized { .. }
             | LifecycleEvent::ClientDetached { .. }
             | LifecycleEvent::SessionRenamed { .. }
             | LifecycleEvent::SessionCreated { .. }
@@ -461,6 +462,9 @@ impl RequestHandler {
             | LifecycleEvent::AlertSilence { .. }
             | LifecycleEvent::PaneExited { .. }
             | LifecycleEvent::PaneDied { .. }
+            | LifecycleEvent::PaneFocusIn { .. }
+            | LifecycleEvent::PaneFocusOut { .. }
+            | LifecycleEvent::PaneTitleChanged { .. }
             | LifecycleEvent::WindowResized { .. }
             | LifecycleEvent::AfterSelectWindow { .. }
             | LifecycleEvent::AfterSelectPane { .. }

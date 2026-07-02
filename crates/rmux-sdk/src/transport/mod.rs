@@ -15,8 +15,8 @@ mod pending;
 mod state;
 
 use failure::TransportFailure;
-use pending::PendingCall;
 pub(crate) use pending::PendingResponse;
+use pending::{PendingCall, PendingResponseAction};
 use state::TransportState;
 #[cfg(test)]
 use state::{allocate_bounded_atomic_id, mix_sdk_wait_owner_id};
@@ -69,12 +69,17 @@ impl TransportClient {
 
         let (reply, response) = oneshot::channel();
         let (armed, armed_response) = oneshot::channel();
+        let wait_id = sdk_wait_id_for_request(&request).ok_or_else(|| {
+            TransportFailure::invalid_data("armed transport requests must be SDK wait requests")
+                .to_error(&operation)
+        })?;
         self.commands
             .send(ActorMessage::ArmedRequest {
                 request,
                 operation: operation.clone(),
                 reply,
                 armed,
+                wait_id,
             })
             .await
             .map_err(|_| self.closed_error(&operation))?;
@@ -208,6 +213,7 @@ enum ActorMessage {
         operation: String,
         reply: oneshot::Sender<Result<Response>>,
         armed: oneshot::Sender<core::result::Result<(), TransportFailure>>,
+        wait_id: SdkWaitId,
     },
     BestEffort {
         request: Request,
@@ -268,6 +274,7 @@ where
                         operation,
                         reply,
                         armed,
+                        wait_id,
                     } => {
                         let command_name = request.command_name();
                         let frame = match encode_request(&request) {
@@ -278,17 +285,17 @@ where
                                 continue;
                             }
                         };
-                        pending.push_back(PendingCall::reply(
+                        pending.push_back(PendingCall::armed_reply(
                             command_name,
                             operation.clone(),
                             reply,
+                            armed,
+                            wait_id,
                         ));
                         if let Err(failure) = write_frame(&mut writer, &frame).await {
-                            let _ = armed.send(Err(failure.clone()));
                             fail_transport(&mut pending, &state, failure);
                             break;
                         }
-                        let _ = armed.send(Ok(()));
                     }
                     ActorMessage::BestEffort { request } => {
                         let command_name = request.command_name();
@@ -324,19 +331,26 @@ where
             }
             ActorEvent::Response(result) => match result {
                 Ok(response) => {
-                    let Some(pending_call) = pending.pop_front() else {
+                    let Some(mut pending_call) = pending.pop_front() else {
                         let failure = TransportFailure::unsolicited_response(&response);
                         fail_shutdown(&mut shutdown_reply, &failure);
                         fail_transport(&mut pending, &state, failure);
                         break;
                     };
-                    if let Err(failure) = pending_call.validate_response(&response) {
-                        pending_call.fail(&failure);
-                        fail_shutdown(&mut shutdown_reply, &failure);
-                        fail_transport(&mut pending, &state, failure);
-                        break;
+                    match pending_call.accept_response(&response) {
+                        Ok(PendingResponseAction::Complete) => {
+                            pending_call.complete(response);
+                        }
+                        Ok(PendingResponseAction::KeepPending) => {
+                            pending.push_front(pending_call);
+                        }
+                        Err(failure) => {
+                            pending_call.fail(&failure);
+                            fail_shutdown(&mut shutdown_reply, &failure);
+                            fail_transport(&mut pending, &state, failure);
+                            break;
+                        }
                     }
-                    pending_call.complete(response);
                 }
                 Err(failure) => {
                     if shutdown_reply.is_some() && pending.is_empty() && failure.is_eof() {
@@ -491,6 +505,14 @@ fn request_operation(request: &Request) -> String {
         "complete `{}` request/response exchange with rmux daemon",
         request.command_name()
     )
+}
+
+fn sdk_wait_id_for_request(request: &Request) -> Option<SdkWaitId> {
+    match request {
+        Request::SdkWaitForOutput(request) => Some(request.wait_id),
+        Request::SdkWaitForOutputRef(request) => Some(request.wait_id),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

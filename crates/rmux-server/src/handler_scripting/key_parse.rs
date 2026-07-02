@@ -1,7 +1,7 @@
 use rmux_proto::{Request, RmuxError, SendKeysRequest};
 
 use super::parse_pane_target;
-use super::tokens::CommandTokens;
+use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
 use super::values::{missing_argument, parse_usize, unsupported_flag};
 
 pub(super) fn parse_send_keys(mut args: CommandTokens) -> Result<Request, RmuxError> {
@@ -17,18 +17,34 @@ pub(super) fn parse_send_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
     let mut repeat_count = None;
 
     while let Some(token) = args.peek().map(str::to_owned) {
-        if let Some(flags) = args.optional_compact_flags("FHlKMRX") {
-            for flag in flags {
+        if let Some(cluster) = parse_compact_flag_cluster(&token, "FHlKMRX", "ct") {
+            let _ = args.optional();
+            for flag in cluster {
                 match flag {
-                    'F' => expand_formats = true,
-                    'H' => hex = true,
-                    'l' => literal = true,
-                    'K' => dispatch_key_table = true,
-                    'M' => forward_mouse_event = true,
-                    'R' => reset_terminal = true,
-                    'X' => copy_mode_command = true,
-                    _ => unreachable!("compact send-keys flags are prevalidated"),
-                }
+                    CompactFlag::Bare(flag) => match flag {
+                        'F' => expand_formats = true,
+                        'H' => hex = true,
+                        'l' => literal = true,
+                        'K' => dispatch_key_table = true,
+                        'M' => forward_mouse_event = true,
+                        'R' => reset_terminal = true,
+                        'X' => copy_mode_command = true,
+                        _ => unreachable!("compact send-keys flags are prevalidated"),
+                    },
+                    compact_flag @ CompactFlag::Value { flag: 'c', .. } => {
+                        target_client =
+                            Some(compact_flag.value_or_next(&mut args, "-c target-client")?);
+                    }
+                    compact_flag @ CompactFlag::Value { flag: 't', .. } => {
+                        target = Some(parse_pane_target(
+                            "send-keys",
+                            compact_flag.value_or_next(&mut args, "-t target")?,
+                        )?);
+                    }
+                    CompactFlag::Value { flag, .. } => {
+                        return Err(unsupported_flag("send-keys", &format!("-{flag}")));
+                    }
+                };
             }
             continue;
         }
@@ -347,6 +363,25 @@ mod tests {
         assert_eq!(request.repeat_count, Some(5));
         assert!(request.copy_mode_command);
         assert_eq!(request.keys, vec!["scroll-up"]);
+    }
+
+    #[test]
+    fn parse_send_keys_accepts_tmux_compact_copy_mode_target() {
+        let request = parse_send_keys(CommandTokens::new(vec![
+            token("-Xt="),
+            token("select-word"),
+        ]))
+        .expect("compact copy-mode target parses");
+
+        let Request::SendKeysExt(request) = request else {
+            panic!("compact copy-mode target must use extended send-keys request");
+        };
+        assert!(request.copy_mode_command);
+        assert_eq!(
+            request.target,
+            Some(parse_pane_target("send-keys", "=".to_owned()).unwrap())
+        );
+        assert_eq!(request.keys, vec!["select-word"]);
     }
 
     #[test]

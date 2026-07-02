@@ -2,10 +2,18 @@ use rmux_core::LifecycleEvent;
 use rmux_proto::{
     ErrorResponse, HookName, OptionName, PaneTarget, PaneTargetRef, ResizePaneAdjustment,
     ResizePaneResponse, Response, RmuxError, ScopeSelector, SelectPaneResponse, SessionId,
-    SetOptionMode, Target, WindowTarget,
+    SessionName, SetOptionMode, Target, WindowTarget,
 };
 
 use super::super::{prepare_lifecycle_event, RequestHandler};
+#[cfg(windows)]
+use super::pane_io_encoding::{
+    prepare_pane_console_input_write, tokens_emulate_windows_cmd_select_all,
+    tokens_route_windows_control_as_pty_bytes, windows_console_input_for_target_tokens,
+    write_windows_console_input_action_to_target_io,
+};
+#[cfg(windows)]
+use super::pane_windows_console_sequence::prepare_single_pane_windows_console_input_sequence;
 use super::{encode_tokens_for_target, prepare_pane_input_write, write_bytes_to_target};
 use crate::hook_runtime::PendingInlineHookFormat;
 use crate::pane_terminals::{session_not_found, HandlerState};
@@ -34,6 +42,76 @@ impl RequestHandler {
                     Err(error) => return Response::Error(ErrorResponse { error }),
                 }
             };
+            #[cfg(windows)]
+            if !request.literal
+                && !tokens_emulate_windows_cmd_select_all(&state, &target, &request.keys)
+            {
+                match prepare_single_pane_windows_console_input_sequence(
+                    &mut state,
+                    &target,
+                    &request.keys,
+                    None,
+                ) {
+                    Ok(Some(steps)) => {
+                        drop(state);
+                        return self
+                            .write_windows_console_input_sequence_and_mark_interactive(
+                                steps, key_count,
+                            )
+                            .await;
+                    }
+                    Ok(None) => {}
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                }
+                if let Some((action, console_bytes)) =
+                    windows_console_input_for_target_tokens(&state, &target, &request.keys, 1)
+                {
+                    if tokens_route_windows_control_as_pty_bytes(&state, &target, &request.keys) {
+                        let write = match prepare_pane_input_write(&mut state, &target, &bytes) {
+                            Ok(write) => write,
+                            Err(error) => return Response::Error(ErrorResponse { error }),
+                        };
+                        let session_name = write.session_name().clone();
+                        let wrote_bytes = !bytes.is_empty();
+                        drop(state);
+                        let response = write_bytes_to_target(write, bytes, key_count).await;
+                        return self
+                            .mark_single_pane_input_ref_as_interactive(
+                                &session_name,
+                                wrote_bytes,
+                                response,
+                            )
+                            .await;
+                    }
+                    let write = match prepare_pane_console_input_write(
+                        &mut state,
+                        &target,
+                        &console_bytes,
+                        action,
+                    ) {
+                        Ok(write) => write,
+                        Err(error) => return Response::Error(ErrorResponse { error }),
+                    };
+                    let session_name = write.session_name().clone();
+                    let wrote_bytes = !console_bytes.is_empty();
+                    drop(state);
+                    let response = match write_windows_console_input_action_to_target_io(
+                        write, action,
+                    )
+                    .await
+                    {
+                        Ok(()) => Response::SendKeys(rmux_proto::SendKeysResponse { key_count }),
+                        Err(error) => Response::Error(ErrorResponse { error }),
+                    };
+                    return self
+                        .mark_single_pane_input_ref_as_interactive(
+                            &session_name,
+                            wrote_bytes,
+                            response,
+                        )
+                        .await;
+                }
+            }
             let write = match prepare_pane_input_write(&mut state, &target, &bytes) {
                 Ok(write) => write,
                 Err(error) => return Response::Error(ErrorResponse { error }),
@@ -41,7 +119,24 @@ impl RequestHandler {
             (write, bytes)
         };
 
-        write_bytes_to_target(prepared.0, prepared.1, key_count).await
+        let session_name = prepared.0.session_name().clone();
+        let wrote_bytes = !prepared.1.is_empty();
+        let response = write_bytes_to_target(prepared.0, prepared.1, key_count).await;
+        self.mark_single_pane_input_ref_as_interactive(&session_name, wrote_bytes, response)
+            .await
+    }
+
+    async fn mark_single_pane_input_ref_as_interactive(
+        &self,
+        session_name: &SessionName,
+        wrote_bytes: bool,
+        response: Response,
+    ) -> Response {
+        if wrote_bytes && matches!(response, Response::SendKeys(_)) {
+            self.mark_attached_session_interactive_input(session_name)
+                .await;
+        }
+        response
     }
 
     pub(in crate::handler) async fn handle_pane_resize_ref(
@@ -124,15 +219,6 @@ impl RequestHandler {
                 .unwrap_or_default();
             match state.kill_pane_with_options(target.clone(), request.kill_all_except) {
                 Ok(result) => {
-                    let queued_pane = prepare_lifecycle_event(
-                        &mut state,
-                        &LifecycleEvent::PaneExited {
-                            target: result.hook_context.target.clone(),
-                            pane_id: Some(result.hook_context.pane_id),
-                            window_id: Some(result.hook_context.window_id),
-                            window_name: Some(result.hook_context.window_name.clone()),
-                        },
-                    );
                     let queued_session = if result.session_destroyed {
                         let _ = state.hooks.remove_session(&session_name);
                         result.removed_session_id.map(|session_id| {
@@ -156,7 +242,7 @@ impl RequestHandler {
                     };
                     (
                         Response::KillPane(result.response),
-                        Some(queued_pane),
+                        None,
                         queued_session,
                         result.session_destroyed,
                         result
@@ -254,18 +340,7 @@ impl RequestHandler {
                 None,
                 Some(self.pane_alert_callback()),
                 Some(self.pane_exit_callback()),
-                |state, replaced| {
-                    let queued = prepare_lifecycle_event(
-                        state,
-                        &LifecycleEvent::PaneExited {
-                            target: replaced.target.clone(),
-                            pane_id: Some(replaced.pane_id),
-                            window_id: Some(replaced.window_id),
-                            window_name: Some(replaced.window_name.clone()),
-                        },
-                    );
-                    self.emit_prepared(queued);
-                },
+                |_, _| {},
             ) {
                 Ok(response) => Response::RespawnPane(response),
                 Err(error) => Response::Error(ErrorResponse { error }),

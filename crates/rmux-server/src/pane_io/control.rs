@@ -79,9 +79,10 @@ pub(super) fn coalesce_render_switches(
     deferred_controls: &mut VecDeque<AttachControl>,
     mut control_rx: Option<&mut mpsc::UnboundedReceiver<AttachControl>>,
     control_backlog: &AtomicUsize,
-) -> Box<AttachTarget> {
+) -> (Box<AttachTarget>, u64) {
+    let mut switch_count = 1_u64;
     if !target.is_coalescible_render_refresh() {
-        return target;
+        return (target, switch_count);
     }
 
     while deferred_controls
@@ -92,10 +93,11 @@ pub(super) fn coalesce_render_switches(
             unreachable!("front was checked as a coalescible switch");
         };
         target = next_target;
+        switch_count = switch_count.saturating_add(1);
     }
 
     let Some(control_rx) = control_rx.as_mut() else {
-        return target;
+        return (target, switch_count);
     };
     loop {
         match try_recv_attach_control(control_rx, control_backlog) {
@@ -103,6 +105,7 @@ pub(super) fn coalesce_render_switches(
                 if next_target.is_coalescible_render_refresh() =>
             {
                 target = next_target;
+                switch_count = switch_count.saturating_add(1);
             }
             Ok(control) => {
                 deferred_controls.push_back(control);
@@ -114,7 +117,7 @@ pub(super) fn coalesce_render_switches(
         }
     }
 
-    target
+    (target, switch_count)
 }
 
 pub(super) async fn switch_attach_target(
@@ -227,7 +230,7 @@ pub(super) async fn apply_pending_attach_controls(
                 return Ok(PendingAttachAction::Refresh { target_changed });
             }
             Ok(AttachControl::Switch(next_target)) => {
-                let next_target = coalesce_render_switches(
+                let (next_target, switch_count) = coalesce_render_switches(
                     next_target,
                     deferred_controls,
                     Some(control_rx),
@@ -243,9 +246,10 @@ pub(super) async fn apply_pending_attach_controls(
                     )
                 };
                 if is_stale_persistent_switch(*persistent_overlay_state_id, next_target.as_ref()) {
+                    *render_generation = (*render_generation).saturating_add(switch_count);
                     continue;
                 }
-                *render_generation = render_generation.saturating_add(1);
+                *render_generation = (*render_generation).saturating_add(switch_count);
                 let pending_overlay = take_pending_persistent_overlay_for_state(
                     Some(control_rx),
                     deferred_controls,

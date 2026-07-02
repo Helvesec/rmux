@@ -477,6 +477,10 @@ jobs:
       - name: cargo build
         run: cargo build --workspace --locked
 
+      - name: cargo clippy on Windows MSVC
+        if: runner.os == 'Windows'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
       - name: cargo test portable crates
         if: runner.os != 'Windows'
         run: cargo test --locked --no-fail-fast -p rmux-types -p rmux-os -p rmux-proto -p rmux-ipc -p rmux-core -p rmux-client

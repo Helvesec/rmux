@@ -32,6 +32,7 @@ pub(crate) struct CopyModeCommandContext {
 pub(crate) struct CopyModeMouseContext {
     pub(crate) content_x: u32,
     pub(crate) content_y: u16,
+    pub(crate) selection_anchor: Option<(u32, u16)>,
     pub(crate) scroll_y: u16,
     pub(crate) slider_mpos: i32,
 }

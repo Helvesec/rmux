@@ -11,9 +11,10 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use rmux_proto::{
-    encode_frame, CancelSdkWaitResponse, CommandOutput, FrameDecoder, HasSessionRequest,
-    ListPanesResponse, PaneOutputSubscriptionStart, PaneSnapshotCell, PaneSnapshotCursor,
-    PaneSnapshotResponse, Request, Response, SdkWaitForOutputResponse, SdkWaitOutcome,
+    encode_frame, CancelSdkWaitResponse, CommandOutput, FrameDecoder, HandshakeResponse,
+    HasSessionRequest, ListPanesResponse, PaneOutputSubscriptionStart, PaneSnapshotCell,
+    PaneSnapshotCursor, PaneSnapshotResponse, Request, Response, SdkWaitForOutputRequest,
+    SdkWaitForOutputResponse, SdkWaitOutcome, CAPABILITY_SDK_WAITS_ARMED,
 };
 use rmux_sdk::{EnsureSession, Pane, PaneRef, RmuxBuilder, RmuxError, SessionName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,24 +32,19 @@ async fn wait_for_uses_daemon_sdk_byte_wait() -> TestResult {
     let socket = TestSocket::new("byte-wait")?;
     let listener = UnixListener::bind(socket.path())?;
     let server = tokio::spawn(async move {
-        let mut main = accept_peer(&listener).await?;
-        let mut cancel = accept_peer(&listener).await?;
+        let (mut main, mut peers, request) = accept_sdk_wait(&listener, b"needle").await?;
 
-        let request = main.expect_request().await?;
-        let Request::SdkWaitForOutput(request) = request else {
-            panic!("wait_for must use server-side SDK byte wait, got {request:?}");
-        };
-        assert_eq!(request.target, target().to_proto());
-        assert_eq!(request.bytes, b"needle");
-        assert_eq!(request.start, PaneOutputSubscriptionStart::Now);
-
+        main.write_response(Response::CancelSdkWait(CancelSdkWaitResponse::armed_ack(
+            request.wait_id,
+        )))
+        .await?;
         main.write_response(Response::SdkWaitForOutput(SdkWaitForOutputResponse {
             wait_id: request.wait_id,
             outcome: SdkWaitOutcome::Matched,
         }))
         .await?;
 
-        assert_no_cancel_request(&mut cancel).await?;
+        assert_no_sdk_cancel_request(&listener, &mut peers).await?;
         TestResult::Ok(())
     });
 
@@ -90,22 +86,23 @@ async fn finite_timeout_wraps_wait_for_and_sends_best_effort_cancel() -> TestRes
     let socket = TestSocket::new("byte-wait-timeout")?;
     let listener = UnixListener::bind(socket.path())?;
     let server = tokio::spawn(async move {
-        let mut main = accept_peer(&listener).await?;
-        let mut cancel = accept_peer(&listener).await?;
+        let (mut main, mut peers, request) = accept_sdk_wait(&listener, b"never").await?;
+        main.write_response(Response::CancelSdkWait(CancelSdkWaitResponse::armed_ack(
+            request.wait_id,
+        )))
+        .await?;
 
-        let request = main.expect_request().await?;
-        let Request::SdkWaitForOutput(request) = request else {
-            panic!("wait_for must arm SDK byte wait before timing out, got {request:?}");
-        };
-
-        let cancel_request = cancel.expect_request().await?;
+        let (cancel_peer, cancel_request) =
+            expect_sdk_cancel_request(&listener, &mut peers).await?;
         let Request::CancelSdkWait(cancel_request) = cancel_request else {
             panic!("timeout must send best-effort SDK wait cancellation, got {cancel_request:?}");
         };
         assert_eq!(cancel_request.owner_id, request.owner_id);
         assert_eq!(cancel_request.wait_id, request.wait_id);
 
-        cancel
+        peers
+            .get_mut(cancel_peer)
+            .expect("cancel request peer is retained")
             .write_response(Response::CancelSdkWait(CancelSdkWaitResponse {
                 wait_id: request.wait_id,
                 removed: true,
@@ -114,7 +111,7 @@ async fn finite_timeout_wraps_wait_for_and_sends_best_effort_cancel() -> TestRes
         TestResult::Ok(())
     });
 
-    let pane = pane_for(socket.path(), Duration::from_millis(25)).await?;
+    let pane = pane_for(socket.path(), Duration::from_millis(150)).await?;
     let error = pane
         .wait_for(b"never")
         .await
@@ -129,17 +126,12 @@ async fn duration_max_wait_for_uses_no_sdk_timeout() -> TestResult {
     let socket = TestSocket::new("byte-no-timeout")?;
     let listener = UnixListener::bind(socket.path())?;
     let server = tokio::spawn(async move {
-        let mut main = accept_peer(&listener).await?;
-        let mut cancel = accept_peer(&listener).await?;
+        let (mut main, mut peers, request) = accept_sdk_wait(&listener, b"untimed").await?;
 
-        let request = main.expect_request().await?;
-        let Request::SdkWaitForOutput(request) = request else {
-            panic!("wait_for must use server-side SDK byte wait, got {request:?}");
-        };
-        assert_eq!(request.target, target().to_proto());
-        assert_eq!(request.bytes, b"untimed");
-        assert_eq!(request.start, PaneOutputSubscriptionStart::Now);
-
+        main.write_response(Response::CancelSdkWait(CancelSdkWaitResponse::armed_ack(
+            request.wait_id,
+        )))
+        .await?;
         tokio::time::sleep(Duration::from_millis(50)).await;
         main.write_response(Response::SdkWaitForOutput(SdkWaitForOutputResponse {
             wait_id: request.wait_id,
@@ -147,7 +139,7 @@ async fn duration_max_wait_for_uses_no_sdk_timeout() -> TestResult {
         }))
         .await?;
 
-        assert_no_cancel_request(&mut cancel).await?;
+        assert_no_sdk_cancel_request(&listener, &mut peers).await?;
         TestResult::Ok(())
     });
 
@@ -548,6 +540,102 @@ async fn accept_peer(listener: &UnixListener) -> TestResult<Peer> {
     Ok(Peer::new(stream))
 }
 
+async fn accept_sdk_wait(
+    listener: &UnixListener,
+    expected_bytes: &[u8],
+) -> TestResult<(Peer, Vec<Peer>, SdkWaitForOutputRequest)> {
+    let mut peers = Vec::new();
+    let (mut main_index, mut request) =
+        expect_request_from_existing_or_new(listener, &mut peers, Duration::from_secs(1)).await?;
+    if let Request::Handshake(handshake) = &request {
+        assert!(
+            handshake
+                .required_capabilities
+                .iter()
+                .any(|capability| capability == CAPABILITY_SDK_WAITS_ARMED),
+            "armed SDK wait handshake did not require {CAPABILITY_SDK_WAITS_ARMED}: {handshake:?}"
+        );
+        peers[main_index]
+            .write_response(Response::Handshake(HandshakeResponse::current()))
+            .await?;
+        (main_index, request) =
+            expect_request_from_existing_or_new(listener, &mut peers, Duration::from_secs(1))
+                .await?;
+    }
+    let main = peers.swap_remove(main_index);
+    let Request::SdkWaitForOutput(request) = request else {
+        panic!("wait_for must use server-side SDK byte wait, got {request:?}");
+    };
+    assert_eq!(request.target, target().to_proto());
+    assert_eq!(request.bytes, expected_bytes);
+    assert_eq!(request.start, PaneOutputSubscriptionStart::Now);
+    Ok((main, peers, request))
+}
+
+async fn expect_sdk_cancel_request(
+    listener: &UnixListener,
+    peers: &mut Vec<Peer>,
+) -> TestResult<(usize, Request)> {
+    expect_request_from_existing_or_new(listener, peers, Duration::from_secs(1)).await
+}
+
+async fn assert_no_sdk_cancel_request(
+    listener: &UnixListener,
+    peers: &mut Vec<Peer>,
+) -> TestResult {
+    let deadline = Instant::now() + Duration::from_millis(50);
+    loop {
+        if let Some((_, request)) = try_read_request_from_peers(peers)? {
+            return Err(format!(
+                "successful wait unexpectedly wrote a cancel request: {request:?}"
+            )
+            .into());
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+
+        tokio::select! {
+            accepted = accept_peer(listener) => peers.push(accepted?),
+            _ = tokio::time::sleep(remaining.min(Duration::from_millis(10))) => {}
+        }
+    }
+}
+
+async fn expect_request_from_existing_or_new(
+    listener: &UnixListener,
+    peers: &mut Vec<Peer>,
+    timeout: Duration,
+) -> TestResult<(usize, Request)> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(found) = try_read_request_from_peers(peers)? {
+            return Ok(found);
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err("timed out waiting for SDK wait request".into());
+        }
+
+        tokio::select! {
+            accepted = accept_peer(listener) => peers.push(accepted?),
+            _ = tokio::time::sleep(remaining.min(Duration::from_millis(10))) => {}
+        }
+    }
+}
+
+fn try_read_request_from_peers(peers: &mut [Peer]) -> TestResult<Option<(usize, Request)>> {
+    for (index, peer) in peers.iter_mut().enumerate() {
+        if let Some(request) = peer.try_read_request()? {
+            return Ok(Some((index, request)));
+        }
+    }
+    Ok(None)
+}
+
 async fn expect_list_panes(peer: &mut Peer) -> TestResult {
     let request = peer.expect_request().await?;
     let Request::ListPanes(request) = request else {
@@ -601,15 +689,6 @@ fn snapshot_cell(byte: u8) -> PaneSnapshotCell {
     }
 }
 
-async fn assert_no_cancel_request(peer: &mut Peer) -> TestResult {
-    let mut buffer = [0_u8; 1];
-    match tokio::time::timeout(Duration::from_millis(50), peer.stream.read(&mut buffer)).await {
-        Err(_) | Ok(Ok(0)) => Ok(()),
-        Ok(Ok(_)) => Err("successful wait unexpectedly wrote a cancel request".into()),
-        Ok(Err(error)) => Err(error.into()),
-    }
-}
-
 async fn assert_peer_closed_without_request(peer: &mut Peer) -> TestResult {
     match peer.read_request().await? {
         None => Ok(()),
@@ -654,6 +733,23 @@ impl Peer {
         self.read_request()
             .await?
             .ok_or_else(|| "peer closed before request".into())
+    }
+
+    fn try_read_request(&mut self) -> TestResult<Option<Request>> {
+        if let Some(request) = self.decoder.next_frame::<Request>()? {
+            return Ok(Some(request));
+        }
+
+        let mut buffer = [0_u8; 4096];
+        match self.stream.try_read(&mut buffer) {
+            Ok(0) => Ok(None),
+            Ok(read) => {
+                self.decoder.push_bytes(&buffer[..read]);
+                Ok(self.decoder.next_frame::<Request>()?)
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     async fn read_request(&mut self) -> TestResult<Option<Request>> {

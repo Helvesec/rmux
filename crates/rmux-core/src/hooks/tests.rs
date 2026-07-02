@@ -665,14 +665,17 @@ fn shipped_hooks_accept_registration_at_supported_scopes() {
     assert!(
         validate_hook_registration(HookName::WindowResized, &ScopeSelector::Window(window)).is_ok()
     );
-    assert!(validate_hook_registration(HookName::PaneExited, &ScopeSelector::Pane(pane)).is_ok());
+    assert!(
+        validate_hook_registration(HookName::PaneExited, &ScopeSelector::Pane(pane.clone()))
+            .is_ok()
+    );
+    assert!(
+        validate_hook_registration(HookName::PaneTitleChanged, &ScopeSelector::Pane(pane)).is_ok()
+    );
     assert!(validate_hook_registration(HookName::AfterShowOptions, &ScopeSelector::Global).is_ok());
 }
 
 #[test]
 fn undispatched_hooks_are_rejected_for_registration() {
     assert!(validate_hook_registration(HookName::ClientDarkTheme, &ScopeSelector::Global).is_err());
-    assert!(
-        validate_hook_registration(HookName::PaneTitleChanged, &ScopeSelector::Global).is_err()
-    );
 }

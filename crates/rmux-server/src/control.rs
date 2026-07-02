@@ -519,6 +519,15 @@ struct ActiveControlCommand {
 }
 
 #[cfg(any(unix, windows))]
+impl Drop for ActiveControlCommand {
+    fn drop(&mut self) {
+        if !self.task.is_finished() {
+            self.task.abort();
+        }
+    }
+}
+
+#[cfg(any(unix, windows))]
 fn extract_complete_control_lines(buffer: &mut Vec<u8>) -> Vec<String> {
     let mut lines = Vec::new();
 

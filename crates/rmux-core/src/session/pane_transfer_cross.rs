@@ -189,8 +189,20 @@ impl Session {
             .map(Pane::index)
             .expect("moved pane must survive cross-session join");
         if let Some(requested_size) = requested_size {
-            let _ =
-                target_window.resize_pane_to(moved_pane_index, options.direction, requested_size);
+            if options.full_size {
+                let _ = target_window.resize_pane_to(
+                    moved_pane_index,
+                    options.direction,
+                    requested_size,
+                );
+            } else {
+                let _ = target_window.resize_new_split_pane_to(
+                    moved_pane_index,
+                    options.direction,
+                    requested_size,
+                    options.before,
+                );
+            }
         }
         if !options.detached {
             target_window.select_pane(moved_pane_index);

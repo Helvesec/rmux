@@ -38,6 +38,7 @@ impl PaneAlertCoalescer {
             .entry(key)
             .and_modify(|pending| {
                 pending.bell_count = pending.bell_count.saturating_add(event.bell_count);
+                pending.title_changed |= event.title_changed;
                 pending.queue_activity_alert |= event.queue_activity_alert;
             })
             .or_insert(event);
@@ -64,8 +65,17 @@ mod tests {
             session_name: rmux_proto::SessionName::new("alpha").expect("valid session name"),
             pane_id: PaneId::new(pane_id),
             bell_count,
+            title_changed: false,
             queue_activity_alert: true,
             generation,
+        }
+    }
+
+    fn title_event(pane_id: u32, generation: Option<u64>) -> PaneAlertEvent {
+        PaneAlertEvent {
+            title_changed: true,
+            queue_activity_alert: false,
+            ..alert_event(pane_id, generation, 0)
         }
     }
 
@@ -91,5 +101,21 @@ mod tests {
         assert_eq!(first.bell_count, 3);
         assert_eq!(second.bell_count, 4);
         assert!(state.push(alert_event(1, Some(8), 0)));
+    }
+
+    #[test]
+    fn pane_alert_callback_state_preserves_coalesced_title_changes() {
+        let mut state = PaneAlertCoalescer::default();
+
+        assert!(state.push(alert_event(1, Some(7), 0)));
+        assert!(!state.push(title_event(1, Some(7))));
+
+        let events = state.take_pending();
+        let first = events
+            .iter()
+            .find(|event| event.pane_id == PaneId::new(1))
+            .expect("first pane event");
+        assert!(first.title_changed);
+        assert!(first.queue_activity_alert);
     }
 }

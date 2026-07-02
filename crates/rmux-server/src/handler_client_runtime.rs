@@ -108,14 +108,13 @@ impl RequestHandler {
                 .map(|(&pid, active)| {
                     let outer_terminal =
                         OuterTerminal::resolve(&options, active.terminal_context.clone());
+                    let tty = attached_client_tty_path(pid)
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .unwrap_or_default();
                     ListClientSnapshot {
-                        name: attached_client_tty_path(pid)
-                            .map(|path| path.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| pid.to_string()),
+                        name: attached_client_name(pid),
                         pid,
-                        tty: attached_client_tty_path(pid)
-                            .map(|path| path.to_string_lossy().into_owned())
-                            .unwrap_or_default(),
+                        tty,
                         control: false,
                         session_name: Some(active.session_name.clone()),
                         order: active.id,
@@ -425,6 +424,12 @@ pub(in crate::handler) fn attached_client_matches_target(
 
 fn attached_client_tty_path(attach_pid: u32) -> Option<PathBuf> {
     rmux_os::process::fd_path(attach_pid, 0)
+}
+
+pub(in crate::handler) fn attached_client_name(attach_pid: u32) -> String {
+    attached_client_tty_path(attach_pid)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| attach_pid.to_string())
 }
 
 pub(in crate::handler) fn session_selection_prefers_live_process(pid: u32) -> bool {

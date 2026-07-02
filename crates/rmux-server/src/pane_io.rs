@@ -787,7 +787,7 @@ pub(crate) async fn forward_attach(
                             pane_refresh.schedule_now();
                         }
                         Some(AttachControl::Switch(next_target)) => {
-                            let next_target = coalesce_render_switches(
+                            let (next_target, switch_count) = coalesce_render_switches(
                                 next_target,
                                 &mut deferred_controls,
                                 attach_controls.as_mut(),
@@ -806,10 +806,11 @@ pub(crate) async fn forward_attach(
                                 persistent_overlay_state_id,
                                 next_target.as_ref(),
                             ) {
+                                render_generation = render_generation.saturating_add(switch_count);
                                 continue;
                             }
                             close_pane_output_after_refresh = false;
-                            render_generation = render_generation.saturating_add(1);
+                            render_generation = render_generation.saturating_add(switch_count);
                             pending_input.clear();
                             pending_escape_flush.clear();
                             clear_deferred_passthroughs_if_target_changed(

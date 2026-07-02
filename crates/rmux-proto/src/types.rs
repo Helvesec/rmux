@@ -511,6 +511,44 @@ pub enum ResizePaneAdjustment {
     },
     /// Trims lines below the cursor and pulls history into the viewport.
     TrimBelow,
+    /// Applies tmux's composed resize form: absolute width/height first, then
+    /// one prioritized relative direction.
+    Composite {
+        /// Optional absolute width in columns.
+        columns: Option<u16>,
+        /// Optional absolute height in rows.
+        rows: Option<u16>,
+        /// Optional relative direction applied after absolute dimensions.
+        relative: Option<ResizePaneRelativeDirection>,
+        /// Relative delta in cells when `relative` is present.
+        cells: u16,
+    },
+}
+
+/// Relative direction used by composed `resize-pane` requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResizePaneRelativeDirection {
+    /// Shrinks the pane height upward by a relative amount.
+    Up,
+    /// Grows the pane height downward by a relative amount.
+    Down,
+    /// Shrinks the pane width leftward by a relative amount.
+    Left,
+    /// Grows the pane width rightward by a relative amount.
+    Right,
+}
+
+impl ResizePaneRelativeDirection {
+    /// Converts this relative direction and delta into a regular adjustment.
+    #[must_use]
+    pub const fn to_adjustment(self, cells: u16) -> ResizePaneAdjustment {
+        match self {
+            Self::Up => ResizePaneAdjustment::Up { cells },
+            Self::Down => ResizePaneAdjustment::Down { cells },
+            Self::Left => ResizePaneAdjustment::Left { cells },
+            Self::Right => ResizePaneAdjustment::Right { cells },
+        }
+    }
 }
 
 fn parse_pane_index(target: &str, pane_index: &str) -> Result<u32, RmuxError> {

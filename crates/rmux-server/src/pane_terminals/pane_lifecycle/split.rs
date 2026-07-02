@@ -282,11 +282,12 @@ impl HandlerState {
             committed_index
         };
         if let Some(split_size) = split_size {
-            session.resize_pane_to_in_window(
+            session.resize_new_split_pane_to_in_window(
                 target_window_index,
                 committed_index,
                 direction,
                 split_size,
+                before,
             )?;
         }
         let pane = session

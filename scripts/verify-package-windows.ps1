@@ -4,6 +4,8 @@ param(
     [string]$Checksums = "",
     [switch]$RunBinary,
     [switch]$RunDaemonSmoke,
+    [switch]$RunSdkSmoke,
+    [switch]$RunMouseBorderSmoke,
     [switch]$RequireReleaseArtifact
 )
 
@@ -80,6 +82,17 @@ function AssertHelperFallback([string]$Binary) {
     }
 }
 
+function AssertDaemonBinary([string]$Binary) {
+    $result = Invoke-NativeCapture $Binary @("--help")
+    $output = $result.Output
+    if ($result.Status -ne 1) {
+        Fail "daemon helper returned unexpected exit code $($result.Status): $Binary --help`n$output"
+    }
+    if (($output -join "`n") -notmatch 'rmux-daemon is internal') {
+        Fail "daemon helper did not report the internal-launch contract: $Binary --help`n$output"
+    }
+}
+
 function NewPortableAliasSmoke([string]$Binary, [string]$Root) {
     $links = Join-Path $Root "winget-links"
     New-Item -ItemType Directory -Force -Path $links | Out-Null
@@ -108,6 +121,91 @@ function InvokeWithPathPrefix([string]$Directory, [scriptblock]$Body) {
         & $Body
     } finally {
         $env:Path = $previousPath
+    }
+}
+
+function InvokeWithPackageOnlyPath([string]$PackageRoot, [scriptblock]$Body) {
+    $previousPath = $env:Path
+    $systemRoot = if ($env:SystemRoot) { $env:SystemRoot } else { "C:\Windows" }
+    $system32 = Join-Path $systemRoot "System32"
+    $pathEntries = @(
+        $PackageRoot,
+        (Join-Path $PackageRoot "libexec\rmux"),
+        $system32,
+        $systemRoot,
+        (Join-Path $system32 "WindowsPowerShell\v1.0")
+    )
+    try {
+        $env:Path = ($pathEntries -join [System.IO.Path]::PathSeparator)
+        & $Body
+    } finally {
+        $env:Path = $previousPath
+    }
+}
+
+function Get-FreeTcpPort {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    try {
+        $listener.Start()
+        return $listener.LocalEndpoint.Port
+    } finally {
+        $listener.Stop()
+    }
+}
+
+function AssertOutputContains([object[]]$Output, [string]$Needle, [string]$Context) {
+    $text = $Output -join "`n"
+    if ($text -notmatch [regex]::Escape($Needle)) {
+        Fail "$Context did not contain '$Needle'`n$text"
+    }
+}
+
+function InvokeSdkWindowsSmoke([string]$Binary) {
+    $previousBinary = $env:RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN
+    try {
+        $env:RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN = [System.IO.Path]::GetFullPath($Binary)
+        & cargo @(
+            "test",
+            "--locked",
+            "-p",
+            "rmux-sdk",
+            "--test",
+            "smoke_v1_windows",
+            "daemon_backed_sdk_windows_happy_path_uses_named_pipe_and_cleans_daemon"
+        )
+        if ($LASTEXITCODE -ne 0) {
+            Fail "Windows SDK package smoke failed with exit code $LASTEXITCODE"
+        }
+    } finally {
+        if ($null -eq $previousBinary) {
+            Remove-Item Env:\RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN -ErrorAction SilentlyContinue
+        } else {
+            $env:RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN = $previousBinary
+        }
+    }
+}
+
+function InvokeMouseBorderSmoke([string]$Binary) {
+    $previousBinary = $env:RMUX_MOUSE_BORDER_RMUX_BIN
+    try {
+        $env:RMUX_MOUSE_BORDER_RMUX_BIN = [System.IO.Path]::GetFullPath($Binary)
+        & cargo @(
+            "test",
+            "--locked",
+            "-p",
+            "rmux",
+            "--test",
+            "windows_mouse_border_resize"
+        )
+        if ($LASTEXITCODE -ne 0) {
+            Fail "Windows mouse border package smoke failed with exit code $LASTEXITCODE"
+        }
+    } finally {
+        if ($null -eq $previousBinary) {
+            Remove-Item Env:\RMUX_MOUSE_BORDER_RMUX_BIN -ErrorAction SilentlyContinue
+        } else {
+            $env:RMUX_MOUSE_BORDER_RMUX_BIN = $previousBinary
+        }
     }
 }
 
@@ -225,11 +323,18 @@ try {
     if ($RunBinary) {
         AssertSuccess $binary @("-V") | Out-Null
         AssertHelperFallback $binary
+        AssertSuccess $helperBinary @("-V") | Out-Null
+        AssertDaemonBinary $daemonBinary
         AssertSuccess $binary @("diagnose", "--json") | Out-Null
         AssertSuccess $portableAlias.Binary @("-V") | Out-Null
         AssertHelperFallback $portableAlias.Binary
         AssertSuccess $portableAlias.Binary @("diagnose", "--json") | Out-Null
         InvokeWithPathPrefix $portableAlias.Directory {
+            AssertHelperFallback "rmux"
+            AssertSuccess "rmux" @("diagnose", "--json") | Out-Null
+        }
+        InvokeWithPackageOnlyPath $packageRoot {
+            AssertSuccess "rmux" @("-V") | Out-Null
             AssertHelperFallback "rmux"
             AssertSuccess "rmux" @("diagnose", "--json") | Out-Null
         }
@@ -250,11 +355,23 @@ try {
     if ($RunDaemonSmoke) {
         $label = "package-smoke-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
         try {
+            $webPort = Get-FreeTcpPort
+            AssertSuccessNoCapture $binary @("-L", $label, "start-server", "--web-port", "$webPort")
             AssertSuccessNoCapture $binary @("-L", $label, "new-session", "-d", "-s", "package_smoke", "cmd.exe", "/d", "/q", "/k")
             $sessions = AssertSuccess $binary @("-L", $label, "list-sessions", "-F", "#{session_name}")
             if (($sessions -join "`n") -notmatch 'package_smoke') {
                 Fail "daemon smoke did not list package_smoke session"
             }
+            $sourceFile = Join-Path $tmpRoot "package-source.conf"
+            Set-Content -LiteralPath $sourceFile -Encoding ASCII -Value "set -g status off"
+            AssertSuccessNoCapture $binary @("-L", $label, "source-file", $sourceFile)
+            $status = AssertSuccess $binary @("-L", $label, "show-options", "-gv", "status")
+            AssertOutputContains $status "off" "package source-file smoke"
+            $webShare = AssertSuccess $binary @("-L", $label, "web-share", "-t", "package_smoke", "--no-pin", "--ttl", "30")
+            AssertOutputContains $webShare "http" "package web-share smoke"
+            $webList = AssertSuccess $binary @("-L", $label, "web-share", "list")
+            AssertOutputContains $webList "package_smoke" "package web-share list smoke"
+            AssertSuccessNoCapture $binary @("-L", $label, "web-share", "off")
         } finally {
             & $binary "-L" $label "kill-server" | Out-Null
         }
@@ -293,6 +410,14 @@ try {
         }
     }
 
+    if ($RunSdkSmoke) {
+        InvokeSdkWindowsSmoke $binary
+    }
+
+    if ($RunMouseBorderSmoke) {
+        InvokeMouseBorderSmoke $binary
+    }
+
     Write-Output "archive=$archiveFull"
     Write-Output "sha256=$actualHash"
     Write-Output "binary_sha256=$packagedBinaryHash"
@@ -300,6 +425,8 @@ try {
     Write-Output "daemon_binary_sha256=$packagedDaemonHash"
     Write-Output "run_binary=$($RunBinary.ToString().ToLowerInvariant())"
     Write-Output "run_daemon_smoke=$($RunDaemonSmoke.ToString().ToLowerInvariant())"
+    Write-Output "run_sdk_smoke=$($RunSdkSmoke.ToString().ToLowerInvariant())"
+    Write-Output "run_mouse_border_smoke=$($RunMouseBorderSmoke.ToString().ToLowerInvariant())"
     Write-Output "require_release_artifact=$($RequireReleaseArtifact.ToString().ToLowerInvariant())"
 } finally {
     Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue

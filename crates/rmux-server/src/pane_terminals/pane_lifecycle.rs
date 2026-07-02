@@ -586,8 +586,8 @@ impl HandlerState {
         if let Some(pipe) = self.remove_pane_pipe(&runtime_session_name, pane_id) {
             pipe.stop();
         }
-        if let Some(mut terminal) = self.terminals.remove_pane(&runtime_session_name, pane_id) {
-            terminal.terminate_with_bounded_grace();
+        if let Some(terminal) = self.terminals.remove_pane(&runtime_session_name, pane_id) {
+            terminal.terminate_in_background();
             if pane_was_alive {
                 on_replaced_active_pane(
                     self,
@@ -644,8 +644,8 @@ impl HandlerState {
 fn terminate_removed_terminals(
     terminals: &mut std::collections::HashMap<PaneId, crate::pane_terminal_process::PaneTerminal>,
 ) {
-    for terminal in terminals.values_mut() {
-        terminal.terminate_with_bounded_grace();
+    for terminal in terminals.drain().map(|(_, terminal)| terminal) {
+        terminal.terminate_in_background();
     }
 }
 

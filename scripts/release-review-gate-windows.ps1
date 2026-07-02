@@ -2,12 +2,34 @@ param(
     [string]$OutputDir = "target\release-review-gate-windows",
     [string]$TargetDir = "target\release-review-gate-windows-cargo",
     [switch]$SkipPackage,
-    [switch]$SkipClippy
+    [switch]$SkipClippy,
+    [switch]$RunCtrlMatrixSmoke
 )
 
 $ErrorActionPreference = "Stop"
 
 $env:CARGO_TARGET_DIR = $TargetDir
+if (-not $env:CARGO_INCREMENTAL) {
+    $env:CARGO_INCREMENTAL = "0"
+}
+if (-not $env:CARGO_BUILD_JOBS) {
+    $env:CARGO_BUILD_JOBS = "1"
+}
+if (-not $env:CARGO_PROFILE_DEV_DEBUG) {
+    $env:CARGO_PROFILE_DEV_DEBUG = "0"
+}
+if (-not $env:CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG) {
+    $env:CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG = "0"
+}
+if (-not $env:CARGO_PROFILE_TEST_DEBUG) {
+    $env:CARGO_PROFILE_TEST_DEBUG = "0"
+}
+$pdbSuppressFlag = "-Clink-arg=/DEBUG:NONE"
+if (-not $env:RUSTFLAGS) {
+    $env:RUSTFLAGS = $pdbSuppressFlag
+} elseif ($env:RUSTFLAGS -notlike "*$pdbSuppressFlag*") {
+    $env:RUSTFLAGS = "$env:RUSTFLAGS $pdbSuppressFlag"
+}
 
 function Step([string]$Name, [scriptblock]$Body) {
     Write-Host ""
@@ -134,6 +156,12 @@ function Check-CfgBudgets {
 
 Step "release versions" { Check-ReleaseVersions }
 Write-Host "cargo-target-dir=$env:CARGO_TARGET_DIR"
+Write-Host "cargo-incremental=$env:CARGO_INCREMENTAL"
+Write-Host "cargo-build-jobs=$env:CARGO_BUILD_JOBS"
+Write-Host "cargo-profile-dev-debug=$env:CARGO_PROFILE_DEV_DEBUG"
+Write-Host "cargo-profile-dev-build-override-debug=$env:CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG"
+Write-Host "cargo-profile-test-debug=$env:CARGO_PROFILE_TEST_DEBUG"
+Write-Host "rustflags=$env:RUSTFLAGS"
 Step "formatting" { Run "cargo" @("fmt", "--all", "--check") }
 Step "platform cfg budget" { Check-CfgBudgets }
 
@@ -149,8 +177,35 @@ Step "tiny parser and boundary tests" {
 Step "mutating target-action retry tests" {
     Run "cargo" @("test", "-p", "rmux", "--bin", "rmux", "--locked", "target_action_retry_is_limited")
 }
+Step "server lib tests" {
+    Run "cargo" @("test", "-p", "rmux-server", "--lib", "--locked", "--", "--test-threads=1")
+}
+Step "SDK lib tests" {
+    Run "cargo" @("test", "-p", "rmux-sdk", "--lib", "--locked", "--", "--test-threads=1")
+}
+Step "CLI acceptance matrix" {
+    Run "cargo" @("test", "--locked", "--test", "acceptance_cli_matrix", "--", "--test-threads=1")
+}
+Step "source/config acceptance matrix" {
+    Run "cargo" @("test", "--locked", "--test", "acceptance_source_config_matrix", "--", "--test-threads=1")
+}
+Step "target/format acceptance matrix" {
+    Run "cargo" @("test", "--locked", "--test", "acceptance_target_format_matrix", "--", "--test-threads=1")
+}
+Step "Windows attach stream queue regressions" {
+    Run "cargo" @("test", "-p", "rmux-client", "--locked", "output_writer_failure_wakes", "--", "--test-threads=1")
+    Run "cargo" @("test", "-p", "rmux-client", "--locked", "blocked_console_output_does_not_block_input_forwarding", "--", "--test-threads=1")
+    Run "cargo" @("test", "-p", "rmux-client", "--locked", "output_backpressure_keeps_local_input_and_resize_live", "--", "--test-threads=1")
+}
+Step "Windows Ctrl matrix spec" {
+    Run "powershell" @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\windows_ctrl_matrix.ps1", "-StaticMatrixSpec")
+    Run "cargo" @("test", "--locked", "-p", "rmux", "--test", "windows_ctrl_matrix_spec", "--", "--test-threads=1")
+}
 Step "Windows attach exit probes" {
-    Run "cargo" @("test", "--locked", "-p", "rmux", "--test", "windows_attach_exit")
+    Run "cargo" @("test", "--locked", "-p", "rmux", "--test", "windows_attach_exit", "--", "--test-threads=1")
+}
+Step "Windows mouse border resize probes" {
+    Run "cargo" @("test", "--locked", "-p", "rmux", "--test", "windows_mouse_border_resize", "--", "--test-threads=1")
 }
 Step "Windows daemon integration" {
     Run "cargo" @("test", "--locked", "-p", "rmux", "--test", "internal_daemon_windows")
@@ -185,7 +240,28 @@ if (-not $SkipPackage) {
             "-File",
             "scripts\verify-package-windows.ps1",
             "-Archive",
-            $archive
+            $archive,
+            "-RunBinary",
+            "-RunDaemonSmoke",
+            "-RunSdkSmoke",
+            "-RunMouseBorderSmoke",
+            "-RequireReleaseArtifact"
+        )
+    }
+}
+
+if ($RunCtrlMatrixSmoke) {
+    Step "Windows Ctrl matrix portable smoke" {
+        $rmux = Join-Path $TargetDir "x86_64-pc-windows-msvc\release\rmux.exe"
+        Run "powershell" @(
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            "scripts\windows_ctrl_matrix.ps1",
+            "-Rmux",
+            $rmux,
+            "-PortableSmokeOnly"
         )
     }
 }

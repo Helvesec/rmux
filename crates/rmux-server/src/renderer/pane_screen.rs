@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use rmux_core::input::mode;
 use rmux_core::style::{Style, StyleCell};
 use rmux_core::{
     text_width as tmux_text_width, GridRenderOptions, OptionStore, Pane, Screen,
@@ -14,6 +15,43 @@ pub(crate) fn render_pane_screen(
     options: &OptionStore,
     pane: &Pane,
     screen: &Screen,
+) -> Vec<u8> {
+    render_pane_screen_with_cursor_restore(
+        session,
+        options,
+        pane,
+        screen,
+        PaneScreenCursorRestore::Pane,
+    )
+}
+
+pub(crate) fn render_pane_screen_preserving_prompt_cursor(
+    session: &Session,
+    options: &OptionStore,
+    pane: &Pane,
+    screen: &Screen,
+) -> Vec<u8> {
+    render_pane_screen_with_cursor_restore(
+        session,
+        options,
+        pane,
+        screen,
+        PaneScreenCursorRestore::Prompt,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum PaneScreenCursorRestore {
+    Pane,
+    Prompt,
+}
+
+fn render_pane_screen_with_cursor_restore(
+    session: &Session,
+    options: &OptionStore,
+    pane: &Pane,
+    screen: &Screen,
+    cursor_restore: PaneScreenCursorRestore,
 ) -> Vec<u8> {
     let _render_span = crate::perf_instrument::span("render_compose")
         .with_str("site", "pane_screen")
@@ -49,7 +87,7 @@ pub(crate) fn render_pane_screen(
             .saturating_add(usize::from(pane_geometry.rows()).saturating_mul(20))
             .saturating_add(32),
     );
-    frame.extend_from_slice(b"\x1b[s\x1b[0m");
+    frame.extend_from_slice(b"\x1b[s\x1b[?25l\x1b[0m");
     for row in 0..usize::from(pane_geometry.rows()) {
         let line = rendered_lines.get(row).copied().unwrap_or_default();
         let line = truncate_rendered_pane_line(line, usize::from(pane_geometry.cols()), &utf8);
@@ -73,6 +111,34 @@ pub(crate) fn render_pane_screen(
         }
     }
     frame.extend_from_slice(b"\x1b[0m\x1b[u");
+    match cursor_restore {
+        PaneScreenCursorRestore::Pane => frame.extend_from_slice(
+            final_pane_cursor_state(screen, pane_geometry, geometry.content_y_offset).as_slice(),
+        ),
+        PaneScreenCursorRestore::Prompt => frame.extend_from_slice(b"\x1b[?25h"),
+    }
+    frame
+}
+
+fn final_pane_cursor_state(
+    screen: &Screen,
+    pane_geometry: rmux_core::PaneGeometry,
+    content_y_offset: u16,
+) -> Vec<u8> {
+    let (cursor_x, cursor_y) = screen.cursor_position();
+    let x = pane_geometry
+        .x()
+        .saturating_add(cursor_x.min(u32::from(pane_geometry.cols().saturating_sub(1))) as u16);
+    let y = pane_geometry
+        .y()
+        .saturating_add(content_y_offset)
+        .saturating_add(cursor_y.min(u32::from(pane_geometry.rows().saturating_sub(1))) as u16);
+    let mut frame = cursor_position_bytes(y, x);
+    if screen.mode() & mode::MODE_CURSOR == 0 {
+        frame.extend_from_slice(b"\x1b[?25l");
+    } else {
+        frame.extend_from_slice(b"\x1b[?25h");
+    }
     frame
 }
 

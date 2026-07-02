@@ -1201,10 +1201,18 @@ fn run_attach_session(
     let attach_windows_console_key = connection
         .supports_capability(CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY)
         .map_err(|error| error.to_string())?;
-    let transition = if attach_render {
+    let mut attach_capabilities = Vec::new();
+    if attach_render {
+        attach_capabilities.push(CAPABILITY_ATTACH_RENDER.to_owned());
+    }
+    #[cfg(windows)]
+    if attach_windows_console_key {
+        attach_capabilities.push(CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY.to_owned());
+    }
+    let transition = if !attach_capabilities.is_empty() {
         connection.begin_attach_with_capabilities(AttachSessionExt3Request::from_ext2(
             request,
-            vec![CAPABILITY_ATTACH_RENDER.to_owned()],
+            attach_capabilities,
         ))
     } else {
         connection.begin_attach_with_target_spec(request)

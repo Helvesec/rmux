@@ -110,6 +110,23 @@ fn move_window_accepts_source_destination_and_kill_flags() {
 }
 
 #[test]
+fn move_window_placement_flags_follow_tmux_priority() {
+    for argv in [
+        ["move-window", "-a", "-b", "-s", "alpha:2", "-t", "beta:5"],
+        ["move-window", "-b", "-a", "-s", "alpha:2", "-t", "beta:5"],
+    ] {
+        let cli = parse_args(&argv).unwrap();
+        match cli.command.expect("parsed command") {
+            super::super::Command::MoveWindow(args) => {
+                assert!(!args.after);
+                assert!(args.before);
+            }
+            _ => panic!("expected MoveWindow command"),
+        }
+    }
+}
+
+#[test]
 fn move_window_accepts_implicit_source_and_relative_destination() {
     let cli = parse_args(&["move-window", "-t", "-1"]).unwrap();
 

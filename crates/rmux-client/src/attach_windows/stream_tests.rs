@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use rmux_proto::{
     encode_attach_message, AttachFrameDecoder, AttachMessage, AttachShellCommand,
-    AttachedKeystroke, AttachedWindowsConsoleKey,
+    AttachedKeystroke, AttachedWindowsConsoleKey, TerminalSize,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -318,6 +318,217 @@ async fn render_frames_flush_while_stream_stays_busy() -> Result<(), Box<dyn std
 }
 
 #[tokio::test]
+async fn blocked_console_output_does_not_block_input_forwarding(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, mut server) = tokio::io::duplex(4096);
+    let (reader, writer) = tokio::io::split(client_stream);
+    let (input_tx, input_rx) = mpsc::channel(8);
+    let (resize_tx, resize_rx) = mpsc::unbounded_channel();
+    let locked = Arc::new(AttachLockState::default());
+    let actions = RecordingActions::default();
+    let client_actions = actions.clone();
+    let (action_tx, action_rx) = std::sync::mpsc::channel();
+    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let action_worker: std::thread::JoinHandle<std::result::Result<(), crate::ClientError>> =
+        std::thread::spawn(move || {
+            let mut actions = client_actions;
+            while let Ok(action) = action_rx.recv() {
+                if completion_tx
+                    .send(run_attach_action(&mut actions, action))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        });
+    let (output, write_started_rx, release_tx) = BlockingOutput::new();
+    let client = tokio::spawn(async move {
+        drive_async_attach(
+            reader,
+            writer,
+            Vec::new(),
+            output,
+            AttachScreenTracker::default(),
+            AttachAsyncChannels::new(input_rx, resize_rx, action_tx, completion_rx, locked, true),
+        )
+        .await
+    });
+
+    write_server_message(&mut server, AttachMessage::Data(b"blocked".to_vec())).await?;
+    wait_for_blocking_output_start(write_started_rx).await?;
+    input_tx
+        .send(super::super::input::AttachInput::bytes(
+            b"still-live".to_vec(),
+        ))
+        .await
+        .expect("send input while output is blocked");
+
+    assert_eq!(
+        read_client_message(&mut server).await?,
+        AttachMessage::Keystroke(AttachedKeystroke::new(b"still-live".to_vec()))
+    );
+
+    resize_tx
+        .send(TerminalSize::new(120, 40))
+        .expect("send resize while output is blocked");
+    assert_eq!(
+        read_client_message(&mut server).await?,
+        AttachMessage::Resize(TerminalSize::new(120, 40))
+    );
+
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    actions
+        .wait_for_call("detach-kill", Duration::from_secs(1))
+        .await?;
+
+    release_tx.send(()).expect("release blocked output");
+    timeout(client).await???;
+    action_worker
+        .join()
+        .map_err(|_| io::Error::other("action worker panicked"))??;
+    assert_eq!(actions.calls(), vec!["detach-kill"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn output_backpressure_keeps_local_input_and_resize_live(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, mut server) = tokio::io::duplex(8192);
+    let (reader, writer) = tokio::io::split(client_stream);
+    let (input_tx, input_rx) = mpsc::channel(8);
+    let (resize_tx, resize_rx) = mpsc::unbounded_channel();
+    let locked = Arc::new(AttachLockState::default());
+    let actions = RecordingActions::default();
+    let client_actions = actions.clone();
+    let (action_tx, action_rx) = std::sync::mpsc::channel();
+    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let action_worker: std::thread::JoinHandle<std::result::Result<(), crate::ClientError>> =
+        std::thread::spawn(move || {
+            let mut actions = client_actions;
+            while let Ok(action) = action_rx.recv() {
+                if completion_tx
+                    .send(run_attach_action(&mut actions, action))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        });
+    let (output, write_started_rx, release_tx) = BlockingOutput::new();
+    let client = tokio::spawn(async move {
+        drive_async_attach(
+            reader,
+            writer,
+            Vec::new(),
+            output,
+            AttachScreenTracker::default(),
+            AttachAsyncChannels::new(input_rx, resize_rx, action_tx, completion_rx, locked, true),
+        )
+        .await
+    });
+
+    write_server_message(&mut server, AttachMessage::Data(b"blocked".to_vec())).await?;
+    wait_for_blocking_output_start(write_started_rx).await?;
+    for index in 0..(ATTACH_OUTPUT_QUEUE_CAPACITY + 8) {
+        write_server_message(
+            &mut server,
+            AttachMessage::Data(format!("queued-{index}\n").into_bytes()),
+        )
+        .await?;
+    }
+
+    input_tx
+        .send(super::super::input::AttachInput::bytes(
+            b"backpressure-input".to_vec(),
+        ))
+        .await
+        .expect("send input while output queue is backpressured");
+    assert_eq!(
+        read_client_message(&mut server).await?,
+        AttachMessage::Keystroke(AttachedKeystroke::new(b"backpressure-input".to_vec()))
+    );
+
+    resize_tx
+        .send(TerminalSize::new(132, 43))
+        .expect("send resize while output queue is backpressured");
+    assert_eq!(
+        read_client_message(&mut server).await?,
+        AttachMessage::Resize(TerminalSize::new(132, 43))
+    );
+
+    release_tx.send(()).expect("release blocked output");
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    timeout(client).await???;
+    action_worker
+        .join()
+        .map_err(|_| io::Error::other("action worker panicked"))??;
+    assert!(actions.calls().contains(&"detach-kill".to_owned()));
+    Ok(())
+}
+
+#[test]
+fn attach_output_queue_rejects_oversized_frame_without_poisoning_budget() {
+    let mut queue = AttachOutputQueue::spawn(SharedOutput::default());
+    queue.pending_bytes = ATTACH_OUTPUT_PENDING_MAX_BYTES - 1;
+
+    let error = queue
+        .write_frame(vec![b'x'; 2])
+        .expect_err("frame that exceeds the pending byte budget must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("attach output writer is blocked and queued more than"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        queue.pending_bytes,
+        ATTACH_OUTPUT_PENDING_MAX_BYTES - 1,
+        "a rejected frame must not consume pending byte budget"
+    );
+    assert!(
+        queue.pending.is_empty(),
+        "a rejected frame must not be queued for the writer thread"
+    );
+}
+
+#[tokio::test]
+async fn output_writer_failure_wakes_attach_loop_while_server_is_idle(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, mut server) = tokio::io::duplex(4096);
+    let (reader, writer) = tokio::io::split(client_stream);
+    let (_input_tx, input_rx) = mpsc::channel(8);
+    let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
+    let locked = Arc::new(AttachLockState::default());
+    let (action_tx, _action_rx) = std::sync::mpsc::channel();
+    let (_completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let client = tokio::spawn(async move {
+        drive_async_attach(
+            reader,
+            writer,
+            Vec::new(),
+            FailingOutput,
+            AttachScreenTracker::default(),
+            AttachAsyncChannels::new(input_rx, resize_rx, action_tx, completion_rx, locked, true),
+        )
+        .await
+    });
+
+    write_server_message(&mut server, AttachMessage::Data(b"broken".to_vec())).await?;
+    let error = timeout(client)
+        .await??
+        .expect_err("output write failure must fail attach");
+    match error {
+        ClientError::Io(error) => assert_eq!(error.kind(), io::ErrorKind::BrokenPipe),
+        other => panic!("expected BrokenPipe output error, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn mouse_sequences_toggle_windows_console_mouse_actions(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut scenario = AttachScenario::new(RecordingActions::default());
@@ -544,6 +755,71 @@ impl Write for SharedOutput {
     }
 }
 
+#[derive(Debug)]
+struct BlockingOutput {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    write_started_tx: Option<std::sync::mpsc::Sender<()>>,
+    release_rx: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+impl BlockingOutput {
+    fn new() -> (
+        Self,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (write_started_tx, write_started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        (
+            Self {
+                bytes: Arc::new(Mutex::new(Vec::new())),
+                write_started_tx: Some(write_started_tx),
+                release_rx: Some(release_rx),
+            },
+            write_started_rx,
+            release_tx,
+        )
+    }
+}
+
+impl Write for BlockingOutput {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if let Some(write_started_tx) = self.write_started_tx.take() {
+            let _ = write_started_tx.send(());
+        }
+        if let Some(release_rx) = self.release_rx.take() {
+            release_rx
+                .recv()
+                .map_err(|_| io::Error::other("blocking output release sender dropped"))?;
+        }
+        self.bytes
+            .lock()
+            .map_err(|_| io::Error::other("output mutex poisoned"))?
+            .extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct FailingOutput;
+
+impl Write for FailingOutput {
+    fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "injected output failure",
+        ))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct RecordingActions {
     calls: Arc<Mutex<Vec<String>>>,
@@ -659,6 +935,25 @@ async fn read_client_message(
         if let Some(message) = decoder.next_message()? {
             return Ok(message);
         }
+    }
+}
+
+async fn wait_for_blocking_output_start(
+    rx: std::sync::mpsc::Receiver<()>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        match rx.try_recv() {
+            Ok(()) => return Ok(()),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err("blocking output ended before first write".into());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("timed out waiting for blocking output write".into());
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 

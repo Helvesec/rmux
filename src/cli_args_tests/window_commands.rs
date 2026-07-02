@@ -65,6 +65,23 @@ fn new_window_accepts_kill_and_select_existing_flags() {
 }
 
 #[test]
+fn new_window_placement_flags_follow_tmux_priority() {
+    for argv in [
+        ["new-window", "-a", "-b", "-t", "alpha"],
+        ["new-window", "-b", "-a", "-t", "alpha"],
+    ] {
+        let cli = parse_args(&argv).unwrap();
+        match cli.command.expect("parsed command") {
+            super::super::Command::NewWindow(args) => {
+                assert!(!args.after);
+                assert!(args.before);
+            }
+            _ => panic!("expected NewWindow command"),
+        }
+    }
+}
+
+#[test]
 fn respawn_window_accepts_directory_environment_and_command() {
     let cli = parse_args(&[
         "respawn-window",
@@ -169,6 +186,24 @@ fn select_window_accepts_navigation_and_toggle_flags() {
                 assert_eq!(args.next, expect_next);
                 assert_eq!(args.previous, expect_previous);
                 assert_eq!(args.toggle_last, expect_toggle);
+            }
+            _ => panic!("expected SelectWindow command"),
+        }
+    }
+}
+
+#[test]
+fn select_window_navigation_flags_follow_tmux_priority() {
+    for argv in [
+        ["select-window", "-n", "-p", "-t", "alpha:1"],
+        ["select-window", "-p", "-n", "-t", "alpha:1"],
+    ] {
+        let cli = parse_args(&argv).unwrap();
+        match cli.command.expect("parsed command") {
+            super::super::Command::SelectWindow(args) => {
+                assert!(args.next);
+                assert!(!args.previous);
+                assert!(!args.last);
             }
             _ => panic!("expected SelectWindow command"),
         }
@@ -630,12 +665,16 @@ fn resize_pane_accepts_mouse_and_trim_flags() {
 }
 
 #[test]
-fn resize_pane_trim_flag_rejects_size_flags() {
-    let error = parse_args(&["resize-pane", "-T", "-y", "5", "-t", "alpha:0.0"]).unwrap_err();
+fn resize_pane_trim_flag_accepts_size_flags_like_tmux() {
+    let cli = parse_args(&["resize-pane", "-T", "-y", "5", "-t", "alpha:0.0"]).unwrap();
 
-    assert!(error.to_string().contains(
-        "resize-pane accepts only one relative adjustment, trim, zoom, or absolute size"
-    ));
+    match cli.command.expect("parsed command") {
+        super::super::Command::ResizePane(args) => {
+            assert!(args.trim_below);
+            assert!(args.rows.is_some());
+        }
+        other => panic!("expected ResizePane command, got {other:?}"),
+    }
 }
 
 #[test]
@@ -753,12 +792,12 @@ fn resize_pane_accepts_tmux_style_space_separated_direction_delta() {
 }
 
 #[test]
-fn resize_pane_valueless_relative_before_absolute_follows_tmux_last_wins() {
+fn resize_pane_valueless_relative_before_absolute_composes_like_tmux() {
     let cli = parse_args(&["resize-pane", "-U", "-x", "10"]).unwrap();
 
     match cli.command.expect("parsed command") {
         super::super::Command::ResizePane(args) => {
-            assert_eq!(args.up, None);
+            assert_eq!(args.up, Some(1));
             assert_eq!(args.columns, Some(super::super::ResizePaneSize::Cells(10)));
         }
         other => panic!("expected ResizePane command, got {other:?}"),

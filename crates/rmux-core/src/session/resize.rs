@@ -41,6 +41,22 @@ impl Session {
                 let _ = window.resize_pane_width(pane_index, columns);
                 let _ = window.resize_pane_height(pane_index, rows);
             }
+            ResizePaneAdjustment::Composite {
+                columns,
+                rows,
+                relative,
+                cells,
+            } => {
+                if let Some(columns) = columns {
+                    let _ = window.resize_pane_width(pane_index, columns);
+                }
+                if let Some(rows) = rows {
+                    let _ = window.resize_pane_height(pane_index, rows);
+                }
+                if let Some(relative) = relative {
+                    let _ = window.resize_pane_by(pane_index, relative.to_adjustment(cells));
+                }
+            }
             ResizePaneAdjustment::Up { cells } => {
                 let _ = window.resize_pane_by(pane_index, ResizePaneAdjustment::Up { cells });
             }
@@ -72,6 +88,32 @@ impl Session {
             .window_at_mut(window_index)
             .expect("addressed session window must exist");
         let _ = window.resize_pane_to(pane_index, direction, size.max(1));
+        Ok(())
+    }
+
+    /// Resizes the newly split pane while keeping the adjustment inside the
+    /// original target pane cell. Plain `resize_pane_to` follows tmux's normal
+    /// border-selection rules and may borrow size from the next sibling when a
+    /// pane is not last. For `split-window -l`, tmux instead sizes the new pane
+    /// against the pane it just split, leaving unrelated neighbours untouched.
+    pub fn resize_new_split_pane_to_in_window(
+        &mut self,
+        window_index: u32,
+        new_pane_index: u32,
+        direction: SplitDirection,
+        size: u32,
+        inserted_before_target: bool,
+    ) -> Result<(), RmuxError> {
+        self.ensure_resize_target(window_index, new_pane_index)?;
+        let window = self
+            .window_at_mut(window_index)
+            .expect("addressed session window must exist");
+        let _ = window.resize_new_split_pane_to(
+            new_pane_index,
+            direction,
+            size,
+            inserted_before_target,
+        );
         Ok(())
     }
 

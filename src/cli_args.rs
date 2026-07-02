@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use clap::{ArgAction, Args, CommandFactory, FromArgMatches, Parser};
-use rmux_core::command_parser::{CommandEntry, ParsedCommands, COMMAND_TABLE};
+use rmux_core::{
+    command_parser::{CommandEntry, ParsedCommands, COMMAND_TABLE},
+    tmux_precedence,
+};
 
 #[cfg(test)]
 use rmux_core::command_parser::CommandParser as TmuxCommandParser;
@@ -70,8 +73,6 @@ use targets::{parse_session_name, parse_target};
 pub(crate) use targets::{parse_target_spec, TargetSpec};
 #[path = "cli_args/pane.rs"]
 mod pane;
-#[path = "cli_args/tmux_last_wins.rs"]
-mod tmux_last_wins;
 use pane::{
     parse_join_pane_args, parse_resize_pane_args, parse_select_layout_args, parse_select_pane_args,
     parse_split_window_args,
@@ -441,7 +442,7 @@ where
             .help("Print help"),
     );
     let arguments = normalize_attached_short_values(&command, arguments);
-    let arguments = tmux_last_wins::normalize(command_name, arguments);
+    let arguments = tmux_precedence::normalize_tmux_precedence(command_name, arguments);
     validate_options_before_positionals(command_name, &command, &arguments)?;
     let matches = command.try_get_matches_from(arguments)?;
     T::from_arg_matches(&matches)

@@ -1,5 +1,6 @@
 use std::io;
 
+use rmux_core::LifecycleEvent;
 use rmux_proto::{RmuxError, TerminalGeometry, TerminalSize};
 
 use super::pane_support::retain_partial_attached_control_input;
@@ -8,7 +9,6 @@ use super::scripting_support::{QueueCommandAction, QueueExecutionContext};
 use super::RequestHandler;
 use crate::input_keys::{decode_mouse, MouseDecode};
 use crate::pane_io::{AttachControl, OverlayFrame};
-use crate::pane_terminals::session_not_found;
 
 #[path = "handler_overlay/commands.rs"]
 mod commands;
@@ -200,24 +200,34 @@ impl RequestHandler {
         }
 
         let mut close_overlay = false;
-        let (resized_session, mode_tree_zoom_target) = {
+        let (resized_session, ignores_size, client_size_changed) = {
             let mut active_attach = self.active_attach.lock().await;
-            let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
+            let Some(active) = active_attach.by_pid.get(&attach_pid) else {
                 return Ok(());
             };
-            if active
+            let ignores_size = active
                 .flags
-                .contains(super::attach_support::ClientFlags::IGNORESIZE)
-            {
-                return Ok(());
+                .contains(super::attach_support::ClientFlags::IGNORESIZE);
+            let client_size_changed = active.client_size != size;
+            let geometry_changed = client_size_changed || active.client_pixels != geometry.pixels;
+            let size_sequence = if geometry_changed {
+                let size_sequence = active_attach.next_size_sequence;
+                active_attach.next_size_sequence =
+                    active_attach.next_size_sequence.saturating_add(1);
+                Some(size_sequence)
+            } else {
+                None
+            };
+            let active = active_attach
+                .by_pid
+                .get_mut(&attach_pid)
+                .expect("attached client checked above");
+            if let Some(size_sequence) = size_sequence {
+                active.client_size = size;
+                active.client_pixels = geometry.pixels;
+                active.size_sequence = size_sequence;
             }
-            active.client_size = size;
-            active.client_pixels = geometry.pixels;
             let session_name = active.session_name.clone();
-            let mode_tree_zoom_target = active
-                .mode_tree
-                .as_ref()
-                .and_then(|mode| mode.zoom_restore.clone());
             if let Some(overlay) = active.overlay.as_mut() {
                 match overlay {
                     ClientOverlayState::Menu(menu) => {
@@ -265,35 +275,26 @@ impl RequestHandler {
                     }
                 }
             }
-            (session_name, mode_tree_zoom_target)
+            (session_name, ignores_size, client_size_changed)
         };
 
+        if !ignores_size
+            && self
+                .attached_window_size_policy_for_session(&resized_session)
+                .await?
+                != super::attach_support::AttachedWindowSizePolicy::Manual
         {
             let mut state = self.state.lock().await;
             state.set_attached_terminal_pixels(&resized_session, geometry.pixels);
-            if let Some(target) = mode_tree_zoom_target {
-                {
-                    let session = state
-                        .sessions
-                        .session_mut(&resized_session)
-                        .ok_or_else(|| session_not_found(&resized_session))?;
-                    session.toggle_zoom_in_window(target.window_index(), target.pane_index())?;
-                    session.resize_terminal(size);
-                }
-                state.resize_terminals(&resized_session)?;
-                {
-                    let session = state
-                        .sessions
-                        .session_mut(&resized_session)
-                        .ok_or_else(|| session_not_found(&resized_session))?;
-                    session.toggle_zoom_in_window(target.window_index(), target.pane_index())?;
-                }
-            } else {
-                state.mutate_session_and_resize_terminals(&resized_session, |session| {
-                    session.resize_terminal(size);
-                    Ok(())
-                })?;
-            }
+        }
+        self.reconcile_attached_session_size_and_emit(&resized_session)
+            .await?;
+        if client_size_changed {
+            self.emit(LifecycleEvent::ClientResized {
+                session_name: resized_session.clone(),
+                client_name: Some(attach_pid.to_string()),
+            })
+            .await;
         }
         self.refresh_attached_session(&resized_session).await;
 

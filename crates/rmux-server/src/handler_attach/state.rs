@@ -20,6 +20,7 @@ use crate::pane_io::AttachControl;
 #[derive(Debug, Default)]
 pub(in crate::handler) struct ActiveAttachState {
     pub(in crate::handler) next_id: u64,
+    pub(in crate::handler) next_size_sequence: u64,
     pub(in crate::handler) by_pid: HashMap<u32, ActiveAttach>,
 }
 
@@ -44,6 +45,7 @@ pub(in crate::handler) struct ActiveAttach {
     pub(in crate::handler) terminal_context: OuterTerminalContext,
     pub(in crate::handler) client_size: TerminalSize,
     pub(in crate::handler) client_pixels: Option<TerminalPixels>,
+    pub(in crate::handler) size_sequence: u64,
     pub(in crate::handler) persistent_overlay_epoch: Arc<AtomicU64>,
     pub(in crate::handler) render_generation: u64,
     pub(in crate::handler) overlay_generation: u64,

@@ -11,7 +11,7 @@ use rmux_proto::{
 use crate::pane_terminals::session_not_found;
 
 use super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
-use super::values::{missing_argument, unsupported_flag};
+use super::values::unsupported_flag;
 use super::{
     implicit_session_name, implicit_window_target, parse_new_window_target_argument,
     parse_window_target,
@@ -497,7 +497,11 @@ pub(super) fn parse_rotate_window(
     }))
 }
 
-pub(super) fn parse_resize_window(mut args: CommandTokens) -> Result<Request, RmuxError> {
+pub(super) fn parse_resize_window(
+    mut args: CommandTokens,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Result<Request, RmuxError> {
     let mut target = None;
     let mut width = None;
     let mut height = None;
@@ -581,7 +585,11 @@ pub(super) fn parse_resize_window(mut args: CommandTokens) -> Result<Request, Rm
     });
 
     Ok(Request::ResizeWindow(ResizeWindowRequest {
-        target: target.ok_or_else(|| missing_argument("resize-window", "-t target"))?,
+        target: target.unwrap_or(implicit_window_target(
+            sessions,
+            find_context,
+            "resize-window",
+        )?),
         width,
         height,
         adjustment,

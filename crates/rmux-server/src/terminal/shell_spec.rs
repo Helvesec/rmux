@@ -41,13 +41,15 @@ impl ShellSpec {
             #[cfg(unix)]
             ShellKind::Unix => ShellCommandPlan::new(&self.program).arg("-c").arg(command),
             #[cfg(windows)]
-            ShellKind::PowerShell => ShellCommandPlan::new(&self.program)
-                .arg("-NoProfile")
-                .arg("-Command")
-                .arg(format!(
-                    "Set-Location -LiteralPath {}; {command}",
-                    powershell_single_quoted(cwd)
-                )),
+            ShellKind::PowerShell | ShellKind::WindowsPowerShell => {
+                ShellCommandPlan::new(&self.program)
+                    .arg("-NoProfile")
+                    .arg("-Command")
+                    .arg(format!(
+                        "Set-Location -LiteralPath {}; {command}",
+                        powershell_single_quoted(cwd)
+                    ))
+            }
             #[cfg(windows)]
             ShellKind::Cmd => ShellCommandPlan::new(&self.program)
                 .arg("/D")
@@ -66,6 +68,8 @@ impl ShellSpec {
     fn interactive_plan(&self, cwd: &Path) -> ShellCommandPlan {
         #[cfg(unix)]
         let _ = cwd;
+        #[cfg(windows)]
+        let _ = cwd;
 
         match self.kind {
             #[cfg(unix)]
@@ -75,12 +79,22 @@ impl ShellSpec {
             #[cfg(windows)]
             ShellKind::PowerShell => ShellCommandPlan::new(&self.program)
                 .arg("-NoLogo")
-                .arg("-NoExit")
-                .arg("-Command")
-                .arg(format!(
-                    "Set-Location -LiteralPath {}",
-                    powershell_single_quoted(cwd)
-                )),
+                .arg("-NoProfile")
+                .arg("-NoExit"),
+            #[cfg(windows)]
+            ShellKind::WindowsPowerShell => {
+                // Windows PowerShell 5.1 can exit shortly after startup when spawned
+                // directly under ConPTY. Keep cmd.exe as the /K parent, but pass the
+                // PowerShell program as a separate token so cmd does not see escaped
+                // quotes such as \"C:\...\powershell.exe\".
+                ShellCommandPlan::new(&cmd_wrapper_program())
+                    .arg("/D")
+                    .arg("/K")
+                    .arg(self.program.as_os_str())
+                    .arg("-NoLogo")
+                    .arg("-NoProfile")
+                    .arg("-NoExit")
+            }
             #[cfg(windows)]
             ShellKind::Cmd => ShellCommandPlan::new(&self.program).arg("/D").arg("/K"),
             #[cfg(windows)]
@@ -146,6 +160,8 @@ enum ShellKind {
     #[cfg(windows)]
     PowerShell,
     #[cfg(windows)]
+    WindowsPowerShell,
+    #[cfg(windows)]
     Posix,
     #[cfg(windows)]
     Nu,
@@ -166,7 +182,8 @@ fn detect_shell_kind(shell: &Path) -> ShellKind {
         .as_deref()
     {
         Some("cmd.exe" | "cmd") => ShellKind::Cmd,
-        Some("powershell.exe" | "powershell" | "pwsh.exe" | "pwsh") => ShellKind::PowerShell,
+        Some("powershell.exe" | "powershell") => ShellKind::WindowsPowerShell,
+        Some("pwsh.exe" | "pwsh") => ShellKind::PowerShell,
         Some("bash.exe" | "bash" | "sh.exe" | "sh" | "zsh.exe" | "zsh") => ShellKind::Posix,
         Some("nu.exe" | "nu") => ShellKind::Nu,
         _ => ShellKind::Other,
@@ -176,6 +193,13 @@ fn detect_shell_kind(shell: &Path) -> ShellKind {
 #[cfg(windows)]
 fn powershell_single_quoted(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "''"))
+}
+
+#[cfg(windows)]
+fn cmd_wrapper_program() -> PathBuf {
+    std::env::var_os("COMSPEC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("cmd.exe"))
 }
 
 #[cfg(unix)]
@@ -202,7 +226,7 @@ mod tests {
         );
         assert_eq!(
             detect_shell_kind(Path::new("powershell")),
-            ShellKind::PowerShell
+            ShellKind::WindowsPowerShell
         );
         assert_eq!(
             detect_shell_kind(Path::new("pwsh.exe")),
@@ -210,6 +234,34 @@ mod tests {
         );
         assert_eq!(detect_shell_kind(Path::new("bash.exe")), ShellKind::Posix);
         assert_eq!(detect_shell_kind(Path::new("nu.exe")), ShellKind::Nu);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_powershell_interactive_uses_cmd_keepalive_wrapper_without_embedded_quotes() {
+        let spec = ShellSpec::new(Path::new(
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        ));
+        let plan = spec.interactive_plan(Path::new(r"C:\tmp"));
+
+        assert_eq!(
+            plan.program
+                .file_name()
+                .map(|name| name.to_string_lossy().to_ascii_lowercase())
+                .as_deref(),
+            Some("cmd.exe")
+        );
+        assert_eq!(
+            plan.args,
+            os_args([
+                "/D",
+                "/K",
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NoExit",
+            ])
+        );
     }
 
     #[cfg(windows)]
@@ -241,12 +293,7 @@ mod tests {
         let interactive = spec.interactive_plan(cwd);
         assert_eq!(
             interactive.args,
-            os_args([
-                "-NoLogo",
-                "-NoExit",
-                "-Command",
-                "Set-Location -LiteralPath 'C:\\Users\\RMUXUser''s Workspace\\rmux'",
-            ])
+            os_args(["-NoLogo", "-NoProfile", "-NoExit"])
         );
 
         let one_shot = spec.command_plan(cwd, "Write-Output RMUX_OK");

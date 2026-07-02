@@ -225,7 +225,6 @@ const fn hook_is_supported_for_registration(hook: HookName) -> bool {
         HookName::ClientLightTheme
             | HookName::ClientDarkTheme
             | HookName::CommandError
-            | HookName::PaneTitleChanged
             | HookName::PasteBufferChanged
             | HookName::PasteBufferDeleted
     )

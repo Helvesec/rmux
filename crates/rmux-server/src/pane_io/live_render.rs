@@ -118,6 +118,23 @@ mod tests {
         SessionName::new(value).expect("valid session name")
     }
 
+    fn assert_small_issue63_interactive_frame(frame: &str, stable_prefix: &str) {
+        assert!(
+            !frame.contains(&format!("{stable_prefix}-00"))
+                && !frame.contains(&format!("{stable_prefix}-46")),
+            "interactive render must not repaint unchanged history rows over SSH-sized panes: {frame:?}"
+        );
+        assert!(
+            frame.len() < 1024,
+            "interactive render should stay small; a full terminal repaint is far larger: len={} frame={frame:?}",
+            frame.len()
+        );
+        assert!(
+            frame.matches('H').count() <= 3,
+            "interactive key echo should not emit one cursor position per row: {frame:?}"
+        );
+    }
+
     #[test]
     fn replaceable_live_render_is_self_contained_for_client_side_coalescing() {
         let session = Session::new(session_name("alpha"), TerminalSize { cols: 10, rows: 4 });
@@ -186,6 +203,178 @@ mod tests {
         assert!(
             !frame.contains("\u{1b}[2;1H"),
             "interactive render should not repaint unchanged rows: {frame:?}"
+        );
+    }
+
+    #[test]
+    fn issue63_interactive_render_does_not_repaint_large_ssh_pane() {
+        let session = Session::new(
+            session_name("alpha"),
+            TerminalSize {
+                cols: 160,
+                rows: 49,
+            },
+        );
+        let pane = session.window().active_pane().expect("active pane").clone();
+        let options = OptionStore::new();
+        let transcript = PaneTranscript::shared(
+            5000,
+            TerminalSize {
+                cols: 160,
+                rows: 48,
+            },
+        );
+
+        {
+            let mut transcript = transcript
+                .lock()
+                .expect("transcript mutex must not be poisoned");
+            for row in 0..47 {
+                transcript.append_bytes(format!("ssh-row-{row:02} stable content\r\n").as_bytes());
+            }
+            transcript.append_bytes(b"prompt> ");
+        }
+
+        let mut renderer =
+            LivePaneRender::new_from_transcript(transcript.clone(), session, options, pane)
+                .expect("initial render snapshot");
+
+        transcript
+            .lock()
+            .expect("transcript mutex must not be poisoned")
+            .append_bytes(b"x");
+
+        let PaneRenderDelta::Incremental(delta) =
+            renderer.render_interactive_frame_from_transcript()
+        else {
+            panic!("single key echo should render as an incremental delta");
+        };
+        let frame = String::from_utf8(delta.frame().to_vec()).expect("frame is utf8");
+
+        assert!(
+            frame.contains('x'),
+            "interactive delta should include the echoed key: {frame:?}"
+        );
+        assert!(
+            frame.len() < 512,
+            "plain append should normally use the tiny cursor append path: len={} frame={frame:?}",
+            frame.len()
+        );
+        assert_small_issue63_interactive_frame(&frame, "ssh-row");
+    }
+
+    #[test]
+    fn issue63_interactive_render_stays_small_for_styled_prompts() {
+        let session = Session::new(
+            session_name("alpha"),
+            TerminalSize {
+                cols: 160,
+                rows: 49,
+            },
+        );
+        let pane = session.window().active_pane().expect("active pane").clone();
+        let options = OptionStore::new();
+        let transcript = PaneTranscript::shared(
+            5000,
+            TerminalSize {
+                cols: 160,
+                rows: 48,
+            },
+        );
+
+        {
+            let mut transcript = transcript
+                .lock()
+                .expect("transcript mutex must not be poisoned");
+            for row in 0..47 {
+                transcript
+                    .append_bytes(format!("styled-row-{row:02} stable content\r\n").as_bytes());
+            }
+            transcript.append_bytes(b"\x1b[32mprompt>\x1b[0m ");
+        }
+
+        let mut renderer =
+            LivePaneRender::new_from_transcript(transcript.clone(), session, options, pane)
+                .expect("initial render snapshot");
+
+        transcript
+            .lock()
+            .expect("transcript mutex must not be poisoned")
+            .append_bytes(b"x");
+
+        let PaneRenderDelta::Incremental(delta) =
+            renderer.render_interactive_frame_from_transcript()
+        else {
+            panic!("single styled key echo should render as an incremental delta");
+        };
+        let frame = String::from_utf8(delta.frame().to_vec()).expect("frame is utf8");
+
+        assert!(
+            frame.contains('x'),
+            "interactive delta should include the echoed key: {frame:?}"
+        );
+        assert_small_issue63_interactive_frame(&frame, "styled-row");
+    }
+
+    #[test]
+    fn issue63_interactive_render_stays_small_for_split_panes() {
+        let mut session = Session::new(
+            session_name("alpha"),
+            TerminalSize {
+                cols: 160,
+                rows: 49,
+            },
+        );
+        session
+            .split_active_pane_with_direction(rmux_proto::SplitDirection::Vertical)
+            .expect("split pane");
+        let pane = session.window().active_pane().expect("active pane").clone();
+        let pane_size = TerminalSize {
+            cols: pane.geometry().cols(),
+            rows: pane.geometry().rows(),
+        };
+        let options = OptionStore::new();
+        let transcript = PaneTranscript::shared(5000, pane_size);
+
+        {
+            let mut transcript = transcript
+                .lock()
+                .expect("transcript mutex must not be poisoned");
+            for row in 0..20 {
+                transcript
+                    .append_bytes(format!("split-row-{row:02} stable content\r\n").as_bytes());
+            }
+            transcript.append_bytes(b"prompt> ");
+        }
+
+        let mut renderer =
+            LivePaneRender::new_from_transcript(transcript.clone(), session, options, pane)
+                .expect("initial render snapshot");
+
+        transcript
+            .lock()
+            .expect("transcript mutex must not be poisoned")
+            .append_bytes(b"x");
+
+        let PaneRenderDelta::Incremental(delta) =
+            renderer.render_interactive_frame_from_transcript()
+        else {
+            panic!("single split-pane key echo should render as an incremental delta");
+        };
+        let frame = String::from_utf8(delta.frame().to_vec()).expect("frame is utf8");
+
+        assert!(
+            frame.contains('x'),
+            "interactive delta should include the echoed key: {frame:?}"
+        );
+        assert!(
+            !frame.contains("split-row-00"),
+            "split-pane interactive render must not repaint unchanged top rows: {frame:?}"
+        );
+        assert!(
+            frame.len() < 1024,
+            "split-pane interactive render should stay small; len={} frame={frame:?}",
+            frame.len()
         );
     }
 }

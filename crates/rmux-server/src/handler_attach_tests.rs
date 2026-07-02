@@ -12,13 +12,13 @@ use rmux_proto::request::{
 };
 use rmux_proto::{
     AttachSessionResponse, AttachedKeystroke, CapturePaneRequest, CopyModeRequest,
-    DetachClientRequest, ErrorResponse, KeyDispatched, KillSessionRequest, LayoutName,
-    ListPanesRequest, ListWindowsRequest, NewSessionRequest, NewWindowRequest, OptionName,
-    PaneTarget, RenameSessionRequest, Request, ResizePaneAdjustment, Response, RmuxError,
-    ScopeSelector, SelectLayoutRequest, SelectLayoutTarget, SelectPaneRequest, SendKeysRequest,
-    SessionName, SetOptionMode, SetOptionRequest, SplitWindowRequest, SplitWindowTarget,
-    SwitchClientRequest, TerminalSize, WindowTarget, CAPABILITY_ATTACH_RENDER,
-    DEFAULT_MAX_FRAME_LENGTH,
+    DetachClientExtRequest, DetachClientRequest, ErrorResponse, KeyDispatched, KillSessionRequest,
+    LayoutName, LinkWindowRequest, ListPanesRequest, ListWindowsRequest, NewSessionRequest,
+    NewWindowRequest, OptionName, PaneTarget, RenameSessionRequest, Request, ResizePaneAdjustment,
+    Response, RmuxError, ScopeSelector, SelectLayoutRequest, SelectLayoutTarget, SelectPaneRequest,
+    SelectWindowRequest, SendKeysRequest, SessionName, SetOptionMode, SetOptionRequest,
+    SplitWindowRequest, SplitWindowTarget, SwitchClientRequest, TerminalSize, WindowTarget,
+    CAPABILITY_ATTACH_RENDER, DEFAULT_MAX_FRAME_LENGTH,
 };
 #[cfg(unix)]
 use rmux_pty::{ChildCommand, TerminalSize as PtyTerminalSize};

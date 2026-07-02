@@ -24,10 +24,13 @@ mod key_table;
 mod refresh;
 #[path = "handler_attach/registration.rs"]
 mod registration;
+#[path = "handler_attach/resize_policy.rs"]
+mod resize_policy;
 #[path = "handler_attach/state.rs"]
 mod state;
 
 pub(crate) use crate::client_flags::ClientFlags;
+pub(in crate::handler) use resize_policy::AttachedWindowSizePolicy;
 pub(crate) use state::AttachRegistration;
 pub(super) use state::{
     ActiveAttach, ActiveAttachState, DisplayPanesClientState, DisplayPanesLabel,
@@ -84,6 +87,7 @@ impl RequestHandler {
         TerminalSize,
         Option<rmux_proto::TerminalPixels>,
         bool,
+        ClientFlags,
     )> {
         let active_attach = self.active_attach.lock().await;
         active_attach.by_pid.get(&attach_pid).map(|active| {
@@ -92,6 +96,7 @@ impl RequestHandler {
                 active.client_size,
                 active.client_pixels,
                 active.render_stream,
+                active.flags,
             )
         })
     }
@@ -569,13 +574,29 @@ fn attach_target_for_session_with_prompt(
     for pane in session.window().panes() {
         let copy_screen = state.pane_copy_mode_render_screen(session_name, pane.id());
         if let Some(screen) = copy_screen.as_ref() {
-            render_frame.extend_from_slice(
-                renderer::render_pane_screen(session, &state.options, pane, screen).as_slice(),
-            );
+            let pane_frame = if options.prompt.is_some() {
+                renderer::render_pane_screen_preserving_prompt_cursor(
+                    session,
+                    &state.options,
+                    pane,
+                    screen,
+                )
+            } else {
+                renderer::render_pane_screen(session, &state.options, pane, screen)
+            };
+            render_frame.extend_from_slice(pane_frame.as_slice());
         } else if let Some(screen) = state.pane_screen(session_name, pane.id()) {
-            render_frame.extend_from_slice(
-                renderer::render_pane_screen(session, &state.options, pane, &screen).as_slice(),
-            );
+            let pane_frame = if options.prompt.is_some() {
+                renderer::render_pane_screen_preserving_prompt_cursor(
+                    session,
+                    &state.options,
+                    pane,
+                    &screen,
+                )
+            } else {
+                renderer::render_pane_screen(session, &state.options, pane, &screen)
+            };
+            render_frame.extend_from_slice(pane_frame.as_slice());
         }
         if pane.index() == session.active_pane_index() && copy_screen.is_some() {
             if let (Some(summary), Some(stats)) = (

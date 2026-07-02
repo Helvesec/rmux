@@ -249,11 +249,12 @@ impl HandlerState {
             .retain(|(tracked_session, _)| tracked_session != session_name);
         let mut removed_terminals = self.terminals.remove_session(session_name);
         if let Some(panes) = removed_terminals.as_mut() {
-            for terminal in panes.values_mut() {
-                terminal.terminate_with_bounded_grace();
+            let pane_ids = panes.keys().copied().collect::<Vec<_>>();
+            for pane_id in pane_ids {
+                self.remove_pane_lifecycle(pane_id);
             }
-            for pane_id in panes.keys() {
-                self.remove_pane_lifecycle(*pane_id);
+            for terminal in panes.drain().map(|(_, terminal)| terminal) {
+                terminal.terminate_in_background();
             }
         }
         Ok(removed_terminals.is_some())

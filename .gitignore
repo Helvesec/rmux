@@ -1,4 +1,6 @@
 /target
+/crates/*/target/
+/target-audit/
 /dist/
 __pycache__/
 *.py[cod]
@@ -23,6 +25,7 @@ SDK demo/playwright-report/
 /.release-deployment/
 /.rmux-audit/
 /scripts/bench/README.md
+/.claude/settings.local.json
 
 # Local secret material and environment overrides.
 .env

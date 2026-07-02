@@ -37,6 +37,14 @@ impl TransportFailure {
         }
     }
 
+    pub(super) fn invalid_data(message: impl Into<String>) -> Self {
+        Self {
+            kind: io::ErrorKind::InvalidData,
+            message: message.into(),
+            protocol_error: None,
+        }
+    }
+
     pub(super) fn mismatched_response(expected: &'static str, actual: &'static str) -> Self {
         Self {
             kind: io::ErrorKind::InvalidData,

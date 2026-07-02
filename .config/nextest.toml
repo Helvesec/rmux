@@ -1,5 +1,10 @@
 [test-groups]
 daemon-integration = { max-threads = 6 }
+windows-console = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(windows_attach_exit)'
+test-group = 'windows-console'
 
 [[profile.default.overrides]]
 filter = 'kind(test) & (package(rmux) | package(rmux-client) | package(rmux-server) | package(rmux-sdk) | package(rmux-pty))'

@@ -32,17 +32,27 @@ impl CopyModeState {
             }
             "begin-selection" => {
                 if let Some(mouse) = context.mouse {
-                    self.move_cursor_to_mouse(mouse.content_x, mouse.content_y);
                     if self
                         .selection
                         .as_ref()
                         .is_some_and(|selection| selection.active)
                     {
+                        self.move_cursor_to_mouse(mouse.content_x, mouse.content_y);
                         return Ok(self.finish_policy(
                             CopyModeCommandOutcome::nothing(),
                             ClearPolicy::Always,
                         ));
                     }
+                    if let Some((anchor_x, anchor_y)) = mouse.selection_anchor {
+                        self.move_cursor_to_mouse(anchor_x, anchor_y);
+                        self.begin_selection();
+                        self.move_cursor_to_mouse(mouse.content_x, mouse.content_y);
+                        return Ok(self.finish_policy(
+                            CopyModeCommandOutcome::nothing(),
+                            ClearPolicy::Always,
+                        ));
+                    }
+                    self.move_cursor_to_mouse(mouse.content_x, mouse.content_y);
                 }
                 self.begin_selection();
                 Ok(self.finish_policy(CopyModeCommandOutcome::nothing(), ClearPolicy::Always))
@@ -249,10 +259,16 @@ impl CopyModeState {
             "search-forward-incremental" => self.incremental_search(args, SearchDirection::Forward),
             "search-reverse" => self.search_reverse(),
             "select-line" => {
+                if let Some(mouse) = context.mouse {
+                    self.move_cursor_to_mouse(mouse.content_x, mouse.content_y);
+                }
                 self.select_line();
                 Ok(self.finish_policy(CopyModeCommandOutcome::nothing(), ClearPolicy::Always))
             }
             "select-word" => {
+                if let Some(mouse) = context.mouse {
+                    self.move_cursor_to_mouse(mouse.content_x, mouse.content_y);
+                }
                 self.select_word();
                 Ok(self.finish_policy(CopyModeCommandOutcome::nothing(), ClearPolicy::Always))
             }

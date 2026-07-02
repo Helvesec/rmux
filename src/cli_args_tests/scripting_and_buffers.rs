@@ -60,6 +60,16 @@ fn display_message_accepts_target_client_without_treating_it_as_message() {
 }
 
 #[test]
+fn display_message_rejects_multiple_message_arguments() {
+    let error = parse_args(&["display-message", "a", "b", "c"]).unwrap_err();
+
+    assert_eq!(error.kind(), clap::error::ErrorKind::TooManyValues);
+    assert!(error
+        .to_string()
+        .contains("command display-message: too many arguments (need at most 1)"));
+}
+
+#[test]
 fn display_message_accepts_compact_delay_flag() {
     let cli = parse_args(&["display-message", "-d0", "-p", "hello"]).unwrap();
 

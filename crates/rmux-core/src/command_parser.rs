@@ -419,6 +419,42 @@ impl CommandParser {
         self.parse_inner(input, false, CommandGrouping::ByLine)
     }
 
+    /// Parses command structure without command-name lookup or alias expansion.
+    ///
+    /// Source recovery uses this to find the command boundary around a lookup
+    /// error without corrupting multi-line brace blocks.
+    pub fn parse_structure(&self, input: &str) -> Result<ParsedCommands, CommandParseError> {
+        let mut parser = GrammarParser::new(Lexer::new(input, self), CommandGrouping::ByLine);
+        let commands = parser.parse_all()?;
+        ensure_parsed_command_lengths(&commands, self.max_command_bytes)?;
+        Ok(commands)
+    }
+
+    /// Parses source-file/startup config text with tmux source-file comment
+    /// semantics.
+    ///
+    /// tmux treats any unquoted `#` outside condition directives as the start of
+    /// a comment, even when the next byte is `{`. Command strings parsed from
+    /// argv or option values keep RMUX's historical `#{...}` token support; only
+    /// source-file text uses this stricter mode.
+    pub fn parse_source_file(&self, input: &str) -> Result<ParsedCommands, CommandParseError> {
+        self.parse_source_file_inner(input, false, CommandGrouping::ByLine)
+    }
+
+    /// Parses source-file structure without command-name lookup or alias
+    /// expansion. Recovery uses this to locate command boundaries after a
+    /// lookup error while preserving source-file comment semantics.
+    pub fn parse_source_file_structure(
+        &self,
+        input: &str,
+    ) -> Result<ParsedCommands, CommandParseError> {
+        let mut parser =
+            GrammarParser::new(Lexer::new_source_file(input, self), CommandGrouping::ByLine);
+        let commands = parser.parse_all()?;
+        ensure_parsed_command_lengths(&commands, self.max_command_bytes)?;
+        Ok(commands)
+    }
+
     /// Parses a tmux command string with `CMD_PARSE_ONEGROUP` semantics.
     ///
     /// tmux uses this mode when a command string is parsed from an argument or
@@ -492,6 +528,18 @@ impl CommandParser {
         self.expand_and_lookup(commands, no_alias)
     }
 
+    fn parse_source_file_inner(
+        &self,
+        input: &str,
+        no_alias: bool,
+        grouping: CommandGrouping,
+    ) -> Result<ParsedCommands, CommandParseError> {
+        let mut parser = GrammarParser::new(Lexer::new_source_file(input, self), grouping);
+        let commands = parser.parse_all()?;
+        ensure_parsed_command_lengths(&commands, self.max_command_bytes)?;
+        self.expand_and_lookup(commands, no_alias)
+    }
+
     fn expand_and_lookup(
         &self,
         commands: ParsedCommands,
@@ -513,8 +561,9 @@ impl CommandParser {
                             .iter()
                             .map(|assignment| (assignment.name.clone(), assignment.value.clone())),
                     );
-                    let mut replacement =
-                        alias_parser.parse_inner(alias, true, CommandGrouping::OneGroup)?;
+                    let mut replacement = alias_parser
+                        .parse_inner(alias, true, CommandGrouping::OneGroup)
+                        .map_err(|error| error.with_line(command.line))?;
                     for replacement_command in &mut replacement.commands {
                         replacement_command.line = command.line;
                     }
@@ -650,6 +699,18 @@ impl FormatVariables for ParseTimeFormatVariables<'_> {
 pub struct CommandParseError {
     line: usize,
     message: String,
+    kind: CommandParseErrorKind,
+}
+
+/// Coarse parse error class used by source-file recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandParseErrorKind {
+    /// The parser cannot safely identify a complete command boundary.
+    Structural,
+    /// Command name lookup failed after a structurally valid parse.
+    Lookup,
+    /// Tokenization or command-size validation failed.
+    Other,
 }
 
 impl CommandParseError {
@@ -665,11 +726,39 @@ impl CommandParseError {
         &self.message
     }
 
+    /// Returns the coarse error class.
+    #[must_use]
+    pub const fn kind(&self) -> CommandParseErrorKind {
+        self.kind
+    }
+
     pub(crate) fn new(line: usize, message: impl Into<String>) -> Self {
         Self {
             line,
             message: message.into(),
+            kind: CommandParseErrorKind::Other,
         }
+    }
+
+    pub(crate) fn structural(line: usize, message: impl Into<String>) -> Self {
+        Self {
+            line,
+            message: message.into(),
+            kind: CommandParseErrorKind::Structural,
+        }
+    }
+
+    pub(crate) fn lookup(line: usize, message: impl Into<String>) -> Self {
+        Self {
+            line,
+            message: message.into(),
+            kind: CommandParseErrorKind::Lookup,
+        }
+    }
+
+    fn with_line(mut self, line: usize) -> Self {
+        self.line = line;
+        self
     }
 }
 

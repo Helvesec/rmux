@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use rmux_core::{command_parser::ParsedCommand, OptionStore, SessionStore, TargetFindContext};
+use rmux_core::{
+    command_parser::ParsedCommand, tmux_precedence, OptionStore, SessionStore, TargetFindContext,
+};
 use rmux_proto::{Request, RmuxError};
 
 use super::super::RequestHandler;
@@ -25,7 +27,9 @@ use super::display_parse::{
 use super::key_parse::{
     parse_bind_key, parse_list_keys, parse_send_keys, parse_send_prefix, parse_unbind_key,
 };
-use super::layout_parse::{parse_display_panes, parse_resize_pane, parse_select_layout};
+use super::layout_parse::{
+    parse_display_panes, parse_resize_pane, parse_resize_pane_mouse_target, parse_select_layout,
+};
 use super::list_parse::{
     parse_list_panes, parse_list_sessions, parse_list_windows, parse_queued_list_panes_all,
 };
@@ -139,6 +143,7 @@ pub(super) fn parse_queue_invocation(
         sessions,
         find_context,
     )?;
+    let arguments = tmux_precedence::normalize_tmux_precedence(&command_name, arguments);
     if matches!(command_name.as_str(), "set-option" | "set-window-option") {
         let force_window = command_name == "set-window-option";
         return match parse_set_option_invocation(
@@ -147,12 +152,22 @@ pub(super) fn parse_queue_invocation(
             default_set_option_target(sessions, find_context),
         )? {
             ParsedSetOptionCommand::Request(request) => Ok(QueueInvocation::Request(*request)),
+            ParsedSetOptionCommand::Ignored(_) => Ok(QueueInvocation::NoOp),
             ParsedSetOptionCommand::NoOp => Ok(QueueInvocation::NoOp),
         };
     }
     if command_name == "split-window" {
         return parse_queued_split_window(CommandTokens::new(arguments), sessions, find_context)
             .map(QueueInvocation::SplitWindow);
+    }
+    if command_name == "resize-pane" {
+        if let Some(target) = parse_resize_pane_mouse_target(
+            CommandTokens::new(arguments.clone()),
+            sessions,
+            find_context,
+        )? {
+            return Ok(QueueInvocation::MouseResizePane(target));
+        }
     }
     if let Some(command) =
         RequestHandler::parse_overlay_queue_command(&command_name, arguments.clone())?
@@ -186,6 +201,7 @@ pub(crate) fn parse_request_from_parts(
     options: &OptionStore,
     find_context: &TargetFindContext,
 ) -> Result<Request, RmuxError> {
+    let arguments = tmux_precedence::normalize_tmux_precedence(&command_name, arguments);
     let args = CommandTokens::new(arguments);
     match command_name.as_str() {
         "run-shell" => parse_run_shell(args),
@@ -214,8 +230,8 @@ pub(crate) fn parse_request_from_parts(
         "delete-buffer" => parse_delete_buffer(args),
         "load-buffer" => parse_load_buffer(args, caller_cwd),
         "save-buffer" => parse_save_buffer(args, caller_cwd),
-        "capture-pane" => parse_capture_pane(args),
-        "clear-history" => parse_clear_history(args),
+        "capture-pane" => parse_capture_pane(args, sessions, find_context),
+        "clear-history" => parse_clear_history(args, sessions, find_context),
         "display-message" => parse_display_message(args),
         "show-messages" => parse_show_messages(args),
         "new-session" => parse_new_session(args),
@@ -223,7 +239,7 @@ pub(crate) fn parse_request_from_parts(
         "refresh-client" => parse_refresh_client(args),
         "list-clients" => parse_list_clients(args),
         "has-session" => parse_session_request(args, "has-session", sessions, find_context),
-        "kill-session" => parse_kill_session(args),
+        "kill-session" => parse_kill_session(args, sessions, find_context),
         "kill-server" => parse_no_argument_request(args, "kill-server"),
         "lock-server" => parse_no_argument_request(args, "lock-server"),
         "lock-session" => parse_session_request(args, "lock-session", sessions, find_context),
@@ -240,7 +256,7 @@ pub(crate) fn parse_request_from_parts(
         "move-window" => parse_move_window(args, sessions, options, find_context),
         "swap-window" => parse_swap_window(args, sessions, find_context),
         "rotate-window" => parse_rotate_window(args, sessions, find_context),
-        "resize-window" => parse_resize_window(args),
+        "resize-window" => parse_resize_window(args, sessions, find_context),
         "respawn-window" => parse_respawn_window(args, sessions, find_context),
         "split-window" => parse_split_window(args, sessions, find_context),
         "display-panes" => parse_display_panes(args, sessions, find_context),
@@ -249,7 +265,7 @@ pub(crate) fn parse_request_from_parts(
         "join-pane" => parse_join_pane(args, sessions, find_context),
         "move-pane" => parse_move_pane(args, sessions, find_context),
         "break-pane" => parse_break_pane(args, sessions, find_context),
-        "pipe-pane" => parse_pipe_pane(args),
+        "pipe-pane" => parse_pipe_pane(args, sessions, find_context),
         "kill-pane" => parse_pane_request(args, "kill-pane", sessions, find_context),
         "respawn-pane" => parse_respawn_pane(args, sessions, find_context),
         "select-layout" => parse_select_layout(args, sessions, find_context),
@@ -261,7 +277,7 @@ pub(crate) fn parse_request_from_parts(
         "select-pane" => parse_select_pane(args, sessions, find_context),
         "new-window" => parse_new_window(args, sessions, find_context),
         "kill-window" => parse_kill_window(args, sessions, find_context),
-        "list-windows" => parse_list_windows(args),
+        "list-windows" => parse_list_windows(args, sessions, find_context),
         "list-panes" => parse_list_panes(args, sessions, find_context),
         "send-keys" => parse_send_keys(args),
         "bind-key" => parse_bind_key(args),
@@ -286,5 +302,52 @@ fn parse_no_argument_request(args: CommandTokens, command: &str) -> Result<Reque
         other => Err(RmuxError::Server(format!(
             "unsupported command in queue: {other}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmux_proto::PaneTarget;
+
+    fn parse_request(command: &str, args: &[&str]) -> Request {
+        parse_request_from_parts(
+            command.to_owned(),
+            args.iter().map(|arg| (*arg).to_owned()).collect(),
+            None,
+            &SessionStore::default(),
+            &OptionStore::default(),
+            &TargetFindContext::new(None),
+        )
+        .expect("request parses")
+    }
+
+    fn assert_mouse_target(target: Option<&PaneTarget>) {
+        let target = target.expect("target should parse from -t=");
+        assert_eq!(target.session_name().as_str(), "=");
+        assert_eq!(target.window_index(), 0);
+        assert_eq!(target.pane_index(), 0);
+    }
+
+    #[test]
+    fn default_mouse_binding_copy_mode_compact_target_parses() {
+        let Request::CopyMode(request) = parse_request("copy-mode", &["-Ht="]) else {
+            panic!("copy-mode -Ht= should parse as CopyMode");
+        };
+
+        assert!(request.hide_position);
+        assert_mouse_target(request.target.as_ref());
+    }
+
+    #[test]
+    fn default_mouse_binding_send_keys_compact_target_parses() {
+        let Request::SendKeysExt(request) = parse_request("send-keys", &["-Xt=", "select-word"])
+        else {
+            panic!("send -Xt= should parse as extended send-keys");
+        };
+
+        assert!(request.copy_mode_command);
+        assert_mouse_target(request.target.as_ref());
+        assert_eq!(request.keys, vec!["select-word"]);
     }
 }

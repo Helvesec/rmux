@@ -1,12 +1,12 @@
 use rmux_core::{SessionStore, TargetFindContext};
 use rmux_proto::{
-    DisplayPanesRequest, Request, ResizePaneAdjustment, ResizePaneRequest, RmuxError,
-    SelectCustomLayoutRequest, SelectLayoutRequest, SelectLayoutTarget, SelectOldLayoutRequest,
-    SpreadLayoutRequest,
+    DisplayPanesRequest, PaneTarget, Request, ResizePaneAdjustment, ResizePaneRelativeDirection,
+    ResizePaneRequest, RmuxError, SelectCustomLayoutRequest, SelectLayoutRequest,
+    SelectLayoutTarget, SelectOldLayoutRequest, SpreadLayoutRequest, TerminalSize,
 };
 
 use super::tokens::CommandTokens;
-use super::values::{parse_u16, parse_u64};
+use super::values::{parse_percentage, parse_u64};
 use super::{
     implicit_pane_target, implicit_session_name, implicit_window_target,
     is_unsupported_named_layout, parse_layout_name, parse_pane_target, parse_select_layout_target,
@@ -139,16 +139,99 @@ pub(super) fn parse_select_layout(
     }
 }
 
+#[derive(Clone, Copy)]
+enum ResizePaneSize {
+    Cells(u16),
+    Percent(u8),
+}
+
+#[derive(Clone, Copy)]
+enum ResizeAxis {
+    Width,
+    Height,
+}
+
+impl ResizePaneSize {
+    fn resolve(self, window_size: Option<TerminalSize>, axis: ResizeAxis) -> Option<u16> {
+        match self {
+            Self::Cells(cells) => Some(cells),
+            Self::Percent(percent) => {
+                let total = match axis {
+                    ResizeAxis::Width => window_size?.cols,
+                    ResizeAxis::Height => window_size?.rows,
+                };
+                let cells = u32::from(total) * u32::from(percent) / 100;
+                Some(u16::try_from(cells.max(1)).unwrap_or(u16::MAX))
+            }
+        }
+    }
+}
+
+fn parse_resize_pane_size(flag: &str, value: &str) -> Result<ResizePaneSize, RmuxError> {
+    if let Some(percent) = value.strip_suffix('%') {
+        return parse_percentage("resize-pane", flag, percent).map(ResizePaneSize::Percent);
+    }
+    parse_resize_pane_cells(flag, value).map(ResizePaneSize::Cells)
+}
+
+fn parse_resize_pane_cells(flag: &str, value: &str) -> Result<u16, RmuxError> {
+    let cells = value.parse::<i64>().map_err(|error| {
+        RmuxError::Server(format!(
+            "resize-pane {flag} expects an integer cell count: {error}"
+        ))
+    })?;
+    if cells < 0 {
+        return Err(RmuxError::Server(format!(
+            "resize-pane {flag} expects a non-negative cell count"
+        )));
+    }
+    if cells > i64::from(i32::MAX) {
+        return Err(RmuxError::Server(format!(
+            "resize-pane {flag} cell count is too large"
+        )));
+    }
+    Ok(u16::try_from(cells).unwrap_or(u16::MAX))
+}
+
+fn resize_pane_uses_percent(width: Option<ResizePaneSize>, height: Option<ResizePaneSize>) -> bool {
+    matches!(width, Some(ResizePaneSize::Percent(_)))
+        || matches!(height, Some(ResizePaneSize::Percent(_)))
+}
+
+fn resize_pane_window_size(
+    sessions: &SessionStore,
+    target: &PaneTarget,
+) -> Result<TerminalSize, RmuxError> {
+    let session = sessions.session(target.session_name()).ok_or_else(|| {
+        RmuxError::Server(format!(
+            "resize-pane could not resolve dimensions for pane {target}"
+        ))
+    })?;
+    let window = session.window_at(target.window_index()).ok_or_else(|| {
+        RmuxError::Server(format!(
+            "resize-pane could not resolve dimensions for pane {target}"
+        ))
+    })?;
+    if window.pane(target.pane_index()).is_none() {
+        return Err(RmuxError::Server(format!(
+            "resize-pane could not resolve dimensions for pane {target}"
+        )));
+    }
+    Ok(window.size())
+}
+
 pub(super) fn parse_resize_pane(
     mut args: CommandTokens,
     sessions: &SessionStore,
     find_context: &TargetFindContext,
 ) -> Result<Request, RmuxError> {
     let mut target = None;
-    let mut adjustment = None;
+    let mut relative = None;
     let mut absolute_width = None;
     let mut absolute_height = None;
     let mut trim_below = false;
+    let mut zoom = false;
+    let mut relative_seen = false;
 
     while let Some(token) = args.peek() {
         match token {
@@ -165,75 +248,71 @@ pub(super) fn parse_resize_pane(
             }
             "-x" => {
                 let _ = args.optional();
-                if adjustment.is_some() {
-                    return Err(RmuxError::Server(
-                        "resize-pane accepts only one adjustment flag".to_owned(),
-                    ));
-                }
-                absolute_width = Some(parse_u16("resize-pane", "-x", &args.required("-x value")?)?);
+                absolute_width = Some(parse_resize_pane_size("-x", &args.required("-x value")?)?);
             }
             "-y" => {
                 let _ = args.optional();
-                if adjustment.is_some() {
-                    return Err(RmuxError::Server(
-                        "resize-pane accepts only one adjustment flag".to_owned(),
-                    ));
-                }
-                absolute_height =
-                    Some(parse_u16("resize-pane", "-y", &args.required("-y value")?)?);
+                absolute_height = Some(parse_resize_pane_size("-y", &args.required("-y value")?)?);
             }
             "-U" => {
                 let _ = args.optional();
-                if adjustment.is_some() || absolute_width.is_some() || absolute_height.is_some() {
+                if relative_seen {
                     return Err(RmuxError::Server(
-                        "resize-pane accepts only one adjustment flag".to_owned(),
+                        "resize-pane accepts only one relative adjustment".to_owned(),
                     ));
                 }
-                adjustment = Some(ResizePaneAdjustment::Up {
-                    cells: parse_resize_pane_delta(&mut args, "-U")?,
-                });
+                relative_seen = true;
+                relative = Some(parse_resize_pane_relative(
+                    &mut args,
+                    ResizePaneRelativeDirection::Up,
+                    "-U",
+                )?);
             }
             "-D" => {
                 let _ = args.optional();
-                if adjustment.is_some() || absolute_width.is_some() || absolute_height.is_some() {
+                if relative_seen {
                     return Err(RmuxError::Server(
-                        "resize-pane accepts only one adjustment flag".to_owned(),
+                        "resize-pane accepts only one relative adjustment".to_owned(),
                     ));
                 }
-                adjustment = Some(ResizePaneAdjustment::Down {
-                    cells: parse_resize_pane_delta(&mut args, "-D")?,
-                });
+                relative_seen = true;
+                relative = Some(parse_resize_pane_relative(
+                    &mut args,
+                    ResizePaneRelativeDirection::Down,
+                    "-D",
+                )?);
             }
             "-L" => {
                 let _ = args.optional();
-                if adjustment.is_some() || absolute_width.is_some() || absolute_height.is_some() {
+                if relative_seen {
                     return Err(RmuxError::Server(
-                        "resize-pane accepts only one adjustment flag".to_owned(),
+                        "resize-pane accepts only one relative adjustment".to_owned(),
                     ));
                 }
-                adjustment = Some(ResizePaneAdjustment::Left {
-                    cells: parse_resize_pane_delta(&mut args, "-L")?,
-                });
+                relative_seen = true;
+                relative = Some(parse_resize_pane_relative(
+                    &mut args,
+                    ResizePaneRelativeDirection::Left,
+                    "-L",
+                )?);
             }
             "-R" => {
                 let _ = args.optional();
-                if adjustment.is_some() || absolute_width.is_some() || absolute_height.is_some() {
+                if relative_seen {
                     return Err(RmuxError::Server(
-                        "resize-pane accepts only one adjustment flag".to_owned(),
+                        "resize-pane accepts only one relative adjustment".to_owned(),
                     ));
                 }
-                adjustment = Some(ResizePaneAdjustment::Right {
-                    cells: parse_resize_pane_delta(&mut args, "-R")?,
-                });
+                relative_seen = true;
+                relative = Some(parse_resize_pane_relative(
+                    &mut args,
+                    ResizePaneRelativeDirection::Right,
+                    "-R",
+                )?);
             }
             "-Z" => {
                 let _ = args.optional();
-                if adjustment.is_some() || absolute_width.is_some() || absolute_height.is_some() {
-                    return Err(RmuxError::Server(
-                        "resize-pane accepts only one adjustment flag".to_owned(),
-                    ));
-                }
-                adjustment = Some(ResizePaneAdjustment::Zoom);
+                zoom = true;
             }
             "-T" => {
                 let _ = args.optional();
@@ -245,33 +324,202 @@ pub(super) fn parse_resize_pane(
             _ => break,
         }
     }
+    relative = parse_trailing_resize_pane_adjustment(&mut args, relative)?;
+    if relative.is_none() {
+        parse_no_direction_trailing_resize_pane_adjustment(&mut args)?;
+    }
     args.no_extra("resize-pane")?;
+    let target = target.unwrap_or(implicit_pane_target(sessions, find_context, "resize-pane")?);
+    let window_size = if resize_pane_uses_percent(absolute_width, absolute_height) {
+        Some(resize_pane_window_size(sessions, &target)?)
+    } else {
+        None
+    };
+    let absolute_width =
+        absolute_width.and_then(|size| size.resolve(window_size, ResizeAxis::Width));
+    let absolute_height =
+        absolute_height.and_then(|size| size.resolve(window_size, ResizeAxis::Height));
     let adjustment = if trim_below {
         Some(ResizePaneAdjustment::TrimBelow)
+    } else if zoom {
+        Some(ResizePaneAdjustment::Zoom)
     } else {
-        adjustment.or(match (absolute_width, absolute_height) {
-            (Some(columns), Some(rows)) => {
-                Some(ResizePaneAdjustment::AbsoluteSize { columns, rows })
-            }
-            (Some(columns), None) => Some(ResizePaneAdjustment::AbsoluteWidth { columns }),
-            (None, Some(rows)) => Some(ResizePaneAdjustment::AbsoluteHeight { rows }),
-            (None, None) => None,
-        })
+        resize_pane_adjustment(
+            absolute_width,
+            absolute_height,
+            relative.map(|(direction, cells, _)| (direction, cells)),
+        )
     };
 
     Ok(Request::ResizePane(ResizePaneRequest {
-        target: target.unwrap_or(implicit_pane_target(sessions, find_context, "resize-pane")?),
+        target,
         adjustment: adjustment.unwrap_or(ResizePaneAdjustment::NoOp),
     }))
 }
 
-fn parse_resize_pane_delta(args: &mut CommandTokens, flag: &str) -> Result<u16, RmuxError> {
+pub(super) fn parse_resize_pane_mouse_target(
+    mut args: CommandTokens,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+) -> Result<Option<rmux_proto::PaneTarget>, RmuxError> {
+    let mut target = None;
+    let mut mouse_resize = false;
+
+    while let Some(token) = args.peek() {
+        match token {
+            "--" => {
+                let _ = args.optional();
+                break;
+            }
+            "-t" => {
+                let _ = args.optional();
+                target = Some(parse_pane_target(
+                    "resize-pane",
+                    args.required("-t target")?,
+                )?);
+            }
+            "-M" => {
+                let _ = args.optional();
+                mouse_resize = true;
+            }
+            "-D" | "-U" | "-L" | "-R" | "-Z" | "-T" | "-x" | "-y" => {
+                return Ok(None);
+            }
+            _ => break,
+        }
+    }
+
+    if !mouse_resize {
+        return Ok(None);
+    }
+    args.no_extra("resize-pane")?;
+    Ok(Some(target.unwrap_or(implicit_pane_target(
+        sessions,
+        find_context,
+        "resize-pane",
+    )?)))
+}
+
+fn parse_resize_pane_relative(
+    args: &mut CommandTokens,
+    direction: ResizePaneRelativeDirection,
+    flag: &str,
+) -> Result<(ResizePaneRelativeDirection, u16, bool), RmuxError> {
+    let (cells, explicit) = parse_resize_pane_delta(args, flag)?;
+    if explicit && !args.is_empty() {
+        return Err(RmuxError::Server(format!(
+            "command resize-pane: too many arguments after {flag} adjustment"
+        )));
+    }
+    Ok((direction, cells, explicit))
+}
+
+fn parse_resize_pane_delta(args: &mut CommandTokens, flag: &str) -> Result<(u16, bool), RmuxError> {
     match args.peek() {
-        Some(next) if !next.starts_with('-') || next == "-" => parse_u16(
-            "resize-pane",
-            flag,
-            &args.required(&format!("{flag} value"))?,
-        ),
-        _ => Ok(1),
+        Some(next) if !next.starts_with('-') || next == "-" => Ok((
+            parse_resize_pane_adjustment(&args.required(&format!("{flag} value"))?)?,
+            true,
+        )),
+        _ => Ok((1, false)),
+    }
+}
+
+fn parse_trailing_resize_pane_adjustment(
+    args: &mut CommandTokens,
+    relative: Option<(ResizePaneRelativeDirection, u16, bool)>,
+) -> Result<Option<(ResizePaneRelativeDirection, u16, bool)>, RmuxError> {
+    let Some((direction, cells, explicit)) = relative else {
+        return Ok(None);
+    };
+    if explicit || args.is_empty() {
+        return Ok(Some((direction, cells, explicit)));
+    }
+    let Some(next) = args.peek() else {
+        return Ok(Some((direction, cells, explicit)));
+    };
+    if next.starts_with('-') && next != "-" {
+        return Ok(Some((direction, cells, explicit)));
+    }
+    let value = args.required("resize-pane adjustment")?;
+    let cells = parse_resize_pane_adjustment(&value)?;
+    Ok(Some((direction, cells, true)))
+}
+
+fn parse_no_direction_trailing_resize_pane_adjustment(
+    args: &mut CommandTokens,
+) -> Result<(), RmuxError> {
+    let Some(next) = args.peek() else {
+        return Ok(());
+    };
+    if !integer_like_resize_pane_adjustment(next) {
+        return Ok(());
+    }
+    let value = args.required("resize-pane adjustment")?;
+    let _ = parse_resize_pane_adjustment(&value)?;
+    Ok(())
+}
+
+fn parse_resize_pane_adjustment(value: &str) -> Result<u16, RmuxError> {
+    let cells = match value.parse::<i128>() {
+        Ok(value) => value,
+        Err(_) if integer_like_resize_pane_adjustment(value) && value.starts_with('-') => {
+            return Err(RmuxError::Server("adjustment too small".to_owned()));
+        }
+        Err(_) if integer_like_resize_pane_adjustment(value) => {
+            return Err(RmuxError::Server("adjustment too large".to_owned()));
+        }
+        Err(error) => {
+            return Err(RmuxError::Server(format!(
+                "resize-pane adjustment invalid: {error}"
+            )));
+        }
+    };
+    if cells <= 0 {
+        return Err(RmuxError::Server("adjustment too small".to_owned()));
+    }
+    if cells > i128::from(i32::MAX) {
+        return Err(RmuxError::Server("adjustment too large".to_owned()));
+    }
+    Ok(u16::try_from(cells).unwrap_or(u16::MAX))
+}
+
+fn integer_like_resize_pane_adjustment(value: &str) -> bool {
+    let digits = value.strip_prefix(['+', '-']).unwrap_or(value);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn resize_pane_adjustment(
+    columns: Option<u16>,
+    rows: Option<u16>,
+    relative: Option<(ResizePaneRelativeDirection, u16)>,
+) -> Option<ResizePaneAdjustment> {
+    match (columns, rows, relative) {
+        (Some(columns), Some(rows), Some((relative, cells))) => {
+            Some(ResizePaneAdjustment::Composite {
+                columns: Some(columns),
+                rows: Some(rows),
+                relative: Some(relative),
+                cells,
+            })
+        }
+        (Some(columns), None, Some((relative, cells))) => Some(ResizePaneAdjustment::Composite {
+            columns: Some(columns),
+            rows: None,
+            relative: Some(relative),
+            cells,
+        }),
+        (None, Some(rows), Some((relative, cells))) => Some(ResizePaneAdjustment::Composite {
+            columns: None,
+            rows: Some(rows),
+            relative: Some(relative),
+            cells,
+        }),
+        (Some(columns), Some(rows), None) => {
+            Some(ResizePaneAdjustment::AbsoluteSize { columns, rows })
+        }
+        (Some(columns), None, None) => Some(ResizePaneAdjustment::AbsoluteWidth { columns }),
+        (None, Some(rows), None) => Some(ResizePaneAdjustment::AbsoluteHeight { rows }),
+        (None, None, Some((relative, cells))) => Some(relative.to_adjustment(cells)),
+        (None, None, None) => None,
     }
 }
