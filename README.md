@@ -158,6 +158,10 @@ rmux claude [args]
 RMUX opens an attached session and automatically passes `--teammate-mode tmux`
 along with your `[args]` straight to Claude.
 
+How it works under the hood: to route commands properly, RMUX prepends a
+private `tmux` shim to Claude's `PATH`. This is strictly scoped to the Claude
+process and will not conflict with your system `tmux` installation.
+
 Install RMUX's user-level Claude Code skill when you want Claude to remember
 the RMUX CLI, SDK, web-share, and automation patterns outside this repository:
 
@@ -169,10 +173,6 @@ The skill is installed under your Claude profile (`~/.claude/skills/rmux` on
 Linux/macOS, `%USERPROFILE%\.claude\skills\rmux` on Windows). The repository
 keeps the source copy at `resources/claude/skills/rmux/SKILL.md` so the project
 can package and install it without a hidden `.claude` source-tree directory.
-
-How it works under the hood: to route commands properly, RMUX prepends a
-private `tmux` shim to Claude's `PATH`. This is strictly scoped to the Claude
-process and will not conflict with your system `tmux` installation.
 
 Note: Requires `claude` to be installed on your machine.
 
