@@ -161,6 +161,20 @@ Sous le capot : pour router correctement les commandes, RMUX ajoute un shim
 au processus Claude et n'entre pas en conflit avec votre installation système
 de `tmux`.
 
+Installez la skill Claude Code utilisateur de RMUX pour que Claude conserve les
+repères RMUX hors de ce dépôt : CLI, SDK, web-share et patterns
+d'automatisation.
+
+```bash
+rmux claude install-skill
+```
+
+La skill est installée dans le profil Claude (`~/.claude/skills/rmux` sous
+Linux/macOS, `%USERPROFILE%\.claude\skills\rmux` sous Windows). Le dépôt garde
+la copie source dans `resources/claude/skills/rmux/SKILL.md`, afin que le
+projet puisse la packager et l'installer sans dossier source caché `.claude`
+dans l'arborescence.
+
 Note : nécessite que `claude` soit installé sur votre machine.
 
 <a id="configuration"></a>
