@@ -211,6 +211,36 @@ async fn paste_buffer_to_session_pane_through_real_socket() -> Result<(), Box<dy
 }
 
 #[tokio::test]
+async fn paste_buffer_without_buffers_is_successful_noop_through_real_socket(
+) -> Result<(), Box<dyn Error>> {
+    let harness = TestHarness::new("buf-paste-empty");
+    let handle = start_server(&harness).await?;
+    create_session(&harness, "alpha").await?;
+
+    let paste_response = send_request(
+        harness.socket_path(),
+        &Request::PasteBuffer(Box::new(PasteBufferRequest {
+            name: None,
+            target: PaneTarget::new(session_name("alpha"), 0),
+            delete_after: false,
+            separator: None,
+            linefeed: false,
+            raw: false,
+            bracketed: false,
+        })),
+    )
+    .await?;
+
+    match &paste_response {
+        Response::PasteBuffer(r) => assert_eq!(r.buffer_name, ""),
+        other => panic!("expected PasteBuffer empty success, got {other:?}"),
+    }
+
+    handle.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn paste_buffer_with_delete_removes_buffer_through_real_socket() -> Result<(), Box<dyn Error>>
 {
     let harness = TestHarness::new("buf-paste-del");

@@ -21,10 +21,30 @@ pub(super) fn render_explicit_status_format_line(
         return None;
     }
 
+    render_status_format_line_at(
+        session_name,
+        options,
+        runtime,
+        base_style,
+        width,
+        utf8_config,
+        0,
+    )
+}
+
+pub(super) fn render_status_format_line_at(
+    session_name: &SessionName,
+    options: &OptionStore,
+    runtime: &RuntimeFormatContext<'_>,
+    base_style: &Style,
+    width: usize,
+    utf8_config: &Utf8Config,
+    index: usize,
+) -> Option<FormattedLine> {
     let template = options
         .resolve_array_values(Some(session_name), OptionName::StatusFormat)
         .into_iter()
-        .next()?;
+        .nth(index)?;
     if template.is_empty() {
         return None;
     }

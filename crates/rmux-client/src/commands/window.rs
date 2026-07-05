@@ -149,7 +149,25 @@ impl Connection {
         target: SessionName,
         format: Option<String>,
     ) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::ListWindows(ListWindowsRequest { target, format }))
+        self.list_windows_with_options(target, format, None, None, false)
+    }
+
+    /// Sends a `list-windows` request with filtering and ordering options.
+    pub fn list_windows_with_options(
+        &mut self,
+        target: SessionName,
+        format: Option<String>,
+        filter: Option<String>,
+        sort_order: Option<String>,
+        reversed: bool,
+    ) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::ListWindows(Box::new(ListWindowsRequest {
+            target,
+            format,
+            filter,
+            sort_order,
+            reversed,
+        })))
     }
 
     /// Sends a `link-window` request over the detached RPC channel.

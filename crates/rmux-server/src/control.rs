@@ -5,6 +5,8 @@ use crate::daemon::ShutdownHandle;
 #[cfg(any(unix, windows))]
 use crate::handler::RequestHandler;
 #[cfg(any(unix, windows))]
+use rmux_core::command_parser::{ParsedCommand, ParsedCommands};
+#[cfg(any(unix, windows))]
 use rmux_ipc::LocalStream;
 use rmux_proto::SessionName;
 #[cfg(windows)]
@@ -37,6 +39,11 @@ use output_queue::{ensure_control_newline, flush_output_queue, ControlOutputQueu
 mod command_numbering;
 #[cfg(any(unix, windows))]
 use command_numbering::ControlCommandNumbering;
+
+#[path = "control/command_validation.rs"]
+mod command_validation;
+#[cfg(any(unix, windows))]
+use command_validation::validate_control_command_arguments;
 
 #[path = "control/subscriptions.rs"]
 mod subscriptions;
@@ -74,6 +81,8 @@ pub(crate) enum ControlServerEvent {
 pub(crate) struct ControlCommandResult {
     pub(crate) stdout: Vec<u8>,
     pub(crate) error: Option<rmux_proto::RmuxError>,
+    pub(crate) source_file_error: Option<rmux_proto::RmuxError>,
+    pub(crate) execution_error: Option<rmux_proto::RmuxError>,
     pub(crate) exit_status: Option<i32>,
 }
 
@@ -99,6 +108,10 @@ pub(crate) async fn forward_control(
     let mut input_buffer = initial_socket_bytes;
     let mut queued_lines: VecDeque<String> =
         extract_complete_control_lines(&mut input_buffer).into();
+    let initial_command_count = queued_lines
+        .iter()
+        .take_while(|line| !line.is_empty())
+        .count();
     let mut output_queue = ControlOutputQueue::default();
     let mut subscriptions = HashMap::new();
     let mut paused_panes = HashSet::new();
@@ -110,7 +123,20 @@ pub(crate) async fn forward_control(
         .await
         .unwrap_or_default();
     let mut current_command: Option<ActiveControlCommand> = None;
-    let mut command_numbering = ControlCommandNumbering::new();
+    let mut command_numbering = if initial_command_count == 0 {
+        let initial_timestamp = unix_epoch_seconds();
+        output_queue.enqueue_line(
+            format_guard_line(ControlGuardKind::Begin, initial_timestamp, 1, 0).into_bytes(),
+            false,
+        );
+        output_queue.enqueue_line(
+            format_guard_line(ControlGuardKind::End, initial_timestamp, 1, 0).into_bytes(),
+            false,
+        );
+        ControlCommandNumbering::after_initial_ack()
+    } else {
+        ControlCommandNumbering::with_initial_commands(initial_command_count)
+    };
 
     refresh_subscriptions(
         &handler,
@@ -194,7 +220,7 @@ pub(crate) async fn forward_control(
             }
 
             let timestamp = unix_epoch_seconds();
-            let command_frame = command_numbering.next_frame(&line);
+            let command_frame = command_numbering.next_frame();
             output_queue.enqueue_line(
                 format_guard_line(
                     ControlGuardKind::Begin,
@@ -208,13 +234,19 @@ pub(crate) async fn forward_control(
             flush_output_queue(&mut output_queue, &mut write_half, flags, &mut paused_panes)
                 .await?;
 
-            match handler.parse_control_commands(&line).await {
+            match handler
+                .parse_control_commands(&line)
+                .await
+                .and_then(validate_control_command_arguments)
+            {
                 Ok(commands) => {
+                    let abort_on_eof = control_commands_abort_on_eof(&commands);
                     let handler = Arc::clone(&handler);
                     current_command = Some(ActiveControlCommand {
                         timestamp,
                         command_number: command_frame.number,
                         guard_flag: command_frame.guard_flag,
+                        abort_on_eof,
                         task: tokio::spawn(async move {
                             handler
                                 .execute_control_commands(requester_pid, commands)
@@ -258,6 +290,8 @@ pub(crate) async fn forward_control(
         }
 
         tokio::select! {
+            biased;
+
             result = shutdown.changed() => {
                 let _ = result;
                 output_queue.enqueue_line(
@@ -305,13 +339,13 @@ pub(crate) async fn forward_control(
                     None => std::future::pending().await,
                 }
             } => {
-                let Some(result) = result else {
+                let Some(task_result) = result else {
                     continue;
                 };
                 let Some(command) = current_command.take() else {
                     continue;
                 };
-                let result = result
+                let result = task_result
                     .map_err(|error| io::Error::other(format!("control command task failed: {error}")))?;
                 if !result.stdout.is_empty() {
                     output_queue.enqueue_stdout(result.stdout);
@@ -354,8 +388,50 @@ pub(crate) async fn forward_control(
                     lifecycle.shutdown_handle.request_shutdown();
                 }
             }
+            _ = tokio::task::yield_now(),
+                if input_closed
+                    && current_command
+                        .as_ref()
+                        .is_some_and(|command| command.abort_on_eof) =>
+            {
+                close_active_control_command_on_eof(
+                    &mut current_command,
+                    &mut output_queue,
+                    &mut write_half,
+                    flags,
+                    &mut paused_panes,
+                )
+                .await?;
+                return Ok(());
+            }
         }
     }
+}
+
+#[cfg(any(unix, windows))]
+async fn close_active_control_command_on_eof(
+    current_command: &mut Option<ActiveControlCommand>,
+    output_queue: &mut ControlOutputQueue,
+    write_half: &mut WriteHalf<LocalStream>,
+    flags: ControlClientFlags,
+    paused_panes: &mut HashSet<u32>,
+) -> io::Result<()> {
+    let Some(command) = current_command.take() else {
+        return Ok(());
+    };
+    output_queue.enqueue_line(
+        format_guard_line(
+            ControlGuardKind::End,
+            command.timestamp,
+            command.command_number,
+            command.guard_flag,
+        )
+        .into_bytes(),
+        false,
+    );
+    output_queue.enqueue_line(format_exit_line(None).into_bytes(), false);
+    drop(command);
+    flush_output_queue(output_queue, write_half, flags, paused_panes).await
 }
 
 #[cfg(any(unix, windows))]
@@ -515,6 +591,7 @@ struct ActiveControlCommand {
     timestamp: i64,
     command_number: u64,
     guard_flag: u8,
+    abort_on_eof: bool,
     task: JoinHandle<ControlCommandResult>,
 }
 
@@ -525,6 +602,41 @@ impl Drop for ActiveControlCommand {
             self.task.abort();
         }
     }
+}
+
+#[cfg(any(unix, windows))]
+fn control_commands_abort_on_eof(commands: &ParsedCommands) -> bool {
+    let [command] = commands.commands() else {
+        return false;
+    };
+    wait_for_command_aborts_on_eof(command)
+}
+
+#[cfg(any(unix, windows))]
+fn wait_for_command_aborts_on_eof(command: &ParsedCommand) -> bool {
+    if command.name() != "wait-for" {
+        return false;
+    }
+
+    for argument in command.arguments().iter().filter_map(|arg| arg.as_string()) {
+        if argument == "--" {
+            break;
+        }
+        let Some(flags) = argument.strip_prefix('-') else {
+            continue;
+        };
+        if flags.is_empty() {
+            continue;
+        }
+        if flags.contains('S') || flags.contains('U') {
+            return false;
+        }
+        if flags.contains('L') {
+            return true;
+        }
+    }
+
+    true
 }
 
 #[cfg(any(unix, windows))]

@@ -211,7 +211,7 @@ mod tests {
     use std::io::{self, Read};
     use std::os::unix::net::UnixStream;
 
-    use rmux_proto::{OptionName, RmuxError, ScopeSelector, SessionName, SetOptionMode};
+    use rmux_proto::{OptionName, RmuxError, ScopeSelector, SetOptionMode};
 
     use super::Connection;
     use crate::ClientError;
@@ -226,9 +226,9 @@ mod tests {
 
         let error = connection
             .set_option(
-                ScopeSelector::Session(SessionName::new("alpha").expect("valid session")),
-                OptionName::DefaultTerminal,
-                "tmux-256color".to_owned(),
+                ScopeSelector::Global,
+                OptionName::BaseIndex,
+                "abc".to_owned(),
                 SetOptionMode::Replace,
             )
             .expect_err("invalid request should fail");
@@ -236,7 +236,7 @@ mod tests {
         assert!(matches!(
             error,
             ClientError::Protocol(RmuxError::InvalidSetOption(message))
-                if message == "default-terminal is only supported at global scope"
+                if message == "value is invalid: abc"
         ));
 
         let mut buffer = [0_u8; 1];

@@ -362,6 +362,7 @@ async fn kill_session_prunes_web_session_share_before_name_reuse() {
             target: session_name.clone(),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }))
         .await;
     assert!(matches!(killed, Response::KillSession(_)));

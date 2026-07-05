@@ -145,10 +145,11 @@ fn boolean_or() {
 
 #[test]
 fn bang_prefix_is_not_a_boolean_modifier() {
-    assert_eq!(render_template("#{!:0}", &StaticWindowValues), "");
-    assert_eq!(render_template("#{!:1}", &StaticWindowValues), "");
-    assert_eq!(render_template("#{!!:0}", &StaticWindowValues), "");
-    assert_eq!(render_template("#{!!:1}", &StaticWindowValues), "");
+    assert_eq!(render_template("#{!:0}", &StaticWindowValues), "1");
+    assert_eq!(render_template("#{!:1}", &StaticWindowValues), "0");
+    assert_eq!(render_template("#{!!:0}", &StaticWindowValues), "0");
+    assert_eq!(render_template("#{!!:1}", &StaticWindowValues), "1");
+    assert_eq!(render_template("#{!!:foo}", &StaticWindowValues), "1");
     assert_eq!(
         render_template("#{!#{window_active}}", &StaticWindowValues),
         "!1"
@@ -301,7 +302,7 @@ fn expression_non_finite_comparisons_match_tmux_sentinel() {
 }
 
 #[test]
-fn boolean_and_matches_tmux_3_4_binary_semantics() {
+fn boolean_and_matches_tmux_3_7_variadic_semantics() {
     assert_eq!(
         render_template(
             "#{&&:#{window_active},#{session_name},#{window_panes}}",
@@ -314,7 +315,7 @@ fn boolean_and_matches_tmux_3_4_binary_semantics() {
             "#{&&:#{window_active},#{window_last_flag},#{session_name}}",
             &StaticWindowValues
         ),
-        "1"
+        "0"
     );
     assert_eq!(
         render_template(
@@ -323,23 +324,24 @@ fn boolean_and_matches_tmux_3_4_binary_semantics() {
         ),
         "0"
     );
-    assert_eq!(render_template("#{&&:1}", &StaticWindowValues), "");
+    assert_eq!(render_template("#{&&:}", &StaticWindowValues), "0");
+    assert_eq!(render_template("#{&&:1}", &StaticWindowValues), "1");
     assert_eq!(render_template("#{&&:1,1,1}", &StaticWindowValues), "1");
-    assert_eq!(render_template("#{&&:1,1,0}", &StaticWindowValues), "1");
+    assert_eq!(render_template("#{&&:1,1,0}", &StaticWindowValues), "0");
     assert_eq!(
         render_template("#{&&:1,#{&&:1,0},1}", &StaticWindowValues),
-        "1"
+        "0"
     );
 }
 
 #[test]
-fn boolean_or_matches_tmux_3_4_binary_semantics() {
+fn boolean_or_matches_tmux_3_7_variadic_semantics() {
     assert_eq!(
         render_template(
             "#{||:#{window_last_flag},#{missing},#{missing2}}",
             &StaticWindowValues
         ),
-        "1"
+        "0"
     );
     assert_eq!(
         render_template(
@@ -348,13 +350,14 @@ fn boolean_or_matches_tmux_3_4_binary_semantics() {
         ),
         "1"
     );
-    assert_eq!(render_template("#{||:0}", &StaticWindowValues), "");
-    assert_eq!(render_template("#{||:1}", &StaticWindowValues), "");
-    assert_eq!(render_template("#{||:0,0,0}", &StaticWindowValues), "1");
+    assert_eq!(render_template("#{||:}", &StaticWindowValues), "0");
+    assert_eq!(render_template("#{||:0}", &StaticWindowValues), "0");
+    assert_eq!(render_template("#{||:1}", &StaticWindowValues), "1");
+    assert_eq!(render_template("#{||:0,0,0}", &StaticWindowValues), "0");
     assert_eq!(render_template("#{||:0,1,0}", &StaticWindowValues), "1");
     assert_eq!(
         render_template("#{||:0,#{||:0,0},0}", &StaticWindowValues),
-        "1"
+        "0"
     );
 }
 
@@ -381,15 +384,63 @@ fn conditional_false_branch_preserves_commas() {
             "#{?window_last_flag,first,missing,second,default}tail",
             &StaticWindowValues
         ),
-        "missing,second,defaulttail"
+        "defaulttail"
     );
     assert_eq!(
         render_template(
             "#{?window_last_flag,first,session_name,second,default}tail",
             &StaticWindowValues
         ),
-        "session_name,second,defaulttail"
+        "secondtail"
     );
+}
+
+#[test]
+fn conditional_else_if_matches_tmux_3_7() {
+    assert_eq!(
+        render_template("#{?#{==:a,b},X,#{==:c,c},Y,Z}", &StaticWindowValues),
+        "Y"
+    );
+    assert_eq!(
+        render_template("#{?#{==:a,b},X,#{==:c,d},Y,Z}", &StaticWindowValues),
+        "Z"
+    );
+}
+
+#[test]
+fn repeat_modifier_matches_tmux_3_7() {
+    assert_eq!(render_template("#{R:ab,3}", &StaticWindowValues), "ababab");
+    assert_eq!(render_template("#{R:x,0}", &StaticWindowValues), "");
+    assert_eq!(render_template("#{R:x,-1}", &StaticWindowValues), "");
+    assert_eq!(render_template("#{R:x,2.9}", &StaticWindowValues), "");
+    assert_eq!(
+        render_template("#{R: ,#{n:#{session_name}}}", &StaticWindowValues),
+        "     "
+    );
+    assert_eq!(
+        render_template("#{R:0123456789,1000}", &StaticWindowValues).len(),
+        10_000
+    );
+    assert_eq!(
+        render_template("#{R:0123456789,1001}", &StaticWindowValues).len(),
+        10_010
+    );
+    assert_eq!(
+        render_template("#{n:#{R:#{p10000:a},100}}", &StaticWindowValues),
+        "1000000"
+    );
+    assert_eq!(
+        render_template("#{n:#{R:#{p10000:a},1000}}", &StaticWindowValues),
+        "0"
+    );
+    assert_eq!(
+        render_template(
+            "#{n:#{R:#{R:#{p10000:a},10000},10000}}",
+            &StaticWindowValues
+        ),
+        "0"
+    );
+    assert_eq!(render_template("#{R:x,10001}", &StaticWindowValues), "");
 }
 
 #[test]

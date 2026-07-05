@@ -96,6 +96,8 @@ pub(crate) struct KillSessionArgs {
     pub(crate) kill_all_except_target: bool,
     #[arg(short = 'C', action = ArgAction::SetTrue)]
     pub(crate) clear_alerts: bool,
+    #[arg(short = 'g', action = ArgAction::SetTrue)]
+    pub(crate) kill_group: bool,
     #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
     pub(crate) target: Option<TargetSpec>,
 }
@@ -112,20 +114,13 @@ pub(crate) struct ServerAccessArgs {
     pub(crate) read_only: bool,
     #[arg(short = 'w', action = ArgAction::SetTrue)]
     pub(crate) write: bool,
-    #[arg(short = 't', action = ArgAction::SetTrue, hide = true)]
-    pub(crate) unsupported_target: bool,
+    #[arg(short = 't', allow_hyphen_values = true)]
+    pub(crate) target: Option<String>,
     pub(crate) user: Option<String>,
 }
 
 impl ServerAccessArgs {
     pub(super) fn validate(self) -> Result<Self, clap::Error> {
-        if self.unsupported_target {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::UnknownArgument,
-                "command server-access: unknown flag -t",
-            ));
-        }
-
         Ok(self)
     }
 }
@@ -156,7 +151,7 @@ pub(crate) struct ListSessionsArgs {
     pub(crate) filter: Option<String>,
     #[arg(long = "json", action = ArgAction::SetTrue)]
     pub(crate) json: bool,
-    #[arg(short = 'O', num_args = 0..=1, default_missing_value = "", allow_hyphen_values = true)]
+    #[arg(short = 'O', allow_hyphen_values = true)]
     pub(crate) sort_order: Option<String>,
     #[arg(short = 'r', action = ArgAction::SetTrue)]
     pub(crate) reversed: bool,
@@ -164,21 +159,8 @@ pub(crate) struct ListSessionsArgs {
 
 impl ListSessionsArgs {
     pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        if self.sort_order.is_some() {
-            return Err(unknown_flag_error("list-sessions", "-O"));
-        }
-        if self.reversed {
-            return Err(unknown_flag_error("list-sessions", "-r"));
-        }
         Ok(self)
     }
-}
-
-fn unknown_flag_error(command_name: &str, flag: &str) -> clap::Error {
-    clap::Error::raw(
-        clap::error::ErrorKind::UnknownArgument,
-        format!("command {command_name}: unknown flag {flag}"),
-    )
 }
 
 #[derive(Debug, Clone, Args)]

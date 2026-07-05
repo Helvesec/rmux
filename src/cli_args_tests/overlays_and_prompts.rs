@@ -181,15 +181,16 @@ fn prompt_commands_accept_target_client_flags() {
 }
 
 #[test]
-fn command_prompt_rejects_tmux_invalid_short_flags() {
-    for flag in ["-e", "-l"] {
-        let error = parse_args(&["command-prompt", flag, "display-message hi"]).unwrap_err();
+fn command_prompt_accepts_tmux_command_error_backspace_and_literal_flags() {
+    let cli = parse_args(&["command-prompt", "-Cel", "display-message hi"]).unwrap();
 
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("command command-prompt: unknown flag {flag}")),
-            "{error}"
-        );
+    match cli.command.expect("parsed command") {
+        super::super::Command::Prompt(args) => {
+            assert!(args.command_error);
+            assert!(args.backspace_exit);
+            assert!(args.literal);
+            assert_eq!(args.template, vec!["display-message hi"]);
+        }
+        other => panic!("expected Prompt command, got {other:?}"),
     }
 }

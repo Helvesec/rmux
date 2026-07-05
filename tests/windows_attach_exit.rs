@@ -255,6 +255,56 @@ fn windows_explicit_cmd_shim_pane_command_runs_through_cmd_wrapper() -> Result<(
 }
 
 #[test]
+fn windows_cmd_default_shell_script_runs_through_cmd_wrapper() -> Result<(), Box<dyn Error>> {
+    let _serial = lock_windows_console_test();
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let label = unique_label("win-cmd-default-shell");
+    let case_dir = std::env::temp_dir().join(&label).join("shell dir");
+    fs::create_dir_all(&case_dir)?;
+    let script = case_dir.join("custom default.cmd");
+    fs::write(
+        &script,
+        "@echo off\r\n\
+         echo RMUX_DEFAULT_CMD_READY\r\n\
+         echo RMUX_DEFAULT_CMD_PATH:%~f0\r\n\
+         ping -n 30 127.0.0.1 >NUL\r\n",
+    )?;
+    let _guard = RmuxServerGuard::new(&binary, label.clone());
+
+    run_rmux(&binary, &label, ["start-server"])?;
+    let set_default = Command::new(&binary)
+        .arg("-L")
+        .arg(&label)
+        .args(["set-option", "-g", "default-shell"])
+        .arg(&script)
+        .output()?;
+    assert!(
+        set_default.status.success(),
+        "setting .cmd default-shell failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+        set_default.status,
+        String::from_utf8_lossy(&set_default.stdout),
+        String::from_utf8_lossy(&set_default.stderr)
+    );
+    run_rmux(&binary, &label, ["new-session", "-d", "-s", "cmddefault"])?;
+
+    let output = wait_for_capture_contains(
+        &binary,
+        &label,
+        "cmddefault:0.0",
+        b"RMUX_DEFAULT_CMD_READY",
+        SETUP_TIMEOUT,
+    )?;
+    assert!(
+        output_contains(&output, b"custom default.cmd"),
+        ".cmd default-shell path with spaces was not executed through the wrapper; observed output: {}",
+        escaped_output(&output)
+    );
+
+    let _ = fs::remove_dir_all(case_dir);
+    Ok(())
+}
+
+#[test]
 #[ignore = "timing-sensitive Windows attach latency probe"]
 fn windows_attach_exit_command_returns_under_latency_budget() -> Result<(), Box<dyn Error>> {
     let _serial = lock_windows_console_test();
@@ -1555,7 +1605,7 @@ fn windows_attach_ctrl_c_preserves_raw_console_character_when_processed_input_is
         .spawn()?;
     let io = attach.master().try_clone_io()?;
 
-    wait_for_needle_or_error(&mut attach, b"RAW_READY", RAW_CONSOLE_PROBE_READY_TIMEOUT)?;
+    wait_for_needle_or_error(&mut attach, b"RAW_READY", SETUP_TIMEOUT)?;
     write_windows_console_key(attach.child().pid(), WindowsConsoleKeyEvent::ctrl_c())?;
     thread::sleep(Duration::from_millis(150));
     io.write_all(b"x")?;
@@ -1589,13 +1639,7 @@ fn windows_send_keys_ctrl_c_preserves_raw_console_character_when_processed_input
         ["new-session", "-d", "-s", "rawsend", command.as_str()],
     )?;
     run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
-    wait_for_capture_contains(
-        &binary,
-        &label,
-        "rawsend:0.0",
-        b"RAW_READY",
-        RAW_CONSOLE_PROBE_READY_TIMEOUT,
-    )?;
+    wait_for_capture_contains(&binary, &label, "rawsend:0.0", b"RAW_READY", SETUP_TIMEOUT)?;
 
     run_rmux(
         &binary,
@@ -2021,7 +2065,38 @@ fn write_python_descendant_sleep_script(label: &str) -> Result<PathBuf, Box<dyn 
 }
 
 const RAW_CONSOLE_PROBE_SCRIPT: &str = r#"
-[Console]::TreatControlCAsInput = $true
+Add-Type @"
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public static class RmuxRawConsoleProbe {
+    private const int STD_INPUT_HANDLE = -10;
+    private const uint ENABLE_PROCESSED_INPUT = 0x0001;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GetStdHandle(int nStdHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+
+    public static void DisableProcessedInput() {
+        IntPtr handle = GetStdHandle(STD_INPUT_HANDLE);
+        uint mode;
+        if (!GetConsoleMode(handle, out mode)) {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+        if (!SetConsoleMode(handle, mode & ~ENABLE_PROCESSED_INPUT)) {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+    }
+}
+"@
+
+[RmuxRawConsoleProbe]::DisableProcessedInput()
 [Console]::Out.WriteLine("RAW_READY")
 [Console]::Out.Flush()
 while ($true) {

@@ -140,14 +140,17 @@ async fn list_panes_uses_shared_formatter_through_real_socket() -> Result<(), Bo
 
     let listed = send_request(
         harness.socket_path(),
-        &Request::ListPanes(ListPanesRequest {
+        &Request::ListPanes(Box::new(ListPanesRequest {
             target: alpha,
             format: Some(
                 "#{session_name}:#{window_index}:#{pane_index}:#{pane_id}:#{pane_active}"
                     .to_owned(),
             ),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }),
+        })),
     )
     .await?;
 
@@ -226,7 +229,13 @@ async fn rename_session_round_trips_and_migrates_session_scoped_state() -> Resul
             &Request::SetHook(SetHookRequest {
                 scope: ScopeSelector::Session(alpha.clone()),
                 hook: HookName::AfterSendKeys,
-                command: format!("printf renamed-hook > {}", hook_path.display()),
+                command: format!(
+                    "run-shell {}",
+                    shell_quote_str(&format!(
+                        "printf renamed-hook > {}",
+                        shell_quote(&hook_path)
+                    ))
+                ),
                 lifecycle: HookLifecycle::Persistent,
             }),
         )
@@ -342,4 +351,12 @@ async fn wait_for_file_contents(path: &Path, expected: &str) -> Result<(), Box<d
         expected
     ))
     .into())
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+fn shell_quote_str(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }

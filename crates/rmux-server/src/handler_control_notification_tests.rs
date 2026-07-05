@@ -407,6 +407,7 @@ async fn sessions_changed_notifications_reach_control_clients_with_and_without_s
             target: beta,
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }))
         .await;
     assert!(matches!(response, Response::KillSession(_)));

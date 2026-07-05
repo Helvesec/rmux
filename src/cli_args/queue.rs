@@ -430,7 +430,7 @@ fn parse_server_access_args(arguments: Vec<String>) -> Result<ServerAccessArgs, 
             continue;
         }
         for flag in flags.chars() {
-            if !matches!(flag, 'a' | 'd' | 'l' | 'r' | 'w') {
+            if !matches!(flag, 'a' | 'd' | 'l' | 'r' | 't' | 'w') {
                 return Err(clap::Error::raw(
                     clap::error::ErrorKind::UnknownArgument,
                     format!("command server-access: unknown flag -{flag}"),
@@ -448,12 +448,14 @@ fn parse_set_option_args(
     mut arguments: Vec<String>,
 ) -> Result<SetOptionArgs, clap::Error> {
     let trailing_literal_separator = normalize_set_option_separator(command_name, &mut arguments)?;
+    let explicit_scope = set_option_scope(command_name, &arguments);
     let kind = match command_name {
         "set-option" => SetOptionCommandKind::SetOption,
         "set-window-option" => SetOptionCommandKind::SetWindowOption,
         _ => unreachable!("unexpected set-option command name"),
     };
     let mut args = parse_command_args::<SetOptionArgs>(command_name, arguments)?;
+    apply_set_option_scope(&mut args, explicit_scope);
     if trailing_literal_separator {
         if args.value.is_some() {
             return Err(set_option_too_many_arguments(command_name));
@@ -461,6 +463,91 @@ fn parse_set_option_args(
         args.value = Some("--".to_owned());
     }
     args.validate(kind)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SetOptionScopeFlag {
+    Server,
+    Window,
+    Pane,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct SetOptionScopeFlags {
+    server: bool,
+    window: bool,
+    pane: bool,
+}
+
+impl SetOptionScopeFlags {
+    const fn selected(self) -> Option<SetOptionScopeFlag> {
+        if self.server {
+            Some(SetOptionScopeFlag::Server)
+        } else if self.pane {
+            Some(SetOptionScopeFlag::Pane)
+        } else if self.window {
+            Some(SetOptionScopeFlag::Window)
+        } else {
+            None
+        }
+    }
+}
+
+fn set_option_scope(
+    command_name: &'static str,
+    arguments: &[String],
+) -> Option<SetOptionScopeFlag> {
+    if command_name != "set-option" {
+        return None;
+    }
+
+    let mut scopes = SetOptionScopeFlags::default();
+    let mut index = 0;
+    while let Some(argument) = arguments.get(index) {
+        if argument == "--" {
+            break;
+        }
+        if !argument.starts_with('-') || argument == "-" {
+            break;
+        }
+        if argument.starts_with("-t") && argument.len() > 2 {
+            index += 1;
+            continue;
+        }
+
+        let mut chars = argument[1..].chars().peekable();
+        while let Some(flag) = chars.next() {
+            match flag {
+                's' => scopes.server = true,
+                'w' | 'U' => scopes.window = true,
+                'p' => scopes.pane = true,
+                't' => {
+                    if chars.peek().is_none() {
+                        index += 1;
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+
+    scopes.selected()
+}
+
+fn apply_set_option_scope(args: &mut SetOptionArgs, scope: Option<SetOptionScopeFlag>) {
+    let Some(scope) = scope else {
+        return;
+    };
+    args.server = false;
+    args.window = false;
+    args.pane = false;
+    match scope {
+        SetOptionScopeFlag::Server => args.server = true,
+        SetOptionScopeFlag::Window => args.window = true,
+        SetOptionScopeFlag::Pane => args.pane = true,
+    }
 }
 
 fn normalize_set_option_separator(
@@ -495,6 +582,15 @@ fn set_option_positionals_before_separator(arguments: &[String]) -> usize {
             continue;
         }
         if argument.starts_with('-') && argument.len() > 1 {
+            let flags = &argument[1..];
+            if let Some((offset, flag)) = flags.char_indices().find(|(_, flag)| *flag == 't') {
+                index += if offset + flag.len_utf8() == flags.len() {
+                    2
+                } else {
+                    1
+                };
+                continue;
+            }
             index += 1;
             continue;
         }

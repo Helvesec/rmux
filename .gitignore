@@ -1,5 +1,4 @@
 /target
-/crates/*/target/
 /target-audit/
 /dist/
 __pycache__/

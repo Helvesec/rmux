@@ -1,6 +1,6 @@
 # ratatui-rmux
 
-Ratatui integration for the [RMUX](https://github.com/helvesec/rmux) terminal multiplexer.
+Ratatui integration for the [RMUX](https://github.com/Helvesec/rmux) terminal multiplexer.
 
 Paints daemon-backed pane snapshots into a `ratatui::buffer::Buffer` with no
 async work in the draw path. The async driver pulls snapshots from the
@@ -12,8 +12,8 @@ state.
 ```toml
 [dependencies]
 ratatui = "0.29"
-ratatui-rmux = "0.8.0"
-rmux-sdk = "0.8.0"
+ratatui-rmux = "0.9.0"
+rmux-sdk = "0.9.0"
 ```
 
 ```rust

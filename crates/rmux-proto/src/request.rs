@@ -134,7 +134,7 @@ pub enum Request {
     /// `last-window`
     LastWindow(LastWindowRequest),
     /// `list-windows`
-    ListWindows(ListWindowsRequest),
+    ListWindows(Box<ListWindowsRequest>),
     /// `move-window`
     MoveWindow(MoveWindowRequest),
     /// `swap-window`
@@ -214,7 +214,7 @@ pub enum Request {
     /// `list-sessions`
     ListSessions(ListSessionsRequest),
     /// `list-panes`
-    ListPanes(ListPanesRequest),
+    ListPanes(Box<ListPanesRequest>),
     /// `source-file`
     SourceFile(Box<SourceFileRequest>),
     /// `set-option` using an open string-based option name.
@@ -498,6 +498,9 @@ pub struct ShowMessagesRequest {
 pub struct RunShellRequest {
     /// The server-local shell command passed to `sh -c`.
     pub command: String,
+    /// Literal positional format arguments exposed as `#{1}`, `#{2}`, and so on.
+    #[serde(default)]
+    pub arguments: Vec<String>,
     /// Whether the command should run fire-and-forget without output capture.
     pub background: bool,
     /// Whether the command should be executed as tmux commands instead of `sh -c`.
@@ -667,6 +670,15 @@ pub struct ListPanesRequest {
     pub target_window_index: Option<u32>,
     /// An optional server-side format template.
     pub format: Option<String>,
+    /// Optional filter expression.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Optional sort-order token.
+    #[serde(default)]
+    pub sort_order: Option<String>,
+    /// Whether the selected sort order should be reversed.
+    #[serde(default)]
+    pub reversed: bool,
 }
 
 #[cfg(test)]
@@ -1012,6 +1024,21 @@ mod tests {
             unset_pane_overrides: false,
             format: true,
             format_target: Some(crate::Target::Session(alpha())),
+        });
+        assert_box_serializes_like_value(ListWindowsRequest {
+            target: alpha(),
+            format: Some("#{window_index}".to_owned()),
+            filter: Some("#{==:#{window_active},1}".to_owned()),
+            sort_order: Some("index".to_owned()),
+            reversed: true,
+        });
+        assert_box_serializes_like_value(ListPanesRequest {
+            target: alpha(),
+            target_window_index: Some(1),
+            format: Some("#{pane_index}".to_owned()),
+            filter: Some("#{==:#{pane_active},1}".to_owned()),
+            sort_order: Some("index".to_owned()),
+            reversed: true,
         });
         assert_box_serializes_like_value(AttachSessionExt3Request::from_ext2(
             AttachSessionExt2Request {

@@ -149,6 +149,7 @@ async fn server_access_list_returns_server_access_response() {
             list: true,
             read_only: false,
             write: false,
+            target: None,
             user: None,
         }))
         .await;

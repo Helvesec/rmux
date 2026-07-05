@@ -318,6 +318,8 @@ impl FormatVariables for RuntimeFormatContext<'_> {
             "pane_dead_status" => self.pane_dead_status(),
             "pane_dead_time" => self.pane_dead_time(),
             "pane_bg" => self.pane_style_colour(false),
+            "pane_activity" => self.pane.map(|pane| pane.activity_at().to_string()),
+            "pane_created" => self.pane.map(|pane| pane.created_at().to_string()),
             "pane_fg" => self.pane_style_colour(true),
             "pane_flags" => self.pane.map(|pane| {
                 let mut flags = String::new();
@@ -532,7 +534,7 @@ impl FormatVariables for RuntimeFormatContext<'_> {
                     .and_then(|_| self.session_name().map(ToString::to_string))
                     .unwrap_or_default(),
             ),
-            "window_activity" => self.session.map(|session| session.activity_at().to_string()),
+            "window_activity" => self.window.map(|window| window.activity_at().to_string()),
             "window_bigger" => Some("0".to_owned()),
             "window_cell_height" => Some("32".to_owned()),
             "window_cell_width" => Some("16".to_owned()),
@@ -544,6 +546,7 @@ impl FormatVariables for RuntimeFormatContext<'_> {
                 )
             }),
             "window_format" => Some(bool_string(self.window.is_some() && self.pane.is_none())),
+            "window_created" => self.window.map(|window| window.created_at().to_string()),
             "window_marked_flag" => Some(bool_string(self.window_marked())),
             "window_offset_x" | "window_offset_y" => Some("0".to_owned()),
             "window_stack_index" => self.window_stack_index(),

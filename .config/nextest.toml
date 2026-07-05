@@ -2,6 +2,13 @@
 daemon-integration = { max-threads = 6 }
 windows-console = { max-threads = 1 }
 
+[profile.default]
+retries = 0
+
+[[profile.default.overrides]]
+filter = 'test(/^quarantine::/)'
+retries = 1
+
 [[profile.default.overrides]]
 filter = 'binary(windows_attach_exit)'
 test-group = 'windows-console'

@@ -205,11 +205,12 @@ impl RequestHandler {
             active.overlay_generation = active.overlay_generation.saturating_add(1);
             let render_generation = active.render_generation;
             let overlay_generation = active.overlay_generation;
-            let mut frame = if active.mode_tree.is_some() || active.overlay.is_some() {
-                Vec::new()
-            } else {
-                clear_frame.clone()
-            };
+            let mut frame =
+                if active.mode_tree.is_some() || active.overlay.is_some() || active.render_stream {
+                    Vec::new()
+                } else {
+                    clear_frame.clone()
+                };
             frame.extend_from_slice(&overlay_frame);
 
             if active

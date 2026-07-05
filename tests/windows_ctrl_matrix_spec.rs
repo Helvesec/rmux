@@ -1,6 +1,12 @@
 #[test]
 fn windows_ctrl_matrix_script_keeps_direct_attach_send_keys_axes() {
     let script = include_str!("../scripts/windows_ctrl_matrix.ps1");
+    let implementation = windows_ctrl_matrix_implementation(script);
+    assert!(
+        !implementation.contains("$requiredSnippets = @("),
+        "Windows Ctrl matrix spec must not validate against its own snippet list"
+    );
+
     for required in [
         "function Invoke-DirectCase",
         "function Invoke-AttachCase",
@@ -16,6 +22,9 @@ fn windows_ctrl_matrix_script_keeps_direct_attach_send_keys_axes() {
         "WezTerm",
         "Alacritty",
         "PortableSmokeOnly",
+        "portable-smoke.skip.txt",
+        "owner=release-engineering",
+        "cadence=release-candidate-and-manual-windows-review",
         "Ctrl-C",
         "Ctrl-D",
         "Ctrl-A",
@@ -36,22 +45,76 @@ fn windows_ctrl_matrix_script_keeps_direct_attach_send_keys_axes() {
         "fzf",
     ] {
         assert!(
-            script.contains(required),
+            implementation.contains(required),
             "Windows Ctrl matrix script lost required axis/snippet {required:?}"
         );
     }
 
     assert!(
-        script.contains(
+        implementation.contains(
             "$Direct.Returned -eq $Attach.Returned -and $Direct.Returned -eq $Send.Returned"
         ),
         "Windows Ctrl matrix must continue comparing native, attach, and send-keys outcomes"
     );
 
     assert!(
-        script.contains("$Results.Count -eq 0")
-            && script.contains("Where-Object { $_.Verdict -eq \"NO GO\" }")
-            && script.contains("Windows Ctrl matrix found"),
+        implementation.contains("$Results.Count -eq 0")
+            && implementation.contains("Where-Object { $_.Verdict -eq \"NO GO\" }")
+            && implementation.contains("Windows Ctrl matrix found"),
         "Windows Ctrl matrix must fail closed on empty or NO GO results"
+    );
+}
+
+fn windows_ctrl_matrix_implementation(script: &str) -> String {
+    let start = script
+        .find("if ($StaticMatrixSpec) {")
+        .expect("StaticMatrixSpec block start");
+    let end = script[start..]
+        .find("\nif ($PortableSmokeOnly")
+        .map(|offset| start + offset)
+        .expect("StaticMatrixSpec block end");
+    let mut implementation = String::with_capacity(script.len() - (end - start));
+    implementation.push_str(&script[..start]);
+    implementation.push_str(&script[end..]);
+    implementation
+}
+
+#[test]
+fn windows_release_gate_runs_ctrl_matrix_and_nonempty_cargo_filters() {
+    let workflow = include_str!("../.github/workflows/release.yml");
+    let gate = include_str!("../scripts/gate-windows-fast.ps1");
+    let assert_filter = include_str!("../scripts/assert-cargo-filter-nonempty.ps1");
+    let package_verify = include_str!("../scripts/verify-package-windows.ps1");
+
+    for required in [
+        "./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux-client --locked output_writer_failure_wakes",
+        "./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux --locked --test windows_attach_exit",
+        "./scripts/windows_ctrl_matrix.ps1 -PortableSmokeOnly -OutDir target/windows-ctrl-matrix",
+        "rmux-${{ env.RELEASE_REF }}-${{ matrix.target }}-windows-ctrl-matrix",
+        "-RunCtrlMatrixSmoke",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "Windows release workflow lost required Lot 7 gate snippet {required:?}"
+        );
+    }
+
+    assert!(
+        gate.contains("assert-cargo-filter-nonempty.ps1")
+            && gate.contains("windows prompt overlay chain")
+            && gate.contains("windows ctrl matrix spec"),
+        "fast Windows gate must assert non-empty filtered Windows probes"
+    );
+    assert!(
+        assert_filter.contains("--list")
+            && assert_filter.contains("':\\s+test$'")
+            && assert_filter.contains("cargo-filter-nonempty=ok"),
+        "PowerShell cargo-filter assertion must list tests and fail closed"
+    );
+    assert!(
+        package_verify.contains("RunCtrlMatrixSmoke")
+            && package_verify.contains("windows_ctrl_matrix.ps1")
+            && package_verify.contains("-PortableSmokeOnly"),
+        "Windows package verification must keep the packaged Ctrl matrix smoke"
     );
 }

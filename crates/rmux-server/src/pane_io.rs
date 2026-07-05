@@ -115,6 +115,7 @@ pub(crate) async fn forward_attach(
     let stream = stream.into();
     let mut decoder = AttachFrameDecoder::new();
     let mut pending_input = Vec::new();
+    let mut active_emit_cache = None;
     let mut attach_controls = Some(control_rx);
     let mut deferred_controls = VecDeque::new();
     let mut pending_escape_flush = PendingEscapeFlush::default();
@@ -280,6 +281,7 @@ pub(crate) async fn forward_attach(
                 &live_input,
                 &mut current_target,
                 &mut pending_input,
+                &mut active_emit_cache,
                 &mut locked,
                 &mut pane_refresh,
                 &mut pending_escape_flush,
@@ -431,6 +433,7 @@ pub(crate) async fn forward_attach(
                         &live_input,
                         &mut current_target,
                         &mut pending_input,
+                        &mut active_emit_cache,
                         &mut locked,
                         &mut pane_refresh,
                         &mut pending_escape_flush,
@@ -1433,6 +1436,7 @@ async fn process_attach_socket_messages(
     live_input: &LiveAttachInputContext,
     current_target: &mut types::OpenAttachTarget,
     pending_input: &mut Vec<u8>,
+    active_emit_cache: &mut Option<(u64, rmux_proto::WindowTarget)>,
     locked: &mut bool,
     pane_refresh: &mut AttachRefreshScheduler,
     pending_escape_flush: &mut PendingEscapeFlush,
@@ -1444,6 +1448,7 @@ async fn process_attach_socket_messages(
         live_input,
         Some(current_target),
         pending_input,
+        active_emit_cache,
         locked,
     )
     .await?
@@ -1473,21 +1478,22 @@ async fn process_socket_messages(
     live_input: &LiveAttachInputContext,
     mut current_target: Option<&mut types::OpenAttachTarget>,
     pending_input: &mut Vec<u8>,
+    active_emit_cache: &mut Option<(u64, rmux_proto::WindowTarget)>,
     locked: &mut bool,
 ) -> io::Result<bool> {
-    let mut saw_client_activity = false;
+    let mut forwarded_to_pane = false;
     let mut data_scratch = [0_u8; ATTACH_INPUT_STACK_PAYLOAD];
     loop {
         while let Some(bytes) = decoder
             .next_data_payload_into(&mut data_scratch)
             .map_err(invalid_attach_message)?
         {
-            saw_client_activity = true;
-            process_attach_data_payload(
+            forwarded_to_pane |= process_attach_data_payload(
                 live_input,
                 stream,
                 current_target.as_deref_mut(),
                 pending_input,
+                active_emit_cache,
                 locked,
                 bytes,
             )
@@ -1499,38 +1505,39 @@ async fn process_socket_messages(
         };
         match message {
             AttachMessage::Data(bytes) => {
-                saw_client_activity = true;
-                process_attach_data_payload(
+                forwarded_to_pane |= process_attach_data_payload(
                     live_input,
                     stream,
                     current_target.as_deref_mut(),
                     pending_input,
+                    active_emit_cache,
                     locked,
                     &bytes,
                 )
                 .await?;
             }
             AttachMessage::Keystroke(keystroke) => {
-                saw_client_activity = true;
-                let forwarded_to_pane = if *locked {
+                let keystroke_forwarded_to_pane = if *locked {
                     pending_input.clear();
                     false
                 } else {
                     live_input
                         .handler
-                        .handle_attached_keystroke_input(
+                        .handle_attached_keystroke_input_with_active_cache(
                             live_input.attach_pid,
                             pending_input,
                             &keystroke,
+                            active_emit_cache,
                         )
                         .await?
                 };
+                forwarded_to_pane |= keystroke_forwarded_to_pane;
                 let response = live_input
                     .handler
                     .handle_attached_keystroke(
                         live_input.attach_pid,
                         &keystroke,
-                        !forwarded_to_pane,
+                        !keystroke_forwarded_to_pane,
                     )
                     .await
                     .map_err(io::Error::other)?;
@@ -1590,7 +1597,7 @@ async fn process_socket_messages(
         }
     }
 
-    Ok(saw_client_activity)
+    Ok(forwarded_to_pane)
 }
 
 #[cfg(any(unix, windows))]
@@ -1599,12 +1606,13 @@ async fn process_attach_data_payload(
     stream: &AttachTransport,
     current_target: Option<&mut types::OpenAttachTarget>,
     pending_input: &mut Vec<u8>,
+    active_emit_cache: &mut Option<(u64, rmux_proto::WindowTarget)>,
     locked: &mut bool,
     bytes: &[u8],
-) -> io::Result<()> {
+) -> io::Result<bool> {
     if *locked {
         pending_input.clear();
-        return Ok(());
+        return Ok(false);
     }
     #[cfg(windows)]
     {
@@ -1622,6 +1630,7 @@ async fn process_attach_data_payload(
                     bytes,
                     &current_target.input_target,
                     master,
+                    active_emit_cache,
                 )
                 .await?
             {
@@ -1629,14 +1638,19 @@ async fn process_attach_data_payload(
                     let echo_enabled = master.local_echo_enabled().unwrap_or(false);
                     maybe_emit_predicted_local_echo(stream, current_target, echo_enabled, bytes)
                         .await?;
-                    return Ok(());
+                    return Ok(true);
                 }
             }
         }
     }
     live_input
         .handler
-        .handle_attached_live_input(live_input.attach_pid, pending_input, bytes)
+        .handle_attached_live_input_with_active_cache(
+            live_input.attach_pid,
+            pending_input,
+            bytes,
+            active_emit_cache,
+        )
         .await
 }
 

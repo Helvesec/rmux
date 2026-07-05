@@ -3,6 +3,13 @@ use rmux_proto::{HookName, PaneTarget, ScopeSelector, SessionName, Target, Windo
 /// A typed server lifecycle event that may dispatch a registered hook.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleEvent {
+    /// The client became the active client for its attached session/window.
+    ClientActive {
+        /// The session associated with the event.
+        session_name: SessionName,
+        /// The best available rmux client identifier.
+        client_name: Option<String>,
+    },
     /// A client attached to a session.
     ClientAttached {
         /// The session associated with the event.
@@ -17,6 +24,20 @@ pub enum LifecycleEvent {
         /// The best available rmux client identifier.
         client_name: Option<String>,
     },
+    /// The outer terminal reported focus-in for a client.
+    ClientFocusIn {
+        /// The session associated with the event.
+        session_name: SessionName,
+        /// The best available rmux client identifier.
+        client_name: Option<String>,
+    },
+    /// The outer terminal reported focus-out for a client.
+    ClientFocusOut {
+        /// The session associated with the event.
+        session_name: SessionName,
+        /// The best available rmux client identifier.
+        client_name: Option<String>,
+    },
     /// A client switched to another session.
     ClientSessionChanged {
         /// The session associated with the event.
@@ -26,6 +47,20 @@ pub enum LifecycleEvent {
     },
     /// A client changed its terminal size.
     ClientResized {
+        /// The session associated with the event.
+        session_name: SessionName,
+        /// The best available rmux client identifier.
+        client_name: Option<String>,
+    },
+    /// The client reported a light terminal theme.
+    ClientLightTheme {
+        /// The session associated with the event.
+        session_name: SessionName,
+        /// The best available rmux client identifier.
+        client_name: Option<String>,
+    },
+    /// The client reported a dark terminal theme.
+    ClientDarkTheme {
         /// The session associated with the event.
         session_name: SessionName,
         /// The best available rmux client identifier.
@@ -143,6 +178,11 @@ pub enum LifecycleEvent {
         /// The targeted pane.
         target: PaneTarget,
     },
+    /// A pane program emitted an OSC 52 clipboard sequence.
+    PaneSetClipboard {
+        /// The targeted pane.
+        target: PaneTarget,
+    },
     /// A pane title changed.
     PaneTitleChanged {
         /// The targeted pane.
@@ -185,10 +225,15 @@ impl LifecycleEvent {
     #[must_use]
     pub const fn hook_name(&self) -> HookName {
         match self {
+            Self::ClientActive { .. } => HookName::ClientActive,
             Self::ClientAttached { .. } => HookName::ClientAttached,
             Self::ClientDetached { .. } => HookName::ClientDetached,
+            Self::ClientFocusIn { .. } => HookName::ClientFocusIn,
+            Self::ClientFocusOut { .. } => HookName::ClientFocusOut,
             Self::ClientSessionChanged { .. } => HookName::ClientSessionChanged,
             Self::ClientResized { .. } => HookName::ClientResized,
+            Self::ClientLightTheme { .. } => HookName::ClientLightTheme,
+            Self::ClientDarkTheme { .. } => HookName::ClientDarkTheme,
             Self::SessionCreated { .. } => HookName::SessionCreated,
             Self::SessionClosed { .. } => HookName::SessionClosed,
             Self::SessionRenamed { .. } => HookName::SessionRenamed,
@@ -207,6 +252,7 @@ impl LifecycleEvent {
             Self::PaneModeChanged { .. } => HookName::PaneModeChanged,
             Self::PaneFocusIn { .. } => HookName::PaneFocusIn,
             Self::PaneFocusOut { .. } => HookName::PaneFocusOut,
+            Self::PaneSetClipboard { .. } => HookName::PaneSetClipboard,
             Self::PaneTitleChanged { .. } => HookName::PaneTitleChanged,
             Self::PasteBufferChanged { .. } => HookName::PasteBufferChanged,
             Self::PasteBufferDeleted { .. } => HookName::PasteBufferDeleted,
@@ -221,10 +267,15 @@ impl LifecycleEvent {
     #[must_use]
     pub fn scope(&self) -> ScopeSelector {
         match self {
-            Self::ClientAttached { session_name, .. }
+            Self::ClientActive { session_name, .. }
+            | Self::ClientAttached { session_name, .. }
             | Self::ClientDetached { session_name, .. }
+            | Self::ClientFocusIn { session_name, .. }
+            | Self::ClientFocusOut { session_name, .. }
             | Self::ClientSessionChanged { session_name, .. }
             | Self::ClientResized { session_name, .. }
+            | Self::ClientLightTheme { session_name, .. }
+            | Self::ClientDarkTheme { session_name, .. }
             | Self::SessionCreated { session_name }
             | Self::SessionClosed { session_name, .. }
             | Self::SessionRenamed { session_name }
@@ -246,6 +297,7 @@ impl LifecycleEvent {
             | Self::PaneModeChanged { target }
             | Self::PaneFocusIn { target }
             | Self::PaneFocusOut { target }
+            | Self::PaneSetClipboard { target }
             | Self::PaneTitleChanged { target }
             | Self::AfterSelectPane { target }
             | Self::AfterSendKeys { target } => ScopeSelector::Pane(target.clone()),
@@ -263,10 +315,15 @@ impl LifecycleEvent {
     #[must_use]
     pub fn session_name(&self) -> Option<&SessionName> {
         match self {
-            Self::ClientAttached { session_name, .. }
+            Self::ClientActive { session_name, .. }
+            | Self::ClientAttached { session_name, .. }
             | Self::ClientDetached { session_name, .. }
+            | Self::ClientFocusIn { session_name, .. }
+            | Self::ClientFocusOut { session_name, .. }
             | Self::ClientSessionChanged { session_name, .. }
             | Self::ClientResized { session_name, .. }
+            | Self::ClientLightTheme { session_name, .. }
+            | Self::ClientDarkTheme { session_name, .. }
             | Self::SessionCreated { session_name }
             | Self::SessionClosed { session_name, .. }
             | Self::SessionRenamed { session_name }
@@ -286,6 +343,7 @@ impl LifecycleEvent {
             | Self::PaneModeChanged { target }
             | Self::PaneFocusIn { target }
             | Self::PaneFocusOut { target }
+            | Self::PaneSetClipboard { target }
             | Self::PaneTitleChanged { target }
             | Self::AfterSelectPane { target }
             | Self::AfterSendKeys { target } => Some(target.session_name()),
@@ -300,8 +358,13 @@ impl LifecycleEvent {
         match self {
             Self::ClientAttached { client_name, .. }
             | Self::ClientDetached { client_name, .. }
+            | Self::ClientActive { client_name, .. }
+            | Self::ClientFocusIn { client_name, .. }
+            | Self::ClientFocusOut { client_name, .. }
             | Self::ClientSessionChanged { client_name, .. }
-            | Self::ClientResized { client_name, .. } => client_name.as_deref(),
+            | Self::ClientResized { client_name, .. }
+            | Self::ClientLightTheme { client_name, .. }
+            | Self::ClientDarkTheme { client_name, .. } => client_name.as_deref(),
             _ => None,
         }
     }
@@ -326,6 +389,7 @@ impl LifecycleEvent {
             | Self::PaneModeChanged { target }
             | Self::PaneFocusIn { target }
             | Self::PaneFocusOut { target }
+            | Self::PaneSetClipboard { target }
             | Self::PaneTitleChanged { target }
             | Self::AfterSelectPane { target }
             | Self::AfterSendKeys { target } => Some(WindowTarget::with_window(
@@ -345,6 +409,7 @@ impl LifecycleEvent {
             | Self::PaneModeChanged { target }
             | Self::PaneFocusIn { target }
             | Self::PaneFocusOut { target }
+            | Self::PaneSetClipboard { target }
             | Self::PaneTitleChanged { target }
             | Self::AfterSelectPane { target }
             | Self::AfterSendKeys { target } => Some(target),
@@ -421,10 +486,15 @@ impl LifecycleEvent {
             ))),
             Self::WindowLinked { session_name, .. }
             | Self::WindowUnlinked { session_name, .. }
+            | Self::ClientActive { session_name, .. }
             | Self::ClientAttached { session_name, .. }
             | Self::ClientDetached { session_name, .. }
+            | Self::ClientFocusIn { session_name, .. }
+            | Self::ClientFocusOut { session_name, .. }
             | Self::ClientSessionChanged { session_name, .. }
             | Self::ClientResized { session_name, .. }
+            | Self::ClientLightTheme { session_name, .. }
+            | Self::ClientDarkTheme { session_name, .. }
             | Self::SessionCreated { session_name }
             | Self::SessionClosed { session_name, .. }
             | Self::SessionRenamed { session_name }
@@ -444,6 +514,7 @@ impl LifecycleEvent {
             | Self::PaneModeChanged { target }
             | Self::PaneFocusIn { target }
             | Self::PaneFocusOut { target }
+            | Self::PaneSetClipboard { target }
             | Self::PaneTitleChanged { target }
             | Self::AfterSelectPane { target }
             | Self::AfterSendKeys { target } => Some(Target::Pane(target.clone())),

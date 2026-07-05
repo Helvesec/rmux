@@ -7,6 +7,9 @@ binary=""
 output_dir="target/perf"
 skip_build=0
 fail_on_budget=0
+source_command_count="${RMUX_PERF_SOURCE_COMMANDS:-1000}"
+hook_storm_events="${RMUX_PERF_HOOK_STORM_EVENTS:-25}"
+daemon_churn_cycles="${RMUX_PERF_DAEMON_CHURN_CYCLES:-10}"
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -68,6 +71,21 @@ if ! is_positive_integer "$line_count"; then
     exit 2
 fi
 
+if ! is_positive_integer "$source_command_count"; then
+    echo "RMUX_PERF_SOURCE_COMMANDS must be a positive integer, got: $source_command_count" >&2
+    exit 2
+fi
+
+if ! is_positive_integer "$hook_storm_events"; then
+    echo "RMUX_PERF_HOOK_STORM_EVENTS must be a positive integer, got: $hook_storm_events" >&2
+    exit 2
+fi
+
+if ! is_positive_integer "$daemon_churn_cycles"; then
+    echo "RMUX_PERF_DAEMON_CHURN_CYCLES must be a positive integer, got: $daemon_churn_cycles" >&2
+    exit 2
+fi
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
@@ -85,6 +103,12 @@ if [ ! -x "$binary" ]; then
 fi
 
 binary="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"
+case "$binary" in
+    */debug/rmux)
+        echo "perf bench requires a release artifact, got debug binary: $binary" >&2
+        exit 2
+        ;;
+esac
 mkdir -p "$output_dir"
 
 metric_names=()
@@ -157,7 +181,7 @@ max_value() {
 
 new_line_script() {
     local path
-    path="$(mktemp "${TMPDIR:-/tmp}/rmux-perf-lines.XXXXXX.sh")"
+    path="$(mktemp "${TMPDIR:-/tmp}/rmux-perf-lines.XXXXXX")"
     cat >"$path" <<SCRIPT
 #!/bin/sh
 i=1
@@ -169,6 +193,32 @@ sleep 30
 SCRIPT
     chmod +x "$path"
     printf '%s' "$path"
+}
+
+new_large_source_file() {
+    local path
+    path="$(mktemp "${TMPDIR:-/tmp}/rmux-perf-source.XXXXXX")"
+    for ((index = 1; index <= source_command_count; index++)); do
+        printf 'set-option -g @perf-source-%05d value-%05d\n' "$index" "$index"
+    done >"$path"
+    printf '%s' "$path"
+}
+
+new_hook_storm_source_file() {
+    local path
+    path="$(mktemp "${TMPDIR:-/tmp}/rmux-perf-hooks.XXXXXX")"
+    for ((index = 1; index <= hook_storm_events; index++)); do
+        printf 'set-option -g @perf-hook-storm-%03d value-%03d\n' "$index" "$index"
+    done >"$path"
+    printf '%s' "$path"
+}
+
+heavy_status_format() {
+    local format=""
+    for ((index = 1; index <= 80; index++)); do
+        format="${format}#{session_name}:#{window_index}:#{pane_index}:#{window_panes}:#{?pane_active,active,inactive}|"
+    done
+    printf '%s' "$format"
 }
 
 wait_for_line_marker() {
@@ -276,6 +326,147 @@ sample_capture_pane() {
     printf '%s' "$ms"
 }
 
+sample_attach_render() {
+    local socket output_file script marker ms status
+    socket="$(unique_socket attach-render)"
+    output_file="$(mktemp)"
+    script="$(new_line_script)"
+    marker="rmux-perf-line-$line_count"
+    "$binary" -L "$socket" new-session -d -s perf /bin/sh "$script" >/dev/null
+    wait_for_line_marker "$socket" "$output_file"
+    set +e
+    ms="$(
+        python3 - "$binary" "$socket" "$marker" <<'PY'
+import fcntl
+import os
+import pty
+import select
+import signal
+import struct
+import sys
+import termios
+import time
+
+rmux, socket, marker = sys.argv[1], sys.argv[2], sys.argv[3].encode()
+env = os.environ.copy()
+env.setdefault("TERM", "xterm-256color")
+env["COLUMNS"] = "80"
+env["LINES"] = "24"
+started = time.perf_counter()
+pid, fd = pty.fork()
+if pid == 0:
+    os.execve(rmux, [rmux, "-L", socket, "attach-session", "-t", "perf"], env)
+
+try:
+    winsize = struct.pack("HHHH", 24, 80, 0, 0)
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+    tail = bytearray()
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        readable, _, _ = select.select([fd], [], [], 0.1)
+        if fd not in readable:
+            continue
+        try:
+            data = os.read(fd, 65536)
+        except OSError:
+            break
+        if not data:
+            break
+        tail.extend(data)
+        if len(tail) > 65536:
+            del tail[:-65536]
+        if marker in tail:
+            print(f"{(time.perf_counter() - started) * 1000.0:.3f}")
+            raise SystemExit(0)
+    raise SystemExit("attach render marker was not observed")
+finally:
+    try:
+        os.write(fd, b"\x02d")
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except OSError:
+        pass
+PY
+    )"
+    status=$?
+    set -e
+    cleanup_socket "$socket"
+    rm -f "$output_file" "$script"
+    if [ "$status" -ne 0 ]; then
+        exit "$status"
+    fi
+    printf '%s' "$ms"
+}
+
+sample_source_file_large() {
+    local socket output_file source_file
+    socket="$(unique_socket source-large)"
+    output_file="$(mktemp)"
+    source_file="$(new_large_source_file)"
+    "$binary" -L "$socket" new-session -d -s perf /bin/sh >/dev/null
+    run_timed_ms "$output_file" -L "$socket" source-file "$source_file"
+    cleanup_socket "$socket"
+    rm -f "$output_file" "$source_file"
+}
+
+sample_status_format_heavy() {
+    local socket output_file format
+    socket="$(unique_socket status-format)"
+    output_file="$(mktemp)"
+    format="$(heavy_status_format)"
+    "$binary" -L "$socket" new-session -d -s perf /bin/sh >/dev/null
+    run_timed_ms "$output_file" -L "$socket" display-message -p -F "$format" -t perf
+    cleanup_socket "$socket"
+    rm -f "$output_file"
+}
+
+sample_hook_storm() {
+    local socket output_file source_file
+    socket="$(unique_socket hook-storm)"
+    output_file="$(mktemp)"
+    source_file="$(new_hook_storm_source_file)"
+    "$binary" -L "$socket" new-session -d -s perf /bin/sh >/dev/null
+    "$binary" -L "$socket" set-hook -g after-set-option 'display-message -p "#{hook}:#{option_name}"' >/dev/null
+    run_timed_ms "$output_file" -L "$socket" source-file "$source_file"
+    cleanup_socket "$socket"
+    rm -f "$output_file" "$source_file"
+}
+
+sample_daemon_churn() {
+    local root start_ns end_ns status socket
+    root="$(mktemp -d "${TMPDIR:-/tmp}/rmux-perf-daemon-churn.XXXXXX")"
+    status=0
+    start_ns="$(date +%s%N)"
+    for ((index = 1; index <= daemon_churn_cycles; index++)); do
+        socket="$root/churn-$index.sock"
+        "$binary" -S "$socket" new-session -d -s "churn$index" /bin/sh >/dev/null 2>&1 || {
+            status=$?
+            break
+        }
+        "$binary" -S "$socket" kill-server >/dev/null 2>&1 || {
+            status=$?
+            break
+        }
+    done
+    end_ns="$(date +%s%N)"
+    rm -rf "$root"
+    if [ "$status" -ne 0 ]; then
+        echo "daemon churn failed with exit code $status" >&2
+        exit "$status"
+    fi
+    awk -v start="$start_ns" -v end="$end_ns" 'BEGIN { printf "%.3f", (end - start) / 1000000 }'
+}
+
 record_metric() {
     local name="$1"
     local budget="$2"
@@ -317,6 +508,11 @@ record_metric "send_keys_detached_round_trip" "20" sample_send_keys
 record_metric "resize_pane_round_trip" "100" sample_resize_pane
 record_metric "pane_output_${line_count}_lines_ready" "null" sample_pane_output_ready
 record_metric "capture_pane_${line_count}_lines" "75" sample_capture_pane
+record_metric "attach_render_${line_count}_line_scrollback" "null" sample_attach_render
+record_metric "source_file_${source_command_count}_commands" "null" sample_source_file_large
+record_metric "status_format_heavy_expand" "null" sample_status_format_heavy
+record_metric "hook_storm_${hook_storm_events}_after_set_option" "null" sample_hook_storm
+record_metric "daemon_churn_${daemon_churn_cycles}_create_kill" "null" sample_daemon_churn
 
 timestamp="$(date -u +%Y%m%d-%H%M%S)"
 json_path="$output_dir/unix-$timestamp.json"

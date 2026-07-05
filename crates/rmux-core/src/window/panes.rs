@@ -169,6 +169,8 @@ impl Window {
             self.last_pane = Some(self.active_pane);
             self.active_pane = pane_index;
             self.mark_pane_active(pane_index);
+        } else if let Some(pane) = self.pane_mut(pane_index) {
+            pane.touch_activity();
         }
 
         true
@@ -206,12 +208,6 @@ impl Window {
         }
     }
 
-    pub(crate) fn clear_last_pane_reference(&mut self, pane_index: u32) {
-        if self.last_pane == Some(pane_index) {
-            self.last_pane = None;
-        }
-    }
-
     pub(super) fn mark_pane_active(&mut self, pane_index: u32) {
         let next_active_point = self
             .panes
@@ -222,6 +218,7 @@ impl Window {
             .saturating_add(1);
         if let Some(pane) = self.pane_mut(pane_index) {
             pane.set_active_point(next_active_point);
+            pane.touch_activity();
         }
     }
 
@@ -258,12 +255,8 @@ impl Window {
             return;
         }
 
-        let pane_id = self.panes[0].id();
-        self.panes[0] = Pane::new_with_id(
-            pane_id,
-            0,
-            PaneGeometry::new(0, 0, self.size.cols, self.size.rows),
-        );
+        self.panes[0].set_index(0);
+        self.panes[0].set_geometry(PaneGeometry::new(0, 0, self.size.cols, self.size.rows));
         self.next_pane_index = 1;
         self.active_pane = 0;
         self.last_pane = None;

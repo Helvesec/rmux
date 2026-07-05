@@ -1103,6 +1103,7 @@ async fn kill_session_clears_attached_last_session_references() {
             target: alpha,
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }))
         .await;
     assert_eq!(

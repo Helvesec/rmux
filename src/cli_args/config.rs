@@ -158,12 +158,6 @@ pub(crate) struct ShowOptionsArgs {
 
 impl ShowOptionsArgs {
     pub(crate) fn validate(self, kind: ShowOptionsCommandKind) -> Result<Self, clap::Error> {
-        if self.global && self.pane {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::ArgumentConflict,
-                "show-options does not support combining -g and -p",
-            ));
-        }
         if matches!(kind, ShowOptionsCommandKind::ShowWindowOptions) {
             if self.quiet {
                 return Err(unknown_flag_error(kind.command_name(), "-q"));

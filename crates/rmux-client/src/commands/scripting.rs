@@ -13,6 +13,7 @@ impl Connection {
     pub fn run_shell(
         &mut self,
         command: String,
+        arguments: Vec<String>,
         background: bool,
         as_commands: bool,
         show_stderr: bool,
@@ -22,6 +23,7 @@ impl Connection {
     ) -> Result<Response, ClientError> {
         self.roundtrip_without_read_timeout(&Request::RunShell(Box::new(RunShellRequest {
             command,
+            arguments,
             background,
             as_commands,
             show_stderr,

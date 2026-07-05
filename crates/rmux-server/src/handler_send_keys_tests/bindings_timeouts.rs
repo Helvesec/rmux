@@ -62,21 +62,26 @@ async fn bind_key_without_a_command_updates_note_and_repeat_in_place() {
     let listed = handler
         .handle(Request::ListKeys(Box::new(ListKeysRequest {
             table_name: Some("prefix".to_owned()),
-            first_only: true,
+            first_only: false,
             notes: false,
             include_unnoted: true,
             reversed: false,
             format: Some("#{key_note}|#{key_repeat}|#{key_command}".to_owned()),
             sort_order: None,
             prefix: None,
-            key: Some("C-b".to_owned()),
+            key: None,
         })))
         .await;
     let Response::ListKeys(response) = listed else {
         panic!("expected list-keys response");
     };
     let stdout = String::from_utf8(response.command_output().stdout().to_vec()).unwrap();
-    assert_eq!(stdout.trim_end(), "updated note|1|send-prefix");
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == "updated note|1|send-prefix"),
+        "{stdout:?}"
+    );
 }
 
 #[tokio::test]
@@ -155,7 +160,7 @@ async fn list_keys_notes_render_effective_prefix_column() {
 }
 
 #[tokio::test]
-async fn list_keys_single_key_filter_uses_tmux_unpadded_alignment() {
+async fn list_keys_single_key_filter_is_silent_for_explicit_table() {
     let handler = RequestHandler::new();
 
     let listed = handler
@@ -176,12 +181,12 @@ async fn list_keys_single_key_filter_uses_tmux_unpadded_alignment() {
     };
 
     let stdout = String::from_utf8(response.command_output().stdout().to_vec()).unwrap();
-    assert_eq!(stdout, "bind-key -T prefix C-b send-prefix\n");
-    assert_eq!(response.match_count, 1);
+    assert_eq!(stdout, "");
+    assert_eq!(response.match_count, 0);
 }
 
 #[tokio::test]
-async fn list_keys_single_key_filter_aligns_multiple_matching_tables() {
+async fn list_keys_single_key_filter_matches_valid_key_across_tables() {
     let handler = RequestHandler::new();
 
     let listed = handler
@@ -202,17 +207,23 @@ async fn list_keys_single_key_filter_aligns_multiple_matching_tables() {
     };
 
     let stdout = String::from_utf8(response.command_output().stdout().to_vec()).unwrap();
-    assert_eq!(
-        stdout,
-        "bind-key -T copy-mode    C-b send-keys -X cursor-left\n\
-bind-key -T copy-mode-vi C-b send-keys -X page-up\n\
-bind-key -T prefix       C-b send-prefix\n"
+    assert!(
+        stdout.contains("-T copy-mode    C-b send-keys -X cursor-left"),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.contains("-T copy-mode-vi C-b send-keys -X page-up"),
+        "{stdout:?}"
+    );
+    assert!(
+        stdout.contains("-T prefix       C-b send-prefix"),
+        "{stdout:?}"
     );
     assert_eq!(response.match_count, 3);
 }
 
 #[tokio::test]
-async fn list_keys_single_key_filter_errors_when_unbound() {
+async fn list_keys_single_key_filter_errors_when_key_syntax_is_invalid() {
     let handler = RequestHandler::new();
 
     let listed = handler
@@ -225,14 +236,14 @@ async fn list_keys_single_key_filter_errors_when_unbound() {
             format: None,
             sort_order: None,
             prefix: None,
-            key: Some("Z".to_owned()),
+            key: Some("NotAKey".to_owned()),
         })))
         .await;
 
     assert_eq!(
         listed,
         Response::Error(ErrorResponse {
-            error: RmuxError::Message("unknown key: Z".to_owned())
+            error: RmuxError::Server("invalid key: NotAKey".to_owned())
         })
     );
 }

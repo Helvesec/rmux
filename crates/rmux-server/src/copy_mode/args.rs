@@ -117,6 +117,7 @@ pub(super) fn is_readonly_command(command: &str) -> bool {
             | "previous-space"
             | "previous-word"
             | "refresh-from-pane"
+            | "recentre-top-bottom"
             | "scroll-bottom"
             | "scroll-down"
             | "scroll-down-and-cancel"

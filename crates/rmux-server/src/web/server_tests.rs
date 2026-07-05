@@ -481,6 +481,7 @@ async fn session_share_sends_revoked_before_closing_when_session_is_killed() {
             target: session_name,
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }))
         .await;
     assert!(matches!(killed, Response::KillSession(_)));
@@ -800,10 +801,13 @@ async fn session_spectator_can_select_windows_without_operator_access() {
     })
     .await;
     let Response::ListWindows(listed) = handler
-        .handle(Request::ListWindows(ListWindowsRequest {
+        .handle(Request::ListWindows(Box::new(ListWindowsRequest {
             target: session_name,
             format: None,
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await
     else {
         panic!("expected list-windows response");

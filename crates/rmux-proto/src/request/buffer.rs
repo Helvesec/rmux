@@ -125,6 +125,15 @@ pub struct CapturePaneRequest {
     /// Whether control sequences should be octal-escaped.
     #[serde(default)]
     pub escape_sequences: bool,
+    /// Whether each captured line should be prefixed with tmux line flags.
+    #[serde(default)]
+    pub include_format: bool,
+    /// Whether hyperlink information should be captured instead of text.
+    #[serde(default)]
+    pub hyperlinks: bool,
+    /// Whether each captured line should be prefixed with its line number.
+    #[serde(default)]
+    pub line_numbers: bool,
     /// Whether wrapped rows should be joined without intervening newlines.
     #[serde(default)]
     pub join_wrapped: bool,
@@ -174,6 +183,15 @@ pub struct CapturePaneTargetActionRequest {
     /// Whether control sequences should be octal-escaped.
     #[serde(default)]
     pub escape_sequences: bool,
+    /// Whether each captured line should be prefixed with tmux line flags.
+    #[serde(default)]
+    pub include_format: bool,
+    /// Whether hyperlink information should be captured instead of text.
+    #[serde(default)]
+    pub hyperlinks: bool,
+    /// Whether each captured line should be prefixed with its line number.
+    #[serde(default)]
+    pub line_numbers: bool,
     /// Whether wrapped rows should be joined without intervening newlines.
     #[serde(default)]
     pub join_wrapped: bool,

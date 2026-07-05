@@ -297,6 +297,12 @@ pub enum OptionName {
     WrapSearch,
     /// The `xterm-keys` option.
     XtermKeys,
+    /// The `copy-mode-line-numbers` option.
+    CopyModeLineNumbers,
+    /// The `copy-mode-line-number-style` option.
+    CopyModeLineNumberStyle,
+    /// The `copy-mode-current-line-number-style` option.
+    CopyModeCurrentLineNumberStyle,
 }
 
 /// The mutation mode for `set-option`.

@@ -11,7 +11,7 @@
 //! 2. The checked-in ledger fixtures under
 //!    `tests/wire-fixtures/ledger-v1-current-wire/`
 //!    decode through both `decode_frame` and `FrameDecoder` using the current
-//!    wire envelope (currently `RMUX_WIRE_VERSION = 3`), asserting stable
+//!    wire envelope, asserting stable
 //!    semantic fields rather than enum source order. Encoding canonical inputs
 //!    reproduces each fixture byte-for-byte to guard against silent codec drift.
 
@@ -85,6 +85,7 @@ fn fixtures() -> Vec<FullFrameFixture> {
         target: alpha(),
         kill_all_except_target: false,
         clear_alerts: false,
+        kill_group: false,
     });
     let send_keys = Request::SendKeys(SendKeysRequest {
         target: pane_alpha_2(),
@@ -99,6 +100,9 @@ fn fixtures() -> Vec<FullFrameFixture> {
         alternate: false,
         escape_ansi: false,
         escape_sequences: false,
+        include_format: false,
+        hyperlinks: false,
+        line_numbers: false,
         join_wrapped: false,
         use_mode_screen: false,
         preserve_trailing_spaces: false,
@@ -142,6 +146,9 @@ fn fixtures() -> Vec<FullFrameFixture> {
             alternate: false,
             escape_ansi: false,
             escape_sequences: false,
+            include_format: false,
+            hyperlinks: false,
+            line_numbers: false,
             join_wrapped: false,
             use_mode_screen: false,
             preserve_trailing_spaces: false,
@@ -503,6 +510,7 @@ fn cross_section_requests() -> Vec<Request> {
             target: alpha.clone(),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
         Request::DetachClient(DetachClientRequest),
         Request::SendKeys(SendKeysRequest {
@@ -538,6 +546,9 @@ fn cross_section_requests() -> Vec<Request> {
             alternate: false,
             escape_ansi: false,
             escape_sequences: false,
+            include_format: false,
+            hyperlinks: false,
+            line_numbers: false,
             join_wrapped: false,
             use_mode_screen: false,
             preserve_trailing_spaces: false,

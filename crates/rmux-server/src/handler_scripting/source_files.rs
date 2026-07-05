@@ -16,6 +16,7 @@ pub(super) struct LoadedSourceFile {
     pub(super) commands: Vec<SourcedParsedCommands>,
     pub(super) stdout: Vec<u8>,
     errors: Vec<RmuxError>,
+    read_errors: Vec<RmuxError>,
     parse_errors: bool,
     loaded_file_count: usize,
 }
@@ -26,7 +27,7 @@ impl LoadedSourceFile {
     }
 
     pub(super) fn has_errors(&self) -> bool {
-        !self.errors.is_empty()
+        !self.errors.is_empty() || !self.read_errors.is_empty()
     }
 
     pub(super) fn record_loaded_files(&mut self, count: usize) {
@@ -37,13 +38,23 @@ impl LoadedSourceFile {
         self.errors.push(error);
     }
 
+    pub(super) fn push_read_error(&mut self, error: RmuxError) {
+        self.read_errors.push(error);
+    }
+
     pub(super) fn push_parse_error(&mut self, error: RmuxError) {
         self.parse_errors = true;
         self.push_error(error);
     }
 
+    pub(super) fn take_read_error(&mut self) -> Option<RmuxError> {
+        aggregate_rmux_errors(std::mem::take(&mut self.read_errors))
+    }
+
     pub(super) fn take_error(&mut self) -> Option<RmuxError> {
-        aggregate_rmux_errors(std::mem::take(&mut self.errors))
+        let mut errors = std::mem::take(&mut self.read_errors);
+        errors.extend(std::mem::take(&mut self.errors));
+        aggregate_rmux_errors(errors)
     }
 }
 
@@ -57,6 +68,11 @@ pub(super) struct SourcedParsedCommands {
 pub(super) struct SourceInput {
     pub(super) current_file: String,
     pub(super) contents: String,
+}
+
+pub(super) struct SourcePathRead {
+    pub(super) inputs: Vec<SourceInput>,
+    pub(super) error: Option<RmuxError>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,6 +320,7 @@ fn env_flag_enabled(name: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 pub(super) fn source_inputs_for_path(
     path: &str,
     cwd: Option<&Path>,
@@ -311,20 +328,40 @@ pub(super) fn source_inputs_for_path(
     stdin: Option<&str>,
     read_policy: SourceReadPolicy,
 ) -> Result<Vec<SourceInput>, RmuxError> {
+    let read = source_inputs_for_path_with_diagnostics(path, cwd, quiet, stdin, read_policy)?;
+    if let Some(error) = read.error {
+        return Err(error);
+    }
+    Ok(read.inputs)
+}
+
+pub(super) fn source_inputs_for_path_with_diagnostics(
+    path: &str,
+    cwd: Option<&Path>,
+    quiet: bool,
+    stdin: Option<&str>,
+    read_policy: SourceReadPolicy,
+) -> Result<SourcePathRead, RmuxError> {
     #[cfg(unix)]
     if is_unix_null_config_path(path) {
-        return Ok(vec![SourceInput {
-            current_file: path.to_owned(),
-            contents: String::new(),
-        }]);
+        return Ok(SourcePathRead {
+            inputs: vec![SourceInput {
+                current_file: path.to_owned(),
+                contents: String::new(),
+            }],
+            error: None,
+        });
     }
 
     #[cfg(windows)]
     if is_windows_null_config_path(path) {
-        return Ok(vec![SourceInput {
-            current_file: path.to_owned(),
-            contents: String::new(),
-        }]);
+        return Ok(SourcePathRead {
+            inputs: vec![SourceInput {
+                current_file: path.to_owned(),
+                contents: String::new(),
+            }],
+            error: None,
+        });
     }
 
     if path == "-" {
@@ -333,13 +370,17 @@ pub(super) fn source_inputs_for_path(
                 "source-file - requires client stdin".to_owned(),
             ));
         };
-        return Ok(vec![SourceInput {
-            current_file: "-".to_owned(),
-            contents: strip_utf8_bom(stdin.to_owned()),
-        }]);
+        return Ok(SourcePathRead {
+            inputs: vec![SourceInput {
+                current_file: "-".to_owned(),
+                contents: strip_utf8_bom(stdin.to_owned()),
+            }],
+            error: None,
+        });
     }
 
     let pattern = glob_pattern_for_source_path(path, cwd);
+    let has_glob_metachars = source_path_has_glob_metachars(path);
     let entries = glob::glob(&pattern)
         .map_err(|error| RmuxError::Server(format!("invalid source-file glob '{path}': {error}")))?
         .collect::<Result<Vec<_>, _>>()
@@ -347,17 +388,17 @@ pub(super) fn source_inputs_for_path(
 
     if entries.is_empty() {
         if quiet {
-            return Ok(Vec::new());
+            return Ok(SourcePathRead {
+                inputs: Vec::new(),
+                error: None,
+            });
         }
         return Err(no_such_source_file(path));
     }
 
-    let skip_glob_directories = source_path_has_glob_metachars(path);
     let mut inputs = Vec::new();
+    let mut errors = Vec::new();
     for entry in entries {
-        if skip_glob_directories && source_entry_is_directory(&entry) {
-            continue;
-        }
         match read_source_entry(&entry, read_policy) {
             Ok(contents) => inputs.push(SourceInput {
                 current_file: source_entry_display_path(&entry),
@@ -365,36 +406,40 @@ pub(super) fn source_inputs_for_path(
             }),
             Err(error) if quiet && error.kind() == io::ErrorKind::NotFound => {}
             Err(_) if read_policy == SourceReadPolicy::BestEffort => {}
+            Err(error) if has_glob_metachars => {
+                errors.push(source_entry_read_error(&entry, &error));
+            }
             Err(error) => {
-                return Err(RmuxError::Server(format!(
-                    "{}: {}",
-                    source_entry_display_path(&entry),
-                    source_io_error_message(&error)
-                )));
+                return Err(source_entry_read_error(&entry, &error));
             }
         }
     }
 
-    Ok(inputs)
+    Ok(SourcePathRead {
+        inputs,
+        error: aggregate_rmux_errors(errors),
+    })
 }
 
 fn source_path_has_glob_metachars(path: &str) -> bool {
     path.chars().any(|ch| matches!(ch, '*' | '?' | '[' | ']'))
 }
 
-fn source_entry_is_directory(entry: &Path) -> bool {
-    fs::metadata(entry)
-        .map(|metadata| metadata.file_type().is_dir())
-        .unwrap_or(false)
-}
-
 fn source_io_error_message(error: &io::Error) -> String {
     match error.kind() {
         io::ErrorKind::NotFound => "No such file or directory".to_owned(),
         io::ErrorKind::PermissionDenied => "Permission denied".to_owned(),
-        io::ErrorKind::IsADirectory => "Is a directory".to_owned(),
+        io::ErrorKind::IsADirectory => "Input/output error".to_owned(),
         _ => error.to_string(),
     }
+}
+
+fn source_entry_read_error(entry: &Path, error: &io::Error) -> RmuxError {
+    RmuxError::Server(format!(
+        "{}: {}",
+        source_io_error_message(error),
+        source_entry_display_path(entry)
+    ))
 }
 
 fn read_source_entry(entry: &Path, read_policy: SourceReadPolicy) -> io::Result<String> {
@@ -575,7 +620,7 @@ fn source_entry_display_path(path: &Path) -> String {
 }
 
 fn no_such_source_file(path: &str) -> RmuxError {
-    RmuxError::Message(format!("{path}: No such file or directory"))
+    RmuxError::Message(format!("No such file or directory: {path}"))
 }
 
 pub(super) fn source_parse_error_with_line_offset(
@@ -602,7 +647,10 @@ mod tests {
     #[cfg(windows)]
     use super::glob_pattern_for_source_path;
 
-    use super::{source_inputs_for_path, strip_utf8_bom, LoadedSourceFile, SourceReadPolicy};
+    use super::{
+        source_inputs_for_path, source_inputs_for_path_with_diagnostics, strip_utf8_bom,
+        LoadedSourceFile, SourceReadPolicy,
+    };
     use rmux_proto::RmuxError;
 
     #[test]
@@ -744,13 +792,13 @@ mod tests {
         let _ = std::fs::remove_dir(&path);
 
         assert!(
-            error.to_string().contains("Is a directory"),
+            error.to_string().contains("Input/output error"),
             "unexpected error: {error}"
         );
     }
 
     #[test]
-    fn strict_source_glob_skips_directories_and_reads_regular_entries() {
+    fn strict_source_glob_reports_directories_and_reads_regular_entries() {
         let root = temp_source_path("glob-with-directory-strict-source");
         std::fs::create_dir(&root).expect("create glob source root");
         let first = root.join("a.conf");
@@ -760,26 +808,32 @@ mod tests {
         std::fs::write(&second, "set -g @b yes\n").expect("write second source");
         std::fs::create_dir(&directory).expect("create directory glob match");
 
-        let inputs = source_inputs_for_path(
+        let read = source_inputs_for_path_with_diagnostics(
             &format!("{}/*", root.to_string_lossy()),
             None,
             false,
             None,
             SourceReadPolicy::Strict,
         )
-        .expect("strict glob source should skip matched directories");
+        .expect("strict glob source should keep readable matches");
         let _ = std::fs::remove_file(&first);
         let _ = std::fs::remove_file(&second);
         let _ = std::fs::remove_dir(&directory);
         let _ = std::fs::remove_dir(&root);
 
-        let contents = inputs
+        let contents = read
+            .inputs
             .iter()
             .map(|input| input.contents.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(inputs.len(), 2);
+        assert_eq!(read.inputs.len(), 2);
         assert!(contents.contains(&"set -g @a yes\n"));
         assert!(contents.contains(&"set -g @b yes\n"));
+        let error = read.error.expect("globbed directory should be reported");
+        assert!(
+            error.to_string().contains("Input/output error"),
+            "unexpected error: {error}"
+        );
     }
 
     #[cfg(unix)]

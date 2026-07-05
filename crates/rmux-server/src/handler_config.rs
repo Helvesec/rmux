@@ -243,7 +243,7 @@ impl RequestHandler {
         request: &rmux_proto::ShowOptionsRequest,
         lines: Vec<String>,
     ) -> Vec<String> {
-        if !matches!(request.name.as_deref(), Some("default-shell")) {
+        if request.name.is_some() && !matches!(request.name.as_deref(), Some("default-shell")) {
             return lines;
         }
         if !matches!(request.scope, OptionScopeSelector::SessionGlobal) {
@@ -257,10 +257,29 @@ impl RequestHandler {
         )
         .to_string_lossy()
         .into_owned();
-        if request.value_only {
-            vec![shell]
+        if request.value_only && matches!(request.name.as_deref(), Some("default-shell")) {
+            if lines.as_slice() == [""] {
+                vec![shell]
+            } else {
+                lines
+            }
+        } else if matches!(request.name.as_deref(), Some("default-shell")) {
+            if lines.as_slice() == ["default-shell ''"] {
+                vec![format!("default-shell {shell}")]
+            } else {
+                lines
+            }
         } else {
-            vec![format!("default-shell {shell}")]
+            lines
+                .into_iter()
+                .map(|line| {
+                    if line == "default-shell ''" {
+                        format!("default-shell {shell}")
+                    } else {
+                        line
+                    }
+                })
+                .collect()
         }
     }
 

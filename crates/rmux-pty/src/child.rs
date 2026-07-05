@@ -23,6 +23,7 @@ pub struct ChildCommand {
     pub(crate) program: PathBuf,
     pub(crate) arg0: Option<OsString>,
     pub(crate) args: Vec<OsString>,
+    pub(crate) windows_verbatim_args: Option<OsString>,
     pub(crate) env: Vec<(OsString, OsString)>,
     pub(crate) clear_env: bool,
     pub(crate) current_dir: Option<PathBuf>,
@@ -37,6 +38,7 @@ impl ChildCommand {
             program: program.into(),
             arg0: None,
             args: Vec::new(),
+            windows_verbatim_args: None,
             env: Vec::new(),
             clear_env: false,
             current_dir: None,
@@ -66,6 +68,17 @@ impl ChildCommand {
         S: Into<OsString>,
     {
         self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    /// Appends raw command-line text on Windows after the normal argument list.
+    ///
+    /// This is reserved for command interpreters such as `cmd.exe` whose `/C`
+    /// tail has quoting rules that cannot be represented as independent argv
+    /// tokens. Non-Windows backends ignore the field.
+    #[must_use]
+    pub fn windows_verbatim_args(mut self, args: impl Into<OsString>) -> Self {
+        self.windows_verbatim_args = Some(args.into());
         self
     }
 

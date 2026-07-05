@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - "release/**"
     tags:
       - "v*"
   pull_request:
@@ -249,6 +250,66 @@ jobs:
       - name: No side effects in debug assertions
         run: scripts/no-debug-assert-side-effects.sh
 
+  tmux-oracle-linux:
+    name: Linux tmux 3.7b oracle harness
+    runs-on: ubuntu-latest
+    env:
+      RUST_MIN_STACK: "8388608"
+      RMUX_REQUIRE_TMUX: "1"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
+        with:
+          toolchain: stable
+
+      - name: Install tmux oracle build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison \
+            build-essential \
+            ca-certificates \
+            curl \
+            libevent-dev \
+            libncurses-dev \
+            libutf8proc-dev \
+            pkg-config
+
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            target
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+            cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Cache tmux oracle source
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ~/.cache/rmux-oracle
+          key: tmux-oracle-3.7b-87f2e99e3b685973f2ca002ffd6ed7e51a5744f7009daae5a15670b6d532db96
+
+      - name: Build pinned tmux 3.7b oracle
+        run: scripts/oracle/build-tmux37.sh --prefix "$RUNNER_TEMP/rmux-oracle"
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Source-file oracle must not skip
+        env:
+          RMUX_FROZEN_TMUX: ${{ runner.temp }}/rmux-oracle/tmux
+        run: cargo test --locked --test unix_source_file_tmux_oracle -- --test-threads=1
+
+      - name: Differential harness oracle self-tests
+        env:
+          RMUX_FROZEN_TMUX: ${{ runner.temp }}/rmux-oracle/tmux
+        run: cargo test --locked --test tmux_compat_harness -- --test-threads=1
+
   release-review-gate:
     name: Release review gate (no package)
     runs-on: ubuntu-latest
@@ -277,7 +338,26 @@ jobs:
       - name: Fetch locked dependencies
         run: cargo fetch --locked
 
+      - name: Install tmux oracle build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison \
+            build-essential \
+            ca-certificates \
+            curl \
+            libevent-dev \
+            libncurses-dev \
+            libutf8proc-dev \
+            pkg-config
+
+      - name: Build pinned tmux 3.7b oracle
+        run: scripts/oracle/build-tmux37.sh --prefix "$RUNNER_TEMP/rmux-oracle"
+
       - name: Release review gate
+        env:
+          RMUX_FROZEN_TMUX: ${{ runner.temp }}/rmux-oracle/tmux
+          RMUX_REQUIRE_TMUX: "1"
         run: scripts/release-review-gate.sh --skip-package --target-dir target/release-review-ci
 
   snap-package:

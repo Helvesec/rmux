@@ -361,6 +361,9 @@ async fn buffer_capture_and_scripting_requests_round_trip_over_real_socket(
             alternate: false,
             escape_ansi: false,
             escape_sequences: false,
+            include_format: false,
+            hyperlinks: false,
+            line_numbers: false,
             join_wrapped: false,
             use_mode_screen: false,
             preserve_trailing_spaces: false,
@@ -433,6 +436,7 @@ async fn buffer_capture_and_scripting_requests_round_trip_over_real_socket(
         harness.socket_path(),
         &Request::RunShell(Box::new(RunShellRequest {
             command: "printf server-run-shell-output".to_owned(),
+            arguments: Vec::new(),
             background: false,
             as_commands: false,
             show_stderr: true,
@@ -446,10 +450,13 @@ async fn buffer_capture_and_scripting_requests_round_trip_over_real_socket(
     match shell {
         Response::RunShell(response) => {
             assert_eq!(response.exit_status(), Some(0));
+            let output = response
+                .command_output()
+                .expect("run-shell -E returns foreground command output");
             assert_eq!(
-                response.command_output(),
-                None,
-                "foreground run-shell should drain stdout without returning it"
+                output.stdout(),
+                b"server-run-shell-output\n",
+                "foreground run-shell -E should return stdout like tmux 3.7"
             );
         }
         other => panic!("expected run-shell response, got {other:?}"),
@@ -546,11 +553,14 @@ async fn rename_listing_and_wait_for_requests_round_trip_over_real_socket(
 
     let listed_before = send_request(
         harness.socket_path(),
-        &Request::ListPanes(ListPanesRequest {
+        &Request::ListPanes(Box::new(ListPanesRequest {
             target: alpha.clone(),
             format: Some("#{session_name}:#{window_index}:#{pane_index}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }),
+        })),
     )
     .await?;
     let before_lines = nonempty_lines(std::str::from_utf8(
@@ -615,11 +625,14 @@ async fn rename_listing_and_wait_for_requests_round_trip_over_real_socket(
 
     let panes_after = send_request(
         harness.socket_path(),
-        &Request::ListPanes(ListPanesRequest {
+        &Request::ListPanes(Box::new(ListPanesRequest {
             target: gamma.clone(),
             format: Some("#{session_name}:#{window_index}:#{pane_index}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }),
+        })),
     )
     .await?;
     let after_lines = nonempty_lines(std::str::from_utf8(
@@ -863,6 +876,9 @@ async fn wait_for_capture(
                 alternate: false,
                 escape_ansi: false,
                 escape_sequences: false,
+                include_format: false,
+                hyperlinks: false,
+                line_numbers: false,
                 join_wrapped: false,
                 use_mode_screen: false,
                 preserve_trailing_spaces: false,

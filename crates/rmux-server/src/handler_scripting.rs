@@ -243,7 +243,9 @@ impl RequestHandler {
         {
             return ControlCommandResult {
                 stdout: Vec::new(),
-                error: Some(error),
+                error: Some(error.clone()),
+                source_file_error: None,
+                execution_error: Some(error),
                 exit_status: Some(1),
             };
         }
@@ -251,6 +253,8 @@ impl RequestHandler {
         let mut contexts = VecDeque::from(vec![context; queue.len()]);
         let mut stdout = Vec::new();
         let mut errors = Vec::new();
+        let mut source_file_errors = Vec::new();
+        let mut execution_errors = Vec::new();
         let mut exit_status = None;
 
         while let Some(item) = queue.pop_front() {
@@ -264,25 +268,37 @@ impl RequestHandler {
                 Ok(QueueCommandAction::Normal {
                     output: Some(output),
                     error,
+                    source_file_error,
                     exit_status: action_exit_status,
                 }) => {
                     stdout.extend_from_slice(output.stdout());
                     if let Some(status) = action_exit_status {
                         exit_status = Some(status);
                     }
+                    if let Some(error) = source_file_error {
+                        source_file_errors.push(error.clone());
+                        errors.push(error);
+                    }
                     if let Some(error) = error {
+                        execution_errors.push(error.clone());
                         errors.push(error);
                     }
                 }
                 Ok(QueueCommandAction::Normal {
                     output: None,
                     error,
+                    source_file_error,
                     exit_status: action_exit_status,
                 }) => {
                     if let Some(status) = action_exit_status {
                         exit_status = Some(status);
                     }
+                    if let Some(error) = source_file_error {
+                        source_file_errors.push(error.clone());
+                        errors.push(error);
+                    }
                     if let Some(error) = error {
+                        execution_errors.push(error.clone());
                         errors.push(error);
                     }
                 }
@@ -290,6 +306,7 @@ impl RequestHandler {
                     batches,
                     output,
                     error,
+                    source_file_error,
                     exit_status: action_exit_status,
                 }) => {
                     if let Some(output) = output {
@@ -298,7 +315,12 @@ impl RequestHandler {
                     if let Some(status) = action_exit_status {
                         exit_status = Some(status);
                     }
+                    if let Some(error) = source_file_error {
+                        source_file_errors.push(error.clone());
+                        errors.push(error);
+                    }
                     if let Some(error) = error {
+                        execution_errors.push(error.clone());
                         errors.push(error);
                     }
                     for (commands, context) in batches.into_iter().rev() {
@@ -306,6 +328,7 @@ impl RequestHandler {
                             .apply_parse_time_assignments(requester_pid, &commands)
                             .await
                         {
+                            execution_errors.push(error.clone());
                             errors.push(error);
                             exit_status = Some(1);
                             continue;
@@ -318,6 +341,7 @@ impl RequestHandler {
                     }
                 }
                 Err(error) => {
+                    execution_errors.push(error.clone());
                     errors.push(error);
                     remove_group_contexts(&queue, &mut contexts, item.group());
                     queue.remove_group(item.group());
@@ -347,6 +371,8 @@ impl RequestHandler {
         ControlCommandResult {
             stdout,
             error: aggregate_rmux_errors(errors),
+            source_file_error: aggregate_rmux_errors(source_file_errors),
+            execution_error: aggregate_rmux_errors(execution_errors),
             exit_status,
         }
     }
@@ -420,6 +446,7 @@ impl RequestHandler {
             QueueInvocation::NoOp => Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             }),
             QueueInvocation::Request(request) => {
@@ -462,6 +489,7 @@ impl RequestHandler {
             QueueInvocation::StartServer => Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             }),
             QueueInvocation::NewWindow(command) => {
@@ -575,12 +603,16 @@ impl RequestHandler {
                     target: session_name,
                     target_window_index: None,
                     format: command.format.clone(),
+                    filter: command.filter.clone(),
+                    sort_order: command.sort_order.clone(),
+                    reversed: command.reversed,
                 })
                 .await;
             let action = queue_action_from_response(response)?;
             if let QueueCommandAction::Normal {
                 output: Some(output),
                 error,
+                source_file_error: _,
                 exit_status: _,
             } = action
             {
@@ -594,6 +626,7 @@ impl RequestHandler {
         Ok(QueueCommandAction::Normal {
             output: Some(CommandOutput::from_stdout(stdout)),
             error: None,
+            source_file_error: None,
             exit_status: None,
         })
     }
@@ -619,6 +652,7 @@ impl RequestHandler {
                 return Ok(QueueCommandAction::Normal {
                     output: None,
                     error: None,
+                    source_file_error: None,
                     exit_status: None,
                 });
             };
@@ -627,6 +661,7 @@ impl RequestHandler {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             });
         };
@@ -634,6 +669,7 @@ impl RequestHandler {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             });
         }
@@ -653,6 +689,7 @@ impl RequestHandler {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             });
         }

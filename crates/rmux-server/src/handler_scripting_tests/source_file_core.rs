@@ -72,6 +72,209 @@ async fn source_file_handles_crlf_backslash_continuations() {
 }
 
 #[tokio::test]
+async fn source_file_parse_only_verbose_uses_tmux37_end_lines_for_multiline_strings() {
+    let handler = RequestHandler::new();
+    let root = temp_root("parse-only-multiline-lines");
+    let config = root.join("main.conf");
+    write_config(&config, "display-message -p \"a\nb\"\nset -g @after yes\n");
+
+    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.parse_only = true;
+    request.verbose = true;
+
+    let Response::SourceFile(response) = handler.handle(Request::SourceFile(request)).await else {
+        panic!("expected source-file -n -v to return verbose output");
+    };
+    let stdout = response
+        .command_output()
+        .expect("parse-only verbose output")
+        .stdout();
+    assert_eq!(
+        std::str::from_utf8(stdout).expect("verbose output is UTF-8"),
+        format!(
+            "{}:2: display-message -p a\\nb\n{}:3: set-option -g @after yes\n",
+            config.display(),
+            config.display()
+        )
+    );
+}
+
+#[tokio::test]
+async fn source_file_parse_only_validation_errors_use_multiline_command_end_line() {
+    let handler = RequestHandler::new();
+    let root = temp_root("parse-only-multiline-error-line");
+    write_config(
+        &root.join("main.conf"),
+        "new-window -Q \"x\ny\"\nset -g @after yes\n",
+    );
+
+    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.parse_only = true;
+
+    let Response::Error(error) = handler.handle(Request::SourceFile(request)).await else {
+        panic!("expected source-file -n to reject invalid flag");
+    };
+    assert!(
+        error
+            .error
+            .to_string()
+            .contains("main.conf:2: command new-window: unknown flag -Q"),
+        "{}",
+        error.error
+    );
+}
+
+#[tokio::test]
+async fn source_file_unquoted_percent_word_is_fatal_syntax_error() {
+    let handler = RequestHandler::new();
+    let root = temp_root("percent-word-syntax");
+    write_config(&root.join("main.conf"), "%word\nset-buffer -b after yes\n");
+
+    let Response::Error(error) = handler
+        .handle(source_file_request(
+            vec!["main.conf".to_owned()],
+            Some(root.clone()),
+        ))
+        .await
+    else {
+        panic!("source-file should reject unquoted percent word");
+    };
+    assert!(
+        error
+            .error
+            .to_string()
+            .contains("main.conf:1: syntax error"),
+        "unexpected error: {:?}",
+        error
+    );
+    assert!(matches!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("after".to_owned()),
+            }))
+            .await,
+        Response::Error(_)
+    ));
+}
+
+#[tokio::test]
+async fn source_file_execute_verbose_reports_lookup_prefix_without_running_bad_file() {
+    let handler = RequestHandler::new();
+    let root = temp_root("execute-verbose-lookup-stop");
+    let config = root.join("main.conf");
+    write_config(
+        &config,
+        "set-buffer -b before yes\nbogus\nset-buffer -b after yes\n",
+    );
+
+    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.verbose = true;
+
+    let Response::SourceFile(response) = handler.handle(Request::SourceFile(request)).await else {
+        panic!("source-file -v should return verbose output plus parse error");
+    };
+    assert_eq!(response.exit_status(), Some(1));
+    assert_eq!(
+        response
+            .command_output()
+            .expect("source-file -v output")
+            .stdout(),
+        format!(
+            "{}:1: set-buffer -b before yes\n{}:2: unknown command: bogus\n",
+            config.display(),
+            config.display()
+        )
+        .as_bytes()
+    );
+
+    for name in ["before", "after"] {
+        assert!(
+            matches!(
+                handler
+                    .handle(Request::ShowBuffer(ShowBufferRequest {
+                        name: Some(name.to_owned()),
+                    }))
+                    .await,
+                Response::Error(_)
+            ),
+            "{name} should not run from a file with a lookup parse error"
+        );
+    }
+}
+
+#[tokio::test]
+async fn source_file_verbose_execution_errors_go_to_stderr() {
+    let handler = RequestHandler::new();
+    let root = temp_root("execute-verbose-stderr");
+    let config = root.join("main.conf");
+    write_config(&config, "set-option -g xyzzy on\n");
+
+    let mut request = match source_file_request(vec!["main.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.verbose = true;
+
+    let Response::SourceFile(response) = handler.handle(Request::SourceFile(request)).await else {
+        panic!("source-file -v should return verbose output plus execution stderr");
+    };
+    assert_eq!(response.exit_status(), Some(1));
+    assert_eq!(
+        response
+            .command_output()
+            .expect("source-file -v output")
+            .stdout(),
+        format!("{}:1: set-option -g xyzzy on\n", config.display()).as_bytes()
+    );
+    assert_eq!(
+        std::str::from_utf8(response.stderr()).expect("stderr is UTF-8"),
+        "invalid option: xyzzy\n"
+    );
+}
+
+#[tokio::test]
+async fn source_file_read_diagnostics_do_not_move_execution_errors_to_stdout() {
+    let handler = RequestHandler::new();
+    let root = temp_root("read-diagnostic-exec-stderr");
+    fs::create_dir_all(root.join("adir")).expect("create directory entry");
+    write_config(&root.join("b.conf"), "set-option -g xyzzy on\n");
+
+    let response = handler
+        .handle(source_file_request(
+            vec!["*".to_owned()],
+            Some(root.clone()),
+        ))
+        .await;
+
+    let Response::SourceFile(response) = response else {
+        panic!("source-file should return stderr diagnostics, got {response:?}");
+    };
+    assert_eq!(response.exit_status(), Some(1));
+    assert!(
+        response.command_output().is_none(),
+        "read + execution diagnostics must not spill to stdout"
+    );
+    let stderr = std::str::from_utf8(response.stderr()).expect("stderr is UTF-8");
+    assert!(
+        stderr.contains("Input/output error"),
+        "stderr should include directory read diagnostic: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("invalid option: xyzzy"),
+        "stderr should include execution error: {stderr:?}"
+    );
+}
+
+#[tokio::test]
 async fn source_file_parse_only_reports_parse_without_executing() {
     let handler = RequestHandler::new();
     let root = temp_root("parse-only");
@@ -733,12 +936,14 @@ async fn source_file_nested_limit_reports_too_many_nested_files() {
         ))
         .await;
 
-    let Response::Error(error) = response else {
-        panic!("source-file should report recursion limit, got {response:?}");
+    let Response::SourceFile(response) = response else {
+        panic!("source-file should report recursion limit on stderr, got {response:?}");
     };
+    assert_eq!(response.exit_status(), Some(1));
+    let error = std::str::from_utf8(response.stderr()).expect("stderr is UTF-8");
     assert!(
-        error.error.to_string().contains("too many nested files"),
-        "unexpected error: {:?}",
+        error.contains("too many nested files"),
+        "unexpected error: {}",
         error
     );
 }
@@ -756,13 +961,16 @@ async fn source_file_non_quiet_rejects_empty_glob_pattern() {
         ))
         .await;
 
-    let Response::Error(error) = response else {
+    let Response::SourceFile(response) = response else {
         panic!("source-file should report empty glob, got {response:?}");
     };
+    assert_eq!(response.exit_status(), Some(1));
     assert!(
-        error.error.to_string().contains("nonexistent*.conf"),
-        "unexpected error: {:?}",
-        error
+        std::str::from_utf8(response.stderr())
+            .expect("stderr is UTF-8")
+            .contains("nonexistent*.conf"),
+        "unexpected stderr: {:?}",
+        response.stderr()
     );
 }
 
@@ -798,6 +1006,45 @@ async fn source_file_multiple_paths_loads_all_in_order() {
 }
 
 #[tokio::test]
+async fn source_file_glob_reports_directories_after_loading_regular_files() {
+    let handler = RequestHandler::new();
+    let root = temp_root("glob-directory-error");
+    fs::create_dir_all(root.join("nested")).expect("create nested directory");
+    write_config(&root.join("a.conf"), "set-buffer -b glob first\n");
+    write_config(&root.join("b.conf"), "set-buffer -b glob second\n");
+
+    let response = handler
+        .handle(source_file_request(
+            vec!["*".to_owned()],
+            Some(root.clone()),
+        ))
+        .await;
+
+    let Response::SourceFile(response) = response else {
+        panic!("source-file glob should report the matched directory, got {response:?}");
+    };
+    assert_eq!(response.exit_status(), Some(1));
+    assert!(
+        std::str::from_utf8(response.stderr())
+            .expect("stderr is UTF-8")
+            .contains("Input/output error"),
+        "unexpected glob stderr: {:?}",
+        response.stderr()
+    );
+    assert_eq!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("glob".to_owned()),
+            }))
+            .await
+            .command_output()
+            .expect("glob buffer output")
+            .stdout(),
+        b"second"
+    );
+}
+
+#[tokio::test]
 async fn source_file_continues_after_missing_paths_and_reports_one_clean_error_prefix() {
     let handler = RequestHandler::new();
     let root = temp_root("multi-path-missing");
@@ -816,16 +1063,14 @@ async fn source_file_continues_after_missing_paths_and_reports_one_clean_error_p
         ))
         .await;
 
-    let Response::Error(error) = response else {
+    let Response::SourceFile(response) = response else {
         panic!("source-file should report missing paths, got {response:?}");
     };
-    assert!(
-        matches!(
-            error.error,
-            rmux_proto::RmuxError::Server(ref message)
-                if message == "missing-a.conf: No such file or directory\nmissing-b.conf: No such file or directory"
-        ),
-        "unexpected missing-path error: {error:?}"
+    assert_eq!(response.exit_status(), Some(1));
+    assert_eq!(
+        std::str::from_utf8(response.stderr()).expect("stderr is UTF-8"),
+        "No such file or directory: missing-a.conf\nNo such file or directory: missing-b.conf\n",
+        "unexpected missing-path stderr"
     );
     assert_eq!(
         handler
@@ -869,10 +1114,10 @@ async fn source_file_continues_after_runtime_errors_and_reports_error() {
         "source-file should preserve later stdout, got {}",
         String::from_utf8_lossy(output)
     );
+    let stderr = String::from_utf8_lossy(response.stderr());
     assert!(
-        String::from_utf8_lossy(output).contains("definitely/missing.conf"),
-        "source-file should keep runtime error visible, got {}",
-        String::from_utf8_lossy(output)
+        stderr.contains("definitely/missing.conf"),
+        "source-file should keep runtime error visible on stderr, got {stderr}"
     );
     assert_eq!(
         handler
@@ -909,17 +1154,12 @@ async fn source_file_continues_after_non_quiet_legacy_option_lookup_errors() {
         ))
         .await;
 
-    let Response::Error(error) = response else {
-        panic!("non-quiet legacy option should report an error, got {response:?}");
+    let Response::SourceFile(response) = response else {
+        panic!("non-quiet legacy option should report stderr, got {response:?}");
     };
-    assert!(
-        error
-            .error
-            .to_string()
-            .contains("invalid option: status-utf8"),
-        "{}",
-        error.error
-    );
+    assert_eq!(response.exit_status(), Some(1));
+    let error = std::str::from_utf8(response.stderr()).expect("stderr is UTF-8");
+    assert!(error.contains("invalid option: status-utf8"), "{}", error);
 
     for name in ["@before_legacy_error", "@after_legacy_error"] {
         assert_eq!(
@@ -1001,14 +1241,12 @@ async fn source_file_set_option_quiet_does_not_suppress_bad_values() {
         ))
         .await;
 
-    let Response::Error(error) = response else {
-        panic!("bad option value should remain an error, got {response:?}");
+    let Response::SourceFile(response) = response else {
+        panic!("bad option value should remain stderr, got {response:?}");
     };
-    assert!(
-        error.error.to_string().contains("unknown value: maybe"),
-        "{}",
-        error.error
-    );
+    assert_eq!(response.exit_status(), Some(1));
+    let error = std::str::from_utf8(response.stderr()).expect("stderr is UTF-8");
+    assert!(error.contains("unknown value: maybe"), "{}", error);
     let state = handler.state.lock().await;
     assert_eq!(
         state.options.global_value(OptionName::BaseIndex),

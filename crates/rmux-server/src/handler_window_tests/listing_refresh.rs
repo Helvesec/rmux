@@ -139,10 +139,13 @@ async fn list_windows_returns_structured_entries_and_rendered_stdout() {
     ));
 
     let response = handler
-        .handle(Request::ListWindows(ListWindowsRequest {
+        .handle(Request::ListWindows(Box::new(ListWindowsRequest {
             target: alpha.clone(),
             format: Some("#{window_index}:#{window_id}:#{window_last_flag}".to_owned()),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
 
     let Response::ListWindows(response) = response else {
@@ -203,10 +206,13 @@ async fn list_windows_format_uses_each_windows_active_pane_context() {
     };
 
     let response = handler
-        .handle(Request::ListWindows(ListWindowsRequest {
+        .handle(Request::ListWindows(Box::new(ListWindowsRequest {
             target: alpha.clone(),
             format: Some("#{window_index}:#{pane_index}".to_owned()),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
 
     let Response::ListWindows(response) = response else {
@@ -321,10 +327,13 @@ async fn window_mutations_refresh_attached_sessions() {
 
     assert!(matches!(
         handler
-            .handle(Request::ListWindows(ListWindowsRequest {
+            .handle(Request::ListWindows(Box::new(ListWindowsRequest {
                 target: alpha,
                 format: None,
-            }))
+                filter: None,
+                sort_order: None,
+                reversed: false,
+            })))
             .await,
         Response::ListWindows(_)
     ));

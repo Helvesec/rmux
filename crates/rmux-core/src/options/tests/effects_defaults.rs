@@ -35,6 +35,27 @@ fn unix_default_shell_starts_empty_for_runtime_resolution() {
 }
 
 #[test]
+fn tmux37_default_option_surface_matches_pinned_oracle() {
+    let store = OptionStore::new();
+
+    assert_eq!(store.resolve(None, OptionName::EscapeTime), Some("10"));
+    assert_eq!(
+        store.resolve(None, OptionName::TerminalOverrides),
+        Some("linux*:AX@")
+    );
+    assert_eq!(
+        store.resolve(None, OptionName::UpdateEnvironment),
+        Some(
+            "DISPLAY KRB5CCNAME MSYSTEM SSH_ASKPASS SSH_AUTH_SOCK SSH_AGENT_PID SSH_CONNECTION WAYLAND_DISPLAY WINDOWID XAUTHORITY XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE"
+        )
+    );
+    assert_eq!(
+        store.resolve(None, OptionName::ModeStyle),
+        Some("noattr,bg=yellow,fg=black")
+    );
+}
+
+#[test]
 fn notification_effects_are_reported_for_known_options() {
     let mut store = OptionStore::new();
 
@@ -113,23 +134,22 @@ fn default_size_rejects_empty_width_or_height() {
 }
 
 #[test]
-fn append_on_choice_type_is_rejected() {
+fn append_on_choice_type_behaves_like_replace() {
     let mut store = OptionStore::new();
 
-    let error = store
+    store
         .set(
             ScopeSelector::Global,
             OptionName::StatusJustify,
             "centre".to_owned(),
             SetOptionMode::Append,
         )
-        .expect_err("choice append is not a real append");
+        .expect("choice append behaves like set");
 
     assert_eq!(
-        error,
-        RmuxError::InvalidSetOption("status-justify is not an array option".to_owned())
+        store.global_value(OptionName::StatusJustify),
+        Some("centre")
     );
-    assert_eq!(store.global_value(OptionName::StatusJustify), None);
 }
 
 #[test]
@@ -148,6 +168,28 @@ fn invalid_choice_value_uses_tmux_error_text() {
     assert_eq!(
         error,
         RmuxError::InvalidSetOption("unknown value: maybe".to_owned())
+    );
+}
+
+#[test]
+fn explicit_empty_choice_value_is_invalid_like_tmux() {
+    let mut store = OptionStore::new();
+
+    let error = store
+        .set_by_name(
+            OptionScopeSelector::WindowGlobal,
+            "mode-keys",
+            Some(String::new()),
+            SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect_err("explicit empty choice value must fail");
+
+    assert_eq!(
+        error,
+        RmuxError::InvalidSetOption("unknown value: ".to_owned())
     );
 }
 
@@ -174,23 +216,19 @@ fn invalid_flag_value_uses_tmux_error_text() {
 }
 
 #[test]
-fn append_on_number_type_is_rejected() {
+fn append_on_number_type_behaves_like_replace() {
     let mut store = OptionStore::new();
 
-    let error = store
+    store
         .set(
             ScopeSelector::Global,
             OptionName::HistoryLimit,
             "100".to_owned(),
             SetOptionMode::Append,
         )
-        .expect_err("number append is not a real append");
+        .expect("number append behaves like set");
 
-    assert_eq!(
-        error,
-        RmuxError::InvalidSetOption("history-limit is not an array option".to_owned())
-    );
-    assert_eq!(store.global_value(OptionName::HistoryLimit), None);
+    assert_eq!(store.global_value(OptionName::HistoryLimit), Some("100"));
 }
 
 #[test]
@@ -222,6 +260,35 @@ fn invalid_number_values_use_tmux_error_text() {
         invalid,
         RmuxError::InvalidSetOption("value is invalid: abc".to_owned())
     );
+
+    for option in [
+        OptionName::BaseIndex,
+        OptionName::StatusInterval,
+        OptionName::RepeatTime,
+        OptionName::MessageLimit,
+    ] {
+        let too_large = store
+            .set(
+                ScopeSelector::Global,
+                option,
+                "2147483648".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect_err("numbers above INT_MAX must fail");
+        assert_eq!(
+            too_large,
+            RmuxError::InvalidSetOption("value is too large: 2147483648".to_owned())
+        );
+
+        store
+            .set(
+                ScopeSelector::Global,
+                option,
+                "2147483647".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("INT_MAX itself is accepted");
+    }
 }
 
 #[test]
@@ -257,35 +324,19 @@ fn status_format_array_default_resolves_tmux_entries_in_snapshot() {
     let value = snapshot
         .get(&OptionName::StatusFormat)
         .expect("status-format must be in snapshot");
-    assert!(value.contains("#[align=left"), "missing status line entry");
     assert!(
-        value.contains("#[align=centre]"),
-        "missing pane-mode status entry"
+        value.contains("#[align=left range=left"),
+        "missing primary status line entry"
+    );
+    assert!(value.contains("#{P:"), "missing pane status-format entry");
+    assert!(
+        value.contains("#{S:"),
+        "missing session status-format entry"
     );
 }
 
-#[cfg(windows)]
 #[test]
-fn status_right_default_uses_host_short_on_windows() {
-    let store = OptionStore::new();
-    let alpha = session_name("alpha");
-    let value = store
-        .resolve(Some(&alpha), OptionName::StatusRight)
-        .expect("status-right default resolves");
-
-    assert!(
-        value.contains("#{=21:host_short}"),
-        "status-right should show the host name, got {value:?}"
-    );
-    assert!(
-        !value.contains("pane_title"),
-        "status-right must not depend on pane title updates, got {value:?}"
-    );
-}
-
-#[cfg(not(windows))]
-#[test]
-fn status_right_default_uses_pane_title_on_unix_like_platforms() {
+fn status_right_default_uses_tmux_pane_title() {
     let store = OptionStore::new();
     let alpha = session_name("alpha");
     let value = store
@@ -294,11 +345,11 @@ fn status_right_default_uses_pane_title_on_unix_like_platforms() {
 
     assert!(
         value.contains("#{=21:pane_title}"),
-        "status-right should match tmux pane-title default, got {value:?}"
+        "status-right should match tmux 3.7b pane-title default, got {value:?}"
     );
     assert!(
         !value.contains("host_short"),
-        "status-right must not use host name on non-Windows, got {value:?}"
+        "status-right must not diverge to host_short, got {value:?}"
     );
 }
 
@@ -340,12 +391,12 @@ fn frozen_registry_scope_counts_match_tmux_partitioning() {
         .filter(|entry| entry.scope_mask() == (registry::SCOPE_WINDOW | registry::SCOPE_PANE))
         .count();
 
-    // tmux frozen: 25 server, 54 session, 67 window (49 window-only + 18 window|pane)
+    // tmux 3.7b frozen: 25 server, 54 session, 70 window (52 window-only + 18 window|pane)
     assert_eq!(server_count, 25, "server options");
     assert_eq!(session_count, 54, "session options");
     assert_eq!(
         window_only_count + window_pane_count,
-        67,
+        70,
         "window options total"
     );
     assert_eq!(window_pane_count, 18, "window|pane dual-scope options");

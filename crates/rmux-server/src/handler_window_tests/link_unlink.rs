@@ -222,11 +222,14 @@ async fn linked_windows_survive_runtime_owner_session_rename() {
     }
 
     let list = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: beta,
             target_window_index: Some(1),
             format: Some("#{session_name}:#{window_index}:#{pane_index}".to_owned()),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
     let Response::ListPanes(list) = list else {
         panic!("linked list-panes should survive owner rename, got {list:?}");
@@ -319,6 +322,7 @@ async fn linked_windows_survive_runtime_owner_session_removal_after_rename() {
             target: gamma.clone(),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }))
         .await;
     assert!(
@@ -344,11 +348,14 @@ async fn linked_windows_survive_runtime_owner_session_removal_after_rename() {
     }
 
     let list = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: beta,
             target_window_index: Some(1),
             format: Some("#{session_name}:#{window_index}:#{pane_index}".to_owned()),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
     let Response::ListPanes(list) = list else {
         panic!("linked list-panes should survive owner removal, got {list:?}");
@@ -401,11 +408,14 @@ async fn link_window_shares_pane_base_index_with_linked_slots() {
     ));
 
     let list = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: beta.clone(),
             target_window_index: Some(1),
             format: Some("#{pane_index}".to_owned()),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
     let Response::ListPanes(list) = list else {
         panic!("linked list-panes should succeed, got {list:?}");

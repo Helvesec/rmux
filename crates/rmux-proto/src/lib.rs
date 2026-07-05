@@ -32,6 +32,8 @@ pub use capabilities::{
     CAPABILITY_SDK_WAITS, CAPABILITY_SDK_WAITS_ARMED, CAPABILITY_TARGET_CLIENT_COMMANDS,
     CAPABILITY_WEB_SHARE, SUPPORTED_CAPABILITIES,
 };
+#[cfg(feature = "fuzzing")]
+pub use codec::fuzz_detached_frame_decoder;
 pub use codec::{
     decode_frame, encode_frame, FrameDecoder, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
     DEFAULT_MAX_FRAME_LENGTH,

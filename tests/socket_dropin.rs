@@ -5,7 +5,10 @@ mod common;
 use std::error::Error;
 use std::fs;
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::path::Path;
 use std::process::{Command, Output};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use common::{assert_success, stderr, stdout, CliHarness};
 
@@ -130,6 +133,46 @@ fn custom_socket_missing_parent_is_created_owner_only() -> Result<(), Box<dyn Er
 }
 
 #[test]
+fn bare_relative_custom_socket_uses_current_directory() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("socket-bare-relative")?;
+    let cwd = harness.tmpdir().join("cwd");
+    fs::create_dir_all(&cwd)?;
+    let socket = cwd.join("bare.sock");
+
+    let created = harness.run_with(
+        &["-S", "bare.sock", "new-session", "-d", "-s", "relative"],
+        |cmd| {
+            cmd.current_dir(&cwd);
+        },
+    )?;
+    assert_success(&created);
+    assert_eq!(stderr(&created), "");
+
+    let listed = harness.run_with(
+        &["-S", "bare.sock", "list-sessions", "-F", "#{session_name}"],
+        |cmd| {
+            cmd.current_dir(&cwd);
+        },
+    )?;
+    assert_status_success(&listed);
+    assert_eq!(stdout(&listed).trim(), "relative");
+
+    let metadata = fs::symlink_metadata(&socket)?;
+    assert_eq!(
+        metadata.mode() & 0o777,
+        0o600,
+        "bare relative -S sockets should still be owner-only"
+    );
+
+    let killed = harness.run_with(&["-S", "bare.sock", "kill-server"], |cmd| {
+        cmd.current_dir(&cwd);
+    })?;
+    assert_success(&killed);
+    wait_for_path_absent(&socket)?;
+    Ok(())
+}
+
+#[test]
 fn version_branding_stays_rmux_for_rmux_binary_and_tmux_for_shim() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("version-shim")?;
     let rmux = harness.run(&["-V"])?;
@@ -201,5 +244,16 @@ fn explicit_dev_null_config_is_silent_and_not_recorded_as_config_error(
         !combined.contains("/dev/null") && !combined.contains("config error"),
         "unexpected config message: {combined:?}"
     );
+    Ok(())
+}
+
+fn wait_for_path_absent(path: &Path) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while path.exists() {
+        if Instant::now() >= deadline {
+            return Err(format!("timed out waiting for '{}' to disappear", path.display()).into());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
     Ok(())
 }

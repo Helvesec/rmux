@@ -201,15 +201,15 @@ pub(super) fn run_control_mode(
 ) -> Result<i32, ExitFailure> {
     let connection = connect_with_startserver(socket_path, startup)?;
     match connection
-        .begin_control_mode(
+        .begin_control_mode_with_initial_commands(
             ControlMode::from_count(cli.control_mode),
             client_terminal_context_from_cli(cli),
+            cli.control_command_lines(),
         )
         .map_err(ExitFailure::from_client)?
     {
         ControlTransition::Upgraded(upgrade) => {
-            drive_control_mode(upgrade, cli.control_command_lines())
-                .map_err(ExitFailure::from_client)?;
+            drive_control_mode(upgrade, &[]).map_err(ExitFailure::from_client)?;
             Ok(0)
         }
         ControlTransition::Rejected(Response::Error(ErrorResponse { error })) => {
@@ -275,7 +275,7 @@ pub(super) fn run_refresh_client(
             subscriptions: args.subscriptions,
             subscriptions_format: args.subscriptions_format,
             control_size: args.control_size,
-            colour_report: None,
+            colour_report: args.colour_report,
         })
     })
 }
@@ -284,12 +284,6 @@ pub(super) fn run_list_clients(
     args: ListClientsArgs,
     socket_path: &Path,
 ) -> Result<i32, ExitFailure> {
-    if let Some(flag) = args.unsupported_flag() {
-        return Err(ExitFailure::new(
-            1,
-            format!("command list-clients: unknown flag {flag}"),
-        ));
-    }
     if args.json {
         let mut connection = connect(socket_path)
             .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
@@ -302,8 +296,8 @@ pub(super) fn run_list_clients(
             .list_clients(ListClientsRequest {
                 format: Some(list_clients_json_format()),
                 filter: args.filter,
-                sort_order: None,
-                reversed: false,
+                sort_order: args.sort_order,
+                reversed: args.reversed,
                 target_session,
             })
             .map_err(ExitFailure::from_client)?;
@@ -324,8 +318,8 @@ pub(super) fn run_list_clients(
             .list_clients(ListClientsRequest {
                 format: args.format,
                 filter: args.filter,
-                sort_order: None,
-                reversed: false,
+                sort_order: args.sort_order,
+                reversed: args.reversed,
                 target_session,
             })
             .map_err(ExitFailure::from_client)

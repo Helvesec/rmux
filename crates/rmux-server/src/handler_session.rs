@@ -94,6 +94,7 @@ impl RequestHandler {
                     target: session_name,
                     kill_all_except_target: false,
                     clear_alerts: false,
+                    kill_group: false,
                 })
                 .await;
         }
@@ -750,6 +751,12 @@ impl RequestHandler {
                     .collect::<Vec<_>>();
                 sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
                 sessions
+            } else if request.kill_group {
+                let mut sessions = state.sessions.session_group_members(&session_name);
+                if sessions.is_empty() {
+                    sessions.push(session_name.clone());
+                }
+                sessions
             } else {
                 vec![session_name.clone()]
             }
@@ -904,12 +911,12 @@ impl RequestHandler {
         &self,
         request: rmux_proto::ListSessionsRequest,
     ) -> Response {
+        let has_explicit_sort = request.sort_order.is_some();
         let sort_order = match parse_session_sort_order(request.sort_order.as_deref()) {
             Some(sort_order) => sort_order,
             None if request.sort_order.is_some() => {
-                let value = request.sort_order.unwrap_or_default();
                 return Response::Error(ErrorResponse {
-                    error: RmuxError::Server(format!("invalid sort order: {value}")),
+                    error: RmuxError::Server(rmux_core::INVALID_SORT_ORDER.to_owned()),
                 });
             }
             None => SessionSortOrder::Name,
@@ -932,7 +939,11 @@ impl RequestHandler {
                 activity_at: session.activity_at(),
             })
             .collect::<Vec<_>>();
-        sort_list_sessions(&mut sessions, sort_order, request.reversed);
+        sort_list_sessions(
+            &mut sessions,
+            sort_order,
+            request.reversed && has_explicit_sort,
+        );
 
         let active_attach = self.active_attach.lock().await;
         let active_control = self.active_control.lock().await;

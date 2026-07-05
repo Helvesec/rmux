@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use rmux_client::connect;
@@ -48,7 +48,7 @@ use super::window_commands::{
     run_new_window, run_next_window, run_previous_window, run_rename_window, run_resize_window,
     run_respawn_window, run_rotate_window, run_select_window, run_swap_window, run_unlink_window,
 };
-use super::{connect_with_startserver, shell_command_text, ExitFailure, StartupOptions};
+use super::{connect_with_startserver, ExitFailure, StartupOptions};
 use crate::cli_args::{Command, NewSessionArgs, SetOptionCommandKind, ShowOptionsCommandKind};
 use crate::cli_response::tmux_cli_error_message;
 use crate::tmux_error_surface::source_file_error_uses_stdout;
@@ -119,6 +119,7 @@ fn dispatch_commands(
 fn command_allows_detached_connection_reuse(candidate: &Command) -> bool {
     match candidate {
         Command::SendKeys(args) if args.has_wait() => false,
+        Command::Noop => true,
         Command::NewSession(_)
         | Command::StartServer(_)
         | Command::KillServer
@@ -236,6 +237,7 @@ fn dispatch(
     );
 
     match command {
+        Command::Noop => run_noop(socket_path),
         Command::NewSession(args) => {
             run_new_session(args, socket_path, command_startup, client_terminal)
         }
@@ -345,9 +347,6 @@ fn dispatch(
                 };
                 let layout = args.layout.as_ref().expect("handled no-op layout");
                 match layout.parse::<LayoutName>() {
-                    Ok(parsed) if is_unsupported_named_layout(parsed) => {
-                        Err(invalid_layout_failure(layout))
-                    }
                     Ok(parsed) => connection
                         .select_layout(target, parsed)
                         .map_err(ExitFailure::from_client),
@@ -440,12 +439,12 @@ fn dispatch(
                 connection
                     .copy_mode(CopyModeRequest {
                         target,
-                        page_down: false,
+                        page_down: args.page_down,
                         exit_on_scroll: args.exit_on_scroll,
                         hide_position: args.hide_position,
                         mouse_drag_start: args.mouse_drag_start,
                         cancel_mode: args.cancel_mode,
-                        scrollbar_scroll: false,
+                        scrollbar_scroll: args.scrollbar_scroll,
                         source,
                         page_up: args.page_up,
                     })
@@ -561,14 +560,8 @@ fn dispatch(
             })
         }
         Command::ListBuffers(args) => {
-            if let Some(flag) = args.unsupported_flag() {
-                return Err(ExitFailure::new(
-                    1,
-                    format!("command list-buffers: unknown flag {flag}"),
-                ));
-            }
             run_payload_command(socket_path, "list-buffers", move |connection| {
-                connection.list_buffers(args.format, args.filter, None, false)
+                connection.list_buffers(args.format, args.filter, args.sort_order, args.reversed)
             })
         }
         Command::DeleteBuffer(args) => {
@@ -609,15 +602,15 @@ fn dispatch(
             })
         }
         Command::RunShell(args) if args.background => {
-            let command = shell_command_text(args.command);
+            let (command, arguments) =
+                run_shell_command_and_arguments(args.command, args.as_commands);
             run_command_resolved(socket_path, "run-shell", move |connection| {
-                let target = match args.target.as_ref() {
-                    Some(target) => Some(resolve_pane_target_spec(connection, target)?),
-                    None => inherited_pane_target(connection, socket_path)?,
-                };
+                let target =
+                    resolve_run_shell_target(connection, socket_path, args.target.as_ref())?;
                 connection
                     .run_shell(
                         command,
+                        arguments,
                         true,
                         args.as_commands,
                         args.show_stderr,
@@ -674,16 +667,14 @@ fn run_shell_foreground(
     socket_path: &Path,
     args: crate::cli_args::RunShellArgs,
 ) -> Result<i32, ExitFailure> {
-    let command = shell_command_text(args.command);
+    let (command, arguments) = run_shell_command_and_arguments(args.command, args.as_commands);
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
-    let target = match args.target.as_ref() {
-        Some(target) => Some(resolve_pane_target_spec(&mut connection, target)?),
-        None => inherited_pane_target(&mut connection, socket_path)?,
-    };
+    let target = resolve_run_shell_target(&mut connection, socket_path, args.target.as_ref())?;
     let response = connection
         .run_shell(
             command,
+            arguments,
             false,
             args.as_commands,
             args.show_stderr,
@@ -704,6 +695,34 @@ fn run_shell_foreground(
     }
 }
 
+fn run_shell_command_and_arguments(
+    command: Vec<String>,
+    as_commands: bool,
+) -> (String, Vec<String>) {
+    let mut command = command.into_iter();
+    let Some(shell_command) = command.next() else {
+        return (String::new(), Vec::new());
+    };
+    if as_commands {
+        return (shell_command, Vec::new());
+    }
+    (shell_command, command.collect())
+}
+
+fn resolve_run_shell_target(
+    connection: &mut rmux_client::Connection,
+    socket_path: &Path,
+    target: Option<&crate::cli_args::TargetSpec>,
+) -> Result<Option<rmux_proto::PaneTarget>, ExitFailure> {
+    match target {
+        Some(target) => match resolve_pane_target_spec(connection, target) {
+            Ok(target) => Ok(Some(target)),
+            Err(_) => Ok(None),
+        },
+        None => inherited_pane_target(connection, socket_path),
+    }
+}
+
 fn run_select_layout_noop(
     target: Option<&crate::cli_args::TargetSpec>,
     socket_path: &Path,
@@ -721,11 +740,10 @@ fn run_select_layout_noop(
     Ok(0)
 }
 
-fn is_unsupported_named_layout(layout: LayoutName) -> bool {
-    matches!(
-        layout,
-        LayoutName::MainHorizontalMirrored | LayoutName::MainVerticalMirrored
-    )
+fn run_noop(socket_path: &Path) -> Result<i32, ExitFailure> {
+    let _connection = connect(socket_path)
+        .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    Ok(0)
 }
 
 fn looks_like_custom_layout(layout: &str) -> bool {
@@ -738,6 +756,7 @@ fn invalid_layout_failure(layout: &str) -> ExitFailure {
 
 pub(super) fn command_has_start_server_flag(command: &Command) -> bool {
     match command {
+        Command::Noop => false,
         Command::NewSession(_) | Command::StartServer(_) | Command::AttachSession(_) => true,
         Command::WebShare(args) => web_share_creates_share(args),
         _ => false,
@@ -807,6 +826,13 @@ fn run_source_file(
     if let Response::SourceFile(response) = &response {
         if let Some(output) = response.command_output() {
             write_command_output(output)?;
+        }
+        if !response.stderr().is_empty() {
+            std::io::stderr()
+                .write_all(response.stderr())
+                .map_err(|error| {
+                    ExitFailure::new(1, format!("failed to write source-file stderr: {error}"))
+                })?;
         }
         return Ok(response.exit_status().unwrap_or(0));
     }

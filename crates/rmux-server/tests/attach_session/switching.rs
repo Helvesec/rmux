@@ -114,6 +114,7 @@ async fn switch_client_reroutes_attach_input_and_output() -> Result<(), Box<dyn 
                 target,
                 kill_all_except_target: false,
                 clear_alerts: false,
+                kill_group: false,
             }),
         )
         .await?;
@@ -279,6 +280,7 @@ async fn switch_client_to_multi_pane_session_emits_border_frame_before_forwardin
                 target,
                 kill_all_except_target: false,
                 clear_alerts: false,
+                kill_group: false,
             }),
         )
         .await?;
@@ -357,6 +359,7 @@ async fn switch_client_to_missing_session_keeps_the_current_attach_stream(
             target: session_name("alpha"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
     )
     .await?;

@@ -47,6 +47,7 @@ impl RequestHandler {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             });
         }
@@ -86,6 +87,7 @@ impl RequestHandler {
                         return Ok(QueueCommandAction::Normal {
                             output: None,
                             error: None,
+                            source_file_error: None,
                             exit_status: None,
                         });
                     }
@@ -96,6 +98,7 @@ impl RequestHandler {
                     return Ok(QueueCommandAction::Normal {
                         output: None,
                         error: None,
+                        source_file_error: None,
                         exit_status: None,
                     });
                 }
@@ -110,6 +113,7 @@ impl RequestHandler {
         Ok(QueueCommandAction::Normal {
             output: None,
             error: None,
+            source_file_error: None,
             exit_status: None,
         })
     }
@@ -134,6 +138,7 @@ impl RequestHandler {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             });
         }
@@ -153,6 +158,7 @@ impl RequestHandler {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             });
         }
@@ -176,6 +182,7 @@ impl RequestHandler {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             });
         }
@@ -210,6 +217,7 @@ impl RequestHandler {
         Ok(QueueCommandAction::Normal {
             output: None,
             error: None,
+            source_file_error: None,
             exit_status: None,
         })
     }

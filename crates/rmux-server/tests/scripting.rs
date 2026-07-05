@@ -11,7 +11,7 @@ use rmux_proto::{
 };
 
 #[tokio::test]
-async fn run_shell_foreground_returns_status_without_stdout() -> Result<(), Box<dyn Error>> {
+async fn run_shell_foreground_returns_status_and_stdout() -> Result<(), Box<dyn Error>> {
     let harness = TestHarness::new("run-shell-foreground");
     let socket_path = harness.socket_path().to_path_buf();
     let handle = start_server(&harness).await?;
@@ -20,6 +20,7 @@ async fn run_shell_foreground_returns_status_without_stdout() -> Result<(), Box<
         &socket_path,
         &Request::RunShell(Box::new(RunShellRequest {
             command: "printf server".to_owned(),
+            arguments: Vec::new(),
             background: false,
             as_commands: false,
             show_stderr: false,
@@ -35,7 +36,13 @@ async fn run_shell_foreground_returns_status_without_stdout() -> Result<(), Box<
         panic!("unexpected response: {response:?}");
     };
     assert_eq!(response.exit_status(), Some(0));
-    assert!(response.command_output().is_none());
+    assert_eq!(
+        response
+            .command_output()
+            .expect("run-shell stdout")
+            .stdout(),
+        b"server\n"
+    );
     handle.shutdown().await?;
     Ok(())
 }

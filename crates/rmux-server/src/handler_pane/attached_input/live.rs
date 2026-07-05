@@ -1,9 +1,10 @@
 use std::io;
+use std::sync::atomic::Ordering;
 
-use rmux_core::{input::mode, key_code_lookup_bits};
+use rmux_core::{input::mode, key_code_lookup_bits, LifecycleEvent};
 #[cfg(windows)]
 use rmux_core::{key_string_lookup_string, KEYC_CTRL, KEYC_IMPLIED_META, KEYC_META, KEYC_SHIFT};
-use rmux_proto::{AttachedKeystroke, PaneTarget, Response};
+use rmux_proto::{AttachedKeystroke, PaneTarget, Response, WindowTarget};
 #[cfg(unix)]
 use rmux_pty::PtyMaster;
 #[cfg(windows)]
@@ -19,7 +20,10 @@ use super::super::pane_prompt_input::{
 };
 use super::bracketed_paste::{decode_bracketed_paste, BracketedPasteDecode};
 use super::kitty_graphics::{decode_kitty_graphics_apc, KittyGraphicsApcDecode};
-use super::terminal_response::{decode_attached_terminal_control, TerminalResponseDecode};
+use super::terminal_response::{
+    decode_attached_terminal_control, decode_focus_event, TerminalControlEvent,
+    TerminalResponseDecode,
+};
 use super::{
     is_enter_key, is_mouse_prefix, resolve_input_target, retain_partial_attached_control_input,
 };
@@ -33,18 +37,40 @@ use crate::key_table::{
 #[cfg(unix)]
 const DIRECT_CURRENT_PANE_INPUT_MAX_BYTES: usize = 16;
 
+pub(crate) type ActiveClientEmitCache = Option<(u64, WindowTarget)>;
+
 impl RequestHandler {
+    #[allow(dead_code)]
     pub(crate) async fn handle_attached_keystroke_input(
         &self,
         attach_pid: u32,
         pending_input: &mut Vec<u8>,
         keystroke: &AttachedKeystroke,
     ) -> io::Result<bool> {
+        let mut active_emit_cache = None;
         self.handle_attached_live_input_inner_with_windows_console_key(
             attach_pid,
             pending_input,
             keystroke.bytes(),
             keystroke.windows_console_key(),
+            &mut active_emit_cache,
+        )
+        .await
+    }
+
+    pub(crate) async fn handle_attached_keystroke_input_with_active_cache(
+        &self,
+        attach_pid: u32,
+        pending_input: &mut Vec<u8>,
+        keystroke: &AttachedKeystroke,
+        active_emit_cache: &mut ActiveClientEmitCache,
+    ) -> io::Result<bool> {
+        self.handle_attached_live_input_inner_with_windows_console_key(
+            attach_pid,
+            pending_input,
+            keystroke.bytes(),
+            keystroke.windows_console_key(),
+            active_emit_cache,
         )
         .await
     }
@@ -56,23 +82,65 @@ impl RequestHandler {
         pending_input: &mut Vec<u8>,
         bytes: &[u8],
     ) -> io::Result<()> {
-        self.handle_attached_live_input_inner(attach_pid, pending_input, bytes)
-            .await
-            .map(|_| ())
+        let mut active_emit_cache = None;
+        self.handle_attached_live_input_inner_cached(
+            attach_pid,
+            pending_input,
+            bytes,
+            &mut active_emit_cache,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub(crate) async fn handle_attached_live_input_with_active_cache(
+        &self,
+        attach_pid: u32,
+        pending_input: &mut Vec<u8>,
+        bytes: &[u8],
+        active_emit_cache: &mut ActiveClientEmitCache,
+    ) -> io::Result<bool> {
+        self.handle_attached_live_input_inner_cached(
+            attach_pid,
+            pending_input,
+            bytes,
+            active_emit_cache,
+        )
+        .await
     }
 
     #[async_recursion::async_recursion]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn handle_attached_live_input_inner(
         &self,
         attach_pid: u32,
         pending_input: &mut Vec<u8>,
         bytes: &[u8],
     ) -> io::Result<bool> {
+        let mut active_emit_cache = None;
+        self.handle_attached_live_input_inner_cached(
+            attach_pid,
+            pending_input,
+            bytes,
+            &mut active_emit_cache,
+        )
+        .await
+    }
+
+    #[async_recursion::async_recursion]
+    async fn handle_attached_live_input_inner_cached(
+        &self,
+        attach_pid: u32,
+        pending_input: &mut Vec<u8>,
+        bytes: &[u8],
+        active_emit_cache: &mut ActiveClientEmitCache,
+    ) -> io::Result<bool> {
         self.handle_attached_live_input_inner_with_windows_console_key(
             attach_pid,
             pending_input,
             bytes,
             None,
+            active_emit_cache,
         )
         .await
     }
@@ -84,6 +152,7 @@ impl RequestHandler {
         pending_input: &mut Vec<u8>,
         bytes: &[u8],
         windows_console_key: Option<rmux_proto::AttachedWindowsConsoleKey>,
+        active_emit_cache: &mut ActiveClientEmitCache,
     ) -> io::Result<bool> {
         #[cfg(not(windows))]
         let _ = windows_console_key;
@@ -98,7 +167,12 @@ impl RequestHandler {
         let try_plain_fast_path = true;
         if try_plain_fast_path {
             if let Some(forwarded) = self
-                .try_forward_plain_attached_bytes_fast(attach_pid, pending_input, bytes)
+                .try_forward_plain_attached_bytes_fast(
+                    attach_pid,
+                    pending_input,
+                    bytes,
+                    active_emit_cache,
+                )
                 .await?
             {
                 return Ok(forwarded);
@@ -135,6 +209,8 @@ impl RequestHandler {
             .attached_input_target(attach_pid)
             .await
             .map_err(io_other)?;
+        self.emit_attached_client_active_if_changed(attach_pid, &target, active_emit_cache)
+            .await;
         if self
             .target_is_in_clock_mode(&target)
             .await
@@ -275,12 +351,33 @@ impl RequestHandler {
                 }
                 KittyGraphicsApcDecode::NotKittyGraphics => {}
             }
+            if let Some(event) = decode_focus_event(slice) {
+                if raw_start < offset {
+                    self.write_attached_bytes(attach_pid, &pending_input[raw_start..offset])
+                        .await?;
+                    forwarded_to_pane = true;
+                }
+                self.handle_attached_terminal_control_event(attach_pid, &target, event)
+                    .await;
+                if target_focus_events {
+                    self.write_attached_bytes(attach_pid, &pending_input[offset..offset + 3])
+                        .await?;
+                    forwarded_to_pane = true;
+                }
+                offset += 3;
+                raw_start = offset;
+                continue;
+            }
             match decode_attached_terminal_control(slice, target_focus_events) {
-                TerminalResponseDecode::Matched { size } => {
+                TerminalResponseDecode::Matched { size, event } => {
                     if raw_start < offset {
                         self.write_attached_bytes(attach_pid, &pending_input[raw_start..offset])
                             .await?;
                         forwarded_to_pane = true;
+                    }
+                    if let Some(event) = event {
+                        self.handle_attached_terminal_control_event(attach_pid, &target, event)
+                            .await;
                     }
                     offset += size;
                     raw_start = offset;
@@ -377,6 +474,7 @@ impl RequestHandler {
                                 attach_pid,
                                 pending_input,
                                 raw_start,
+                                active_emit_cache,
                             )
                             .await?
                         {
@@ -482,6 +580,7 @@ impl RequestHandler {
                             attach_pid,
                             pending_input,
                             raw_start,
+                            active_emit_cache,
                         )
                         .await?
                     {
@@ -521,8 +620,13 @@ impl RequestHandler {
         if self.prompt_active(attach_pid).await && raw_start < pending_input.len() {
             let remaining = pending_input[raw_start..].to_vec();
             pending_input.clear();
-            Box::pin(self.handle_attached_live_input(attach_pid, pending_input, &remaining))
-                .await?;
+            Box::pin(self.handle_attached_live_input_inner_cached(
+                attach_pid,
+                pending_input,
+                &remaining,
+                active_emit_cache,
+            ))
+            .await?;
             return Ok(forwarded_to_pane);
         }
 
@@ -540,6 +644,7 @@ impl RequestHandler {
         attach_pid: u32,
         pending_input: &[u8],
         bytes: &[u8],
+        active_emit_cache: &mut ActiveClientEmitCache,
     ) -> io::Result<Option<bool>> {
         if !pending_input.is_empty() || !is_plain_attached_fast_path_input(bytes) {
             return Ok(None);
@@ -548,7 +653,7 @@ impl RequestHandler {
         let Some(session_name) = self.fast_path_attached_session(attach_pid).await? else {
             return Ok(None);
         };
-        let (writes, clear_alerts_changed) = {
+        let (target, writes, clear_alerts_changed) = {
             let mut state = self.state.lock().await;
             let target =
                 resolve_input_target(&state, None, Some(&session_name)).map_err(io_other)?;
@@ -581,9 +686,11 @@ impl RequestHandler {
                     });
             let writes =
                 prepare_attached_pane_input_writes(&mut state, &target, bytes).map_err(io_other)?;
-            (writes, clear_alerts_changed)
+            (target, writes, clear_alerts_changed)
         };
 
+        self.emit_attached_client_active_if_changed(attach_pid, &target, active_emit_cache)
+            .await;
         for write in writes {
             write_bytes_to_target_io(write, bytes.to_vec())
                 .await
@@ -609,6 +716,7 @@ impl RequestHandler {
         bytes: &[u8],
         target: &PaneTarget,
         master: &PtyMaster,
+        active_emit_cache: &mut ActiveClientEmitCache,
     ) -> io::Result<Option<bool>> {
         if !is_direct_current_pane_fast_path_input(bytes)
             || !pending_input.is_empty()
@@ -677,6 +785,8 @@ impl RequestHandler {
                 .is_some_and(|session| session.clear_all_winlink_alert_flags(target.window_index()))
         };
 
+        self.emit_attached_client_active_if_changed(attach_pid, target, active_emit_cache)
+            .await;
         match master.try_write_immediate(bytes)? {
             written if written == bytes.len() => {
                 if clear_alerts_changed {
@@ -746,6 +856,97 @@ impl RequestHandler {
             == Some(PREFIX_TABLE)
     }
 
+    async fn emit_attached_client_active_if_changed(
+        &self,
+        attach_pid: u32,
+        target: &PaneTarget,
+        active_emit_cache: &mut ActiveClientEmitCache,
+    ) {
+        let window_target =
+            WindowTarget::with_window(target.session_name().clone(), target.window_index());
+        let epoch = self.active_attach_epoch.load(Ordering::Acquire);
+        if active_emit_cache
+            .as_ref()
+            .is_some_and(|(cached_epoch, cached)| {
+                *cached_epoch == epoch && cached == &window_target
+            })
+        {
+            return;
+        }
+
+        let (should_emit, cache_epoch) = {
+            let mut active_attach = self.active_attach.lock().await;
+            if !active_attach.by_pid.contains_key(&attach_pid) {
+                return;
+            }
+            let changed = active_attach.record_active_client_for_window(attach_pid, target);
+            let cache_epoch = if changed {
+                self.active_attach_epoch
+                    .fetch_add(1, Ordering::AcqRel)
+                    .saturating_add(1)
+            } else {
+                self.active_attach_epoch.load(Ordering::Acquire)
+            };
+            (changed, cache_epoch)
+        };
+        *active_emit_cache = Some((cache_epoch, window_target));
+        if should_emit {
+            self.emit(LifecycleEvent::ClientActive {
+                session_name: target.session_name().clone(),
+                client_name: Some(attach_pid.to_string()),
+            })
+            .await;
+        }
+    }
+
+    async fn handle_attached_terminal_control_event(
+        &self,
+        attach_pid: u32,
+        target: &PaneTarget,
+        event: TerminalControlEvent,
+    ) {
+        let session_name = target.session_name().clone();
+        let client_name = Some(attach_pid.to_string());
+        match event {
+            TerminalControlEvent::FocusIn => {
+                self.emit(LifecycleEvent::ClientFocusIn {
+                    session_name,
+                    client_name,
+                })
+                .await;
+                self.emit(LifecycleEvent::PaneFocusIn {
+                    target: target.clone(),
+                })
+                .await;
+            }
+            TerminalControlEvent::FocusOut => {
+                self.emit(LifecycleEvent::PaneFocusOut {
+                    target: target.clone(),
+                })
+                .await;
+                self.emit(LifecycleEvent::ClientFocusOut {
+                    session_name,
+                    client_name,
+                })
+                .await;
+            }
+            TerminalControlEvent::ClientLightTheme => {
+                self.emit(LifecycleEvent::ClientLightTheme {
+                    session_name,
+                    client_name,
+                })
+                .await;
+            }
+            TerminalControlEvent::ClientDarkTheme => {
+                self.emit(LifecycleEvent::ClientDarkTheme {
+                    session_name,
+                    client_name,
+                })
+                .await;
+            }
+        }
+    }
+
     async fn clear_attached_focus_alerts(&self, attach_pid: u32) {
         let focused_window = {
             let session_name = {
@@ -792,6 +993,7 @@ impl RequestHandler {
         attach_pid: u32,
         pending_input: &mut Vec<u8>,
         consumed: usize,
+        active_emit_cache: &mut ActiveClientEmitCache,
     ) -> io::Result<Option<bool>> {
         if consumed >= pending_input.len() {
             return Ok(None);
@@ -816,9 +1018,13 @@ impl RequestHandler {
 
         let remaining = pending_input[consumed..].to_vec();
         pending_input.clear();
-        let forwarded =
-            Box::pin(self.handle_attached_live_input_inner(attach_pid, pending_input, &remaining))
-                .await?;
+        let forwarded = Box::pin(self.handle_attached_live_input_inner_cached(
+            attach_pid,
+            pending_input,
+            &remaining,
+            active_emit_cache,
+        ))
+        .await?;
         Ok(Some(forwarded))
     }
 

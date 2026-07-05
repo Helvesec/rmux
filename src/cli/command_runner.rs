@@ -161,6 +161,14 @@ fn finish_queued_server_command(
     command_name: &'static str,
     response: Response,
 ) -> Result<i32, ExitFailure> {
+    if let Response::SourceFile(source) = &response {
+        if source.exit_status().unwrap_or(0) != 0 && !source.stderr().is_empty() {
+            let message = String::from_utf8_lossy(source.stderr())
+                .trim_end_matches('\n')
+                .to_owned();
+            return Err(ExitFailure::new(source.exit_status().unwrap_or(1), message));
+        }
+    }
     if let Some(output) = response
         .command_output()
         .filter(|output| !output.stdout().is_empty())

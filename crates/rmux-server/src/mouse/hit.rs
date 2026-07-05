@@ -51,8 +51,9 @@ pub(super) fn resolve_mouse_hit(
 ) -> MouseHit {
     if let Some(status_at) = layout.status_at {
         if y >= status_at && y < status_at.saturating_add(layout.status_lines) {
+            let status_line = y.saturating_sub(status_at);
             if let Some(status) = &layout.status {
-                return status_hit(layout.session_id, status, x);
+                return status_hit(layout.session_id, status, x, status_line);
             }
             return MouseHit::status_default(layout.session_id);
         }
@@ -123,8 +124,12 @@ pub(super) fn hit_to_attached_event(
     })
 }
 
-fn status_hit(session_id: u32, status: &StatusLineLayout, x: u16) -> MouseHit {
-    let Some(range) = status.ranges.iter().find(|range| range.x.contains(&x)) else {
+fn status_hit(session_id: u32, status: &StatusLineLayout, x: u16, line: u16) -> MouseHit {
+    let Some(range) = status
+        .ranges
+        .iter()
+        .find(|range| range.line == line && range.x.contains(&x))
+    else {
         return MouseHit::status_default(session_id);
     };
     match &range.kind {

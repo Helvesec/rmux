@@ -20,26 +20,32 @@ fn layout() -> MouseLayout {
         status: Some(StatusLineLayout {
             ranges: vec![
                 StatusRange {
+                    line: 0,
                     x: 0..=3,
                     kind: StatusRangeType::Left,
                 },
                 StatusRange {
+                    line: 0,
                     x: 4..=7,
                     kind: StatusRangeType::Right,
                 },
                 StatusRange {
+                    line: 0,
                     x: 8..=11,
                     kind: StatusRangeType::Window(9),
                 },
                 StatusRange {
+                    line: 0,
                     x: 12..=15,
                     kind: StatusRangeType::Session(4),
                 },
                 StatusRange {
+                    line: 0,
                     x: 16..=19,
                     kind: StatusRangeType::User,
                 },
                 StatusRange {
+                    line: 0,
                     x: 20..=23,
                     kind: StatusRangeType::Control(3),
                 },
@@ -85,6 +91,13 @@ fn layout() -> MouseLayout {
     }
 }
 
+#[test]
+fn status_line_count_accepts_numeric_status_values() {
+    assert_eq!(super::status_line_count(Some("on"), 10), 1);
+    assert_eq!(super::status_line_count(Some("2"), 10), 2);
+    assert_eq!(super::status_line_count(Some("5"), 3), 3);
+}
+
 fn raw(b: u16, x: u16, y: u16) -> MouseForwardEvent {
     MouseForwardEvent {
         b,
@@ -122,6 +135,31 @@ fn status_ranges_hit_left_right_window_session_user_and_control() {
 
     let control = classify_mouse_event(&mut state, &layout(), raw(0, 22, 0), now).expect("control");
     assert_eq!(control.event.location, MouseLocation::Control(3));
+}
+
+#[test]
+fn status_ranges_are_matched_on_the_clicked_status_line() {
+    let mut state = super::ClientMouseState::default();
+    let now = Instant::now();
+    let mut layout = layout();
+    layout.status_lines = 2;
+    layout.status = Some(StatusLineLayout {
+        ranges: vec![StatusRange {
+            line: 1,
+            x: 0..=3,
+            kind: StatusRangeType::Window(42),
+        }],
+    });
+
+    let first_line =
+        classify_mouse_event(&mut state, &layout, raw(0, 1, 0), now).expect("first line");
+    assert_eq!(first_line.event.location, MouseLocation::StatusDefault);
+    assert_eq!(first_line.event.window_id, None);
+
+    let second_line =
+        classify_mouse_event(&mut state, &layout, raw(0, 1, 1), now).expect("second line");
+    assert_eq!(second_line.event.location, MouseLocation::Status);
+    assert_eq!(second_line.event.window_id, Some(42));
 }
 
 #[test]

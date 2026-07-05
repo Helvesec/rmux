@@ -62,6 +62,18 @@ fn tiny_connect_error_uses_tmux_shape() {
     assert!(!message.contains("os error"));
 }
 
+#[test]
+fn tiny_incompatible_daemon_message_uses_kill_server_hint() {
+    let explicit = std::path::Path::new("/tmp/rmux stale.sock");
+    let explicit_message = incompatible_daemon_error(explicit);
+    assert!(explicit_message.contains("uses an incompatible protocol"));
+    assert!(explicit_message.contains("rmux -S '/tmp/rmux stale.sock' kill-server"));
+
+    let default_socket = rmux_client::default_socket_path().expect("default socket path");
+    let default_message = incompatible_daemon_error(&default_socket);
+    assert!(default_message.contains("rmux kill-server"));
+}
+
 #[derive(Clone)]
 struct FuzzRng(u64);
 

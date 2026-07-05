@@ -61,6 +61,12 @@ impl ShellSpec {
             #[cfg(windows)]
             ShellKind::Nu => ShellCommandPlan::new(&self.program).arg("-c").arg(command),
             #[cfg(windows)]
+            ShellKind::Batch => ShellCommandPlan::new(&cmd_wrapper_program())
+                .arg("/D")
+                .arg("/S")
+                .arg("/C")
+                .windows_verbatim_args(batch_cmd_tail(&self.program, command)),
+            #[cfg(windows)]
             ShellKind::Other => ShellCommandPlan::new(&self.program).arg(command),
         }
     }
@@ -87,6 +93,11 @@ impl ShellSpec {
             #[cfg(windows)]
             ShellKind::Cmd => ShellCommandPlan::new(&self.program).arg("/D").arg("/K"),
             #[cfg(windows)]
+            ShellKind::Batch => ShellCommandPlan::new(&cmd_wrapper_program())
+                .arg("/D")
+                .arg("/K")
+                .arg(self.program.as_os_str()),
+            #[cfg(windows)]
             ShellKind::Posix | ShellKind::Nu | ShellKind::Other => {
                 ShellCommandPlan::new(&self.program)
             }
@@ -99,6 +110,8 @@ struct ShellCommandPlan {
     program: PathBuf,
     arg0: Option<OsString>,
     args: Vec<OsString>,
+    #[cfg(windows)]
+    windows_verbatim_args: Option<OsString>,
 }
 
 impl ShellCommandPlan {
@@ -107,6 +120,8 @@ impl ShellCommandPlan {
             program: program.to_path_buf(),
             arg0: None,
             args: Vec::new(),
+            #[cfg(windows)]
+            windows_verbatim_args: None,
         }
     }
 
@@ -120,12 +135,23 @@ impl ShellCommandPlan {
         self
     }
 
+    #[cfg(windows)]
+    fn windows_verbatim_args(mut self, args: impl Into<OsString>) -> Self {
+        self.windows_verbatim_args = Some(args.into());
+        self
+    }
+
     fn into_child_command(self) -> ChildCommand {
         let mut command = ChildCommand::new(self.program);
         if let Some(arg0) = self.arg0 {
             command = command.arg0(arg0);
         }
-        command.args(self.args)
+        command = command.args(self.args);
+        #[cfg(windows)]
+        if let Some(args) = self.windows_verbatim_args {
+            command = command.windows_verbatim_args(args);
+        }
+        command
     }
 
     fn into_std_command(self) -> StdCommand {
@@ -136,6 +162,11 @@ impl ShellCommandPlan {
             command.arg0(arg0);
         }
         command.args(self.args);
+        #[cfg(windows)]
+        if let Some(args) = self.windows_verbatim_args {
+            use std::os::windows::process::CommandExt as _;
+            command.raw_arg(args);
+        }
         command
     }
 }
@@ -155,6 +186,8 @@ enum ShellKind {
     #[cfg(windows)]
     Nu,
     #[cfg(windows)]
+    Batch,
+    #[cfg(windows)]
     Other,
 }
 
@@ -165,6 +198,10 @@ fn detect_shell_kind(_shell: &Path) -> ShellKind {
 
 #[cfg(windows)]
 fn detect_shell_kind(shell: &Path) -> ShellKind {
+    if is_windows_batch_script(shell) {
+        return ShellKind::Batch;
+    }
+
     match executable_name(shell)
         .as_deref()
         .map(str::to_ascii_lowercase)
@@ -180,8 +217,38 @@ fn detect_shell_kind(shell: &Path) -> ShellKind {
 }
 
 #[cfg(windows)]
+fn is_windows_batch_script(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| matches!(extension.to_ascii_lowercase().as_str(), "bat" | "cmd"))
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
 fn powershell_single_quoted(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "''"))
+}
+
+#[cfg(windows)]
+fn cmd_wrapper_program() -> PathBuf {
+    std::env::var_os("COMSPEC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("cmd.exe"))
+}
+
+#[cfg(windows)]
+fn batch_cmd_tail(program: &Path, command: &str) -> OsString {
+    let tail = format!(
+        "{} {}",
+        cmd_double_quoted(&program.to_string_lossy()),
+        cmd_double_quoted(command)
+    );
+    format!("\"{tail}\"").into()
+}
+
+#[cfg(windows)]
+fn cmd_double_quoted(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 #[cfg(unix)]
@@ -216,6 +283,10 @@ mod tests {
         );
         assert_eq!(detect_shell_kind(Path::new("bash.exe")), ShellKind::Posix);
         assert_eq!(detect_shell_kind(Path::new("nu.exe")), ShellKind::Nu);
+        assert_eq!(
+            detect_shell_kind(Path::new(r"C:\Users\RMUX User\shells\custom.cmd")),
+            ShellKind::Batch
+        );
     }
 
     #[cfg(windows)]
@@ -317,6 +388,50 @@ mod tests {
         let plan = spec.command_plan(Path::new(r"C:\tmp"), "echo RMUX_OK");
 
         assert_eq!(plan.args, os_args(["echo RMUX_OK"]));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn batch_default_shell_interactive_uses_cmd_keepalive_wrapper() {
+        let spec = ShellSpec::new(Path::new(r"C:\Users\RMUX User\shells\custom shell.cmd"));
+        let plan = spec.interactive_plan(Path::new(r"C:\tmp"));
+
+        assert_eq!(
+            plan.program
+                .file_name()
+                .map(|name| name.to_string_lossy().to_ascii_lowercase())
+                .as_deref(),
+            Some("cmd.exe")
+        );
+        assert_eq!(
+            plan.args,
+            os_args(["/D", "/K", r"C:\Users\RMUX User\shells\custom shell.cmd"])
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn batch_default_shell_command_uses_cmd_c_wrapper() {
+        let spec = ShellSpec::new(Path::new(r"C:\Users\RMUX User\shells\custom shell.bat"));
+        let plan = spec.command_plan(Path::new(r"C:\tmp"), "echo RMUX_OK");
+
+        assert_eq!(
+            plan.program
+                .file_name()
+                .map(|name| name.to_string_lossy().to_ascii_lowercase())
+                .as_deref(),
+            Some("cmd.exe")
+        );
+        assert_eq!(plan.args, os_args(["/D", "/S", "/C"]));
+        assert_eq!(
+            plan.windows_verbatim_args.as_deref(),
+            Some(
+                OsString::from(
+                    "\"\"C:\\Users\\RMUX User\\shells\\custom shell.bat\" \"echo RMUX_OK\"\""
+                )
+                .as_os_str()
+            )
+        );
     }
 
     #[cfg(unix)]

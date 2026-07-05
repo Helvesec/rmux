@@ -561,7 +561,11 @@ fn copy_mode_context(
             target.pane_index(),
         )
         .ok();
+    #[cfg(unix)]
+    let default_shell = "/bin/sh".to_owned();
+    #[cfg(not(unix))]
     let default_shell = pane_profile
+        .as_ref()
         .map(|profile| profile.shell().to_string_lossy().into_owned())
         .or_else(|| {
             state
@@ -683,11 +687,6 @@ fn normalize_file_url_path_for_platform(mut path: String) -> String {
 #[cfg(not(windows))]
 fn normalize_file_url_path_for_platform(path: String) -> String {
     path
-}
-
-#[cfg(unix)]
-fn process_default_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned())
 }
 
 #[cfg(windows)]

@@ -289,6 +289,7 @@ impl RequestHandler {
                         target: session_name,
                         kill_all_except_target: false,
                         clear_alerts: false,
+                        kill_group: false,
                     })
                     .await
                 }

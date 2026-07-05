@@ -5,7 +5,7 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/release-review-gate.sh [options]
 
-Run the review-derived release gate for the current RMUX release. This targets
+Run the review-derived release gate for RMUX 0.9.0. This intentionally targets
 the bug classes that manual reviews kept finding: tiny CLI fallback boundaries,
 tmux authority cases, package layout, version drift, platform-neutrality budget,
 and mutating target-action retry safety.
@@ -78,8 +78,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 cd "$repo_root"
-# v0.7.0 is the previous public baseline used for v0.8 regression checks.
-perf_baseline="benches/perf/baselines/release-0.7.0.json"
+perf_baseline="benches/perf/baselines/release-0.9.0.json"
 
 case "$target_dir" in
   /*) ;;
@@ -88,16 +87,23 @@ esac
 export CARGO_TARGET_DIR="$target_dir"
 export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+export RMUX_REQUIRE_TMUX="${RMUX_REQUIRE_TMUX:-1}"
 
 run_step "release versions" scripts/check-release-versions.sh
+run_step "changelog release audit" python3 scripts/check-changelog-release.py CHANGELOG.md
+run_step "tmux divergence ledger" python3 scripts/check-tmux-release-ledger.py
+run_step "feature inventory" \
+  cargo run --locked --package xtask -- feature-inventory --check
 run_step "formatting" cargo fmt --all -- --check
 run_step "perf baseline JSON" \
   bash -c 'test -s "$1" && python3 -m json.tool "$1" >/dev/null' _ "$perf_baseline"
+run_step "perf baseline Lot 9 coverage" python3 scripts/check-perf-baseline.py "$perf_baseline"
 run_step "perf comparator" \
   python3 scripts/perf-diff.py "$perf_baseline" "$perf_baseline" \
     --fail-on-regression \
     --json-out "$target_dir/perf-baseline-self-diff.json"
 run_step "perf comparator self-test" python3 scripts/perf-diff.py --self-test
+run_step "worktree hygiene" scripts/check-worktree-hygiene.sh
 run_step "platform neutrality" scripts/check-platform-neutrality.sh
 run_step "workspace clippy" \
   cargo clippy --workspace --all-targets --locked -- -D warnings
@@ -124,13 +130,25 @@ run_step "target/format acceptance matrix filter selects tests" \
 run_step "target/format acceptance matrix" \
   cargo test --locked --test acceptance_target_format_matrix -- --test-threads=1
 run_step "config corpus smoke filter selects tests" \
-  scripts/assert-cargo-filter-nonempty.sh 1 -- test --locked --test config_corpus_script
+  scripts/assert-cargo-filter-nonempty.sh 2 -- test --locked --test config_corpus_script
 run_step "config corpus parse-only smoke" \
   cargo test --locked --test config_corpus_script -- --test-threads=1
 run_step "source-file tmux oracle filter selects tests" \
   scripts/assert-cargo-filter-nonempty.sh 2 -- test --locked --test unix_source_file_tmux_oracle
 run_step "source-file tmux oracle" \
   cargo test --locked --test unix_source_file_tmux_oracle -- --test-threads=1
+run_step "tmux surface matrix oracle filter selects tests" \
+  scripts/assert-cargo-filter-nonempty.sh 45 -- test --locked --test tmux_compat_surface_matrix
+run_step "tmux surface matrix oracle" \
+  cargo test --locked --test tmux_compat_surface_matrix -- --test-threads=1
+run_step "format tmux oracle filter selects tests" \
+  scripts/assert-cargo-filter-nonempty.sh 18 -- test --locked --test formats
+run_step "format tmux oracle" \
+  cargo test --locked --test formats -- --test-threads=1
+run_step "capture tmux oracle filter selects tests" \
+  scripts/assert-cargo-filter-nonempty.sh 13 -- test --locked --test capture
+run_step "capture tmux oracle" \
+  cargo test --locked --test capture -- --test-threads=1
 run_step "startup config acceptance filter selects tests" \
   scripts/assert-cargo-filter-nonempty.sh 1 -- test --locked --test unix_startup_config_acceptance
 run_step "startup config acceptance" \

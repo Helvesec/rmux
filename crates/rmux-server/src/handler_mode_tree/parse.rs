@@ -279,12 +279,12 @@ fn parse_sort_order(kind: ModeTreeKind, value: &str) -> Result<SortOrder, RmuxEr
         "activity" => SortOrder::Activity,
         "creation" => SortOrder::Creation,
         "size" => SortOrder::Size,
-        _ => return Err(RmuxError::Server(format!("invalid sort order: {value}"))),
+        _ => return Err(RmuxError::Server(rmux_core::INVALID_SORT_ORDER.to_owned())),
     };
     if default_order_seq(kind).contains(&order) {
         Ok(order)
     } else {
-        Err(RmuxError::Server(format!("invalid sort order: {value}")))
+        Err(RmuxError::Server(rmux_core::INVALID_SORT_ORDER.to_owned()))
     }
 }
 

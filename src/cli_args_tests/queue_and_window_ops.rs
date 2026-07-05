@@ -17,15 +17,26 @@ fn argv_semicolons_build_an_ordered_command_queue() {
 }
 
 #[test]
-fn list_keys_rejects_tmux_invalid_reverse_flag() {
-    let error = parse_args(&["list-keys", "-r"]).unwrap_err();
+fn bare_semicolon_builds_a_noop_command_queue() {
+    let cli = parse_args(&[";"]).unwrap();
+    let commands = cli.into_command_queue();
 
-    assert!(
-        error
-            .to_string()
-            .contains("command list-keys: unknown flag -r"),
-        "{error}"
-    );
+    assert_eq!(commands.len(), 1);
+    assert!(matches!(&commands[0], super::super::Command::Noop));
+}
+
+#[test]
+fn list_keys_accepts_tmux_sort_format_and_reverse_flags() {
+    let cli = parse_args(&["list-keys", "-r", "-F", "#{key_table}", "-Okey"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::ListKeys(args) => {
+            assert!(args.reversed);
+            assert_eq!(args.format.as_deref(), Some("#{key_table}"));
+            assert_eq!(args.sort_order.as_deref(), Some("key"));
+        }
+        _ => panic!("expected ListKeys command"),
+    }
 }
 
 #[cfg(unix)]

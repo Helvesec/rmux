@@ -190,10 +190,7 @@ async fn eof_on_empty_input_emits_bare_exit() {
         .expect("forward control task joins")
         .expect("forward control succeeds");
 
-    assert_eq!(
-        rendered, b"%exit\n",
-        "EOF must be promoted to a bare %exit with no guard tuple"
-    );
+    assert_initial_control_frame_then_exit(&rendered);
 }
 
 #[tokio::test]
@@ -231,12 +228,16 @@ async fn eof_after_command_block_appends_exit() {
         .expect("forward control succeeds");
 
     let rendered = String::from_utf8(rendered).expect("utf-8 control stream");
-    let begin = parse_guard_line(&rendered, "%begin ")
+    let begin = parse_guard_lines(&rendered, "%begin ")
+        .pop()
         .expect("expected %begin guard for the command block");
-    let end =
-        parse_guard_line(&rendered, "%end ").expect("expected %end guard for the command block");
+    let end = parse_guard_lines(&rendered, "%end ")
+        .pop()
+        .expect("expected %end guard for the command block");
     assert_eq!(begin.command_number, end.command_number);
     assert_eq!(begin.flags, end.flags);
+    assert_eq!(begin.command_number, 1);
+    assert_eq!(begin.flags, 0);
     assert!(
         begin.time_secs > 0,
         "begin timestamp must be populated: {begin:?}"
@@ -252,6 +253,390 @@ async fn eof_after_command_block_appends_exit() {
     assert_eq!(
         last_line, "%exit",
         "EOF after a command block must terminate with %exit: {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn eof_while_finite_control_command_is_pending_waits_for_completion() {
+    let handler = Arc::new(RequestHandler::new());
+    let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (_server_event_tx, server_event_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
+    let _requester_access_guard = handler.begin_detached_requester_access(4242, true);
+
+    let control_task = tokio::spawn(forward_control(
+        server_stream,
+        Arc::clone(&handler),
+        4242,
+        b"if-shell 'sleep 0.2; true' 'display-message -p ok'\n".to_vec(),
+        shutdown_rx,
+        server_event_rx,
+        ControlLifecycle {
+            closing: Arc::clone(&closing),
+            shutdown_handle,
+        },
+    ));
+
+    let mut begin_prefix = vec![0_u8; 256];
+    let bytes_read = client_stream
+        .read(&mut begin_prefix)
+        .await
+        .expect("control output begins");
+    let begin_prefix =
+        String::from_utf8(begin_prefix[..bytes_read].to_vec()).expect("control output is utf-8");
+    assert!(
+        begin_prefix.contains("%begin "),
+        "expected begin guard in initial output: {begin_prefix:?}"
+    );
+
+    client_stream
+        .shutdown()
+        .await
+        .expect("client write half closes");
+
+    let mut remaining = Vec::new();
+    read_control_to_end(&mut client_stream, &mut remaining).await;
+    control_task
+        .await
+        .expect("forward control task joins")
+        .expect("forward control succeeds");
+
+    let rendered = format!(
+        "{begin_prefix}{}",
+        String::from_utf8(remaining).expect("utf-8 control stream")
+    );
+    assert!(
+        rendered.contains("ok\n"),
+        "finite pending command should still emit stdout after EOF: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("%end "),
+        "finite pending command should close with %end after EOF: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("%error "),
+        "finite pending command must not be converted to %error after EOF: {rendered:?}"
+    );
+    assert!(
+        rendered.ends_with("%exit\n"),
+        "finite pending command should append bare exit after completion: {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn stdin_command_after_upgrade_uses_flags_one_after_initial_ack() {
+    let handler = Arc::new(RequestHandler::new());
+    let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (_server_event_tx, server_event_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
+
+    let control_task = tokio::spawn(forward_control(
+        server_stream,
+        Arc::clone(&handler),
+        4242,
+        Vec::new(),
+        shutdown_rx,
+        server_event_rx,
+        ControlLifecycle {
+            closing: Arc::clone(&closing),
+            shutdown_handle,
+        },
+    ));
+
+    client_stream
+        .write_all(b"display-message -p ok\n")
+        .await
+        .expect("stdin command writes");
+    client_stream
+        .shutdown()
+        .await
+        .expect("client write half closes");
+
+    let mut rendered = Vec::new();
+    read_control_to_end(&mut client_stream, &mut rendered).await;
+    control_task
+        .await
+        .expect("forward control task joins")
+        .expect("forward control succeeds");
+
+    let rendered = String::from_utf8(rendered).expect("utf-8 control stream");
+    let begins = parse_guard_lines(&rendered, "%begin ");
+    let ends = parse_guard_lines(&rendered, "%end ");
+    assert_eq!(
+        begins.len(),
+        2,
+        "expected ack plus stdin block: {rendered:?}"
+    );
+    assert_eq!(ends.len(), 2, "expected ack plus stdin block: {rendered:?}");
+    assert_eq!(begins[0].command_number, 1);
+    assert_eq!(begins[0].flags, 0);
+    assert_eq!(begins[1].command_number, 2);
+    assert_eq!(begins[1].flags, 1);
+    assert_eq!(ends[1].command_number, begins[1].command_number);
+    assert_eq!(ends[1].flags, begins[1].flags);
+    assert!(
+        rendered.contains("ok\n"),
+        "stdin command output should be present: {rendered:?}"
+    );
+    assert!(
+        rendered.ends_with("%exit\n"),
+        "EOF after stdin command must terminate with %exit: {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn command_with_more_than_one_thousand_arguments_errors() {
+    let handler = Arc::new(RequestHandler::new());
+    let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (_server_event_tx, server_event_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
+    let mut input = String::from("display-message");
+    for index in 0..1001 {
+        input.push_str(" arg");
+        input.push_str(&index.to_string());
+    }
+    input.push_str("\n\n");
+
+    let control_task = tokio::spawn(forward_control(
+        server_stream,
+        Arc::clone(&handler),
+        4242,
+        input.into_bytes(),
+        shutdown_rx,
+        server_event_rx,
+        ControlLifecycle {
+            closing: Arc::clone(&closing),
+            shutdown_handle,
+        },
+    ));
+
+    let mut rendered = Vec::new();
+    read_control_to_end(&mut client_stream, &mut rendered).await;
+    control_task
+        .await
+        .expect("forward control task joins")
+        .expect("forward control succeeds");
+
+    let rendered = String::from_utf8(rendered).expect("utf-8 control stream");
+    assert!(
+        rendered.contains("too many arguments: 1001 (maximum 1000)"),
+        "oversized MSG_COMMAND should report the argument cap: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("%error "),
+        "oversized MSG_COMMAND should close the block with %error: {rendered:?}"
+    );
+    assert!(
+        !rendered
+            .lines()
+            .any(|line| line.starts_with("%end ") && line.ends_with(" 1")),
+        "oversized MSG_COMMAND must not close the user block with %end: {rendered:?}"
+    );
+    assert!(
+        rendered.ends_with("%exit\n"),
+        "empty trailing line should still close control mode: {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn nested_command_with_more_than_one_thousand_arguments_errors() {
+    let handler = Arc::new(RequestHandler::new());
+    let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (_server_event_tx, server_event_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
+    let mut input = String::from("bind-key x { display-message");
+    for index in 0..1001 {
+        input.push_str(" arg");
+        input.push_str(&index.to_string());
+    }
+    input.push_str(" }\n\n");
+
+    let control_task = tokio::spawn(forward_control(
+        server_stream,
+        Arc::clone(&handler),
+        4242,
+        input.into_bytes(),
+        shutdown_rx,
+        server_event_rx,
+        ControlLifecycle {
+            closing: Arc::clone(&closing),
+            shutdown_handle,
+        },
+    ));
+
+    let mut rendered = Vec::new();
+    read_control_to_end(&mut client_stream, &mut rendered).await;
+    control_task
+        .await
+        .expect("forward control task joins")
+        .expect("forward control succeeds");
+
+    let rendered = String::from_utf8(rendered).expect("utf-8 control stream");
+    assert!(
+        rendered.contains("too many arguments: 1001 (maximum 1000)"),
+        "oversized nested command should report the argument cap: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("%error "),
+        "oversized nested command should close the block with %error: {rendered:?}"
+    );
+    assert!(
+        !rendered
+            .lines()
+            .any(|line| line.starts_with("%end ") && line.ends_with(" 1")),
+        "oversized nested command must not close the user block with %end: {rendered:?}"
+    );
+    assert!(
+        rendered.ends_with("%exit\n"),
+        "empty trailing line should still close control mode: {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn pending_control_command_waits_for_completion_without_execution_timeout() {
+    let handler = Arc::new(RequestHandler::new());
+    let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (_server_event_tx, server_event_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
+    let _requester_access_guard = handler.begin_detached_requester_access(4242, true);
+
+    let control_task = tokio::spawn(forward_control(
+        server_stream,
+        Arc::clone(&handler),
+        4242,
+        b"wait-for control-timeout-block\n\n".to_vec(),
+        shutdown_rx,
+        server_event_rx,
+        ControlLifecycle {
+            closing: Arc::clone(&closing),
+            shutdown_handle,
+        },
+    ));
+
+    let mut begin_prefix = vec![0_u8; 256];
+    let bytes_read = client_stream
+        .read(&mut begin_prefix)
+        .await
+        .expect("control output begins");
+    let begin_prefix =
+        String::from_utf8(begin_prefix[..bytes_read].to_vec()).expect("control output is utf-8");
+    assert!(
+        begin_prefix.contains("%begin "),
+        "expected begin guard in initial output: {begin_prefix:?}"
+    );
+
+    wait_for_waiter(&handler, "control-timeout-block").await;
+    tokio::time::sleep(Duration::from_millis(650)).await;
+    let response = handler
+        .handle(Request::WaitFor(WaitForRequest {
+            channel: "control-timeout-block".to_owned(),
+            mode: WaitForMode::Signal,
+        }))
+        .await;
+    assert!(matches!(response, Response::WaitFor(WaitForResponse)));
+
+    let mut rendered = Vec::new();
+    read_control_to_end(&mut client_stream, &mut rendered).await;
+    control_task
+        .await
+        .expect("forward control task joins")
+        .expect("forward control succeeds");
+
+    let rendered = format!(
+        "{begin_prefix}{}",
+        String::from_utf8(rendered).expect("utf-8 control stream")
+    );
+    assert!(
+        !rendered.contains("command timed out after"),
+        "control-mode must not cap command execution at 500ms: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("%end "),
+        "signalled pending control command should close successfully: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("%error "),
+        "signalled pending control command must not emit %error: {rendered:?}"
+    );
+    assert!(
+        rendered.ends_with("%exit\n"),
+        "empty trailing line should close control mode after command completion: {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn eof_while_control_command_is_pending_closes_guard_and_exits() {
+    let handler = Arc::new(RequestHandler::new());
+    let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (_server_event_tx, server_event_rx) = mpsc::unbounded_channel();
+    let closing = Arc::new(AtomicBool::new(false));
+    let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
+    let _requester_access_guard = handler.begin_detached_requester_access(4242, true);
+
+    let control_task = tokio::spawn(forward_control(
+        server_stream,
+        Arc::clone(&handler),
+        4242,
+        b"wait-for control-eof-block\n".to_vec(),
+        shutdown_rx,
+        server_event_rx,
+        ControlLifecycle {
+            closing: Arc::clone(&closing),
+            shutdown_handle,
+        },
+    ));
+
+    let mut begin_prefix = vec![0_u8; 256];
+    let bytes_read = client_stream
+        .read(&mut begin_prefix)
+        .await
+        .expect("control output begins");
+    let begin_prefix =
+        String::from_utf8(begin_prefix[..bytes_read].to_vec()).expect("control output is utf-8");
+    assert!(
+        begin_prefix.contains("%begin "),
+        "expected begin guard in initial output: {begin_prefix:?}"
+    );
+    wait_for_waiter(&handler, "control-eof-block").await;
+
+    client_stream
+        .shutdown()
+        .await
+        .expect("client write half closes");
+
+    let mut remaining = Vec::new();
+    read_control_to_end(&mut client_stream, &mut remaining).await;
+    control_task
+        .await
+        .expect("forward control task joins")
+        .expect("forward control succeeds");
+
+    let rendered = format!(
+        "{begin_prefix}{}",
+        String::from_utf8(remaining).expect("utf-8 control stream")
+    );
+    assert!(
+        rendered.contains("%end "),
+        "EOF while a command is pending must close the guard: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("%error "),
+        "EOF cancellation should be a clean end guard: {rendered:?}"
+    );
+    assert!(
+        rendered.ends_with("%exit\n"),
+        "EOF while a command is pending must terminate control mode: {rendered:?}"
     );
 }
 
@@ -283,6 +668,7 @@ async fn dropping_active_control_command_aborts_inflight_task() {
         timestamp: 0,
         command_number: 1,
         guard_flag: 0,
+        abort_on_eof: true,
         task,
     });
 
@@ -316,10 +702,10 @@ async fn wait_for_waiter(handler: &RequestHandler, channel: &str) {
 }
 
 #[tokio::test]
-async fn empty_line_input_emits_bare_exit_without_begin() {
-    // Minimal control-mode scenario: a bare `\n` as the first input
-    // byte must route through the in-loop empty-line branch and emit a
-    // bare `%exit\n` with no preceding %begin/%end/%error guard tuple.
+async fn empty_line_input_emits_initial_frame_and_bare_exit() {
+    // Minimal control-mode scenario: a bare `\n` as the first input byte must
+    // route through the in-loop empty-line branch after the initial tmux-style
+    // control guard pair, then terminate with a bare `%exit\n`.
     let handler = Arc::new(RequestHandler::new());
     let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
     let (_shutdown_tx, shutdown_rx) = watch::channel(());
@@ -350,10 +736,7 @@ async fn empty_line_input_emits_bare_exit_without_begin() {
         .expect("forward control task joins")
         .expect("forward control succeeds");
 
-    assert_eq!(
-        rendered, b"%exit\n",
-        "empty-line input must emit bare %exit with no guard tuple"
-    );
+    assert_initial_control_frame_then_exit(&rendered);
 }
 
 #[tokio::test]
@@ -390,15 +773,15 @@ async fn crlf_empty_line_also_emits_bare_exit() {
         .expect("forward control task joins")
         .expect("forward control succeeds");
 
-    assert_eq!(rendered, b"%exit\n");
+    assert_initial_control_frame_then_exit(&rendered);
 }
 
 #[tokio::test]
 async fn incomplete_trailing_line_is_discarded_on_eof() {
     // control-mode contract: `extract_complete_control_lines` discards any
     // incomplete trailing line on EOF (tmux `evbuffer_readln` semantics).
-    // The command-without-newline must not trigger a %begin, and the
-    // transcript must still terminate in a bare `%exit\n`.
+    // The command-without-newline must not trigger a user-command %begin, and
+    // the transcript must still terminate in a bare `%exit\n`.
     let handler = Arc::new(RequestHandler::new());
     let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
     let (_shutdown_tx, shutdown_rx) = watch::channel(());
@@ -434,9 +817,34 @@ async fn incomplete_trailing_line_is_discarded_on_eof() {
         .expect("forward control task joins")
         .expect("forward control succeeds");
 
+    assert_initial_control_frame_then_exit(&rendered);
+}
+
+fn assert_initial_control_frame_then_exit(rendered: &[u8]) {
+    let rendered = String::from_utf8(rendered.to_vec()).expect("utf-8 control stream");
+    let begins = parse_guard_lines(&rendered, "%begin ");
+    let ends = parse_guard_lines(&rendered, "%end ");
     assert_eq!(
-        rendered, b"%exit\n",
-        "incomplete trailing line must be dropped and EOF must emit bare %exit"
+        begins.len(),
+        1,
+        "empty/discarded input must emit only the initial %begin: {rendered:?}"
+    );
+    assert_eq!(
+        ends.len(),
+        1,
+        "empty/discarded input must emit only the initial %end: {rendered:?}"
+    );
+    assert_eq!(begins[0].command_number, 1);
+    assert_eq!(begins[0].flags, 0);
+    assert_eq!(ends[0].command_number, 1);
+    assert_eq!(ends[0].flags, 0);
+    assert!(
+        !rendered.contains("%error "),
+        "empty/discarded input must not emit %error: {rendered:?}"
+    );
+    assert!(
+        rendered.ends_with("%exit\n"),
+        "control stream must end with bare %exit: {rendered:?}"
     );
 }
 
@@ -447,8 +855,17 @@ struct TestGuardTuple {
     flags: u8,
 }
 
-fn parse_guard_line(output: &str, prefix: &str) -> Option<TestGuardTuple> {
-    let line = output.lines().find(|line| line.starts_with(prefix))?;
+fn parse_guard_lines(output: &str, prefix: &str) -> Vec<TestGuardTuple> {
+    output
+        .lines()
+        .filter_map(|line| parse_guard_tuple(line, prefix))
+        .collect()
+}
+
+fn parse_guard_tuple(line: &str, prefix: &str) -> Option<TestGuardTuple> {
+    if !line.starts_with(prefix) {
+        return None;
+    }
     let rest = line.strip_prefix(prefix)?;
     let mut parts = rest.split_whitespace();
     let time_secs = parts.next()?.parse::<i64>().ok()?;

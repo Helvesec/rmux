@@ -513,7 +513,7 @@ fn legacy_wire_v1_request_writer_uses_v1_shutdown_envelope() {
     let mut connection = super::Connection::new(client_stream).expect("connection with timeout");
 
     connection
-        .write_legacy_wire_v1_request(&Request::KillServer(rmux_proto::KillServerRequest))
+        .write_legacy_wire_request(&Request::KillServer(rmux_proto::KillServerRequest), 1)
         .expect("write legacy kill-server request");
 
     let mut buffer = [0_u8; 64];
@@ -523,6 +523,32 @@ fn legacy_wire_v1_request_writer_uses_v1_shutdown_envelope() {
     assert!(bytes_read >= 10, "legacy frame should include envelope and tag");
     assert_eq!(buffer[0], RMUX_FRAME_MAGIC);
     assert_eq!(buffer[1], 1, "legacy shutdown must use wire version 1");
+
+    let length = u32::from_le_bytes(
+        buffer[2..6]
+            .try_into()
+            .expect("single-byte wire version leaves length at offset 2"),
+    );
+    assert_eq!(length, 4, "empty KillServer payload only carries enum tag");
+    assert_eq!(&buffer[6..10], &72_u32.to_le_bytes());
+}
+
+#[test]
+fn legacy_wire_request_writer_can_target_wire_v3_shutdown() {
+    let (client_stream, mut server_stream) = UnixStream::pair().expect("create stream pair");
+    let mut connection = super::Connection::new(client_stream).expect("connection with timeout");
+
+    connection
+        .write_legacy_wire_request(&Request::KillServer(rmux_proto::KillServerRequest), 3)
+        .expect("write wire-v3 kill-server request");
+
+    let mut buffer = [0_u8; 64];
+    let bytes_read = server_stream
+        .read(&mut buffer)
+        .expect("read legacy shutdown frame");
+    assert!(bytes_read >= 10, "legacy frame should include envelope and tag");
+    assert_eq!(buffer[0], RMUX_FRAME_MAGIC);
+    assert_eq!(buffer[1], 3, "0.8 shutdown fallback must use wire version 3");
 
     let length = u32::from_le_bytes(
         buffer[2..6]

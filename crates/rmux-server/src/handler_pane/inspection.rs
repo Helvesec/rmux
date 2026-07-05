@@ -1,5 +1,5 @@
 use rmux_core::formats::{
-    render_list_panes_line, FormatContext, DEFAULT_DISPLAY_MESSAGE_FORMAT,
+    is_truthy, render_list_panes_line, FormatContext, DEFAULT_DISPLAY_MESSAGE_FORMAT,
     DEFAULT_LIST_PANES_SESSION_FORMAT, DEFAULT_LIST_PANES_WINDOW_FORMAT,
 };
 use rmux_proto::{
@@ -334,15 +334,20 @@ impl RequestHandler {
             }
         }
 
-        Response::ListPanes(ListPanesResponse {
-            output: collect_list_pane_output(
-                &state,
-                session,
-                attached_count,
-                request.target_window_index,
-                request.format.as_deref(),
-            ),
-        })
+        let output = match collect_list_pane_output_with_selection(ListPaneOutputSelection {
+            state: &state,
+            session,
+            attached_count,
+            target_window_index: request.target_window_index,
+            format: request.format.as_deref(),
+            filter: request.filter.as_deref(),
+            sort_order: request.sort_order.as_deref(),
+            reversed: request.reversed,
+        }) {
+            Ok(output) => output,
+            Err(error) => return Response::Error(ErrorResponse { error }),
+        };
+        Response::ListPanes(ListPanesResponse { output })
     }
 }
 
@@ -659,13 +664,38 @@ pub(in crate::handler) fn attached_status_message_for_error(error: &RmuxError) -
     }
 }
 
-fn collect_list_pane_output(
-    state: &HandlerState,
-    session: &rmux_core::Session,
+struct ListPaneOutputSelection<'a> {
+    state: &'a HandlerState,
+    session: &'a rmux_core::Session,
     attached_count: usize,
     target_window_index: Option<u32>,
-    format: Option<&str>,
-) -> CommandOutput {
+    format: Option<&'a str>,
+    filter: Option<&'a str>,
+    sort_order: Option<&'a str>,
+    reversed: bool,
+}
+
+fn collect_list_pane_output_with_selection(
+    selection: ListPaneOutputSelection<'_>,
+) -> Result<CommandOutput, RmuxError> {
+    let ListPaneOutputSelection {
+        state,
+        session,
+        attached_count,
+        target_window_index,
+        format,
+        filter,
+        sort_order,
+        reversed,
+    } = selection;
+    let sort_order = match PaneListSortOrder::parse(sort_order) {
+        Some(sort_order) => sort_order,
+        None if sort_order.is_some() => {
+            return Err(RmuxError::Message(rmux_core::INVALID_SORT_ORDER.to_owned()));
+        }
+        None => PaneListSortOrder::Index,
+    };
+    let structured = filter.is_some() || sort_order.is_explicit();
     let active_window = session.active_window_index();
     let last_window = session.last_window_index();
     let session_context =
@@ -675,13 +705,14 @@ fn collect_list_pane_output(
     } else {
         DEFAULT_LIST_PANES_SESSION_FORMAT
     }));
-    let fast_format = if attached_count == 0 {
+    let fast_format = if attached_count == 0 && !structured {
         format.and_then(DefaultListPanesFormat::from_format)
     } else {
         None
     };
 
     let mut stdout = Vec::new();
+    let mut structured_lines = Vec::new();
     for (window_index, window) in session.windows() {
         if target_window_index.is_some_and(|target| *window_index != target) {
             continue;
@@ -693,6 +724,7 @@ fn collect_list_pane_output(
             session_context
                 .clone()
                 .with_window(*window_index, window, active, last);
+        let mut window_rows = Vec::new();
 
         for pane in window.panes() {
             let pane_active = pane.index() == window.active_pane_index();
@@ -725,17 +757,104 @@ fn collect_list_pane_output(
             if attached_count == 0 {
                 runtime = runtime.with_unclipped_geometry();
             }
+            if let Some(filter) = filter {
+                let expanded = render_runtime_template(filter, &runtime, false);
+                if !is_truthy(&expanded) {
+                    continue;
+                }
+            }
+            if structured {
+                window_rows.push(PaneListLine {
+                    window_index: *window_index,
+                    pane_index: pane.index(),
+                    size: pane.geometry(),
+                    title: render_runtime_template("#{pane_title}", &runtime, false),
+                    created_at: pane.created_at(),
+                    activity_at: pane.activity_at(),
+                    rendered: render_list_panes_line(&runtime, format),
+                });
+                continue;
+            }
             if !stdout.is_empty() {
                 stdout.push(b'\n');
             }
             stdout.extend_from_slice(render_list_panes_line(&runtime, format).as_bytes());
         }
+
+        if structured {
+            if sort_order.is_explicit() {
+                sort_pane_list_lines(&mut window_rows, sort_order, reversed);
+            }
+            structured_lines.extend(window_rows.into_iter().map(|row| row.rendered));
+        }
+    }
+
+    if structured {
+        stdout = structured_lines.join("\n").into_bytes();
     }
 
     if !stdout.is_empty() {
         stdout.push(b'\n');
     }
-    CommandOutput::from_stdout(stdout)
+    Ok(CommandOutput::from_stdout(stdout))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneListSortOrder {
+    Index,
+    ExplicitIndex,
+    Name,
+    Size,
+    Activity,
+    Creation,
+}
+
+impl PaneListSortOrder {
+    fn parse(value: Option<&str>) -> Option<Self> {
+        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            None | Some("") => Some(Self::Index),
+            Some("index" | "order") => Some(Self::ExplicitIndex),
+            Some("name" | "title") => Some(Self::Name),
+            Some("size") => Some(Self::Size),
+            Some("activity") => Some(Self::Activity),
+            Some("creation") => Some(Self::Creation),
+            Some(_) => None,
+        }
+    }
+
+    const fn is_explicit(self) -> bool {
+        !matches!(self, Self::Index)
+    }
+}
+
+struct PaneListLine {
+    window_index: u32,
+    pane_index: u32,
+    size: rmux_core::PaneGeometry,
+    title: String,
+    created_at: i64,
+    activity_at: i64,
+    rendered: String,
+}
+
+fn sort_pane_list_lines(rows: &mut [PaneListLine], sort_order: PaneListSortOrder, reversed: bool) {
+    rows.sort_by(|left, right| {
+        let primary = match sort_order {
+            PaneListSortOrder::Index | PaneListSortOrder::ExplicitIndex => {
+                (left.window_index, left.pane_index).cmp(&(right.window_index, right.pane_index))
+            }
+            PaneListSortOrder::Name => left.title.cmp(&right.title),
+            PaneListSortOrder::Size => {
+                (left.size.cols(), left.size.rows()).cmp(&(right.size.cols(), right.size.rows()))
+            }
+            PaneListSortOrder::Activity => left.activity_at.cmp(&right.activity_at),
+            PaneListSortOrder::Creation => left.created_at.cmp(&right.created_at),
+        };
+        let primary = if reversed { primary.reverse() } else { primary };
+        primary.then_with(|| {
+            (left.window_index, left.pane_index).cmp(&(right.window_index, right.pane_index))
+        })
+    });
 }
 
 pub(in crate::handler) fn command_output_from_lines(lines: &[String]) -> CommandOutput {

@@ -350,18 +350,25 @@ fn server_access_missing_user_is_a_runtime_error() {
 }
 
 #[test]
-fn server_access_rejects_unknown_target_flag() {
-    let error = parse_args(&["server-access", "-t", "%0", "-l"]).unwrap_err();
-    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(error
-        .to_string()
-        .contains("command server-access: unknown flag -t"));
+fn server_access_accepts_tmux_target_flag() {
+    let cli = parse_args(&["server-access", "-t", "%0", "-l"]).unwrap();
+    match cli.command.expect("parsed command") {
+        super::super::Command::ServerAccess(args) => {
+            assert_eq!(args.target.as_deref(), Some("%0"));
+            assert!(args.list);
+            assert_eq!(args.user, None);
+        }
+        _ => panic!("expected ServerAccess command"),
+    }
 
-    let error = parse_args(&["server-access", "-t", "%0", "root"]).unwrap_err();
-    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(error
-        .to_string()
-        .contains("command server-access: unknown flag -t"));
+    let cli = parse_args(&["server-access", "-t", "%0", "root"]).unwrap();
+    match cli.command.expect("parsed command") {
+        super::super::Command::ServerAccess(args) => {
+            assert_eq!(args.target.as_deref(), Some("%0"));
+            assert_eq!(args.user.as_deref(), Some("root"));
+        }
+        _ => panic!("expected ServerAccess command"),
+    }
 
     let error = parse_args(&["server-access", "-xt", "root"]).unwrap_err();
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);

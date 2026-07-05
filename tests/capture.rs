@@ -70,6 +70,114 @@ fn capture_pane_non_numeric_bounds_are_rejected() -> Result<(), Box<dyn Error>> 
 }
 
 #[test]
+fn capture_pane_format_flags_match_tmux_supported_surface() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("capture-pane-format-flags")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+    let marker = "cli_capture_format_flags_marker";
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    assert_success(&harness.run(&[
+        "send-keys",
+        "-t",
+        "alpha:0.0",
+        &format!("printf '{marker}\\n'"),
+        "Enter",
+    ])?);
+    let _ = wait_for_capture(&harness, marker)?;
+
+    let line_numbers = harness.run(&["capture-pane", "-p", "-L", "-t", "alpha:0.0"])?;
+    assert_eq!(line_numbers.status.code(), Some(0));
+    assert!(stderr(&line_numbers).is_empty());
+    assert!(
+        stdout(&line_numbers)
+            .lines()
+            .any(|line| line.contains(marker)
+                && line
+                    .split_once(' ')
+                    .and_then(|(prefix, _)| prefix.parse::<i64>().ok())
+                    .is_some()),
+        "line-numbered output did not prefix the marker line: {:?}",
+        stdout(&line_numbers)
+    );
+
+    let line_flags = harness.run(&["capture-pane", "-p", "-F", "-t", "alpha:0.0"])?;
+    assert_eq!(line_flags.status.code(), Some(0));
+    assert!(stderr(&line_flags).is_empty());
+    assert!(
+        stdout(&line_flags)
+            .lines()
+            .any(|line| line.contains(marker) && line.starts_with("- ")),
+        "line-flag output did not prefix the marker line: {:?}",
+        stdout(&line_flags)
+    );
+
+    let hyperlinks = harness.run(&["capture-pane", "-p", "-H", "-t", "alpha:0.0"])?;
+    assert_eq!(hyperlinks.status.code(), Some(0));
+    assert!(stderr(&hyperlinks).is_empty());
+
+    let queued = harness.run(&["run-shell", "-C", "capture-pane -p -L -t alpha:0.0"])?;
+    assert_eq!(queued.status.code(), Some(0));
+    assert!(stderr(&queued).is_empty());
+    assert!(
+        stdout(&queued).lines().any(|line| line.contains(marker)),
+        "queued capture-pane -L did not return the captured marker: {:?}",
+        stdout(&queued)
+    );
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn capture_pane_format_flags_mark_wrapped_lines() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("capture-pane-format-wrapped")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+    assert_success(&harness.run(&[
+        "new-session",
+        "-d",
+        "-x",
+        "8",
+        "-y",
+        "4",
+        "-s",
+        "alpha",
+        "printf 'abcdefghijklmnop'; sleep 3",
+    ])?);
+    let _ = wait_for_capture(&harness, "ijklmnop")?;
+
+    let line_flags = harness.run(&["capture-pane", "-pF", "-t", "alpha:0.0"])?;
+    assert_eq!(line_flags.status.code(), Some(0));
+    assert!(stderr(&line_flags).is_empty());
+    assert!(
+        stdout(&line_flags).starts_with("W abcdefgh\n- ijklmnop\n"),
+        "wrapped line flags did not match tmux: {:?}",
+        stdout(&line_flags)
+    );
+
+    Ok(())
+}
+
+#[test]
+fn capture_pane_hyperlinks_prints_osc8_uri() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("capture-pane-hyperlinks")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+    assert_success(&harness.run(&[
+        "new-session",
+        "-d",
+        "-s",
+        "alpha",
+        "printf '\\033]8;id=abc;https://example.com\\033\\\\link\\033]8;;\\033\\\\\\n'; sleep 3",
+    ])?);
+    let _ = wait_for_capture(&harness, "link")?;
+
+    let hyperlinks = harness.run(&["capture-pane", "-pH", "-t", "alpha:0.0"])?;
+    assert_eq!(hyperlinks.status.code(), Some(0));
+    assert!(stderr(&hyperlinks).is_empty());
+    assert_eq!(stdout(&hyperlinks), "https://example.com\n");
+
+    Ok(())
+}
+
+#[test]
 fn capture_pane_writes_buffer_without_printing() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("capture-buffer")?;
     let mut daemon = harness.start_hidden_daemon()?;

@@ -79,6 +79,7 @@ async fn windows_daemon_empty_session_requests_match_unix_semantics() -> io::Res
                 target,
                 kill_all_except_target: false,
                 clear_alerts: false,
+                kill_group: false,
             }),
         )?;
 
@@ -143,15 +144,21 @@ async fn windows_daemon_empty_listing_requests_succeed() -> io::Result<()> {
                 sort_order: None,
                 reversed: false,
             }),
-            Request::ListWindows(ListWindowsRequest {
+            Request::ListWindows(Box::new(ListWindowsRequest {
                 target: SessionName::new("alpha").expect("valid session"),
                 format: None,
-            }),
-            Request::ListPanes(ListPanesRequest {
+                filter: None,
+                sort_order: None,
+                reversed: false,
+            })),
+            Request::ListPanes(Box::new(ListPanesRequest {
                 target: SessionName::new("alpha").expect("valid session"),
                 target_window_index: None,
                 format: None,
-            }),
+                filter: None,
+                sort_order: None,
+                reversed: false,
+            })),
             Request::ListClients(Box::new(ListClientsRequest {
                 format: None,
                 filter: None,

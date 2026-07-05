@@ -485,11 +485,14 @@ fn quiet_attached_command() -> Vec<String> {
 
 async fn active_panes(handler: &RequestHandler, session: &SessionName) -> String {
     let response = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: session.clone(),
             format: Some("#{pane_index}:#{pane_active}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }))
+        })))
         .await;
     let Response::ListPanes(response) = response else {
         panic!("expected list-panes response, got {response:?}");
@@ -518,10 +521,13 @@ async fn pane_terminal_size(
 
 async fn active_windows(handler: &RequestHandler, session: &SessionName) -> String {
     let response = handler
-        .handle(Request::ListWindows(ListWindowsRequest {
+        .handle(Request::ListWindows(Box::new(ListWindowsRequest {
             target: session.clone(),
             format: Some("#{window_index}:#{window_active}".to_owned()),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
     let Response::ListWindows(response) = response else {
         panic!("expected list-windows response, got {response:?}");
@@ -553,13 +559,16 @@ async fn select_layout(handler: &RequestHandler, session: &SessionName, layout: 
 
 async fn pane_mode_status(handler: &RequestHandler, session: &SessionName) -> String {
     let response = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: session.clone(),
             format: Some(
                 "#{pane_in_mode}:#{pane_mode}:#{search_present}:#{selection_present}".to_owned(),
             ),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }))
+        })))
         .await;
     let Response::ListPanes(response) = response else {
         panic!("expected list-panes response, got {response:?}");
@@ -643,6 +652,9 @@ async fn capture_pane_print(handler: &RequestHandler, target: PaneTarget) -> Str
             alternate: false,
             escape_ansi: false,
             escape_sequences: false,
+            include_format: false,
+            hyperlinks: false,
+            line_numbers: false,
             join_wrapped: false,
             use_mode_screen: false,
             preserve_trailing_spaces: false,

@@ -2,8 +2,8 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="benchmarks/hero-v0.8.0-rmux-dark.svg">
-  <img src="benchmarks/hero-v0.8.0-rmux-light.svg" width="100%" alt="RMUX benchmark overview">
+  <source media="(prefers-color-scheme: dark)" srcset="benchmarks/hero-v0.9.0-rmux-dark.svg">
+  <img src="benchmarks/hero-v0.9.0-rmux-light.svg" width="100%" alt="RMUX benchmark overview">
 </picture>
 
 </div>

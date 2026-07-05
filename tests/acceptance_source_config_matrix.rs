@@ -109,6 +109,29 @@ fn source_file_unquoted_hash_format_comments_match_tmux_boolean_toggle(
 }
 
 #[test]
+fn source_file_set_option_scope_and_scalar_append_match_tmux37() -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("source-config-options-tmux37")?;
+    harness.success(["new-session", "-d", "-s", "cfg"])?;
+
+    let config = harness.tmpdir().join("options-tmux37.conf");
+    fs::write(
+        &config,
+        "set-option -sw -t cfg status off\n\
+         set-option -ga history-limit 5\n\
+         set-option -g set-clipboard external\n\
+         set-option -g set-clipboard\n",
+    )?;
+
+    harness.success([OsStr::new("source-file"), config.as_os_str()])?;
+    let window_status = harness.stdout(["show-options", "-wv", "-t", "cfg", "status"])?;
+    assert_eq!(window_status.trim(), "off");
+    assert_option(&harness, "history-limit", "5")?;
+    assert_option(&harness, "set-clipboard", "off")?;
+
+    Ok(())
+}
+
+#[test]
 #[cfg(unix)]
 fn source_file_uses_current_targets_for_tmux_commands_without_t() -> Result<(), Box<dyn Error>> {
     let harness = CrossPlatformHarness::new("source-config-implicit-targets")?;

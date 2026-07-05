@@ -7,8 +7,8 @@ mod options;
 
 use rmux_client::{connect, ClientError};
 use rmux_proto::{
-    ErrorResponse, Request, Response, RmuxError, ScopeSelector, SetEnvironmentMode,
-    SetOptionByNameRequest,
+    ErrorResponse, PaneTarget, Request, Response, RmuxError, ScopeSelector, SessionName,
+    SetEnvironmentMode, SetOptionByNameRequest,
 };
 
 use crate::cli::target_resolution::resolve_session_target_spec;
@@ -93,6 +93,9 @@ pub(crate) fn run_show_options(
 ) -> Result<i32, ExitFailure> {
     let command_name = command.command_name();
     let quiet = args.quiet;
+    if show_options_global_pane_is_noop(command, &args) {
+        return Ok(0);
+    }
     let scope = match resolve_show_options_scope(command, &args) {
         Ok(scope) => scope,
         Err(error) if quiet && quiet_option_failure(&error) => return Ok(0),
@@ -127,6 +130,34 @@ pub(crate) fn run_show_options(
             Ok(0)
         }
     }
+}
+
+fn show_options_global_pane_is_noop(
+    command: ShowOptionsCommandKind,
+    args: &ShowOptionsArgs,
+) -> bool {
+    matches!(command, ShowOptionsCommandKind::ShowOptions)
+        && args.global
+        && args.pane
+        && args
+            .name
+            .as_deref()
+            .map(option_name_supports_pane_show_scope)
+            .unwrap_or(true)
+}
+
+fn option_name_supports_pane_show_scope(name: &str) -> bool {
+    rmux_core::resolve_option_name(name)
+        .map(|query| query.supports_scope(&dummy_pane_scope()))
+        .unwrap_or(false)
+}
+
+fn dummy_pane_scope() -> rmux_proto::types::OptionScopeSelector {
+    rmux_proto::types::OptionScopeSelector::Pane(PaneTarget::with_window(
+        SessionName::new("show-options").expect("valid session name"),
+        0,
+        0,
+    ))
 }
 
 fn show_options_exit_failure(error: ClientError) -> ExitFailure {
@@ -252,7 +283,7 @@ mod tests {
         parse_target_spec, SetEnvironmentArgs, SetOptionArgs, SetOptionCommandKind,
         ShowOptionsArgs, ShowOptionsCommandKind, TargetSpec,
     };
-    use rmux_proto::{OptionScopeSelector, SessionName, WindowTarget};
+    use rmux_proto::{OptionScopeSelector, PaneTarget, SessionName, WindowTarget};
     use std::path::Path;
 
     fn target_spec(value: &str) -> TargetSpec {
@@ -301,13 +332,6 @@ mod tests {
                 panic!("expected set-option to resolve to a request")
             }
         }
-    }
-
-    fn resolve_set_option_noop(command: SetOptionCommandKind, args: SetOptionArgs) {
-        assert_eq!(
-            resolve_set_option_command(command, args).expect("set-option resolves"),
-            ResolvedSetOptionCommand::NoOp
-        );
     }
 
     #[test]
@@ -406,16 +430,18 @@ mod tests {
     }
 
     #[test]
-    fn set_option_server_flag_ignores_non_server_options_like_tmux() {
-        resolve_set_option_noop(
+    fn set_option_server_flag_is_ignored_for_non_server_options_like_tmux() {
+        let resolved = resolve_set_option_args(
             SetOptionCommandKind::SetOption,
             SetOptionArgs {
                 server: true,
                 ..global_set_args("mode-style", "fg=black,bg=red")
             },
-        );
+        )
+        .expect("window global set-option resolves");
+        assert_eq!(resolved.scope, OptionScopeSelector::WindowGlobal);
 
-        resolve_set_option_noop(
+        let resolved = resolve_set_option_args(
             SetOptionCommandKind::SetOption,
             SetOptionArgs {
                 global: false,
@@ -426,6 +452,11 @@ mod tests {
                 value: Some("append".to_owned()),
                 ..global_set_args("status-left", "append")
             },
+        )
+        .expect("targeted session set-option resolves");
+        assert_eq!(
+            resolved.scope,
+            OptionScopeSelector::Session(SessionName::new("alpha").expect("valid session name"))
         );
     }
 
@@ -441,6 +472,95 @@ mod tests {
         .expect("set-option -gw resolves");
 
         assert_eq!(resolved.scope, OptionScopeSelector::WindowGlobal);
+    }
+
+    #[test]
+    fn set_option_global_with_scope_flag_uses_named_option_global_root() {
+        for (server, window, pane) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let resolved = resolve_set_option_args(
+                SetOptionCommandKind::SetOption,
+                SetOptionArgs {
+                    server,
+                    window,
+                    pane,
+                    ..global_set_args("status", "off")
+                },
+            )
+            .expect("set-option -g plus scope flag resolves");
+
+            assert_eq!(resolved.scope, OptionScopeSelector::SessionGlobal);
+        }
+    }
+
+    #[test]
+    fn set_option_explicit_pane_scope_wins_for_pane_capable_known_options() {
+        let session = SessionName::new("alpha").expect("valid session");
+        let resolved = resolve_set_option_args(
+            SetOptionCommandKind::SetOption,
+            SetOptionArgs {
+                global: false,
+                server: false,
+                window: false,
+                pane: true,
+                quiet: false,
+                append: false,
+                format: false,
+                only_if_unset: false,
+                unset: false,
+                unset_pane_overrides: false,
+                target: Some(target_spec("alpha:0.1")),
+                option: "window-style".to_owned(),
+                value: Some("bg=red".to_owned()),
+            },
+        )
+        .expect("set-option -p resolves to a pane scope");
+
+        assert_eq!(
+            resolved.scope,
+            OptionScopeSelector::Pane(PaneTarget::with_window(session, 0, 1))
+        );
+    }
+
+    #[test]
+    fn set_window_option_uses_natural_scope_for_session_options() {
+        let resolved = resolve_set_option_args(
+            SetOptionCommandKind::SetWindowOption,
+            SetOptionArgs {
+                global: false,
+                server: false,
+                window: false,
+                pane: false,
+                quiet: false,
+                append: false,
+                format: false,
+                only_if_unset: false,
+                unset: false,
+                unset_pane_overrides: false,
+                target: Some(target_spec("alpha")),
+                option: "status".to_owned(),
+                value: Some("off".to_owned()),
+            },
+        )
+        .expect("set-window-option session option resolves");
+
+        assert_eq!(
+            resolved.scope,
+            OptionScopeSelector::Session(SessionName::new("alpha").expect("valid session"))
+        );
+
+        let resolved = resolve_set_option_args(
+            SetOptionCommandKind::SetWindowOption,
+            SetOptionArgs {
+                ..global_set_args("history-limit", "1234")
+            },
+        )
+        .expect("set-window-option -g session option resolves");
+
+        assert_eq!(resolved.scope, OptionScopeSelector::SessionGlobal);
     }
 
     #[test]

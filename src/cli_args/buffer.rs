@@ -86,20 +86,8 @@ pub(crate) struct ListBuffersArgs {
     pub(crate) format: Option<String>,
     #[arg(short = 'f')]
     pub(crate) filter: Option<String>,
-    #[arg(short = 'O', hide = true)]
-    unsupported_sort_order: Option<String>,
+    #[arg(short = 'O')]
+    pub(crate) sort_order: Option<String>,
     #[arg(short = 'r', action = ArgAction::SetTrue, hide = true)]
-    unsupported_reversed: bool,
-}
-
-impl ListBuffersArgs {
-    pub(crate) fn unsupported_flag(&self) -> Option<&'static str> {
-        if self.unsupported_reversed {
-            Some("-r")
-        } else if self.unsupported_sort_order.is_some() {
-            Some("-O")
-        } else {
-            None
-        }
-    }
+    pub(crate) reversed: bool,
 }

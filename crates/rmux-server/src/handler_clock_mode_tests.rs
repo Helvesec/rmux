@@ -228,11 +228,14 @@ async fn pane_id(handler: &RequestHandler, target: &PaneTarget) -> u32 {
 
 async fn list_panes_text(handler: &RequestHandler, target: &PaneTarget, format: &str) -> String {
     let response = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: target.session_name().clone(),
             format: Some(format.to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }))
+        })))
         .await;
     let output = response
         .command_output()

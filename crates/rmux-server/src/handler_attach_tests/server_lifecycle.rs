@@ -226,6 +226,7 @@ async fn server_access_protects_owner_uid() {
             list: false,
             read_only: false,
             write: false,
+            target: None,
             user: Some(current_owner_uid().to_string()),
         }))
         .await;
@@ -246,6 +247,7 @@ async fn server_access_deny_nonexistent_user_returns_error() {
             list: false,
             read_only: false,
             write: false,
+            target: None,
             user: Some("99999".to_owned()),
         }))
         .await;
@@ -263,6 +265,7 @@ async fn server_access_list_skips_uid_zero() {
             list: true,
             read_only: false,
             write: false,
+            target: None,
             user: None,
         }))
         .await;
@@ -290,6 +293,7 @@ async fn server_access_combined_flags_resolve_user_before_mutation() {
             list: false,
             read_only: false,
             write: false,
+            target: None,
             user: Some("rmux-no-such-user".to_owned()),
         }))
         .await;
@@ -308,6 +312,7 @@ async fn server_access_combined_flags_resolve_user_before_mutation() {
             list: false,
             read_only: true,
             write: true,
+            target: None,
             user: Some("rmux-no-such-user".to_owned()),
         }))
         .await;
@@ -333,6 +338,7 @@ async fn server_access_user_mutations_are_rejected_before_user_resolution_window
             list: false,
             read_only: false,
             write: false,
+            target: None,
             user: Some("rmux-no-such-user".to_owned()),
         },
         rmux_proto::ServerAccessRequest {
@@ -341,6 +347,7 @@ async fn server_access_user_mutations_are_rejected_before_user_resolution_window
             list: false,
             read_only: true,
             write: true,
+            target: None,
             user: Some("rmux-no-such-user".to_owned()),
         },
     ] {
@@ -362,6 +369,7 @@ async fn server_access_list_ignores_user_and_mutation_flags() {
             list: true,
             read_only: false,
             write: false,
+            target: None,
             user: Some("rmux-no-such-user".to_owned()),
         }))
         .await;

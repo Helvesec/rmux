@@ -850,6 +850,9 @@ mod tests {
             alternate: false,
             escape_ansi: false,
             escape_sequences: false,
+            include_format: false,
+            hyperlinks: false,
+            line_numbers: false,
             join_wrapped: false,
             use_mode_screen: false,
             preserve_trailing_spaces: false,
@@ -871,6 +874,9 @@ mod tests {
             alternate: false,
             escape_ansi: false,
             escape_sequences: false,
+            include_format: false,
+            hyperlinks: false,
+            line_numbers: false,
             join_wrapped: false,
             use_mode_screen: false,
             preserve_trailing_spaces: false,
@@ -891,6 +897,7 @@ mod tests {
             list: false,
             read_only: false,
             write: false,
+            target: None,
             user: Some("someone".to_owned()),
         })
         .expect_err("Windows cannot safely map server-access users to Unix UIDs");
@@ -909,6 +916,7 @@ mod tests {
             list: true,
             read_only: false,
             write: false,
+            target: None,
             user: None,
         })
         .expect("server-access -l remains read-only and portable");

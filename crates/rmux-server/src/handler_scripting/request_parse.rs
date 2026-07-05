@@ -177,6 +177,9 @@ pub(super) fn parse_queue_invocation(
     if let Some(command) = parse_prompt_history_queue_command(&command_name, arguments.clone())? {
         return Ok(QueueInvocation::PromptHistory(command));
     }
+    if command_name == "show-options" && show_options_global_pane_is_noop(&arguments) {
+        return Ok(QueueInvocation::NoOp);
+    }
     if command_name == "start-server" {
         let args = CommandTokens::new(arguments);
         parse_no_argument_request(args, "start-server")?;
@@ -191,6 +194,54 @@ pub(super) fn parse_queue_invocation(
         find_context,
     )
     .map(QueueInvocation::Request)
+}
+
+fn show_options_global_pane_is_noop(arguments: &[String]) -> bool {
+    let mut global = false;
+    let mut pane = false;
+    let mut name = None;
+    let mut index = 0;
+    while let Some(argument) = arguments.get(index) {
+        if argument == "--" || !argument.starts_with('-') || argument == "-" {
+            name = arguments.get(index).map(String::as_str);
+            break;
+        }
+        if argument == "-t" {
+            index += 2;
+            continue;
+        }
+        if argument.starts_with("-t") && argument.len() > 2 {
+            index += 1;
+            continue;
+        }
+        for flag in argument[1..].chars() {
+            match flag {
+                'g' => global = true,
+                'p' => pane = true,
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    global
+        && pane
+        && name
+            .map(show_option_name_supports_pane_scope)
+            .unwrap_or(true)
+}
+
+fn show_option_name_supports_pane_scope(name: &str) -> bool {
+    rmux_core::resolve_option_name(name)
+        .map(|query| query.supports_scope(&dummy_pane_scope()))
+        .unwrap_or(false)
+}
+
+fn dummy_pane_scope() -> rmux_proto::types::OptionScopeSelector {
+    rmux_proto::types::OptionScopeSelector::Pane(rmux_proto::PaneTarget::with_window(
+        rmux_proto::SessionName::new("show-options").expect("valid session name"),
+        0,
+        0,
+    ))
 }
 
 pub(crate) fn parse_request_from_parts(
@@ -218,7 +269,7 @@ pub(crate) fn parse_request_from_parts(
             default_set_option_target(sessions, find_context),
         ),
         "set-environment" => parse_set_environment(args, sessions, find_context),
-        "set-hook" => parse_set_hook(args),
+        "set-hook" => parse_set_hook(args, sessions, find_context),
         "show-options" => parse_show_options(args, false, sessions, find_context),
         "show-window-options" => parse_show_options(args, true, sessions, find_context),
         "show-environment" => parse_show_environment(args, sessions, find_context),

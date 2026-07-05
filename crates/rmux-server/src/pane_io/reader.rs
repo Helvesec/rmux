@@ -1,6 +1,6 @@
 use std::io;
 
-use rmux_core::PaneId;
+use rmux_core::{PaneId, TerminalPassthrough, TerminalPassthroughKind};
 #[cfg(windows)]
 use rmux_pty::PtyChild;
 use rmux_pty::{PtyIo, PtyMaster};
@@ -538,14 +538,15 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
     if !pane_output.accepts_generation(generation) {
         return Vec::new();
     }
-    let Some((_sequence, append_result)) =
+    let Some((_sequence, (append_result, clipboard_set))) =
         pane_output.publish_for_generation(generation, bytes, |bytes| {
             let mut transcript = transcript
                 .lock()
                 .expect("pane transcript mutex must not be poisoned");
             let mut append_result = transcript.append_bytes_with_effects(bytes);
             let passthroughs = std::mem::take(&mut append_result.passthroughs);
-            (append_result, passthroughs)
+            let clipboard_set = passthroughs.iter().any(passthrough_is_clipboard_set);
+            ((append_result, clipboard_set), passthroughs)
         })
     else {
         return Vec::new();
@@ -569,11 +570,57 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
             pane_id,
             bell_count: append_result.bell_count,
             title_changed: append_result.title_changed,
+            clipboard_set,
             queue_activity_alert: emit_no_bell_alert || append_result.bell_count > 0,
             generation,
         });
     }
     replies
+}
+
+fn passthrough_is_clipboard_set(passthrough: &TerminalPassthrough) -> bool {
+    passthrough.kind() == TerminalPassthroughKind::Clipboard
+        && osc52_payload_is_clipboard_set(passthrough.payload())
+}
+
+fn osc52_payload_is_clipboard_set(sequence: &[u8]) -> bool {
+    let Some(body) = sequence.strip_prefix(b"\x1b]52;") else {
+        return false;
+    };
+    let Some(body) = body
+        .strip_suffix(b"\x07")
+        .or_else(|| body.strip_suffix(b"\x1b\\"))
+    else {
+        return false;
+    };
+    let Some(separator) = body.iter().position(|byte| *byte == b';') else {
+        return false;
+    };
+    let payload = &body[separator + 1..];
+    payload != b"?" && base64_payload_syntax_is_valid(payload)
+}
+
+fn base64_payload_syntax_is_valid(payload: &[u8]) -> bool {
+    if payload.len() % 4 == 1 {
+        return false;
+    }
+
+    let mut padding = 0usize;
+    let mut seen_padding = false;
+    for &byte in payload {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' if !seen_padding => {}
+            b'=' => {
+                seen_padding = true;
+                padding += 1;
+                if padding > 2 {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 struct PaneGroundTimerJob {
@@ -798,6 +845,20 @@ fn spawn_blocking_pane_output_reader_inner(
             thread = %thread_name,
             "failed to spawn pane output reader: {error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::osc52_payload_is_clipboard_set;
+
+    #[test]
+    fn osc52_clipboard_set_requires_write_payload() {
+        assert!(osc52_payload_is_clipboard_set(b"\x1b]52;c;aGk=\x07"));
+        assert!(osc52_payload_is_clipboard_set(b"\x1b]52;c;aGk\x1b\\"));
+        assert!(!osc52_payload_is_clipboard_set(b"\x1b]52;c;?\x07"));
+        assert!(!osc52_payload_is_clipboard_set(b"\x1b]52;c;%%\x07"));
+        assert!(!osc52_payload_is_clipboard_set(b"\x1b]52;c;abcde\x07"));
     }
 }
 

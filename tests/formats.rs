@@ -550,6 +550,48 @@ fn window_name_format_matches_frozen_tmux_when_available() -> Result<(), Box<dyn
 }
 
 #[test]
+fn anchored_substitution_matches_frozen_tmux_when_available(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let harness = TmuxCompatHarness::new("formats-anchored-substitution-tmux-compat")?;
+    let tmux_binary = match FrozenTmuxBinary::discover() {
+        FrozenTmuxBinary::Available(path) => path,
+        FrozenTmuxBinary::Unavailable {
+            checked_path,
+            reason,
+        } => {
+            eprintln!(
+                "runtime skip: frozen tmux binary unavailable via {FROZEN_TMUX_ENV} or default '{}': {reason}",
+                checked_path.display()
+            );
+            return Ok(());
+        }
+    };
+    let config = TmuxCompatRunConfig::default();
+
+    let create = harness.run_pair_with(
+        &tmux_binary,
+        &["new-session", "-d", "-s", "foofoo"],
+        config.clone(),
+    )?;
+    assert_exact_tmux_compat(&create);
+
+    let display = harness.run_pair_with(
+        &tmux_binary,
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            "foofoo",
+            "#{s/^foo/bar/:session_name}",
+        ],
+        config,
+    )?;
+    assert_exact_tmux_compat(&display);
+    assert_eq!(display.rmux.stdout_string().trim(), "barfoo");
+    Ok(())
+}
+
+#[test]
 fn linked_window_format_variables_match_frozen_tmux_when_available(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let harness = TmuxCompatHarness::new("formats-linked-window-tmux-compat")?;

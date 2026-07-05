@@ -6,6 +6,9 @@
 //! This crate models sessions, windows, panes, layout geometry, and exact
 //! target resolution without any OS, network, or process integration.
 
+/// tmux-compatible message for invalid `-O` sort-order arguments.
+pub const INVALID_SORT_ORDER: &str = "invalid sort order";
+
 mod box_lines;
 mod buffers;
 pub mod command_parser;
@@ -49,8 +52,9 @@ pub use environment::{EnvironmentStore, ShowEnvironmentEntry, ENVIRON_HIDDEN};
 pub use formats::format_skip_delimiter;
 pub use grid::GridRenderOptions;
 pub use hooks::{
-    hook_global_root, validate_hook_registration, validate_hook_scope, HookBindingView,
-    HookDispatch, HookGlobalRoot, HookSetOptions, HookStore,
+    hook_global_root, hook_natural_scope_for_session_target, hook_natural_scope_for_target,
+    validate_hook_registration, validate_hook_scope, HookBindingView, HookDispatch, HookGlobalRoot,
+    HookSetOptions, HookStore,
 };
 pub use identity::{PaneId, SessionId, SessionName, WindowId};
 pub use input::{

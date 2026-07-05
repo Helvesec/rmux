@@ -44,11 +44,14 @@ async fn pane_index_formats_use_window_local_pane_base_index() {
     ));
 
     let list = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: alpha.clone(),
             target_window_index: Some(0),
             format: Some("#{pane_index}".to_owned()),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
     let Response::ListPanes(list) = list else {
         panic!("list-panes should succeed, got {list:?}");

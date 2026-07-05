@@ -15,7 +15,7 @@ pub(crate) fn normalize_set_hook_request(request: SetHookRequest) -> SetHookRequ
 
     SetHookRequest {
         lifecycle: HookLifecycle::OneShot,
-        command: shell_command,
+        command: run_shell_hook_command(&shell_command),
         ..request
     }
 }
@@ -38,7 +38,7 @@ pub(crate) fn normalize_set_hook_mutation_request(
 
     SetHookMutationRequest {
         lifecycle: HookLifecycle::OneShot,
-        command: Some(shell_command),
+        command: Some(run_shell_hook_command(&shell_command)),
         ..request
     }
 }
@@ -56,7 +56,6 @@ pub(crate) fn canonicalize_set_hook_mutation_command(
             request.command = Some(parsed.to_tmux_binding_string());
             Ok(request)
         }
-        Err(error) if error.message().starts_with("unknown command: ") => Ok(request),
         Err(error) => Err(RmuxError::Server(error.to_string())),
     }
 }
@@ -232,6 +231,14 @@ fn parse_single_quoted_shell_argument(input: &str) -> Option<(String, &str)> {
     None
 }
 
+fn run_shell_hook_command(shell_command: &str) -> String {
+    format!("run-shell {}", quote_tmux_single_argument(shell_command))
+}
+
+fn quote_tmux_single_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::normalize_set_hook_request;
@@ -257,7 +264,7 @@ mod tests {
         assert_eq!(normalized.lifecycle, HookLifecycle::OneShot);
         assert_eq!(
             normalized.command,
-            "mkdir -p '/tmp/example' && printf 'attached\\n' > '/tmp/example/hook'"
+            "run-shell 'mkdir -p '\\''/tmp/example'\\'' && printf '\\''attached\\n'\\'' > '\\''/tmp/example/hook'\\'''"
         );
     }
 
@@ -308,7 +315,10 @@ mod tests {
 
         let normalized = super::normalize_set_hook_mutation_request(request);
         assert_eq!(normalized.lifecycle, HookLifecycle::OneShot);
-        assert_eq!(normalized.command.as_deref(), Some("printf attached"));
+        assert_eq!(
+            normalized.command.as_deref(),
+            Some("run-shell 'printf attached'")
+        );
     }
 
     #[test]
@@ -354,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_unknown_hook_commands_for_legacy_shell_fallback() {
+    fn rejects_unknown_hook_commands_at_registration_time() {
         let request = SetHookMutationRequest {
             scope: ScopeSelector::Global,
             hook: HookName::PaneExited,
@@ -366,9 +376,12 @@ mod tests {
             index: None,
         };
 
-        let canonical = super::canonicalize_set_hook_mutation_command(request)
-            .expect("unknown command should remain available to shell fallback");
-        assert_eq!(canonical.command.as_deref(), Some("printf attached"));
+        let error = super::canonicalize_set_hook_mutation_command(request)
+            .expect_err("unknown hook commands must be rejected");
+        assert!(
+            error.to_string().contains("unknown command: printf"),
+            "unexpected error: {error}"
+        );
     }
 
     fn shell_quote_str(value: &str) -> String {

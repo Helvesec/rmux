@@ -25,6 +25,10 @@ pub(super) fn command_line(command: &ChildCommand) -> Vec<u16> {
         line.push(SPACE);
         append_quoted_arg(&mut line, arg);
     }
+    if let Some(args) = &command.windows_verbatim_args {
+        line.push(SPACE);
+        line.extend(args.encode_wide());
+    }
     line.push(0);
     line
 }
@@ -138,6 +142,21 @@ mod tests {
         let rendered = String::from_utf16_lossy(&line[..line.len() - 1]);
 
         assert_eq!(rendered, r#"prog.exe "C:\two words\ends\\""#);
+    }
+
+    #[test]
+    fn command_line_appends_windows_verbatim_args_without_msvc_quoting() {
+        let command = ChildCommand::new("cmd.exe")
+            .arg("/D")
+            .arg("/S")
+            .windows_verbatim_args(r#"/C ""C:\two words\script.bat" "echo hi"""#);
+        let line = command_line(&command);
+        let rendered = String::from_utf16_lossy(&line[..line.len() - 1]);
+
+        assert_eq!(
+            rendered,
+            r#"cmd.exe /D /S /C ""C:\two words\script.bat" "echo hi"""#
+        );
     }
 
     #[test]

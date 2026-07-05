@@ -618,13 +618,16 @@ async fn respawn_window_retains_surviving_pane_lifecycle_counters_and_redacts_en
     };
 
     let listed = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: alpha.clone(),
             target_window_index: Some(0),
             format: Some(
                 "#{pane_id}\t#{pane_lifecycle_generation}\t#{pane_lifecycle_revision}\t#{pane_output_sequence}\t#{pane_start_command}".to_owned(),
             ),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
     let list_stdout = match listed {
         Response::ListPanes(response) => {
@@ -641,13 +644,16 @@ async fn respawn_window_retains_surviving_pane_lifecycle_counters_and_redacts_en
     assert!(!list_stdout.contains(&respawn_secret));
 
     let windows = handler
-        .handle(Request::ListWindows(ListWindowsRequest {
+        .handle(Request::ListWindows(Box::new(ListWindowsRequest {
             target: alpha,
             format: Some(
                 "#{window_id}\t#{pane_id}\t#{pane_lifecycle_generation}\t#{pane_output_sequence}"
                     .to_owned(),
             ),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
     let windows_stdout = match windows {
         Response::ListWindows(response) => {

@@ -14,6 +14,11 @@ pub(crate) struct DisplayMessageArgs {
     pub(crate) format: Option<String>,
     #[arg(short = 'a', action = ArgAction::SetTrue)]
     pub(crate) all_formats: bool,
+    /// tmux's `-C` keeps pane updates flowing while the message is displayed.
+    /// RMUX does not freeze pane output for status messages, so this flag is
+    /// accepted for compatibility and has no additional runtime effect.
+    #[arg(short = 'C', action = ArgAction::SetTrue)]
+    pub(crate) no_freeze: bool,
     #[arg(short = 'I', action = ArgAction::SetTrue)]
     pub(crate) stdin: bool,
     #[arg(short = 'l', action = ArgAction::SetTrue)]

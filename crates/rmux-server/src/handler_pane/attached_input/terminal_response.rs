@@ -2,7 +2,18 @@
 pub(super) enum TerminalResponseDecode {
     NotResponse,
     Partial,
-    Matched { size: usize },
+    Matched {
+        size: usize,
+        event: Option<TerminalControlEvent>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TerminalControlEvent {
+    FocusIn,
+    FocusOut,
+    ClientLightTheme,
+    ClientDarkTheme,
 }
 
 pub(super) fn decode_attached_terminal_control(
@@ -15,7 +26,7 @@ pub(super) fn decode_attached_terminal_control(
     }
 
     if !focus_passthrough {
-        match decode_focus_event(input) {
+        match decode_focus_response(input) {
             TerminalResponseDecode::NotResponse => {}
             matched => return matched,
         }
@@ -38,25 +49,44 @@ pub(super) fn decode_terminal_response(input: &[u8]) -> TerminalResponseDecode {
     };
     let final_index = final_offset + 2;
     match input[final_index] {
-        b'c' | b'n' | b't' => TerminalResponseDecode::Matched {
-            size: final_index + 1,
-        },
-        b'y' if is_decrpm_response(input, final_index) => TerminalResponseDecode::Matched {
-            size: final_index + 1,
-        },
+        b'n' => matched(final_index + 1, decode_theme_report(input, final_index)),
+        b'c' | b't' => matched(final_index + 1, None),
+        b'y' if is_decrpm_response(input, final_index) => matched(final_index + 1, None),
         _ => TerminalResponseDecode::NotResponse,
     }
+}
+
+const fn matched(size: usize, event: Option<TerminalControlEvent>) -> TerminalResponseDecode {
+    TerminalResponseDecode::Matched { size, event }
 }
 
 fn is_decrpm_response(input: &[u8], final_index: usize) -> bool {
     final_index > 2 && input.get(final_index - 1) == Some(&b'$')
 }
 
-fn decode_focus_event(input: &[u8]) -> TerminalResponseDecode {
-    if input.starts_with(b"\x1b[I") || input.starts_with(b"\x1b[O") {
-        return TerminalResponseDecode::Matched { size: 3 };
+pub(super) fn decode_focus_event(input: &[u8]) -> Option<TerminalControlEvent> {
+    if input.starts_with(b"\x1b[I") {
+        return Some(TerminalControlEvent::FocusIn);
     }
-    TerminalResponseDecode::NotResponse
+    if input.starts_with(b"\x1b[O") {
+        return Some(TerminalControlEvent::FocusOut);
+    }
+    None
+}
+
+fn decode_focus_response(input: &[u8]) -> TerminalResponseDecode {
+    match decode_focus_event(input) {
+        Some(event) => matched(3, Some(event)),
+        None => TerminalResponseDecode::NotResponse,
+    }
+}
+
+fn decode_theme_report(input: &[u8], final_index: usize) -> Option<TerminalControlEvent> {
+    match &input[..=final_index] {
+        b"\x1b[?997;1n" => Some(TerminalControlEvent::ClientDarkTheme),
+        b"\x1b[?997;2n" => Some(TerminalControlEvent::ClientLightTheme),
+        _ => None,
+    }
 }
 
 fn decode_osc_sequence(input: &[u8]) -> TerminalResponseDecode {
@@ -80,9 +110,9 @@ fn decode_osc_sequence(input: &[u8]) -> TerminalResponseDecode {
     let mut index = 2;
     while index < input.len() {
         match input[index] {
-            b'\x07' => return TerminalResponseDecode::Matched { size: index + 1 },
+            b'\x07' => return matched(index + 1, None),
             b'\x1b' if input.get(index + 1) == Some(&b'\\') => {
-                return TerminalResponseDecode::Matched { size: index + 2 };
+                return matched(index + 2, None);
             }
             _ => index += 1,
         }
@@ -103,14 +133,18 @@ fn is_csi_final(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_attached_terminal_control, decode_terminal_response, TerminalResponseDecode,
+        decode_attached_terminal_control, decode_focus_event, decode_terminal_response,
+        TerminalControlEvent, TerminalResponseDecode,
     };
 
     #[test]
     fn matches_primary_device_attributes_response() {
         assert_eq!(
             decode_terminal_response(b"\x1b[?62;52;ctail"),
-            TerminalResponseDecode::Matched { size: 10 }
+            TerminalResponseDecode::Matched {
+                size: 10,
+                event: None
+            }
         );
     }
 
@@ -126,7 +160,35 @@ mod tests {
     fn matches_decrpm_response() {
         assert_eq!(
             decode_terminal_response(b"\x1b[?2004;1$y"),
-            TerminalResponseDecode::Matched { size: 11 }
+            TerminalResponseDecode::Matched {
+                size: 11,
+                event: None
+            }
+        );
+    }
+
+    #[test]
+    fn matches_theme_reports() {
+        assert_eq!(
+            decode_terminal_response(b"\x1b[?997;1n"),
+            TerminalResponseDecode::Matched {
+                size: 9,
+                event: Some(TerminalControlEvent::ClientDarkTheme)
+            }
+        );
+        assert_eq!(
+            decode_terminal_response(b"\x1b[?997;2n"),
+            TerminalResponseDecode::Matched {
+                size: 9,
+                event: Some(TerminalControlEvent::ClientLightTheme)
+            }
+        );
+        assert_eq!(
+            decode_terminal_response(b"\x1b[?2031;1$y"),
+            TerminalResponseDecode::Matched {
+                size: 11,
+                event: None
+            }
         );
     }
 
@@ -158,11 +220,21 @@ mod tests {
     fn attached_terminal_control_consumes_focus_events_by_default() {
         assert_eq!(
             decode_attached_terminal_control(b"\x1b[Irest", false),
-            TerminalResponseDecode::Matched { size: 3 }
+            TerminalResponseDecode::Matched {
+                size: 3,
+                event: Some(TerminalControlEvent::FocusIn)
+            }
         );
         assert_eq!(
             decode_attached_terminal_control(b"\x1b[Orest", false),
-            TerminalResponseDecode::Matched { size: 3 }
+            TerminalResponseDecode::Matched {
+                size: 3,
+                event: Some(TerminalControlEvent::FocusOut)
+            }
+        );
+        assert_eq!(
+            decode_focus_event(b"\x1b[Irest"),
+            Some(TerminalControlEvent::FocusIn)
         );
     }
 
@@ -182,11 +254,17 @@ mod tests {
     fn attached_terminal_control_consumes_osc_sequences() {
         assert_eq!(
             decode_attached_terminal_control(b"\x1b]52;c;AAAA\x07tail", false),
-            TerminalResponseDecode::Matched { size: 12 }
+            TerminalResponseDecode::Matched {
+                size: 12,
+                event: None
+            }
         );
         assert_eq!(
             decode_attached_terminal_control(b"\x1b]52;c;AAAA\x1b\\tail", false),
-            TerminalResponseDecode::Matched { size: 13 }
+            TerminalResponseDecode::Matched {
+                size: 13,
+                event: None
+            }
         );
         assert_eq!(
             decode_attached_terminal_control(b"\x1b]52;c;AAAA", false),

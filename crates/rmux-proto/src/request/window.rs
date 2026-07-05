@@ -94,6 +94,15 @@ pub struct ListWindowsRequest {
     pub target: SessionName,
     /// An optional server-side compatibility format template.
     pub format: Option<String>,
+    /// Optional filter expression.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Optional sort-order token.
+    #[serde(default)]
+    pub sort_order: Option<String>,
+    /// Whether the selected sort order should be reversed.
+    #[serde(default)]
+    pub reversed: bool,
 }
 
 /// Request payload for `link-window`.

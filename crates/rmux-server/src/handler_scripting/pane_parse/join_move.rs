@@ -4,8 +4,8 @@ use rmux_proto::{
 };
 
 use super::super::tokens::{parse_compact_flag_cluster, CommandTokens, CompactFlag};
-use super::super::values::{missing_argument, parse_percentage, parse_u32, unsupported_flag};
-use super::super::{marked_pane_target_or_current, parse_pane_target};
+use super::super::values::{parse_percentage, parse_u32, unsupported_flag};
+use super::super::{implicit_pane_target, marked_pane_target_or_current, parse_pane_target};
 
 pub(in crate::handler::scripting_support) fn parse_join_pane(
     mut args: CommandTokens,
@@ -35,7 +35,7 @@ fn parse_join_or_move_pane(
     let mut full_size = false;
     let mut direction = SplitDirection::Vertical;
     let mut size = None;
-    let mut legacy_percentage = false;
+    let mut percentage_size = None;
     let mut source = None;
     let mut target = None;
 
@@ -74,12 +74,19 @@ fn parse_join_or_move_pane(
             }
             "-p" => {
                 let _ = args.optional();
-                let _ = args.required("-p size")?;
-                legacy_percentage = true;
+                let percentage = args.required("-p size")?;
+                if size.is_none() {
+                    percentage_size = Some(percentage);
+                }
             }
-            token if legacy_percentage_attached_value(token) => {
+            token if legacy_percentage_attached_value(token).is_some() => {
+                let percentage = legacy_percentage_attached_value(token)
+                    .expect("checked above")
+                    .to_owned();
                 let _ = args.optional();
-                legacy_percentage = true;
+                if size.is_none() {
+                    percentage_size = Some(percentage);
+                }
             }
             "-v" => {
                 let _ = args.optional();
@@ -126,8 +133,10 @@ fn parse_join_or_move_pane(
                             )?);
                         }
                         compact_flag @ CompactFlag::Value { flag: 'p', .. } => {
-                            let _ = compact_flag.value_or_next(args, "-p size")?;
-                            legacy_percentage = true;
+                            let percentage = compact_flag.value_or_next(args, "-p size")?;
+                            if size.is_none() {
+                                percentage_size = Some(percentage);
+                            }
                         }
                         compact_flag @ CompactFlag::Value { flag: 's', .. } => {
                             source = Some(parse_pane_target(
@@ -150,10 +159,14 @@ fn parse_join_or_move_pane(
         }
     }
     args.no_extra(command)?;
-    if size.is_none() && legacy_percentage {
-        // tmux treats the legacy -p argument as a modifier for -l, not as a
-        // size source by itself.
-        return Err(RmuxError::Server("size missing".to_owned()));
+    if size.is_none() {
+        if let Some(percentage) = percentage_size {
+            size = Some(PaneSplitSize::Percentage(parse_percentage(
+                command,
+                "-p",
+                &percentage,
+            )?));
+        }
     }
 
     let source = match source {
@@ -163,7 +176,7 @@ fn parse_join_or_move_pane(
 
     let request = JoinPaneRequest {
         source,
-        target: target.ok_or_else(|| missing_argument(command, "-t target"))?,
+        target: target.unwrap_or(implicit_pane_target(sessions, find_context, command)?),
         direction,
         detached,
         before,
@@ -186,8 +199,10 @@ fn parse_join_or_move_pane(
     }
 }
 
-fn legacy_percentage_attached_value(token: &str) -> bool {
-    token.starts_with("-p") && token != "-p" && !token.starts_with("--")
+fn legacy_percentage_attached_value(token: &str) -> Option<&str> {
+    token
+        .strip_prefix("-p")
+        .filter(|value| !value.is_empty() && !token.starts_with("--"))
 }
 
 fn parse_pane_split_size(

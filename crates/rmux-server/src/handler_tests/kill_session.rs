@@ -8,6 +8,7 @@ async fn kill_session_is_idempotent_for_missing_sessions() {
             target: session_name("missing"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }))
         .await;
 
@@ -70,6 +71,7 @@ async fn kill_session_all_except_target_preserves_only_the_resolved_target() {
             target: session_name("bet"),
             kill_all_except_target: true,
             clear_alerts: false,
+            kill_group: false,
         }))
         .await;
 
@@ -120,6 +122,7 @@ async fn kill_session_clear_alerts_preserves_the_resolved_session() {
             target: session_name("alp"),
             kill_all_except_target: false,
             clear_alerts: true,
+            kill_group: false,
         }))
         .await;
 
@@ -176,6 +179,7 @@ async fn kill_session_last_session_requests_shutdown() {
             target: session_name("alpha"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }))
         .await;
     assert_eq!(
@@ -217,6 +221,7 @@ async fn exit_empty_shutdown_is_cancelled_when_a_new_session_starts_first() {
             target: session_name("alpha"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }))
         .await;
     assert_eq!(
@@ -263,6 +268,7 @@ async fn exit_empty_shutdown_retries_after_state_lock_contention() {
             target: session_name("alpha"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }))
         .await;
     assert_eq!(
@@ -309,6 +315,7 @@ async fn exit_empty_does_not_downgrade_pending_kill_server_shutdown() {
             target: session_name("alpha"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }))
         .await;
     assert_eq!(
@@ -366,6 +373,7 @@ async fn kill_session_last_session_respects_exit_empty_off() {
             target: session_name("alpha"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }))
         .await;
     assert_eq!(
@@ -416,6 +424,7 @@ async fn kill_session_last_session_exits_attached_clients_before_shutdown() {
             target: alpha,
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }))
         .await;
     assert_eq!(
@@ -427,6 +436,10 @@ async fn kill_session_last_session_exits_attached_clients_before_shutdown() {
     assert!(
         active_attach.by_pid.is_empty(),
         "attached clients should be gone before shutdown is requested"
+    );
+    assert!(
+        active_attach.active_client_by_window.is_empty(),
+        "killed sessions must drop latest-client window state"
     );
     drop(active_attach);
     assert!(
@@ -465,6 +478,7 @@ async fn kill_session_all_except_target_does_not_request_shutdown_while_target_s
             target: session_name("beta"),
             kill_all_except_target: true,
             clear_alerts: false,
+            kill_group: false,
         }))
         .await;
     assert_eq!(
@@ -500,6 +514,7 @@ async fn kill_session_clear_alerts_does_not_request_shutdown() {
             target: session_name("alpha"),
             kill_all_except_target: false,
             clear_alerts: true,
+            kill_group: false,
         }))
         .await;
     assert_eq!(

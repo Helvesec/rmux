@@ -160,9 +160,10 @@ impl RequestHandler {
         }
 
         if request.as_commands {
-            let parsed = self
-                .parse_command_string_one_group(&request.command)
+            let command = self
+                .expand_run_shell_command(&request, client_name.as_deref())
                 .await?;
+            let parsed = self.parse_command_string_one_group(&command).await?;
             let current_target = self
                 .run_shell_commands_current_target(requester_pid, request.target)
                 .await;
@@ -185,16 +186,19 @@ impl RequestHandler {
 
         let profile = self.run_shell_profile(&request).await?;
         let command = self
-            .expand_run_shell_command(
-                &request.command,
-                request.target.as_ref(),
-                client_name.as_deref(),
-            )
+            .expand_run_shell_command(&request, client_name.as_deref())
             .await?;
-        let output = run_shell_foreground(command, &profile, request.show_stderr).await?;
+        let output = run_shell_foreground(command.clone(), &profile, request.show_stderr).await?;
         let exit_status = shell_exit_status(&output.status);
+        let stdout = run_shell_stdout_for_response(
+            output.stdout,
+            &command,
+            exit_status,
+            shell_exit_signal(&output.status),
+        );
+        let output = (!stdout.is_empty()).then(|| CommandOutput::from_stdout(stdout));
         Ok(RunShellTaskOutput::Shell {
-            output: None,
+            output,
             exit_status,
         })
     }
@@ -205,7 +209,9 @@ impl RequestHandler {
         target: Option<PaneTarget>,
     ) -> Option<Target> {
         if let Some(target) = target {
-            return Some(Target::Pane(target));
+            return self
+                .existing_target_or_none(Some(Target::Pane(target)))
+                .await;
         }
 
         let session_name = match self.current_session_candidate(requester_pid).await {
@@ -214,6 +220,24 @@ impl RequestHandler {
         }?;
         let state = self.state.lock().await;
         active_session_target(&state.sessions, &session_name)
+    }
+
+    async fn existing_target_or_none(&self, target: Option<Target>) -> Option<Target> {
+        let target = target?;
+        let state = self.state.lock().await;
+        let exists = match &target {
+            Target::Session(session_name) => state.sessions.contains_session(session_name),
+            Target::Window(target) => state
+                .sessions
+                .session(target.session_name())
+                .is_some_and(|session| session.window_at(target.window_index()).is_some()),
+            Target::Pane(target) => state
+                .sessions
+                .session(target.session_name())
+                .and_then(|session| session.window_at(target.window_index()))
+                .is_some_and(|window| window.pane(target.pane_index()).is_some()),
+        };
+        exists.then_some(target)
     }
 
     async fn if_shell_task(
@@ -245,12 +269,13 @@ impl RequestHandler {
         let parsed = self
             .parse_command_string_one_group(&selected_command)
             .await?;
+        let current_target = self.existing_target_or_none(request.target).await;
         let output = self
             .execute_parsed_commands(
                 requester_pid,
                 parsed,
                 QueueExecutionContext::new(request.caller_cwd)
-                    .with_current_target(request.target)
+                    .with_current_target(current_target)
                     .with_client_name(client_name),
             )
             .await?;
@@ -259,10 +284,10 @@ impl RequestHandler {
 
     async fn expand_run_shell_command(
         &self,
-        command: &str,
-        target: Option<&PaneTarget>,
+        request: &RunShellRequest,
         client_name: Option<&str>,
     ) -> Result<String, RmuxError> {
+        let target = request.target.as_ref();
         let attached_count = if let Some(target) = target {
             self.attached_count(target.session_name()).await
         } else {
@@ -278,7 +303,8 @@ impl RequestHandler {
                 &Target::Pane(target.clone()),
                 attached_count,
                 &socket_path,
-            )?,
+            )
+            .unwrap_or_else(|_| global_format_context(&state, &socket_path)),
             None => match hook_formats
                 .iter()
                 .rev()
@@ -301,7 +327,18 @@ impl RequestHandler {
             .fold(context, |context, (name, value)| {
                 context.with_named_value(name, value)
             });
-        Ok(render_runtime_template(command, &context, false))
+        let context = if request.as_commands {
+            context
+        } else {
+            request
+                .arguments
+                .iter()
+                .enumerate()
+                .fold(context, |context, (index, value)| {
+                    context.with_named_value((index + 1).to_string(), value.clone())
+                })
+        };
+        Ok(render_runtime_template(&request.command, &context, false))
     }
 
     async fn run_shell_profile(
@@ -405,7 +442,8 @@ impl RequestHandler {
                 target,
                 attached_count,
                 &socket_path,
-            )?,
+            )
+            .unwrap_or_else(|_| global_format_context(&state, &socket_path)),
             None => fallback_target
                 .as_ref()
                 .and_then(|session_name| active_session_target(&state.sessions, session_name))
@@ -461,12 +499,14 @@ impl RequestHandler {
                 return Ok(QueueCommandAction::Normal {
                     output: None,
                     error: Some(error),
+                    source_file_error: None,
                     exit_status: None,
                 });
             }
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             });
         }
@@ -520,6 +560,7 @@ impl RequestHandler {
             return Ok(QueueCommandAction::Normal {
                 output: None,
                 error: None,
+                source_file_error: None,
                 exit_status: None,
             });
         };
@@ -538,6 +579,7 @@ impl RequestHandler {
             )],
             output: None,
             error: None,
+            source_file_error: None,
             exit_status: None,
         })
     }
@@ -729,4 +771,37 @@ fn shell_exit_status(status: &std::process::ExitStatus) -> i32 {
     {
         1
     }
+}
+
+fn shell_exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        status.signal()
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
+
+fn run_shell_stdout_for_response(
+    mut stdout: Vec<u8>,
+    command: &str,
+    exit_status: i32,
+    signal: Option<i32>,
+) -> Vec<u8> {
+    if !stdout.is_empty() && !stdout.ends_with(b"\n") {
+        stdout.push(b'\n');
+    }
+    if exit_status == 0 {
+        return stdout;
+    }
+    if let Some(signal) = signal {
+        stdout.extend_from_slice(format!("'{command}' terminated by signal {signal}\n").as_bytes());
+        return stdout;
+    }
+    stdout.extend_from_slice(format!("'{command}' returned {exit_status}\n").as_bytes());
+    stdout
 }

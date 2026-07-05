@@ -49,6 +49,14 @@ fn key_lookup_canonicalizes_ctrl_bracket_as_escape() {
 }
 
 #[test]
+fn single_string_binding_rejects_unknown_percent_directives() {
+    let error = parse_binding_command_tokens(&["display-message -p %foo".to_owned()])
+        .expect_err("unknown percent directive should fail like tmux");
+
+    assert_eq!(error.to_string(), "syntax error");
+}
+
+#[test]
 fn key_code_to_bytes_encodes_ascii_control_and_utf8() {
     assert_eq!(
         key_code_to_bytes(key_string_lookup_string("Enter").unwrap()),
@@ -84,12 +92,115 @@ fn default_store_keeps_prefix_meta_layout_bindings() {
         ("M-3", "select-layout main-horizontal"),
         ("M-4", "select-layout main-vertical"),
         ("M-5", "select-layout tiled"),
+        ("M-6", "select-layout main-horizontal-mirrored"),
+        ("M-7", "select-layout main-vertical-mirrored"),
     ] {
         let binding = store
             .get_binding("prefix", key_string_lookup_string(key).expect("key parses"))
             .unwrap_or_else(|| panic!("missing default prefix binding for {key}"));
         assert_eq!(binding.commands().to_tmux_string(), expected);
     }
+}
+
+#[test]
+fn default_store_matches_tmux37_lot6_root_and_copy_bindings() {
+    let store = KeyBindingStore::default();
+    for (table, key, expected) in [
+        ("root", "MouseDown1Status", "switch-client -t ="),
+        (
+            "root",
+            "WheelUpPane",
+            r##"if-shell -F "#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}" { send-keys -M } { copy-mode -e }"##,
+        ),
+        ("root", "C-MouseDown1Pane", "swap-pane -s @"),
+        ("root", "C-MouseDown1Status", "swap-window -t @"),
+        (
+            "root",
+            "MouseDown1ScrollbarUp",
+            r##"if-shell -F -t = "#{pane_in_mode}" { send-keys -X page-up } { copy-mode -u }"##,
+        ),
+        (
+            "root",
+            "MouseDown1ScrollbarDown",
+            r##"if-shell -F -t = "#{pane_in_mode}" { send-keys -X page-down } { copy-mode -d }"##,
+        ),
+        (
+            "root",
+            "MouseDrag1ScrollbarSlider",
+            r##"if-shell -F -t = "#{pane_in_mode}" { send-keys -X scroll-to-mouse } { copy-mode -S }"##,
+        ),
+        ("root", "MouseDown1Control8", "resize-pane -Z"),
+        ("root", "MouseDown1Border", "select-pane -M"),
+        (
+            "root",
+            "MouseDown1Control9",
+            r#"display-menu -O -T "Kill pane #{pane_index}?" -t = -x M -y M Yes y { kill-pane -t = } No n {  }"#,
+        ),
+        ("copy-mode", "C-l", "send-keys -X recentre-top-bottom"),
+        ("copy-mode", "M-l", "send-keys -X cursor-centre-horizontal"),
+        ("copy-mode", "C-[", "send-keys -X cancel"),
+        ("copy-mode-vi", "C-[", "send-keys -X clear-selection"),
+    ] {
+        let binding = store
+            .list_bindings(Some(table), KeyBindingSortOrder::Key, false)
+            .into_iter()
+            .find(|binding| binding.key_string() == key)
+            .unwrap_or_else(|| panic!("missing default {table} binding for {key}"));
+        assert_eq!(binding.command_string(), expected, "{table} {key}");
+    }
+}
+
+#[test]
+fn default_store_matches_tmux37_status_and_pane_menu_rows() {
+    let store = KeyBindingStore::default();
+    let root_bindings = store.list_bindings(Some("root"), KeyBindingSortOrder::Key, false);
+    for key in ["MouseDown3StatusLeft", "M-MouseDown3StatusLeft"] {
+        let binding = root_bindings
+            .iter()
+            .find(|binding| binding.key_string() == key)
+            .unwrap_or_else(|| panic!("missing default root binding for {key}"));
+        assert!(
+            binding.command_string().contains("Rename r"),
+            "{key} should use tmux 3.7b rename shortcut"
+        );
+        assert!(
+            binding.command_string().contains("Detach d"),
+            "{key} should include tmux 3.7b detach entry"
+        );
+    }
+
+    for (table, key) in [("prefix", ">"), ("root", "MouseDown3Pane")] {
+        let binding = store
+            .list_bindings(Some(table), KeyBindingSortOrder::Key, false)
+            .into_iter()
+            .find(|binding| binding.key_string() == key)
+            .unwrap_or_else(|| panic!("missing default {table} binding for {key}"));
+        assert!(
+            binding.command_string().contains("Paste"),
+            "{table} {key} should include the tmux 3.7b paste menu entry"
+        );
+    }
+}
+
+#[test]
+fn default_key_string_format_exposes_unescaped_key_names() {
+    let store = KeyBindingStore::default();
+    let prefix_bindings = store.list_bindings(Some("prefix"), KeyBindingSortOrder::Key, false);
+
+    for key in ["\"", "#", "$", "'", ";"] {
+        assert!(
+            prefix_bindings
+                .iter()
+                .any(|binding| binding.key_string() == key),
+            "missing unescaped prefix key string {key:?}"
+        );
+    }
+    assert!(
+        !prefix_bindings
+            .iter()
+            .any(|binding| matches!(binding.key_string(), "\\\"" | "\\#" | "\\$" | "\\'" | "\\;")),
+        "default key_string values must not expose command-line escaping"
+    );
 }
 
 #[test]

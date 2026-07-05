@@ -268,7 +268,7 @@ async fn set_hook_updates_the_store_and_one_shot_hooks_are_consumed_on_attach() 
             .handle(Request::SetHook(SetHookRequest {
                 scope: ScopeSelector::Session(session_name("alpha")),
                 hook: HookName::ClientAttached,
-                command: "printf attached".to_owned(),
+                command: "display-message attached".to_owned(),
                 lifecycle: HookLifecycle::OneShot,
             }))
             .await,
@@ -285,7 +285,7 @@ async fn set_hook_updates_the_store_and_one_shot_hooks_are_consumed_on_attach() 
             state
                 .hooks
                 .session_command(&session_name("alpha"), HookName::ClientAttached),
-            Some("printf attached")
+            Some("display-message attached")
         );
     }
 
@@ -347,6 +347,7 @@ async fn session_closed_hooks_fire_before_session_scope_is_removed() {
                 target: session_name("alpha"),
                 kill_all_except_target: false,
                 clear_alerts: false,
+                kill_group: false,
             }))
             .await,
         Response::KillSession(rmux_proto::KillSessionResponse { existed: true })
@@ -500,7 +501,7 @@ async fn self_unsetting_hook_payloads_are_normalized_to_one_shot_shell_commands(
         state
             .hooks
             .session_command(&session_name("alpha"), HookName::ClientAttached),
-        Some("printf attached > /tmp/rmux-hook")
+        Some("run-shell \"printf attached > /tmp/rmux-hook\"")
     );
     assert_eq!(
         state
@@ -562,6 +563,7 @@ async fn session_scoped_mutations_require_live_sessions_and_are_cleared_on_kill(
                 target: session_name("alpha"),
                 kill_all_except_target: false,
                 clear_alerts: false,
+                kill_group: false,
             }))
             .await,
         Response::KillSession(rmux_proto::KillSessionResponse { existed: true })

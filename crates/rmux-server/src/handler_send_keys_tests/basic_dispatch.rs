@@ -128,11 +128,14 @@ async fn send_keys_plain_input_uses_copy_mode_until_copy_mode_exits() {
     );
 
     let listed = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: alpha,
             format: Some("#{pane_in_mode}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }))
+        })))
         .await;
     let Response::ListPanes(response) = listed else {
         panic!("expected list-panes response");
@@ -600,7 +603,7 @@ async fn bind_key_and_list_keys_round_trip_through_the_handler() {
             format: None,
             sort_order: None,
             prefix: None,
-            key: Some("C-a".to_owned()),
+            key: None,
         })))
         .await;
 
@@ -846,11 +849,14 @@ async fn send_keys_k_uses_copy_mode_bindings_until_copy_mode_exits() {
 
     let listed = handle_boxed(
         &handler,
-        Request::ListPanes(ListPanesRequest {
+        Request::ListPanes(Box::new(ListPanesRequest {
             target: alpha,
             format: Some("#{pane_in_mode}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }),
+        })),
     )
     .await;
     let Response::ListPanes(response) = listed else {
@@ -963,11 +969,14 @@ async fn send_keys_k_uses_copy_mode_vi_bindings_when_mode_keys_is_vi() {
 
     let listed = handle_boxed(
         &handler,
-        Request::ListPanes(ListPanesRequest {
+        Request::ListPanes(Box::new(ListPanesRequest {
             target: alpha,
             format: Some("#{pane_in_mode}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }),
+        })),
     )
     .await;
     let Response::ListPanes(response) = listed else {

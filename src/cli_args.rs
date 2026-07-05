@@ -358,16 +358,24 @@ struct RawCli {
 
 impl Cli {
     fn from_raw(raw: RawCli, parsed_commands: ParsedCommands) -> Result<Self, clap::Error> {
+        let explicit_command_args = !raw.command.is_empty();
         let control_command_lines = if parsed_commands.is_empty() {
             Vec::new()
         } else {
-            vec![parsed_commands.to_tmux_string()]
+            parsed_commands
+                .commands()
+                .iter()
+                .map(rmux_core::command_parser::ParsedCommand::to_tmux_string)
+                .collect()
         };
-        let command_queue = parsed_commands
+        let mut command_queue = parsed_commands
             .into_commands()
             .into_iter()
             .map(command_from_parsed)
             .collect::<Result<Vec<_>, _>>()?;
+        if command_queue.is_empty() && explicit_command_args {
+            command_queue.push(Command::Noop);
+        }
         Ok(Self {
             assume_256_colors: raw.assume_256_colors,
             control_mode: raw.control_mode,
@@ -683,6 +691,7 @@ fn exact_short_flag(argument: &str, flags: &std::collections::BTreeSet<char>) ->
 
 #[derive(Debug, Clone)]
 pub(crate) enum Command {
+    Noop,
     NewSession(NewSessionArgs),
     StartServer(StartServerArgs),
     KillServer,

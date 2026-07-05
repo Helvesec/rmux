@@ -210,6 +210,9 @@ impl CopyModeState {
                 }
                 Ok(())
             }),
+            "recentre-top-bottom" => {
+                self.readonly(Self::cmd_recentre_top_bottom, ClearPolicy::Always)
+            }
             "scroll-bottom" => self.readonly(Self::cmd_scroll_bottom, ClearPolicy::Always),
             "scroll-down" => {
                 self.readonly_exit_on_scroll(Self::cmd_scroll_down, ClearPolicy::EmacsOnly)

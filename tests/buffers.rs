@@ -74,6 +74,31 @@ fn list_buffers_shows_entries() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn list_buffers_bare_reverse_does_not_reverse_default_order() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("buf-list-bare-reverse")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["set-buffer", "-b", "gamma", "g"])?);
+    assert_success(&harness.run(&["set-buffer", "-b", "alpha", "a"])?);
+
+    let default = harness.run(&["list-buffers", "-F", "#{buffer_name}"])?;
+    assert_eq!(default.status.code(), Some(0));
+    assert_eq!(stdout(&default), "alpha\ngamma\n");
+
+    let bare_reverse = harness.run(&["list-buffers", "-r", "-F", "#{buffer_name}"])?;
+    assert_eq!(bare_reverse.status.code(), Some(0));
+    assert_eq!(stdout(&bare_reverse), stdout(&default));
+
+    let explicit_reverse =
+        harness.run(&["list-buffers", "-O", "name", "-r", "-F", "#{buffer_name}"])?;
+    assert_eq!(explicit_reverse.status.code(), Some(0));
+    assert_eq!(stdout(&explicit_reverse), "gamma\nalpha\n");
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
 fn show_buffer_without_name_uses_latest_automatic_buffer() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("buf-show-top-auto")?;
     let mut daemon = harness.start_hidden_daemon()?;

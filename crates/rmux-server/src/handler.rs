@@ -164,6 +164,7 @@ impl DetachedRequesterAccess {
 pub(crate) struct RequestHandler {
     state: Arc<Mutex<HandlerState>>,
     active_attach: Arc<Mutex<ActiveAttachState>>,
+    active_attach_epoch: Arc<AtomicU64>,
     active_control: Arc<Mutex<ActiveControlState>>,
     silence_timers: Arc<StdMutex<HashMap<WindowTarget, alert_support::SilenceTimerState>>>,
     pane_alert_coalescer: Arc<StdMutex<alert_support::PaneAlertCoalescer>>,
@@ -215,6 +216,7 @@ impl Clone for RequestHandler {
         Self {
             state: self.state.clone(),
             active_attach: self.active_attach.clone(),
+            active_attach_epoch: self.active_attach_epoch.clone(),
             active_control: self.active_control.clone(),
             silence_timers: self.silence_timers.clone(),
             pane_alert_coalescer: self.pane_alert_coalescer.clone(),
@@ -257,6 +259,7 @@ impl Clone for RequestHandler {
 pub(crate) struct WeakRequestHandler {
     state: Weak<Mutex<HandlerState>>,
     active_attach: Weak<Mutex<ActiveAttachState>>,
+    active_attach_epoch: Weak<AtomicU64>,
     active_control: Weak<Mutex<ActiveControlState>>,
     silence_timers: Weak<StdMutex<HashMap<WindowTarget, alert_support::SilenceTimerState>>>,
     pane_alert_coalescer: Weak<StdMutex<alert_support::PaneAlertCoalescer>>,
@@ -296,6 +299,7 @@ impl WeakRequestHandler {
         Some(RequestHandler {
             state: self.state.upgrade()?,
             active_attach: self.active_attach.upgrade()?,
+            active_attach_epoch: self.active_attach_epoch.upgrade()?,
             active_control: self.active_control.upgrade()?,
             silence_timers: self.silence_timers.upgrade()?,
             pane_alert_coalescer: self.pane_alert_coalescer.upgrade()?,
@@ -443,6 +447,7 @@ impl RequestHandler {
         Self {
             state: Arc::new(Mutex::new(state)),
             active_attach: Arc::new(Mutex::new(ActiveAttachState::default())),
+            active_attach_epoch: Arc::new(AtomicU64::new(0)),
             active_control: Arc::new(Mutex::new(ActiveControlState::default())),
             silence_timers: Arc::new(StdMutex::new(HashMap::new())),
             pane_alert_coalescer: Arc::new(StdMutex::new(
@@ -492,6 +497,7 @@ impl RequestHandler {
         WeakRequestHandler {
             state: Arc::downgrade(&self.state),
             active_attach: Arc::downgrade(&self.active_attach),
+            active_attach_epoch: Arc::downgrade(&self.active_attach_epoch),
             active_control: Arc::downgrade(&self.active_control),
             silence_timers: Arc::downgrade(&self.silence_timers),
             pane_alert_coalescer: Arc::downgrade(&self.pane_alert_coalescer),
@@ -531,6 +537,10 @@ impl RequestHandler {
 
     pub(crate) fn allocate_connection_id(&self) -> u64 {
         self.next_connection_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub(in crate::handler) fn bump_active_attach_epoch(&self) {
+        self.active_attach_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     pub(crate) fn server_task_runtime(&self) -> Option<tokio::runtime::Handle> {

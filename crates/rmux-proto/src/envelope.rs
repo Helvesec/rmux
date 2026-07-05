@@ -7,9 +7,13 @@ use crate::RmuxError;
 /// Magic byte that identifies versioned RMUX detached RPC frames.
 pub const RMUX_FRAME_MAGIC: u8 = 0x52;
 /// Current detached RPC wire version.
-pub const RMUX_WIRE_VERSION: u32 = 3;
+pub const RMUX_WIRE_VERSION: u32 = 4;
 
 /// Supported detached RPC wire-version range for this build.
+///
+/// RMUX 0.9.0 uses an exact hard-cut envelope: frames decode only when their
+/// wire version equals [`RMUX_WIRE_VERSION`]. Compatibility ranges in later
+/// handshake DTOs are advisory and only apply after this envelope has decoded.
 pub const SUPPORTED_WIRE_VERSION: RangeInclusive<u32> = RMUX_WIRE_VERSION..=RMUX_WIRE_VERSION;
 
 /// Encodes a u32 as unsigned LEB128.
@@ -62,7 +66,14 @@ pub(crate) fn decode_varint_u32(bytes: &[u8]) -> Result<Option<(u32, usize)>, Rm
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_varint_u32, encode_varint_u32};
+    use super::{decode_varint_u32, encode_varint_u32, RMUX_WIRE_VERSION};
+
+    #[test]
+    fn current_wire_version_separates_0_9_from_0_8_layouts() {
+        const {
+            assert!(RMUX_WIRE_VERSION > 3);
+        }
+    }
 
     #[test]
     fn varint_round_trips_representative_values() {

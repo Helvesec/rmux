@@ -372,11 +372,14 @@ struct ListedPane {
 async fn list_session_panes(session: &crate::Session) -> Result<Vec<ListedPane>> {
     let response = session
         .transport()
-        .request(Request::ListPanes(ListPanesRequest {
+        .request(Request::ListPanes(Box::new(ListPanesRequest {
             target: session.name().clone(),
             target_window_index: None,
             format: Some(PANE_DISCOVERY_FORMAT.to_owned()),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await?;
 
     let output = match response {

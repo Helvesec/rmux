@@ -6,6 +6,7 @@ param(
     [switch]$RunDaemonSmoke,
     [switch]$RunSdkSmoke,
     [switch]$RunMouseBorderSmoke,
+    [switch]$RunCtrlMatrixSmoke,
     [switch]$RequireReleaseArtifact
 )
 
@@ -209,6 +210,22 @@ function InvokeMouseBorderSmoke([string]$Binary) {
     }
 }
 
+function InvokeCtrlMatrixSmoke([string]$Binary) {
+    $outDir = Join-Path ([System.IO.Path]::GetTempPath()) "rmux-package-ctrl-matrix-$PID-$([guid]::NewGuid().ToString('N'))"
+    try {
+        $global:LASTEXITCODE = 0
+        & (Join-Path $PSScriptRoot "windows_ctrl_matrix.ps1") `
+            -Rmux ([System.IO.Path]::GetFullPath($Binary)) `
+            -OutDir $outDir `
+            -PortableSmokeOnly
+        if ($LASTEXITCODE -ne 0) {
+            Fail "Windows Ctrl matrix package smoke failed with exit code $LASTEXITCODE"
+        }
+    } finally {
+        Remove-Item -LiteralPath $outDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function VerifyChecksumManifest([string]$Root, [string]$Manifest) {
     $rootFull = [System.IO.Path]::GetFullPath($Root)
     foreach ($line in Get-Content -LiteralPath $Manifest) {
@@ -231,6 +248,29 @@ function VerifyChecksumManifest([string]$Root, [string]$Manifest) {
         $actual = Sha256File $path
         if ($actual -ne $expected) {
             Fail "checksum mismatch for $relative"
+        }
+    }
+}
+
+function AssertPackageHygiene([string]$Root) {
+    [char[]]$separators = @(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar
+    )
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd($separators)
+    foreach ($entry in Get-ChildItem -LiteralPath $rootFull -Force -Recurse) {
+        $relative = $entry.FullName.Substring($rootFull.Length).TrimStart($separators)
+        $portable = $relative -replace '\\', '/'
+        $segments = $portable -split '/'
+        if ($segments -contains ".claude" -or $segments -contains ".codex") {
+            Fail "forbidden package entry: $portable"
+        }
+        if ($entry.Name -like "*.sock" -or
+            $entry.Name -like "*.tmp" -or
+            $entry.Name -like "*.bak" -or
+            $entry.Name -like "*.orig" -or
+            $entry.Name -like "*~") {
+            Fail "forbidden package entry: $portable"
         }
     }
 }
@@ -276,6 +316,7 @@ try {
     if (-not (Test-Path -LiteralPath $packageRoot -PathType Container)) {
         Fail "archive root directory is missing: $([System.IO.Path]::GetFileNameWithoutExtension($archiveName))"
     }
+    AssertPackageHygiene $packageRoot
 
     foreach ($required in @("rmux.exe", "libexec/rmux/rmux.exe", "rmux-daemon.exe", "SHA256SUMS.txt", "share/rmux/artifact-metadata.json", "README.md", "LICENSE-APACHE", "LICENSE-MIT", "rmux.1")) {
         if (-not (Test-Path -LiteralPath (Join-Path $packageRoot $required))) {
@@ -418,6 +459,10 @@ try {
         InvokeMouseBorderSmoke $binary
     }
 
+    if ($RunCtrlMatrixSmoke) {
+        InvokeCtrlMatrixSmoke $binary
+    }
+
     Write-Output "archive=$archiveFull"
     Write-Output "sha256=$actualHash"
     Write-Output "binary_sha256=$packagedBinaryHash"
@@ -427,6 +472,7 @@ try {
     Write-Output "run_daemon_smoke=$($RunDaemonSmoke.ToString().ToLowerInvariant())"
     Write-Output "run_sdk_smoke=$($RunSdkSmoke.ToString().ToLowerInvariant())"
     Write-Output "run_mouse_border_smoke=$($RunMouseBorderSmoke.ToString().ToLowerInvariant())"
+    Write-Output "run_ctrl_matrix_smoke=$($RunCtrlMatrixSmoke.ToString().ToLowerInvariant())"
     Write-Output "require_release_artifact=$($RequireReleaseArtifact.ToString().ToLowerInvariant())"
 } finally {
     Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue

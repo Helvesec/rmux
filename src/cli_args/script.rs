@@ -61,7 +61,7 @@ pub(crate) struct RunShellArgs {
     pub(crate) background: bool,
     #[arg(short = 'C', action = ArgAction::SetTrue)]
     pub(crate) as_commands: bool,
-    #[arg(short = 'E', action = ArgAction::SetTrue, hide = true)]
+    #[arg(short = 'E', action = ArgAction::SetTrue)]
     pub(crate) show_stderr: bool,
     #[arg(short = 'd')]
     pub(crate) delay_seconds: Option<f64>,
@@ -75,12 +75,6 @@ pub(crate) struct RunShellArgs {
 
 impl RunShellArgs {
     pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        if self.show_stderr {
-            return Err(clap::Error::raw(
-                clap::error::ErrorKind::UnknownArgument,
-                "command run-shell: unknown flag -E",
-            ));
-        }
         Ok(self)
     }
 }

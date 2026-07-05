@@ -3,11 +3,11 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use rmux_client::{connect, ClientError, Connection, StartServerError};
-#[cfg(not(windows))]
 use rmux_client::{connect_or_absent, ConnectResult};
-use rmux_proto::ListSessionsRequest;
-#[cfg(not(windows))]
 use rmux_proto::RmuxError;
+#[cfg(windows)]
+use rmux_proto::CAPABILITY_DAEMON_STATUS;
+use rmux_proto::{ListSessionsRequest, RMUX_WIRE_VERSION};
 
 use super::{
     expect_command_output, resolve_session_target_or_current, run_command, run_command_resolved,
@@ -53,6 +53,16 @@ pub(super) fn run_start_server(
 pub(super) fn run_kill_server(socket_path: &Path) -> Result<i32, ExitFailure> {
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
+    match probe_kill_server_compatible(&mut connection) {
+        Ok(()) => {}
+        Err(error) if kill_server_connection_closed(&error) => return Ok(0),
+        Err(error) => {
+            if let Some(wire_version) = legacy_shutdown_fallback_wire_version(&error) {
+                return run_legacy_wire_kill_server(socket_path, wire_version);
+            }
+            return Err(ExitFailure::from_client(error));
+        }
+    }
     match connection.kill_server_after_write() {
         Ok(()) => Ok(0),
         Err(error) if kill_server_connection_closed(&error) => Ok(0),
@@ -78,15 +88,24 @@ pub(super) fn run_kill_server(socket_path: &Path) -> Result<i32, ExitFailure> {
             wait_for_killed_server_socket_cleanup(socket_path);
             Ok(0)
         }
-        Err(error) if unsupported_wire_version(&error) => {
-            run_legacy_wire_v1_kill_server(socket_path)
+        Err(error) => {
+            if let Some(wire_version) = legacy_shutdown_fallback_wire_version(&error) {
+                run_legacy_wire_kill_server(socket_path, wire_version)
+            } else {
+                Err(ExitFailure::from_client(error))
+            }
         }
-        Err(error) => Err(ExitFailure::from_client(error)),
     }
 }
 
-#[cfg(not(windows))]
-fn run_legacy_wire_v1_kill_server(socket_path: &Path) -> Result<i32, ExitFailure> {
+#[cfg(windows)]
+fn probe_kill_server_compatible(connection: &mut Connection) -> Result<(), ClientError> {
+    connection
+        .supports_capability(CAPABILITY_DAEMON_STATUS)
+        .map(|_| ())
+}
+
+fn run_legacy_wire_kill_server(socket_path: &Path, wire_version: u32) -> Result<i32, ExitFailure> {
     let mut connection = match connect_or_absent(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?
     {
@@ -97,7 +116,7 @@ fn run_legacy_wire_v1_kill_server(socket_path: &Path) -> Result<i32, ExitFailure
         }
     };
 
-    match connection.kill_server_legacy_wire_v1() {
+    match connection.kill_server_legacy_wire(wire_version) {
         Ok(()) => {
             wait_for_killed_server_socket_cleanup(socket_path);
             Ok(0)
@@ -120,7 +139,7 @@ fn wait_for_killed_server_socket_cleanup(socket_path: &Path) {
     }
 }
 
-#[cfg(all(not(unix), not(windows)))]
+#[cfg(not(unix))]
 fn wait_for_killed_server_socket_cleanup(_socket_path: &Path) {}
 
 pub(super) fn run_server_access(
@@ -134,6 +153,7 @@ pub(super) fn run_server_access(
             list: args.list,
             read_only: args.read_only,
             write: args.write,
+            target: args.target,
             user: args.user,
         })
     })
@@ -181,10 +201,13 @@ fn kill_server_connection_closed(error: &ClientError) -> bool {
         )
 }
 
-#[cfg(not(windows))]
-fn unsupported_wire_version(error: &ClientError) -> bool {
-    matches!(
-        error,
-        ClientError::Protocol(RmuxError::UnsupportedWireVersion { .. })
-    )
+fn legacy_shutdown_fallback_wire_version(error: &ClientError) -> Option<u32> {
+    match error {
+        ClientError::Protocol(RmuxError::UnsupportedWireVersion { got, .. })
+            if (1..RMUX_WIRE_VERSION).contains(got) =>
+        {
+            Some(*got)
+        }
+        _ => None,
+    }
 }

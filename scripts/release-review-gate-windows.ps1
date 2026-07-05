@@ -44,6 +44,17 @@ function Run([string]$Program, [string[]]$Arguments) {
     }
 }
 
+function Run-PythonScript([string]$Script, [string[]]$Arguments = @()) {
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $python) {
+        $python = Get-Command python3 -ErrorAction SilentlyContinue
+    }
+    if (-not $python) {
+        throw "python is required for $Script"
+    }
+    Run $python.Source (@($Script) + $Arguments)
+}
+
 function Read-CargoPackageVersion([string]$Manifest) {
     $inPackage = $false
     $workspaceVersion = $null
@@ -86,6 +97,11 @@ function Read-CargoPackageVersion([string]$Manifest) {
 
 function Check-ReleaseVersions {
     $rootVersion = Read-CargoPackageVersion "Cargo.toml"
+    $rootText = Get-Content -LiteralPath "Cargo.toml" -Raw
+    if ($rootText -notmatch '(?ms)^\s*\[package\].*?^\s*publish\s*=\s*false') {
+        throw "root rmux package must keep publish=false"
+    }
+    Write-Host "root-publish=false"
     $manpage = Get-Content -LiteralPath "docs\man\rmux.1" -Raw
     if ($manpage -notmatch [regex]::Escape("RMUX $rootVersion")) {
         throw "docs\man\rmux.1 does not contain RMUX $rootVersion"
@@ -99,6 +115,7 @@ function Check-ReleaseVersions {
         "crates\rmux-os\Cargo.toml",
         "crates\rmux-proto\Cargo.toml",
         "crates\rmux-pty\Cargo.toml",
+        "crates\rmux-render-core\Cargo.toml",
         "crates\rmux-sdk\Cargo.toml",
         "crates\rmux-server\Cargo.toml",
         "crates\rmux-types\Cargo.toml",
@@ -154,7 +171,29 @@ function Check-CfgBudgets {
     Write-Host "cfg(target_os) check passed."
 }
 
+function Check-WorktreeHygiene {
+    $trackedLocal = @(& git ls-files ".claude" ".claude/**" ".codex" ".codex/**")
+    if ($trackedLocal.Count -gt 0) {
+        $trackedLocal | ForEach-Object { Write-Error $_ }
+        throw "tracked local assistant metadata is forbidden"
+    }
+    $trackedArtifacts = @(& git ls-files ".release-deployment" ".release-deployment/**" ".rmux-audit" ".rmux-audit/**" "dist" "dist/**")
+    if ($trackedArtifacts.Count -gt 0) {
+        $trackedArtifacts | ForEach-Object { Write-Error $_ }
+        throw "tracked local deployment artifacts are forbidden"
+    }
+    $untrackedSockets = @(& git ls-files --others --exclude-standard | Where-Object { $_ -match '\.(sock|socket)$' })
+    if ($untrackedSockets.Count -gt 0) {
+        $untrackedSockets | ForEach-Object { Write-Error $_ }
+        throw "untracked socket-like files are forbidden in the worktree"
+    }
+    Write-Host "worktree-hygiene=ok"
+}
+
 Step "release versions" { Check-ReleaseVersions }
+Step "changelog release audit" { Run-PythonScript "scripts\check-changelog-release.py" @("CHANGELOG.md") }
+Step "tmux divergence ledger" { Run-PythonScript "scripts\check-tmux-release-ledger.py" }
+Step "feature inventory" { Run "cargo" @("run", "--locked", "--package", "xtask", "--", "feature-inventory", "--check") }
 Write-Host "cargo-target-dir=$env:CARGO_TARGET_DIR"
 Write-Host "cargo-incremental=$env:CARGO_INCREMENTAL"
 Write-Host "cargo-build-jobs=$env:CARGO_BUILD_JOBS"
@@ -164,6 +203,7 @@ Write-Host "cargo-profile-test-debug=$env:CARGO_PROFILE_TEST_DEBUG"
 Write-Host "rustflags=$env:RUSTFLAGS"
 Step "formatting" { Run "cargo" @("fmt", "--all", "--check") }
 Step "platform cfg budget" { Check-CfgBudgets }
+Step "worktree hygiene" { Check-WorktreeHygiene }
 
 if (-not $SkipClippy) {
     Step "workspace clippy" {

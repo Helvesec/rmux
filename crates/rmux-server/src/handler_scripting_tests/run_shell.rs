@@ -1,6 +1,6 @@
 use super::*;
 #[tokio::test]
-async fn run_shell_foreground_suppresses_stdout_like_tmux() {
+async fn run_shell_foreground_returns_stdout_like_tmux() {
     let handler = RequestHandler::new();
     use_platform_test_shell(&handler).await;
 
@@ -10,25 +10,120 @@ async fn run_shell_foreground_suppresses_stdout_like_tmux() {
 
     assert_eq!(
         response,
-        Response::RunShell(RunShellResponse::from_exit_status(0))
+        Response::RunShell(RunShellResponse::from_output_and_exit_status(
+            rmux_proto::CommandOutput::from_stdout(b"hello\n".to_vec()),
+            0,
+        ))
     );
 }
 
 #[tokio::test]
-async fn run_shell_nonzero_returns_exact_exit_status_without_stdout() {
+async fn run_shell_nonzero_returns_stdout_and_returned_message() {
+    let handler = RequestHandler::new();
+    use_platform_test_shell(&handler).await;
+    let command = shell_print_then_exit_command("hidden", 7);
+
+    let response = handler.handle(run_shell(&command, false)).await;
+
+    assert_eq!(
+        response,
+        Response::RunShell(RunShellResponse::from_output_and_exit_status(
+            rmux_proto::CommandOutput::from_stdout(
+                format!("hidden\n'{command}' returned 7\n").into_bytes()
+            ),
+            7,
+        ))
+    );
+}
+
+#[tokio::test]
+async fn run_shell_stderr_output_flag_merges_stdout_and_stderr_like_tmux() {
     let handler = RequestHandler::new();
     use_platform_test_shell(&handler).await;
 
     let response = handler
-        .handle(run_shell(
-            &shell_print_then_exit_command("hidden", 7),
-            false,
-        ))
+        .handle(Request::RunShell(Box::new(RunShellRequest {
+            command: format!(
+                "{}; {}",
+                shell_print_command("out"),
+                shell_stderr_command("err")
+            ),
+            arguments: Vec::new(),
+            background: false,
+            as_commands: false,
+            show_stderr: true,
+            delay_seconds: None,
+            start_directory: None,
+            target: None,
+            source_depth: None,
+        })))
+        .await;
+
+    let output = response
+        .command_output()
+        .expect("run-shell -E returns stdout and stderr output");
+    assert_eq!(output.stdout(), b"outerr\n");
+    match response {
+        Response::RunShell(response) => assert_eq!(response.exit_status(), Some(0)),
+        other => panic!("expected RunShell response, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn run_shell_uses_bin_sh_instead_of_default_shell_like_tmux() {
+    let handler = RequestHandler::new();
+    let root = temp_root("run-shell-bin-sh");
+    fs::create_dir_all(&root).expect("temp output root");
+    let fake_shell = root.join("fake-shell.sh");
+    let marker_path = root.join("default-shell-used.txt");
+    let output_path = root.join("run-shell-output.txt");
+
+    write_executable_script(
+        &fake_shell,
+        &format!(
+            "#!/bin/sh\nprintf used > {}\nexit 42\n",
+            shell_quote(&marker_path)
+        ),
+    );
+
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Global,
+                option: OptionName::DefaultShell,
+                value: fake_shell.to_string_lossy().into_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+
+    let response = handler
+        .handle(Request::RunShell(Box::new(RunShellRequest {
+            command: format!("printf ok > {}", shell_quote(&output_path)),
+            arguments: Vec::new(),
+            background: false,
+            as_commands: false,
+            show_stderr: false,
+            delay_seconds: None,
+            start_directory: None,
+            target: None,
+            source_depth: None,
+        })))
         .await;
 
     assert_eq!(
         response,
-        Response::RunShell(RunShellResponse::from_exit_status(7))
+        Response::RunShell(RunShellResponse::from_exit_status(0))
+    );
+    assert_eq!(
+        fs::read_to_string(&output_path).expect("run-shell output"),
+        "ok"
+    );
+    assert!(
+        !marker_path.exists(),
+        "run-shell should not execute default-shell for tmux jobs"
     );
 }
 
@@ -50,6 +145,7 @@ async fn background_run_shell_is_tracked_as_detached_request_until_finished() {
     let response = handler
         .handle(Request::RunShell(Box::new(RunShellRequest {
             command: String::new(),
+            arguments: Vec::new(),
             background: true,
             as_commands: false,
             show_stderr: false,
@@ -98,6 +194,64 @@ async fn background_run_shell_commands_still_emit_after_hooks_outside_hook_conte
     execute_test_command(&handler, "run-shell -b -C 'new-window -d -n bg'").await;
 
     wait_for_named_buffer(&handler, "after-run-shell", b"yes").await;
+}
+
+#[tokio::test]
+async fn queued_run_shell_command_mode_ignores_positional_arguments_like_tmux() {
+    let handler = RequestHandler::new();
+
+    execute_test_command(
+        &handler,
+        "run-shell -C 'set-buffer -b positional #{1}-#{2}' alpha beta",
+    )
+    .await;
+
+    let response = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("positional".to_owned()),
+        }))
+        .await;
+    assert_eq!(
+        response
+            .command_output()
+            .expect("show-buffer output")
+            .stdout(),
+        b"-"
+    );
+}
+
+#[tokio::test]
+async fn queued_run_shell_accepts_empty_command_as_noop_like_tmux() {
+    let handler = RequestHandler::new();
+
+    for command in ["run-shell", "run-shell -b", "run-shell -C"] {
+        execute_test_command(&handler, command).await;
+    }
+}
+
+#[tokio::test]
+async fn run_shell_missing_explicit_target_is_nonfatal() {
+    let handler = RequestHandler::new();
+    use_platform_test_shell(&handler).await;
+
+    let response = handler
+        .handle(Request::RunShell(Box::new(RunShellRequest {
+            command: shell_success_command(),
+            arguments: Vec::new(),
+            background: false,
+            as_commands: false,
+            show_stderr: false,
+            delay_seconds: None,
+            start_directory: None,
+            target: Some(PaneTarget::new(session_name("missing"), 0)),
+            source_depth: None,
+        })))
+        .await;
+
+    assert_eq!(
+        response,
+        Response::RunShell(RunShellResponse::from_exit_status(0))
+    );
 }
 
 #[tokio::test]
@@ -152,6 +306,7 @@ async fn background_run_shell_preserves_hook_formats_after_hook_scope_exits() {
             handler
                 .handle(Request::RunShell(Box::new(RunShellRequest {
                     command,
+                    arguments: Vec::new(),
                     background: true,
                     as_commands: false,
                     show_stderr: true,
@@ -182,6 +337,7 @@ async fn run_shell_expands_socket_path_without_target() {
     let response = handler
         .handle(Request::RunShell(Box::new(RunShellRequest {
             command,
+            arguments: Vec::new(),
             background: false,
             as_commands: false,
             show_stderr: true,
@@ -304,6 +460,7 @@ async fn run_shell_rejects_invalid_delay_without_closing_connection() {
         let response = handler
             .handle(Request::RunShell(Box::new(RunShellRequest {
                 command: shell_success_command(),
+                arguments: Vec::new(),
                 background: false,
                 as_commands: false,
                 show_stderr: false,
@@ -329,6 +486,7 @@ async fn run_shell_background_rejects_invalid_delay_before_reporting_success() {
         let response = handler
             .handle(Request::RunShell(Box::new(RunShellRequest {
                 command: shell_success_command(),
+                arguments: Vec::new(),
                 background: true,
                 as_commands: false,
                 show_stderr: false,

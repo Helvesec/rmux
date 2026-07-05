@@ -5,8 +5,11 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+static UNIQUE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) struct CrossPlatformHarness {
     label: String,
@@ -114,22 +117,29 @@ pub(crate) fn rmux_binary() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_rmux"))
 }
 
-fn unique_id(_label: &str) -> String {
+fn unique_id(label: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before epoch")
         .as_nanos();
+    let counter = UNIQUE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let label_hash = label.bytes().fold(0u16, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(byte as u16)
+    });
     let suffix = nanos % 1_000_000_000;
-    format!("rx-{}-{suffix}", std::process::id())
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect()
+    format!(
+        "rx-{}-{label_hash:04x}-{counter}-{suffix}",
+        std::process::id()
+    )
+    .chars()
+    .map(|ch| {
+        if ch.is_ascii_alphanumeric() || ch == '-' {
+            ch
+        } else {
+            '-'
+        }
+    })
+    .collect()
 }
 
 fn temp_root() -> PathBuf {

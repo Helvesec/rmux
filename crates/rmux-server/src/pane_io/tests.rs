@@ -65,6 +65,20 @@ fn overlay_generation_rejects_stale_clears_after_switches_or_newer_overlays() {
         &mut current_overlay_generation,
         &OverlayFrame::new(Vec::new(), 0, 3)
     ));
+    assert_eq!(current_overlay_generation, 2);
+
+    assert!(should_emit_overlay(
+        1,
+        &mut current_overlay_generation,
+        &OverlayFrame::new(Vec::new(), 2, 3)
+    ));
+    assert_eq!(current_overlay_generation, 3);
+
+    assert!(!should_emit_overlay(
+        2,
+        &mut current_overlay_generation,
+        &OverlayFrame::new(Vec::new(), 1, 4)
+    ));
 }
 
 #[test]
@@ -259,6 +273,7 @@ async fn typed_keystroke_wire_reaches_stub_and_acknowledges() {
     let mut decoder = AttachFrameDecoder::new();
     decoder.push_bytes(&encoded);
     let mut pending_input = Vec::new();
+    let mut active_emit_cache = None;
     let mut locked = true;
     let live_input = LiveAttachInputContext {
         handler,
@@ -271,6 +286,7 @@ async fn typed_keystroke_wire_reaches_stub_and_acknowledges() {
         &live_input,
         None,
         &mut pending_input,
+        &mut active_emit_cache,
         &mut locked,
     )
     .await
@@ -320,6 +336,7 @@ async fn mouse_keystroke_wire_does_not_error_or_drop_the_attach() {
     let mut decoder = AttachFrameDecoder::new();
     decoder.push_bytes(&encoded);
     let mut pending_input = Vec::new();
+    let mut active_emit_cache = None;
     let mut locked = false;
     let live_input = LiveAttachInputContext {
         handler: Arc::clone(&handler),
@@ -332,6 +349,7 @@ async fn mouse_keystroke_wire_does_not_error_or_drop_the_attach() {
         &live_input,
         None,
         &mut pending_input,
+        &mut active_emit_cache,
         &mut locked,
     )
     .await

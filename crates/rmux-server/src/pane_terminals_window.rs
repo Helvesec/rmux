@@ -1,7 +1,8 @@
+use std::cmp::Ordering;
 use std::collections::HashSet;
 
 use rmux_core::{
-    formats::{render_list_windows_line, FormatContext},
+    formats::{is_truthy, render_list_windows_line, FormatContext},
     Session,
 };
 use rmux_proto::{
@@ -19,7 +20,7 @@ use super::{
     session_not_found, HandlerState, KilledWindowResult, NewWindowOptions,
     RemovedWindowHookContext, RespawnWindowOptions,
 };
-use crate::format_runtime::RuntimeFormatContext;
+use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 
 #[path = "pane_terminals/window_removal.rs"]
 mod window_removal;
@@ -478,16 +479,65 @@ impl HandlerState {
         session_name: &SessionName,
         format: Option<&str>,
         attached_count: usize,
+        filter: Option<&str>,
+        sort_order: Option<&str>,
+        reversed: bool,
     ) -> Result<ListWindowsResponse, RmuxError> {
         let session = self
             .sessions
             .session(session_name)
             .ok_or_else(|| session_not_found(session_name))?;
-        let windows = collect_window_entries(self, session, session_name, format, attached_count);
+        let sort_order = match WindowListSortOrder::parse(sort_order) {
+            Some(sort_order) => sort_order,
+            None if sort_order.is_some() => {
+                return Err(RmuxError::Message(rmux_core::INVALID_SORT_ORDER.to_owned()));
+            }
+            None => WindowListSortOrder::Index,
+        };
+        let mut rows =
+            collect_window_entries(self, session, session_name, format, attached_count, filter);
+        if sort_order != WindowListSortOrder::Index || reversed && sort_order.is_explicit() {
+            sort_window_entries(&mut rows, sort_order, reversed);
+        }
+        let windows = rows.into_iter().map(|row| row.entry).collect::<Vec<_>>();
         let output = build_command_output(&windows);
 
         Ok(ListWindowsResponse { windows, output })
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowListSortOrder {
+    Index,
+    Name,
+    Size,
+    Activity,
+    Creation,
+    ExplicitIndex,
+}
+
+impl WindowListSortOrder {
+    fn parse(value: Option<&str>) -> Option<Self> {
+        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            None | Some("") => Some(Self::Index),
+            Some("index" | "order") => Some(Self::ExplicitIndex),
+            Some("name" | "title") => Some(Self::Name),
+            Some("size") => Some(Self::Size),
+            Some("activity") => Some(Self::Activity),
+            Some("creation") => Some(Self::Creation),
+            Some(_) => None,
+        }
+    }
+
+    const fn is_explicit(self) -> bool {
+        !matches!(self, Self::Index)
+    }
+}
+
+struct WindowListRow {
+    entry: WindowListEntry,
+    created_at: i64,
+    activity_at: i64,
 }
 
 fn collect_window_entries(
@@ -496,7 +546,8 @@ fn collect_window_entries(
     session_name: &SessionName,
     format: Option<&str>,
     attached_count: usize,
-) -> Vec<WindowListEntry> {
+    filter: Option<&str>,
+) -> Vec<WindowListRow> {
     let active_window = session.active_window_index();
     let last_window = session.last_window_index();
     let session_context =
@@ -505,7 +556,7 @@ fn collect_window_entries(
     session
         .windows()
         .iter()
-        .map(|(window_index, window)| {
+        .filter_map(|(window_index, window)| {
             let active = *window_index == active_window;
             let last = Some(*window_index) == last_window;
             let mut context =
@@ -525,21 +576,66 @@ fn collect_window_entries(
             if attached_count == 0 {
                 runtime = runtime.with_unclipped_geometry();
             }
+            if let Some(filter) = filter {
+                let expanded = render_runtime_template(filter, &runtime, false);
+                if !is_truthy(&expanded) {
+                    return None;
+                }
+            }
+            let rendered_name = render_runtime_template("#{window_name}", &runtime, false);
             let rendered = render_list_windows_line(&runtime, format);
 
-            WindowListEntry {
-                target: WindowTarget::with_window(session_name.clone(), *window_index),
-                window_id: window.id().to_string(),
-                name: window.name().map(str::to_owned),
-                pane_count: u32::try_from(window.pane_count()).expect("pane count fits in u32"),
-                size: window.size(),
-                layout: window.layout(),
-                active,
-                last,
-                rendered,
-            }
+            Some(WindowListRow {
+                entry: WindowListEntry {
+                    target: WindowTarget::with_window(session_name.clone(), *window_index),
+                    window_id: window.id().to_string(),
+                    name: (!rendered_name.is_empty()).then_some(rendered_name),
+                    pane_count: u32::try_from(window.pane_count()).expect("pane count fits in u32"),
+                    size: window.size(),
+                    layout: window.layout(),
+                    active,
+                    last,
+                    rendered,
+                },
+                created_at: window.created_at(),
+                activity_at: window.activity_at(),
+            })
         })
         .collect()
+}
+
+fn sort_window_entries(
+    entries: &mut [WindowListRow],
+    sort_order: WindowListSortOrder,
+    reversed: bool,
+) {
+    entries.sort_by(|left, right| {
+        let primary = match sort_order {
+            WindowListSortOrder::Index | WindowListSortOrder::ExplicitIndex => left
+                .entry
+                .target
+                .window_index()
+                .cmp(&right.entry.target.window_index()),
+            WindowListSortOrder::Name => left.entry.name.cmp(&right.entry.name),
+            WindowListSortOrder::Size => (left.entry.size.cols, left.entry.size.rows)
+                .cmp(&(right.entry.size.cols, right.entry.size.rows)),
+            WindowListSortOrder::Activity => right.activity_at.cmp(&left.activity_at),
+            WindowListSortOrder::Creation => left.created_at.cmp(&right.created_at),
+        };
+        let primary = if reversed { primary.reverse() } else { primary };
+        primary
+            .then_with(|| stable_window_name_cmp(left, right))
+            .then_with(|| {
+                left.entry
+                    .target
+                    .window_index()
+                    .cmp(&right.entry.target.window_index())
+            })
+    });
+}
+
+fn stable_window_name_cmp(left: &WindowListRow, right: &WindowListRow) -> Ordering {
+    left.entry.name.cmp(&right.entry.name)
 }
 
 fn build_command_output(windows: &[WindowListEntry]) -> CommandOutput {

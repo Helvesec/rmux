@@ -10,14 +10,14 @@ use common::{assert_success, read_until_contains, stderr, stdout, AttachedSessio
 use rmux_proto::TerminalSize;
 
 #[test]
-fn foreground_run_shell_suppresses_stdout_like_tmux() -> Result<(), Box<dyn Error>> {
+fn foreground_run_shell_prints_stdout_like_tmux() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("run-shell-stdout")?;
     let _daemon = harness.start_hidden_daemon()?;
 
     let output = harness.run(&["run-shell", "printf hello"])?;
 
     assert_eq!(output.status.code(), Some(0));
-    assert!(stdout(&output).is_empty());
+    assert_eq!(stdout(&output), "hello\n");
     assert!(stderr(&output).is_empty());
     Ok(())
 }
@@ -79,21 +79,23 @@ fn run_shell_exports_parseable_tmux_program_shim() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
-fn run_shell_nonzero_preserves_exit_status_without_stdout() -> Result<(), Box<dyn Error>> {
+fn run_shell_nonzero_preserves_exit_status_and_stdout() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("run-shell-nonzero")?;
     let _daemon = harness.start_hidden_daemon()?;
 
     let output = harness.run(&["run-shell", "printf hidden; exit 9"])?;
 
     assert_eq!(output.status.code(), Some(9));
-    assert!(stdout(&output).is_empty());
+    assert_eq!(
+        stdout(&output),
+        "hidden\n'printf hidden; exit 9' returned 9\n"
+    );
     assert!(stderr(&output).is_empty());
     Ok(())
 }
 
 #[test]
-fn source_file_run_shell_nonzero_preserves_exit_status_without_stdout() -> Result<(), Box<dyn Error>>
-{
+fn source_file_run_shell_nonzero_preserves_exit_status_and_stdout() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("source-file-run-shell-nonzero")?;
     let _daemon = harness.start_hidden_daemon()?;
     let config = harness.tmpdir().join("run-shell-nonzero.conf");
@@ -102,7 +104,10 @@ fn source_file_run_shell_nonzero_preserves_exit_status_without_stdout() -> Resul
     let output = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
 
     assert_eq!(output.status.code(), Some(7));
-    assert!(stdout(&output).is_empty());
+    assert_eq!(
+        stdout(&output),
+        "hidden\n'printf hidden; exit 7' returned 7\n"
+    );
     assert!(stderr(&output).is_empty());
     Ok(())
 }
@@ -117,8 +122,8 @@ fn source_file_later_successful_run_shell_clears_prior_run_shell_status(
 
     let output = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
 
-    assert_success(&output);
-    assert!(stdout(&output).is_empty());
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "'exit 7' returned 7\n");
     assert!(stderr(&output).is_empty());
     Ok(())
 }
@@ -157,15 +162,29 @@ fn source_file_commands_follow_implicit_selected_window_context() -> Result<(), 
 }
 
 #[test]
-fn run_shell_dash_e_is_rejected_like_tmux() -> Result<(), Box<dyn Error>> {
+fn run_shell_dash_e_merges_stderr_like_tmux37() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("run-shell-stderr")?;
     let _daemon = harness.start_hidden_daemon()?;
 
     let output = harness.run(&["run-shell", "-E", "printf err >&2"])?;
 
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stdout(&output).is_empty());
-    assert_eq!(stderr(&output), "command run-shell: unknown flag -E\n");
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "err\n");
+    assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn run_shell_signal_termination_uses_tmux_message() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("run-shell-signal-message")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    let output = harness.run(&["run-shell", "kill -9 $$"])?;
+
+    assert_eq!(output.status.code(), Some(137));
+    assert_eq!(stdout(&output), "'kill -9 $$' terminated by signal 9\n");
+    assert!(stderr(&output).is_empty());
     Ok(())
 }
 
@@ -178,7 +197,14 @@ fn run_shell_stdout_is_drained_without_cli_output() -> Result<(), Box<dyn Error>
     let output = harness.run(&["run-shell", command])?;
 
     assert_eq!(output.status.code(), Some(0));
-    assert!(stdout(&output).is_empty());
+    let stdout = stdout(&output);
+    assert!(
+        stdout.len() > 900_000,
+        "run-shell stdout should drain a large payload, got {} bytes",
+        stdout.len()
+    );
+    assert!(stdout.starts_with("AAAA"));
+    assert!(stdout.ends_with("\nrmux: run-shell output truncated\n"));
     assert!(stderr(&output).is_empty());
     Ok(())
 }
@@ -191,11 +217,8 @@ fn run_shell_preserves_spaced_path_arguments() -> Result<(), Box<dyn Error>> {
 
     let output = harness.run(&[
         "run-shell",
-        "env",
-        "-C",
-        harness.tmpdir().to_str().expect("utf-8 test path"),
-        "touch",
-        "name with spaces",
+        "touch \"#{1}\"",
+        spaced_path.to_str().expect("utf-8 test path"),
     ])?;
 
     assert_eq!(output.status.code(), Some(0));
@@ -262,6 +285,44 @@ fn nested_commands_report_missing_session_without_invalid_target_wrapper(
 }
 
 #[test]
+fn run_shell_command_mode_ignores_trailing_positional_arguments() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("run-shell-c-ignore-positionals")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&[
+        "run-shell",
+        "-C",
+        "set-buffer -b positional #{1}-#{2}",
+        "alpha",
+        "beta",
+    ])?);
+
+    let output = harness.run(&["show-buffer", "-b", "positional"])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "-");
+    assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
+fn run_shell_empty_command_forms_are_noops() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("run-shell-empty-noops")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    for args in [
+        vec!["run-shell"],
+        vec!["run-shell", "-b"],
+        vec!["run-shell", "-C"],
+    ] {
+        let output = harness.run(&args)?;
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        assert!(stdout(&output).is_empty(), "{args:?}");
+        assert!(stderr(&output).is_empty(), "{args:?}");
+    }
+    Ok(())
+}
+
+#[test]
 fn run_shell_commands_use_explicit_target_for_implicit_nested_target() -> Result<(), Box<dyn Error>>
 {
     let harness = CliHarness::new("run-shell-c-explicit-target")?;
@@ -284,6 +345,30 @@ fn run_shell_commands_use_explicit_target_for_implicit_nested_target() -> Result
         !panes.lines().any(|line| line == "beta:1"),
         "run-shell -C -t should not ignore the explicit target, got:\n{panes}"
     );
+    Ok(())
+}
+
+#[test]
+fn source_file_list_panes_all_preserves_filter_sort_and_reverse() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("source-file-list-panes-all-options")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "beta"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-t", "beta"])?);
+
+    let config = harness.tmpdir().join("list-panes-all.conf");
+    fs::write(
+        &config,
+        "list-panes -ar -O index -f '#{||:#{==:#{pane_index},0},#{==:#{pane_index},1}}' -F '#{session_name}:#{pane_index}'\n",
+    )?;
+
+    let output = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "alpha:1\nalpha:0\nbeta:1\nbeta:0\n");
+    assert!(stderr(&output).is_empty());
+
     Ok(())
 }
 
@@ -396,8 +481,9 @@ fn if_shell_nested_run_shell_preserves_spaced_path_arguments() -> Result<(), Box
     let _daemon = harness.start_hidden_daemon()?;
     let spaced_path = harness.tmpdir().join("nested name with spaces");
     let nested_command = format!(
-        "run-shell env -C {} touch 'nested name with spaces'",
-        harness.tmpdir().display()
+        "run-shell {} {}",
+        shell_quote_str("touch \"#{1}\""),
+        shell_quote(&spaced_path)
     );
 
     let output = harness.run(&["if-shell", "-F", "1", &nested_command])?;
@@ -459,7 +545,7 @@ fn source_file_reports_invalid_command_flags_on_stdout_with_line_prefix(
     let config = harness.tmpdir().join("unsupported-command-flags.conf");
     fs::write(
         &config,
-        "capture-pane -M\nchoose-tree -y 1\nlist-keys -O name\nlist-keys -Oname\nlist-clients -r\nlist-buffers -O name\n",
+        "capture-pane -Z\nchoose-tree -y 1\nlist-clients -Q\nlist-buffers -Q\n",
     )?;
 
     let output = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
@@ -468,9 +554,7 @@ fn source_file_reports_invalid_command_flags_on_stdout_with_line_prefix(
     assert_eq!(
         stdout(&output),
         format!(
-            "{}:1: command capture-pane: unknown flag -M\n{}:2: command choose-tree: unknown flag -y\n{}:3: command list-keys: unknown flag -O\n{}:4: command list-keys: unknown flag -O\n{}:5: command list-clients: unknown flag -r\n{}:6: command list-buffers: unknown flag -O\n",
-            config.display(),
-            config.display(),
+            "{}:1: command capture-pane: unknown flag -Z\n{}:2: command choose-tree: unknown flag -y\n{}:3: command list-clients: unknown flag -Q\n{}:4: command list-buffers: unknown flag -Q\n",
             config.display(),
             config.display(),
             config.display(),
@@ -478,6 +562,22 @@ fn source_file_reports_invalid_command_flags_on_stdout_with_line_prefix(
         )
     );
     assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
+fn source_file_execution_errors_report_on_stderr_without_line_prefix() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("source-file-execution-error-stderr")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let config = harness.tmpdir().join("execution-error.conf");
+    fs::write(&config, "has-session -t missing\n")?;
+
+    let output = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty());
+    assert_eq!(stderr(&output), "can't find session: missing\n");
     Ok(())
 }
 
@@ -499,19 +599,21 @@ fn source_file_parse_errors_report_input_line_number() -> Result<(), Box<dyn Err
         format!("{}:2: unknown command: bogus-command\n", config.display())
     );
     assert!(stderr(&output).is_empty());
-    let before = harness.run(&["show-options", "-gqv", "@before"])?;
-    assert_eq!(before.status.code(), Some(0));
-    assert_eq!(stdout(&before), "ok\n");
-    assert!(stderr(&before).is_empty());
-    let after = harness.run(&["show-options", "-gqv", "@after"])?;
-    assert_eq!(after.status.code(), Some(0));
-    assert_eq!(stdout(&after), "ok\n");
-    assert!(stderr(&after).is_empty());
+    for option in ["@before", "@after"] {
+        let output = harness.run(&["show-options", "-gqv", option])?;
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "show-options -q should stay quiet for {option}"
+        );
+        assert!(stdout(&output).is_empty(), "{option} should not be set");
+        assert!(stderr(&output).is_empty());
+    }
     Ok(())
 }
 
 #[test]
-fn source_file_config_errors_force_exit_one_even_after_command_status() -> Result<(), Box<dyn Error>>
+fn source_file_config_parse_errors_prevent_neighbor_command_execution() -> Result<(), Box<dyn Error>>
 {
     let harness = CliHarness::new("source-file-error-status")?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -524,15 +626,12 @@ fn source_file_config_errors_force_exit_one_even_after_command_status() -> Resul
     let output = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(
-        stdout(&output).contains("after\n"),
-        "source-file should preserve successful stdout, got {:?}",
-        stdout(&output)
-    );
-    assert!(
-        stdout(&output).contains("unknown command: definitely-not-a-command"),
-        "source-file should append config error output, got {:?}",
-        stdout(&output)
+    assert_eq!(
+        stdout(&output),
+        format!(
+            "{}:2: unknown command: definitely-not-a-command\n",
+            config.display()
+        )
     );
     assert!(stderr(&output).is_empty());
     Ok(())
@@ -689,7 +788,9 @@ fn source_file_recursion_through_tmux_shim_is_bounded() -> Result<(), Box<dyn Er
     let output = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(stdout(&output).is_empty());
+    let stdout = stdout(&output);
+    assert!(stdout.contains("'tmux source-file "));
+    assert!(stdout.contains("' returned 1\n"));
     assert!(stderr(&output).is_empty());
     Ok(())
 }
@@ -718,7 +819,7 @@ fn startup_config_parse_errors_skip_bad_file_without_aborting_startup() -> Resul
 
     let option = harness.run(&["show-options", "-gqv", "@after-startup"])?;
     assert_eq!(option.status.code(), Some(0));
-    assert_eq!(stdout(&option), "yes\n");
+    assert!(stdout(&option).is_empty());
     assert!(stderr(&option).is_empty());
     Ok(())
 }
@@ -1213,7 +1314,10 @@ fn source_file_verbose_prefixes_each_command_with_path_and_line() -> Result<(), 
     let harness = CliHarness::new("source-file-verbose-prefix")?;
     let _daemon = harness.start_hidden_daemon()?;
     let config = harness.tmpdir().join("verbose.conf");
-    fs::write(&config, "set-buffer -b sf yes\ndisplay-message -p hello\n")?;
+    fs::write(
+        &config,
+        "set-buffer -b sf yes; display-message -p hello\ndisplay-message -p bye\n",
+    )?;
 
     let output = harness.run(&[
         "source-file",
@@ -1225,9 +1329,39 @@ fn source_file_verbose_prefixes_each_command_with_path_and_line() -> Result<(), 
     assert_eq!(
         stdout(&output),
         format!(
-            "{}:1: set-buffer -b sf yes\n{}:2: display-message -p hello\nhello\n",
+            "{}:1: set-buffer -b sf yes ; display-message -p hello\n{}:2: display-message -p bye\nhello\nbye\n",
             config.display(),
             config.display()
+        )
+    );
+    assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
+fn source_file_verbose_includes_nested_brace_groups() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("source-file-verbose-nested")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let config = harness.tmpdir().join("verbose-nested.conf");
+    fs::write(
+        &config,
+        "if-shell -F 1 {\n  display-message -p hi\n}\ndisplay-message -p bye\n",
+    )?;
+
+    let output = harness.run(&[
+        "source-file",
+        "-v",
+        config.to_str().expect("utf-8 config path"),
+    ])?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout(&output),
+        format!(
+            "{}:2: display-message -p hi\n{}:2: if-shell -F 1 {{ display-message -p hi }}\n{}:4: display-message -p bye\nhi\nbye\n",
+            config.display(),
+            config.display(),
+            config.display(),
         )
     );
     assert!(stderr(&output).is_empty());
@@ -1246,7 +1380,7 @@ fn source_file_missing_path_reports_plain_no_such_file_surface() -> Result<(), B
     assert!(stdout(&output).is_empty());
     assert_eq!(
         stderr(&output),
-        format!("{}: No such file or directory\n", missing.display())
+        format!("No such file or directory: {}\n", missing.display())
     );
     Ok(())
 }
@@ -1265,7 +1399,7 @@ fn source_file_directory_is_rejected() -> Result<(), Box<dyn Error>> {
     assert!(stdout(&output).is_empty());
     assert_eq!(
         stderr(&output),
-        format!("{}: Is a directory\n", harness.tmpdir().display())
+        format!("Input/output error: {}\n", harness.tmpdir().display())
     );
     Ok(())
 }
@@ -1474,7 +1608,7 @@ fn hook_surface_smoke_matches_supported_cli_behavior() -> Result<(), Box<dyn Err
 
     let bindings = harness.run(&["list-keys", "-T", "prefix", "C-b"])?;
     assert_eq!(bindings.status.code(), Some(0));
-    assert_eq!(stdout(&bindings), "bind-key -T prefix C-b send-prefix\n");
+    assert_eq!(stdout(&bindings), "");
     assert!(stderr(&bindings).is_empty());
 
     Ok(())
@@ -1487,7 +1621,12 @@ fn source_file_set_hook_accepts_compact_flag_clusters() -> Result<(), Box<dyn Er
     let config = harness.tmpdir().join("hooks.conf");
     fs::write(
         &config,
-        "set-hook -ga after-new-window 'set-option -g @compact-hook yes'\n",
+        concat!(
+            "set-hook -ga after-new-window 'set-option -g @compact-hook yes'\n",
+            "set-hook -gat alpha after-new-window 'set-option -g @compact-target-hook yes'\n",
+            "set-hook -pt alpha:0.0 pane-died 'display-message pane-died'\n",
+            "set-hook -R client-attached\n",
+        ),
     )?;
 
     assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
@@ -1495,6 +1634,150 @@ fn source_file_set_hook_accepts_compact_flag_clusters() -> Result<(), Box<dyn Er
     assert_success(&harness.run(&["new-window", "-t", "alpha"])?);
 
     wait_for_option_value(&harness, "@compact-hook", "yes")?;
+    wait_for_option_value(&harness, "@compact-target-hook", "yes")?;
+
+    Ok(())
+}
+
+#[test]
+fn source_file_set_hook_run_immediately_uses_current_session_scope() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("set-hook-run-immediate-current-session")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let config = harness.tmpdir().join("run-hook.conf");
+    fs::write(&config, "set-hook -R client-attached\n")?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-t",
+        "alpha",
+        "client-attached",
+        "set-buffer -b run-hook yes",
+    ])?);
+    assert_success(&harness.run(&["source-file", config.to_str().expect("utf-8 config")])?);
+
+    wait_for_buffer(&harness, "run-hook", "yes")?;
+    Ok(())
+}
+
+#[test]
+fn startup_config_set_hook_without_sessions_does_not_abort_file() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("startup-set-hook-no-session")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+    let config = harness.tmpdir().join("startup-hooks.conf");
+    fs::write(
+        &config,
+        concat!(
+            "set -g @a 1\n",
+            "set-hook client-attached 'display-message startup-hook'\n",
+            "set-hook -R client-attached\n",
+            "set -g @b 2\n",
+        ),
+    )?;
+
+    let output = harness.run(&[
+        "-f",
+        config.to_str().expect("utf-8 config"),
+        "new-session",
+        "-d",
+        "-s",
+        "y",
+    ])?;
+    assert_success(&output);
+
+    let show_a = harness.run(&["show-options", "-gv", "@a"])?;
+    assert_eq!(show_a.status.code(), Some(0));
+    assert!(stderr(&show_a).is_empty());
+    assert_eq!(stdout(&show_a), "1\n");
+    let show_b = harness.run(&["show-options", "-gv", "@b"])?;
+    assert_eq!(show_b.status.code(), Some(0));
+    assert!(stderr(&show_b).is_empty());
+    assert_eq!(stdout(&show_b), "2\n");
+    let hook = harness.run(&["show-hooks", "-g", "client-attached"])?;
+    assert_eq!(hook.status.code(), Some(0));
+    assert!(stderr(&hook).is_empty());
+    assert_eq!(
+        stdout(&hook),
+        "client-attached[0] display-message startup-hook\n"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn startup_config_set_option_pg_without_sessions_is_noop() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("startup-set-option-pg-no-session")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+    let config = harness.tmpdir().join("startup-set-option-pg.conf");
+    fs::write(
+        &config,
+        "set -pg pane-border-style fg=colour3\nset -g @after-set-pg yes\n",
+    )?;
+
+    let output = harness.run(&[
+        "-f",
+        config.to_str().expect("utf-8 config"),
+        "new-session",
+        "-d",
+        "-s",
+        "alpha",
+    ])?;
+    assert_success(&output);
+
+    let after = harness.run(&["show-options", "-gqv", "@after-set-pg"])?;
+    assert_eq!(after.status.code(), Some(0));
+    assert!(stderr(&after).is_empty());
+    assert_eq!(stdout(&after), "yes\n");
+
+    let global = harness.run(&["show-options", "-gqv", "pane-border-style"])?;
+    assert_eq!(global.status.code(), Some(0));
+    assert!(stderr(&global).is_empty());
+    assert_eq!(stdout(&global), "default\n");
+
+    let pane = harness.run(&[
+        "show-options",
+        "-pqv",
+        "-t",
+        "alpha:0.0",
+        "pane-border-style",
+    ])?;
+    assert_eq!(pane.status.code(), Some(0));
+    assert!(stderr(&pane).is_empty());
+    assert!(stdout(&pane).is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn set_hook_accepts_tmux_37_scope_forms() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("set-hook-tmux-37-scopes")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    for args in [
+        vec!["set-hook", "-w", "session-created", "display-message ok"],
+        vec!["set-hook", "-p", "client-detached", "display-message ok"],
+        vec!["set-hook", "-R", "client-attached"],
+        vec![
+            "set-hook",
+            "-gt",
+            "alpha",
+            "client-attached",
+            "display-message ok",
+        ],
+        vec![
+            "set-hook",
+            "-pt",
+            "alpha:0.0",
+            "pane-died",
+            "display-message ok",
+        ],
+    ] {
+        let output = harness.run(&args)?;
+        assert_eq!(output.status.code(), Some(0), "args={args:?}");
+        assert!(stderr(&output).is_empty(), "args={args:?}");
+    }
 
     Ok(())
 }
@@ -1562,6 +1845,15 @@ fn set_hook_canonicalizes_and_validates_command_body() -> Result<(), Box<dyn Err
         stderr(&invalid).contains("too many arguments"),
         "stderr={:?}",
         stderr(&invalid)
+    );
+
+    let unknown = harness.run(&["set-hook", "-g", "pane-exited", "not-a-command"])?;
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(stdout(&unknown).is_empty());
+    assert!(
+        stderr(&unknown).contains("unknown command: not-a-command"),
+        "stderr={:?}",
+        stderr(&unknown)
     );
 
     Ok(())

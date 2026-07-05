@@ -81,8 +81,27 @@ jobs:
           scripts/check-platform-neutrality.sh
           scripts/no-debug-assert-side-effects.sh
 
+      - name: Install tmux oracle build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison build-essential ca-certificates curl libevent-dev libncurses-dev libutf8proc-dev pkg-config
+
+      - name: Cache tmux oracle source
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: ~/.cache/rmux-oracle
+          key: tmux-oracle-3.7b-87f2e99e3b685973f2ca002ffd6ed7e51a5744f7009daae5a15670b6d532db96
+
+      - name: Build pinned tmux 3.7b oracle
+        shell: bash
+        run: scripts/oracle/build-tmux37.sh --prefix "$RUNNER_TEMP/rmux-oracle"
+
       - name: Release review gate
         shell: bash
+        env:
+          RMUX_FROZEN_TMUX: ${{ runner.temp }}/rmux-oracle/tmux
+          RMUX_REQUIRE_TMUX: "1"
         run: scripts/release-review-gate.sh --target-dir target/release-review
 
   build:
@@ -226,13 +245,28 @@ jobs:
           $env:CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG = "0"
           $env:CARGO_PROFILE_TEST_DEBUG = "0"
           $env:RUSTFLAGS = "-Clink-arg=/DEBUG:NONE"
+          ./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux-client --locked output_writer_failure_wakes
           cargo test -p rmux-client --locked output_writer_failure_wakes -- --test-threads=1
+          ./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux-client --locked blocked_console_output_does_not_block_input_forwarding
           cargo test -p rmux-client --locked blocked_console_output_does_not_block_input_forwarding -- --test-threads=1
           ./scripts/windows_ctrl_matrix.ps1 -StaticMatrixSpec
+          ./scripts/windows_ctrl_matrix.ps1 -PortableSmokeOnly -OutDir target/windows-ctrl-matrix
+          ./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux --locked --test windows_ctrl_matrix_spec
           cargo test -p rmux --locked --test windows_ctrl_matrix_spec -- --test-threads=1
+          ./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux --locked --test windows_attach_exit
           cargo test -p rmux --locked --test windows_attach_exit -- --test-threads=1
+          ./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux --locked --test automation_cli_windows
           cargo test -p rmux --locked --test automation_cli_windows -- --test-threads=1
+          ./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux --locked --test internal_daemon_windows
           cargo test -p rmux --locked --test internal_daemon_windows -- --nocapture --test-threads=1
+
+      - name: Upload Windows Ctrl matrix smoke artifacts
+        if: runner.os == 'Windows' && always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: rmux-${{ env.RELEASE_REF }}-${{ matrix.target }}-windows-ctrl-matrix
+          path: target/windows-ctrl-matrix
+          if-no-files-found: ignore
 
       - name: Create Unix archive
         if: matrix.archive == 'tar.gz'
@@ -291,6 +325,7 @@ jobs:
             -RunDaemonSmoke `
             -RunSdkSmoke `
             -RunMouseBorderSmoke `
+            -RunCtrlMatrixSmoke `
             -RequireReleaseArtifact
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

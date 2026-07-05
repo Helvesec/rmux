@@ -594,7 +594,7 @@ fn append_remain_on_exit_message(
         .size()
         .rows
         .max(1);
-    let mut bytes = format!("\x1b[{rows};1H\x1b[2K").into_bytes();
+    let mut bytes = format!("\x1b[{rows};1H\n\x1b[2K").into_bytes();
     bytes.extend_from_slice(rendered.as_bytes());
     state.append_bytes_to_runtime_pane_transcript(runtime_session_name, pane_id, &bytes)
 }

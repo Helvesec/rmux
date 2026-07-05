@@ -105,7 +105,35 @@ fn substitute_regex(value: &str, regex: &regex::Regex, replacement: &str) -> Str
         }
 
         let suffix = &value[offset..];
-        let Some(captures) = regex.captures(suffix) else {
+        let Some(suffix_captures) = regex.captures(suffix) else {
+            output.push_str(&value[offset..]);
+            return output;
+        };
+        let Some(suffix_match) = suffix_captures.get(0) else {
+            output.push_str(&value[offset..]);
+            return output;
+        };
+
+        if suffix_match.is_empty() {
+            let match_start = offset + suffix_match.start();
+            output.push_str(&value[offset..match_start]);
+
+            if match_start >= value.len() {
+                push_tmux_replacement(&suffix_captures, replacement, &mut output);
+                offset = value.len();
+                continue;
+            }
+            let byte = value.as_bytes()[match_start];
+            push_tmux_byte(byte, &mut output);
+            let next_offset = match_start + 1;
+            if !has_non_empty_match_at(regex, value, next_offset) {
+                push_tmux_replacement(&suffix_captures, replacement, &mut output);
+            }
+            offset = next_offset;
+            continue;
+        }
+
+        let Some(captures) = regex.captures_at(value, offset) else {
             output.push_str(suffix);
             return output;
         };
@@ -114,25 +142,9 @@ fn substitute_regex(value: &str, regex: &regex::Regex, replacement: &str) -> Str
             return output;
         };
 
-        let match_start = offset + match_.start();
-        let match_end = offset + match_.end();
+        let match_start = match_.start();
+        let match_end = match_.end();
         output.push_str(&value[offset..match_start]);
-
-        if match_.is_empty() {
-            if match_start >= value.len() {
-                push_tmux_replacement(&captures, replacement, &mut output);
-                offset = value.len();
-                continue;
-            }
-            let byte = value.as_bytes()[match_start];
-            push_tmux_byte(byte, &mut output);
-            let next_offset = match_start + 1;
-            if !has_non_empty_match_at(regex, value, next_offset) {
-                push_tmux_replacement(&captures, replacement, &mut output);
-            }
-            offset = next_offset;
-            continue;
-        }
 
         push_tmux_replacement(&captures, replacement, &mut output);
         offset = match_end;

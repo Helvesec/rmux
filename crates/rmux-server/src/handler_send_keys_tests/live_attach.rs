@@ -1,4 +1,56 @@
 use super::*;
+use crate::handler::QueuedLifecycleEvent;
+
+async fn set_global_hook(handler: &RequestHandler, hook: HookName, command: &str) {
+    let response = handler
+        .handle(Request::SetHookMutation(SetHookMutationRequest {
+            scope: ScopeSelector::Global,
+            hook,
+            command: Some(command.to_owned()),
+            lifecycle: HookLifecycle::Persistent,
+            append: false,
+            unset: false,
+            run_immediately: false,
+            index: None,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetHook(_)), "{response:?}");
+}
+
+async fn wait_for_buffer(handler: &RequestHandler, name: &str, expected: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        {
+            let state = handler.state.lock().await;
+            if let Ok((_, content)) = state.buffers.show(Some(name)) {
+                if String::from_utf8_lossy(content) == expected {
+                    return;
+                }
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "buffer {name} did not reach {expected:?}"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn drain_lifecycle_hooks(
+    handler: &RequestHandler,
+    events: &mut tokio::sync::broadcast::Receiver<QueuedLifecycleEvent>,
+) {
+    loop {
+        match events.try_recv() {
+            Ok(event) => handler.dispatch_lifecycle_hook(event).await,
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                panic!("lifecycle events lagged during test: {skipped}");
+            }
+        }
+    }
+}
 
 async fn enable_mouse(handler: &RequestHandler) {
     let response = handler
@@ -1078,6 +1130,119 @@ async fn live_attach_focus_sequences_are_consumed_at_attach_boundary() {
 
     capture.finish(&handler, &alpha).await;
     capture.assert_contents(&handler, b"").await;
+}
+
+#[tokio::test]
+async fn live_attach_focus_sequences_emit_client_and_pane_hooks_in_order() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("live-attach-focus-hooks");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    set_global_hook(
+        &handler,
+        HookName::ClientFocusIn,
+        "set-buffer -a -b focus-hooks CFI,",
+    )
+    .await;
+    set_global_hook(
+        &handler,
+        HookName::PaneFocusIn,
+        "set-buffer -a -b focus-hooks PFI,",
+    )
+    .await;
+    set_global_hook(
+        &handler,
+        HookName::PaneFocusOut,
+        "set-buffer -a -b focus-hooks PFO,",
+    )
+    .await;
+    set_global_hook(
+        &handler,
+        HookName::ClientFocusOut,
+        "set-buffer -a -b focus-hooks CFO,",
+    )
+    .await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[I\x1b[O")
+        .await
+        .expect("live attach focus input");
+
+    drain_lifecycle_hooks(&handler, &mut lifecycle).await;
+    wait_for_buffer(&handler, "focus-hooks", "CFI,PFI,PFO,CFO,").await;
+}
+
+#[tokio::test]
+async fn live_attach_first_typist_after_second_attach_marks_changed_client_active() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("live-attach-client-active");
+    let first_pid = std::process::id();
+    let second_pid = first_pid.saturating_add(1);
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    set_global_hook(
+        &handler,
+        HookName::ClientActive,
+        "set-buffer -a -b client-active active,",
+    )
+    .await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    let (first_tx, _first_rx) = mpsc::unbounded_channel();
+    let _first_attach = handler
+        .register_attach(first_pid, alpha.clone(), first_tx)
+        .await;
+    let (second_tx, _second_rx) = mpsc::unbounded_channel();
+    let _second_attach = handler
+        .register_attach(second_pid, alpha.clone(), second_tx)
+        .await;
+
+    handler
+        .handle_attached_live_input_for_test(first_pid, b"a")
+        .await
+        .expect("first client input");
+
+    drain_lifecycle_hooks(&handler, &mut lifecycle).await;
+    wait_for_buffer(&handler, "client-active", "active,").await;
+}
+
+#[tokio::test]
+async fn live_attach_theme_reports_emit_client_theme_hooks() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("live-attach-theme-hooks");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    set_global_hook(
+        &handler,
+        HookName::ClientDarkTheme,
+        "set-buffer -a -b theme-hooks dark,",
+    )
+    .await;
+    set_global_hook(
+        &handler,
+        HookName::ClientLightTheme,
+        "set-buffer -a -b theme-hooks light,",
+    )
+    .await;
+    let mut lifecycle = handler.subscribe_lifecycle_events();
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x1b[?997;1n\x1b[?997;2n")
+        .await
+        .expect("live attach theme reports");
+
+    drain_lifecycle_hooks(&handler, &mut lifecycle).await;
+    wait_for_buffer(&handler, "theme-hooks", "dark,light,").await;
 }
 
 #[tokio::test]

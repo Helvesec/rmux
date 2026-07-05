@@ -297,6 +297,7 @@ pub(super) fn run_kill_session(
             target,
             kill_all_except_target: args.kill_all_except_target,
             clear_alerts: args.clear_alerts,
+            kill_group: args.kill_group,
         })
         .map_err(ExitFailure::from_client)?;
     expect_command_success(response, "kill-session")?;

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use rmux_core::{
     command_parser::{
-        CommandParseErrorKind, CommandParser, ParsedCommand, ParsedCommands,
+        CommandArgument, CommandParseErrorKind, CommandParser, ParsedCommand, ParsedCommands,
         SOURCE_FILE_MAX_COMMAND_BYTES,
     },
     parse_binding_command_tokens,
@@ -29,7 +29,7 @@ use super::parser_context::command_parser_from_state;
 use super::queue::{QueueCommandAction, QueueExecutionContext, QueueInvocation, QueueMode};
 use super::request_parse::parse_queue_invocation;
 use super::source_files::{
-    default_config_paths, default_tmux_fallback_paths, source_inputs_for_path,
+    default_config_paths, default_tmux_fallback_paths, source_inputs_for_path_with_diagnostics,
     source_parse_error_with_line_offset, LoadedSourceFile, ParsedSourceFileCommand, SourceInput,
     SourceSyntax, SourcedParsedCommands,
 };
@@ -40,8 +40,8 @@ use super::tmux_compat::tmux_compat_input;
 use crate::format_runtime::render_runtime_template;
 use crate::{ConfigFileSelection, ConfigLoadOptions};
 
-const SOURCE_PARSE_RECOVERY_ERROR_LIMIT: usize = 256;
 const STARTUP_CONFIG_ERROR_LIMIT: usize = 256;
+const SOURCE_PARSE_RECOVERY_ERROR_LIMIT: usize = 256;
 const CONFIG_MESSAGE_MAX_BYTES: usize = 512;
 #[cfg(not(test))]
 const STARTUP_READINESS_BUDGET: Duration = Duration::from_secs(2);
@@ -129,7 +129,10 @@ impl RequestHandler {
                 guard,
             )
             .await;
-        if let Some(error) = execution.error {
+        if let Some(error) = execution.source_file_error {
+            errors.push(error);
+        }
+        if let Some(error) = execution.execution_error {
             errors.push(error);
         }
         if let Some(error) = super::aggregate_rmux_errors(errors) {
@@ -188,7 +191,15 @@ impl RequestHandler {
             Err(error) => return Response::Error(ErrorResponse { error }),
         };
         let strict_errors = command.syntax == SourceSyntax::Rmux;
-        let mut errors = Vec::new();
+        let mut stdout_errors = Vec::new();
+        let mut stderr_errors = Vec::new();
+        let mut stderr = Vec::new();
+        if let Some(error) = loaded.take_read_error() {
+            append_error_output(&mut stderr, &error);
+            if invoked_from_sourced_shell {
+                self.log_source_file_error_messages(&error, true).await;
+            }
+        }
         let load_error = loaded.take_error();
 
         let context = QueueExecutionContext::new(command.caller_cwd.clone());
@@ -211,15 +222,16 @@ impl RequestHandler {
                 append_verbose_loaded_commands(&mut stdout, &loaded, stop.as_ref());
             }
             if let Some(error) = error {
-                errors.push(error);
+                stdout_errors.push(error);
             }
         } else {
             if let Some(error) = load_error {
-                errors.push(error);
+                stdout_errors.push(error);
             }
             let SourceFileExecution {
                 output,
-                error,
+                source_file_error,
+                execution_error,
                 exit_status: execution_exit_status,
             } = self
                 .execute_loaded_source_file(requester_pid, loaded, context, depth)
@@ -228,33 +240,45 @@ impl RequestHandler {
             if let Some(status) = execution_exit_status {
                 exit_status = Some(status);
             }
-            if let Some(error) = error {
-                errors.push(error);
+            if let Some(error) = source_file_error {
+                stdout_errors.push(error);
+            }
+            if let Some(error) = execution_error {
+                stderr_errors.push(error);
             }
         }
 
-        if let Some(error) = super::aggregate_rmux_errors(errors) {
+        let mut error_exit_status = false;
+        if let Some(error) = super::aggregate_rmux_errors(stdout_errors) {
             self.log_source_file_error_messages(&error, invoked_from_sourced_shell)
                 .await;
             if strict_errors {
-                if !stdout.is_empty() {
+                if !stdout.is_empty() || !stderr.is_empty() {
                     append_error_output(&mut stdout, &error);
-                    return Response::SourceFile(
-                        SourceFileResponse::from_output(CommandOutput::from_stdout(stdout))
-                            .with_exit_status(Some(1)),
-                    );
+                    error_exit_status = true;
+                } else {
+                    return Response::Error(ErrorResponse { error });
                 }
-                return Response::Error(ErrorResponse { error });
+            } else {
+                append_error_output(&mut stdout, &error);
+                error_exit_status = true;
             }
-            append_error_output(&mut stdout, &error);
+        }
+        if let Some(error) = super::aggregate_rmux_errors(stderr_errors) {
+            self.log_source_file_error_messages(&error, invoked_from_sourced_shell)
+                .await;
+            if strict_errors {
+                append_execution_error_output(&mut stderr, &error);
+                error_exit_status = true;
+            } else {
+                append_error_output(&mut stdout, &error);
+                error_exit_status = true;
+            }
         }
 
-        let response = if stdout.is_empty() {
-            SourceFileResponse::no_output()
-        } else {
-            SourceFileResponse::from_output(CommandOutput::from_stdout(stdout))
-        };
-        Response::SourceFile(response.with_exit_status(nonzero_exit_status(exit_status)))
+        let exit_status = nonzero_exit_status(exit_status)
+            .or_else(|| (error_exit_status || !stderr.is_empty()).then_some(1));
+        Response::SourceFile(source_file_response(stdout, stderr, exit_status))
     }
 
     pub(super) async fn implicit_source_file_target(
@@ -310,7 +334,8 @@ impl RequestHandler {
         let mut loaded = self
             .load_nested_source_file_command(&command, depth, explicit_target)
             .await?;
-        let mut errors = Vec::new();
+        let mut source_file_errors = Vec::new();
+        let mut execution_errors = Vec::new();
         let load_error = loaded.take_error();
 
         let mut batches = Vec::new();
@@ -333,23 +358,29 @@ impl RequestHandler {
                 .await
             {
                 Ok(()) => batches.push((batch.commands, batch_context)),
-                Err(error) => errors.push(error),
+                Err(error) => source_file_errors.push(error),
             }
-            if command.parse_only && !errors.is_empty() {
+            if command.parse_only && !source_file_errors.is_empty() {
                 break;
             }
         }
         if let Some(error) = load_error {
-            if !command.parse_only || errors.is_empty() {
-                errors.push(error);
+            if !command.parse_only || source_file_errors.is_empty() {
+                if source_error_has_line_prefix(&error) {
+                    source_file_errors.push(error);
+                } else {
+                    execution_errors.push(error);
+                }
             }
         }
-        let error = super::aggregate_rmux_errors(errors);
+        let error = super::aggregate_rmux_errors(execution_errors);
+        let source_file_error = super::aggregate_rmux_errors(source_file_errors);
 
         if command.parse_only || batches.is_empty() {
             return Ok(QueueCommandAction::Normal {
                 output: nonempty_stdout(loaded.stdout),
                 error,
+                source_file_error,
                 exit_status: None,
             });
         }
@@ -358,6 +389,7 @@ impl RequestHandler {
             batches,
             output: nonempty_stdout(loaded.stdout),
             error,
+            source_file_error,
             exit_status: None,
         })
     }
@@ -370,7 +402,8 @@ impl RequestHandler {
         depth: usize,
     ) -> SourceFileExecution {
         let mut stdout = Vec::new();
-        let mut errors = Vec::new();
+        let mut source_file_errors = Vec::new();
+        let mut execution_errors = Vec::new();
         let mut exit_status = None;
         for batch in loaded.commands {
             let batch_context = context.for_sourced_commands(depth, batch.current_file);
@@ -385,7 +418,7 @@ impl RequestHandler {
                 )
                 .await
             {
-                errors.push(error);
+                source_file_errors.push(error);
                 continue;
             }
             let result = self
@@ -400,8 +433,11 @@ impl RequestHandler {
             if let Some(status) = result.exit_status {
                 exit_status = Some(status);
             }
-            if let Some(error) = result.error {
-                errors.push(error);
+            if let Some(error) = result.source_file_error {
+                source_file_errors.push(error);
+            }
+            if let Some(error) = result.execution_error {
+                execution_errors.push(error);
             }
             if !context.uses_explicit_current_target() {
                 context = context.with_implicit_current_target(
@@ -412,10 +448,10 @@ impl RequestHandler {
             }
         }
 
-        let error = super::aggregate_rmux_errors(errors);
         SourceFileExecution {
             output: CommandOutput::from_stdout(stdout),
-            error,
+            source_file_error: super::aggregate_rmux_errors(source_file_errors),
+            execution_error: super::aggregate_rmux_errors(execution_errors),
             exit_status,
         }
     }
@@ -509,6 +545,7 @@ impl RequestHandler {
         &self,
         command: &ParsedSourceFileCommand,
         depth: usize,
+        origin: ConfigLoadOrigin,
     ) -> Result<LoadedSourceFile, RmuxError> {
         if depth > super::SOURCE_FILE_NESTING_LIMIT {
             return Err(RmuxError::Server("too many nested files".to_owned()));
@@ -527,7 +564,7 @@ impl RequestHandler {
             } else {
                 path.clone()
             };
-            let inputs = match source_inputs_for_path(
+            let read = match source_inputs_for_path_with_diagnostics(
                 &expanded_path,
                 command.caller_cwd.as_deref(),
                 command.quiet,
@@ -536,10 +573,14 @@ impl RequestHandler {
             ) {
                 Ok(inputs) => inputs,
                 Err(error) => {
-                    loaded.push_error(error);
+                    loaded.push_read_error(error);
                     continue;
                 }
             };
+            if let Some(error) = read.error {
+                loaded.push_read_error(error);
+            }
+            let inputs = read.inputs;
             if !inputs.is_empty() {
                 loaded.record_loaded_files(inputs.len());
             }
@@ -552,7 +593,13 @@ impl RequestHandler {
                     continue;
                 }
                 let parsed = match self
-                    .parse_source_input(&input, command.target.as_ref(), command.parse_only)
+                    .parse_source_input(
+                        &input,
+                        command.target.as_ref(),
+                        command.parse_only,
+                        command.syntax,
+                        origin == ConfigLoadOrigin::NestedSourceFile,
+                    )
                     .await
                 {
                     Ok(parsed) => parsed,
@@ -565,6 +612,15 @@ impl RequestHandler {
                     loaded.push_parse_error(error);
                 }
                 if parsed.has_fatal_parse_error {
+                    if command.verbose && !command.parse_only {
+                        for commands in parsed.commands {
+                            append_verbose_commands(
+                                &mut loaded.stdout,
+                                &input.current_file,
+                                &commands,
+                            );
+                        }
+                    }
                     continue;
                 }
                 for commands in parsed.commands {
@@ -656,6 +712,8 @@ impl RequestHandler {
         input: &SourceInput,
         target: Option<&PaneTarget>,
         stop_at_first_error: bool,
+        syntax: SourceSyntax,
+        recover_lookup_errors: bool,
     ) -> Result<ParsedSourceInput, RmuxError> {
         let attached_count = if let Some(target) = target {
             self.attached_count(target.session_name()).await
@@ -687,8 +745,16 @@ impl RequestHandler {
                 0,
                 &mut parsed,
             );
+        } else if syntax == SourceSyntax::TmuxCompat || recover_lookup_errors {
+            parse_source_fragment_recovering_lookup_errors(
+                &parser,
+                input,
+                &input.contents,
+                0,
+                &mut parsed,
+            );
         } else {
-            parse_source_fragment_recovering(&parser, input, &input.contents, 0, &mut parsed);
+            parse_source_fragment_for_execution(&parser, input, &input.contents, 0, &mut parsed);
         }
         Ok(parsed)
     }
@@ -1082,7 +1148,8 @@ struct ParsedSourceInput {
 
 struct SourceFileExecution {
     output: CommandOutput,
-    error: Option<RmuxError>,
+    source_file_error: Option<RmuxError>,
+    execution_error: Option<RmuxError>,
     exit_status: Option<i32>,
 }
 
@@ -1090,7 +1157,76 @@ fn nonzero_exit_status(exit_status: Option<i32>) -> Option<i32> {
     exit_status.filter(|status| *status != 0)
 }
 
-fn parse_source_fragment_recovering(
+fn source_file_response(
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit_status: Option<i32>,
+) -> SourceFileResponse {
+    let response = if stdout.is_empty() {
+        SourceFileResponse::no_output()
+    } else {
+        SourceFileResponse::from_output(CommandOutput::from_stdout(stdout))
+    };
+    response.with_stderr(stderr).with_exit_status(exit_status)
+}
+
+fn append_execution_error_output(stderr: &mut Vec<u8>, error: &RmuxError) {
+    for line in config_error_lines(error) {
+        let line = strip_execution_error_prefixes(&line);
+        stderr.extend_from_slice(line.as_bytes());
+        stderr.push(b'\n');
+    }
+}
+
+fn strip_execution_error_prefixes(line: &str) -> &str {
+    let line = strip_source_file_line_prefix(line);
+    let Some(rest) = line.strip_prefix("invalid target '") else {
+        return line;
+    };
+    match rest.split_once("': ") {
+        Some((_, reason)) => reason,
+        None => line,
+    }
+}
+
+fn strip_source_file_line_prefix(line: &str) -> &str {
+    let Some((_, rest)) = line.split_once(':') else {
+        return line;
+    };
+    let Some((line_number, message)) = rest.split_once(':') else {
+        return line;
+    };
+    if !line_number.is_empty() && line_number.bytes().all(|byte| byte.is_ascii_digit()) {
+        message.strip_prefix(' ').unwrap_or(message)
+    } else {
+        line
+    }
+}
+
+fn source_error_has_line_prefix(error: &RmuxError) -> bool {
+    error.to_string().lines().any(|line| {
+        let bytes = line.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] != b':' {
+                index += 1;
+                continue;
+            }
+
+            let mut cursor = index + 1;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+                cursor += 1;
+            }
+            if cursor > index + 1 && cursor < bytes.len() && bytes[cursor] == b':' {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    })
+}
+
+fn parse_source_fragment_recovering_lookup_errors(
     parser: &CommandParser,
     input: &SourceInput,
     contents: &str,
@@ -1146,6 +1282,19 @@ fn parse_source_fragment_recovering(
                 }
             }
         }
+    }
+}
+
+fn parse_source_fragment_for_execution(
+    parser: &CommandParser,
+    input: &SourceInput,
+    contents: &str,
+    line_offset: usize,
+    parsed: &mut ParsedSourceInput,
+) {
+    parse_source_fragment_until_first_error(parser, input, contents, line_offset, parsed);
+    if !parsed.errors.is_empty() {
+        parsed.has_fatal_parse_error = true;
     }
 }
 
@@ -1206,10 +1355,10 @@ fn split_around_source_command<'a>(
     let structure = parser.parse_source_file_structure(contents).ok()?;
     let commands = structure.commands();
     let (index, command) = commands.iter().enumerate().find(|(index, command)| {
-        let start_line = command.line();
+        let start_line = command.start_line();
         let next_line = commands
             .get(index.saturating_add(1))
-            .map(ParsedCommand::line)
+            .map(ParsedCommand::start_line)
             .unwrap_or_else(|| {
                 contents
                     .lines()
@@ -1219,10 +1368,10 @@ fn split_around_source_command<'a>(
             });
         start_line <= line && line < next_line
     })?;
-    let start = line_start_byte(contents, command.line())?;
+    let start = line_start_byte(contents, command.start_line())?;
     let end_line = commands
         .get(index.saturating_add(1))
-        .map(ParsedCommand::line)
+        .map(ParsedCommand::start_line)
         .unwrap_or_else(|| contents.lines().count().saturating_add(1));
     let end = line_start_byte(contents, end_line).unwrap_or(contents.len());
     if start >= end || start > contents.len() || end > contents.len() {
@@ -1287,9 +1436,7 @@ fn append_verbose_commands(stdout: &mut Vec<u8>, current_file: &str, parsed: &Pa
     if parsed.is_empty() {
         return;
     }
-    for command in parsed.commands() {
-        append_verbose_command(stdout, current_file, command);
-    }
+    append_verbose_command_groups(stdout, current_file, parsed.commands(), None);
 }
 
 fn append_verbose_loaded_commands(
@@ -1299,23 +1446,112 @@ fn append_verbose_loaded_commands(
 ) {
     for batch in &loaded.commands {
         let current_file = batch.current_file.as_deref().unwrap_or_default();
-        for command in batch.commands.commands() {
-            if stop.is_some_and(|stop| {
-                stop.current_file == current_file && command.line() >= stop.line
-            }) {
-                return;
-            }
-            append_verbose_command(stdout, current_file, command);
+        let stop_line = stop
+            .filter(|stop| stop.current_file == current_file)
+            .map(|stop| stop.line);
+        if append_verbose_command_groups(stdout, current_file, batch.commands.commands(), stop_line)
+        {
+            return;
         }
     }
 }
 
-fn append_verbose_command(stdout: &mut Vec<u8>, current_file: &str, command: &ParsedCommand) {
+fn append_verbose_command_groups(
+    stdout: &mut Vec<u8>,
+    current_file: &str,
+    commands: &[ParsedCommand],
+    stop_line: Option<usize>,
+) -> bool {
+    let command_lines = commands.iter().map(ParsedCommand::line).collect::<Vec<_>>();
+    let mut current_line = None;
+    let mut current_raw_line = None;
+    let mut current_commands = Vec::new();
+
+    for (index, command) in commands.iter().enumerate() {
+        if stop_line.is_some_and(|stop_line| command.line() >= stop_line) {
+            append_verbose_group(stdout, current_file, current_line, &current_commands);
+            return true;
+        }
+
+        let raw_line = command.line();
+        if current_raw_line.is_some_and(|line| line != raw_line) {
+            append_verbose_group(stdout, current_file, current_line, &current_commands);
+            current_commands.clear();
+        }
+
+        for argument in command.arguments() {
+            if let CommandArgument::Commands(commands) = argument {
+                if append_verbose_command_groups(
+                    stdout,
+                    current_file,
+                    commands.commands(),
+                    stop_line,
+                ) {
+                    return true;
+                }
+            }
+        }
+
+        current_line = Some(verbose_line_for_command(command, &command_lines, index));
+        current_raw_line = Some(raw_line);
+        current_commands.push(command.to_tmux_string());
+    }
+
+    append_verbose_group(stdout, current_file, current_line, &current_commands);
+    false
+}
+
+fn verbose_line_for_command(
+    command: &ParsedCommand,
+    command_lines: &[usize],
+    index: usize,
+) -> usize {
+    let raw_line = command.line();
+    let has_same_line_neighbor = index
+        .checked_sub(1)
+        .and_then(|previous| command_lines.get(previous))
+        .is_some_and(|line| *line == raw_line)
+        || command_lines
+            .get(index.saturating_add(1))
+            .is_some_and(|line| *line == raw_line);
+    if !has_same_line_neighbor {
+        if let Some(line) = last_nested_command_line(command) {
+            return line;
+        }
+    }
+    raw_line
+}
+
+fn last_nested_command_line(command: &ParsedCommand) -> Option<usize> {
+    command.arguments().iter().rev().find_map(|argument| {
+        let CommandArgument::Commands(commands) = argument else {
+            return None;
+        };
+        last_command_line(commands)
+    })
+}
+
+fn last_command_line(commands: &ParsedCommands) -> Option<usize> {
+    commands
+        .commands()
+        .last()
+        .map(|command| last_nested_command_line(command).unwrap_or_else(|| command.line()))
+}
+
+fn append_verbose_group(
+    stdout: &mut Vec<u8>,
+    current_file: &str,
+    line: Option<usize>,
+    commands: &[String],
+) {
+    let Some(line) = line else {
+        return;
+    };
     stdout.extend_from_slice(current_file.as_bytes());
     stdout.push(b':');
-    stdout.extend_from_slice(command.line().to_string().as_bytes());
+    stdout.extend_from_slice(line.to_string().as_bytes());
     stdout.extend_from_slice(b": ");
-    stdout.extend_from_slice(command.to_tmux_string().as_bytes());
+    stdout.extend_from_slice(commands.join(" ; ").as_bytes());
     stdout.push(b'\n');
 }
 
@@ -1464,7 +1700,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_startup_config_lookup_errors_continue_after_bad_command() {
+    async fn explicit_startup_config_lookup_errors_stop_before_later_commands() {
         let _lock = crate::test_env::lock_async().await;
         let root = unique_temp_root("explicit-load-error");
         let config_path = root.join("bad.conf");
@@ -1496,8 +1732,8 @@ mod tests {
         let state = handler.state.lock().await;
         assert_eq!(
             state.options.global_value(OptionName::Status),
-            Some("off"),
-            "startup config must retain lookup errors and continue with later commands"
+            None,
+            "startup config must retain lookup errors and stop before later commands"
         );
 
         let _ = fs::remove_dir_all(root);

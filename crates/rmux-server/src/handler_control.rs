@@ -456,7 +456,12 @@ impl RequestHandler {
                 self.exit_control_session(session_name, None).await;
                 self.refresh_all_control_sessions().await;
             }
-            LifecycleEvent::ClientAttached { .. }
+            LifecycleEvent::ClientActive { .. }
+            | LifecycleEvent::ClientAttached { .. }
+            | LifecycleEvent::ClientFocusIn { .. }
+            | LifecycleEvent::ClientFocusOut { .. }
+            | LifecycleEvent::ClientLightTheme { .. }
+            | LifecycleEvent::ClientDarkTheme { .. }
             | LifecycleEvent::AlertBell { .. }
             | LifecycleEvent::AlertActivity { .. }
             | LifecycleEvent::AlertSilence { .. }
@@ -464,6 +469,7 @@ impl RequestHandler {
             | LifecycleEvent::PaneDied { .. }
             | LifecycleEvent::PaneFocusIn { .. }
             | LifecycleEvent::PaneFocusOut { .. }
+            | LifecycleEvent::PaneSetClipboard { .. }
             | LifecycleEvent::PaneTitleChanged { .. }
             | LifecycleEvent::WindowResized { .. }
             | LifecycleEvent::AfterSelectWindow { .. }

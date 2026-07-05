@@ -3,10 +3,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rmux_core::{encode_paste_bytes, GridRenderOptions, LifecycleEvent, ScreenCaptureRange};
+use rmux_core::{encode_paste_bytes, LifecycleEvent, ScreenCaptureRange};
 use rmux_proto::{
     CapturePaneResponse, ClearHistoryResponse, CommandOutput, DeleteBufferResponse, ErrorResponse,
-    ListBuffersResponse, LoadBufferResponse, OptionName, PasteBufferResponse, Response, RmuxError,
+    ListBuffersResponse, LoadBufferResponse, PasteBufferResponse, Response, RmuxError,
     SaveBufferResponse, SetBufferResponse, ShowBufferResponse,
 };
 
@@ -16,9 +16,12 @@ use crate::outer_terminal::OuterTerminal;
 use crate::pane_io::AttachControl;
 use crate::pane_terminals::{session_not_found, PaneCaptureRequest};
 
+#[path = "handler_buffer/capture_format.rs"]
+mod capture_format;
 #[path = "handler_buffer/list.rs"]
 mod list;
 
+use capture_format::{apply_capture_format_flags, capture_render_options, parse_buffer_limit};
 use list::{
     command_output_from_lines, render_list_buffer_line, sort_buffer_entries, BufferSortOrder,
 };
@@ -103,6 +106,12 @@ impl RequestHandler {
                 });
             }
 
+            if request.name.is_none() && state.buffers.is_empty() {
+                return Response::PasteBuffer(PasteBufferResponse {
+                    buffer_name: String::new(),
+                });
+            }
+
             let (name, content, order) =
                 match state.buffers.show_with_order(request.name.as_deref()) {
                     Ok((name, content, order)) => (name.to_owned(), content.to_vec(), order),
@@ -177,15 +186,18 @@ impl RequestHandler {
         let sort_order = match BufferSortOrder::parse(request.sort_order.as_deref()) {
             Some(order) => order,
             None => {
-                let value = request.sort_order.unwrap_or_default();
                 return Response::Error(ErrorResponse {
-                    error: RmuxError::Server(format!("invalid sort order: {value}")),
+                    error: RmuxError::Server(rmux_core::INVALID_SORT_ORDER.to_owned()),
                 });
             }
         };
 
         let mut entries = state.buffers.entries();
-        sort_buffer_entries(&mut entries, sort_order, request.reversed);
+        sort_buffer_entries(
+            &mut entries,
+            sort_order,
+            request.reversed && request.sort_order.is_some(),
+        );
         let lines = entries
             .into_iter()
             .filter_map(|entry| render_list_buffer_line(&state, &request, entry))
@@ -284,7 +296,7 @@ impl RequestHandler {
         &self,
         request: rmux_proto::CapturePaneRequest,
     ) -> Response {
-        let content = {
+        let (mut content, line_flags) = {
             let mut state = self.state.lock().await;
             let range = ScreenCaptureRange {
                 start: request.start,
@@ -293,22 +305,31 @@ impl RequestHandler {
                 end_is_absolute: request.end_is_absolute,
             };
             let options = capture_render_options(&request);
-            match state.capture_transcript_for_command(
-                &request.target,
-                PaneCaptureRequest {
-                    range,
-                    options,
-                    alternate: request.alternate,
-                    use_mode_screen: request.use_mode_screen,
-                    pending_input: request.pending_input,
-                    quiet: request.quiet,
-                    escape_pending: request.escape_sequences,
-                },
-            ) {
-                Ok(content) => content,
-                Err(error) => return Response::Error(ErrorResponse { error }),
-            }
+            let capture_request = PaneCaptureRequest {
+                range,
+                options,
+                alternate: request.alternate,
+                use_mode_screen: request.use_mode_screen,
+                pending_input: request.pending_input,
+                quiet: request.quiet,
+                escape_pending: request.escape_sequences,
+            };
+            let line_flags = if request.include_format {
+                match state.capture_line_format_flags(&request.target, capture_request) {
+                    Ok(flags) => Some(flags),
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                }
+            } else {
+                None
+            };
+            let content =
+                match state.capture_transcript_for_command(&request.target, capture_request) {
+                    Ok(content) => content,
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                };
+            (content, line_flags)
         };
+        apply_capture_format_flags(&mut content, &request, line_flags.as_deref());
 
         if request.print {
             let mut stdout = content;
@@ -439,26 +460,6 @@ impl RequestHandler {
             )
             .await;
     }
-}
-
-fn capture_render_options(request: &rmux_proto::CapturePaneRequest) -> GridRenderOptions {
-    let join_wrapped = request.join_wrapped;
-    GridRenderOptions {
-        join_wrapped,
-        with_sequences: request.escape_ansi,
-        escape_sequences: request.escape_sequences,
-        include_empty_cells: !join_wrapped && !request.preserve_trailing_spaces,
-        use_tmux_cell_capacity: request.do_not_trim_spaces,
-        trim_spaces: !join_wrapped && !request.do_not_trim_spaces,
-    }
-}
-
-fn parse_buffer_limit(state: &crate::pane_terminals::HandlerState) -> usize {
-    state
-        .options
-        .resolve(None, OptionName::BufferLimit)
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(50)
 }
 
 fn resolve_buffer_path(path: &str, cwd: Option<&Path>) -> PathBuf {

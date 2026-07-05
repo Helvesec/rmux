@@ -28,7 +28,7 @@ pub(super) fn should_emit_overlay(
     current_overlay_generation: &mut u64,
     overlay: &OverlayFrame,
 ) -> bool {
-    if overlay.render_generation != render_generation {
+    if overlay.render_generation < render_generation {
         return false;
     }
     if overlay.overlay_generation < *current_overlay_generation {

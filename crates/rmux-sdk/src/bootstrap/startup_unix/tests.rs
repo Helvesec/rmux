@@ -41,6 +41,21 @@ async fn startup_lock_path_uses_sibling_filename() {
 }
 
 #[test]
+fn bare_relative_socket_path_uses_current_directory_parent() {
+    let socket = Path::new("bare.sock");
+
+    assert_eq!(
+        socket_parent_or_current(socket).expect("parent"),
+        Path::new(".")
+    );
+    assert_eq!(
+        startup_lock_path(socket),
+        PathBuf::from("bare.sock.startup-lock")
+    );
+    assert!(can_probe_existing_socket_before_startup_validation(socket));
+}
+
+#[test]
 fn shared_sticky_parent_uses_private_lock_directory() {
     let tmp = PathBuf::from("/tmp");
     let metadata = fs::symlink_metadata(&tmp).expect("stat /tmp");

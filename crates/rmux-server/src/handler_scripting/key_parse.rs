@@ -248,9 +248,9 @@ pub(super) fn parse_list_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
     let mut first_only = false;
     let mut include_unnoted = false;
     let mut notes = false;
-    let reversed = false;
-    let format = None;
-    let sort_order = None;
+    let mut reversed = false;
+    let mut format = None;
+    let mut sort_order = None;
     let mut prefix = None;
 
     while let Some(token) = args.peek() {
@@ -272,16 +272,25 @@ pub(super) fn parse_list_keys(mut args: CommandTokens) -> Result<Request, RmuxEr
                 notes = true;
             }
             "-r" => {
-                return Err(unsupported_flag("list-keys", "-r"));
+                let _ = args.optional();
+                reversed = true;
             }
             "-F" => {
-                return Err(unsupported_flag("list-keys", "-F"));
+                let _ = args.optional();
+                format = Some(args.required("-F format")?);
             }
-            flag if flag.starts_with("-F") => return Err(unsupported_flag("list-keys", "-F")),
-            "-O" | "-Oname" => {
-                return Err(unsupported_flag("list-keys", "-O"));
+            flag if flag.starts_with("-F") => {
+                let flag = args.optional().expect("peeked list-keys -F flag exists");
+                format = Some(flag[2..].to_owned());
             }
-            flag if flag.starts_with("-O") => return Err(unsupported_flag("list-keys", "-O")),
+            "-O" => {
+                let _ = args.optional();
+                sort_order = Some(args.required("-O order")?);
+            }
+            flag if flag.starts_with("-O") => {
+                let flag = args.optional().expect("peeked list-keys -O flag exists");
+                sort_order = Some(flag[2..].to_owned());
+            }
             "-P" => {
                 let _ = args.optional();
                 prefix = Some(args.required("-P prefix")?);

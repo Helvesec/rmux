@@ -23,7 +23,7 @@ use rmux_client::INTERNAL_DAEMON_FLAG;
 use rmux_core::command_parser::COMMAND_TABLE;
 use rmux_proto::{
     encode_frame, ErrorResponse, FrameDecoder, Request, Response, RmuxError, CONTROL_CONTROL_END,
-    CONTROL_CONTROL_START, RMUX_WIRE_VERSION,
+    CONTROL_CONTROL_START, RMUX_FRAME_MAGIC, RMUX_WIRE_VERSION,
 };
 use rmux_pty::TerminalSize;
 
@@ -94,12 +94,15 @@ fn spawn_incompatible_wire_server(socket_path: &Path) -> io::Result<JoinHandle<i
             decoder.push_bytes(&buffer[..bytes_read]);
         }
 
-        write_legacy_incompatible_wire_response(&mut stream)
+        write_legacy_incompatible_wire_response(&mut stream, 1)
     });
     Ok(handle)
 }
 
-fn write_legacy_incompatible_wire_response(stream: &mut impl Write) -> io::Result<()> {
+fn write_legacy_incompatible_wire_response(
+    stream: &mut impl Write,
+    wire_version: u8,
+) -> io::Result<()> {
     let response = Response::Error(ErrorResponse {
         error: RmuxError::UnsupportedWireVersion {
             got: RMUX_WIRE_VERSION,
@@ -115,8 +118,79 @@ fn write_legacy_incompatible_wire_response(stream: &mut impl Write) -> io::Resul
             "unexpected encoded RMUX wire envelope",
         ));
     }
-    frame[1] = 1;
+    frame[1] = wire_version;
     stream.write_all(&frame)
+}
+
+fn spawn_wire_v3_kill_server(socket_path: &Path) -> io::Result<JoinHandle<io::Result<()>>> {
+    if let Some(parent) = socket_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _ = fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path)?;
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept()?;
+        let mut decoder = FrameDecoder::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match decoder.next_frame::<Request>() {
+                Ok(Some(Request::KillServer(_))) => break,
+                Ok(Some(request)) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("expected kill-server request, got {request:?}"),
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, error));
+                }
+            }
+
+            let bytes_read = stream.read(&mut buffer)?;
+            if bytes_read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "client closed before sending first kill-server request",
+                ));
+            }
+            decoder.push_bytes(&buffer[..bytes_read]);
+        }
+        write_legacy_incompatible_wire_response(&mut stream, 3)?;
+        drop(stream);
+
+        let (mut stream, _) = listener.accept()?;
+        let bytes_read = stream.read(&mut buffer)?;
+        if bytes_read < 10 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "wire-v3 kill-server fallback frame was truncated",
+            ));
+        }
+        if buffer[0] != RMUX_FRAME_MAGIC || buffer[1] != 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "expected wire-v3 RMUX envelope, got magic={:?} version={:?}",
+                    buffer.first(),
+                    buffer.get(1)
+                ),
+            ));
+        }
+        let length = u32::from_le_bytes(
+            buffer[2..6]
+                .try_into()
+                .expect("wire-v3 test frame includes fixed length"),
+        );
+        if length != 4 || buffer[6..10] != 72_u32.to_le_bytes() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "wire-v3 fallback did not send a kill-server request",
+            ));
+        }
+        Ok(())
+    });
+    Ok(handle)
 }
 
 fn spawn_alias_fallback_incompatible_wire_server(
@@ -398,8 +472,16 @@ fn list_keys_uses_default_table_without_server() -> Result<(), Box<dyn Error>> {
     assert!(stdout(&output).contains("bind-key    -T prefix Space   next-layout"));
     assert!(stdout(&output).contains("bind-key    -T prefix q       display-panes"));
     assert!(stdout(&output).contains("bind-key    -T prefix M-5     select-layout tiled"));
-    assert!(!stdout(&output).contains("bind-key    -T prefix M-6"));
-    assert!(!stdout(&output).contains("bind-key    -T prefix M-7"));
+    assert!(stdout(&output)
+        .contains("bind-key    -T prefix M-6     select-layout main-horizontal-mirrored"));
+    assert!(stdout(&output)
+        .contains("bind-key    -T prefix M-7     select-layout main-vertical-mirrored"));
+    assert!(
+        !stdout(&output).contains("new-pane"),
+        "new-pane is deferred in the tmux-3.7 ledger and must not be advertised"
+    );
+    assert!(stdout(&output).contains("bind-key    -T prefix \\\"      split-window"));
+    assert!(stdout(&output).contains("bind-key    -T prefix \\~      show-messages"));
     assert!(stderr(&output).is_empty());
     assert!(!harness.socket_path().exists());
     Ok(())
@@ -411,14 +493,15 @@ fn list_keys_help_and_inventory_match_supported_flags() -> Result<(), Box<dyn Er
 
     let help = harness.run(&["list-keys", "--help"])?;
     assert_eq!(help.status.code(), Some(0));
-    assert!(!stdout(&help).contains("-F <FORMAT>"));
-    assert!(!stdout(&help).contains("-O <SORT_ORDER>"));
-    assert!(!stdout(&help).contains("-r"));
+    assert!(stdout(&help).contains("-F <FORMAT>"));
+    assert!(stdout(&help).contains("-O <SORT_ORDER>"));
+    assert!(stdout(&help).contains("-r"));
 
     let inventory = harness.run(&["list-commands", "list-keys"])?;
     assert_eq!(inventory.status.code(), Some(0));
-    assert!(!stdout(&inventory).contains("[-F format]"));
-    assert!(!stdout(&inventory).contains("[-O"));
+    assert!(stdout(&inventory).contains("[-1aNr]"));
+    assert!(stdout(&inventory).contains("[-F format]"));
+    assert!(stdout(&inventory).contains("[-O order]"));
     assert!(stderr(&inventory).is_empty());
     Ok(())
 }
@@ -445,9 +528,65 @@ fn list_keys_matches_tmux_table_errors_notes_and_first_line_alignment() -> Resul
     assert_eq!(first.status.code(), Some(0));
     assert_eq!(
         stdout(&first),
-        "bind-key    -T prefix C-b     send-prefix\n"
+        "bind-key    -T prefix Space   next-layout\n"
     );
     assert!(stderr(&first).is_empty());
+    assert!(!harness.socket_path().exists());
+    Ok(())
+}
+
+#[test]
+fn list_keys_key_filter_matches_all_tables_without_explicit_table() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("list-keys-key-filter")?;
+
+    let all_tables = harness.run(&["list-keys", "C-b"])?;
+    assert_eq!(all_tables.status.code(), Some(0));
+    assert!(stdout(&all_tables).contains("-T copy-mode    C-b send-keys -X cursor-left"));
+    assert!(stdout(&all_tables).contains("-T copy-mode-vi C-b send-keys -X page-up"));
+    assert!(stdout(&all_tables).contains("-T prefix       C-b send-prefix"));
+    assert!(stderr(&all_tables).is_empty());
+
+    let absent_bound = harness.run(&["list-keys", "-T", "prefix", "d"])?;
+    assert_eq!(absent_bound.status.code(), Some(0));
+    assert!(stdout(&absent_bound).is_empty());
+    assert!(stderr(&absent_bound).is_empty());
+
+    let absent_unbound = harness.run(&["list-keys", "-T", "prefix", "F12"])?;
+    assert_eq!(absent_unbound.status.code(), Some(0));
+    assert!(stdout(&absent_unbound).is_empty());
+    assert!(stderr(&absent_unbound).is_empty());
+
+    let invalid = harness.run(&["list-keys", "no-such-key!!"])?;
+    assert_eq!(invalid.status.code(), Some(1));
+    assert_eq!(stderr(&invalid), "invalid key: no-such-key!!\n");
+
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let connected_all_tables = harness.run(&["list-keys", "C-b"])?;
+    assert_eq!(connected_all_tables.status.code(), Some(0));
+    assert!(stdout(&connected_all_tables).contains("-T prefix       C-b send-prefix"));
+    assert!(stderr(&connected_all_tables).is_empty());
+
+    let connected = harness.run(&["list-keys", "-T", "prefix", "d"])?;
+    assert_eq!(connected.status.code(), Some(0));
+    assert!(stdout(&connected).is_empty());
+    assert!(stderr(&connected).is_empty());
+    Ok(())
+}
+
+#[test]
+fn list_keys_bare_reverse_does_not_reverse_default_order_without_server(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("list-keys-bare-reverse")?;
+
+    let default = harness.run(&["list-keys", "-T", "prefix"])?;
+    assert_eq!(default.status.code(), Some(0));
+    assert!(stderr(&default).is_empty());
+
+    let bare_reverse = harness.run(&["list-keys", "-r", "-T", "prefix"])?;
+    assert_eq!(bare_reverse.status.code(), Some(0));
+    assert_eq!(stdout(&bare_reverse), stdout(&default));
+    assert!(stderr(&bare_reverse).is_empty());
     assert!(!harness.socket_path().exists());
     Ok(())
 }
@@ -515,8 +654,17 @@ fn bind_key_canonicalizes_ctrl_bracket_as_escape() -> Result<(), Box<dyn Error>>
     assert_success(&harness.run(&["bind-key", "C-[", "display-message", "escape"])?);
     let output = harness.run(&["list-keys"])?;
     assert_eq!(output.status.code(), Some(0));
-    assert!(stdout(&output).contains("Escape"));
-    assert!(!stdout(&output).contains("C-["));
+    let rendered = stdout(&output);
+    assert!(rendered.lines().any(|line| {
+        line.contains("-T prefix")
+            && line.contains("Escape")
+            && line.ends_with("display-message escape")
+    }));
+    assert!(!rendered.lines().any(|line| {
+        line.contains("-T prefix")
+            && line.contains("C-[")
+            && line.ends_with("display-message escape")
+    }));
     assert!(stderr(&output).is_empty());
 
     terminate_child(daemon.child_mut())?;
@@ -793,6 +941,18 @@ fn kill_server_shuts_down_daemon_and_cleans_socket() -> Result<(), Box<dyn Error
 }
 
 #[test]
+fn kill_server_falls_back_to_wire_v3_shutdown_for_0_8_daemon() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("kill-server-wire-v3-fallback")?;
+    let server = spawn_wire_v3_kill_server(harness.socket_path())?;
+
+    let output = harness.run(&["kill-server"])?;
+
+    assert_success(&output);
+    server.join().expect("fake wire-v3 server should exit")?;
+    Ok(())
+}
+
+#[test]
 fn server_access_list_succeeds_against_running_server() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("server-access-list")?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -821,51 +981,34 @@ fn server_access_missing_user_is_reported_like_tmux() -> Result<(), Box<dyn Erro
 }
 
 #[test]
-fn server_access_target_flag_reports_tmux_unknown_flag() -> Result<(), Box<dyn Error>> {
+fn server_access_target_flag_is_accepted_like_tmux() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("server-access-target-flag")?;
+    let _daemon = harness.start_hidden_daemon()?;
 
-    let output = harness.run(&["server-access", "-t", "%0", "-l"])?;
+    let output = harness.run(&["server-access", "-t", "%0", "-l", "ignored-user"])?;
 
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stdout(&output).is_empty());
-    assert_eq!(stderr(&output), "command server-access: unknown flag -t\n");
-
-    let output_with_user = harness.run(&["server-access", "-t", "%0", "root"])?;
-    assert_eq!(output_with_user.status.code(), Some(1));
-    assert!(stdout(&output_with_user).is_empty());
-    assert_eq!(
-        stderr(&output_with_user),
-        "command server-access: unknown flag -t\n"
-    );
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty());
     Ok(())
 }
 
 #[test]
-fn tmux_invalid_listing_flags_are_rejected_by_cli_parser() -> Result<(), Box<dyn Error>> {
+fn invalid_listing_flags_are_rejected_by_cli_parser() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("invalid-listing-flags")?;
 
-    for (args, expected) in [
-        (
-            &["list-clients", "-r"][..],
-            "command list-clients: unknown flag -r\n",
-        ),
-        (
-            &["list-buffers", "-O", "name"][..],
-            "command list-buffers: unknown flag -O\n",
-        ),
-        (
-            &["list-keys", "-O", "name"][..],
-            "command list-keys: unknown flag -O\n",
-        ),
-        (
-            &["list-keys", "-F", "#{key_table}"][..],
-            "command list-keys: unknown flag -F\n",
-        ),
+    for args in [
+        &["list-clients", "-Q"][..],
+        &["list-buffers", "-Q"][..],
+        &["list-sessions", "-Q"][..],
     ] {
         let output = harness.run(args)?;
         assert_eq!(output.status.code(), Some(1), "args={args:?}");
         assert!(stdout(&output).is_empty(), "args={args:?}");
-        assert_eq!(stderr(&output), expected, "args={args:?}");
+        assert!(
+            stderr(&output).contains("unexpected argument '-Q'"),
+            "args={args:?}, stderr={}",
+            stderr(&output)
+        );
     }
     Ok(())
 }
@@ -900,6 +1043,67 @@ fn current_target_commands_accept_tmux_style_implicit_defaults() -> Result<(), B
     assert_eq!(windows.status.code(), Some(0));
     assert!(stderr(&windows).is_empty());
     assert_eq!(stdout(&windows).lines().count(), 1);
+    Ok(())
+}
+
+#[test]
+fn direct_cli_list_windows_and_panes_forward_sort_and_reverse() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("direct-list-sort-reverse")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-n", "z"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha", "-n", "a"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha", "-n", "m"])?);
+
+    let windows = harness.run(&[
+        "list-windows",
+        "-t",
+        "alpha",
+        "-O",
+        "name",
+        "-F",
+        "#{window_name}",
+    ])?;
+    assert_eq!(windows.status.code(), Some(0));
+    assert!(stderr(&windows).is_empty());
+    assert_eq!(stdout(&windows), "a\nm\nz\n");
+
+    let invalid = harness.run(&["list-windows", "-t", "alpha", "-O", "bogus"])?;
+    assert_eq!(invalid.status.code(), Some(1));
+    assert_eq!(stderr(&invalid), "invalid sort order\n");
+
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:0"])?);
+    let panes = harness.run(&[
+        "list-panes",
+        "-t",
+        "alpha:0",
+        "-O",
+        "index",
+        "-r",
+        "-F",
+        "#{pane_index}",
+    ])?;
+    assert_eq!(panes.status.code(), Some(0));
+    assert!(stderr(&panes).is_empty());
+    assert_eq!(stdout(&panes), "1\n0\n");
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "beta", "-n", "b"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "beta", "-n", "c"])?);
+    let all_windows = harness.run(&[
+        "list-windows",
+        "-a",
+        "-O",
+        "name",
+        "-F",
+        "#{session_name}:#{window_name}",
+    ])?;
+    assert_eq!(all_windows.status.code(), Some(0));
+    assert!(stderr(&all_windows).is_empty());
+    assert_eq!(
+        stdout(&all_windows),
+        "alpha:a\nbeta:b\nbeta:c\nalpha:m\nalpha:z\n"
+    );
+
     Ok(())
 }
 
@@ -962,6 +1166,20 @@ fn non_start_server_command_does_not_auto_start() -> Result<(), Box<dyn Error>> 
         !harness.pid_path().exists(),
         "list-sessions must not launch the daemon"
     );
+    assert!(!harness.socket_path().exists());
+    Ok(())
+}
+
+#[test]
+fn bare_semicolon_requires_existing_server_without_autostart() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("bare-semicolon-no-start")?;
+    let _cleanup = harness.auto_start_cleanup()?;
+
+    let output = harness.run(&[";"])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_absent_server_error(&output, &harness, ";");
+    assert!(stdout(&output).is_empty());
     assert!(!harness.socket_path().exists());
     Ok(())
 }
@@ -1099,6 +1317,52 @@ fn control_mode_uses_tmux_text_protocol() -> Result<(), Box<dyn Error>> {
     assert!(rendered.contains("control-mode-output"));
     assert!(rendered.contains("%exit"));
     assert!(rendered.ends_with(CONTROL_CONTROL_END));
+    Ok(())
+}
+
+#[test]
+fn control_mode_argv_command_uses_initial_flags_zero_frame() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("control-mode-argv-frame")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let output = harness.run(&["-C", "display-message", "-p", "hello"])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty());
+    let rendered = stdout(&output);
+    assert!(
+        !rendered.contains("%begin 1 0\n%end 1 0"),
+        "argv command must not be preceded by an empty flags-0 pair: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("%begin ") && rendered.contains(" 1 0\nhello\n%end "),
+        "argv command output must be inside its flags-0 frame: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains(" 2 1\nhello\n"),
+        "argv command must not be reframed as stdin flags-1: {rendered:?}"
+    );
+
+    let list = harness.run(&[
+        "-C",
+        "display-message",
+        "-p",
+        "one",
+        ";",
+        "display-message",
+        "-p",
+        "two",
+    ])?;
+    assert_eq!(list.status.code(), Some(0));
+    assert!(stderr(&list).is_empty());
+    let rendered = stdout(&list);
+    assert_eq!(
+        rendered.matches(" 0\n").count(),
+        4,
+        "two argv commands should have two begin/end flags-0 pairs: {rendered:?}"
+    );
+    assert!(rendered.contains("one\n"));
+    assert!(rendered.contains("two\n"));
     Ok(())
 }
 
@@ -1809,10 +2073,44 @@ fn show_options_default_shell_reports_resolved_shell() -> Result<(), Box<dyn Err
     assert_eq!(stdout(&shown), format!("{expected_shell}\n"));
     assert!(stderr(&shown).is_empty());
 
+    let all = harness.run(&["show-options", "-g"])?;
+    assert_eq!(all.status.code(), Some(0));
+    assert!(
+        stdout(&all).contains(&format!("default-shell {expected_shell}\n")),
+        "{}",
+        stdout(&all)
+    );
+
     let local = harness.run(&["show-options", "-qv", "default-shell"])?;
     assert_eq!(local.status.code(), Some(0));
     assert!(stdout(&local).is_empty());
     assert!(stderr(&local).is_empty());
+    Ok(())
+}
+
+#[test]
+fn show_options_default_shell_preserves_explicit_value() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("show-options-default-shell-explicit")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let expected_shell = "/tmp/rmux-explicit-shell";
+
+    assert_success(&harness.run(&["set-option", "-g", "default-shell", expected_shell])?);
+
+    let named = harness.run(&["show-options", "-g", "default-shell"])?;
+    assert_eq!(named.status.code(), Some(0));
+    assert_eq!(stdout(&named), format!("default-shell {expected_shell}\n"));
+    assert!(stderr(&named).is_empty());
+
+    let value = harness.run(&["show-options", "-gv", "default-shell"])?;
+    assert_eq!(value.status.code(), Some(0));
+    assert_eq!(stdout(&value), format!("{expected_shell}\n"));
+    assert!(stderr(&value).is_empty());
+
+    let all = harness.run(&["show-options", "-g"])?;
+    assert_eq!(all.status.code(), Some(0));
+    assert!(stdout(&all).contains(&format!("default-shell {expected_shell}\n")));
+    assert!(stderr(&all).is_empty());
+
     Ok(())
 }
 
@@ -2270,6 +2568,200 @@ fn set_option_append_without_server_matches_tmux_connect_surface() -> Result<(),
 }
 
 #[test]
+fn set_option_combined_scope_flags_use_tmux_precedence() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("set-option-combined-scope-precedence")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let server_beats_window =
+        harness.run(&["set-option", "-sw", "-t", "alpha", "status", "off"])?;
+    assert_success(&server_beats_window);
+    let session_status = harness.run(&["show-options", "-v", "-t", "alpha", "status"])?;
+    assert_eq!(stdout(&session_status), "off\n");
+
+    let server_beats_window = harness.run(&["set-option", "-ws", "message-limit", "44"])?;
+    assert_success(&server_beats_window);
+    let server_limit = harness.run(&["show-options", "-sv", "message-limit"])?;
+    assert_eq!(stdout(&server_limit), "44\n");
+
+    let pane_beats_window =
+        harness.run(&["set-option", "-pw", "-t", "alpha:0.0", "@pane", "yes"])?;
+    assert_success(&pane_beats_window);
+    let pane_value = harness.run(&["show-options", "-pv", "-t", "alpha:0.0", "@pane"])?;
+    assert_eq!(stdout(&pane_value), "yes\n");
+
+    Ok(())
+}
+
+#[test]
+fn show_options_global_pane_combination_matches_tmux_scope_precedence() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("show-options-gp-precedence")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    for args in [
+        &["show-options", "-gp"][..],
+        &["show-options", "-gp", "pane-border-style"][..],
+        &["show-options", "-pg", "remain-on-exit"][..],
+    ] {
+        let output = harness.run(args)?;
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        assert!(stdout(&output).is_empty(), "{args:?}: {}", stdout(&output));
+        assert!(stderr(&output).is_empty(), "{args:?}: {}", stderr(&output));
+    }
+
+    let status = harness.run(&["show-options", "-gp", "status"])?;
+    assert_eq!(status.status.code(), Some(0));
+    assert_eq!(stdout(&status), "status on\n");
+    assert!(stderr(&status).is_empty());
+
+    let history_limit = harness.run(&["show-options", "-pg", "history-limit"])?;
+    assert_eq!(history_limit.status.code(), Some(0));
+    assert_eq!(stdout(&history_limit), "history-limit 2000\n");
+    assert!(stderr(&history_limit).is_empty());
+
+    let queued = harness.run(&["run-shell", "-C", "show-options -gp pane-border-style"])?;
+    assert_eq!(queued.status.code(), Some(0));
+    assert!(stdout(&queued).is_empty());
+    assert!(stderr(&queued).is_empty());
+
+    let queued_status = harness.run(&["run-shell", "-C", "show-options -gp status"])?;
+    assert_eq!(queued_status.status.code(), Some(0));
+    assert_eq!(stdout(&queued_status), "status on\n");
+    assert!(stderr(&queued_status).is_empty());
+    Ok(())
+}
+
+#[test]
+fn set_option_explicit_scopes_coerce_known_options_to_natural_table() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("set-option-explicit-scope-known-natural")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let window_status = harness.run(&["set-option", "-w", "-t", "alpha", "status", "off"])?;
+    assert_success(&window_status);
+    let shown_session_status = harness.run(&["show-options", "-v", "-t", "alpha", "status"])?;
+    assert_eq!(stdout(&shown_session_status), "off\n");
+
+    let pane_limit =
+        harness.run(&["set-option", "-p", "-t", "alpha:0.0", "message-limit", "77"])?;
+    assert_success(&pane_limit);
+    let shown_server_limit = harness.run(&["show-options", "-sv", "message-limit"])?;
+    assert_eq!(stdout(&shown_server_limit), "77\n");
+
+    let server_status = harness.run(&["set-option", "-s", "-t", "alpha", "status", "on"])?;
+    assert_success(&server_status);
+    let shown_session_status = harness.run(&["show-options", "-v", "-t", "alpha", "status"])?;
+    assert_eq!(stdout(&shown_session_status), "on\n");
+
+    let compact_target = harness.run(&["set-option", "-talpha", "status", "off"])?;
+    assert_success(&compact_target);
+    let shown_compact_status = harness.run(&["show-options", "-v", "-t", "alpha", "status"])?;
+    assert_eq!(stdout(&shown_compact_status), "off\n");
+
+    let pane_style = harness.run(&[
+        "set-option",
+        "-pg",
+        "-t",
+        "alpha:0.0",
+        "window-style",
+        "bg=blue",
+    ])?;
+    assert_success(&pane_style);
+    let pane_value = harness.run(&["show-options", "-pv", "-t", "alpha:0.0", "window-style"])?;
+    assert_eq!(stdout(&pane_value), "bg=blue\n");
+    let global_value = harness.run(&["show-options", "-gwv", "window-style"])?;
+    assert_eq!(stdout(&global_value), "default\n");
+
+    Ok(())
+}
+
+#[test]
+fn set_option_bare_choice_toggles_by_index_like_tmux() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("set-option-choice-index-toggle")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    assert_success(&harness.run(&["set-option", "-w", "mode-keys"])?);
+    let mode_keys = harness.run(&["show-options", "-wqv", "mode-keys"])?;
+    assert_eq!(stdout(&mode_keys), "vi\n");
+
+    assert_success(&harness.run(&["set-option", "-g", "status-position"])?);
+    let status_position = harness.run(&["show-options", "-gqv", "status-position"])?;
+    assert_eq!(stdout(&status_position), "top\n");
+
+    assert_success(&harness.run(&["set-option", "-g", "set-clipboard", "external"])?);
+    assert_success(&harness.run(&["set-option", "-g", "set-clipboard"])?);
+    let clipboard_off = harness.run(&["show-options", "-gqv", "set-clipboard"])?;
+    assert_eq!(stdout(&clipboard_off), "off\n");
+
+    assert_success(&harness.run(&["set-option", "-g", "set-clipboard", "on"])?);
+    assert_success(&harness.run(&["set-option", "-g", "set-clipboard"])?);
+    let clipboard_on = harness.run(&["show-options", "-gqv", "set-clipboard"])?;
+    assert_eq!(stdout(&clipboard_on), "on\n");
+
+    Ok(())
+}
+
+#[test]
+fn show_options_quotes_tmux37_special_values_and_sorts_user_options_first(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("show-options-tmux37-quoting")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    for (name, value) in [
+        ("@z", "1"),
+        ("@a", "2"),
+        ("@semi", "a;b"),
+        ("@brace", "a}b"),
+        ("@percent", "a%b"),
+        ("@quote", "a'b"),
+        ("@digit", "x$1y"),
+        ("@bracevar", "x${z}"),
+    ] {
+        assert_success(&harness.run(&["set-option", "-g", name, value])?);
+    }
+
+    let all = harness.run(&["show-options", "-g"])?;
+    let all_stdout = stdout(&all);
+    let mut lines = all_stdout.lines();
+    assert_eq!(lines.next(), Some("@a 2"));
+    assert_eq!(lines.next(), Some("@brace \"a}b\""));
+    assert_eq!(lines.next(), Some("@bracevar \"x\\${z}\""));
+
+    assert_success(&harness.run(&["set-option", "-g", "@tilde", "~/bin"])?);
+    assert_success(&harness.run(&["set-option", "-g", "@double", "has\"quote"])?);
+    assert_success(&harness.run(&["set-option", "-g", "@control", "line1\nline2\tbell\u{7}"])?);
+
+    for (name, expected) in [
+        ("@semi", "@semi \"a;b\"\n"),
+        ("@percent", "@percent \"a%b\"\n"),
+        ("@quote", "@quote \"a'b\"\n"),
+        ("@digit", "@digit \"x$1y\"\n"),
+        ("@tilde", "@tilde \\~/bin\n"),
+        ("@double", "@double 'has\"quote'\n"),
+        ("@control", "@control line1\\nline2\\tbell\\a\n"),
+    ] {
+        let shown = harness.run(&["show-options", "-g", name])?;
+        assert_eq!(stdout(&shown), expected);
+    }
+
+    let word_separators = harness.run(&["show-options", "-g", "word-separators"])?;
+    assert_eq!(
+        stdout(&word_separators),
+        "word-separators \"!\\\"#$%&'()*+,-./:;<=>?@[\\\\]^`{|}~\"\n"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn set_option_scalar_mutations_keep_product_semantics() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("set-option-scalar-state")?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -2284,26 +2776,23 @@ fn set_option_scalar_mutations_keep_product_semantics() -> Result<(), Box<dyn Er
 
     assert_success(&harness.run(&["set-option", "-g", "history-limit", "100"])?);
     let append_scalar = harness.run(&["set-option", "-ga", "history-limit", "5"])?;
-    assert_eq!(append_scalar.status.code(), Some(1));
+    assert_success(&append_scalar);
     assert!(stdout(&append_scalar).is_empty());
-    assert_eq!(
-        stderr(&append_scalar),
-        "invalid set-option request: history-limit is not an array option\n"
-    );
+    assert!(stderr(&append_scalar).is_empty());
     let history_limit = harness.run(&["show-options", "-gqv", "history-limit"])?;
     assert_eq!(history_limit.status.code(), Some(0));
-    assert_eq!(stdout(&history_limit), "100\n");
+    assert_eq!(stdout(&history_limit), "5\n");
 
     let consultative_scope = harness.run(&["set-option", "-w", "-g", "exit-empty", "off"])?;
-    assert_eq!(consultative_scope.status.code(), Some(1));
+    assert_success(&consultative_scope);
     assert!(stdout(&consultative_scope).is_empty());
-    assert_eq!(
-        stderr(&consultative_scope),
-        "window scope is not supported for this option\n"
-    );
+    assert!(stderr(&consultative_scope).is_empty());
+    let exit_empty_window = harness.run(&["show-options", "-gwv", "exit-empty"])?;
+    assert_eq!(exit_empty_window.status.code(), Some(0));
+    assert_eq!(stdout(&exit_empty_window), "off\n");
     let exit_empty = harness.run(&["show-options", "-gqv", "exit-empty"])?;
     assert_eq!(exit_empty.status.code(), Some(0));
-    assert_eq!(stdout(&exit_empty), "on\n");
+    assert_eq!(stdout(&exit_empty), "off\n");
 
     let already_set = harness.run(&["set-option", "-o", "-g", "status", "on"])?;
     assert_eq!(already_set.status.code(), Some(1));
@@ -2383,6 +2872,19 @@ fn invalid_option_choice_uses_toplevel_tty_error_text() -> Result<(), Box<dyn Er
     assert_eq!(output.status.code(), Some(1));
     assert!(stdout(&output).is_empty());
     assert_eq!(stderr(&output), "unknown value: maybe\n");
+    Ok(())
+}
+
+#[test]
+fn explicit_empty_option_choice_is_invalid() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("empty-option-choice-text")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    let output = harness.run(&["set-option", "-g", "mode-keys", ""])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty());
+    assert_eq!(stderr(&output), "unknown value: \n");
     Ok(())
 }
 
@@ -2534,15 +3036,6 @@ fn send_keys_without_keys_succeeds() -> Result<(), Box<dyn Error>> {
     assert_success(&output);
 
     terminate_child(daemon.child_mut())?;
-    Ok(())
-}
-
-#[test]
-fn set_option_scope_conflict_exits_one() -> Result<(), Box<dyn Error>> {
-    let harness = CliHarness::new("set-option-scope-conflict")?;
-    let output = harness.run(&["set-option", "-s", "-w", "status", "off"])?;
-
-    assert_clap_failure(&output);
     Ok(())
 }
 

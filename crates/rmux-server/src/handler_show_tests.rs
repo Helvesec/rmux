@@ -441,9 +441,12 @@ async fn show_hooks_global_scope_returns_tmux_default_values_when_unset() {
     let stdout = std::str::from_utf8(output.stdout()).expect("utf8 output");
     let lines = stdout.lines().collect::<Vec<_>>();
 
-    assert_eq!(lines.len(), 54);
+    assert_eq!(lines.len(), 57);
     assert_eq!(lines.first().copied(), Some("after-bind-key"));
     assert!(lines.contains(&"client-attached"));
+    assert!(lines.contains(&"client-light-theme"));
+    assert!(lines.contains(&"client-dark-theme"));
+    assert!(lines.contains(&"command-error"));
     assert!(lines.contains(&"session-created"));
 }
 

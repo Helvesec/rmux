@@ -209,8 +209,7 @@ impl RequestHandler {
                     .is_some_and(|active| &active.session_name == session_name);
                 if remove {
                     let mut active = active_attach
-                        .by_pid
-                        .remove(&pid)
+                        .remove_attached_client(pid)
                         .expect("attached client checked above");
                     let _ = active.control_tx.send(AttachControl::Detach);
                     active.closing.store(true, Ordering::SeqCst);
@@ -223,6 +222,9 @@ impl RequestHandler {
             }
             (removed, key_tables, overlays)
         };
+        if !removed.is_empty() {
+            self.bump_active_attach_epoch();
+        }
 
         for overlay in overlays {
             super::terminate_overlay_job(overlay);

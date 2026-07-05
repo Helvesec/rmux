@@ -68,17 +68,7 @@ fn prepare_socket_path(socket_path: &Path) -> io::Result<()> {
 }
 
 fn prepare_socket_parent(socket_path: &Path) -> io::Result<()> {
-    let parent = socket_path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "socket path '{}' has no parent directory",
-                socket_path.display()
-            ),
-        )
-    })?;
-
-    ensure_parent_directory(parent)
+    ensure_parent_directory(socket_parent_or_current(socket_path)?)
 }
 
 pub(crate) fn ensure_parent_directory(parent: &Path) -> io::Result<()> {
@@ -163,15 +153,7 @@ fn enforce_bound_socket_permissions(socket_path: &Path) -> io::Result<()> {
 
 fn validate_bound_socket(socket_path: &Path, require_owner_only: bool) -> io::Result<()> {
     let metadata = socket_metadata(socket_path, io::ErrorKind::PermissionDenied)?;
-    ensure_directory(socket_path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "socket path '{}' has no parent directory",
-                socket_path.display()
-            ),
-        )
-    })?)?;
+    ensure_directory(socket_parent_or_current(socket_path)?)?;
     let user_id = real_user_id()?;
     if metadata.uid() != user_id {
         return Err(io::Error::new(
@@ -186,6 +168,19 @@ fn validate_bound_socket(socket_path: &Path, require_owner_only: bool) -> io::Re
         ));
     }
     Ok(())
+}
+
+fn socket_parent_or_current(socket_path: &Path) -> io::Result<&Path> {
+    let Some(parent) = rmux_os::path::parent_or_current(socket_path) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "socket path '{}' has no parent directory",
+                socket_path.display()
+            ),
+        ));
+    };
+    Ok(parent)
 }
 
 pub(crate) fn socket_file_identity(socket_path: &Path) -> io::Result<SocketFileIdentity> {

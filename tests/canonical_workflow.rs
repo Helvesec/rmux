@@ -32,7 +32,8 @@ fn canonical_session_workflow_runs_end_to_end() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("canonical-workflow")?;
     let _cleanup = harness.auto_start_cleanup()?;
     let hook_path = harness.tmpdir().join("client-attached.hook");
-    let hook_command = format!("sleep 1; printf attached > '{}'", hook_path.display());
+    let shell_command = format!("sleep 1; printf attached > {}", shell_quote(&hook_path));
+    let hook_command = format!("run-shell {}", shell_quote_str(&shell_command));
     let mut attached_session = None;
 
     for step in CANONICAL_SESSION_WORKFLOW {
@@ -407,4 +408,12 @@ fn wait_for_path(path: &Path, timeout: Duration) -> Result<(), Box<dyn Error>> {
     }
 
     Err(format!("timed out waiting for '{}'", path.display()).into())
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
+fn shell_quote_str(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }

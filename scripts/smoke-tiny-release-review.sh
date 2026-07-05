@@ -9,7 +9,7 @@ Build or reuse a real release layout and run the tiny CLI release-review smoke:
   - bin/rmux is the tiny public CLI
   - libexec/rmux/rmux is the full helper
   - bin/rmux-daemon is the daemon
-  - tmux is used as the authority for known CLI ambiguity cases when available
+  - tmux 3.7b is used as the authority for known CLI ambiguity cases when available
 
 Options:
   --layout DIR         Reuse an existing package layout.
@@ -22,6 +22,9 @@ Options:
 Set RMUX_REQUIRE_TMUX=1 to fail instead of skipping when tmux is unavailable.
 USAGE
 }
+
+DEFAULT_FROZEN_TMUX_PATH="/opt/rmux/reference/tmux-frozen/e802909de06012a4df6209d55e86487c56223163/tmux"
+FROZEN_TMUX_VERSION="tmux 3.7b"
 
 die() {
   printf 'error: %s\n' "$*" >&2
@@ -75,6 +78,12 @@ assert_stdout_contains() {
     die "$prefix stdout did not contain: $expected"
 }
 
+assert_stderr_contains() {
+  local prefix="$1" expected="$2"
+  grep -Fq "$expected" "$SMOKE_ROOT/${prefix}.err" ||
+    die "$prefix stderr did not contain: $expected"
+}
+
 assert_stdout_not_empty() {
   local prefix="$1"
   [ -s "$SMOKE_ROOT/${prefix}.out" ] || die "$prefix stdout was empty"
@@ -115,44 +124,72 @@ tmux_available() {
   [ -n "$TMUX_BIN" ] && [ -x "$TMUX_BIN" ]
 }
 
+tmux_required() {
+  case "$(printf '%s' "${RMUX_REQUIRE_TMUX:-0}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+resolve_tmux_authority() {
+  if [ -n "$TMUX_BIN" ]; then
+    return
+  fi
+  for candidate in "${RMUX_TMUX_ORACLE:-}" "${RMUX_FROZEN_TMUX:-}" "$DEFAULT_FROZEN_TMUX_PATH"; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+      TMUX_BIN="$candidate"
+      return
+    fi
+  done
+}
+
+assert_tmux_authority_version() {
+  local version
+  version="$("$TMUX_BIN" -V 2>/dev/null)" ||
+    die "tmux authority '$TMUX_BIN' did not run -V"
+  [ "$version" = "$FROZEN_TMUX_VERSION" ] ||
+    die "tmux authority '$TMUX_BIN' reported '$version', expected '$FROZEN_TMUX_VERSION'"
+}
+
 run_tmux_authority_smoke() {
   if [ "$SKIP_TMUX" -eq 1 ]; then
     log "skipping tmux authority checks (--no-tmux)"
     return
   fi
   if ! tmux_available; then
-    if [ "${RMUX_REQUIRE_TMUX:-0}" = "1" ]; then
-      die "tmux authority checks required but tmux was not found"
+    if tmux_required; then
+      die "tmux 3.7b authority checks required but no pinned oracle was found"
     fi
-    log "skipping tmux authority checks (tmux not found)"
+    log "skipping tmux authority checks (pinned tmux 3.7b oracle not found)"
     return
   fi
+  assert_tmux_authority_version
 
   local sock="$SMOKE_ROOT/tmux.sock"
-  "$TMUX_BIN" -S "$sock" kill-server >/dev/null 2>&1 || true
+  "$TMUX_BIN" -f /dev/null -S "$sock" kill-server >/dev/null 2>&1 || true
   cleanup_tmux() {
-    "$TMUX_BIN" -S "$sock" kill-server >/dev/null 2>&1 || true
+    "$TMUX_BIN" -f /dev/null -S "$sock" kill-server >/dev/null 2>&1 || true
   }
   trap cleanup_tmux RETURN
 
-  "$TMUX_BIN" -S "$sock" new-session -d -s alpha sleep 60
-  "$TMUX_BIN" -S "$sock" split-window -h -v -t alpha:0 sleep 60
-  "$TMUX_BIN" -S "$sock" resize-pane -R -x 80 -t alpha:0.0
-  "$TMUX_BIN" -S "$sock" resize-pane -Z -R -t alpha:0.0
-  "$TMUX_BIN" -S "$sock" resize-pane -R -L -t alpha:0.0
-  "$TMUX_BIN" -S "$sock" new-session -d -s beta -s gamma sleep 1
-  "$TMUX_BIN" -S "$sock" send-keys -t alpha:0.0 -t alpha:0.1 Enter
-  "$TMUX_BIN" -S "$sock" capture-pane -p -S 0 -S 1 >/dev/null
-  [ "$("$TMUX_BIN" -S "$sock" display-message -p -F a -F b)" = "b" ] ||
+  "$TMUX_BIN" -f /dev/null -S "$sock" new-session -d -s alpha sleep 60
+  "$TMUX_BIN" -f /dev/null -S "$sock" split-window -h -v -t alpha:0 sleep 60
+  "$TMUX_BIN" -f /dev/null -S "$sock" resize-pane -R -x 80 -t alpha:0.0
+  "$TMUX_BIN" -f /dev/null -S "$sock" resize-pane -Z -R -t alpha:0.0
+  "$TMUX_BIN" -f /dev/null -S "$sock" resize-pane -R -L -t alpha:0.0
+  "$TMUX_BIN" -f /dev/null -S "$sock" new-session -d -s beta -s gamma sleep 1
+  "$TMUX_BIN" -f /dev/null -S "$sock" send-keys -t alpha:0.0 -t alpha:0.1 Enter
+  "$TMUX_BIN" -f /dev/null -S "$sock" capture-pane -p -S 0 -S 1 >/dev/null
+  [ "$("$TMUX_BIN" -f /dev/null -S "$sock" display-message -p -F a -F b)" = "b" ] ||
     die "tmux duplicate -F authority check did not use last value"
   set +e
-  "$TMUX_BIN" -S "$sock" --version >/dev/null 2>"$SMOKE_ROOT/tmux-version.err"
+  "$TMUX_BIN" -f /dev/null -S "$sock" --version >/dev/null 2>"$SMOKE_ROOT/tmux-version.err"
   local version_status=$?
   set -e
   [ "$version_status" -ne 0 ] || die "tmux accepted --version unexpectedly"
 
   set +e
-  "$TMUX_BIN" -S "$sock" resize-pane -R 5 -t alpha:0.0 >/dev/null 2>"$SMOKE_ROOT/tmux-resize.err"
+  "$TMUX_BIN" -f /dev/null -S "$sock" resize-pane -R 5 -t alpha:0.0 >/dev/null 2>"$SMOKE_ROOT/tmux-resize.err"
   local status=$?
   set -e
   [ "$status" -ne 0 ] || die "tmux accepted resize-pane -R 5 -t target unexpectedly"
@@ -317,7 +354,7 @@ EOF
   run_capture source_status -L "$sock" source-file "$source_file"
   assert_rc source_status 1
   assert_trace source_status "rmux tiny: direct: source-file"
-  assert_stdout_contains source_status "$missing"
+  assert_stderr_contains source_status "$missing"
   assert_stdout_line source_status "after"
 
   "$RMUX" -S "$real" new-session -d -s base sleep 60 >/dev/null
@@ -394,9 +431,7 @@ done
 
 cd "$repo_root"
 
-if [ -z "$TMUX_BIN" ] && command -v tmux >/dev/null 2>&1; then
-  TMUX_BIN="$(command -v tmux)"
-fi
+resolve_tmux_authority
 
 if [ -z "$layout" ]; then
   layout="$(mktemp -d "${TMPDIR:-/tmp}/rmux-review-layout.XXXXXX")"

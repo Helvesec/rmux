@@ -118,6 +118,15 @@ impl RequestHandler {
         if matches!(response, Response::NewWindow(_)) {
             self.sync_session_silence_timers(&session_name).await;
             if let Response::NewWindow(success) = &response {
+                {
+                    let mut active_attach = self.active_attach.lock().await;
+                    active_attach.seed_active_client_for_window(
+                        requester_pid,
+                        success.target.session_name(),
+                        success.target.window_index(),
+                    );
+                }
+                self.bump_active_attach_epoch();
                 self.queue_inline_hook(
                     HookName::AfterNewWindow,
                     ScopeSelector::Session(session_name.clone()),
@@ -171,6 +180,13 @@ impl RequestHandler {
             for affected_session in &affected_sessions {
                 self.sync_session_silence_timers(affected_session).await;
             }
+            {
+                let mut active_attach = self.active_attach.lock().await;
+                for removed_window in &removed_windows {
+                    active_attach.forget_window(&removed_window.target);
+                }
+            }
+            self.bump_active_attach_epoch();
             for removed_window in removed_windows {
                 let removed_session_name = removed_window.target.session_name().clone();
                 self.emit(LifecycleEvent::WindowUnlinked {
@@ -191,6 +207,7 @@ impl RequestHandler {
 
     pub(super) async fn handle_select_window(
         &self,
+        requester_pid: Option<u32>,
         request: rmux_proto::SelectWindowRequest,
     ) -> Response {
         let session_name = request.target.session_name().clone();
@@ -224,6 +241,16 @@ impl RequestHandler {
         };
 
         if matches!(response, Response::SelectWindow(_)) {
+            if let Some(requester_pid) = requester_pid {
+                let mut active_attach = self.active_attach.lock().await;
+                active_attach.seed_active_client_for_window(
+                    requester_pid,
+                    &session_name,
+                    target_window_index,
+                );
+                drop(active_attach);
+                self.bump_active_attach_epoch();
+            }
             if window_changed {
                 self.emit(LifecycleEvent::SessionWindowChanged {
                     session_name: session_name.clone(),
@@ -435,7 +462,14 @@ impl RequestHandler {
             self.wait_for_windows_deferred_all_pane_pids().await;
         }
         let state = self.state.lock().await;
-        match state.list_windows(&request.target, request.format.as_deref(), attached_count) {
+        match state.list_windows(
+            &request.target,
+            request.format.as_deref(),
+            attached_count,
+            request.filter.as_deref(),
+            request.sort_order.as_deref(),
+            request.reversed,
+        ) {
             Ok(response) => Response::ListWindows(response),
             Err(error) => Response::Error(ErrorResponse { error }),
         }

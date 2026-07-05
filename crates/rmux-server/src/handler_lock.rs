@@ -171,7 +171,8 @@ impl RequestHandler {
             .send(AttachControl::LockShellCommand(command))
             .is_err()
         {
-            active_attach.by_pid.remove(&attach_pid);
+            active_attach.remove_attached_client(attach_pid);
+            self.bump_active_attach_epoch();
             return Ok(None);
         }
         Ok(Some(active.session_name.clone()))

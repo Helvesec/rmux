@@ -91,7 +91,7 @@ PLATFORM_ICON = {
     "windows": ("install/windows.svg", "install/windows-light.svg"),
 }
 
-HERO_ASSET_STEM = "hero-v0.8.0-rmux"
+HERO_ASSET_STEM = "hero-v0.9.0-rmux"
 
 DARK = {
     "bg": "#05101b",
@@ -346,7 +346,7 @@ def render_hero(mode: str) -> str:
   <text x="145" y="96" fill="{colors['muted']}" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="21">Performance comparison between RMUX and tmux across common operations.</text>
   <text x="145" y="129" fill="#7dff58" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="21">Lower is faster.</text>
   <rect x="1268" y="38" width="205" height="54" rx="15" fill="{colors['panel']}" stroke="{colors['line']}"/>
-  <text x="1370" y="72" fill="{colors['text']}" text-anchor="middle" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="20" font-weight="700">RMUX v0.8.0</text>
+  <text x="1370" y="72" fill="{colors['text']}" text-anchor="middle" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="20" font-weight="700">RMUX v0.9.0</text>
 </svg>
 """
 

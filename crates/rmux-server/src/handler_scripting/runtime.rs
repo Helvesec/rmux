@@ -18,6 +18,7 @@ use crate::terminal::TerminalProfile;
 const RUN_SHELL_TIMEOUT: Duration = Duration::from_secs(300);
 const RUN_SHELL_PIPE_DRAIN_GRACE: Duration = Duration::from_millis(250);
 const RUN_SHELL_PIPE_FINISH_TIMEOUT: Duration = Duration::from_secs(2);
+const RUN_SHELL_TERMINATE_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 const RUN_SHELL_TRUNCATION_MARKER: &[u8] = b"\nrmux: run-shell output truncated\n";
 const RUN_SHELL_OUTPUT_LIMIT: usize = DEFAULT_MAX_FRAME_LENGTH - 64 * 1024;
 const MAX_BACKGROUND_TASKS: usize = 1024;
@@ -141,7 +142,7 @@ struct ShellTaskProfile {
 impl ShellTaskProfile {
     fn from_terminal_profile(profile: &TerminalProfile) -> Self {
         Self {
-            shell: profile.shell().to_path_buf(),
+            shell: tmux_job_shell(profile),
             cwd: profile.cwd().to_path_buf(),
             raw_environment: profile
                 .raw_environment()
@@ -159,6 +160,16 @@ impl ShellTaskProfile {
         }
         child
     }
+}
+
+#[cfg(unix)]
+fn tmux_job_shell(_: &TerminalProfile) -> PathBuf {
+    PathBuf::from("/bin/sh")
+}
+
+#[cfg(not(unix))]
+fn tmux_job_shell(profile: &TerminalProfile) -> PathBuf {
+    profile.shell().to_path_buf()
 }
 
 async fn run_shell_foreground_async(
@@ -254,18 +265,28 @@ async fn wait_child_with_timeout(
     command_name: &str,
     wait_label: &str,
 ) -> Result<std::process::ExitStatus, RmuxError> {
-    match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => Ok(status),
-        Ok(Err(error)) => Err(RmuxError::Server(format!(
-            "failed to wait for {wait_label}: {error}"
-        ))),
-        Err(_) => {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(RmuxError::Server(format!(
+                    "failed to wait for {wait_label}: {error}"
+                )));
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
             terminate_shell_task(child, process_group).await;
-            Err(RmuxError::Server(format!(
+            return Err(RmuxError::Server(format!(
                 "{command_name} timed out after {}s",
                 timeout.as_secs()
-            )))
+            )));
         }
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(remaining.min(Duration::from_millis(10))).await;
     }
 }
 
@@ -408,8 +429,20 @@ impl ShellTaskProcessGroup {
 
 async fn terminate_shell_task(child: &mut Child, process_group: ShellTaskProcessGroup) {
     process_group.terminate();
-    let _ = child.kill().await;
-    let _ = child.wait().await;
+    let _ = child.start_kill();
+    let deadline = tokio::time::Instant::now() + RUN_SHELL_TERMINATE_REAP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(_) => return,
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(remaining.min(Duration::from_millis(10))).await;
+    }
 }
 
 async fn read_limited_pipe<R>(
@@ -474,7 +507,7 @@ async fn read_limited_pipe<R>(
 mod tests {
     use super::{
         finish_pipe_task, run_shell_foreground_with_timeout, spawn_pipe_reader,
-        BackgroundTaskLimiter, RUN_SHELL_TRUNCATION_MARKER,
+        wait_child_with_timeout, BackgroundTaskLimiter, RUN_SHELL_TRUNCATION_MARKER,
     };
     use crate::terminal::TerminalProfile;
     use rmux_core::{EnvironmentStore, OptionStore};
@@ -526,6 +559,34 @@ mod tests {
 
         assert!(output.starts_with(b"a\n"), "{output:?}");
         assert!(output.ends_with(RUN_SHELL_TRUNCATION_MARKER), "{output:?}");
+    }
+
+    #[tokio::test]
+    async fn wait_child_reaps_already_exited_shell_without_signal_wakeup() {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("true")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut command = tokio::process::Command::from(command);
+        command.kill_on_drop(true);
+        let mut child = command.spawn().expect("spawn short-lived child");
+        let process_group = super::ShellTaskProcessGroup::from_child(&child);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let status = wait_child_with_timeout(
+            &mut child,
+            process_group,
+            Duration::from_secs(1),
+            "run-shell",
+            "already-exited shell",
+        )
+        .await
+        .expect("already-exited shell should be reaped");
+
+        assert!(status.success());
     }
 
     #[cfg(unix)]

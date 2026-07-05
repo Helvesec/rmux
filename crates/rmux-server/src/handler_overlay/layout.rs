@@ -7,6 +7,7 @@ use crate::pane_terminals::HandlerState;
 use crate::renderer::{
     status_line_layout, OverlayMousePosition, OverlayPositionContext, OverlayRect,
 };
+use crate::status_lines::status_line_count;
 
 use super::parse::{ParsedDisplayMenuCommand, ParsedDisplayPopupCommand, PopupSizeSpec};
 use super::MenuOverlayItem;
@@ -239,28 +240,22 @@ fn overlay_status_at(
     session: &rmux_core::Session,
     options: &rmux_core::OptionStore,
 ) -> Option<u16> {
-    if matches!(
-        options.resolve(Some(session.name()), OptionName::Status),
-        Some("off")
-    ) {
-        None
-    } else {
-        match options.resolve(Some(session.name()), OptionName::StatusPosition) {
-            Some("top") => Some(0),
-            _ => Some(session.window().size().rows.saturating_sub(1)),
-        }
+    let status_lines = overlay_status_lines(session, options);
+    if status_lines == 0 {
+        return None;
+    }
+
+    match options.resolve(Some(session.name()), OptionName::StatusPosition) {
+        Some("top") => Some(0),
+        _ => Some(session.window().size().rows.saturating_sub(status_lines)),
     }
 }
 
 fn overlay_status_lines(session: &rmux_core::Session, options: &rmux_core::OptionStore) -> u16 {
-    if matches!(
+    status_line_count(
         options.resolve(Some(session.name()), OptionName::Status),
-        Some("off")
-    ) {
-        0
-    } else {
-        1.min(session.window().size().rows)
-    }
+        session.window().size().rows,
+    )
 }
 
 fn window_status_range_start(
@@ -306,5 +301,58 @@ fn window_scope_for_target<'a>(
                 .expect("overlay session must exist");
             (session_name, session.active_window_index())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_name(value: &str) -> rmux_proto::SessionName {
+        rmux_proto::SessionName::new(value).expect("valid session name")
+    }
+
+    fn session() -> rmux_core::Session {
+        rmux_core::Session::new(session_name("overlay"), TerminalSize { cols: 80, rows: 10 })
+    }
+
+    fn set_session_option(
+        options: &mut rmux_core::OptionStore,
+        session: &rmux_core::Session,
+        name: &str,
+        value: &str,
+    ) {
+        options
+            .set_by_name(
+                rmux_proto::types::OptionScopeSelector::Session(session.name().clone()),
+                name,
+                Some(value.to_owned()),
+                rmux_proto::SetOptionMode::Replace,
+                false,
+                false,
+                false,
+            )
+            .expect("session option set succeeds");
+    }
+
+    #[test]
+    fn overlay_status_geometry_respects_multi_line_status() {
+        let session = session();
+        let mut options = rmux_core::OptionStore::new();
+
+        assert_eq!(overlay_status_lines(&session, &options), 1);
+        assert_eq!(overlay_status_at(&session, &options), Some(9));
+
+        set_session_option(&mut options, &session, "status", "3");
+        assert_eq!(overlay_status_lines(&session, &options), 3);
+        assert_eq!(overlay_status_at(&session, &options), Some(7));
+
+        set_session_option(&mut options, &session, "status-position", "top");
+        assert_eq!(overlay_status_lines(&session, &options), 3);
+        assert_eq!(overlay_status_at(&session, &options), Some(0));
+
+        set_session_option(&mut options, &session, "status", "off");
+        assert_eq!(overlay_status_lines(&session, &options), 0);
+        assert_eq!(overlay_status_at(&session, &options), None);
     }
 }

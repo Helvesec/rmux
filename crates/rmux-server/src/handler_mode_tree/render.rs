@@ -232,8 +232,19 @@ fn render_overlay_line(
 ) {
     let width = usize::from(cols);
     let text = sanitize_overlay_text(&tmux_truncate_to_width(text, width, utf8));
+    if !text.contains("#[") {
+        render_plain_overlay_line(frame, row, &text, base_style);
+        return;
+    }
     let line = crate::renderer::format_draw_line(&text, base_style, width, utf8);
     crate::renderer::render_formatted_line(frame, 0, row, &line);
+}
+
+fn render_plain_overlay_line(frame: &mut Vec<u8>, row: u16, text: &str, style: &Style) {
+    frame.extend_from_slice(format!("\x1b[{};1H", row.saturating_add(1)).as_bytes());
+    frame.extend_from_slice(crate::renderer::style_sgr_bytes(style, true).as_slice());
+    frame.extend_from_slice(text.as_bytes());
+    frame.extend_from_slice(b"\x1b[K");
 }
 
 pub(super) fn render_overlay_formatted_line(

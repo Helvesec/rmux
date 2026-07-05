@@ -715,6 +715,20 @@ fn explicit_empty_process_commands_are_rejected() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_batch_tail_wraps_cmd_s_c_payload() {
+    let tail = super::windows_batch_cmd_tail(
+        Path::new(r"C:\Users\RMUX User\scripts\custom shell.bat"),
+        &["echo hi".to_owned()],
+    );
+
+    assert_eq!(
+        tail,
+        OsString::from("\"\"C:\\Users\\RMUX User\\scripts\\custom shell.bat\" \"echo hi\"\"")
+    );
+}
+
 #[test]
 fn empty_shell_process_command_is_allowed_for_empty_tmux_panes() {
     validate_process_command(Some(&ProcessCommand::Shell(String::new())))

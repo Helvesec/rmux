@@ -15,6 +15,7 @@ async fn live_attach_direct_fast_path_requires_current_unsynchronized_pane() {
 
     let pane_zero = PaneTarget::with_window(alpha.clone(), 0, 0);
     let pty = rmux_pty::PtyPair::open().expect("open pty pair");
+    let mut active_emit_cache = None;
 
     let direct = handler
         .try_forward_plain_attached_bytes_to_current_pane_fast(
@@ -23,6 +24,7 @@ async fn live_attach_direct_fast_path_requires_current_unsynchronized_pane() {
             b"x",
             &pane_zero,
             pty.master(),
+            &mut active_emit_cache,
         )
         .await
         .expect("direct fast path should run");
@@ -35,6 +37,7 @@ async fn live_attach_direct_fast_path_requires_current_unsynchronized_pane() {
             b"abc",
             &pane_zero,
             pty.master(),
+            &mut active_emit_cache,
         )
         .await
         .expect("direct fast path should accept small printable batches");
@@ -48,6 +51,7 @@ async fn live_attach_direct_fast_path_requires_current_unsynchronized_pane() {
             b"x",
             &stale_target,
             pty.master(),
+            &mut active_emit_cache,
         )
         .await
         .expect("stale target check should run");
@@ -70,6 +74,7 @@ async fn live_attach_direct_fast_path_requires_current_unsynchronized_pane() {
             b"x",
             &pane_zero,
             pty.master(),
+            &mut active_emit_cache,
         )
         .await
         .expect("sync panes check should run");

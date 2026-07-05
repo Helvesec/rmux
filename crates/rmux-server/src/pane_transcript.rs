@@ -225,6 +225,10 @@ impl PaneTranscript {
         self.terminal.screen().capture_transcript(range, options)
     }
 
+    pub(crate) fn capture_main_line_format_flags(&self, range: ScreenCaptureRange) -> Vec<u8> {
+        self.terminal.screen().capture_line_format_flags(range)
+    }
+
     pub(crate) fn capture_main_visible_line_changes(
         &self,
         rows: usize,
@@ -282,6 +286,15 @@ impl PaneTranscript {
             .capture_saved_transcript(range, options)
     }
 
+    pub(crate) fn capture_saved_line_format_flags(
+        &self,
+        range: ScreenCaptureRange,
+    ) -> Option<Vec<u8>> {
+        self.terminal
+            .screen()
+            .capture_saved_line_format_flags(range)
+    }
+
     pub(crate) fn capture_copy_mode(
         &self,
         range: ScreenCaptureRange,
@@ -290,6 +303,18 @@ impl PaneTranscript {
         match &self.mode {
             Some(PaneModeState::Copy(mode)) => {
                 Some(mode.render_screen().capture_transcript(range, options))
+            }
+            Some(PaneModeState::Clock(_) | PaneModeState::ModeTree(_)) | None => None,
+        }
+    }
+
+    pub(crate) fn capture_copy_mode_line_format_flags(
+        &self,
+        range: ScreenCaptureRange,
+    ) -> Option<Vec<u8>> {
+        match &self.mode {
+            Some(PaneModeState::Copy(mode)) => {
+                Some(mode.render_screen().capture_line_format_flags(range))
             }
             Some(PaneModeState::Clock(_) | PaneModeState::ModeTree(_)) | None => None,
         }

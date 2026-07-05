@@ -10,10 +10,16 @@ pub(crate) struct CapturePaneArgs {
     pub(crate) escape_ansi: bool,
     #[arg(short = 'C', action = ArgAction::SetTrue)]
     pub(crate) escape_sequences: bool,
+    #[arg(short = 'F', action = ArgAction::SetTrue)]
+    pub(crate) include_format: bool,
+    #[arg(short = 'H', action = ArgAction::SetTrue)]
+    pub(crate) hyperlinks: bool,
     #[arg(short = 'J', action = ArgAction::SetTrue)]
     pub(crate) join_wrapped: bool,
-    #[arg(short = 'M', action = ArgAction::SetTrue, hide = true)]
-    unsupported_mode_screen: bool,
+    #[arg(short = 'L', action = ArgAction::SetTrue)]
+    pub(crate) line_numbers: bool,
+    #[arg(short = 'M', action = ArgAction::SetTrue)]
+    pub(crate) use_mode_screen: bool,
     #[arg(short = 'N', action = ArgAction::SetTrue)]
     pub(crate) do_not_trim_spaces: bool,
     #[arg(short = 'T', action = ArgAction::SetTrue)]
@@ -36,18 +42,8 @@ pub(crate) struct CapturePaneArgs {
 
 impl CapturePaneArgs {
     pub(crate) fn validate(self) -> Result<Self, clap::Error> {
-        if self.unsupported_mode_screen {
-            return Err(unknown_flag_error("capture-pane", "-M"));
-        }
         Ok(self)
     }
-}
-
-fn unknown_flag_error(command_name: &str, flag: &str) -> clap::Error {
-    clap::Error::raw(
-        clap::error::ErrorKind::UnknownArgument,
-        format!("command {command_name}: unknown flag {flag}"),
-    )
 }
 
 #[derive(Debug, Clone, Args)]

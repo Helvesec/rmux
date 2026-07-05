@@ -11,6 +11,7 @@ use rmux_proto::{OptionName, PaneTarget, SessionName};
 use crate::copy_mode::CopyModeMouseContext;
 use crate::input_keys::MouseForwardEvent;
 use crate::pane_terminals::HandlerState;
+use crate::status_lines::status_line_count;
 
 mod hit;
 mod types;
@@ -101,12 +102,21 @@ pub(crate) fn layout_for_session(
             Some("off")
         );
     let (status_at, status_lines) = if status_enabled {
+        let status_lines = status_line_count(
+            state
+                .options
+                .resolve(Some(session_name), OptionName::Status),
+            window.size().rows,
+        );
         match state
             .options
             .resolve(Some(session_name), OptionName::StatusPosition)
         {
-            Some("top") => (Some(0), 1),
-            _ => (Some(window.size().rows.saturating_sub(1)), 1),
+            Some("top") => (Some(0), status_lines),
+            _ => (
+                Some(window.size().rows.saturating_sub(status_lines)),
+                status_lines,
+            ),
         }
     } else {
         (None, 0)

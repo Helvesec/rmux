@@ -25,14 +25,26 @@ impl Connection {
     /// Requests a control-mode upgrade and, on success, yields the raw local
     /// stream for tmux-compatible text control traffic.
     pub fn begin_control_mode(
+        self,
+        mode: ControlMode,
+        client_terminal: ClientTerminalContext,
+    ) -> Result<ControlTransition, ClientError> {
+        self.begin_control_mode_with_initial_commands(mode, client_terminal, &[])
+    }
+
+    /// Requests a control-mode upgrade and writes command-line commands across
+    /// the upgrade boundary so the server can frame them as tmux argv commands.
+    pub fn begin_control_mode_with_initial_commands(
         mut self,
         mode: ControlMode,
         client_terminal: ClientTerminalContext,
+        initial_commands: &[String],
     ) -> Result<ControlTransition, ClientError> {
         self.write_request(&Request::ControlMode(ControlModeRequest {
             mode,
             client_terminal,
         }))?;
+        write_initial_control_commands(self.stream_mut(), initial_commands)?;
         let response = read_response_frame_exact(self.stream_mut())?;
 
         match response {
@@ -42,6 +54,22 @@ impl Connection {
             other => Ok(ControlTransition::Rejected(other)),
         }
     }
+}
+
+fn write_initial_control_commands<W>(
+    stream: &mut W,
+    initial_commands: &[String],
+) -> Result<(), ClientError>
+where
+    W: Write,
+{
+    for command in initial_commands {
+        stream
+            .write_all(command.as_bytes())
+            .map_err(ClientError::Io)?;
+        stream.write_all(b"\n").map_err(ClientError::Io)?;
+    }
+    Ok(())
 }
 
 /// Drives a control-mode session using the process stdio streams.

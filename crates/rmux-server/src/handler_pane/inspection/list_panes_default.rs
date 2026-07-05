@@ -115,16 +115,12 @@ fn list_panes_default_geometry(
         return geometry;
     }
 
-    let content_rows = if matches!(
+    let content_rows = crate::status_lines::content_rows_for_status(
         state
             .options
             .resolve(Some(session.name()), OptionName::Status),
-        Some("off")
-    ) {
-        size.rows
-    } else {
-        size.rows.saturating_sub(1)
-    };
+        size.rows,
+    );
     visible_pane_content_geometry(
         &state.options,
         session.name(),
@@ -132,4 +128,34 @@ fn list_panes_default_geometry(
         geometry,
         content_rows,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::list_panes_default_geometry;
+    use crate::pane_terminals::HandlerState;
+    use rmux_core::Session;
+    use rmux_proto::{OptionName, ScopeSelector, SessionName, SetOptionMode, TerminalSize};
+
+    #[test]
+    fn attached_default_geometry_uses_multi_line_status_rows() {
+        let alpha = SessionName::new("alpha").expect("valid session name");
+        let mut session = Session::new(alpha.clone(), TerminalSize { cols: 80, rows: 24 });
+        session.touch_attached();
+        let pane = session.active_pane().expect("active pane");
+        let mut state = HandlerState::default();
+        state
+            .options
+            .set(
+                ScopeSelector::Session(alpha),
+                OptionName::Status,
+                "2".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("session status set succeeds");
+
+        let geometry = list_panes_default_geometry(&state, &session, 1, 0, pane);
+
+        assert_eq!(geometry.rows(), 22);
+    }
 }

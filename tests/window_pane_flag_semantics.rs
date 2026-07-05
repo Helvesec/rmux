@@ -638,19 +638,29 @@ fn resize_pane_compact_direction_and_trailing_adjustment_match_tmux() -> Result<
 }
 
 #[test]
-fn split_window_legacy_percentage_modifier_matches_tmux_compat() -> Result<(), Box<dyn Error>> {
+fn pane_percentage_size_flags_match_tmux_compat() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("split-window-legacy-percentage")?;
     let mut daemon = harness.start_hidden_daemon()?;
 
     assert_success(&harness.run(&["new-session", "-d", "-x", "100", "-y", "24", "-s", "s"])?);
-    let missing_size = harness.run(&["split-window", "-p", "50", "-t", "s:0"])?;
-    assert_eq!(missing_size.status.code(), Some(1));
-
-    assert_success(&harness.run(&["split-window", "-l", "5", "-p", "50", "-t", "s:0"])?);
-    let panes = harness.run(&[
+    assert_success(&harness.run(&["split-window", "-p", "35", "-t", "s:0"])?);
+    let percent_panes = harness.run(&[
         "list-panes",
         "-t",
         "s",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(percent_panes.status.code(), Some(0));
+    assert_eq!(stdout(&percent_panes), "0:100x15\n1:100x8\n");
+    assert!(stderr(&percent_panes).is_empty());
+
+    assert_success(&harness.run(&["new-session", "-d", "-x", "100", "-y", "24", "-s", "l"])?);
+    assert_success(&harness.run(&["split-window", "-l", "5", "-p", "50", "-t", "l:0"])?);
+    let panes = harness.run(&[
+        "list-panes",
+        "-t",
+        "l",
         "-F",
         "#{pane_index}:#{pane_width}x#{pane_height}",
     ])?;
@@ -671,16 +681,26 @@ fn split_window_legacy_percentage_modifier_matches_tmux_compat() -> Result<(), B
     assert_eq!(stdout(&direct_opaque), "0:100x18\n1:100x5\n");
     assert!(stderr(&direct_opaque).is_empty());
 
-    let move_missing = harness.run(&["move-pane", "-p", "35", "-s", "r:0.1", "-t", "r:0.0"])?;
-    assert_eq!(move_missing.status.code(), Some(1));
-    assert_eq!(stderr(&move_missing), "size missing\n");
+    assert_success(&harness.run(&["new-session", "-d", "-x", "100", "-y", "24", "-s", "mv"])?);
+    assert_success(&harness.run(&["split-window", "-h", "-t", "mv:0.0"])?);
+    assert_success(&harness.run(&["move-pane", "-p", "35", "-s", "mv:0.1", "-t", "mv:0.0"])?);
+    let moved_percent = harness.run(&[
+        "list-panes",
+        "-t",
+        "mv",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(moved_percent.status.code(), Some(0));
+    assert_eq!(stdout(&moved_percent), "0:100x15\n1:100x8\n");
+    assert!(stderr(&moved_percent).is_empty());
 
     assert_success(&harness.run(&["new-session", "-d", "-x", "100", "-y", "24", "-s", "j"])?);
     assert_success(&harness.run(&["split-window", "-h", "-t", "j:0.0"])?);
     let join_source = harness.tmpdir().join("join.conf");
     fs::write(
         &join_source,
-        "select-pane -t j:0.1 -m\njoin-pane -pabc -l 5 -t j:0.0\n",
+        "select-pane -t j:0.1 -m\njoin-pane -p35 -t j:0.0\n",
     )?;
     assert_success(&harness.run(&["source-file", join_source.to_str().expect("utf-8 path")])?);
     let joined = harness.run(&[
@@ -691,7 +711,7 @@ fn split_window_legacy_percentage_modifier_matches_tmux_compat() -> Result<(), B
         "#{pane_index}:#{pane_width}x#{pane_height}",
     ])?;
     assert_eq!(joined.status.code(), Some(0));
-    assert_eq!(stdout(&joined), "0:100x18\n1:100x5\n");
+    assert_eq!(stdout(&joined), "0:100x15\n1:100x8\n");
     assert!(stderr(&joined).is_empty());
 
     assert_success(&harness.run(&["new-session", "-d", "-x", "100", "-y", "24", "-s", "m"])?);
@@ -699,7 +719,7 @@ fn split_window_legacy_percentage_modifier_matches_tmux_compat() -> Result<(), B
     let move_source = harness.tmpdir().join("move.conf");
     fs::write(
         &move_source,
-        "select-pane -t m:0.1 -m\nmove-pane -pabc -l 5 -t m:0.0\n",
+        "select-pane -t m:0.1 -m\nmove-pane -p35 -t m:0.0\n",
     )?;
     assert_success(&harness.run(&["source-file", move_source.to_str().expect("utf-8 path")])?);
     let moved = harness.run(&[
@@ -710,8 +730,52 @@ fn split_window_legacy_percentage_modifier_matches_tmux_compat() -> Result<(), B
         "#{pane_index}:#{pane_width}x#{pane_height}",
     ])?;
     assert_eq!(moved.status.code(), Some(0));
-    assert_eq!(stdout(&moved), "0:100x18\n1:100x5\n");
+    assert_eq!(stdout(&moved), "0:100x15\n1:100x8\n");
     assert!(stderr(&moved).is_empty());
+
+    assert_success(&harness.run(&["new-session", "-d", "-x", "100", "-y", "24", "-s", "jd"])?);
+    assert_success(&harness.run(&["split-window", "-h", "-t", "jd:0.0"])?);
+    let default_join_target_source = harness.tmpdir().join("join-default-target.conf");
+    fs::write(
+        &default_join_target_source,
+        "select-pane -t jd:0.1 -m\nselect-pane -t jd:0.0\njoin-pane -p35\n",
+    )?;
+    assert_success(&harness.run(&[
+        "source-file",
+        default_join_target_source.to_str().expect("utf-8 path"),
+    ])?);
+    let default_joined = harness.run(&[
+        "list-panes",
+        "-t",
+        "jd",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(default_joined.status.code(), Some(0));
+    assert_eq!(stdout(&default_joined), "0:100x15\n1:100x8\n");
+    assert!(stderr(&default_joined).is_empty());
+
+    assert_success(&harness.run(&["new-session", "-d", "-x", "100", "-y", "24", "-s", "md"])?);
+    assert_success(&harness.run(&["split-window", "-h", "-t", "md:0.0"])?);
+    let default_move_target_source = harness.tmpdir().join("move-default-target.conf");
+    fs::write(
+        &default_move_target_source,
+        "select-pane -t md:0.1 -m\nselect-pane -t md:0.0\nmove-pane -p35\n",
+    )?;
+    assert_success(&harness.run(&[
+        "source-file",
+        default_move_target_source.to_str().expect("utf-8 path"),
+    ])?);
+    let default_moved = harness.run(&[
+        "list-panes",
+        "-t",
+        "md",
+        "-F",
+        "#{pane_index}:#{pane_width}x#{pane_height}",
+    ])?;
+    assert_eq!(default_moved.status.code(), Some(0));
+    assert_eq!(stdout(&default_moved), "0:100x15\n1:100x8\n");
+    assert!(stderr(&default_moved).is_empty());
 
     assert_success(&harness.run(&["new-session", "-d", "-x", "100", "-y", "24", "-s", "jx"])?);
     assert_success(&harness.run(&["split-window", "-h", "-t", "jx:0.0"])?);

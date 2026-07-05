@@ -118,6 +118,46 @@ fn set_option_accepts_window_scope_and_optional_value() {
 }
 
 #[test]
+fn set_option_combined_scope_flags_use_tmux_precedence() {
+    for (flags, server, window, pane) in [
+        ("-sw", true, false, false),
+        ("-ws", true, false, false),
+        ("-sp", true, false, false),
+        ("-ps", true, false, false),
+        ("-pw", false, false, true),
+        ("-wp", false, false, true),
+    ] {
+        let cli = parse_args(&["set-option", flags, "status", "off"]).unwrap();
+
+        match cli.command.expect("parsed command") {
+            super::super::Command::SetOption(args) => {
+                assert_eq!(args.server, server, "{flags}");
+                assert_eq!(args.window, window, "{flags}");
+                assert_eq!(args.pane, pane, "{flags}");
+            }
+            _ => panic!("expected SetOption command"),
+        }
+    }
+}
+
+#[test]
+fn set_option_scope_scanner_stops_at_mid_cluster_target_value() {
+    let cli = parse_args(&["set-option", "-wtvps", "@y", "2"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::SetOption(args) => {
+            assert!(!args.server);
+            assert!(args.window);
+            assert!(!args.pane);
+            assert_eq!(target_text(&args.target), "vps");
+            assert_eq!(args.option, "@y");
+            assert_eq!(args.value.as_deref(), Some("2"));
+        }
+        _ => panic!("expected SetOption command"),
+    }
+}
+
+#[test]
 fn set_option_rejects_dash_dash_before_value() {
     let error = parse_args(&["set-option", "-g", "status-left", "--", "-abc"]).unwrap_err();
     assert!(

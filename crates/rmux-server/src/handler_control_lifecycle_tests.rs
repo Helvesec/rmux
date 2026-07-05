@@ -138,6 +138,7 @@ async fn control_client_exits_when_its_target_session_is_killed() {
             target: alpha,
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
     )
     .await;
@@ -187,6 +188,7 @@ async fn control_client_stays_open_when_another_session_is_killed() {
             target: beta,
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
     )
     .await;

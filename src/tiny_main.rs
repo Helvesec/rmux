@@ -26,14 +26,14 @@ use rmux_proto::request::{
     AttachSessionExt2Request, AttachSessionExt3Request, DisplayMessageRequest, KillSessionRequest,
     NewSessionExtRequest,
 };
-#[cfg(windows)]
-use rmux_proto::CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY;
 use rmux_proto::{
     CapturePaneTargetActionRequest, JoinPaneRequest, ListSessionsRequest, Request,
     ResizePaneTargetActionRequest, Response, RmuxError, SetOptionMode, SourceFileResponse,
     SplitDirection, SplitWindowTargetActionRequest, CAPABILITY_ATTACH_RENDER,
     CAPABILITY_ATTACH_RESIZE_GEOMETRY,
 };
+#[cfg(windows)]
+use rmux_proto::{CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY, CAPABILITY_DAEMON_STATUS};
 
 mod helper;
 mod output;
@@ -44,7 +44,7 @@ use crate::tmux_error_surface::{source_file_error_uses_stdout, tmux_cli_error_me
 #[cfg(not(windows))]
 use helper::daemon_helper_path;
 use helper::exec_full_helper;
-use output::{client_error, write_response_output_or_error, write_stdout};
+use output::{client_error, write_response_output_or_error, write_stderr, write_stdout};
 use parse::{
     parse_attach_session, parse_capture_pane, parse_display_message, parse_has_session,
     parse_join_pane, parse_kill_pane, parse_kill_session, parse_list_panes, parse_list_windows,
@@ -977,11 +977,23 @@ fn resolve_active_window_index(
 #[cfg(windows)]
 fn run_kill_server(socket_path: &Path) -> Result<i32, String> {
     let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
+    match probe_kill_server_compatible(&mut connection) {
+        Ok(()) => {}
+        Err(error) if kill_server_connection_closed(&error) => return Ok(0),
+        Err(error) => return Err(error.to_string()),
+    }
     match connection.kill_server_after_write() {
         Ok(()) => Ok(0),
         Err(error) if kill_server_connection_closed(&error) => Ok(0),
         Err(error) => Err(error.to_string()),
     }
+}
+
+#[cfg(windows)]
+fn probe_kill_server_compatible(connection: &mut Connection) -> Result<(), ClientError> {
+    connection
+        .supports_capability(CAPABILITY_DAEMON_STATUS)
+        .map(|_| ())
 }
 
 #[cfg(not(windows))]
@@ -997,7 +1009,7 @@ fn run_kill_server(socket_path: &Path) -> Result<i32, String> {
             wait_for_killed_server_socket_cleanup(socket_path);
             Ok(0)
         }
-        Err(error) if unsupported_wire_version(&error) => {
+        Err(error) if legacy_wire_v1_fallback_applies(&error) => {
             run_legacy_wire_v1_kill_server(socket_path)
         }
         Err(error) => Err(error.to_string()),
@@ -1073,6 +1085,7 @@ fn run_kill_session(
             target: request.target,
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         })
         .map_err(|error| error.to_string())?;
     if response_needs_session_resolution_retry(&response) {
@@ -1335,6 +1348,9 @@ fn write_source_file_success_response(response: SourceFileResponse) -> Result<i3
     if let Some(output) = response.command_output() {
         write_stdout(output.stdout()).map_err(|error| error.to_string())?;
     }
+    if !response.stderr().is_empty() {
+        write_stderr(response.stderr()).map_err(|error| error.to_string())?;
+    }
     Ok(response.exit_status().unwrap_or(0))
 }
 
@@ -1349,7 +1365,7 @@ fn run_legacy_wire_v1_kill_server(socket_path: &Path) -> Result<i32, String> {
             }
         };
 
-    match connection.kill_server_legacy_wire_v1() {
+    match connection.kill_server_legacy_wire(1) {
         Ok(()) => {
             wait_for_killed_server_socket_cleanup(socket_path);
             Ok(0)
@@ -1377,11 +1393,52 @@ fn kill_server_connection_closed(error: &ClientError) -> bool {
 }
 
 #[cfg(not(windows))]
-fn unsupported_wire_version(error: &ClientError) -> bool {
+fn legacy_wire_v1_fallback_applies(error: &ClientError) -> bool {
     matches!(
         error,
-        ClientError::Protocol(RmuxError::UnsupportedWireVersion { .. })
+        ClientError::Protocol(RmuxError::UnsupportedWireVersion { got, .. }) if *got <= 1
     )
+}
+
+#[cfg(test)]
+fn incompatible_daemon_error(socket_path: &Path) -> String {
+    format!(
+        "rmux: running daemon on '{}' uses an incompatible protocol.\nrmux: run `{}` to stop it, then retry.",
+        socket_path.display(),
+        incompatible_daemon_kill_server_command(socket_path)
+    )
+}
+
+#[cfg(test)]
+fn incompatible_daemon_kill_server_command(socket_path: &Path) -> String {
+    if rmux_client::default_socket_path()
+        .ok()
+        .as_deref()
+        .is_some_and(|default_path| default_path == socket_path)
+    {
+        return "rmux kill-server".to_owned();
+    }
+
+    format!("rmux -S {} kill-server", shell_quote_path(socket_path))
+}
+
+#[cfg(test)]
+fn shell_quote_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    if !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/._-+=:@".contains(&byte))
+    {
+        return text;
+    }
+
+    #[cfg(windows)]
+    {
+        return format!("\"{}\"", text.replace('"', "\"\""));
+    }
+    #[cfg(not(windows))]
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 fn response_needs_full_helper(

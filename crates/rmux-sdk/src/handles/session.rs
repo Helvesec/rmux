@@ -226,6 +226,7 @@ pub(crate) async fn kill_session(client: &TransportClient, name: SessionName) ->
             target: name,
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }))
         .await?
     {

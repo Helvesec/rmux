@@ -114,13 +114,17 @@ fn run_shell_rejects_unknown_flags_before_shell_text() {
 }
 
 #[test]
-fn run_shell_rejects_stderr_output_flag() {
-    let error = parse_args(&["run-shell", "-E", "true"]).unwrap_err();
+fn run_shell_accepts_stderr_output_and_positional_arguments() {
+    let cli = parse_args(&["run-shell", "-CE", "set-buffer -b out #{1}-#{2}", "a", "b"]).unwrap();
 
-    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    assert!(error
-        .to_string()
-        .contains("command run-shell: unknown flag -E"));
+    match cli.command.expect("parsed command") {
+        super::super::Command::RunShell(args) => {
+            assert!(args.as_commands);
+            assert!(args.show_stderr);
+            assert_eq!(args.command, vec!["set-buffer -b out #{1}-#{2}", "a", "b"]);
+        }
+        _ => panic!("expected RunShell command"),
+    }
 }
 
 #[test]

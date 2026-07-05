@@ -604,10 +604,13 @@ async fn raw_list_windows(
 ) -> TestResult<Vec<WindowListEntry>> {
     match framed_request(
         socket_path,
-        Request::ListWindows(ListWindowsRequest {
+        Request::ListWindows(Box::new(ListWindowsRequest {
             target,
             format: Some("#{window_index}:#{window_id}:#{window_panes}".to_owned()),
-        }),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })),
     )
     .await?
     {
@@ -623,11 +626,14 @@ async fn raw_list_pane_ids(
 ) -> TestResult<Vec<String>> {
     match framed_request(
         socket_path,
-        Request::ListPanes(ListPanesRequest {
+        Request::ListPanes(Box::new(ListPanesRequest {
             target,
             target_window_index,
             format: Some("#{pane_id}".to_owned()),
-        }),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })),
     )
     .await?
     {

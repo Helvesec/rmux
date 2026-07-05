@@ -336,11 +336,14 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
     )
     .to_owned();
     let listed = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: alpha.clone(),
             target_window_index: None,
             format: Some(list_format.clone()),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
     let list_stdout = match listed {
         rmux_proto::Response::ListPanes(response) => {
@@ -354,10 +357,13 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
     assert!(!list_stdout.contains(&split_secret));
 
     let windows = handler
-        .handle(Request::ListWindows(ListWindowsRequest {
+        .handle(Request::ListWindows(Box::new(ListWindowsRequest {
             target: alpha.clone(),
             format: Some(list_format),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
     let windows_stdout = match windows {
         rmux_proto::Response::ListWindows(response) => {
@@ -453,7 +459,7 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
     }
 
     let relisted = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: alpha,
             target_window_index: Some(0),
             format: Some(
@@ -465,7 +471,10 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
                 )
                 .to_owned(),
             ),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
     let relisted_stdout = match relisted {
         rmux_proto::Response::ListPanes(response) => {
@@ -712,11 +721,14 @@ async fn pane_output_sequence_advances_when_transcript_changes() {
 
 async fn listed_output_sequence(handler: &RequestHandler, session_name: &SessionName) -> u64 {
     let listed = handler
-        .handle(Request::ListPanes(ListPanesRequest {
+        .handle(Request::ListPanes(Box::new(ListPanesRequest {
             target: session_name.clone(),
             target_window_index: Some(0),
             format: Some("#{pane_output_sequence}".to_owned()),
-        }))
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })))
         .await;
     let stdout = match listed {
         rmux_proto::Response::ListPanes(response) => {

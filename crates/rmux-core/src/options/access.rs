@@ -500,8 +500,10 @@ impl OptionStore {
             }
             ResolveContext::Session(session_name) => {
                 let mut chain = Vec::new();
-                if scope_allows_session(query) {
-                    if let Some(node) = self.sessions.get(*session_name) {
+                if let Some(node) = self.sessions.get(*session_name) {
+                    if scope_allows_session(query)
+                        || node.contains(query.canonical_name(), query.index())
+                    {
                         chain.push(node);
                     }
                 }
@@ -510,14 +512,18 @@ impl OptionStore {
             }
             ResolveContext::Window(session_name, window_index) => {
                 let mut chain = Vec::new();
-                if scope_allows_window(query) {
-                    let target = WindowTarget::with_window((*session_name).clone(), *window_index);
-                    if let Some(node) = self.windows.get(&target) {
+                let target = WindowTarget::with_window((*session_name).clone(), *window_index);
+                if let Some(node) = self.windows.get(&target) {
+                    if scope_allows_window(query)
+                        || node.contains(query.canonical_name(), query.index())
+                    {
                         chain.push(node);
                     }
                 }
-                if scope_allows_session(query) {
-                    if let Some(node) = self.sessions.get(*session_name) {
+                if let Some(node) = self.sessions.get(*session_name) {
+                    if scope_allows_session(query)
+                        || node.contains(query.canonical_name(), query.index())
+                    {
                         chain.push(node);
                     }
                 }
@@ -526,25 +532,28 @@ impl OptionStore {
             }
             ResolveContext::Pane(session_name, window_index, pane_index) => {
                 let mut chain = Vec::new();
-                if scope_allows_pane(query) {
-                    let pane_target = PaneTarget::with_window(
-                        (*session_name).clone(),
-                        *window_index,
-                        *pane_index,
-                    );
-                    if let Some(node) = self.panes.get(&pane_target) {
+                let pane_target =
+                    PaneTarget::with_window((*session_name).clone(), *window_index, *pane_index);
+                if let Some(node) = self.panes.get(&pane_target) {
+                    if scope_allows_pane(query)
+                        || node.contains(query.canonical_name(), query.index())
+                    {
                         chain.push(node);
                     }
                 }
-                if scope_allows_window(query) {
-                    let window_target =
-                        WindowTarget::with_window((*session_name).clone(), *window_index);
-                    if let Some(node) = self.windows.get(&window_target) {
+                let window_target =
+                    WindowTarget::with_window((*session_name).clone(), *window_index);
+                if let Some(node) = self.windows.get(&window_target) {
+                    if scope_allows_window(query)
+                        || node.contains(query.canonical_name(), query.index())
+                    {
                         chain.push(node);
                     }
                 }
-                if scope_allows_session(query) {
-                    if let Some(node) = self.sessions.get(*session_name) {
+                if let Some(node) = self.sessions.get(*session_name) {
+                    if scope_allows_session(query)
+                        || node.contains(query.canonical_name(), query.index())
+                    {
                         chain.push(node);
                     }
                 }

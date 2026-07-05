@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+mod common;
+
+use common::{FrozenTmuxBinary, FROZEN_TMUX_ENV, TMUX_ORACLE_ENV};
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,9 +11,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
 fn source_file_parse_only_clear_history_matches_tmux_oracle() -> Result<(), Box<dyn Error>> {
-    let Some(tmux) = tmux_binary() else {
-        eprintln!("runtime skip: tmux binary not found for source-file oracle");
-        return Ok(());
+    let tmux = match FrozenTmuxBinary::discover() {
+        FrozenTmuxBinary::Available(path) => path,
+        FrozenTmuxBinary::Unavailable {
+            checked_path,
+            reason,
+        } => {
+            eprintln!(
+                "runtime skip: tmux 3.7b oracle unavailable via {TMUX_ORACLE_ENV}/{FROZEN_TMUX_ENV} or default '{}': {reason}",
+                checked_path.display()
+            );
+            return Ok(());
+        }
     };
     let harness = SourceFileOracleHarness::new("source-file-clear-history")?;
     let config = harness.tmpdir().join("clear-history.tmux.conf");
@@ -158,7 +170,7 @@ impl SourceFileOracleHarness {
 impl Drop for SourceFileOracleHarness {
     fn drop(&mut self) {
         let _ = self.rmux_output(["kill-server"], "");
-        if let Some(tmux) = tmux_binary() {
+        if let FrozenTmuxBinary::Available(tmux) = FrozenTmuxBinary::discover_optional() {
             let _ = self.tmux_output(&tmux, ["kill-server"], "");
         }
         let _ = fs::remove_dir_all(&self.tmpdir);
@@ -167,11 +179,6 @@ impl Drop for SourceFileOracleHarness {
 
 fn rmux_binary() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_rmux"))
-}
-
-fn tmux_binary() -> Option<PathBuf> {
-    let output = Command::new("tmux").arg("-V").output().ok()?;
-    output.status.success().then(|| PathBuf::from("tmux"))
 }
 
 fn assert_success(program: &str, output: &Output) -> Result<(), Box<dyn Error>> {

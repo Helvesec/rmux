@@ -50,6 +50,7 @@ if ($TestThreads -lt 1) {
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Set-Location $repoRoot
+$assertCargoFilter = Join-Path $PSScriptRoot "assert-cargo-filter-nonempty.ps1"
 
 Remove-Item Env:\RUST_TEST_THREADS -ErrorAction SilentlyContinue
 if (-not $env:CARGO_INCREMENTAL) {
@@ -73,6 +74,18 @@ Write-Host "[gate] cargo_incremental=$env:CARGO_INCREMENTAL"
 
 Run-Step "cargo fmt" { cargo fmt --all --check }
 Run-Step "cargo clippy" { cargo clippy --workspace --all-targets --locked --target $Target -- -D warnings }
+Run-Step "cargo filter nonempty rmux-client output writer" {
+    & $assertCargoFilter 1 -- test -p rmux-client --locked output_writer_failure_wakes
+}
+Run-Step "cargo filter nonempty rmux-client blocked output" {
+    & $assertCargoFilter 1 -- test -p rmux-client --locked blocked_console_output_does_not_block_input_forwarding
+}
+Run-Step "cargo filter nonempty windows prompt overlay chain" {
+    & $assertCargoFilter 2 -- test -p rmux --locked --test windows_prompt_overlay_chain
+}
+Run-Step "cargo filter nonempty windows ctrl matrix spec" {
+    & $assertCargoFilter 1 -- test -p rmux --locked --test windows_ctrl_matrix_spec
+}
 
 if (Has-Nextest) {
     Run-Step "cargo nextest workspace" {

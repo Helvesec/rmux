@@ -44,6 +44,7 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
             target: alpha.clone(),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
         Request::NewWindow(Box::new(NewWindowRequest {
             target: alpha.clone(),
@@ -78,10 +79,13 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
         Request::LastWindow(LastWindowRequest {
             target: alpha.clone(),
         }),
-        Request::ListWindows(ListWindowsRequest {
+        Request::ListWindows(Box::new(ListWindowsRequest {
             target: alpha.clone(),
             format: Some("#{window_index}".to_owned()),
-        }),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })),
         Request::MoveWindow(MoveWindowRequest {
             source: Some(WindowTarget::with_window(alpha.clone(), 1)),
             target: MoveWindowTarget::Window(WindowTarget::with_window(beta.clone(), 3)),
@@ -278,6 +282,9 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
             alternate: false,
             escape_ansi: false,
             escape_sequences: false,
+            include_format: false,
+            hyperlinks: false,
+            line_numbers: false,
             join_wrapped: false,
             use_mode_screen: false,
             preserve_trailing_spaces: false,
@@ -326,11 +333,14 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
             sort_order: None,
             reversed: false,
         }),
-        Request::ListPanes(ListPanesRequest {
+        Request::ListPanes(Box::new(ListPanesRequest {
             target: SessionName::new("alpha").unwrap(),
             format: Some("#{pane_id}".to_owned()),
+            filter: None,
+            sort_order: None,
+            reversed: false,
             target_window_index: None,
-        }),
+        })),
         Request::SourceFile(Box::new(SourceFileRequest {
             paths: vec!["/tmp/rmux.conf".to_owned()],
             quiet: false,
@@ -396,6 +406,7 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
             list: true,
             read_only: false,
             write: false,
+            target: None,
             user: None,
         }),
         Request::RefreshClient(Box::new(RefreshClientRequest {
@@ -580,6 +591,7 @@ fn server_lifecycle_request_variants_append_after_spread_layout() {
                 list: true,
                 read_only: false,
                 write: false,
+                target: None,
                 user: None,
             }),
         ),
@@ -851,6 +863,7 @@ fn decoder_handles_multiple_consecutive_frames() {
         target: SessionName::new("beta").expect("valid session"),
         kill_all_except_target: false,
         clear_alerts: false,
+        kill_group: false,
     });
     let frame_a = encode_frame(&req_a).expect("encodes");
     let frame_b = encode_frame(&req_b).expect("encodes");

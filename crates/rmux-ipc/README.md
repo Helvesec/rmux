@@ -1,7 +1,7 @@
 # rmux-ipc
 
 Local IPC endpoint and transport primitives for the
-[RMUX](https://github.com/helvesec/rmux) terminal multiplexer.
+[RMUX](https://github.com/Helvesec/rmux) terminal multiplexer.
 
 Resolves where the RMUX daemon listens (Unix domain socket on Linux and
 macOS, named pipe on Windows) and provides the listener / stream types the

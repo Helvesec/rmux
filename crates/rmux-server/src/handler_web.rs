@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use rmux_os::identity::UserIdentity;
 use rmux_proto::{
     CreateWebShareRequest, ErrorResponse, KillPaneRequest, KillSessionRequest, KillWindowRequest,
-    NewWindowRequest, PaneInputRequest, PaneResizeRequest, PaneSelectRequest, PaneTarget,
-    PaneTargetRef, RenameWindowRequest, ResizePaneAdjustment, Response, RmuxError,
+    NewWindowRequest, OptionName, PaneInputRequest, PaneResizeRequest, PaneSelectRequest,
+    PaneTarget, PaneTargetRef, RenameWindowRequest, ResizePaneAdjustment, Response, RmuxError,
     SelectWindowRequest, SessionId, SessionName, SplitDirection, SplitWindowRequest,
     SplitWindowTarget, WebShareRequest, WebShareScope, WindowTarget,
 };
@@ -361,7 +361,11 @@ impl RequestHandler {
         let Some(pane) = panes.into_iter().find(|pane| pane.id() == pane_id) else {
             return Ok(None);
         };
-        let Some(geometry) = session_content_geometry(pane.geometry(), window.size()) else {
+        let status = state
+            .options
+            .resolve(Some(session.name()), OptionName::Status);
+        let Some(geometry) = session_content_geometry(pane.geometry(), window.size(), status)
+        else {
             return Ok(None);
         };
         let Some(scrollback) =
@@ -483,6 +487,7 @@ impl RequestHandler {
                 target: session_target.name().clone(),
                 kill_all_except_target: false,
                 clear_alerts: false,
+                kill_group: false,
             })
             .await;
         response_to_result(response)
@@ -598,9 +603,12 @@ impl RequestHandler {
         #[cfg(windows)]
         self.wait_for_windows_deferred_all_pane_pids().await;
         let response = self
-            .handle_select_window(SelectWindowRequest {
-                target: WindowTarget::with_window(session_target.name().clone(), window_index),
-            })
+            .handle_select_window(
+                None,
+                SelectWindowRequest {
+                    target: WindowTarget::with_window(session_target.name().clone(), window_index),
+                },
+            )
             .await;
         response_to_result(response)
     }
@@ -656,7 +664,8 @@ impl RequestHandler {
         if active.control_backlog.load(Ordering::Acquire) >= ATTACH_CONTROL_BACKLOG_LIMIT {
             let _ = active.control_tx.send(AttachControl::Detach);
             active.closing.store(true, Ordering::SeqCst);
-            active_attach.by_pid.remove(&attach_pid);
+            active_attach.remove_attached_client(attach_pid);
+            self.bump_active_attach_epoch();
             return Err(RmuxError::Server(
                 "web session attach is not draining updates".to_owned(),
             ));
@@ -675,7 +684,8 @@ impl RequestHandler {
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                         value.checked_sub(1)
                     });
-            active_attach.by_pid.remove(&attach_pid);
+            active_attach.remove_attached_client(attach_pid);
+            self.bump_active_attach_epoch();
             return Err(RmuxError::Server(
                 "web session attach disappeared".to_owned(),
             ));
@@ -952,7 +962,11 @@ fn web_session_snapshot_from_state(
             }
             screen.mode
         });
-        let Some(geometry) = session_content_geometry(pane.geometry(), window.size()) else {
+        let status = state
+            .options
+            .resolve(Some(session.name()), OptionName::Status);
+        let Some(geometry) = session_content_geometry(pane.geometry(), window.size(), status)
+        else {
             continue;
         };
         let scrollback = match scrolls.get(&pane.id()).copied() {

@@ -417,14 +417,10 @@ fn session_content_rows(session: &Session, options: &OptionStore) -> u16 {
         return size.rows;
     }
 
-    if matches!(
+    crate::status_lines::content_rows_for_status(
         options.resolve(Some(session.name()), OptionName::Status),
-        Some("off")
-    ) {
-        size.rows
-    } else {
-        size.rows.saturating_sub(1)
-    }
+        size.rows,
+    )
 }
 
 pub(crate) fn session_not_found(session_name: &SessionName) -> RmuxError {
@@ -435,7 +431,8 @@ pub(crate) fn session_not_found(session_name: &SessionName) -> RmuxError {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{HandlerState, InitialPaneSpawnOptions};
+    use super::{session_content_rows, HandlerState, InitialPaneSpawnOptions};
+    use rmux_core::Session;
     use rmux_proto::{
         HookLifecycle, HookName, OptionName, PaneTarget, RmuxError, ScopeSelector, SessionName,
         SetOptionMode, TerminalSize, WindowTarget,
@@ -443,6 +440,47 @@ mod tests {
 
     fn session_name(value: &str) -> SessionName {
         SessionName::new(value).expect("valid session name")
+    }
+
+    #[test]
+    fn attached_session_content_rows_use_multi_line_status() {
+        let alpha = session_name("alpha");
+        let mut session = Session::new(alpha.clone(), TerminalSize { cols: 80, rows: 24 });
+        session.touch_attached();
+        let mut state = HandlerState::default();
+
+        state
+            .options
+            .set(
+                ScopeSelector::Session(alpha.clone()),
+                OptionName::Status,
+                "2".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("session status set succeeds");
+        assert_eq!(session_content_rows(&session, &state.options), 22);
+
+        state
+            .options
+            .set(
+                ScopeSelector::Session(alpha.clone()),
+                OptionName::Status,
+                "5".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("session status set succeeds");
+        assert_eq!(session_content_rows(&session, &state.options), 19);
+
+        state
+            .options
+            .set(
+                ScopeSelector::Session(alpha),
+                OptionName::Status,
+                "off".to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("session status set succeeds");
+        assert_eq!(session_content_rows(&session, &state.options), 24);
     }
 
     #[tokio::test]

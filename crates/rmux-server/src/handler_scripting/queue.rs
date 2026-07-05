@@ -129,12 +129,14 @@ pub(in crate::handler) enum QueueCommandAction {
     Normal {
         output: Option<CommandOutput>,
         error: Option<RmuxError>,
+        source_file_error: Option<RmuxError>,
         exit_status: Option<i32>,
     },
     InsertAfter {
         batches: Vec<(ParsedCommands, QueueExecutionContext)>,
         output: Option<CommandOutput>,
         error: Option<RmuxError>,
+        source_file_error: Option<RmuxError>,
         exit_status: Option<i32>,
     },
 }
@@ -188,6 +190,7 @@ pub(super) fn queue_action_from_response(
                 .filter(|output| !output.stdout().is_empty())
                 .cloned(),
             error: None,
+            source_file_error: None,
             exit_status: response.exit_status(),
         }),
         response => Ok(QueueCommandAction::Normal {
@@ -196,6 +199,7 @@ pub(super) fn queue_action_from_response(
                 .filter(|output| !output.stdout().is_empty())
                 .cloned(),
             error: None,
+            source_file_error: None,
             exit_status: None,
         }),
     }
@@ -209,11 +213,13 @@ pub(super) fn prompt_queue_action_from_result(
             batches: vec![(parsed, context)],
             output: None,
             error: result.error,
+            source_file_error: None,
             exit_status: None,
         },
         None => QueueCommandAction::Normal {
             output: None,
             error: result.error,
+            source_file_error: None,
             exit_status: None,
         },
     }

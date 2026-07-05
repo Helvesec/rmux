@@ -212,7 +212,8 @@ impl RequestHandler {
             if !active.render_refresh_pending {
                 active.render_refresh_pending = true;
                 if active.control_tx.send(AttachControl::Refresh).is_err() {
-                    active_attach.by_pid.remove(&attach_pid);
+                    active_attach.remove_attached_client(attach_pid);
+                    self.bump_active_attach_epoch();
                     return Err(attached_client_required(command_name));
                 }
             }
@@ -235,7 +236,8 @@ impl RequestHandler {
         {
             let _ = active.control_tx.send(AttachControl::Detach);
             active.closing.store(true, Ordering::SeqCst);
-            active_attach.by_pid.remove(&attach_pid);
+            active_attach.remove_attached_client(attach_pid);
+            self.bump_active_attach_epoch();
             return Err(rmux_proto::RmuxError::Server(
                 "attached client is not draining updates".to_owned(),
             ));
@@ -251,7 +253,8 @@ impl RequestHandler {
                     |value| value.checked_sub(1),
                 );
             }
-            active_attach.by_pid.remove(&attach_pid);
+            active_attach.remove_attached_client(attach_pid);
+            self.bump_active_attach_epoch();
             return Err(attached_client_required(command_name));
         }
         if closing_control {
@@ -322,7 +325,9 @@ impl RequestHandler {
             active.closing.store(true, Ordering::SeqCst);
             false
         });
+        active_attach.forget_session_windows(session_name);
         drop(active_attach);
+        self.bump_active_attach_epoch();
         for overlay in overlay_jobs {
             terminate_overlay_job(overlay);
         }
@@ -339,8 +344,9 @@ impl RequestHandler {
         let session_name = session_name.clone();
         let mut active_attach = self.active_attach.lock().await;
         let mut delivered = false;
+        let mut removed_pids = Vec::new();
 
-        active_attach.by_pid.retain(|_, active| {
+        active_attach.by_pid.retain(|pid, active| {
             if active.session_name != session_name || active.suspended {
                 return true;
             }
@@ -357,6 +363,7 @@ impl RequestHandler {
                 )))
                 .is_err()
             {
+                removed_pids.push(*pid);
                 return false;
             }
 
@@ -378,6 +385,14 @@ impl RequestHandler {
             delivered = true;
             true
         });
+        let removed_any = !removed_pids.is_empty();
+        for pid in removed_pids {
+            active_attach.forget_attached_client_windows(pid);
+        }
+        if removed_any {
+            drop(active_attach);
+            self.bump_active_attach_epoch();
+        }
 
         delivered
     }
@@ -411,7 +426,8 @@ impl RequestHandler {
             )))
             .is_err()
         {
-            active_attach.by_pid.remove(&attach_pid);
+            active_attach.remove_attached_client(attach_pid);
+            self.bump_active_attach_epoch();
             return false;
         }
 

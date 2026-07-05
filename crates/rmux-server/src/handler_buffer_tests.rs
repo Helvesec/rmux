@@ -448,7 +448,7 @@ async fn paste_buffer_nonexistent_session_returns_error() {
 }
 
 #[tokio::test]
-async fn paste_buffer_empty_store_returns_error() {
+async fn paste_buffer_empty_store_is_successful_noop() {
     let handler = RequestHandler::new();
     create_session(&handler, "alpha").await;
 
@@ -460,7 +460,7 @@ async fn paste_buffer_empty_store_returns_error() {
         ))))
         .await;
 
-    assert!(matches!(response, Response::Error(_)));
+    assert!(matches!(response, Response::PasteBuffer(_)));
 }
 
 #[tokio::test]

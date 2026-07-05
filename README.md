@@ -37,7 +37,7 @@
   <a href="#verification"><img src="https://img.shields.io/badge/unsafe-restricted-success.svg" alt="Unsafe policy"></a>
   <a href="https://github.com/Helvesec/rmux/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/Helvesec/rmux/ci.yml?branch=main&amp;event=push&amp;label=CI" alt="CI"></a>
   <a href="https://www.bestpractices.dev/projects/13290"><img src="https://www.bestpractices.dev/projects/13290/badge" alt="OpenSSF Best Practices"></a>
-  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.8.0"><img src="https://img.shields.io/badge/rmux-0.8.0-informational.svg" alt="rmux 0.8.0"></a>
+  <a href="https://github.com/Helvesec/rmux/releases/tag/v0.9.0"><img src="https://img.shields.io/badge/rmux-0.9.0-informational.svg" alt="rmux 0.9.0"></a>
 </p>
 
 </div>
@@ -123,9 +123,9 @@ Use `rmux -V` for the installed version.
 | <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/linux.svg"><img src="docs/install/linux-light.svg" width="28" alt="Linux"></picture> / APT | See the [APT setup guide](https://rmux.io/docs/get-started/) |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/linux.svg"><img src="docs/install/linux-light.svg" width="28" alt="Linux"></picture> / DNF | See the [DNF setup guide](https://rmux.io/docs/get-started/) |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/linux.svg"><img src="docs/install/linux-light.svg" width="28" alt="Linux"></picture> <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/apple.svg"><img src="docs/install/apple-light.svg" width="28" alt="macOS"></picture> / Nix | `nix profile install github:Helvesec/rmux` |
-| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/rust.svg"><img src="docs/install/rust-light.svg" width="28" alt="Rust"></picture> / Cargo | `cargo install rmux --locked` |
+| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/rust.svg"><img src="docs/install/rust-light.svg" width="28" alt="Rust"></picture> / Cargo | `cargo install --git https://github.com/Helvesec/rmux --tag v0.9.0 rmux --locked` |
 
-Direct downloads (`.tar.gz`, `.deb`, `.rpm`, `.zip`) are available from the [v0.8.0 GitHub Release](https://github.com/helvesec/rmux/releases/tag/v0.8.0).
+Direct downloads (`.tar.gz`, `.deb`, `.rpm`, `.zip`) are available from the [v0.9.0 GitHub Release](https://github.com/Helvesec/rmux/releases/tag/v0.9.0).
 
 Package managers can lag while registries review new releases; direct downloads and the rmux.io installers track the current GitHub Release.
 
@@ -157,6 +157,18 @@ rmux claude [args]
 
 RMUX opens an attached session and automatically passes `--teammate-mode tmux`
 along with your `[args]` straight to Claude.
+
+Install RMUX's user-level Claude Code skill when you want Claude to remember
+the RMUX CLI, SDK, web-share, and automation patterns outside this repository:
+
+```bash
+rmux claude install-skill
+```
+
+The skill is installed under your Claude profile (`~/.claude/skills/rmux` on
+Linux/macOS, `%USERPROFILE%\.claude\skills\rmux` on Windows). The repository
+keeps the source copy at `resources/claude/skills/rmux/SKILL.md` so the project
+can package and install it without a hidden `.claude` source-tree directory.
 
 How it works under the hood: to route commands properly, RMUX prepends a
 private `tmux` shim to Claude's `PATH`. This is strictly scoped to the Claude
@@ -259,9 +271,9 @@ The full documentation is available at [rmux.io/docs](https://rmux.io/docs/).
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://rmux.io/rmux-architecture-dark.png?v=0.8.0-web-share">
-  <source media="(prefers-color-scheme: light)" srcset="https://rmux.io/rmux-architecture-light.png?v=0.8.0-web-share">
-  <img src="https://rmux.io/rmux-architecture-dark.png?v=0.8.0-web-share" alt="RMUX runtime architecture" width="800">
+  <source media="(prefers-color-scheme: dark)" srcset="https://rmux.io/rmux-architecture-dark.png?v=0.9.0-web-share">
+  <source media="(prefers-color-scheme: light)" srcset="https://rmux.io/rmux-architecture-light.png?v=0.9.0-web-share">
+  <img src="https://rmux.io/rmux-architecture-dark.png?v=0.9.0-web-share" alt="RMUX runtime architecture" width="800">
 </picture>
 
 </div>

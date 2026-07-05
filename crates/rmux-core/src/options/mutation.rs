@@ -8,11 +8,12 @@ use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{OptionName, RmuxError, ScopeSelector, SetOptionMode};
 
 use super::registry::{
-    self, option_metadata, resolve_option_name, DefaultValue, GlobalRoot, OptionMetadata,
-    OptionValueType,
+    self, option_metadata, resolve_option_name, DefaultValue, GlobalRoot, OptionValueType,
 };
 use super::storage::{ArrayItem, OptionEntry, StoredOptionValue};
 use super::{OptionMutationOutcome, OptionNotification, OptionQuery};
+
+const TMUX_NUMBER_MAX: i64 = i32::MAX as i64;
 
 /// Validates an option mutation against the legacy known-option registry.
 pub fn validate_option_mutation(
@@ -41,32 +42,11 @@ pub fn validate_option_name_mutation(
 
 fn validate_query_mutation(
     query: &OptionQuery,
-    scope: &OptionScopeSelector,
-    mode: SetOptionMode,
+    _scope: &OptionScopeSelector,
+    _mode: SetOptionMode,
     value: Option<&str>,
     unset: bool,
 ) -> Result<(), RmuxError> {
-    if let Some(metadata) = query.metadata() {
-        if !metadata.supports_scope(scope) {
-            return Err(RmuxError::InvalidSetOption(format!(
-                "{} is only supported at {} scope",
-                query.canonical_name(),
-                allowed_scope_message(metadata),
-            )));
-        }
-    }
-
-    if mode == SetOptionMode::Append
-        && !unset
-        && !query.is_array()
-        && !matches!(query.value_type(), OptionValueType::String)
-    {
-        return Err(RmuxError::InvalidSetOption(format!(
-            "{} is not an array option",
-            query.canonical_name()
-        )));
-    }
-
     if !unset && !query.is_array() {
         match query.value_type() {
             OptionValueType::Flag | OptionValueType::Choice(_) => {}
@@ -128,6 +108,11 @@ pub(super) fn normalize_scalar_value(
                     "value is too small: {raw}"
                 )));
             }
+            if parsed > TMUX_NUMBER_MAX {
+                return Err(RmuxError::InvalidSetOption(format!(
+                    "value is too large: {raw}"
+                )));
+            }
             let parsed = u32::try_from(parsed)
                 .map_err(|_| RmuxError::InvalidSetOption(format!("value is too large: {raw}")))?;
             Ok(StoredOptionValue::Number(parsed))
@@ -154,15 +139,18 @@ pub(super) fn normalize_scalar_value(
             Ok(StoredOptionValue::Flag(toggled))
         }
         OptionValueType::Choice(choices) => {
-            let raw = value.unwrap_or_default();
-            if raw.is_empty() {
-                if choices.contains(&"on") && choices.contains(&"off") {
-                    let current = current.unwrap_or(choices[0]);
-                    let next = if current == "on" { "off" } else { "on" };
-                    return Ok(StoredOptionValue::Choice(next.to_owned()));
-                }
-                return Err(RmuxError::InvalidSetOption("empty value".to_owned()));
-            }
+            let Some(raw) = value else {
+                let current = current.unwrap_or(choices[0]);
+                let Some(index) = choices.iter().position(|choice| *choice == current) else {
+                    return Ok(StoredOptionValue::Choice(current.to_owned()));
+                };
+                let next = if index < 2 {
+                    choices[1 - index]
+                } else {
+                    choices[index]
+                };
+                return Ok(StoredOptionValue::Choice(next.to_owned()));
+            };
             if choices.contains(&raw) {
                 Ok(StoredOptionValue::Choice(raw.to_owned()))
             } else {
@@ -335,23 +323,6 @@ pub(super) fn is_global_scope(scope: &OptionScopeSelector) -> bool {
             | OptionScopeSelector::SessionGlobal
             | OptionScopeSelector::WindowGlobal
     )
-}
-
-fn allowed_scope_message(metadata: &OptionMetadata) -> String {
-    let mut scopes = Vec::new();
-    if metadata.scope_mask() & registry::SCOPE_SERVER != 0 {
-        scopes.push("global");
-    }
-    if metadata.scope_mask() & registry::SCOPE_SESSION != 0 {
-        scopes.push("session");
-    }
-    if metadata.scope_mask() & registry::SCOPE_WINDOW != 0 {
-        scopes.push("window");
-    }
-    if metadata.scope_mask() & registry::SCOPE_PANE != 0 {
-        scopes.push("pane");
-    }
-    scopes.join(" or ")
 }
 
 fn invalid_integer(name: &str, label: &str) -> RmuxError {

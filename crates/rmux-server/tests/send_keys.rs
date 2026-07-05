@@ -164,6 +164,9 @@ async fn capture_pane_text(
             alternate: false,
             escape_ansi: false,
             escape_sequences: false,
+            include_format: false,
+            hyperlinks: false,
+            line_numbers: false,
             join_wrapped: false,
             use_mode_screen: false,
             preserve_trailing_spaces: false,
@@ -287,6 +290,7 @@ async fn send_keys_writes_to_the_correct_pane_through_the_socket() -> Result<(),
             target: session_name("alpha"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
     )
     .await?;
@@ -389,6 +393,7 @@ async fn send_keys_targets_the_correct_pane_in_a_multi_pane_session() -> Result<
             target: session_name("beta"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
     )
     .await?;
@@ -498,6 +503,7 @@ async fn send_keys_ctrl_c_interrupts_a_real_pane_process() -> Result<(), Box<dyn
             target: session_name("gamma"),
             kill_all_except_target: false,
             clear_alerts: false,
+            kill_group: false,
         }),
     )
     .await?;

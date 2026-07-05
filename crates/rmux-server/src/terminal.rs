@@ -708,9 +708,21 @@ fn windows_batch_child_command(
             .arg("/D")
             .arg("/S")
             .arg("/C")
-            .arg(program.as_os_str())
-            .args(args),
+            .windows_verbatim_args(windows_batch_cmd_tail(program, args)),
     )
+}
+
+#[cfg(windows)]
+fn windows_batch_cmd_tail(program: &Path, args: &[String]) -> OsString {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(cmd_double_quoted(&program.to_string_lossy()));
+    parts.extend(args.iter().map(|arg| cmd_double_quoted(arg)));
+    format!("\"{}\"", parts.join(" ")).into()
+}
+
+#[cfg(windows)]
+fn cmd_double_quoted(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 #[cfg(windows)]

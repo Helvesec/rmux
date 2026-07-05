@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use rmux_proto::{LayoutName, RmuxError, RotateWindowDirection, SplitDirection, TerminalSize};
 
 use crate::layout::{LayoutDirection, LayoutTree};
@@ -94,6 +96,8 @@ pub struct Window {
     zoom_restore_pending: bool,
     alert_flags: AlertFlags,
     alerts_queued: bool,
+    created_at: i64,
+    activity_at: i64,
     // `resize-pane -x` sets an explicit main-pane width; otherwise layout derives it.
     requested_main_width: Option<u16>,
     // `resize-pane -y` sets an explicit main-pane height; otherwise layout derives it.
@@ -119,6 +123,7 @@ impl Window {
     }
 
     pub(crate) fn new_with_initial_pane(size: TerminalSize, pane_id: PaneId, id: WindowId) -> Self {
+        let now = current_unix_timestamp();
         let mut window = Self {
             id,
             panes: vec![Pane::new_with_id(
@@ -141,6 +146,8 @@ impl Window {
             zoom_restore_pending: false,
             alert_flags: AlertFlags::empty(),
             alerts_queued: false,
+            created_at: now,
+            activity_at: now,
             requested_main_width: None,
             requested_main_height: None,
         };
@@ -152,6 +159,26 @@ impl Window {
     #[must_use]
     pub const fn id(&self) -> WindowId {
         self.id
+    }
+
+    /// Returns the window creation timestamp as Unix seconds.
+    #[must_use]
+    pub const fn created_at(&self) -> i64 {
+        self.created_at
+    }
+
+    /// Returns the last window activity timestamp as Unix seconds.
+    #[must_use]
+    pub const fn activity_at(&self) -> i64 {
+        self.activity_at
+    }
+
+    /// Records window activity at the current time.
+    pub fn touch_activity(&mut self) {
+        self.activity_at = current_unix_timestamp();
+        if let Some(pane) = self.pane_mut(self.active_pane) {
+            pane.touch_activity();
+        }
     }
 
     /// Returns the panes in window order.
@@ -522,14 +549,26 @@ impl Window {
         Ok(())
     }
 
-    pub(crate) fn replace_pane(&mut self, pane_index: u32, pane: Pane) -> Result<(), RmuxError> {
+    pub(crate) fn replace_pane_for_swap(
+        &mut self,
+        pane_index: u32,
+        pane: Pane,
+    ) -> Result<(), RmuxError> {
         let position = self.pane_position(pane_index).ok_or_else(|| {
             RmuxError::Server(format!(
                 "cannot replace missing pane index {pane_index} in window {}",
                 self.id
             ))
         })?;
-        self.ensure_accepts_pane(&pane, Some(position))?;
+        for (existing_position, existing) in self.panes.iter().enumerate() {
+            if existing_position != position && existing.id() == pane.id() {
+                return Err(RmuxError::Server(format!(
+                    "pane id {} already exists in window {}",
+                    pane.id().as_u32(),
+                    self.id
+                )));
+            }
+        }
         self.bump_next_pane_index(pane.index());
         self.panes[position] = pane;
         self.apply_layout_tree();
@@ -560,6 +599,14 @@ impl Window {
         self.renumber_panes_by_position(active_pane_id, last_pane_id);
         true
     }
+}
+
+fn current_unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

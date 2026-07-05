@@ -11,15 +11,15 @@ use crate::hook_runtime::with_hook_execution;
 use rmux_core::command_parser::CommandParser;
 use rmux_core::TargetFindContext;
 use rmux_proto::{
-    BreakPaneRequest, DisplayMessageRequest, IfShellRequest, KillWindowRequest, LastWindowRequest,
-    LinkWindowRequest, NewSessionExtRequest, NewSessionRequest, NewWindowRequest,
-    NextWindowRequest, OptionName, OptionScopeSelector, PaneTarget, PreviousWindowRequest, Request,
-    RespawnPaneRequest, RespawnWindowRequest, Response, RotateWindowDirection, RotateWindowRequest,
-    RunShellDelaySeconds, RunShellRequest, RunShellResponse, ScopeSelector, SelectPaneRequest,
-    SessionName, SetEnvironmentRequest, SetOptionMode, SetOptionRequest, ShowBufferRequest,
-    ShowOptionsRequest, SourceFileRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget,
-    SwapPaneDirection, SwapPaneRequest, Target, TerminalSize, WaitForMode, WaitForRequest,
-    WaitForResponse, WindowTarget,
+    BreakPaneRequest, DisplayMessageRequest, HookName, IfShellRequest, KillWindowRequest,
+    LastWindowRequest, LinkWindowRequest, NewSessionExtRequest, NewSessionRequest,
+    NewWindowRequest, NextWindowRequest, OptionName, OptionScopeSelector, PaneTarget,
+    PreviousWindowRequest, Request, RespawnPaneRequest, RespawnWindowRequest, Response,
+    RotateWindowDirection, RotateWindowRequest, RunShellDelaySeconds, RunShellRequest,
+    RunShellResponse, ScopeSelector, SelectPaneRequest, SessionName, SetEnvironmentRequest,
+    SetOptionMode, SetOptionRequest, ShowBufferRequest, ShowOptionsRequest, SourceFileRequest,
+    SplitDirection, SplitWindowRequest, SplitWindowTarget, SwapPaneDirection, SwapPaneRequest,
+    Target, TerminalSize, WaitForMode, WaitForRequest, WaitForResponse, WindowTarget,
 };
 
 fn session_name(value: &str) -> SessionName {
@@ -36,8 +36,8 @@ fn wait_for(channel: &str, mode: WaitForMode) -> Request {
 fn run_shell(command: &str, background: bool) -> Request {
     Request::RunShell(Box::new(RunShellRequest {
         command: command.to_owned(),
+        arguments: Vec::new(),
         background,
-
         as_commands: false,
         show_stderr: false,
         delay_seconds: None,
@@ -206,6 +206,19 @@ fn shell_print_then_exit_command(text: &str, code: u8) -> String {
 fn shell_print_then_exit_command(text: &str, code: u8) -> String {
     format!(
         "[Console]::Out.Write({}); exit {code}",
+        crate::test_shell::powershell_quote(text)
+    )
+}
+
+#[cfg(unix)]
+fn shell_stderr_command(text: &str) -> String {
+    format!("printf {} >&2", command_quote(text))
+}
+
+#[cfg(windows)]
+fn shell_stderr_command(text: &str) -> String {
+    format!(
+        "[Console]::Error.Write({})",
         crate::test_shell::powershell_quote(text)
     )
 }

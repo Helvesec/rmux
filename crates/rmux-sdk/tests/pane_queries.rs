@@ -383,11 +383,14 @@ async fn raw_first_pane_id(
 ) -> TestResult<String> {
     match framed_request(
         socket_path,
-        Request::ListPanes(ListPanesRequest {
+        Request::ListPanes(Box::new(ListPanesRequest {
             target,
             target_window_index: Some(window_index),
             format: Some("#{pane_id}".to_owned()),
-        }),
+            filter: None,
+            sort_order: None,
+            reversed: false,
+        })),
     )
     .await?
     {

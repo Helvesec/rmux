@@ -14,6 +14,29 @@ $ErrorActionPreference = "Stop"
 
 if ($StaticMatrixSpec) {
     $scriptText = Get-Content -LiteralPath $PSCommandPath -Raw
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+        $PSCommandPath,
+        [ref]$tokens,
+        [ref]$parseErrors
+    )
+    if ($parseErrors.Count -gt 0) {
+        throw "Windows Ctrl matrix static spec parse failed: $($parseErrors[0].Message)"
+    }
+    $staticSpecBlock = $ast.Find({
+        param($node)
+        $node -is [System.Management.Automation.Language.IfStatementAst] -and
+        $node.Clauses.Count -gt 0 -and
+        $node.Clauses[0].Item1.Extent.Text -eq '$StaticMatrixSpec'
+    }, $true)
+    if (-not $staticSpecBlock) {
+        throw "Windows Ctrl matrix static spec could not locate its own guard block"
+    }
+    $scriptUnderTest = $scriptText.Remove(
+        $staticSpecBlock.Extent.StartOffset,
+        $staticSpecBlock.Extent.EndOffset - $staticSpecBlock.Extent.StartOffset
+    )
     $requiredSnippets = @(
         "function Invoke-DirectCase",
         "function Invoke-AttachCase",
@@ -52,7 +75,7 @@ if ($StaticMatrixSpec) {
         "Windows Ctrl matrix found"
     )
     foreach ($snippet in $requiredSnippets) {
-        if (-not $scriptText.Contains($snippet)) {
+        if (-not $scriptUnderTest.Contains($snippet)) {
             throw "Windows Ctrl matrix static spec missing required snippet: $snippet"
         }
     }
@@ -63,7 +86,14 @@ if ($StaticMatrixSpec) {
 if ($PortableSmokeOnly -and -not $env:RMUX_FORCE_WINDOWS_CTRL_MATRIX_GUI) {
     $currentSession = (Get-Process -Id $PID).SessionId
     if ($currentSession -eq 0) {
-        Write-Host "windows-ctrl-matrix-portable-smoke=skipped reason=non-interactive-session-0"
+        New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+        $skipMessage = "windows-ctrl-matrix-portable-smoke=skipped reason=non-interactive-session-0"
+        Set-Content -LiteralPath (Join-Path $OutDir "portable-smoke.skip.txt") -Encoding ASCII -Value @(
+            $skipMessage
+            "owner=release-engineering"
+            "cadence=release-candidate-and-manual-windows-review"
+        )
+        Write-Host $skipMessage
         Write-Host "Set RMUX_FORCE_WINDOWS_CTRL_MATRIX_GUI=1 to force the GUI focus smoke from this session."
         exit 0
     }

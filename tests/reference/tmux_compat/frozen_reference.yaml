@@ -1,36 +1,36 @@
 artifact: frozen_tmux_reference
-scope: "Frozen tmux reference used by the RMUX tmux compatibility harness."
+scope: "Pinned tmux 3.7b reference used by the RMUX 0.9.0 tmux compatibility harness."
 tmux_reference:
-  source_sha: "31d77e29b6c9fbb07d032018da78db3a8a38d979"
-  manpage_line_count: 8271
+  source_tag: "3.7b"
+  source_sha: "e802909de06012a4df6209d55e86487c56223163"
+  source_tarball_url: "https://github.com/tmux/tmux/releases/download/3.7b/tmux-3.7b.tar.gz"
+  source_tarball_sha256: "87f2e99e3b685973f2ca002ffd6ed7e51a5744f7009daae5a15670b6d532db96"
+  version: "tmux 3.7b"
   system_tmux:
     path: "/usr/bin/tmux"
-    version: "3.4"
+    accepted_as_oracle: false
     used_for_tmux_compat_observations: false
 frozen_tmux_binary_acquisition:
-  source_sha: "31d77e29b6c9fbb07d032018da78db3a8a38d979"
-  source_copy_path: "/tmp/rmux-frozen-tmux-31d77e29b6c9fbb07d032018da78db3a8a38d979/build-debian/source"
-  build_directory_path: "/tmp/rmux-frozen-tmux-31d77e29b6c9fbb07d032018da78db3a8a38d979/build-debian"
-  expected_binary_path: "/opt/rmux/reference/tmux-frozen/31d77e29b6c9fbb07d032018da78db3a8a38d979/tmux"
-  resulting_binary_path: "/opt/rmux/reference/tmux-frozen/31d77e29b6c9fbb07d032018da78db3a8a38d979/tmux"
-  binary_sha256: "525149cdac8d41b7e60ad68c4bab0670c8b769c646bab780e2a7b66239ad83a0"
+  source_tag: "3.7b"
+  source_sha: "e802909de06012a4df6209d55e86487c56223163"
+  source_tarball_sha256: "87f2e99e3b685973f2ca002ffd6ed7e51a5744f7009daae5a15670b6d532db96"
+  version: "tmux 3.7b"
+  source_copy_path: "/tmp/rmux-frozen-tmux-e802909de06012a4df6209d55e86487c56223163/source/tmux-3.7b"
+  build_directory_path: "/tmp/rmux-frozen-tmux-e802909de06012a4df6209d55e86487c56223163/build"
+  expected_binary_path: "/opt/rmux/reference/tmux-frozen/e802909de06012a4df6209d55e86487c56223163/tmux"
+  resulting_binary_path: "/opt/rmux/reference/tmux-frozen/e802909de06012a4df6209d55e86487c56223163/tmux"
+  binary_sha256: "eb05f981dfc0ed55f29b7dc8e13ed838827ebca2764a9fc559ae817d9cf1acd0"
   result: "available"
   dependency_inventory:
-    cc: "debian:bookworm-slim:/usr/bin/cc"
-    make: "debian:bookworm-slim:/usr/bin/make"
-    pkg_config: "debian:bookworm-slim:/usr/bin/pkg-config"
-    autoconf: "debian:bookworm-slim:/usr/bin/autoconf"
-    automake: "debian:bookworm-slim:/usr/bin/automake"
-    aclocal: "debian:bookworm-slim:/usr/bin/aclocal"
-    yacc: "debian:bookworm-slim:/usr/bin/yacc"
-    bison: "debian:bookworm-slim:/usr/bin/bison"
-    libevent_pkg_config: "debian:bookworm-slim:available"
-    ncurses_pkg_config: "debian:bookworm-slim:available"
+    source_tarball: "sha256:87f2e99e3b685973f2ca002ffd6ed7e51a5744f7009daae5a15670b6d532db96"
+    source_commit: "e802909de06012a4df6209d55e86487c56223163"
+    builder: "scripts/oracle/build-tmux37.sh"
+    linux_packages: "build-essential, bison, libevent-dev, libncurses-dev, libutf8proc-dev, pkg-config"
 baseline_test_floor:
-  command: "cargo test --workspace --locked"
-  scope: "Historical baseline recorded before the tmux compatibility harness was added."
-  count_method: "Summed the numeric passed fields from each Cargo 'test result:' line in the complete log."
-  passed: 776
+  command: "RMUX_REQUIRE_TMUX=1 cargo test --locked --test unix_source_file_tmux_oracle -- --test-threads=1"
+  scope: "Lot 0 oracle smoke must compare against the pinned tmux 3.7b binary, never PATH tmux."
+  count_method: "Cargo test result line for unix_source_file_tmux_oracle."
+  passed: 2
   failed: 0
   ignored: 0
   measured: 0

@@ -139,12 +139,14 @@ impl ConsoleInputReader {
     }
 }
 
-// SGR mouse button codes (xterm). Modifiers are OR-ed in; drag adds 32; wheel uses 64/65.
+// SGR mouse button codes (xterm). Modifiers are OR-ed in; drag adds 32.
 const SGR_BTN_LEFT: u16 = 0;
 const SGR_BTN_MIDDLE: u16 = 1;
 const SGR_BTN_RIGHT: u16 = 2;
 const SGR_WHEEL_UP: u16 = 64;
 const SGR_WHEEL_DOWN: u16 = 65;
+const SGR_WHEEL_LEFT: u16 = 66;
+const SGR_WHEEL_RIGHT: u16 = 67;
 const SGR_MOD_SHIFT: u16 = 4;
 const SGR_MOD_ALT: u16 = 8;
 const SGR_MOD_CTRL: u16 = 16;
@@ -170,7 +172,15 @@ fn encode_mouse_event(event: MOUSE_EVENT_RECORD, last_button_state: &mut u32) ->
         return Some(format_sgr_mouse(base | modifiers, x, y, 'M'));
     }
     if event.dwEventFlags & MOUSE_HWHEELED != 0 {
-        return None;
+        // High word of dwButtonState is the signed horizontal wheel delta;
+        // Windows reports positive = right, while SGR 66/67 are left/right.
+        let delta = (buttons >> 16) as i16;
+        let base = if delta >= 0 {
+            SGR_WHEEL_RIGHT
+        } else {
+            SGR_WHEEL_LEFT
+        };
+        return Some(format_sgr_mouse(base | modifiers, x, y, 'M'));
     }
 
     // Ignore bare double-click flags; movement is handled below.
@@ -1072,11 +1082,32 @@ mod tests {
     }
 
     #[test]
-    fn mouse_horizontal_wheel_is_ignored_without_polluting_button_state() {
+    fn mouse_horizontal_wheel_right_encodes_sgr_button_67_without_polluting_button_state() {
         let mut last = FROM_LEFT_1ST_BUTTON_PRESSED;
         let event = mouse_event(0x0078_0000, MOUSE_HWHEELED, 0, 3, 3);
 
-        assert_eq!(encode_mouse(event, &mut last), None);
+        assert_eq!(
+            encode_mouse(event, &mut last).as_deref(),
+            Some("\x1b[<67;4;4M")
+        );
+        assert_eq!(last, FROM_LEFT_1ST_BUTTON_PRESSED);
+    }
+
+    #[test]
+    fn mouse_horizontal_wheel_left_encodes_sgr_button_66_with_modifiers() {
+        let mut last = FROM_LEFT_1ST_BUTTON_PRESSED;
+        let event = mouse_event(
+            0xff88_0000,
+            MOUSE_HWHEELED,
+            SHIFT_PRESSED | LEFT_CTRL_PRESSED,
+            3,
+            3,
+        );
+
+        assert_eq!(
+            encode_mouse(event, &mut last).as_deref(),
+            Some("\x1b[<86;4;4M")
+        );
         assert_eq!(last, FROM_LEFT_1ST_BUTTON_PRESSED);
     }
 

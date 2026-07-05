@@ -968,7 +968,7 @@ async fn parsed_queue_display_panes_t_reports_target_client_errors_like_cli() {
 }
 
 #[tokio::test]
-async fn parsed_queue_refresh_client_r_is_unknown_flag_like_tmux() {
+async fn parsed_queue_refresh_client_r_is_accepted_but_runtime_unsupported() {
     let handler = RequestHandler::new();
     let parsed = CommandParser::new()
         .parse("refresh-client -r %0")
@@ -977,11 +977,11 @@ async fn parsed_queue_refresh_client_r_is_unknown_flag_like_tmux() {
     let error = handler
         .execute_parsed_commands_for_test(std::process::id(), parsed)
         .await
-        .expect_err("refresh-client -r should be rejected");
+        .expect_err("refresh-client -r should be accepted by parser and rejected by runtime");
 
     assert_eq!(
         error,
-        rmux_proto::RmuxError::Server("command refresh-client: unknown flag -r".to_owned())
+        rmux_proto::RmuxError::Server("refresh-client -r is not supported".to_owned())
     );
 }
 

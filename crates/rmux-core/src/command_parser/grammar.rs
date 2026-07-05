@@ -9,13 +9,14 @@ use super::{
 // (parse_condition) both re-enter parse_until, so without a cap an attacker can
 // nest either one arbitrarily deep and overflow the stack (a SIGABRT DoS reachable
 // from control-mode). Cap the shared recursion node and fail closed with a parse
-// error well before the native stack is exhausted. 256 is far beyond any real
-// config yet leaves ample stack headroom.
-const MAX_NESTING_DEPTH: usize = 256;
+// error well before the native stack is exhausted. Keep this below the known
+// 2 MiB worker-stack overflow range for later recursive tree passes too.
+const MAX_NESTING_DEPTH: usize = 124;
 
 pub(super) struct GrammarParser<'a> {
     lexer: Lexer<'a>,
     grouping: CommandGrouping,
+    command_line_mode: CommandLineMode,
     peeked: Option<SpannedToken>,
     depth: usize,
 }
@@ -25,6 +26,17 @@ impl<'a> GrammarParser<'a> {
         Self {
             lexer,
             grouping,
+            command_line_mode: CommandLineMode::Start,
+            peeked: None,
+            depth: 0,
+        }
+    }
+
+    pub(super) fn new_source_file(lexer: Lexer<'a>, grouping: CommandGrouping) -> Self {
+        Self {
+            lexer,
+            grouping,
+            command_line_mode: CommandLineMode::End,
             peeked: None,
             depth: 0,
         }
@@ -217,7 +229,7 @@ impl<'a> GrammarParser<'a> {
     }
 
     fn parse_command(&mut self, active: bool) -> Result<ParsedCommand, CommandParseError> {
-        let (name, line) = self.expect_token_with_line("expected command name")?;
+        let (name, start_line) = self.expect_token_with_line("expected command name")?;
         let mut arguments = Vec::new();
 
         loop {
@@ -254,7 +266,11 @@ impl<'a> GrammarParser<'a> {
             }
         }
 
-        Ok(ParsedCommand::new(name, arguments, line))
+        let line = match self.command_line_mode {
+            CommandLineMode::Start => start_line,
+            CommandLineMode::End => self.peek_line()?,
+        };
+        Ok(ParsedCommand::with_lines(name, arguments, start_line, line))
     }
 
     fn peek(&mut self) -> Result<LexToken, CommandParseError> {
@@ -389,4 +405,10 @@ enum ConditionStop {
     Else,
     Elif,
     Endif,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandLineMode {
+    Start,
+    End,
 }

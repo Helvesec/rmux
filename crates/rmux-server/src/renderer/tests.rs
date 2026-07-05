@@ -33,6 +33,12 @@ fn screen_with(bytes: &[u8], size: TerminalSize) -> Screen {
     screen
 }
 
+fn visible_line_text(screen: &Screen, row: usize, cols: usize) -> String {
+    let mut text = String::new();
+    assert!(screen.visit_visible_line_cells(row, cols, |cell| text.push_str(cell.text())));
+    text
+}
+
 fn render_until_contains(session: &Session, options: &OptionStore, needle: &str) -> String {
     let deadline = std::time::Instant::now() + status_job_test_deadline();
     loop {
@@ -805,6 +811,60 @@ fn status_format_override_replaces_default_status_line() {
 }
 
 #[test]
+fn status_numeric_value_reserves_and_renders_multiple_status_lines() {
+    let size = TerminalSize { cols: 20, rows: 6 };
+    let session = Session::new(session_name("alpha"), size);
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::Status,
+            "3".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("status option set succeeds");
+    for (name, value) in [
+        ("status-format[0]", "ZERO"),
+        ("status-format[1]", "ONE"),
+        ("status-format[2]", "TWO"),
+    ] {
+        options
+            .set_by_name(
+                rmux_proto::types::OptionScopeSelector::Session(session.name().clone()),
+                name,
+                Some(value.to_owned()),
+                SetOptionMode::Replace,
+                false,
+                false,
+                false,
+            )
+            .expect("status-format option set succeeds");
+    }
+
+    let frame = render(&session, &options);
+    let screen = screen_with(&frame, size);
+
+    assert_eq!(
+        visible_line_text(&screen, 3, usize::from(size.cols))
+            .trim_end()
+            .to_owned(),
+        "ZERO"
+    );
+    assert_eq!(
+        visible_line_text(&screen, 4, usize::from(size.cols))
+            .trim_end()
+            .to_owned(),
+        "ONE"
+    );
+    assert_eq!(
+        visible_line_text(&screen, 5, usize::from(size.cols))
+            .trim_end()
+            .to_owned(),
+        "TWO"
+    );
+}
+
+#[test]
 fn status_left_expands_shell_job() {
     let session = Session::new(session_name("alpha"), TerminalSize { cols: 80, rows: 3 });
     let mut options = OptionStore::new();
@@ -1058,6 +1118,29 @@ fn status_message_style_fills_the_full_status_line() {
             || frame.contains("\x1b[30;43mNo next window      \x1b[0m"),
         "message-style should fill the whole status row, got {frame:?}"
     );
+}
+
+#[test]
+fn status_message_uses_message_line_with_multiline_status() {
+    let size = TerminalSize { cols: 20, rows: 5 };
+    let session = Session::new(session_name("alpha"), size);
+    let mut options = OptionStore::new();
+    for (option, value) in [(OptionName::Status, "2"), (OptionName::MessageLine, "1")] {
+        options
+            .set(
+                ScopeSelector::Global,
+                option,
+                value.to_owned(),
+                SetOptionMode::Replace,
+            )
+            .expect("status option set succeeds");
+    }
+
+    let frame = super::render_status_message(&session, &options, "line-one");
+    let screen = screen_with(&frame, size);
+
+    assert_eq!(visible_line_text(&screen, 3, 8), "        ");
+    assert_eq!(visible_line_text(&screen, 4, 8), "line-one");
 }
 
 #[test]

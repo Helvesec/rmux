@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use rmux_proto::{PaneTarget, SessionName};
 
 pub use rmux_proto::PaneId;
@@ -50,6 +52,8 @@ pub struct Pane {
     index: u32,
     geometry: PaneGeometry,
     active_point: u64,
+    created_at: i64,
+    activity_at: i64,
 }
 
 impl Pane {
@@ -75,6 +79,22 @@ impl Pane {
         self.active_point
     }
 
+    /// Returns the pane creation timestamp as Unix seconds.
+    #[must_use]
+    pub const fn created_at(&self) -> i64 {
+        self.created_at
+    }
+
+    /// Returns the last pane activity timestamp as Unix seconds.
+    #[must_use]
+    pub const fn activity_at(&self) -> i64 {
+        self.activity_at
+    }
+
+    pub(crate) fn touch_activity(&mut self) {
+        self.activity_at = current_unix_timestamp();
+    }
+
     /// Builds an exact pane target for this pane in the given session.
     #[must_use]
     pub fn target(&self, session_name: &SessionName) -> PaneTarget {
@@ -82,16 +102,19 @@ impl Pane {
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) const fn new(index: u32, geometry: PaneGeometry) -> Self {
+    pub(crate) fn new(index: u32, geometry: PaneGeometry) -> Self {
         Self::new_with_id(PaneId::new(index), index, geometry)
     }
 
-    pub(crate) const fn new_with_id(id: PaneId, index: u32, geometry: PaneGeometry) -> Self {
+    pub(crate) fn new_with_id(id: PaneId, index: u32, geometry: PaneGeometry) -> Self {
+        let now = current_unix_timestamp();
         Self {
             id,
             index,
             geometry,
             active_point: 0,
+            created_at: now,
+            activity_at: now,
         }
     }
 
@@ -106,6 +129,13 @@ impl Pane {
     pub(crate) fn set_active_point(&mut self, active_point: u64) {
         self.active_point = active_point;
     }
+}
+
+fn current_unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -15,6 +15,154 @@ use common::{assert_clap_failure, assert_success, stderr, stdout, terminate_chil
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[test]
+fn list_windows_sort_activity_creation_and_global_index_match_tmux() -> Result<(), Box<dyn Error>> {
+    let _guard = window_surface_guard();
+    let harness = CliHarness::new("list-windows-sort-order")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-n", "w0"])?);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:", "-n", "w1"])?);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:", "-n", "w2"])?);
+
+    let creation = harness.run(&[
+        "list-windows",
+        "-t",
+        "alpha",
+        "-O",
+        "creation",
+        "-F",
+        "#{window_index}",
+    ])?;
+    assert_eq!(creation.status.code(), Some(0));
+    assert!(stderr(&creation).is_empty());
+    assert_eq!(stdout(&creation), "0\n1\n2\n");
+
+    let activity = harness.run(&[
+        "list-windows",
+        "-t",
+        "alpha",
+        "-O",
+        "activity",
+        "-F",
+        "#{window_index}",
+    ])?;
+    assert_eq!(activity.status.code(), Some(0));
+    assert!(stderr(&activity).is_empty());
+    assert_eq!(stdout(&activity), "2\n1\n0\n");
+
+    std::thread::sleep(Duration::from_secs(1));
+    assert_success(&harness.run(&["new-session", "-d", "-s", "beta"])?);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_success(&harness.run(&["new-window", "-d", "-t", "beta:2"])?);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:3"])?);
+
+    let all_indexes = harness.run(&[
+        "list-windows",
+        "-a",
+        "-O",
+        "index",
+        "-F",
+        "#{session_name}:#{window_index}",
+    ])?;
+    assert_eq!(all_indexes.status.code(), Some(0));
+    assert!(stderr(&all_indexes).is_empty());
+    assert_eq!(
+        stdout(&all_indexes),
+        "alpha:0\nbeta:0\nalpha:1\nalpha:2\nbeta:2\nalpha:3\n"
+    );
+
+    let all_creation = harness.run(&[
+        "list-windows",
+        "-a",
+        "-O",
+        "creation",
+        "-F",
+        "#{session_name}:#{window_index}",
+    ])?;
+    assert_eq!(all_creation.status.code(), Some(0));
+    assert!(stderr(&all_creation).is_empty());
+    assert_eq!(
+        stdout(&all_creation),
+        "alpha:0\nalpha:1\nalpha:2\nbeta:0\nbeta:2\nalpha:3\n"
+    );
+
+    let all_activity = harness.run(&[
+        "list-windows",
+        "-a",
+        "-O",
+        "activity",
+        "-F",
+        "#{session_name}:#{window_index}",
+    ])?;
+    assert_eq!(all_activity.status.code(), Some(0));
+    assert!(stderr(&all_activity).is_empty());
+    assert_eq!(
+        stdout(&all_activity),
+        "alpha:3\nbeta:2\nbeta:0\nalpha:2\nalpha:1\nalpha:0\n"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn list_panes_sort_activity_creation_match_tmux() -> Result<(), Box<dyn Error>> {
+    let _guard = window_surface_guard();
+    let harness = CliHarness::new("list-panes-sort-order")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:0.0"])?);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:0.0"])?);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_success(&harness.run(&["select-pane", "-t", "alpha:0.1"])?);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_success(&harness.run(&["select-pane", "-t", "alpha:0.0"])?);
+
+    let creation = harness.run(&[
+        "list-panes",
+        "-t",
+        "alpha:0",
+        "-O",
+        "creation",
+        "-F",
+        "#{pane_index}:#{pane_created}",
+    ])?;
+    assert_eq!(creation.status.code(), Some(0));
+    assert!(stderr(&creation).is_empty());
+    let creation_stdout = stdout(&creation);
+    let creation_indices = creation_stdout
+        .lines()
+        .map(|line| line.split_once(':').map(|(index, _)| index).unwrap_or(line))
+        .collect::<Vec<_>>();
+    assert_eq!(creation_indices, ["0", "2", "1"]);
+
+    let activity = harness.run(&[
+        "list-panes",
+        "-t",
+        "alpha:0",
+        "-O",
+        "activity",
+        "-F",
+        "#{pane_index}:#{pane_activity}",
+    ])?;
+    assert_eq!(activity.status.code(), Some(0));
+    assert!(stderr(&activity).is_empty());
+    let activity_stdout = stdout(&activity);
+    let activity_indices = activity_stdout
+        .lines()
+        .map(|line| line.split_once(':').map(|(index, _)| index).unwrap_or(line))
+        .collect::<Vec<_>>();
+    assert_eq!(activity_indices, ["2", "1", "0"]);
+
+    Ok(())
+}
+
+#[test]
 fn new_window_detached_keeps_session_target_commands_on_the_current_window(
 ) -> Result<(), Box<dyn Error>> {
     let _guard = window_surface_guard();
@@ -1393,7 +1541,12 @@ fn binary_roundtrip_covers_the_public_window_command_surface() -> Result<(), Box
         "fg=colour1",
     ])?);
     assert_success(&harness.run(&["set-environment", "-t", "alpha", "TERM", "screen"])?);
-    assert_success(&harness.run(&["set-hook", "-g", "client-attached", "true"])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "client-attached",
+        "display-message hook-ok",
+    ])?);
     assert_success(&harness.run(&["kill-window", "-t", "alpha:1"])?);
     assert_success(&harness.run(&["kill-session", "-t", "alpha"])?);
 
@@ -1944,20 +2097,18 @@ fn select_layout_old_flag_reapplies_the_saved_layout() -> Result<(), Box<dyn Err
 }
 
 #[test]
-fn select_layout_rejects_mirrored_layout_names_like_tmux() -> Result<(), Box<dyn Error>> {
+fn select_layout_accepts_mirrored_layout_names_like_tmux() -> Result<(), Box<dyn Error>> {
     let _guard = window_surface_guard();
-    let harness = CliHarness::new("select-layout-mirrored-rejected")?;
+    let harness = CliHarness::new("select-layout-mirrored-accepted")?;
     let mut daemon = harness.start_hidden_daemon()?;
 
     assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
-    let output = harness.run(&["select-layout", "-t", "alpha:0", "main-horizontal-mirrored"])?;
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stdout(&output).is_empty());
-    assert_eq!(
-        stderr(&output),
-        "invalid layout: main-horizontal-mirrored\n"
-    );
+    for layout in ["main-horizontal-mirrored", "main-vertical-mirrored"] {
+        let output = harness.run(&["select-layout", "-t", "alpha:0", layout])?;
+        assert_eq!(output.status.code(), Some(0), "layout={layout}");
+        assert!(stdout(&output).is_empty(), "layout={layout}");
+        assert!(stderr(&output).is_empty(), "layout={layout}");
+    }
 
     terminate_child(daemon.child_mut())?;
     Ok(())

@@ -118,15 +118,15 @@ pub(super) fn parse_paste_buffer(
 pub(super) fn parse_list_buffers(mut args: CommandTokens) -> Result<Request, RmuxError> {
     let mut format = None;
     let mut filter = None;
-    let sort_order = None;
-    let reversed = false;
+    let mut sort_order = None;
+    let mut reversed = false;
 
     while let Some(token) = args.optional() {
         match token.as_str() {
             "-F" => format = Some(args.required("-F format")?),
             "-f" => filter = Some(args.required("-f filter")?),
-            "-O" => return Err(unsupported_flag("list-buffers", "-O")),
-            "-r" => return Err(unsupported_flag("list-buffers", "-r")),
+            "-O" => sort_order = Some(args.required("-O order")?),
+            "-r" => reversed = true,
             flag if flag.starts_with('-') => return Err(unsupported_flag("list-buffers", flag)),
             _ => {
                 return Err(RmuxError::Server(format!(

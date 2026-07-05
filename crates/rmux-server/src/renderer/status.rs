@@ -41,7 +41,7 @@ pub(super) use runs::{sanitize_status_text, status_runs_width, StatusRun};
 use jobs::render_template_with_status_jobs;
 use prompt::prompt_status_layout;
 use runs::{push_spaces, push_status_run, render_status_runs, truncate_status_runs, StatusStyle};
-use status_format::render_explicit_status_format_line;
+use status_format::{render_explicit_status_format_line, render_status_format_line_at};
 
 pub(super) struct StatusBarRenderRequest<'a> {
     pub(super) session: &'a Session,
@@ -75,17 +75,12 @@ pub(super) fn render_status_bar(request: StatusBarRenderRequest<'_>) -> Vec<u8> 
         return Vec::new();
     }
 
-    if let Some(prompt) = prompt {
-        let layout = prompt_status_layout(session, options, geometry.terminal_size.cols, prompt);
-        let mut frame = render_status_runs(status_y, &layout.runs);
-        frame.extend_from_slice(cursor_position_bytes(status_y, layout.cursor_x).as_slice());
-        return frame;
-    }
-
-    let line = status_bar_line_with_pane_title(
+    let mut frame = Vec::new();
+    let lines = status_bar_lines_with_pane_title(
         session,
         options,
         geometry.terminal_size.cols,
+        geometry.status_lines,
         StatusLineContext {
             attached_count,
             pane_title,
@@ -94,8 +89,23 @@ pub(super) fn render_status_bar(request: StatusBarRenderRequest<'_>) -> Vec<u8> 
             socket_path,
         },
     );
-    let mut frame = Vec::new();
-    render_formatted_line(&mut frame, 0, status_y, &line);
+    for (index, line) in lines.iter().enumerate() {
+        let Ok(index) = u16::try_from(index) else {
+            break;
+        };
+        if let Some(line_y) = geometry.status_line_y(index) {
+            render_formatted_line(&mut frame, 0, line_y, line);
+        }
+    }
+
+    if let Some(prompt) = prompt {
+        let message_line =
+            status_message_line_index(session.name(), options, geometry.status_lines);
+        let line_y = geometry.status_line_y(message_line).unwrap_or(status_y);
+        let layout = prompt_status_layout(session, options, geometry.terminal_size.cols, prompt);
+        frame.extend_from_slice(render_status_runs(line_y, &layout.runs).as_slice());
+        frame.extend_from_slice(cursor_position_bytes(line_y, layout.cursor_x).as_slice());
+    }
     frame
 }
 
@@ -196,21 +206,32 @@ fn active_format_context(
     context
 }
 
-pub(super) fn status_bar_line(
+pub(super) fn status_bar_lines(
     session: &Session,
     options: &OptionStore,
     columns: u16,
     attached_count: usize,
-) -> FormattedLine {
-    status_bar_line_with_pane_title(
+    status_lines: u16,
+) -> Vec<FormattedLine> {
+    status_bar_lines_with_pane_title(
         session,
         options,
         columns,
+        status_lines,
         StatusLineContext {
             attached_count,
             ..StatusLineContext::default()
         },
     )
+}
+
+pub(super) fn status_message_y(
+    session: &Session,
+    options: &OptionStore,
+    geometry: StatusGeometry,
+) -> Option<u16> {
+    let line = status_message_line_index(session.name(), options, geometry.status_lines);
+    geometry.status_line_y(line)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -220,6 +241,79 @@ struct StatusLineContext<'a> {
     state: Option<&'a HandlerState>,
     key_table: Option<&'a str>,
     socket_path: Option<&'a Path>,
+}
+
+fn status_bar_lines_with_pane_title(
+    session: &Session,
+    options: &OptionStore,
+    columns: u16,
+    status_lines: u16,
+    context: StatusLineContext<'_>,
+) -> Vec<FormattedLine> {
+    (0..status_lines)
+        .map(|line| status_bar_line_at(session, options, columns, context, line))
+        .collect()
+}
+
+fn status_bar_line_at(
+    session: &Session,
+    options: &OptionStore,
+    columns: u16,
+    context: StatusLineContext<'_>,
+    line_index: u16,
+) -> FormattedLine {
+    if line_index == 0 {
+        return status_bar_line_with_pane_title(session, options, columns, context);
+    }
+
+    let width = usize::from(columns);
+    let utf8_config = Utf8Config::from_options(options);
+    let session_name = session.name();
+    let base_style = resolved_status_style(options, session_name);
+    let mut runtime = RuntimeFormatContext::new(active_format_context(
+        session,
+        context.attached_count,
+        context.key_table,
+        context.socket_path,
+    ))
+    .with_options(options)
+    .with_session(session)
+    .with_window(session.active_window_index(), session.window());
+    if let Some(state) = context.state {
+        runtime = runtime.with_state(state);
+    }
+    if let Some(pane) = session.window().active_pane() {
+        runtime = runtime.with_pane(pane);
+    }
+    if let Some(pane_title) = context.pane_title {
+        runtime = runtime.with_named_value("pane_title", pane_title);
+    }
+
+    render_status_format_line_at(
+        session_name,
+        options,
+        &runtime,
+        &base_style,
+        width,
+        &utf8_config,
+        usize::from(line_index),
+    )
+    .unwrap_or_else(|| format_draw_line("", &base_style, width, &utf8_config))
+}
+
+pub(super) fn status_message_line_index(
+    session_name: &rmux_proto::SessionName,
+    options: &OptionStore,
+    status_lines: u16,
+) -> u16 {
+    if status_lines == 0 {
+        return 0;
+    }
+    options
+        .resolve(Some(session_name), OptionName::MessageLine)
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(0)
+        .min(status_lines.saturating_sub(1))
 }
 
 fn status_bar_line_with_pane_title(

@@ -262,6 +262,19 @@ mod tests {
     }
 
     #[test]
+    fn octal_escape_covers_every_ascii_control_byte() {
+        for byte in 0_u8..b' ' {
+            let escaped = octal_escape(&[byte]);
+            assert_eq!(
+                escaped,
+                format!("\\{byte:03o}"),
+                "control byte {byte:#04x} should be octal escaped"
+            );
+        }
+        assert_eq!(octal_escape(b"\\"), "\\134");
+    }
+
+    #[test]
     fn guard_and_output_lines_are_newline_terminated() {
         assert_eq!(
             format_guard_line(ControlGuardKind::Begin, 10, 22, 1),

@@ -39,6 +39,7 @@ impl PaneAlertCoalescer {
             .and_modify(|pending| {
                 pending.bell_count = pending.bell_count.saturating_add(event.bell_count);
                 pending.title_changed |= event.title_changed;
+                pending.clipboard_set |= event.clipboard_set;
                 pending.queue_activity_alert |= event.queue_activity_alert;
             })
             .or_insert(event);
@@ -66,6 +67,7 @@ mod tests {
             pane_id: PaneId::new(pane_id),
             bell_count,
             title_changed: false,
+            clipboard_set: false,
             queue_activity_alert: true,
             generation,
         }
@@ -74,6 +76,14 @@ mod tests {
     fn title_event(pane_id: u32, generation: Option<u64>) -> PaneAlertEvent {
         PaneAlertEvent {
             title_changed: true,
+            queue_activity_alert: false,
+            ..alert_event(pane_id, generation, 0)
+        }
+    }
+
+    fn clipboard_event(pane_id: u32, generation: Option<u64>) -> PaneAlertEvent {
+        PaneAlertEvent {
+            clipboard_set: true,
             queue_activity_alert: false,
             ..alert_event(pane_id, generation, 0)
         }
@@ -116,6 +126,22 @@ mod tests {
             .find(|event| event.pane_id == PaneId::new(1))
             .expect("first pane event");
         assert!(first.title_changed);
+        assert!(first.queue_activity_alert);
+    }
+
+    #[test]
+    fn pane_alert_callback_state_preserves_coalesced_clipboard_events() {
+        let mut state = PaneAlertCoalescer::default();
+
+        assert!(state.push(alert_event(1, Some(7), 0)));
+        assert!(!state.push(clipboard_event(1, Some(7))));
+
+        let events = state.take_pending();
+        let first = events
+            .iter()
+            .find(|event| event.pane_id == PaneId::new(1))
+            .expect("first pane event");
+        assert!(first.clipboard_set);
         assert!(first.queue_activity_alert);
     }
 }

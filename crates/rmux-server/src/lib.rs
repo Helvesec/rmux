@@ -111,6 +111,8 @@ mod signals;
 #[cfg_attr(windows, allow(dead_code))]
 mod socket_cleanup;
 #[cfg(any(unix, windows))]
+mod status_lines;
+#[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod status_ranges;
 #[cfg(any(unix, windows))]

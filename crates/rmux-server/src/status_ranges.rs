@@ -15,6 +15,7 @@ pub(crate) enum StatusRangeType {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StatusRange {
+    pub(crate) line: u16,
     pub(crate) x: std::ops::RangeInclusive<u16>,
     pub(crate) kind: StatusRangeType,
 }

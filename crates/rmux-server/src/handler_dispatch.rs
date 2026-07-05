@@ -193,9 +193,10 @@ impl RequestHandler {
             Request::KillWindow(request) => {
                 HandleOutcome::response(self.handle_kill_window(request).await)
             }
-            Request::SelectWindow(request) => {
-                HandleOutcome::response(self.handle_select_window(request).await)
-            }
+            Request::SelectWindow(request) => HandleOutcome::response(
+                self.handle_select_window(Some(requester_pid), request)
+                    .await,
+            ),
             Request::RenameWindow(request) => {
                 HandleOutcome::response(self.handle_rename_window(request).await)
             }
@@ -209,7 +210,7 @@ impl RequestHandler {
                 HandleOutcome::response(self.handle_last_window(request).await)
             }
             Request::ListWindows(request) => {
-                HandleOutcome::response(self.handle_list_windows(request).await)
+                HandleOutcome::response(self.handle_list_windows(*request).await)
             }
             Request::LinkWindow(request) => {
                 HandleOutcome::response(self.handle_link_window(request).await)
@@ -310,7 +311,7 @@ impl RequestHandler {
                 HandleOutcome::response(self.handle_display_panes(request).await)
             }
             Request::ListPanes(request) => {
-                HandleOutcome::response(self.handle_list_panes(request).await)
+                HandleOutcome::response(self.handle_list_panes(*request).await)
             }
             Request::SelectPane(request) => {
                 HandleOutcome::response(self.handle_select_pane(*request).await)

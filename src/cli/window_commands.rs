@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -5,7 +6,7 @@ use rmux_client::{connect, Connection};
 use rmux_core::formats::{is_truthy, DEFAULT_LIST_WINDOWS_ALL_FORMAT, DEFAULT_LIST_WINDOWS_FORMAT};
 use rmux_proto::{
     CommandOutput, ErrorResponse, KillSessionRequest, KillWindowResponse, ListWindowsResponse,
-    MoveWindowTarget, OptionScopeSelector, ResolveTargetType, Response,
+    MoveWindowTarget, OptionScopeSelector, ResolveTargetType, Response, WindowListEntry,
 };
 
 use super::format_print::print_target_format;
@@ -26,6 +27,7 @@ use crate::cli_args::{
 
 const DEFAULT_NEW_WINDOW_PRINT_FORMAT: &str = "#{session_name}:#{window_index}.#{pane_index}";
 const LIST_WINDOWS_FILTER_SEPARATOR: char = '\x1f';
+const LIST_WINDOWS_SORT_METADATA_FORMAT: &str = "#{window_activity}\x1f#{window_created}";
 
 pub(super) fn run_link_window(
     args: LinkWindowArgs,
@@ -1064,6 +1066,7 @@ pub(super) fn run_kill_window(
                         target: session_name,
                         kill_all_except_target: false,
                         clear_alerts: false,
+                        kill_group: false,
                     })
                     .map_err(ExitFailure::from_client)?;
                 if matches!(kill_session, Response::KillSession(_)) {
@@ -1201,20 +1204,39 @@ pub(super) fn run_list_windows(
             "list-windows",
         )?]
     };
+    let sort_order = CliWindowListSortOrder::parse(args.sort_order.as_deref())?;
+    let include_sort_metadata = args.all_sessions
+        && matches!(
+            sort_order,
+            CliWindowListSortOrder::Activity | CliWindowListSortOrder::Creation
+        );
     let format = list_windows_server_format(
         args.format.as_deref(),
         args.filter.as_deref(),
         args.all_sessions,
+        include_sort_metadata,
     );
     let mut lines = Vec::new();
     let mut windows = Vec::new();
     for target in targets {
+        let target_sort_order = if args.all_sessions {
+            None
+        } else {
+            args.sort_order.clone()
+        };
+        let target_reversed = !args.all_sessions && args.reversed;
         let response = connection
-            .list_windows(target, format.clone())
+            .list_windows_with_options(
+                target,
+                format.clone(),
+                args.filter.clone(),
+                target_sort_order,
+                target_reversed,
+            )
             .map_err(ExitFailure::from_client)?;
         match response {
-            Response::ListWindows(mut response) => {
-                response.windows = response
+            Response::ListWindows(response) => {
+                let parsed_windows = response
                     .windows
                     .into_iter()
                     .filter_map(|mut window| {
@@ -1225,14 +1247,27 @@ pub(super) fn run_list_windows(
                             Ok(rendered) => rendered?,
                             Err(error) => return Some(Err(error)),
                         };
+                        let (activity_at, created_at, rendered) =
+                            match list_windows_sort_metadata(rendered, include_sort_metadata) {
+                                Ok(parsed) => parsed,
+                                Err(error) => return Some(Err(error)),
+                            };
                         window.rendered = rendered.to_owned();
-                        Some(Ok(window))
+                        Some(Ok(CliWindowListEntry {
+                            window,
+                            activity_at,
+                            created_at,
+                        }))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                if json {
-                    windows.extend(response.windows);
+                if json || args.all_sessions {
+                    windows.extend(parsed_windows);
                 } else {
-                    lines.extend(response.windows.into_iter().map(|window| window.rendered));
+                    lines.extend(
+                        parsed_windows
+                            .into_iter()
+                            .map(|window| window.window.rendered),
+                    );
                 }
             }
             Response::Error(ErrorResponse { error }) => {
@@ -1241,34 +1276,157 @@ pub(super) fn run_list_windows(
             other => return Err(unexpected_response("list-windows", &other)),
         }
     }
+    if args.all_sessions {
+        sort_all_session_window_entries(&mut windows, sort_order, args.reversed);
+        if !json {
+            lines.extend(windows.iter().map(|window| window.window.rendered.clone()));
+        }
+    }
     if json {
         return write_list_windows_json(&ListWindowsResponse {
-            windows,
+            windows: windows.into_iter().map(|window| window.window).collect(),
             output: CommandOutput::from_stdout(Vec::new()),
         });
     }
     write_lines_output(&lines)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CliWindowListSortOrder {
+    Index,
+    Name,
+    Size,
+    Activity,
+    Creation,
+    ExplicitIndex,
+}
+
+impl CliWindowListSortOrder {
+    fn parse(value: Option<&str>) -> Result<Self, ExitFailure> {
+        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            None | Some("") => Ok(Self::Index),
+            Some("index" | "order") => Ok(Self::ExplicitIndex),
+            Some("name" | "title") => Ok(Self::Name),
+            Some("size") => Ok(Self::Size),
+            Some("activity") => Ok(Self::Activity),
+            Some("creation") => Ok(Self::Creation),
+            Some(_) => Err(ExitFailure::new(
+                1,
+                rmux_core::INVALID_SORT_ORDER.to_owned(),
+            )),
+        }
+    }
+
+    const fn is_explicit(self) -> bool {
+        !matches!(self, Self::Index)
+    }
+}
+
+struct CliWindowListEntry {
+    window: WindowListEntry,
+    activity_at: Option<i64>,
+    created_at: Option<i64>,
+}
+
+fn sort_all_session_window_entries(
+    windows: &mut [CliWindowListEntry],
+    sort_order: CliWindowListSortOrder,
+    reversed: bool,
+) {
+    if !sort_order.is_explicit() {
+        return;
+    }
+    windows.sort_by(|left, right| {
+        let primary = match sort_order {
+            CliWindowListSortOrder::Index | CliWindowListSortOrder::ExplicitIndex => left
+                .window
+                .target
+                .window_index()
+                .cmp(&right.window.target.window_index()),
+            CliWindowListSortOrder::Name => stable_window_entry_name_cmp(left, right),
+            CliWindowListSortOrder::Size => (left.window.size.cols, left.window.size.rows)
+                .cmp(&(right.window.size.cols, right.window.size.rows)),
+            CliWindowListSortOrder::Activity => right.activity_at.cmp(&left.activity_at),
+            CliWindowListSortOrder::Creation => left.created_at.cmp(&right.created_at),
+        };
+        let primary = if reversed { primary.reverse() } else { primary };
+        primary
+            .then_with(|| {
+                left.window
+                    .target
+                    .session_name()
+                    .as_str()
+                    .cmp(right.window.target.session_name().as_str())
+            })
+            .then_with(|| {
+                left.window
+                    .target
+                    .window_index()
+                    .cmp(&right.window.target.window_index())
+            })
+            .then_with(|| stable_window_entry_name_cmp(left, right))
+    });
+}
+
+fn stable_window_entry_name_cmp(left: &CliWindowListEntry, right: &CliWindowListEntry) -> Ordering {
+    left.window.name.cmp(&right.window.name)
+}
+
 fn list_windows_server_format(
     format: Option<&str>,
     filter: Option<&str>,
     all_sessions: bool,
+    include_sort_metadata: bool,
 ) -> Option<String> {
     let default_format = if all_sessions {
         DEFAULT_LIST_WINDOWS_ALL_FORMAT
     } else {
         DEFAULT_LIST_WINDOWS_FORMAT
     };
-    let line_format = format
+    let mut line_format = format
         .map(ToOwned::to_owned)
         .or_else(|| all_sessions.then(|| default_format.to_owned()));
+    if include_sort_metadata {
+        let rendered = line_format.as_deref().unwrap_or(default_format);
+        line_format = Some(format!(
+            "{LIST_WINDOWS_SORT_METADATA_FORMAT}{LIST_WINDOWS_FILTER_SEPARATOR}{rendered}"
+        ));
+    }
     filter
         .map(|filter| {
             let line_format = line_format.as_deref().unwrap_or(default_format);
             format!("{filter}{LIST_WINDOWS_FILTER_SEPARATOR}{line_format}")
         })
         .or(line_format)
+}
+
+fn list_windows_sort_metadata(
+    line: &str,
+    include_sort_metadata: bool,
+) -> Result<(Option<i64>, Option<i64>, &str), ExitFailure> {
+    if !include_sort_metadata {
+        return Ok((None, None, line));
+    }
+
+    let Some((activity, rest)) = line.split_once(LIST_WINDOWS_FILTER_SEPARATOR) else {
+        return Err(ExitFailure::new(
+            1,
+            "list-windows sort metadata missing activity separator",
+        ));
+    };
+    let Some((created, rendered)) = rest.split_once(LIST_WINDOWS_FILTER_SEPARATOR) else {
+        return Err(ExitFailure::new(
+            1,
+            "list-windows sort metadata missing creation separator",
+        ));
+    };
+    let activity_at = activity.parse::<i64>().map_err(|_| {
+        ExitFailure::new(1, "list-windows sort metadata has invalid activity value")
+    })?;
+    let created_at = created.parse::<i64>().map_err(|_| {
+        ExitFailure::new(1, "list-windows sort metadata has invalid creation value")
+    })?;
+    Ok((Some(activity_at), Some(created_at), rendered))
 }
 
 fn list_windows_filtered_line<'a>(
