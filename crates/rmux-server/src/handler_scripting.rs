@@ -682,15 +682,28 @@ fn mouse_resize_adjustment(
 ) -> ResizePaneAdjustment {
     let x = event.raw.x;
     let y = adjusted_mouse_y(event);
+    let start_x = event.raw.lx;
+    let start_y = adjusted_mouse_y_value(event, event.raw.ly);
     let right_border = geometry.x().saturating_add(geometry.cols());
     let bottom_border = geometry.y().saturating_add(geometry.rows());
+    let started_on_right_border = start_x == right_border
+        && start_y >= geometry.y().saturating_sub(1)
+        && start_y <= bottom_border;
+    let started_on_bottom_border = start_y == bottom_border
+        && start_x >= geometry.x().saturating_sub(1)
+        && start_x <= right_border;
 
-    if x >= right_border {
+    let horizontal_delta = x.abs_diff(start_x);
+    let vertical_delta = y.abs_diff(start_y);
+
+    if started_on_right_border
+        || (!started_on_bottom_border && horizontal_delta >= vertical_delta && horizontal_delta > 0)
+    {
         return ResizePaneAdjustment::AbsoluteWidth {
             columns: x.saturating_sub(geometry.x()).max(1),
         };
     }
-    if y >= bottom_border {
+    if started_on_bottom_border || vertical_delta > 0 {
         return ResizePaneAdjustment::AbsoluteHeight {
             rows: y.saturating_sub(geometry.y()).max(1),
         };
@@ -700,11 +713,13 @@ fn mouse_resize_adjustment(
 }
 
 fn adjusted_mouse_y(event: &AttachedMouseEvent) -> u16 {
+    adjusted_mouse_y_value(event, event.raw.y)
+}
+
+fn adjusted_mouse_y_value(event: &AttachedMouseEvent, y: u16) -> u16 {
     match event.status_at {
-        Some(0) if event.raw.y >= event.status_lines => {
-            event.raw.y.saturating_sub(event.status_lines)
-        }
-        _ => event.raw.y,
+        Some(0) if y >= event.status_lines => y.saturating_sub(event.status_lines),
+        _ => y,
     }
 }
 

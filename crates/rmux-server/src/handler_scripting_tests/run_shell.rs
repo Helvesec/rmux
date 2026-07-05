@@ -227,7 +227,7 @@ async fn execute_test_command(handler: &RequestHandler, command: &str) {
 }
 
 async fn wait_for_file_text(path: &std::path::Path, expected: &str) {
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(background_shell_test_timeout(), async {
         loop {
             if let Ok(text) = std::fs::read_to_string(path) {
                 if text == expected {

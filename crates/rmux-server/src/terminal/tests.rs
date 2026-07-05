@@ -906,6 +906,24 @@ fn windows_interactive_pwsh_starts_in_profile_cwd_and_accepts_input() -> Result<
 }
 
 #[cfg(windows)]
+#[test]
+fn windows_interactive_powershell_starts_in_profile_cwd_and_accepts_input(
+) -> Result<(), Box<dyn Error>> {
+    let powershell = Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+    if !powershell.is_file() {
+        eprintln!(
+            "skipping Windows PowerShell interactive probe: {} missing",
+            powershell.display()
+        );
+        return Ok(());
+    }
+
+    windows_interactive_shell_starts_in_profile_cwd_and_accepts_input(
+        &powershell.display().to_string(),
+    )
+}
+
+#[cfg(windows)]
 fn reap_windows_test_child(child: &mut rmux_pty::PtyChild) -> Result<(), Box<dyn Error>> {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {

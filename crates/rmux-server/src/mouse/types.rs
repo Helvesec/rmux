@@ -186,5 +186,6 @@ pub(crate) struct ClientMouseState {
     pub(crate) scrolling_flag: bool,
     pub(crate) slider_mpos: i32,
     pub(crate) current_event: Option<AttachedMouseEvent>,
+    pub(crate) drag_start_event: Option<AttachedMouseEvent>,
     pub(crate) drag_handler: Option<MouseDragHandler>,
 }

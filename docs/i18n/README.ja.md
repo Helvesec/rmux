@@ -160,6 +160,21 @@ RMUX は attached session を開き、`--teammate-mode tmux` と `[args]` を
 `PATH` の先頭にプライベートな `tmux` shim を追加します。これは Claude
 プロセス内に厳密に限定され、システムの `tmux` インストールとは競合しません。
 
+このリポジトリの外でも Claude が RMUX CLI、SDK、web-share、automation
+patterns を参照できるようにするには、RMUX の user-level Claude Code
+skill をインストールします:
+
+```bash
+rmux claude install-skill
+```
+
+この skill は Claude profile 配下にインストールされます（Linux/macOS では
+`~/.claude/skills/rmux`、Windows では
+`%USERPROFILE%\.claude\skills\rmux`）。プロジェクトが隠し `.claude`
+source-tree directory を持たずに package/install できるよう、
+リポジトリ内の source copy は `resources/claude/skills/rmux/SKILL.md` に
+保持されています。
+
 注: マシンに `claude` がインストールされている必要があります。
 
 <a id="configuration"></a>

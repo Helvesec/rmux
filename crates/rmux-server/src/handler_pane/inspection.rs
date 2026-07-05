@@ -7,6 +7,7 @@ use rmux_proto::{
     Target, TerminalSize,
 };
 
+use super::super::target_support::{pane_id_target, requester_environment_pane_id};
 use super::super::{format_client_uid, format_client_user, ListClientSnapshot, RequestHandler};
 use crate::control_notifications::format_control_message_line;
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
@@ -93,6 +94,19 @@ impl RequestHandler {
                 .find(|client| !client.control && client.pid == attach_pid),
             None => None,
         };
+        let requester_environment_target = if target.is_none() && target_client.is_none() {
+            let socket_path = self.socket_path();
+            let requester_pane_id = requester_environment_pane_id(requester_pid, &socket_path);
+            match requester_pane_id {
+                Some(pane_id) => {
+                    let state = self.state.lock().await;
+                    pane_id_target(&state.sessions, pane_id)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let session_client_pid = target_attach_pid.unwrap_or(requester_pid);
         let attached_session_name = if target.is_none() && print {
             let active_attach = self.active_attach.lock().await;
@@ -112,6 +126,8 @@ impl RequestHandler {
         };
         let fallback_session_name = if attached_session_name.is_some() {
             attached_session_name
+        } else if let Some(target) = requester_environment_target.as_ref() {
+            Some(target.session_name().clone())
         } else if requester_is_control {
             self.control_session_name(requester_pid).await
         } else {
@@ -125,6 +141,11 @@ impl RequestHandler {
         let mut session_name = target
             .as_ref()
             .map(|target| target.session_name().clone())
+            .or_else(|| {
+                requester_environment_target
+                    .as_ref()
+                    .map(|target| target.session_name().clone())
+            })
             .or(fallback_session_name);
         let template = message.as_deref().unwrap_or(DEFAULT_DISPLAY_MESSAGE_FORMAT);
         let mut uses_lone_session_print_context = false;
@@ -190,7 +211,8 @@ impl RequestHandler {
             .await;
             return Response::DisplayMessage(DisplayMessageResponse::no_output());
         };
-        let context_target = target.unwrap_or_else(|| Target::Session(session_name.clone()));
+        let context_target =
+            display_message_context_target(target, requester_environment_target, &session_name);
         #[cfg(windows)]
         if format_references_pane_pid(Some(template)) {
             self.wait_for_windows_deferred_target_pane_pids(&context_target)
@@ -457,6 +479,16 @@ fn display_message_client_is_control_only(error: &RmuxError) -> bool {
     )
 }
 
+fn display_message_context_target(
+    target: Option<Target>,
+    requester_environment_target: Option<Target>,
+    session_name: &rmux_proto::SessionName,
+) -> Target {
+    target
+        .or(requester_environment_target)
+        .unwrap_or_else(|| Target::Session(session_name.clone()))
+}
+
 pub(in crate::handler) fn display_message_context<'a>(
     state: &'a HandlerState,
     target: &Target,
@@ -712,4 +744,38 @@ pub(in crate::handler) fn command_output_from_lines(lines: &[String]) -> Command
     }
 
     CommandOutput::from_stdout(format!("{}\n", lines.join("\n")).into_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmux_proto::{PaneTarget, SessionName};
+
+    #[test]
+    fn display_message_context_prefers_requester_pane_over_session_fallback() {
+        let session = SessionName::new("beta").expect("session name");
+        let requester_target = Target::Pane(PaneTarget::new(session.clone(), 3));
+
+        assert_eq!(
+            display_message_context_target(None, Some(requester_target.clone()), &session),
+            requester_target
+        );
+    }
+
+    #[test]
+    fn display_message_context_keeps_explicit_target_over_requester_pane() {
+        let fallback_session = SessionName::new("beta").expect("session name");
+        let explicit_session = SessionName::new("alpha").expect("session name");
+        let requester_target = Target::Pane(PaneTarget::new(fallback_session.clone(), 3));
+        let explicit_target = Target::Session(explicit_session);
+
+        assert_eq!(
+            display_message_context_target(
+                Some(explicit_target.clone()),
+                Some(requester_target),
+                &fallback_session,
+            ),
+            explicit_target
+        );
+    }
 }

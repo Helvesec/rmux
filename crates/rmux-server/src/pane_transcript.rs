@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::clock_mode::{ClockModeState, CLOCK_MODE_NAME};
 use crate::copy_mode::{CopyModeState, CopyModeSummary};
@@ -9,6 +10,8 @@ use rmux_core::{
 use rmux_proto::TerminalSize;
 
 pub(crate) type SharedPaneTranscript = Arc<Mutex<PaneTranscript>>;
+
+pub(crate) const PANE_INPUT_GROUND_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PaneModeState {
@@ -22,8 +25,16 @@ pub(crate) struct PaneTranscript {
     mode: Option<PaneModeState>,
     output_sequence: u64,
     next_clock_generation: u64,
+    ground_timer_started_at: Option<Instant>,
+    ground_timer_token: u64,
     #[cfg(test)]
     utf8_config: Utf8Config,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaneGroundTimer {
+    pub(crate) deadline: Instant,
+    token: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -33,6 +44,7 @@ pub(crate) struct PaneAppendResult {
     pub(crate) passthroughs: Vec<TerminalPassthrough>,
     pub(crate) dropped_passthrough_count: u64,
     pub(crate) replies: Vec<u8>,
+    pub(crate) ground_timer: Option<PaneGroundTimer>,
 }
 
 pub(crate) struct PaneTranscriptRenderState {
@@ -66,6 +78,8 @@ impl PaneTranscript {
             mode: None,
             output_sequence: 0,
             next_clock_generation: 1,
+            ground_timer_started_at: None,
+            ground_timer_token: 0,
             #[cfg(test)]
             utf8_config: Utf8Config::default(),
         }
@@ -89,6 +103,8 @@ impl PaneTranscript {
     }
 
     pub(crate) fn append_bytes_with_effects(&mut self, bytes: &[u8]) -> PaneAppendResult {
+        let now = Instant::now();
+        self.expire_ground_timer_if_due(now);
         if !bytes.is_empty() {
             self.output_sequence = self.output_sequence.saturating_add(1);
         }
@@ -98,13 +114,69 @@ impl PaneTranscript {
         let passthroughs = self.terminal.take_terminal_passthrough();
         let dropped_passthrough_count = self.terminal.take_terminal_passthrough_dropped_count();
         let replies = self.terminal.take_replies();
+        let ground_timer = self.refresh_ground_timer(now);
         PaneAppendResult {
             bell_count: self.terminal.screen_mut().take_bell_count(),
             title_changed,
             passthroughs,
             dropped_passthrough_count,
             replies,
+            ground_timer,
         }
+    }
+
+    fn refresh_ground_timer(&mut self, now: Instant) -> Option<PaneGroundTimer> {
+        if self.terminal.ground_timer_active() {
+            if self.ground_timer_started_at.is_none() {
+                self.ground_timer_started_at = Some(now);
+                self.ground_timer_token = self.ground_timer_token.saturating_add(1);
+                return Some(PaneGroundTimer {
+                    deadline: now + PANE_INPUT_GROUND_TIMEOUT,
+                    token: self.ground_timer_token,
+                });
+            }
+            return None;
+        }
+
+        if self.ground_timer_started_at.take().is_some() {
+            self.ground_timer_token = self.ground_timer_token.saturating_add(1);
+        }
+        None
+    }
+
+    fn expire_ground_timer_if_due(&mut self, now: Instant) -> bool {
+        let Some(started_at) = self.ground_timer_started_at else {
+            return false;
+        };
+        if now.duration_since(started_at) < PANE_INPUT_GROUND_TIMEOUT {
+            return false;
+        }
+        self.expire_ground_timer_now()
+    }
+
+    pub(crate) fn expire_ground_timer(&mut self, timer: PaneGroundTimer) -> bool {
+        if self.ground_timer_token != timer.token || Instant::now() < timer.deadline {
+            return false;
+        }
+        self.expire_ground_timer_now()
+    }
+
+    fn expire_ground_timer_now(&mut self) -> bool {
+        if self.ground_timer_started_at.is_none() || !self.terminal.ground_timer_active() {
+            return false;
+        }
+        self.terminal.ground_timer_expired();
+        self.ground_timer_started_at = None;
+        self.ground_timer_token = self.ground_timer_token.saturating_add(1);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_ground_timer_expired_for_test(&mut self, timer: PaneGroundTimer) -> bool {
+        if self.ground_timer_token != timer.token {
+            return false;
+        }
+        self.expire_ground_timer_now()
     }
 
     pub(crate) fn reset_terminal_state(&mut self) {
@@ -113,6 +185,8 @@ impl PaneTranscript {
         let _ = self.terminal.take_terminal_passthrough();
         let _ = self.terminal.take_terminal_passthrough_dropped_count();
         let _ = self.terminal.take_replies();
+        self.ground_timer_started_at = None;
+        self.ground_timer_token = self.ground_timer_token.saturating_add(1);
         self.mode = None;
     }
 
@@ -582,6 +656,79 @@ mod tests {
 
         assert_eq!(result.passthroughs.len(), 1);
         assert_eq!(result.passthroughs[0].payload(), b"\x1b]52;c;QQ==\x07");
+    }
+
+    #[test]
+    fn append_bytes_recovers_after_tmux_wrapped_osc_bel_without_outer_st() {
+        let mut transcript = transcript(40, 4, 10);
+        let result = transcript.append_bytes_with_effects(b"\x1bPtmux;\x1b\x1b]4;0;?\x07OpenCode");
+
+        assert_eq!(result.passthroughs.len(), 1);
+        assert_eq!(result.passthroughs[0].payload(), b"\x1b]4;0;?\x07");
+        let capture = String::from_utf8(
+            transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default()),
+        )
+        .expect("capture is utf8");
+        assert!(capture.contains("OpenCode"));
+        assert!(!capture.contains("4;0;?"));
+    }
+
+    #[test]
+    fn append_bytes_recovers_after_unterminated_non_osc_dcs_ground_timer() {
+        let mut transcript = transcript(40, 4, 10);
+        let result = transcript.append_bytes_with_effects(b"\x1bPtmux;not-osc\x07");
+        let timer = result
+            .ground_timer
+            .expect("unterminated DCS should arm the parser ground timer");
+
+        transcript.append_bytes(b"STILL-HIDDEN");
+        let hidden_capture = String::from_utf8(
+            transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default()),
+        )
+        .expect("capture is utf8");
+        assert!(
+            !hidden_capture.contains("STILL-HIDDEN"),
+            "bytes before the DCS timeout should remain swallowed by the unterminated string"
+        );
+
+        assert!(
+            transcript.force_ground_timer_expired_for_test(timer),
+            "matching ground timer should expire the parser"
+        );
+        transcript.append_bytes(b"AFTER");
+
+        let capture = String::from_utf8(
+            transcript.capture_main(ScreenCaptureRange::default(), GridRenderOptions::default()),
+        )
+        .expect("capture is utf8");
+        assert!(capture.contains("AFTER"));
+        assert!(!capture.contains("not-osc"));
+    }
+
+    #[test]
+    fn append_bytes_arms_single_ground_timer_while_parser_remains_blocked() {
+        let mut transcript = transcript(40, 4, 10);
+        let timer = transcript
+            .append_bytes_with_effects(b"\x1bPtmux;not-osc\x07")
+            .ground_timer
+            .expect("unterminated DCS should arm the parser ground timer");
+
+        assert!(
+            transcript
+                .append_bytes_with_effects(b"still blocked")
+                .ground_timer
+                .is_none(),
+            "the same blocked parser state must not arm another timer on each read"
+        );
+
+        assert!(transcript.force_ground_timer_expired_for_test(timer));
+        let next_timer = transcript
+            .append_bytes_with_effects(b"\x1bPtmux;not-osc-again\x07")
+            .ground_timer;
+        assert!(
+            next_timer.is_some(),
+            "a new blocked sequence should arm a fresh timer after recovery"
+        );
     }
 
     #[test]

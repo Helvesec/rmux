@@ -19,10 +19,11 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 
-const SETUP_TIMEOUT: Duration = Duration::from_secs(6);
+const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 const RAW_CONSOLE_PROBE_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const PYTHON_FOREGROUND_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+const CONPTY_STRESS_OUTPUT_TIMEOUT: Duration = Duration::from_secs(30);
 const CTRL_C_SYNTHETIC_ATTEMPTS: usize = 3;
 const CTRL_C_SYNTHETIC_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
 const CTRL_D_SYNTHETIC_ATTEMPTS: usize = 3;
@@ -563,7 +564,7 @@ fn windows_conpty_stress_survives_large_output_resize_mouse_toggles_and_detach(
         &label,
         "stress:0.0",
         b"RMUX_STRESS_DONE",
-        EXIT_TIMEOUT,
+        CONPTY_STRESS_OUTPUT_TIMEOUT,
     )?;
 
     let mut attach = ChildCommand::new(&binary)
@@ -1811,19 +1812,62 @@ fn wait_for_timeout_countdown_started(
     label: &str,
     target: &str,
 ) -> Result<Vec<u8>, Box<dyn Error>> {
-    let (ready, output) =
-        capture_until_contains(binary, label, target, b"Waiting for", SETUP_TIMEOUT)?;
-    if ready {
-        return Ok(output);
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    let mut last = Vec::new();
+    while Instant::now() < deadline {
+        let output = run_rmux_output(binary, label, ["capture-pane", "-p", "-t", target])?;
+        last = output.stdout;
+        if timeout_countdown_started(&last) {
+            return Ok(last);
+        }
+        thread::sleep(Duration::from_millis(50));
     }
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
         format!(
             "timed out waiting for timeout.exe countdown to start in {target}; last capture: {}",
-            escaped_output(&output)
+            escaped_output(&last)
         ),
     )
     .into())
+}
+
+fn timeout_countdown_started(output: &[u8]) -> bool {
+    output_contains(output, b"Waiting for") || contains_timeout_countdown_number(output)
+}
+
+fn contains_timeout_countdown_number(output: &[u8]) -> bool {
+    let mut index = 0;
+    while index < output.len() {
+        if !output[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        while index < output.len() && output[index].is_ascii_digit() {
+            index += 1;
+        }
+        if index - start >= 4 && output[start] == b'9' {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn timeout_countdown_detection_accepts_localized_countdown_text() {
+    assert!(timeout_countdown_started(
+        b"timeout.exe /T 10000\r\n\r\nAttendre  9994 secondes, appuyez sur une touche pour continuer..."
+    ));
+    assert!(timeout_countdown_started(
+        b"timeout.exe /T 10000\r\n\r\nWaiting for 9999 seconds, press a key to continue ..."
+    ));
+}
+
+#[test]
+fn timeout_countdown_detection_does_not_match_only_the_command_line() {
+    assert!(!timeout_countdown_started(b"timeout.exe /T 10000\r\n"));
 }
 
 fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {

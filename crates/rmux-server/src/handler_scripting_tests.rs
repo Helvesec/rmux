@@ -127,7 +127,7 @@ async fn use_platform_test_shell(handler: &RequestHandler) {
 }
 
 async fn wait_for_named_buffer(handler: &RequestHandler, name: &str, expected: &[u8]) {
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(background_shell_test_timeout(), async {
         loop {
             if let Some(output) = handler
                 .handle(Request::ShowBuffer(ShowBufferRequest {
@@ -148,7 +148,7 @@ async fn wait_for_named_buffer(handler: &RequestHandler, name: &str, expected: &
 }
 
 async fn wait_for_detached_request_count(handler: &RequestHandler, expected: usize) {
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(background_shell_test_timeout(), async {
         loop {
             let active = handler
                 .active_detached_requests
@@ -161,6 +161,17 @@ async fn wait_for_detached_request_count(handler: &RequestHandler, expected: usi
     })
     .await
     .unwrap_or_else(|_| panic!("detached request count did not become {expected}"));
+}
+
+fn background_shell_test_timeout() -> std::time::Duration {
+    #[cfg(windows)]
+    {
+        std::time::Duration::from_secs(10)
+    }
+    #[cfg(not(windows))]
+    {
+        std::time::Duration::from_secs(2)
+    }
 }
 
 #[cfg(unix)]

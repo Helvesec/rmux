@@ -211,6 +211,10 @@ impl EncryptedWebSocketWriter {
     pub(super) async fn write_pong(&mut self, payload: &[u8]) -> io::Result<()> {
         self.writer.write_pong(payload).await
     }
+
+    pub(super) async fn write_ping(&mut self, payload: &[u8]) -> io::Result<()> {
+        self.writer.write_ping(payload).await
+    }
 }
 
 impl FrameOpener {

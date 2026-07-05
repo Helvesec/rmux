@@ -5,12 +5,10 @@ use rmux_core::PaneId;
 use rmux_pty::PtyChild;
 use rmux_pty::{PtyIo, PtyMaster};
 #[cfg(windows)]
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+use std::sync::{mpsc as std_mpsc, Arc, OnceLock};
 #[cfg(windows)]
 use std::time::{Duration, Instant};
 #[cfg(unix)]
@@ -27,7 +25,7 @@ use super::{
 };
 #[cfg(unix)]
 use crate::pane_reader_runtime::PaneReaderRuntime;
-use crate::pane_transcript::SharedPaneTranscript;
+use crate::pane_transcript::{PaneGroundTimer, SharedPaneTranscript};
 
 #[cfg(unix)]
 const PANE_BLOCKING_PARSE_MIN_BYTES: usize = 1024 * 1024;
@@ -552,6 +550,9 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
     else {
         return Vec::new();
     };
+    if let Some(timer) = append_result.ground_timer {
+        schedule_pane_ground_timer(session_name, pane_id, Arc::clone(transcript), timer);
+    }
     let replies = append_result.replies;
     let dropped_passthrough_count = append_result.dropped_passthrough_count;
     if dropped_passthrough_count > 0 {
@@ -573,6 +574,114 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
         });
     }
     replies
+}
+
+struct PaneGroundTimerJob {
+    transcript: SharedPaneTranscript,
+    timer: PaneGroundTimer,
+}
+
+fn schedule_pane_ground_timer(
+    session_name: &rmux_proto::SessionName,
+    pane_id: PaneId,
+    transcript: SharedPaneTranscript,
+    timer: PaneGroundTimer,
+) {
+    let job = PaneGroundTimerJob { transcript, timer };
+    if let Err(error) = pane_ground_timer_tx().send(job) {
+        warn!(
+            session = %session_name,
+            pane_id = pane_id.as_u32(),
+            "failed to schedule pane parser ground timer: {error}"
+        );
+    }
+}
+
+fn pane_ground_timer_tx() -> &'static std_mpsc::Sender<PaneGroundTimerJob> {
+    static TIMER_TX: OnceLock<std_mpsc::Sender<PaneGroundTimerJob>> = OnceLock::new();
+    TIMER_TX.get_or_init(|| {
+        let (tx, rx) = std_mpsc::channel();
+        spawn_pane_ground_timer_worker(rx);
+        tx
+    })
+}
+
+fn spawn_pane_ground_timer_worker(rx: std_mpsc::Receiver<PaneGroundTimerJob>) {
+    let thread_name = "rmux-pane-ground-timer".to_owned();
+    if let Err(error) = std::thread::Builder::new()
+        .name(thread_name.clone())
+        .spawn(move || run_pane_ground_timer_worker(rx))
+    {
+        warn!(
+            thread = %thread_name,
+            "failed to spawn pane parser ground timer worker: {error}"
+        );
+    }
+}
+
+fn run_pane_ground_timer_worker(rx: std_mpsc::Receiver<PaneGroundTimerJob>) {
+    let mut jobs = Vec::<PaneGroundTimerJob>::new();
+    loop {
+        if jobs.is_empty() {
+            match rx.recv() {
+                Ok(job) => {
+                    jobs.push(job);
+                    continue;
+                }
+                Err(_) => return,
+            }
+        }
+
+        expire_due_pane_ground_timers(&mut jobs);
+        if jobs.is_empty() {
+            continue;
+        }
+
+        let next_deadline = jobs
+            .iter()
+            .map(|job| job.timer.deadline)
+            .min()
+            .expect("non-empty timer job queue has a deadline");
+        let timeout = next_deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(timeout) {
+            Ok(job) => jobs.push(job),
+            Err(std_mpsc::RecvTimeoutError::Timeout) => expire_due_pane_ground_timers(&mut jobs),
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+fn expire_due_pane_ground_timers(jobs: &mut Vec<PaneGroundTimerJob>) {
+    let now = Instant::now();
+    let mut index = 0;
+    while index < jobs.len() {
+        if now < jobs[index].timer.deadline {
+            index += 1;
+            continue;
+        }
+        let job = jobs.swap_remove(index);
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            expire_pane_ground_timer_job(job);
+        }))
+        .is_err()
+        {
+            warn!("pane parser ground timer job panicked; timer worker is continuing");
+        }
+    }
+}
+
+fn expire_pane_ground_timer_job(job: PaneGroundTimerJob) {
+    let mut transcript = match job.transcript.lock() {
+        Ok(transcript) => transcript,
+        Err(poisoned) => {
+            warn!(
+                "pane transcript mutex was poisoned while expiring parser ground timer; \
+                 recovering timer worker"
+            );
+            poisoned.into_inner()
+        }
+    };
+    let _ = transcript.expire_ground_timer(job.timer);
 }
 
 #[cfg(unix)]
@@ -953,9 +1062,38 @@ mod tests {
     use rmux_proto::{SessionName, TerminalSize};
     use rmux_pty::{ChildCommand, TerminalSize as PtyTerminalSize};
 
-    use super::{spawn_pane_output_reader, PaneOutputEofState};
+    use super::{
+        expire_due_pane_ground_timers, spawn_pane_output_reader, PaneGroundTimerJob,
+        PaneOutputEofState,
+    };
     use crate::pane_io::pane_output_channel;
     use crate::pane_transcript::PaneTranscript;
+
+    #[test]
+    fn pane_ground_timer_worker_survives_poisoned_transcript_mutex() {
+        let transcript = PaneTranscript::shared(2_000, TerminalSize { cols: 80, rows: 24 });
+        let mut timer = transcript
+            .lock()
+            .expect("new transcript mutex is healthy")
+            .append_bytes_with_effects(b"\x1bPunterminated")
+            .ground_timer
+            .expect("unterminated DCS arms parser ground timer");
+        timer.deadline = Instant::now() - Duration::from_millis(1);
+
+        let poisoned = transcript.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = poisoned.lock().expect("mutex is healthy before poison");
+            panic!("poison pane transcript mutex for timer worker test");
+        });
+
+        let mut jobs = vec![PaneGroundTimerJob { transcript, timer }];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            expire_due_pane_ground_timers(&mut jobs);
+        }));
+
+        assert!(result.is_ok(), "timer worker must survive poisoned jobs");
+        assert!(jobs.is_empty(), "due poisoned job should be consumed");
+    }
 
     #[test]
     fn windows_output_reader_updates_transcript_after_written_input() -> Result<(), Box<dyn Error>>

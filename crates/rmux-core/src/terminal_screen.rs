@@ -82,6 +82,17 @@ impl TerminalScreen {
         self.parser.pending_bytes()
     }
 
+    /// Returns whether the parser ground timeout is currently armed.
+    #[must_use]
+    pub fn ground_timer_active(&self) -> bool {
+        self.parser.ground_timer_active()
+    }
+
+    /// Notifies the parser that its ground timeout has expired.
+    pub fn ground_timer_expired(&mut self) {
+        self.parser.ground_timer_expired();
+    }
+
     /// Returns and drains passthrough events generated while parsing PTY output.
     pub fn take_terminal_passthrough(&mut self) -> Vec<TerminalPassthrough> {
         self.parser.take_terminal_passthrough()

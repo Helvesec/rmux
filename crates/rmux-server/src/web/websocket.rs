@@ -138,6 +138,10 @@ impl WebSocketWriter {
         self.write_frame(OPCODE_PONG, payload).await
     }
 
+    pub(crate) async fn write_ping(&mut self, payload: &[u8]) -> io::Result<()> {
+        self.write_frame(OPCODE_PING, payload).await
+    }
+
     async fn write_frame(&mut self, opcode: u8, payload: &[u8]) -> io::Result<()> {
         write_frame(&mut self.stream, opcode, payload).await
     }

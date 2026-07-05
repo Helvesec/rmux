@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rmux_proto::{
     encode_attach_message, AttachFrameDecoder, AttachMessage, AttachShellCommand,
@@ -458,8 +458,12 @@ async fn output_backpressure_keeps_local_input_and_resize_live(
         AttachMessage::Resize(TerminalSize::new(132, 43))
     );
 
-    release_tx.send(()).expect("release blocked output");
     write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    actions
+        .wait_for_call("detach-kill", Duration::from_secs(1))
+        .await?;
+
+    release_tx.send(()).expect("release blocked output");
     timeout(client).await???;
     action_worker
         .join()
@@ -468,30 +472,301 @@ async fn output_backpressure_keeps_local_input_and_resize_live(
     Ok(())
 }
 
-#[test]
-fn attach_output_queue_rejects_oversized_frame_without_poisoning_budget() {
-    let mut queue = AttachOutputQueue::spawn(SharedOutput::default());
-    queue.pending_bytes = ATTACH_OUTPUT_PENDING_MAX_BYTES - 1;
+#[tokio::test]
+async fn backpressured_render_frames_replace_stale_pending_render(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (client_stream, mut server) = tokio::io::duplex(8192);
+    let (reader, writer) = tokio::io::split(client_stream);
+    let (_input_tx, input_rx) = mpsc::channel(8);
+    let (_resize_tx, resize_rx) = mpsc::unbounded_channel();
+    let locked = Arc::new(AttachLockState::default());
+    let actions = RecordingActions::default();
+    let client_actions = actions.clone();
+    let (action_tx, action_rx) = std::sync::mpsc::channel();
+    let (completion_tx, completion_rx) = mpsc::unbounded_channel();
+    let action_worker: std::thread::JoinHandle<std::result::Result<(), crate::ClientError>> =
+        std::thread::spawn(move || {
+            let mut actions = client_actions;
+            while let Ok(action) = action_rx.recv() {
+                if completion_tx
+                    .send(run_attach_action(&mut actions, action))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+            Ok(())
+        });
+    let (output, write_started_rx, release_tx) = BlockingOutput::new();
+    let captured = output.bytes.clone();
+    let client = tokio::spawn(async move {
+        drive_async_attach(
+            reader,
+            writer,
+            Vec::new(),
+            output,
+            AttachScreenTracker::default(),
+            AttachAsyncChannels::new(input_rx, resize_rx, action_tx, completion_rx, locked, true),
+        )
+        .await
+    });
 
-    let error = queue
-        .write_frame(vec![b'x'; 2])
-        .expect_err("frame that exceeds the pending byte budget must fail");
+    write_server_message(&mut server, AttachMessage::Data(b"blocked".to_vec())).await?;
+    wait_for_blocking_output_start(write_started_rx).await?;
+    for index in 0..24 {
+        write_server_message(
+            &mut server,
+            AttachMessage::Render(format!("stale-{index}\n").into_bytes()),
+        )
+        .await?;
+    }
+    write_server_message(&mut server, AttachMessage::Render(b"latest\n".to_vec())).await?;
+
+    release_tx.send(()).expect("release blocked output");
+    wait_for_output_contains(&captured, b"latest\n", Duration::from_secs(1)).await?;
+    let output = captured.lock().expect("output mutex poisoned").clone();
+    assert!(
+        !String::from_utf8_lossy(&output).contains("stale-"),
+        "stale render frames should be replaced under backpressure, got {output:?}"
+    );
+
+    write_server_message(&mut server, AttachMessage::DetachKill).await?;
+    timeout(client).await???;
+    action_worker
+        .join()
+        .map_err(|_| io::Error::other("action worker panicked"))??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_render_after_strict_frame_rearms_coalescing_deadline(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output = SharedOutput::default();
+    let captured = output.bytes.clone();
+    let mut queue = AttachOutputQueue::spawn(output);
+
+    queue.push_pending(AttachOutputFrame::render(b"first-render\n".to_vec()))?;
+    queue.push_pending(AttachOutputFrame::strict(b"strict-frame\n".to_vec()))?;
+    queue.push_pending(AttachOutputFrame::render(b"final-render\n".to_vec()))?;
+    queue.flush_pending()?;
+
+    wait_for_output_contains(&captured, b"strict-frame\n", Duration::from_secs(1)).await?;
+    tokio::time::sleep(ATTACH_RENDER_MAX_PENDING + Duration::from_millis(5)).await;
+    queue.flush_pending()?;
+
+    wait_for_output_contains(&captured, b"final-render\n", Duration::from_secs(1)).await?;
+    Ok(())
+}
+
+#[test]
+fn expired_render_backpressure_uses_retry_delay_instead_of_zero_spin() {
+    let mut queue = AttachOutputQueue::spawn(SharedOutput::default());
+    queue
+        .pending
+        .push_back(AttachOutputFrame::render(b"render".to_vec()));
+    queue.pending_bytes = b"render".len();
+    queue.pending_render_started_at = Some(Instant::now() - ATTACH_RENDER_MAX_PENDING);
+    queue.queued_frames = 1;
+    queue.painted_frame = true;
+
+    assert_eq!(
+        queue.backpressure_retry_delay(),
+        Some(ATTACH_OUTPUT_BACKPRESSURE_RETRY)
+    );
+}
+
+#[tokio::test]
+async fn strict_overflow_spools_without_pausing_server_reads_or_losing_order(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output = SharedOutput::default();
+    let captured = output.bytes.clone();
+    let mut queue = AttachOutputQueue::spawn(output);
+    let base = vec![b'x'; ATTACH_OUTPUT_PENDING_MAX_BYTES - 1];
+
+    queue.push_pending(AttachOutputFrame::strict(base.clone()))?;
+    queue.push_pending(AttachOutputFrame::strict(b"latest-delta".to_vec()))?;
+
+    assert_eq!(
+        queue.pending_bytes,
+        ATTACH_OUTPUT_PENDING_MAX_BYTES - 1,
+        "spooled output must not consume in-memory pending budget"
+    );
+    assert!(
+        !queue.should_pause_server_reads(),
+        "overflow must not block control messages behind server output"
+    );
+    assert_eq!(queue.spool.frames.len(), 1);
+
+    queue.flush_pending()?;
+    wait_for_output_contains(&captured, b"latest-delta", Duration::from_secs(1)).await?;
+    let output = captured.lock().expect("output mutex poisoned");
+    assert!(output.starts_with(&base));
+    assert!(output.ends_with(b"latest-delta"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn incoming_render_overflow_spools_after_strict_instead_of_discarding_base(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output = SharedOutput::default();
+    let captured = output.bytes.clone();
+    let mut queue = AttachOutputQueue::spawn(output);
+    let base = vec![b'x'; ATTACH_OUTPUT_PENDING_MAX_BYTES - 1];
+
+    queue.push_pending(AttachOutputFrame::strict(base.clone()))?;
+    queue.push_pending(AttachOutputFrame::render(b"fresh-render".to_vec()))?;
+
+    assert_eq!(queue.pending.len(), 1);
+    let frame = queue.pending.front().expect("strict base remains queued");
+    assert_eq!(frame.kind, AttachOutputFrameKind::Strict);
+    assert_eq!(queue.spool.frames.len(), 1);
+    assert_eq!(
+        queue.spool.frames.front().map(|frame| frame.kind),
+        Some(AttachOutputFrameKind::Render)
+    );
+
+    queue.flush_pending()?;
+    tokio::time::sleep(ATTACH_RENDER_MAX_PENDING + Duration::from_millis(5)).await;
+    queue.flush_pending()?;
+    wait_for_output_contains(&captured, b"fresh-render", Duration::from_secs(1)).await?;
+    let output = captured.lock().expect("output mutex poisoned");
+    assert!(output.starts_with(&base));
+    assert!(output.ends_with(b"fresh-render"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn later_frames_stay_behind_existing_spool_even_when_memory_has_room(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let output = SharedOutput::default();
+    let captured = output.bytes.clone();
+    let mut queue = AttachOutputQueue::spawn(output);
+    let base = vec![b'x'; ATTACH_OUTPUT_PENDING_MAX_BYTES - 1];
+
+    queue.push_pending(AttachOutputFrame::strict(base.clone()))?;
+    queue.push_pending(AttachOutputFrame::render(b"render".to_vec()))?;
+    queue.push_pending(AttachOutputFrame::strict(b"!".to_vec()))?;
+
+    assert_eq!(queue.pending.len(), 1);
+    assert_eq!(queue.spool.frames.len(), 2);
+    assert_eq!(
+        queue.spool.frames.front().map(|frame| frame.kind),
+        Some(AttachOutputFrameKind::Render)
+    );
+    assert_eq!(
+        queue.spool.frames.back().map(|frame| frame.kind),
+        Some(AttachOutputFrameKind::Strict)
+    );
+
+    queue.flush_pending()?;
+    wait_for_output_contains(&captured, b"render!", Duration::from_secs(1)).await?;
+    let output = captured.lock().expect("output mutex poisoned");
+    assert!(output.starts_with(&base));
+    assert!(output.ends_with(b"render!"));
+    Ok(())
+}
+
+#[test]
+fn spool_cap_rejects_replacement_without_truncating_existing_render() {
+    let mut spool = AttachOutputSpool::default();
+    spool.frames.push_back(AttachOutputSpoolFrame {
+        kind: AttachOutputFrameKind::Render,
+        offset: ATTACH_OUTPUT_SPOOL_MAX_BYTES - 1,
+        len: 1,
+    });
+    spool.end_offset = ATTACH_OUTPUT_SPOOL_MAX_BYTES;
+
+    let error = spool
+        .push(AttachOutputFrame::render(vec![b'x'; 2]))
+        .expect_err("replacement render beyond the cap must fail before mutation");
 
     assert!(
-        error
-            .to_string()
-            .contains("attach output writer is blocked and queued more than"),
+        error.to_string().contains("attach output spool exceeded"),
         "unexpected error: {error}"
+    );
+    assert_eq!(spool.frames.len(), 1);
+    assert_eq!(spool.frames[0].kind, AttachOutputFrameKind::Render);
+    assert_eq!(spool.frames[0].offset, ATTACH_OUTPUT_SPOOL_MAX_BYTES - 1);
+    assert_eq!(spool.end_offset, ATTACH_OUTPUT_SPOOL_MAX_BYTES);
+    assert!(spool.file.is_none());
+    assert!(spool.path.is_none());
+}
+
+#[test]
+fn pending_render_replacement_survives_spool_cap_failure() {
+    let mut queue = AttachOutputQueue::spawn(SharedOutput::default());
+    queue
+        .pending
+        .push_back(AttachOutputFrame::render(b"old-render".to_vec()));
+    queue.pending_bytes = ATTACH_OUTPUT_PENDING_MAX_BYTES + b"old-render".len() - 1;
+    queue.spool.end_offset = ATTACH_OUTPUT_SPOOL_MAX_BYTES;
+
+    let error = queue
+        .push_pending(AttachOutputFrame::render(vec![b'x'; 2]))
+        .expect_err("spool cap failure must leave pending render intact");
+
+    assert!(
+        error.to_string().contains("attach output spool exceeded"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(queue.pending.len(), 1);
+    let frame = queue.pending.back().expect("old render remains queued");
+    assert_eq!(frame.kind, AttachOutputFrameKind::Render);
+    assert_eq!(frame.bytes, b"old-render");
+    assert_eq!(
+        queue.pending_bytes,
+        ATTACH_OUTPUT_PENDING_MAX_BYTES + b"old-render".len() - 1
+    );
+    assert!(queue.spool.frames.is_empty());
+    assert!(queue.spool.file.is_none());
+}
+
+#[test]
+fn orphan_spool_cleanup_removes_dead_pid_files_and_parses_current_shape() {
+    let file_name = attach_output_spool_file_name(1234, 5678);
+    assert_eq!(attach_output_spool_pid(&file_name), Some(1234));
+    assert_eq!(
+        attach_output_spool_pid("rmux-attach-output-1234-x.spool"),
+        None
+    );
+
+    let orphan = std::env::temp_dir().join(attach_output_spool_file_name(0, 42));
+    std::fs::write(&orphan, b"stale spool").expect("write orphan spool fixture");
+    cleanup_orphaned_attach_output_spools_now();
+    assert!(
+        !orphan.exists(),
+        "orphaned attach output spool should be removed"
+    );
+}
+
+#[test]
+fn render_stream_strict_overflow_spools_and_keeps_server_reads_enabled(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut queue = AttachOutputQueue::spawn(SharedOutput::default());
+    queue.push_pending(AttachOutputFrame::strict(vec![
+        b'x';
+        ATTACH_OUTPUT_PENDING_MAX_BYTES
+            - 1
+    ]))?;
+
+    queue.push_pending(AttachOutputFrame::strict(b"latest-delta".to_vec()))?;
+
+    assert_eq!(queue.pending.len(), 1);
+    assert!(
+        queue
+            .pending
+            .iter()
+            .all(|frame| frame.kind == AttachOutputFrameKind::Strict),
+        "Strict output is delivery-guaranteed and must not be shed"
     );
     assert_eq!(
         queue.pending_bytes,
         ATTACH_OUTPUT_PENDING_MAX_BYTES - 1,
-        "a rejected frame must not consume pending byte budget"
+        "overflow Strict should leave the memory budget bounded"
     );
-    assert!(
-        queue.pending.is_empty(),
-        "a rejected frame must not be queued for the writer thread"
-    );
+    assert_eq!(queue.spool.frames.len(), 1);
+    assert!(!queue.should_pause_server_reads());
+    Ok(())
 }
 
 #[tokio::test]
@@ -952,6 +1227,27 @@ async fn wait_for_blocking_output_start(
         }
         if tokio::time::Instant::now() >= deadline {
             return Err("timed out waiting for blocking output write".into());
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+async fn wait_for_output_contains(
+    output: &Arc<Mutex<Vec<u8>>>,
+    needle: &[u8],
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        {
+            let bytes = output.lock().expect("output mutex poisoned");
+            if bytes.windows(needle.len()).any(|window| window == needle) {
+                return Ok(());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let bytes = output.lock().expect("output mutex poisoned").clone();
+            return Err(format!("timed out waiting for {needle:?} in output {bytes:?}").into());
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
