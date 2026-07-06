@@ -472,6 +472,8 @@ impl ConnectionCleanupGuard {
         self.handler
             .cleanup_connection_subscriptions_sync(self.connection_id);
         self.handler
+            .cleanup_connection_pane_state_subscriptions_sync(self.connection_id);
+        self.handler
             .cleanup_connection_sdk_waits_sync(self.connection_id);
         self.active = false;
     }

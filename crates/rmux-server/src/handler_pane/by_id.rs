@@ -16,6 +16,7 @@ use super::pane_io_encoding::{
 use super::pane_windows_console_sequence::prepare_single_pane_windows_console_input_sequence;
 use super::{encode_tokens_for_target, prepare_pane_input_write, write_bytes_to_target};
 use crate::hook_runtime::PendingInlineHookFormat;
+use crate::pane_state_journal::PaneStateChange;
 use crate::pane_terminals::{session_not_found, HandlerState};
 
 impl RequestHandler {
@@ -378,7 +379,7 @@ impl RequestHandler {
     ) -> Response {
         let session_name = request.target.session_name().clone();
         let title = request.title.clone();
-        let (response, pane_changed, window_index) = {
+        let (response, pane_changed, window_index, title_changed_target, title_state_event) = {
             let mut state = self.state.lock().await;
             let target = match resolve_pane_target_ref(&state, &request.target) {
                 Ok(target) => target,
@@ -392,9 +393,18 @@ impl RequestHandler {
                     .session(&session_name)
                     .and_then(|session| session.window_at(window_index))
                     .is_some_and(|window| window.active_pane_index() != pane_index);
+            let mut title_changed_target = None;
+            let mut title_state_event = None;
             match (|| -> Result<SelectPaneResponse, RmuxError> {
                 let response_target = if let Some(title) = title.as_deref() {
-                    state.set_pane_title(&target, title)?;
+                    if let Some((old, new)) = state.set_pane_title(&target, title)? {
+                        title_changed_target = Some(target.clone());
+                        if let Some(pane_id) = pane_id_for_select_target(&state, &target) {
+                            let generation =
+                                state.pane_output_generation(target.session_name(), pane_id);
+                            title_state_event = Some((pane_id, generation, old, new));
+                        }
+                    }
                     target.clone()
                 } else {
                     let session = state
@@ -412,21 +422,39 @@ impl RequestHandler {
                     target: response_target,
                 })
             })() {
-                Ok(response) => (Response::SelectPane(response), pane_changed, window_index),
+                Ok(response) => (
+                    Response::SelectPane(response),
+                    pane_changed,
+                    window_index,
+                    title_changed_target,
+                    title_state_event,
+                ),
                 Err(error) => (
                     Response::Error(ErrorResponse { error }),
                     false,
                     window_index,
+                    None,
+                    None,
                 ),
             }
         };
 
         if matches!(response, Response::SelectPane(_)) {
+            if let Some((pane_id, generation, old, new)) = title_state_event {
+                self.record_pane_state_change(
+                    pane_id,
+                    Some(generation),
+                    PaneStateChange::TitleChanged { old, new },
+                );
+            }
             if pane_changed {
                 self.emit(LifecycleEvent::WindowPaneChanged {
                     target: WindowTarget::with_window(session_name.clone(), window_index),
                 })
                 .await;
+            }
+            if let Some(target) = title_changed_target {
+                self.emit(LifecycleEvent::PaneTitleChanged { target }).await;
             }
             if let Response::SelectPane(success) = &response {
                 self.queue_inline_hook(
@@ -441,6 +469,18 @@ impl RequestHandler {
 
         response
     }
+}
+
+fn pane_id_for_select_target(
+    state: &HandlerState,
+    target: &PaneTarget,
+) -> Option<rmux_core::PaneId> {
+    state
+        .sessions
+        .session(target.session_name())
+        .and_then(|session| session.window_at(target.window_index()))
+        .and_then(|window| window.pane(target.pane_index()))
+        .map(|pane| pane.id())
 }
 
 pub(crate) fn resolve_pane_target_ref(

@@ -934,7 +934,7 @@ async fn if_shell_string_mode_runs_multiple_commands_in_one_group() {
 async fn if_shell_inserted_assignments_apply_before_parent_queue_tail() {
     let handler = RequestHandler::new();
     let parsed = CommandParser::new()
-        .parse("if-shell -F 1 { FOO=bar } ; run-shell true")
+        .parse("if-shell -F 1 { FOO=bar } ; run-shell \"exit 0\"")
         .expect("commands parse");
 
     let output = handler

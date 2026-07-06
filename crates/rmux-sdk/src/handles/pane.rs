@@ -20,12 +20,16 @@ use crate::{
 
 #[path = "pane/capture_pane.rs"]
 mod capture_pane;
+#[path = "pane/foreground.rs"]
+mod foreground;
 #[path = "pane/info.rs"]
 mod info;
 #[path = "pane/input.rs"]
 mod input;
 #[path = "pane/lifecycle.rs"]
 mod lifecycle;
+#[path = "pane/options.rs"]
+mod options;
 #[path = "pane/snapshot.rs"]
 mod snapshot;
 #[path = "pane/spawn.rs"]
@@ -34,19 +38,26 @@ mod spawn;
 mod split;
 #[path = "pane/split_builder.rs"]
 mod split_builder;
+#[path = "pane/state_events.rs"]
+mod state_events;
 #[path = "pane/target.rs"]
 mod target;
 #[path = "pane/title.rs"]
 mod title;
 
 pub use capture_pane::{PaneCapture, PaneCaptureBuilder};
+pub use foreground::{ForegroundSource, ForegroundSources, ForegroundState};
 use info::{current_pane_entry, current_pane_ref_for_id, pane_info_snapshot};
 use input::{resize_to_size, send_key, send_text};
 use lifecycle::{close_pane, respawn_pane};
+use options::{get_option, set_option, unset_option};
 use snapshot::pane_snapshot;
 pub use spawn::PaneSpawnBuilder;
 use split::split_pane;
 pub use split_builder::PaneSplitBuilder;
+pub use state_events::{
+    PaneStateEvent, PaneStateEventStream, PaneStateEventsOptions, PaneStateOption,
+};
 pub(crate) use target::is_already_closed_pane_error;
 use title::{get_title, set_title};
 
@@ -87,6 +98,21 @@ pub struct PaneRespawnOptions {
     pub process: ProcessSpec,
     /// Optional keep-dead-pane policy applied before respawn.
     pub keep_alive_on_exit: Option<bool>,
+}
+
+/// Result of a pane-local option mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneOptionMutation {
+    /// Stable pane id resolved by the daemon.
+    pub pane_id: PaneId,
+    /// Canonical option name.
+    pub name: String,
+    /// Exact explicit value before the mutation.
+    pub old_value: Option<String>,
+    /// Exact explicit value after the mutation.
+    pub new_value: Option<String>,
+    /// Whether the explicit value changed.
+    pub changed: bool,
 }
 
 /// Opaque handle for one daemon pane slot.
@@ -464,6 +490,40 @@ impl Pane {
     /// Returns this pane's current UX title label when the pane still exists.
     pub async fn title(&self) -> Result<Option<String>> {
         get_title(self).await
+    }
+
+    /// Sets a pane-local option and returns the exact mutation outcome.
+    pub async fn set_option(
+        &self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<PaneOptionMutation> {
+        set_option(self, name.into(), value.into()).await
+    }
+
+    /// Returns the exact pane-local explicit value for an option.
+    pub async fn option(&self, name: impl Into<String>) -> Result<Option<String>> {
+        get_option(self, name.into()).await
+    }
+
+    /// Removes a pane-local explicit option and returns the exact mutation outcome.
+    pub async fn unset_option(&self, name: impl Into<String>) -> Result<PaneOptionMutation> {
+        unset_option(self, name.into()).await
+    }
+
+    /// Returns best-effort foreground process state for this pane.
+    pub async fn foreground_state(&self) -> Result<Option<ForegroundState>> {
+        foreground::foreground_state(self)
+            .await
+            .map(|state| state.map(|(_, _, foreground)| foreground))
+    }
+
+    /// Opens a long-poll stream of pane title, option, close, and optional foreground events.
+    pub async fn state_events(
+        &self,
+        options: PaneStateEventsOptions,
+    ) -> Result<PaneStateEventStream> {
+        state_events::PaneStateEventStream::open(self, options).await
     }
 
     /// Consumes this handle and kills the addressed pane through the daemon.

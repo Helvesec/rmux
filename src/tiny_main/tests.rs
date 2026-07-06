@@ -74,6 +74,27 @@ fn tiny_incompatible_daemon_message_uses_kill_server_hint() {
     assert!(default_message.contains("rmux kill-server"));
 }
 
+#[test]
+fn tiny_kill_server_legacy_fallback_accepts_every_prior_wire_version() {
+    for got in 1..RMUX_WIRE_VERSION {
+        let error = ClientError::Protocol(RmuxError::UnsupportedWireVersion {
+            got,
+            minimum: RMUX_WIRE_VERSION,
+            maximum: RMUX_WIRE_VERSION,
+        });
+        assert_eq!(legacy_shutdown_fallback_wire_version(&error), Some(got));
+    }
+
+    for got in [0, RMUX_WIRE_VERSION, RMUX_WIRE_VERSION + 1] {
+        let error = ClientError::Protocol(RmuxError::UnsupportedWireVersion {
+            got,
+            minimum: RMUX_WIRE_VERSION,
+            maximum: RMUX_WIRE_VERSION,
+        });
+        assert_eq!(legacy_shutdown_fallback_wire_version(&error), None);
+    }
+}
+
 #[derive(Clone)]
 struct FuzzRng(u64);
 

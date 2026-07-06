@@ -1,5 +1,6 @@
 /target
 /target-audit/
+/crates/*/target/
 /dist/
 __pycache__/
 *.py[cod]

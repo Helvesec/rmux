@@ -140,7 +140,7 @@ fn shell_quote_path(path: &Path) -> String {
 
     #[cfg(windows)]
     {
-        return format!("\"{}\"", text.replace('"', "\"\""));
+        format!("\"{}\"", text.replace('"', "\"\""))
     }
     #[cfg(not(windows))]
     format!("'{}'", text.replace('\'', "'\\''"))

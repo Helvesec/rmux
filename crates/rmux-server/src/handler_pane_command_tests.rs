@@ -18,6 +18,11 @@ use rmux_proto::{HookLifecycle, HookName};
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout};
 
+#[cfg(windows)]
+const PROCESS_OUTPUT_FILE_TIMEOUT: Duration = Duration::from_secs(20);
+#[cfg(not(windows))]
+const PROCESS_OUTPUT_FILE_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
 }
@@ -129,7 +134,7 @@ async fn wait_for_attached_session_exit(control_rx: &mut mpsc::UnboundedReceiver
 }
 
 async fn wait_for_file_contents(path: &Path, expected: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + PROCESS_OUTPUT_FILE_TIMEOUT;
     loop {
         match fs::read_to_string(path) {
             Ok(contents) if contents == expected => return,
@@ -148,6 +153,21 @@ async fn wait_for_file_contents(path: &Path, expected: &str) {
                 expected
             ),
         }
+    }
+}
+
+async fn wait_for_pipe_child_count_to_return_to(baseline: usize) {
+    let deadline = tokio::time::Instant::now() + PROCESS_OUTPUT_FILE_TIMEOUT;
+    loop {
+        let active = crate::pane_terminals::active_pipe_child_count_for_test();
+        if active <= baseline {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for pipe-pane children to stop; baseline={baseline}, active={active}"
+        );
+        sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -242,6 +262,9 @@ async fn sticky_lifecycle_state_is_id_keyed_and_redacts_spawn_env() {
         })))
         .await;
     assert!(matches!(created, rmux_proto::Response::NewSession(_)));
+    handler
+        .wait_for_pane_terminal_for_test(&PaneTarget::new(alpha.clone(), 0))
+        .await;
 
     let (session_id, window_id, initial_pane_id, initial_output_sequence) = {
         let state = handler.state.lock().await;
@@ -1946,6 +1969,7 @@ async fn pipe_pane_empty_command_closes_existing_pipe() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     create_session(&handler, &alpha).await;
+    let pipe_child_baseline = crate::pane_terminals::active_pipe_child_count_for_test();
 
     let open = handler
         .handle(Request::PipePane(PipePaneRequest {
@@ -1971,6 +1995,7 @@ async fn pipe_pane_empty_command_closes_existing_pipe() {
         matches!(close, rmux_proto::Response::PipePane(_)),
         "empty command should close existing pipe, got {close:?}"
     );
+    wait_for_pipe_child_count_to_return_to(pipe_child_baseline).await;
 
     // Opening a new pipe after an empty-command close should succeed, confirming the previous
     // pipe was cleaned up.
@@ -1997,6 +2022,7 @@ async fn pipe_pane_empty_command_closes_existing_pipe() {
             command: None,
         }))
         .await;
+    wait_for_pipe_child_count_to_return_to(pipe_child_baseline).await;
 }
 
 async fn snapshot_response(

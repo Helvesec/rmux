@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 async fn parsed_queue_assignments_apply_before_following_commands() {
     let handler = RequestHandler::new();
     let parsed = CommandParser::new()
-        .parse("FOO=bar ; run-shell true")
+        .parse("FOO=bar ; run-shell \"exit 0\"")
         .expect("commands parse");
 
     let output = handler
@@ -257,7 +257,7 @@ async fn register_read_only_control_client(handler: &RequestHandler, requester_p
 async fn if_shell_inserted_hidden_assignments_stay_out_of_process_environments() {
     let handler = RequestHandler::new();
     let parsed = CommandParser::new()
-        .parse("if-shell -F 1 { %hidden SECRET=classified } ; run-shell true")
+        .parse("if-shell -F 1 { %hidden SECRET=classified } ; run-shell \"exit 0\"")
         .expect("commands parse");
 
     let output = handler

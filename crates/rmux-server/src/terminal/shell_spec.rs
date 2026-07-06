@@ -316,9 +316,8 @@ mod tests {
 
         assert_eq!(plan.program, PathBuf::from("pwsh.exe"));
         assert_eq!(plan.args, os_args(["-NoLogo", "-NoExit"]));
-        assert_eq!(
-            plan.args.iter().any(|arg| arg == "-NoProfile"),
-            false,
+        assert!(
+            !plan.args.iter().any(|arg| arg == "-NoProfile"),
             "interactive PowerShell must not suppress profiles"
         );
     }

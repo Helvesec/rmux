@@ -17,7 +17,7 @@ use crate::pane_terminals::{session_not_found, HandlerState};
 #[cfg(unix)]
 const IMMEDIATE_PANE_INPUT_MAX_BYTES: usize = 256;
 
-pub(super) struct PaneInputWrite {
+pub(in crate::handler) struct PaneInputWrite {
     session_name: SessionName,
     window_index: u32,
     pane_index: u32,
@@ -86,7 +86,7 @@ impl WindowsConsoleInputAction {
     }
 }
 
-pub(super) fn prepare_pane_input_write(
+pub(in crate::handler) fn prepare_pane_input_write(
     state: &mut HandlerState,
     target: &PaneTarget,
     bytes: &[u8],
@@ -724,7 +724,7 @@ pub(super) async fn write_bytes_to_targets(
     Response::SendKeys(SendKeysResponse { key_count })
 }
 
-pub(super) async fn write_bytes_to_target_io(
+pub(in crate::handler) async fn write_bytes_to_target_io(
     write: PaneInputWrite,
     bytes: Vec<u8>,
 ) -> Result<(), RmuxError> {
@@ -777,13 +777,19 @@ pub(super) async fn write_windows_console_input_action_to_target_io(
             );
             tokio::task::spawn_blocking(move || match action {
                 WindowsConsoleInputAction::Key(key) => {
-                    rmux_pty::write_windows_console_key(pid, key)
+                    crate::windows_console_input::write_with_transient_retry(|| {
+                        rmux_pty::write_windows_console_key(pid, key)
+                    })
                 }
                 WindowsConsoleInputAction::KeyThenInterrupt(key) => {
-                    rmux_pty::write_windows_console_key_then_interrupt_if_processed(pid, key)
+                    crate::windows_console_input::write_with_transient_retry(|| {
+                        rmux_pty::write_windows_console_key_then_interrupt_if_processed(pid, key)
+                    })
                 }
                 WindowsConsoleInputAction::Interrupt => {
-                    rmux_pty::send_windows_console_interrupt(pid)
+                    crate::windows_console_input::write_with_transient_retry(|| {
+                        rmux_pty::send_windows_console_interrupt(pid)
+                    })
                 }
                 WindowsConsoleInputAction::Noop => Ok(()),
             })
@@ -888,41 +894,6 @@ fn should_try_immediate_pane_input(byte_len: usize) -> bool {
 #[cfg(not(any(unix, windows)))]
 async fn write_pane_bytes(master: PtyMaster, bytes: Vec<u8>) -> std::io::Result<()> {
     master.write_all(&bytes)
-}
-
-pub(in crate::handler) async fn write_bracketed_pane_payload(
-    master: PtyMaster,
-    payload: Vec<u8>,
-    bracketed: bool,
-) -> std::io::Result<()> {
-    #[cfg(any(unix, windows))]
-    {
-        tokio::task::spawn_blocking(move || {
-            write_bracketed_pane_payload_blocking(&master, &payload, bracketed)
-        })
-        .await
-        .map_err(|error| std::io::Error::other(format!("pane paste task failed: {error}")))?
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        write_bracketed_pane_payload_blocking(&master, &payload, bracketed)
-    }
-}
-
-fn write_bracketed_pane_payload_blocking(
-    master: &PtyMaster,
-    payload: &[u8],
-    bracketed: bool,
-) -> std::io::Result<()> {
-    if bracketed {
-        master.write_all(b"\x1b[200~")?;
-    }
-    master.write_all(payload)?;
-    if bracketed {
-        master.write_all(b"\x1b[201~")?;
-    }
-    Ok(())
 }
 
 pub(super) fn encode_tokens_for_target(

@@ -10,7 +10,7 @@ use rmux_proto::{
     SaveBufferResponse, SetBufferResponse, ShowBufferResponse,
 };
 
-use super::pane_support::write_bracketed_pane_payload;
+use super::pane_support::{prepare_pane_input_write, write_bytes_to_target_io};
 use super::RequestHandler;
 use crate::outer_terminal::OuterTerminal;
 use crate::pane_io::AttachControl;
@@ -97,8 +97,8 @@ impl RequestHandler {
         let window_index = request.target.window_index();
         let pane_index = request.target.pane_index();
 
-        let (buffer_name, content, buffer_order, master, bracketed_mode) = {
-            let mut state = self.state.lock().await;
+        let (buffer_name, content, buffer_order, bracketed_mode) = {
+            let state = self.state.lock().await;
 
             if !state.sessions.contains_session(&session_name) {
                 return Response::Error(ErrorResponse {
@@ -141,17 +141,19 @@ impl RequestHandler {
                         state.mode & rmux_core::input::mode::MODE_BRACKETPASTE != 0
                     });
 
-            let master =
-                match state.clone_pane_master_if_alive(&session_name, window_index, pane_index) {
-                    Ok(master) => master,
-                    Err(error) => return Response::Error(ErrorResponse { error }),
-                };
-
-            (name, content, order, master, bracketed_mode)
+            (name, content, order, bracketed_mode)
         };
 
         let payload = render_paste_payload(&content, &request);
-        if let Err(error) = write_bracketed_pane_payload(master, payload, bracketed_mode).await {
+        let payload = bracketed_paste_payload(payload, bracketed_mode);
+        let write = {
+            let mut state = self.state.lock().await;
+            match prepare_pane_input_write(&mut state, &request.target, &payload) {
+                Ok(write) => write,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            }
+        };
+        if let Err(error) = write_bytes_to_target_io(write, payload).await {
             return Response::Error(ErrorResponse {
                 error: RmuxError::Server(format!(
                     "failed to write buffer to pane {}:{}.{}: {}",
@@ -564,6 +566,18 @@ fn render_paste_payload(content: &[u8], request: &rmux_proto::PasteBufferRequest
         append_paste_chunk(&mut output, &content[start..], request.raw);
     }
     output
+}
+
+fn bracketed_paste_payload(mut payload: Vec<u8>, bracketed: bool) -> Vec<u8> {
+    if !bracketed {
+        return payload;
+    }
+
+    let mut bracketed_payload = Vec::with_capacity(payload.len() + 12);
+    bracketed_payload.extend_from_slice(b"\x1b[200~");
+    bracketed_payload.append(&mut payload);
+    bracketed_payload.extend_from_slice(b"\x1b[201~");
+    bracketed_payload
 }
 
 fn append_paste_chunk(output: &mut Vec<u8>, chunk: &[u8], raw: bool) {

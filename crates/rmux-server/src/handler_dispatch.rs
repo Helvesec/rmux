@@ -340,6 +340,26 @@ impl RequestHandler {
             Request::PaneBroadcastInput(request) => {
                 HandleOutcome::response(self.handle_pane_broadcast_input(request).await)
             }
+            Request::PaneOptionSet(request) => {
+                HandleOutcome::response(self.handle_pane_option_set(request).await)
+            }
+            Request::PaneOptionGet(request) => {
+                HandleOutcome::response(self.handle_pane_option_get(request).await)
+            }
+            Request::SubscribePaneState(request) => HandleOutcome::response(
+                self.handle_subscribe_pane_state(connection_id, request)
+                    .await,
+            ),
+            Request::PaneStateCursor(request) => {
+                HandleOutcome::response(self.handle_pane_state_cursor(connection_id, request).await)
+            }
+            Request::UnsubscribePaneState(request) => HandleOutcome::response(
+                self.handle_unsubscribe_pane_state(connection_id, request)
+                    .await,
+            ),
+            Request::PaneForegroundState(request) => {
+                HandleOutcome::response(self.handle_pane_foreground_state(request).await)
+            }
             Request::BindKey(request) => {
                 HandleOutcome::response(self.handle_bind_key(*request).await)
             }
@@ -621,6 +641,10 @@ fn request_waits_for_windows_deferred_panes(request: &Request) -> bool {
             | Request::SubscribePaneOutputRef(_)
             | Request::UnsubscribePaneOutput(_)
             | Request::PaneOutputCursor(_)
+            | Request::SubscribePaneState(_)
+            | Request::PaneStateCursor(_)
+            | Request::UnsubscribePaneState(_)
+            | Request::PaneForegroundState(_)
             | Request::SdkWaitForOutput(_)
             | Request::SdkWaitForOutputRef(_)
             | Request::CancelSdkWait(_)

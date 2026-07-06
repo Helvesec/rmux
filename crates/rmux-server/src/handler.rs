@@ -7,7 +7,7 @@ use std::sync::{Arc, Weak};
 use rmux_core::events::{PaneSnapshotCoalescerRegistry, SubscriptionLimits};
 use rmux_ipc::PeerIdentity;
 use rmux_proto::{RmuxError, TerminalSize, WindowTarget};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Mutex, Notify};
 
 use crate::daemon::ShutdownHandle;
 #[path = "handler_alerts.rs"]
@@ -46,6 +46,8 @@ mod mode_tree_support;
 mod option_support;
 #[path = "handler_overlay.rs"]
 mod overlay_support;
+#[path = "handler_pane_state.rs"]
+mod pane_state_support;
 #[path = "handler_pane.rs"]
 mod pane_support;
 #[path = "handler_prompt.rs"]
@@ -67,6 +69,9 @@ mod subscription_support;
 mod target_action_support;
 #[path = "handler_targets.rs"]
 mod target_support;
+#[cfg(test)]
+#[path = "handler_test_support.rs"]
+mod test_support;
 #[path = "handler_waits.rs"]
 mod wait_support;
 pub(crate) use wait_support::PreparedSdkWait;
@@ -87,6 +92,7 @@ pub(crate) use web_support::{
 };
 #[path = "handler_window.rs"]
 mod window_support;
+use crate::pane_state_journal::PaneStateJournal;
 use crate::pane_terminals::HandlerState;
 use crate::server_access::{current_owner_uid, AccessMode, ServerAccessStore};
 use crate::wait_for::WaitForStore;
@@ -190,6 +196,9 @@ pub(crate) struct RequestHandler {
     session_lease_janitor_started: Arc<AtomicBool>,
     pane_snapshot_coalescers: Arc<StdMutex<PaneSnapshotCoalescerRegistry>>,
     pane_snapshot_revisions: Arc<StdMutex<PaneSnapshotRevisionRegistry>>,
+    pane_state_journal: Arc<StdMutex<PaneStateJournal>>,
+    pane_state_notify: Arc<Notify>,
+    foreground_watch_started: Arc<AtomicBool>,
     #[cfg(all(any(unix, windows), feature = "web"))]
     web_shares: Arc<WebShareRegistry>,
     #[cfg(all(any(unix, windows), feature = "web"))]
@@ -242,6 +251,9 @@ impl Clone for RequestHandler {
             session_lease_janitor_started: self.session_lease_janitor_started.clone(),
             pane_snapshot_coalescers: self.pane_snapshot_coalescers.clone(),
             pane_snapshot_revisions: self.pane_snapshot_revisions.clone(),
+            pane_state_journal: self.pane_state_journal.clone(),
+            pane_state_notify: self.pane_state_notify.clone(),
+            foreground_watch_started: self.foreground_watch_started.clone(),
             #[cfg(all(any(unix, windows), feature = "web"))]
             web_shares: self.web_shares.clone(),
             #[cfg(all(any(unix, windows), feature = "web"))]
@@ -285,6 +297,9 @@ pub(crate) struct WeakRequestHandler {
     session_lease_janitor_started: Weak<AtomicBool>,
     pane_snapshot_coalescers: Weak<StdMutex<PaneSnapshotCoalescerRegistry>>,
     pane_snapshot_revisions: Weak<StdMutex<PaneSnapshotRevisionRegistry>>,
+    pane_state_journal: Weak<StdMutex<PaneStateJournal>>,
+    pane_state_notify: Weak<Notify>,
+    foreground_watch_started: Weak<AtomicBool>,
     #[cfg(all(any(unix, windows), feature = "web"))]
     web_shares: Weak<WebShareRegistry>,
     #[cfg(all(any(unix, windows), feature = "web"))]
@@ -325,6 +340,9 @@ impl WeakRequestHandler {
             session_lease_janitor_started: self.session_lease_janitor_started.upgrade()?,
             pane_snapshot_coalescers: self.pane_snapshot_coalescers.upgrade()?,
             pane_snapshot_revisions: self.pane_snapshot_revisions.upgrade()?,
+            pane_state_journal: self.pane_state_journal.upgrade()?,
+            pane_state_notify: self.pane_state_notify.upgrade()?,
+            foreground_watch_started: self.foreground_watch_started.upgrade()?,
             #[cfg(all(any(unix, windows), feature = "web"))]
             web_shares: self.web_shares.upgrade()?,
             #[cfg(all(any(unix, windows), feature = "web"))]
@@ -481,6 +499,9 @@ impl RequestHandler {
             pane_snapshot_revisions: Arc::new(StdMutex::new(
                 PaneSnapshotRevisionRegistry::default(),
             )),
+            pane_state_journal: Arc::new(StdMutex::new(PaneStateJournal::default())),
+            pane_state_notify: Arc::new(Notify::new()),
+            foreground_watch_started: Arc::new(AtomicBool::new(false)),
             #[cfg(all(any(unix, windows), feature = "web"))]
             web_shares: Arc::new(WebShareRegistry::default()),
             #[cfg(all(any(unix, windows), feature = "web"))]
@@ -525,6 +546,9 @@ impl RequestHandler {
             session_lease_janitor_started: Arc::downgrade(&self.session_lease_janitor_started),
             pane_snapshot_coalescers: Arc::downgrade(&self.pane_snapshot_coalescers),
             pane_snapshot_revisions: Arc::downgrade(&self.pane_snapshot_revisions),
+            pane_state_journal: Arc::downgrade(&self.pane_state_journal),
+            pane_state_notify: Arc::downgrade(&self.pane_state_notify),
+            foreground_watch_started: Arc::downgrade(&self.foreground_watch_started),
             #[cfg(all(any(unix, windows), feature = "web"))]
             web_shares: Arc::downgrade(&self.web_shares),
             #[cfg(all(any(unix, windows), feature = "web"))]

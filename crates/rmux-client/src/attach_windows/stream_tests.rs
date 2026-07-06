@@ -551,6 +551,7 @@ async fn pending_render_after_strict_frame_rearms_coalescing_deadline(
     queue.flush_pending()?;
 
     wait_for_output_contains(&captured, b"strict-frame\n", Duration::from_secs(1)).await?;
+    wait_for_output_queue_idle(&mut queue, Duration::from_secs(1)).await?;
     tokio::time::sleep(ATTACH_RENDER_MAX_PENDING + Duration::from_millis(5)).await;
     queue.flush_pending()?;
 
@@ -626,6 +627,7 @@ async fn incoming_render_overflow_spools_after_strict_instead_of_discarding_base
     );
 
     queue.flush_pending()?;
+    wait_for_output_queue_idle(&mut queue, Duration::from_secs(1)).await?;
     tokio::time::sleep(ATTACH_RENDER_MAX_PENDING + Duration::from_millis(5)).await;
     queue.flush_pending()?;
     wait_for_output_contains(&captured, b"fresh-render", Duration::from_secs(1)).await?;
@@ -1248,6 +1250,28 @@ async fn wait_for_output_contains(
         if tokio::time::Instant::now() >= deadline {
             let bytes = output.lock().expect("output mutex poisoned").clone();
             return Err(format!("timed out waiting for {needle:?} in output {bytes:?}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+async fn wait_for_output_queue_idle(
+    queue: &mut AttachOutputQueue,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        queue.drain_completed_writes();
+        queue.check_failure()?;
+        if queue.queued_frames == 0 {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for attach output queue to drain; {} frame(s) still queued",
+                queue.queued_frames
+            )
+            .into());
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
     }

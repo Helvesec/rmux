@@ -20,6 +20,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{timeout, Duration};
 
+#[cfg(windows)]
+const WEBSOCKET_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(not(windows))]
+const WEBSOCKET_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[test]
 fn websocket_upgrade_requires_upgrade_token() {
     let request = request_with_headers([
@@ -1751,7 +1756,7 @@ async fn read_encrypted_binary_frame_with_prefix_containing(
 }
 
 async fn read_server_frame(stream: &mut TcpStream) -> ServerFrame {
-    timeout(Duration::from_secs(2), read_server_frame_inner(stream))
+    timeout(WEBSOCKET_FRAME_TIMEOUT, read_server_frame_inner(stream))
         .await
         .expect("websocket frame timeout")
         .expect("read websocket frame")

@@ -131,6 +131,8 @@ impl AttachGuard {
             .size(TerminalSize::new(100, 30))
             .spawn()?;
         wait_for_attach_client(label, session, ATTACH_READY_TIMEOUT)?;
+        let io = child.master().try_clone_io()?;
+        wait_for_output_containing_all(&io, &[session], IO_TIMEOUT)?;
         Ok(Self {
             label: label.to_owned(),
             child,

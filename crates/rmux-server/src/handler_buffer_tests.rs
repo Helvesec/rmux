@@ -50,9 +50,10 @@ fn paste_buffer_request(
 }
 
 async fn create_session(handler: &RequestHandler, name: &str) {
+    let session_name = session_name(name);
     let response = handler
         .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name(name),
+            session_name: session_name.clone(),
             detached: true,
             size: Some(TerminalSize { cols: 80, rows: 24 }),
             environment: None,
@@ -60,6 +61,9 @@ async fn create_session(handler: &RequestHandler, name: &str) {
         .await;
 
     assert!(matches!(response, Response::NewSession(_)));
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session_name, 0))
+        .await;
 }
 
 fn take_write(control: AttachControl) -> Vec<u8> {

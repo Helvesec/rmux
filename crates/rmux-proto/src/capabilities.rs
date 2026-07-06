@@ -34,6 +34,12 @@ pub const CAPABILITY_SDK_WAITS_ARMED: &str = "sdk.waits.armed";
 pub const CAPABILITY_SDK_PANE_BY_ID: &str = "sdk.pane.by_id";
 /// Stable feature id for daemon-side SDK pane input broadcast.
 pub const CAPABILITY_SDK_PANE_BROADCAST: &str = "sdk.pane.broadcast";
+/// Stable feature id for SDK pane-local option access.
+pub const CAPABILITY_SDK_PANE_OPTIONS: &str = "sdk.pane.options";
+/// Stable feature id for SDK pane title/option/close state events.
+pub const CAPABILITY_SDK_PANE_STATE_EVENTS: &str = "sdk.pane.state_events";
+/// Stable feature id for SDK best-effort pane foreground process state.
+pub const CAPABILITY_SDK_PANE_FOREGROUND: &str = "sdk.pane.foreground";
 /// Stable feature id for daemon-side app-owned session leases.
 pub const CAPABILITY_SDK_SESSION_LEASE: &str = "sdk.session.lease";
 /// Stable feature id for explicit SDK process launch modes.
@@ -67,6 +73,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     CAPABILITY_SDK_WAITS_ARMED,
     CAPABILITY_SDK_PANE_BY_ID,
     CAPABILITY_SDK_PANE_BROADCAST,
+    CAPABILITY_SDK_PANE_OPTIONS,
+    CAPABILITY_SDK_PANE_STATE_EVENTS,
+    CAPABILITY_SDK_PANE_FOREGROUND,
     CAPABILITY_SDK_SESSION_LEASE,
     CAPABILITY_SDK_PROCESS_COMMAND,
     CAPABILITY_TARGET_CLIENT_COMMANDS,

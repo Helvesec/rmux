@@ -479,7 +479,7 @@ async fn parsed_queue_mouse_resize_can_recover_attached_current_mouse_event() {
 async fn create_test_session(handler: &RequestHandler, session: SessionName, size: TerminalSize) {
     let response = handler
         .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
-            session_name: Some(session),
+            session_name: Some(session.clone()),
             working_directory: None,
             detached: true,
             size: Some(size),
@@ -502,6 +502,10 @@ async fn create_test_session(handler: &RequestHandler, session: SessionName, siz
         matches!(response, Response::NewSession(_)),
         "resize test session should be created, got {response:?}"
     );
+    let target = PaneTarget::with_window(session, 0, 0);
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&target)
+        .await;
 }
 
 #[cfg(unix)]

@@ -335,8 +335,28 @@ fn status_format_array_default_resolves_tmux_entries_in_snapshot() {
     );
 }
 
+#[cfg(windows)]
 #[test]
-fn status_right_default_uses_tmux_pane_title() {
+fn status_right_default_uses_host_short_on_windows() {
+    let store = OptionStore::new();
+    let alpha = session_name("alpha");
+    let value = store
+        .resolve(Some(&alpha), OptionName::StatusRight)
+        .expect("status-right default resolves");
+
+    assert!(
+        value.contains("#{=21:host_short}"),
+        "status-right should show the host name, got {value:?}"
+    );
+    assert!(
+        !value.contains("pane_title"),
+        "status-right must not depend on pane title updates, got {value:?}"
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn status_right_default_uses_pane_title_on_unix_like_platforms() {
     let store = OptionStore::new();
     let alpha = session_name("alpha");
     let value = store
@@ -349,7 +369,7 @@ fn status_right_default_uses_tmux_pane_title() {
     );
     assert!(
         !value.contains("host_short"),
-        "status-right must not diverge to host_short, got {value:?}"
+        "status-right must not use host name on non-Windows, got {value:?}"
     );
 }
 

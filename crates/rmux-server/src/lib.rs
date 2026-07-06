@@ -29,6 +29,8 @@ mod daemon;
 #[cfg(any(unix, windows))]
 mod diagnostic_log;
 #[cfg(any(unix, windows))]
+mod foreground_probe;
+#[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod format_runtime;
 #[cfg(any(unix, windows))]
@@ -84,6 +86,8 @@ mod pane_reader_runtime;
 #[cfg_attr(windows, allow(dead_code))]
 mod pane_screen_state;
 #[cfg(any(unix, windows))]
+mod pane_state_journal;
+#[cfg(any(unix, windows))]
 #[cfg_attr(windows, allow(dead_code))]
 mod pane_terminal_lookup;
 #[cfg(any(unix, windows))]
@@ -131,6 +135,8 @@ mod unix_socket;
 mod wait_for;
 #[cfg(all(any(unix, windows), feature = "web"))]
 mod web;
+#[cfg(windows)]
+mod windows_console_input;
 
 /// Fuzzing entry points for protocol parsers.
 #[cfg(all(any(unix, windows), feature = "web", feature = "fuzzing"))]

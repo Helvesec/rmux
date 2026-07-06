@@ -144,16 +144,16 @@ async fn nested_source_file_lookup_parse_error_skips_child_but_outer_continues()
         ),
         "unexpected nested source-file parse error: {error:?}"
     );
-    assert_eq!(
-        handler
-            .handle(Request::ShowBuffer(ShowBufferRequest {
-                name: Some("nested-after".to_owned()),
-            }))
-            .await
-            .command_output()
-            .expect("nested command after lookup parse error should run")
-            .stdout(),
-        b"yes"
+    assert!(
+        matches!(
+            handler
+                .handle(Request::ShowBuffer(ShowBufferRequest {
+                    name: Some("nested-after".to_owned()),
+                }))
+                .await,
+            Response::Error(_)
+        ),
+        "nested command after lookup parse error should not run"
     );
     assert_eq!(
         handler

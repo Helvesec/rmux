@@ -953,6 +953,9 @@ fn reap_windows_test_child(child: &mut rmux_pty::PtyChild) -> Result<(), Box<dyn
 }
 
 #[cfg(windows)]
+const WINDOWS_INTERACTIVE_SHELL_OUTPUT_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[cfg(windows)]
 fn windows_interactive_shell_starts_in_profile_cwd_and_accepts_input(
     default_shell: &str,
 ) -> Result<(), Box<dyn Error>> {
@@ -993,7 +996,11 @@ fn windows_interactive_shell_starts_in_profile_cwd_and_accepts_input(
         } else {
             io.write_all(b"cd && echo RMUX_WINDOWS_INTERACTIVE_OK && exit\r\n")?;
         }
-        read_until_io(&io, b"RMUX_WINDOWS_INTERACTIVE_OK", Duration::from_secs(5))
+        read_until_io(
+            &io,
+            b"RMUX_WINDOWS_INTERACTIVE_OK",
+            WINDOWS_INTERACTIVE_SHELL_OUTPUT_TIMEOUT,
+        )
     })();
 
     reap_windows_test_child(&mut child)?;

@@ -36,6 +36,8 @@ mod marked_pane;
 mod pane_access;
 #[path = "pane_terminals/pane_lifecycle.rs"]
 mod pane_lifecycle;
+#[path = "pane_terminals/pane_option_rekey.rs"]
+mod pane_option_rekey;
 #[path = "pane_terminals/pane_outputs.rs"]
 mod pane_outputs;
 #[path = "pane_pipe.rs"]
@@ -71,6 +73,8 @@ pub(crate) use lifecycle_state::PaneLifecycleState;
 use marked_pane::MarkedPane;
 pub(crate) use pane_outputs::PaneExitMetadata;
 use pane_outputs::{AttachedSubmittedLine, PaneOutputSpawn, RemovedPaneOutputs};
+#[cfg(test)]
+pub(crate) use pane_pipe::active_pipe_child_count_for_test;
 use pane_pipe::PanePipeStore;
 use pane_terminal_store::PaneTerminalStore;
 #[cfg_attr(windows, allow(unused_imports))]

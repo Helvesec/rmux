@@ -85,22 +85,11 @@ impl Session {
         self.cwd = cwd;
     }
 
-    /// Records session activity at the current time.
-    pub fn touch_activity(&mut self) {
-        self.activity_at = current_unix_timestamp();
-        if let Some(window) = self.window_at_mut(self.active_window) {
-            window.touch_activity();
-        }
-    }
-
     /// Records that a client attached to the session at the current time.
     pub fn touch_attached(&mut self) {
         let now = current_unix_timestamp();
         self.activity_at = now;
         self.last_attached_at = Some(now);
-        if let Some(window) = self.window_at_mut(self.active_window) {
-            window.touch_activity();
-        }
     }
 
     /// Clones the session as a grouped peer with a fresh identity and timestamps.

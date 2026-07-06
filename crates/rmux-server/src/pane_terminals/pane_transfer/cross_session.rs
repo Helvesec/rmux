@@ -17,6 +17,8 @@ impl HandlerState {
     ) -> Result<SwapPaneResponse, RmuxError> {
         let source_session_name = source.session_name().clone();
         let target_session_name = target.session_name().clone();
+        let mut source_before_options = self.pane_option_slots_for_session(&source_session_name)?;
+        let mut target_before_options = self.pane_option_slots_for_session(&target_session_name)?;
         let previous_source_session = self
             .sessions
             .session(&source_session_name)
@@ -127,6 +129,27 @@ impl HandlerState {
             self.sync_pane_lifecycle_dimensions_for_session(&target_session_name);
         }
 
+        source_before_options.remove(&source_pane_id);
+        target_before_options.remove(&target_pane_id);
+        self.rekey_pane_options_after_session_change(&source_before_options, &source_session_name)?;
+        self.rekey_pane_options_after_session_change(&target_before_options, &target_session_name)?;
+        let source_final_target = pane_target_for_id(
+            self,
+            &target_session_name,
+            target.window_index(),
+            source_pane_id,
+        )?;
+        let target_final_target = pane_target_for_id(
+            self,
+            &source_session_name,
+            source.window_index(),
+            target_pane_id,
+        )?;
+        self.options.rekey_pane_overrides(&[
+            (source.clone(), Some(source_final_target)),
+            (target.clone(), Some(target_final_target)),
+        ])?;
+
         Ok(SwapPaneResponse { source, target })
     }
 
@@ -136,6 +159,8 @@ impl HandlerState {
     ) -> Result<JoinPaneResponse, RmuxError> {
         let source_session_name = request.source.session_name().clone();
         let target_session_name = request.target.session_name().clone();
+        let mut source_before_options = self.pane_option_slots_for_session(&source_session_name)?;
+        let target_before_options = self.pane_option_slots_for_session(&target_session_name)?;
         let previous_source_session = self
             .sessions
             .session(&source_session_name)
@@ -267,6 +292,26 @@ impl HandlerState {
             return Err(error);
         }
 
+        let moved_index = self
+            .sessions
+            .session(&target_session_name)
+            .and_then(|session| {
+                pane_index_for_id(session, request.target.window_index(), source_pane_id)
+            })
+            .ok_or_else(|| {
+                RmuxError::Server("moved pane disappeared after cross-session join-pane".to_owned())
+            })?;
+        let moved_target = PaneTarget::with_window(
+            target_session_name.clone(),
+            request.target.window_index(),
+            moved_index,
+        );
+        source_before_options.remove(&source_pane_id);
+        self.rekey_pane_options_after_session_change(&source_before_options, &source_session_name)?;
+        self.rekey_pane_options_after_session_change(&target_before_options, &target_session_name)?;
+        self.options
+            .transfer_pane_overrides(&request.source, &moved_target);
+
         if source_session_will_be_removed {
             if source_group_members_before.len() > 1 {
                 if let Some(source_session) = empty_source_session {
@@ -294,16 +339,6 @@ impl HandlerState {
             self.sync_pane_lifecycle_dimensions_for_session(&target_session_name);
         }
 
-        let moved_index = self
-            .sessions
-            .session(&target_session_name)
-            .and_then(|session| {
-                pane_index_for_id(session, request.target.window_index(), source_pane_id)
-            })
-            .ok_or_else(|| {
-                RmuxError::Server("moved pane disappeared after cross-session join-pane".to_owned())
-            })?;
-
         self.clear_marked_pane_if_id(source_pane_id);
         Ok(JoinPaneResponse {
             target: PaneTarget::with_window(
@@ -320,6 +355,9 @@ impl HandlerState {
         destination_session_name: SessionName,
     ) -> Result<BreakPaneResponse, RmuxError> {
         let source_session_name = request.source.session_name().clone();
+        let mut source_before_options = self.pane_option_slots_for_session(&source_session_name)?;
+        let destination_before_options =
+            self.pane_option_slots_for_session(&destination_session_name)?;
         let previous_source_session = self
             .sessions
             .session(&source_session_name)
@@ -451,6 +489,17 @@ impl HandlerState {
             return Err(error);
         }
 
+        let moved_target =
+            PaneTarget::with_window(destination_session_name.clone(), destination_index, 0);
+        source_before_options.remove(&source_pane_id);
+        self.rekey_pane_options_after_session_change(&source_before_options, &source_session_name)?;
+        self.rekey_pane_options_after_session_change(
+            &destination_before_options,
+            &destination_session_name,
+        )?;
+        self.options
+            .transfer_pane_overrides(&request.source, &moved_target);
+
         if source_session_will_be_removed {
             if source_group_members_before.len() > 1 {
                 if let Some(source_session) = empty_source_session {
@@ -507,6 +556,29 @@ impl HandlerState {
             self.sessions.insert_existing_session(previous_session)
         }
     }
+}
+
+fn pane_target_for_id(
+    state: &HandlerState,
+    session_name: &SessionName,
+    window_index: u32,
+    pane_id: rmux_core::PaneId,
+) -> Result<PaneTarget, RmuxError> {
+    let session = state
+        .sessions
+        .session(session_name)
+        .ok_or_else(|| session_not_found(session_name))?;
+    let pane_index = pane_index_for_id(session, window_index, pane_id).ok_or_else(|| {
+        RmuxError::Server(format!(
+            "pane {} disappeared from {session_name}:{window_index} after cross-session move",
+            pane_id.as_u32()
+        ))
+    })?;
+    Ok(PaneTarget::with_window(
+        session_name.clone(),
+        window_index,
+        pane_index,
+    ))
 }
 
 fn resize_two_sessions(

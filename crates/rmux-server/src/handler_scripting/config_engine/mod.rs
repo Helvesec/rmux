@@ -19,7 +19,7 @@ use super::source_files::LoadedSourceFile;
 
 pub(super) use diagnostics::config_error_lines;
 pub(super) use execute::{append_error_output, nonempty_stdout};
-pub(super) use request::{ConfigLoadOrigin, ConfigLoadRequest};
+pub(super) use request::ConfigLoadRequest;
 
 pub(super) async fn load(
     handler: &RequestHandler,
@@ -27,6 +27,6 @@ pub(super) async fn load(
 ) -> Result<LoadedSourceFile, RmuxError> {
     request.assert_boundary_invariants();
     handler
-        .load_source_file_command_inner(request.command, request.depth, request.origin)
+        .load_source_file_command_inner(request.command, request.depth)
         .await
 }

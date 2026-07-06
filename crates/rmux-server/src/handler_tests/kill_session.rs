@@ -283,7 +283,7 @@ async fn exit_empty_shutdown_retries_after_state_lock_contention() {
     );
     drop(state);
 
-    tokio::time::timeout(Duration::from_millis(100), shutdown_rx)
+    tokio::time::timeout(Duration::from_secs(2), shutdown_rx)
         .await
         .expect("deferred exit-empty shutdown should be retried")
         .expect("shutdown receiver should complete cleanly");

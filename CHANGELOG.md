@@ -30,9 +30,18 @@
 
 - Hardened Unix socket startup and cleanup, including bare relative `-S` paths,
   daemon churn, exit-empty behavior, and worktree socket hygiene.
+- Added RMUX-native SDK pane option APIs, pane-state event streams, and
+  best-effort pane foreground state behind explicit detached RPC capabilities.
+  The state stream uses an initial snapshot plus monotone long-poll revisions
+  for pane titles, pane-local options, foreground changes, and close events
+  without claiming tmux compatibility for these RMUX extensions.
 - Kept native Windows daemon upgrade, shell launch, queued quoting, input, Ctrl,
   mouse, and package smokes in the release gate so Windows regressions remain
   review-blocking.
+- Integrated the 0.8.1 Windows attach hardening into the 0.9.0 line, including
+  PowerShell profile-preserving shell startup, startup render recovery, lossless
+  attach overflow handling, and detached control delivery under terminal
+  backpressure.
 - Documented the detached RPC 0.9.0 wire policy as exact-versioned and added
   fuzz coverage for the detached frame decoder.
 - Locked SDK armed waits behind capabilities, including the Windows 250ms
@@ -211,22 +220,8 @@
 
 - Added panic-safe connection cleanup so subscriptions and SDK waits are removed
   even if a connection task unwinds.
-- Gated two-phase SDK wait armed acknowledgements behind an explicit
-  `sdk.waits.armed` capability and kept dropped SDK waits from blocking the
-  shared transport.
-- Hardened Windows Ctrl-C delivery for attached clients and `send-keys` so
-  foreground console programs such as Python and `ping.exe` receive native
-  interrupts while raw-mode console applications still receive Ctrl-C bytes.
-- Moved blocking Windows console attach writes behind a dedicated output queue
-  and cleared QuickEdit when entering raw mode so paused console output does not
-  freeze input forwarding.
-- Routed multi-token Windows `send-keys` sequences containing `C-c`, such as
-  `send-keys C-c Enter`, through the native Ctrl-C path instead of falling back
-  to a raw `0x03` byte.
 - Added a Unix archive installer that preserves the tiny/full `bin` and
   `libexec` layout and installs the public tiny binary last during upgrades.
-- Made `rmux claude install-skill` back up existing user skills before
-  replacing them, while refusing to overwrite symlinks.
 - Made connection subscription/wait cleanup tolerate poisoned cleanup locks.
 - Spawned popup waiters before popup readers so popup children are reaped even
   if reader setup fails.
@@ -242,30 +237,9 @@
 
 ### Compatibility
 
-- Matched tmux `source-file -n -v` behavior for implicit-target commands such
-  as `clear-history`, keeping parse-only diagnostics usable on public tmux
-  configurations.
-- Reported missing optional nested config files sourced through the tmux shim as
-  plain client messages instead of startup `config error:` diagnostics, matching
-  tmux-style fallback config workflows such as oh-my-tmux.
-- Matched tmux 3.4 missing-path `source-file` diagnostics (`<path>: No such
-  file or directory`) and let a later successful queued `run-shell` clear an
-  earlier non-zero source-file status.
-- Routed public clients launched from RMUX panes through RMUX-owned inherited
-  `$TMUX` socket paths, while still ignoring foreign tmux sockets, so nested
-  `rmux has-session` and `new-session -A` target the calling pane's server.
 - Restored sparse-map deserialization defaults for `NewSessionExtRequest` and
   related request types without changing the bincode wire layout.
 - Added a defensive `with-session` empty-command guard before lease creation.
-- Restored tmux 3.4-compatible binary boolean format semantics for `&&:` and
-  `||:`; use nested boolean formats for portable multi-operand conditions.
-- Matched tmux 3.4 expression-format arithmetic for empty operands, `0x`
-  integer literals, invalid `%` operators, and integer divide/modulo-by-zero
-  sentinel results.
-- Matched tmux expression-format overflow sentinels for the
-  `-9223372036854775808 / -1` integer edge case.
-- Matched tmux 3.4 substitution-format behavior for empty and zero-width
-  regex patterns, avoiding synthetic insertions that tmux leaves untouched.
 - Matched tmux control-mode escaping for DEL and fixed HEAD responses to omit
   bodies.
 - Corrected `input-buffer-size` validation and rejected bare non-boolean choice
@@ -276,58 +250,12 @@
   paths, including Windows Terminal rendering and input capabilities.
 - Improved SDK and CLI daemon startup diagnostics when no daemon binary can be
   found or a hidden daemon exits before creating its endpoint.
-- Matched tmux `resize-pane` precedence for repeated relative directions and
-  composed absolute `-x`/`-y` dimensions with later relative adjustments across
-  CLI, tiny, and `source-file` paths.
-- Matched tmux 3.4 `join-pane`/`move-pane` legacy `-p` handling: bare
-  `-p` reports `size missing`, while `-p`/`-p50` paired with `-l` is accepted
-  as a compatibility modifier and preserves the explicit `-l` size.
-- Matched tmux pane-transfer defaults across CLI and `source-file` paths:
-  `join-pane`, `move-pane`, and `swap-pane` now fall back from `{marked}` to
-  the current pane when `-s` is omitted, and same-window `join-pane`/`move-pane`
-  apply `-l` sizing to the same side of the split as tmux.
-- Preserved tmux `swap-pane -d` active-pane behavior when the active pane is
-  neither the source nor the target pane.
-- Aligned pane lifecycle hooks with tmux by firing `pane-exited` for natural
-  pane exits while no longer synthesizing it for `kill-pane`/`respawn-pane -k`,
-  and by avoiding synthetic `pane-focus-in`/`pane-focus-out` hooks on detached
-  `select-pane` changes.
-- Aligned stable pane-id SDK/Web kill and respawn paths with the CLI by no
-  longer synthesizing `pane-exited` for explicit `kill-pane` or
-  `respawn-pane -k` operations.
-- Preserved coalesced `pane-title-changed` notifications when title changes are
-  batched with activity or bell alerts for the same pane.
-- Parsed compact queued `set-hook`/`show-hooks` flag clusters such as `-ga` and
-  `-gpR` in tmux config/source-file paths.
-- Bumped the detached RPC frame envelope to wire version 3 and refreshed the
-  compatibility fixtures so stale v1/v2 frames are rejected explicitly. This is
-  an intentional 0.8 line boundary: restart 0.7.x daemons after upgrading, and
-  run 0.8 SDK/client binaries against 0.8 daemons.
-- Preserved pending `DoubleClick1Pane` dispatch when a later mouse event arrives
-  after the click timeout but before the async timer task runs.
-- Restored tmux 3.4 root mouse bindings for pager/alternate-screen copy
-  interactions by removing the non-tmux `alternate_on` branch from
-  `MouseDrag1Pane`, `MouseDown2Pane`, `WheelUpPane`, `DoubleClick1Pane`, and
-  `TripleClick1Pane`.
-- Parsed compact queued `display-message` clusters such as `-pt target` the same
-  way as tmux, fixing source-file and binding commands that combine print and
-  target flags.
-- Rejected extra `display-message` message operands in both CLI and queued
-  `source-file` paths instead of silently joining them.
-- Consumed bracketed paste while a pane is in copy-mode instead of leaking the
-  pasted payload into the underlying PTY.
 
 ### CI
 
-- Bumped release-facing versions to `0.8.0` across Cargo workspace metadata,
+- Bumped release-facing versions to `0.7.1` across Cargo workspace metadata,
   `Cargo.lock`, the manpage, snap metadata, README download links, and localized
   README files.
-- Serialized the Windows attach/control-key integration probe group under
-  nextest and extended the Windows Ctrl matrix smoke script to exercise
-  multi-token `send-keys C-c Enter`.
-- Hardened the Windows Ctrl matrix `send-keys` harness so single-token controls
-  such as `C-a` and `Escape` are passed as native command arguments rather than
-  as literal probe text.
 - Added a Windows package smoke that exercises portable alias fallback, PATH
   resolution, and daemon startup from a WinGet-like Links layout.
 - Exposed `rmux-daemon` in the Scoop manifest and expanded package-manager
@@ -336,8 +264,6 @@
   before exercising daemon startup.
 - Extended Unix archive verification to install the archive into a temporary
   prefix and smoke the installed `bin/rmux` through its packaged helper.
-- Added release-gate coverage for `rmux-server --lib` and SDK wait-cancellation
-  regressions so deterministic red tests cannot pass through review-only gates.
 
 ## 0.7.0
 

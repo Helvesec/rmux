@@ -102,10 +102,12 @@ pub use events::{
 };
 pub use extract::{CollectedPaneOutput, PaneTextMatch};
 pub use handles::{
-    CleanupPolicy, LeaseState, NewWindowBuilder, OwnedSession, OwnedSessionBuilder,
-    OwnedSessionSignalHandlers, Pane, PaneCapture, PaneCaptureBuilder, PaneCloseOutcome,
-    PaneRespawnOptions, PaneSpawnBuilder, PaneSplitBuilder, Rmux, RmuxBuilder, Session,
-    SplitDirection, Window, WindowCloseOutcome, WindowPane,
+    CleanupPolicy, ForegroundSource, ForegroundSources, ForegroundState, LeaseState,
+    NewWindowBuilder, OwnedSession, OwnedSessionBuilder, OwnedSessionSignalHandlers, Pane,
+    PaneCapture, PaneCaptureBuilder, PaneCloseOutcome, PaneOptionMutation, PaneRespawnOptions,
+    PaneSpawnBuilder, PaneSplitBuilder, PaneStateEvent, PaneStateEventStream,
+    PaneStateEventsOptions, PaneStateOption, Rmux, RmuxBuilder, Session, SplitDirection, Window,
+    WindowCloseOutcome, WindowPane,
 };
 pub use info::{InfoSnapshot, PaneExitState, PaneInfo, PaneProcessState, SessionInfo, WindowInfo};
 pub use input::{

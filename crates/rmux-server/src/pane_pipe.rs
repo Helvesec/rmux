@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::process::Child;
 use std::process::Stdio;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 #[cfg(windows)]
 use std::sync::Mutex as StdMutex;
 use std::sync::{
@@ -18,9 +20,33 @@ use rmux_pty::PtyMaster;
 use tokio::sync::{mpsc, watch};
 
 const PIPE_CHILD_POLL_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(test)]
+static ACTIVE_PIPE_CHILDREN: AtomicUsize = AtomicUsize::new(0);
 
 use crate::pane_io::{PaneOutputReceiver, PaneOutputSender};
 use crate::terminal::TerminalProfile;
+
+#[cfg(test)]
+pub(crate) fn active_pipe_child_count_for_test() -> usize {
+    ACTIVE_PIPE_CHILDREN.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+fn mark_pipe_child_started_for_test() {
+    ACTIVE_PIPE_CHILDREN.fetch_add(1, Ordering::SeqCst);
+}
+
+#[cfg(not(test))]
+fn mark_pipe_child_started_for_test() {}
+
+struct ActivePipeChildGuard;
+
+impl Drop for ActivePipeChildGuard {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        ACTIVE_PIPE_CHILDREN.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct PanePipeStore {
@@ -258,6 +284,7 @@ impl ActivePanePipe {
         let mut child = child.spawn().map_err(|error| {
             RmuxError::Server(format!("failed to spawn pipe-pane command: {error}"))
         })?;
+        mark_pipe_child_started_for_test();
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -437,6 +464,7 @@ where
 }
 
 fn wait_for_pipe_child(mut child: Child, stop_flag: Arc<AtomicBool>) {
+    let _active_child = ActivePipeChildGuard;
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             let _ = child.kill();

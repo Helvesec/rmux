@@ -562,6 +562,9 @@ async fn new_window_does_not_mutate_the_session_when_existing_terminals_are_miss
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     create_session(&handler, "alpha").await;
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::with_window(alpha.clone(), 0, 0))
+        .await;
 
     let removed_pane_id = {
         let mut state = handler.state.lock().await;

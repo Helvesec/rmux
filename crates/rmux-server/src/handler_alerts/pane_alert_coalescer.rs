@@ -67,6 +67,7 @@ mod tests {
             pane_id: PaneId::new(pane_id),
             bell_count,
             title_changed: false,
+            title_change: None,
             clipboard_set: false,
             queue_activity_alert: true,
             generation,
@@ -76,6 +77,7 @@ mod tests {
     fn title_event(pane_id: u32, generation: Option<u64>) -> PaneAlertEvent {
         PaneAlertEvent {
             title_changed: true,
+            title_change: None,
             queue_activity_alert: false,
             ..alert_event(pane_id, generation, 0)
         }

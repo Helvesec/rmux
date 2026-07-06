@@ -318,7 +318,8 @@ impl HandlerState {
             .session(&session_name)
             .cloned()
             .ok_or_else(|| session_not_found(&session_name))?;
-        let (hook_context, pane_id, remove_session, removed_option_targets) = {
+        let before_pane_options = self.pane_option_slots_for_session(&session_name)?;
+        let (hook_context, pane_id, remove_session) = {
             let window = previous_session
                 .window_at(target.window_index())
                 .ok_or_else(|| {
@@ -340,29 +341,12 @@ impl HandlerState {
                 window_id: window.id().as_u32(),
                 window_name: window.name().unwrap_or_default().to_owned(),
             };
-            let removed_option_targets = if kill_all_except {
-                window
-                    .panes()
-                    .iter()
-                    .filter(|pane| pane.index() != target.pane_index())
-                    .map(|pane| {
-                        PaneTarget::with_window(
-                            session_name.clone(),
-                            target.window_index(),
-                            pane.index(),
-                        )
-                    })
-                    .collect()
-            } else {
-                vec![target.clone()]
-            };
             (
                 hook_context,
                 pane_id,
                 !kill_all_except
                     && previous_session.windows().len() == 1
                     && window.pane_count() == 1,
-                removed_option_targets,
             )
         };
         if remove_session {
@@ -440,6 +424,7 @@ impl HandlerState {
 
         self.synchronize_session_group_from(&session_name)?;
         self.sync_pane_lifecycle_dimensions_for_session(&session_name);
+        self.rekey_pane_options_after_session_change(&before_pane_options, &session_name)?;
 
         if committed_outcome.window_destroyed() {
             let _ = self
@@ -448,10 +433,6 @@ impl HandlerState {
                     session_name.clone(),
                     target.window_index(),
                 ));
-        } else {
-            for removed_target in removed_option_targets {
-                let _ = self.options.remove_pane(&removed_target);
-            }
         }
 
         Ok(KilledPaneResult {

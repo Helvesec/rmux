@@ -106,7 +106,7 @@ fn default_store_keeps_prefix_meta_layout_bindings() {
 fn default_store_matches_tmux37_lot6_root_and_copy_bindings() {
     let store = KeyBindingStore::default();
     for (table, key, expected) in [
-        ("root", "MouseDown1Status", "switch-client -t ="),
+        ("root", "MouseDown1Status", "switch-client -t="),
         (
             "root",
             "WheelUpPane",
@@ -117,24 +117,24 @@ fn default_store_matches_tmux37_lot6_root_and_copy_bindings() {
         (
             "root",
             "MouseDown1ScrollbarUp",
-            r##"if-shell -F -t = "#{pane_in_mode}" { send-keys -X page-up } { copy-mode -u }"##,
+            r##"if-shell -F -t= "#{pane_in_mode}" { send-keys -X page-up } { copy-mode -u }"##,
         ),
         (
             "root",
             "MouseDown1ScrollbarDown",
-            r##"if-shell -F -t = "#{pane_in_mode}" { send-keys -X page-down } { copy-mode -d }"##,
+            r##"if-shell -F -t= "#{pane_in_mode}" { send-keys -X page-down } { copy-mode -d }"##,
         ),
         (
             "root",
             "MouseDrag1ScrollbarSlider",
-            r##"if-shell -F -t = "#{pane_in_mode}" { send-keys -X scroll-to-mouse } { copy-mode -S }"##,
+            r##"if-shell -F -t= "#{pane_in_mode}" { send-keys -X scroll-to-mouse } { copy-mode -S }"##,
         ),
         ("root", "MouseDown1Control8", "resize-pane -Z"),
         ("root", "MouseDown1Border", "select-pane -M"),
         (
             "root",
             "MouseDown1Control9",
-            r#"display-menu -O -T "Kill pane #{pane_index}?" -t = -x M -y M Yes y { kill-pane -t = } No n {  }"#,
+            r#"display-menu -O -T "Kill pane #{pane_index}?" -t= -xM -yM Yes y { kill-pane -t= } No n {  }"#,
         ),
         ("copy-mode", "C-l", "send-keys -X recentre-top-bottom"),
         ("copy-mode", "M-l", "send-keys -X cursor-centre-horizontal"),
@@ -146,38 +146,48 @@ fn default_store_matches_tmux37_lot6_root_and_copy_bindings() {
             .into_iter()
             .find(|binding| binding.key_string() == key)
             .unwrap_or_else(|| panic!("missing default {table} binding for {key}"));
-        assert_eq!(binding.command_string(), expected, "{table} {key}");
+        assert_eq!(
+            binding.binding().commands().to_tmux_string(),
+            expected,
+            "{table} {key}"
+        );
     }
 }
 
 #[test]
 fn default_store_matches_tmux37_status_and_pane_menu_rows() {
     let store = KeyBindingStore::default();
-    let root_bindings = store.list_bindings(Some("root"), KeyBindingSortOrder::Key, false);
-    for key in ["MouseDown3StatusLeft", "M-MouseDown3StatusLeft"] {
-        let binding = root_bindings
-            .iter()
-            .find(|binding| binding.key_string() == key)
-            .unwrap_or_else(|| panic!("missing default root binding for {key}"));
-        assert!(
-            binding.command_string().contains("Rename r"),
-            "{key} should use tmux 3.7b rename shortcut"
-        );
-        assert!(
-            binding.command_string().contains("Detach d"),
-            "{key} should include tmux 3.7b detach entry"
-        );
-    }
-
-    for (table, key) in [("prefix", ">"), ("root", "MouseDown3Pane")] {
+    for (table, key, expected) in [
+        (
+            "root",
+            "MouseDown3StatusLeft",
+            r##"display-menu -t= -xM -yW -T "#[align=centre]#{session_name}" Next n { switch-client -n } Previous p { switch-client -p } '' Renumber N { move-window -r } Rename r { command-prompt -I "#S" { rename-session -- "%%" } } Detach d { detach-client } '' "New Session" s { new-session } "New Window" w { new-window }"##,
+        ),
+        (
+            "root",
+            "M-MouseDown3StatusLeft",
+            r##"display-menu -t= -xM -yW -T "#[align=centre]#{session_name}" Next n { switch-client -n } Previous p { switch-client -p } '' Renumber N { move-window -r } Rename r { command-prompt -I "#S" { rename-session -- "%%" } } Detach d { detach-client } '' "New Session" s { new-session } "New Window" w { new-window }"##,
+        ),
+        (
+            "prefix",
+            ">",
+            r##"display-menu -xP -yP -T "#[align=centre]#{pane_index} (#{pane_id})" "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Top,}" < { send-keys -X history-top } "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Bottom,}" > { send-keys -X history-bottom } '' "#{?#{&&:#{buffer_size},#{!:#{pane_in_mode}}},Paste #[underscore]#{=/9/...:buffer_sample},}" p { paste-buffer } '' "#{?mouse_word,Search For #[underscore]#{=/9/...:mouse_word},}" C-r { if-shell -F "#{?#{m/r:(copy|view)-mode,#{pane_mode}},0,1}" "copy-mode -t=" ; send-keys -Xt= search-backward -- "#{q:mouse_word}" } "#{?mouse_word,Type #[underscore]#{=/9/...:mouse_word},}" C-y { copy-mode -q ; send-keys -l -- "#{q:mouse_word}" } "#{?mouse_word,Copy #[underscore]#{=/9/...:mouse_word},}" c { copy-mode -q ; set-buffer -- "#{q:mouse_word}" } "#{?mouse_line,Copy Line,}" l { copy-mode -q ; set-buffer -- "#{q:mouse_line}" } '' "#{?mouse_hyperlink,Type #[underscore]#{=/9/...:mouse_hyperlink},}" C-h { copy-mode -q ; send-keys -l -- "#{q:mouse_hyperlink}" } "#{?mouse_hyperlink,Copy #[underscore]#{=/9/...:mouse_hyperlink},}" h { copy-mode -q ; set-buffer -- "#{q:mouse_hyperlink}" } '' "Horizontal Split" h { split-window -h } "Vertical Split" v { split-window -v } '' "#{?#{>:#{window_panes},1},,-}Swap Up" u { swap-pane -U } "#{?#{>:#{window_panes},1},,-}Swap Down" d { swap-pane -D } "#{?pane_marked_set,,-}Swap Marked" s { swap-pane } '' Kill X { kill-pane } Respawn R { respawn-pane -k } "#{?pane_marked,Unmark,Mark}" m { select-pane -m } "#{?#{>:#{window_panes},1},,-}#{?window_zoomed_flag,Unzoom,Zoom}" z { resize-pane -Z }"##,
+        ),
+        (
+            "root",
+            "MouseDown3Pane",
+            r##"if-shell -Ft= "#{||:#{mouse_any_flag},#{&&:#{pane_in_mode},#{?#{m/r:(copy|view)-mode,#{pane_mode}},0,1}}}" { select-pane -t= ; send-keys -M } { display-menu -t= -xM -yM -T "#[align=centre]#{pane_index} (#{pane_id})" "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Top,}" < { send-keys -X history-top } "#{?#{m/r:(copy|view)-mode,#{pane_mode}},Go To Bottom,}" > { send-keys -X history-bottom } '' "#{?#{&&:#{buffer_size},#{!:#{pane_in_mode}}},Paste #[underscore]#{=/9/...:buffer_sample},}" p { paste-buffer } '' "#{?mouse_word,Search For #[underscore]#{=/9/...:mouse_word},}" C-r { if-shell -F "#{?#{m/r:(copy|view)-mode,#{pane_mode}},0,1}" "copy-mode -t=" ; send-keys -Xt= search-backward -- "#{q:mouse_word}" } "#{?mouse_word,Type #[underscore]#{=/9/...:mouse_word},}" C-y { copy-mode -q ; send-keys -l -- "#{q:mouse_word}" } "#{?mouse_word,Copy #[underscore]#{=/9/...:mouse_word},}" c { copy-mode -q ; set-buffer -- "#{q:mouse_word}" } "#{?mouse_line,Copy Line,}" l { copy-mode -q ; set-buffer -- "#{q:mouse_line}" } '' "#{?mouse_hyperlink,Type #[underscore]#{=/9/...:mouse_hyperlink},}" C-h { copy-mode -q ; send-keys -l -- "#{q:mouse_hyperlink}" } "#{?mouse_hyperlink,Copy #[underscore]#{=/9/...:mouse_hyperlink},}" h { copy-mode -q ; set-buffer -- "#{q:mouse_hyperlink}" } '' "Horizontal Split" h { split-window -h } "Vertical Split" v { split-window -v } '' "#{?#{>:#{window_panes},1},,-}Swap Up" u { swap-pane -U } "#{?#{>:#{window_panes},1},,-}Swap Down" d { swap-pane -D } "#{?pane_marked_set,,-}Swap Marked" s { swap-pane } '' Kill X { kill-pane } Respawn R { respawn-pane -k } "#{?pane_marked,Unmark,Mark}" m { select-pane -m } "#{?#{>:#{window_panes},1},,-}#{?window_zoomed_flag,Unzoom,Zoom}" z { resize-pane -Z } }"##,
+        ),
+    ] {
         let binding = store
             .list_bindings(Some(table), KeyBindingSortOrder::Key, false)
             .into_iter()
             .find(|binding| binding.key_string() == key)
             .unwrap_or_else(|| panic!("missing default {table} binding for {key}"));
-        assert!(
-            binding.command_string().contains("Paste"),
-            "{table} {key} should include the tmux 3.7b paste menu entry"
+        assert_eq!(
+            binding.binding().commands().to_tmux_string(),
+            expected,
+            "{table} {key}"
         );
     }
 }

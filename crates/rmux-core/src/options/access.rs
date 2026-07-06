@@ -438,6 +438,31 @@ impl OptionStore {
             .map(str::to_owned)
     }
 
+    /// Returns the exact explicit value for a tmux-style option name at a scope.
+    pub fn explicit_value_by_name(
+        &self,
+        scope: &OptionScopeSelector,
+        name: &str,
+    ) -> Result<(String, Option<String>), rmux_proto::RmuxError> {
+        let query = resolve_option_name(name)?;
+        Ok((
+            query.canonical_name().to_owned(),
+            self.explicit_value_for_scope(scope, &query),
+        ))
+    }
+
+    /// Returns all explicit option entries stored exactly at a scope.
+    pub fn explicit_entries_for_scope(&self, scope: &OptionScopeSelector) -> Vec<(String, String)> {
+        self.node_for_exact_scope(scope)
+            .map(|node| {
+                node.entries
+                    .values()
+                    .map(|entry| (entry.name.clone(), entry.rendered().to_owned()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub(super) fn default_entry_for_scope(
         &self,
         query: &OptionQuery,

@@ -204,7 +204,7 @@ pub(crate) const DEFAULT_BINDING_STRINGS: &[&str] = &[
     ),
     "bind -n MouseDown1Pane { select-pane -t=; send -M }",
     "bind -n MouseDrag1Pane { if -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send -M } { copy-mode -M } }",
-    "bind -n WheelUpPane { if -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send -M } { copy-mode -e } }",
+    "bind -n WheelUpPane { if -F '#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}' { send -M } { copy-mode -e } }",
     "bind -n MouseDown2Pane { select-pane -t=; if -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send -M } { paste -p } }",
     "bind -n DoubleClick1Pane { select-pane -t=; if -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send -M } { copy-mode -Ht=; send -Xt= select-word; run -d0.3; send -Xt= copy-pipe-and-cancel } }",
     "bind -n TripleClick1Pane { select-pane -t=; if -F '#{||:#{pane_in_mode},#{mouse_any_flag}}' { send -M } { copy-mode -Ht=; send -Xt= select-line; run -d0.3; send -Xt= copy-pipe-and-cancel } }",

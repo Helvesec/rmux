@@ -2,13 +2,16 @@ use std::time::Duration;
 
 use rmux_core::events::{OutputCursorItem, PaneOutputSubscriptionKey};
 use rmux_core::LifecycleEvent;
-use rmux_proto::{OptionName, PaneTarget, RmuxError, SessionId, Target, WindowTarget};
+use rmux_proto::{
+    OptionName, PaneStateClosedReason, PaneTarget, RmuxError, SessionId, Target, WindowTarget,
+};
 
 use super::super::{
     prepare_lifecycle_event, scripting_support::format_context_for_target, RequestHandler,
 };
 use crate::format_runtime::render_runtime_template;
 use crate::pane_io::{PaneExitCallback, PaneExitEvent, PaneOutputReceiver, PaneOutputSender};
+use crate::pane_state_journal::PaneStateChange;
 use crate::pane_terminal_lookup::missing_pane_terminal;
 use crate::pane_terminals::{session_not_found, HandlerState, PaneExitMetadata};
 use tracing::warn;
@@ -317,6 +320,13 @@ impl RequestHandler {
                     )
                     .await;
                 }
+                self.record_pane_state_change(
+                    event.pane_id,
+                    event.generation,
+                    PaneStateChange::Closed {
+                        reason: PaneStateClosedReason::DiedKept,
+                    },
+                );
                 self.emit_prepared(pane_event);
                 let session_names = if self.attached_count(target.session_name()).await == 0 {
                     let mut state = self.state.lock().await;
@@ -361,6 +371,13 @@ impl RequestHandler {
                 self.forget_pane_snapshot_coalescers(&removed_pane_ids);
                 self.cleanup_exited_pane_output_subscription(&runtime_session_name, event.pane_id)
                     .await;
+                self.record_pane_state_change(
+                    event.pane_id,
+                    event.generation,
+                    PaneStateChange::Closed {
+                        reason: PaneStateClosedReason::Exited,
+                    },
+                );
                 self.emit_prepared(pane_event);
                 if let Some(window_event) = window_event {
                     self.emit_prepared(window_event);
@@ -402,6 +419,13 @@ impl RequestHandler {
                 self.forget_pane_snapshot_coalescers(&removed_pane_ids);
                 self.cleanup_exited_pane_output_subscription(&runtime_session_name, event.pane_id)
                     .await;
+                self.record_pane_state_change(
+                    event.pane_id,
+                    event.generation,
+                    PaneStateChange::Closed {
+                        reason: PaneStateClosedReason::Exited,
+                    },
+                );
                 self.exit_attached_session(&session_name).await;
                 self.cancel_session_silence_timers(&session_name).await;
                 self.emit_prepared(pane_event);

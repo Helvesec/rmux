@@ -218,13 +218,12 @@ impl HandlerState {
         &mut self,
         target: &PaneTarget,
         title: &str,
-    ) -> Result<(), RmuxError> {
+    ) -> Result<Option<(String, String)>, RmuxError> {
         let transcript = self.transcript_handle(target)?;
         let mut transcript = transcript
             .lock()
             .expect("pane transcript mutex must not be poisoned");
-        transcript.set_title(title);
-        Ok(())
+        Ok(transcript.set_title(title))
     }
 
     pub(crate) fn refresh_transcript_limits_for_scope(

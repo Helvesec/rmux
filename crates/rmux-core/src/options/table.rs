@@ -52,6 +52,10 @@ const STATUS_FORMAT0: &str = "#[align=left range=left #{E:status-left-style}]#[p
 const STATUS_FORMAT1: &str = "#[align=left]#{R: ,#{n:#{session_name}}}P: #[norange default]#[list=on align=#{status-justify}]#[list=left-marker]<#[list=right-marker]>#[list=on]#{P:#[range=pane|#{pane_id} #{E:pane-status-style}]#[push-default]#{T:window-pane-status-format}#[pop-default]#[norange list=on default]  ,#[range=pane|#{pane_id} list=focus #{?#{!=:#{E:pane-status-current-style},default},#{E:pane-status-current-style},#{E:pane-status-style}}]#[push-default]#{T:window-pane-current-status-format}#[pop-default]#[norange list=on default] }";
 const STATUS_FORMAT2: &str = "#[align=left]#{R: ,#{n:#{session_name}}}S: #[norange default]#[list=on align=#{status-justify}]#[list=left-marker]<#[list=right-marker]>#[list=on]#{S:#[range=session|#{session_id} #{E:session-status-style}]#[push-default]#S#{session_alert}#[pop-default]#[norange list=on default]  ,#[range=session|#{session_id} list=focus #{?#{!=:#{E:session-status-current-style},default},#{E:session-status-current-style},#{E:session-status-style}}]#[push-default]#S*#{session_alert}#[pop-default]#[norange list=on default] }";
 const STATUS_FORMAT_DEFAULT: &[&str] = &[STATUS_FORMAT0, STATUS_FORMAT1, STATUS_FORMAT2];
+#[cfg(windows)]
+const STATUS_RIGHT_DEFAULT: &str =
+    "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}\"#{=21:host_short}\" %H:%M %d-%b-%y";
+#[cfg(not(windows))]
 const STATUS_RIGHT_DEFAULT: &str =
     "#{?window_bigger,[#{window_offset_x}#,#{window_offset_y}] ,}\"#{=21:pane_title}\" %H:%M %d-%b-%y";
 #[cfg(unix)]

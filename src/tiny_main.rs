@@ -15,12 +15,10 @@ use rmux_client::attach_terminal_with_initial_bytes_and_resize_geometry;
 #[cfg(windows)]
 use rmux_client::attach_terminal_with_initial_bytes_and_windows_console_key;
 use rmux_client::{
-    connect, ensure_server_running_with_config, resolve_socket_path,
+    connect, connect_or_absent, ensure_server_running_with_config, resolve_socket_path,
     resolve_tmux_compatible_socket_path, AttachTransition, AutoStartConfig, ClientError,
-    Connection, StartServerError,
+    ConnectResult, Connection, StartServerError,
 };
-#[cfg(not(windows))]
-use rmux_client::{connect_or_absent, ConnectResult};
 use rmux_core::formats::{DEFAULT_LIST_PANES_ALL_FORMAT, DEFAULT_LIST_PANES_WINDOW_FORMAT};
 use rmux_proto::request::{
     AttachSessionExt2Request, AttachSessionExt3Request, DisplayMessageRequest, KillSessionRequest,
@@ -30,7 +28,7 @@ use rmux_proto::{
     CapturePaneTargetActionRequest, JoinPaneRequest, ListSessionsRequest, Request,
     ResizePaneTargetActionRequest, Response, RmuxError, SetOptionMode, SourceFileResponse,
     SplitDirection, SplitWindowTargetActionRequest, CAPABILITY_ATTACH_RENDER,
-    CAPABILITY_ATTACH_RESIZE_GEOMETRY,
+    CAPABILITY_ATTACH_RESIZE_GEOMETRY, RMUX_WIRE_VERSION,
 };
 #[cfg(windows)]
 use rmux_proto::{CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY, CAPABILITY_DAEMON_STATUS};
@@ -980,7 +978,12 @@ fn run_kill_server(socket_path: &Path) -> Result<i32, String> {
     match probe_kill_server_compatible(&mut connection) {
         Ok(()) => {}
         Err(error) if kill_server_connection_closed(&error) => return Ok(0),
-        Err(error) => return Err(error.to_string()),
+        Err(error) => {
+            if let Some(wire_version) = legacy_shutdown_fallback_wire_version(&error) {
+                return run_legacy_wire_kill_server(socket_path, wire_version);
+            }
+            return Err(error.to_string());
+        }
     }
     match connection.kill_server_after_write() {
         Ok(()) => Ok(0),
@@ -1009,10 +1012,13 @@ fn run_kill_server(socket_path: &Path) -> Result<i32, String> {
             wait_for_killed_server_socket_cleanup(socket_path);
             Ok(0)
         }
-        Err(error) if legacy_wire_v1_fallback_applies(&error) => {
-            run_legacy_wire_v1_kill_server(socket_path)
+        Err(error) => {
+            if let Some(wire_version) = legacy_shutdown_fallback_wire_version(&error) {
+                run_legacy_wire_kill_server(socket_path, wire_version)
+            } else {
+                Err(error.to_string())
+            }
         }
-        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -1354,8 +1360,7 @@ fn write_source_file_success_response(response: SourceFileResponse) -> Result<i3
     Ok(response.exit_status().unwrap_or(0))
 }
 
-#[cfg(not(windows))]
-fn run_legacy_wire_v1_kill_server(socket_path: &Path) -> Result<i32, String> {
+fn run_legacy_wire_kill_server(socket_path: &Path, wire_version: u32) -> Result<i32, String> {
     let mut connection =
         match connect_or_absent(socket_path).map_err(|error| client_error(socket_path, error))? {
             ConnectResult::Connected(connection) => connection,
@@ -1365,7 +1370,7 @@ fn run_legacy_wire_v1_kill_server(socket_path: &Path) -> Result<i32, String> {
             }
         };
 
-    match connection.kill_server_legacy_wire(1) {
+    match connection.kill_server_legacy_wire(wire_version) {
         Ok(()) => {
             wait_for_killed_server_socket_cleanup(socket_path);
             Ok(0)
@@ -1392,12 +1397,15 @@ fn kill_server_connection_closed(error: &ClientError) -> bool {
         )
 }
 
-#[cfg(not(windows))]
-fn legacy_wire_v1_fallback_applies(error: &ClientError) -> bool {
-    matches!(
-        error,
-        ClientError::Protocol(RmuxError::UnsupportedWireVersion { got, .. }) if *got <= 1
-    )
+fn legacy_shutdown_fallback_wire_version(error: &ClientError) -> Option<u32> {
+    match error {
+        ClientError::Protocol(RmuxError::UnsupportedWireVersion { got, .. })
+            if (1..RMUX_WIRE_VERSION).contains(got) =>
+        {
+            Some(*got)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1435,7 +1443,7 @@ fn shell_quote_path(path: &Path) -> String {
 
     #[cfg(windows)]
     {
-        return format!("\"{}\"", text.replace('"', "\"\""));
+        format!("\"{}\"", text.replace('"', "\"\""))
     }
     #[cfg(not(windows))]
     format!("'{}'", text.replace('\'', "'\\''"))

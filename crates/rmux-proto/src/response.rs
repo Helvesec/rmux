@@ -36,13 +36,17 @@ pub use window::{
 #[path = "response/pane.rs"]
 mod pane;
 pub use pane::{
-    BreakPaneResponse, DisplayPanesResponse, JoinPaneResponse, KillPaneResponse, LastPaneResponse,
-    ListPanesResponse, MovePaneResponse, PaneBroadcastInputFailure, PaneBroadcastInputResponse,
-    PaneBroadcastInputSuccess, PaneOutputCursor, PaneOutputCursorResponse, PaneOutputEvent,
+    BreakPaneResponse, DisplayPanesResponse, ForegroundFieldSource, ForegroundSourcesDto,
+    ForegroundStateDto, JoinPaneResponse, KillPaneResponse, LastPaneResponse, ListPanesResponse,
+    MovePaneResponse, PaneBroadcastInputFailure, PaneBroadcastInputResponse,
+    PaneBroadcastInputSuccess, PaneForegroundStateResponse, PaneOptionEntry, PaneOptionGetResponse,
+    PaneOptionSetResponse, PaneOutputCursor, PaneOutputCursorResponse, PaneOutputEvent,
     PaneOutputLagNotice, PaneOutputLagResponse, PaneRecentOutput, PaneSnapshotCell,
-    PaneSnapshotCursor, PaneSnapshotResponse, PipePaneResponse, ResizePaneResponse,
-    RespawnPaneResponse, SelectPaneResponse, SendKeysResponse, SplitWindowResponse,
-    SubscribePaneOutputResponse, SwapPaneResponse, UnsubscribePaneOutputResponse,
+    PaneSnapshotCursor, PaneSnapshotResponse, PaneStateClosedReason, PaneStateCursorResponse,
+    PaneStateEventDto, PaneStateLagResponse, PaneStateSnapshot, PipePaneResponse,
+    ResizePaneResponse, RespawnPaneResponse, SelectPaneResponse, SendKeysResponse,
+    SplitWindowResponse, SubscribePaneOutputResponse, SubscribePaneStateResponse, SwapPaneResponse,
+    UnsubscribePaneOutputResponse, UnsubscribePaneStateResponse,
 };
 
 #[path = "response/client.rs"]
@@ -265,6 +269,20 @@ pub enum Response {
     ShutdownIfIdle(ShutdownIfIdleResponse),
     /// Success payload for browser-visible pane sharing.
     WebShare(Box<WebShareResponse>),
+    /// Success payload for SDK pane option mutation.
+    PaneOptionSet(Box<PaneOptionSetResponse>),
+    /// Success payload for SDK pane option lookup.
+    PaneOptionGet(PaneOptionGetResponse),
+    /// Success payload for SDK pane-state subscription.
+    SubscribePaneState(Box<SubscribePaneStateResponse>),
+    /// Success payload for SDK pane-state cursor.
+    PaneStateCursor(PaneStateCursorResponse),
+    /// Lag notice for SDK pane-state cursor.
+    PaneStateLag(Box<PaneStateLagResponse>),
+    /// Success payload for SDK pane-state unsubscription.
+    UnsubscribePaneState(UnsubscribePaneStateResponse),
+    /// Success payload for SDK pane foreground-state lookup.
+    PaneForegroundState(Box<PaneForegroundStateResponse>),
 }
 
 impl Response {
@@ -358,6 +376,13 @@ impl Response {
             Self::SdkWaitForOutput(_) => "sdk-wait-output",
             Self::CancelSdkWait(_) => "cancel-sdk-wait",
             Self::PaneBroadcastInput(_) => "send-keys",
+            Self::PaneOptionSet(_) => "pane-option-set",
+            Self::PaneOptionGet(_) => "pane-option-get",
+            Self::SubscribePaneState(_) => "subscribe-pane-state",
+            Self::PaneStateCursor(_) => "pane-state-cursor",
+            Self::PaneStateLag(_) => "pane-state-lag",
+            Self::UnsubscribePaneState(_) => "unsubscribe-pane-state",
+            Self::PaneForegroundState(_) => "pane-foreground-state",
             Self::CreateSessionLease(_) => "create-session-lease",
             Self::RenewSessionLease(_) => "renew-session-lease",
             Self::ReleaseSessionLease(_) => "release-session-lease",
@@ -413,6 +438,13 @@ impl Response {
             | Self::SdkWaitForOutput(_)
             | Self::CancelSdkWait(_)
             | Self::PaneBroadcastInput(_)
+            | Self::PaneOptionSet(_)
+            | Self::PaneOptionGet(_)
+            | Self::SubscribePaneState(_)
+            | Self::PaneStateCursor(_)
+            | Self::PaneStateLag(_)
+            | Self::UnsubscribePaneState(_)
+            | Self::PaneForegroundState(_)
             | Self::CreateSessionLease(_)
             | Self::RenewSessionLease(_)
             | Self::ReleaseSessionLease(_)
@@ -1101,6 +1133,9 @@ mod tests {
     fn pr6g_response_boxing_keeps_response_size_bounded() {
         assert_eq!(size_of::<Box<WebShareResponse>>(), 8);
         assert_eq!(size_of::<Box<PaneOutputLagResponse>>(), 8);
+        assert_eq!(size_of::<Box<PaneOptionSetResponse>>(), 8);
+        assert_eq!(size_of::<Box<SubscribePaneStateResponse>>(), 8);
+        assert_eq!(size_of::<Box<PaneForegroundStateResponse>>(), 8);
         assert_eq!(
             size_of::<Response>(),
             72,
@@ -1113,6 +1148,18 @@ mod tests {
         assert!(
             size_of::<PaneOutputLagResponse>() > size_of::<Response>(),
             "PaneOutputLagResponse must remain boxed while it is larger than Response"
+        );
+        assert!(
+            size_of::<PaneOptionSetResponse>() > size_of::<Response>(),
+            "PaneOptionSetResponse must remain boxed while it is larger than Response"
+        );
+        assert!(
+            size_of::<SubscribePaneStateResponse>() > size_of::<Response>(),
+            "SubscribePaneStateResponse must remain boxed while it is larger than Response"
+        );
+        assert!(
+            size_of::<PaneForegroundStateResponse>() > size_of::<Response>(),
+            "PaneForegroundStateResponse must remain boxed while it is larger than Response"
         );
     }
 

@@ -12,6 +12,13 @@ use crate::handler_support::{ensure_option_scope_exists, ensure_scope_session_ex
 use super::target_support::target_for_option_scope;
 use super::{attach_support::option_affects_attached_rendering, RequestHandler};
 
+#[path = "handler_options/pane_sdk.rs"]
+mod pane_sdk;
+#[path = "handler_options/pane_state_events.rs"]
+mod pane_state_events;
+
+use pane_state_events::pane_option_events_for_outcome;
+
 impl RequestHandler {
     pub(super) async fn handle_set_option(
         &self,
@@ -39,6 +46,7 @@ impl RequestHandler {
         let automatic_rename_scope = (request.option == OptionName::AutomaticRename)
             .then(|| legacy_scope_to_refresh_scope(&request.scope));
         let mut alerts_changed = false;
+        let mut pane_option_events = Vec::new();
         let response = {
             let mut state = self.state.lock().await;
 
@@ -57,6 +65,7 @@ impl RequestHandler {
                         .notifications
                         .iter()
                         .any(|notification| notification.effects.affects_alerts());
+                    pane_option_events = pane_option_events_for_outcome(&state, &outcome);
                     state.refresh_transcript_limits_for_scope(&request.scope, request.option);
                     if let rmux_proto::ScopeSelector::Window(target) = &request.scope {
                         state.synchronize_linked_window_options_from_slot(
@@ -85,6 +94,9 @@ impl RequestHandler {
         };
 
         if matches!(response, Response::SetOption(_)) {
+            for (pane_id, generation, outcome) in &pane_option_events {
+                self.record_pane_option_mutation(*pane_id, Some(*generation), outcome);
+            }
             if let Some(scope) = resize_policy_scope.as_ref() {
                 self.reconcile_attached_sizes_for_option_scope(scope).await;
             }
@@ -140,6 +152,7 @@ impl RequestHandler {
         let mut alerts_changed = false;
         let mut destroy_unattached_scope = None;
         let mut resize_policy_scope = None;
+        let mut pane_option_events = Vec::new();
         let response = {
             let mut state = self.state.lock().await;
 
@@ -191,6 +204,7 @@ impl RequestHandler {
                         .notifications
                         .iter()
                         .any(|notification| notification.effects.affects_alerts());
+                    pane_option_events = pane_option_events_for_outcome(&state, &outcome);
                     if let Some(option) = outcome.known_option {
                         if option == OptionName::DestroyUnattached {
                             destroy_unattached_scope = Some(request.scope.clone());
@@ -246,6 +260,9 @@ impl RequestHandler {
         };
 
         if matches!(response, Response::SetOptionByName(_)) {
+            for (pane_id, generation, outcome) in &pane_option_events {
+                self.record_pane_option_mutation(*pane_id, Some(*generation), outcome);
+            }
             if let Some(scope) = resize_policy_scope.as_ref() {
                 self.reconcile_attached_sizes_for_option_scope(scope).await;
             }

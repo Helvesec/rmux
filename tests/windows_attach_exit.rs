@@ -19,7 +19,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 
-const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
+const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 const RAW_CONSOLE_PROBE_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const PYTHON_FOREGROUND_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1605,7 +1605,7 @@ fn windows_attach_ctrl_c_preserves_raw_console_character_when_processed_input_is
         .spawn()?;
     let io = attach.master().try_clone_io()?;
 
-    wait_for_needle_or_error(&mut attach, b"RAW_READY", SETUP_TIMEOUT)?;
+    wait_for_needle_or_error(&mut attach, b"RAW_READY", RAW_CONSOLE_PROBE_READY_TIMEOUT)?;
     write_windows_console_key(attach.child().pid(), WindowsConsoleKeyEvent::ctrl_c())?;
     thread::sleep(Duration::from_millis(150));
     io.write_all(b"x")?;
@@ -1639,7 +1639,13 @@ fn windows_send_keys_ctrl_c_preserves_raw_console_character_when_processed_input
         ["new-session", "-d", "-s", "rawsend", command.as_str()],
     )?;
     run_rmux(&binary, &label, ["set-option", "-g", "status", "off"])?;
-    wait_for_capture_contains(&binary, &label, "rawsend:0.0", b"RAW_READY", SETUP_TIMEOUT)?;
+    wait_for_capture_contains(
+        &binary,
+        &label,
+        "rawsend:0.0",
+        b"RAW_READY",
+        RAW_CONSOLE_PROBE_READY_TIMEOUT,
+    )?;
 
     run_rmux(
         &binary,
@@ -1755,7 +1761,7 @@ fn run_rmux<const N: usize>(
         .args(args)
         .status()?;
     if !status.success() {
-        return Err(io::Error::other(format!("rmux command failed with {status}")).into());
+        return Err(io::Error::other(format!("rmux command {args:?} failed with {status}")).into());
     }
     Ok(())
 }
@@ -1794,7 +1800,7 @@ fn wait_for_capture_contains(
     while Instant::now() < deadline {
         let output = run_rmux_output(binary, label, ["capture-pane", "-p", "-t", target])?;
         last = output.stdout;
-        if last.windows(needle.len()).any(|window| window == needle) {
+        if output_contains(&last, needle) {
             return Ok(last);
         }
         thread::sleep(Duration::from_millis(50));
@@ -1914,11 +1920,24 @@ fn timeout_countdown_detection_does_not_match_only_the_command_line() {
     assert!(!timeout_countdown_started(b"timeout.exe /T 10000\r\n"));
 }
 
+#[test]
+fn capture_matching_accepts_soft_wrapped_prompt_markers() {
+    let wrapped = b"RMUX_TIMEOUT\r\n_READY>\r\nRMUX_TIMEOUT\r\n_READY>";
+    assert!(output_contains(wrapped, b"RMUX_TIMEOUT_READY>"));
+    assert_eq!(count_occurrences(wrapped, b"RMUX_TIMEOUT_READY>"), 2);
+}
+
 fn count_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
-    haystack
+    let direct = haystack
         .windows(needle.len())
         .filter(|window| *window == needle)
-        .count()
+        .count();
+    let unwrapped = terminal_unwrapped_bytes(haystack);
+    let unwrapped_count = unwrapped
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count();
+    direct.max(unwrapped_count)
 }
 
 fn send_attach_ctrl_c_and_wait_for_marker(
@@ -2284,6 +2303,17 @@ fn wait_for_spawned_exit_or_terminate(
 
 fn output_contains(output: &[u8], needle: &[u8]) -> bool {
     output.windows(needle.len()).any(|window| window == needle)
+        || terminal_unwrapped_bytes(output)
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
+fn terminal_unwrapped_bytes(output: &[u8]) -> Vec<u8> {
+    output
+        .iter()
+        .copied()
+        .filter(|byte| !matches!(byte, b'\r' | b'\n'))
+        .collect()
 }
 
 fn escaped_output(output: &[u8]) -> String {

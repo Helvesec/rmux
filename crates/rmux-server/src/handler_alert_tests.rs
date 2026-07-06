@@ -7,16 +7,17 @@ use crate::format_runtime::render_runtime_template;
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::AttachControl;
 use crate::server_access::current_owner_uid;
-use rmux_core::{WINLINK_ACTIVITY, WINLINK_BELL, WINLINK_SILENCE};
+use rmux_core::{PaneId, WINLINK_ACTIVITY, WINLINK_BELL, WINLINK_SILENCE};
 #[cfg(unix)]
 use rmux_proto::SendKeysRequest;
 use rmux_proto::{
     DisplayMessageRequest, HookLifecycle, HookName, KillWindowRequest, NewSessionExtRequest,
     NewSessionRequest, NewWindowRequest, NextWindowRequest, OptionName, OptionScopeSelector,
-    PaneTarget, PreviousWindowRequest, Request, Response, ScopeSelector, SelectPaneRequest,
-    SessionName, SetHookMutationRequest, SetOptionByNameRequest, SetOptionMode, SetOptionRequest,
-    ShowMessagesRequest, SplitDirection, SplitWindowExtRequest, SplitWindowTarget, Target,
-    TerminalSize, WindowTarget,
+    PaneStateCursorRequest, PaneStateEventDto, PaneTarget, PaneTargetRef, PreviousWindowRequest,
+    Request, Response, ScopeSelector, SelectPaneRequest, SessionName, SetHookMutationRequest,
+    SetOptionByNameRequest, SetOptionMode, SetOptionRequest, ShowMessagesRequest, SplitDirection,
+    SplitWindowExtRequest, SplitWindowTarget, SubscribePaneStateRequest, Target, TerminalSize,
+    WindowTarget,
 };
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -27,6 +28,8 @@ use tokio::time::{timeout, Duration};
 const ALERT_TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(not(windows))]
 const ALERT_TEST_EVENT_TIMEOUT: Duration = Duration::from_millis(500);
+const ACTIVITY_BASELINE_SETTLE: Duration = Duration::from_millis(1200);
+const ACTIVITY_BASELINE_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn session_name(value: &str) -> SessionName {
     SessionName::new(value).expect("valid session name")
@@ -121,6 +124,9 @@ async fn create_quiet_session(handler: &RequestHandler, name: &str) -> SessionNa
         })))
         .await;
     assert!(matches!(response, Response::NewSession(_)));
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session.clone(), 0))
+        .await;
     session
 }
 
@@ -162,7 +168,67 @@ async fn split_quiet_window(handler: &RequestHandler, session: &SessionName) {
             stdin_payload: None,
         })))
         .await;
-    assert!(matches!(response, Response::SplitWindow(_)));
+    let Response::SplitWindow(response) = response else {
+        panic!("expected split-window response");
+    };
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&response.pane)
+        .await;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActivitySnapshot {
+    origin_pane_id: PaneId,
+    window: i64,
+    origin: i64,
+    other: i64,
+}
+
+async fn two_pane_activity_snapshot(
+    handler: &RequestHandler,
+    session_name: &SessionName,
+) -> ActivitySnapshot {
+    let state = handler.state.lock().await;
+    let session = state
+        .sessions
+        .session(session_name)
+        .expect("session exists");
+    let window = session.window_at(0).expect("window exists");
+    let origin = window.pane(0).expect("origin pane exists");
+    let other = window.pane(1).expect("other pane exists");
+    ActivitySnapshot {
+        origin_pane_id: origin.id(),
+        window: window.activity_at(),
+        origin: origin.activity_at(),
+        other: other.activity_at(),
+    }
+}
+
+async fn wait_for_two_pane_activity_to_settle(
+    handler: &RequestHandler,
+    session_name: &SessionName,
+) -> ActivitySnapshot {
+    let deadline = tokio::time::Instant::now() + ACTIVITY_BASELINE_TIMEOUT;
+    let mut previous = two_pane_activity_snapshot(handler, session_name).await;
+    let mut stable_since = tokio::time::Instant::now();
+
+    loop {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let current = two_pane_activity_snapshot(handler, session_name).await;
+        let now = tokio::time::Instant::now();
+        if current == previous {
+            if now.duration_since(stable_since) >= ACTIVITY_BASELINE_SETTLE {
+                return current;
+            }
+        } else {
+            previous = current;
+            stable_since = now;
+        }
+        assert!(
+            now < deadline,
+            "activity baseline did not settle; last snapshot: {previous:?}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -555,6 +621,7 @@ async fn pane_alert_event_sets_bell_and_activity_flags_and_emits_alert_hooks() {
         pane_id,
         bell_count: 1,
         title_changed: false,
+        title_change: None,
         clipboard_set: false,
         queue_activity_alert: true,
         generation: None,
@@ -615,6 +682,7 @@ async fn pane_alert_callback_can_be_invoked_from_reader_thread() {
             pane_id,
             bell_count: 0,
             title_changed: false,
+            title_change: None,
             clipboard_set: false,
             queue_activity_alert: true,
             generation: None,
@@ -647,6 +715,7 @@ async fn pane_title_change_output_emits_lifecycle_hook_event() {
         pane_id,
         bell_count: 0,
         title_changed: true,
+        title_change: None,
         clipboard_set: false,
         queue_activity_alert: false,
         generation: None,
@@ -654,6 +723,162 @@ async fn pane_title_change_output_emits_lifecycle_hook_event() {
 
     let event = recv_lifecycle(&mut lifecycle).await;
     assert_eq!(event.hook_name, HookName::PaneTitleChanged);
+}
+
+#[tokio::test]
+async fn pane_state_title_alert_ignores_stale_generation() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "pane-title-state-generation").await;
+    let target = PaneTarget::with_window(session.clone(), 0, 0);
+    let (pane_id, generation) = {
+        let state = handler.state.lock().await;
+        let pane_id = state
+            .sessions
+            .session(&session)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0).map(|pane| pane.id()))
+            .expect("window pane exists");
+        (pane_id, state.pane_output_generation(&session, pane_id))
+    };
+    let subscription_id = match handler
+        .handle_subscribe_pane_state(
+            71,
+            SubscribePaneStateRequest {
+                target: PaneTargetRef::slot(target),
+                include_title: true,
+                include_options: false,
+                include_foreground: false,
+            },
+        )
+        .await
+    {
+        Response::SubscribePaneState(response) => response.subscription_id,
+        response => panic!("subscribe-pane-state failed: {response:?}"),
+    };
+
+    let callback = handler.pane_alert_callback();
+    callback(crate::pane_io::PaneAlertEvent {
+        session_name: session.clone(),
+        pane_id,
+        bell_count: 0,
+        title_changed: true,
+        title_change: Some(("old".to_owned(), "current".to_owned())),
+        clipboard_set: false,
+        queue_activity_alert: false,
+        generation: Some(generation),
+    });
+
+    let revision = timeout(Duration::from_secs(2), async {
+        let mut after_revision = 0;
+        'wait_for_title: loop {
+            match handler
+                .handle_pane_state_cursor(
+                    71,
+                    PaneStateCursorRequest {
+                        subscription_id,
+                        after_revision,
+                        wait: false,
+                        max_events: Some(16),
+                    },
+                )
+                .await
+            {
+                Response::PaneStateCursor(response) if !response.events.is_empty() => {
+                    for event in response.events {
+                        match event {
+                            PaneStateEventDto::TitleChanged {
+                                revision,
+                                old_title,
+                                new_title,
+                                ..
+                            } if old_title == "old" && new_title == "current" => {
+                                break 'wait_for_title revision;
+                            }
+                            PaneStateEventDto::TitleChanged { revision, .. }
+                            | PaneStateEventDto::OptionSet { revision, .. }
+                            | PaneStateEventDto::OptionUnset { revision, .. }
+                            | PaneStateEventDto::ForegroundChanged { revision, .. }
+                            | PaneStateEventDto::Closed { revision, .. } => {
+                                after_revision = after_revision.max(revision);
+                            }
+                        }
+                    }
+                }
+                Response::PaneStateCursor(_) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                response => panic!("pane-state-cursor failed: {response:?}"),
+            }
+        }
+    })
+    .await
+    .expect("current-generation title event must arrive");
+
+    callback(crate::pane_io::PaneAlertEvent {
+        session_name: session,
+        pane_id,
+        bell_count: 0,
+        title_changed: true,
+        title_change: Some(("current".to_owned(), "stale".to_owned())),
+        clipboard_set: false,
+        queue_activity_alert: false,
+        generation: Some(generation.saturating_add(1)),
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    match handler
+        .handle_pane_state_cursor(
+            71,
+            PaneStateCursorRequest {
+                subscription_id,
+                after_revision: revision,
+                wait: false,
+                max_events: Some(16),
+            },
+        )
+        .await
+    {
+        Response::PaneStateCursor(response) => assert!(
+            !response.events.iter().any(|event| matches!(
+                event,
+                PaneStateEventDto::TitleChanged { new_title, .. } if new_title == "stale"
+            )),
+            "stale-generation title change leaked into pane-state stream: {:?}",
+            response.events
+        ),
+        response => panic!("pane-state-cursor failed: {response:?}"),
+    }
+}
+
+#[tokio::test]
+async fn pane_output_updates_activity_for_originating_pane_only() {
+    let handler = RequestHandler::new();
+    let session = create_quiet_session(&handler, "pane-output-activity").await;
+    split_quiet_window(&handler, &session).await;
+    let before = wait_for_two_pane_activity_to_settle(&handler, &session).await;
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    handler
+        .handle_pane_alert_event(crate::pane_io::PaneAlertEvent {
+            session_name: session.clone(),
+            pane_id: before.origin_pane_id,
+            bell_count: 0,
+            title_changed: false,
+            title_change: None,
+            clipboard_set: false,
+            queue_activity_alert: false,
+            generation: None,
+        })
+        .await;
+
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&session).expect("session exists");
+    let window = session.window_at(0).expect("window exists");
+    let origin = window.pane(0).expect("origin pane exists");
+    let other = window.pane(1).expect("other pane exists");
+    assert!(window.activity_at() > before.window);
+    assert!(origin.activity_at() > before.origin);
+    assert_eq!(other.activity_at(), before.other);
 }
 
 #[tokio::test]
@@ -684,6 +909,7 @@ async fn pane_set_clipboard_output_emits_hook_without_activity() {
             pane_id,
             bell_count: 0,
             title_changed: false,
+            title_change: None,
             clipboard_set: true,
             queue_activity_alert: false,
             generation: None,
@@ -721,6 +947,7 @@ async fn pane_set_clipboard_hook_requires_set_clipboard_on() {
             pane_id,
             bell_count: 0,
             title_changed: false,
+            title_change: None,
             clipboard_set: true,
             queue_activity_alert: false,
             generation: None,
@@ -844,6 +1071,7 @@ async fn pane_alert_callback_coalesces_inactive_pane_refreshes_by_session() {
             pane_id,
             bell_count: 0,
             title_changed: false,
+            title_change: None,
             clipboard_set: false,
             queue_activity_alert: false,
             generation: None,
@@ -924,6 +1152,7 @@ async fn pane_alert_event_updates_automatic_window_name_without_disabling_auto_r
         pane_id,
         bell_count: 0,
         title_changed: false,
+        title_change: None,
         clipboard_set: false,
         queue_activity_alert: true,
         generation: None,
@@ -987,6 +1216,7 @@ async fn pane_alert_event_respects_automatic_rename_off() {
             pane_id,
             bell_count: 0,
             title_changed: false,
+            title_change: None,
             clipboard_set: false,
             queue_activity_alert: true,
             generation: None,
@@ -1053,6 +1283,7 @@ async fn pane_alert_event_updates_grouped_session_window_names() {
             pane_id,
             bell_count: 0,
             title_changed: false,
+            title_change: None,
             clipboard_set: false,
             queue_activity_alert: true,
             generation: None,

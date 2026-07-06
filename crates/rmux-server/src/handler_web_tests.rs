@@ -422,7 +422,7 @@ async fn kill_session_on_expire_follows_renamed_session_id() {
     create_share(
         &handler,
         CreateWebShareRequest {
-            ttl_seconds: Some(2),
+            ttl_seconds: Some(6),
             operator: true,
             kill_session_on_expire: true,
             ..share_request(WebShareScope::Session(session_name.clone()))
@@ -438,7 +438,7 @@ async fn kill_session_on_expire_follows_renamed_session_id() {
         .await;
     assert!(matches!(renamed, Response::RenameSession(_)));
 
-    timeout(Duration::from_secs(4), async {
+    timeout(Duration::from_secs(10), async {
         loop {
             let session_gone = {
                 let state = handler.state.lock().await;

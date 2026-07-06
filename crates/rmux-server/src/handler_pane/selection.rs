@@ -6,6 +6,7 @@ use rmux_proto::{
 
 use super::super::RequestHandler;
 use crate::hook_runtime::PendingInlineHookFormat;
+use crate::pane_state_journal::PaneStateChange;
 use crate::pane_terminals::session_not_found;
 
 impl RequestHandler {
@@ -58,7 +59,7 @@ impl RequestHandler {
         let title = request.title.clone();
         let style = request.style.clone();
         let input_disabled = request.input_disabled;
-        let (response, pane_changed) = {
+        let (response, pane_changed, title_changed_target, title_state_event, pane_option_event) = {
             let mut state = self.state.lock().await;
             let pane_changed = title.is_none()
                 && input_disabled.is_none()
@@ -67,6 +68,9 @@ impl RequestHandler {
                     .session(&session_name)
                     .and_then(|session| session.window_at(window_index))
                     .is_some_and(|window| window.active_pane_index() != pane_index);
+            let mut title_changed_target = None;
+            let mut title_state_event = None;
+            let mut pane_option_event = None;
             match (|| -> Result<SelectPaneResponse, RmuxError> {
                 if let Some(style) = style.as_deref() {
                     let scope = OptionScopeSelector::Pane(request.target.clone());
@@ -79,7 +83,14 @@ impl RequestHandler {
                     )?;
                 }
                 let response_target = if let Some(title) = title.as_deref() {
-                    state.set_pane_title(&request.target, title)?;
+                    if let Some((old, new)) = state.set_pane_title(&request.target, title)? {
+                        title_changed_target = Some(request.target.clone());
+                        if let Some(pane_id) = pane_id_for_select_target(&state, &request.target) {
+                            let generation = state
+                                .pane_output_generation(request.target.session_name(), pane_id);
+                            title_state_event = Some((pane_id, generation, old, new));
+                        }
+                    }
                     request.target.clone()
                 } else if let Some(disabled) = input_disabled {
                     state.set_pane_input_disabled(&request.target, disabled)?;
@@ -101,7 +112,7 @@ impl RequestHandler {
                     PaneTarget::with_window(session_name.clone(), window_index, active_pane_index)
                 };
                 if let Some(style) = style {
-                    let _ = state.options.set_by_name(
+                    let outcome = state.options.set_by_name(
                         OptionScopeSelector::Pane(request.target.clone()),
                         "window-style",
                         Some(style),
@@ -110,6 +121,13 @@ impl RequestHandler {
                         false,
                         false,
                     )?;
+                    if outcome.changed {
+                        if let Some(pane_id) = pane_id_for_select_target(&state, &request.target) {
+                            let generation = state
+                                .pane_output_generation(request.target.session_name(), pane_id);
+                            pane_option_event = Some((pane_id, generation, outcome));
+                        }
+                    }
                     state.refresh_transcript_limits_for_scope(
                         &ScopeSelector::Pane(request.target.clone()),
                         OptionName::WindowStyle,
@@ -120,17 +138,42 @@ impl RequestHandler {
                     target: response_target,
                 })
             })() {
-                Ok(response) => (Response::SelectPane(response), pane_changed),
-                Err(error) => (Response::Error(ErrorResponse { error }), false),
+                Ok(response) => (
+                    Response::SelectPane(response),
+                    pane_changed,
+                    title_changed_target,
+                    title_state_event,
+                    pane_option_event,
+                ),
+                Err(error) => (
+                    Response::Error(ErrorResponse { error }),
+                    false,
+                    None,
+                    None,
+                    None,
+                ),
             }
         };
 
         if matches!(response, Response::SelectPane(_)) {
+            if let Some((pane_id, generation, old, new)) = title_state_event {
+                self.record_pane_state_change(
+                    pane_id,
+                    Some(generation),
+                    PaneStateChange::TitleChanged { old, new },
+                );
+            }
+            if let Some((pane_id, generation, outcome)) = pane_option_event.as_ref() {
+                self.record_pane_option_mutation(*pane_id, Some(*generation), outcome);
+            }
             if pane_changed {
                 self.emit(LifecycleEvent::WindowPaneChanged {
                     target: WindowTarget::with_window(session_name.clone(), window_index),
                 })
                 .await;
+            }
+            if let Some(target) = title_changed_target {
+                self.emit(LifecycleEvent::PaneTitleChanged { target }).await;
             }
             if let Response::SelectPane(success) = &response {
                 self.queue_inline_hook(
@@ -207,11 +250,20 @@ impl RequestHandler {
     ) -> Response {
         let session_name = request.target.session_name().clone();
         let window_index = request.target.window_index();
-        let response = {
+        let (response, title_changed_target, title_state_event) = {
             let mut state = self.state.lock().await;
+            let mut title_changed_target = None;
+            let mut title_state_event = None;
             match (|| -> Result<SelectPaneResponse, RmuxError> {
                 if let Some(title) = request.title.as_deref() {
-                    state.set_pane_title(&request.target, title)?;
+                    if let Some((old, new)) = state.set_pane_title(&request.target, title)? {
+                        title_changed_target = Some(request.target.clone());
+                        if let Some(pane_id) = pane_id_for_select_target(&state, &request.target) {
+                            let generation = state
+                                .pane_output_generation(request.target.session_name(), pane_id);
+                            title_state_event = Some((pane_id, generation, old, new));
+                        }
+                    }
                 }
                 if request.clear {
                     state.clear_marked_pane();
@@ -240,16 +292,42 @@ impl RequestHandler {
                     ),
                 })
             })() {
-                Ok(response) => Response::SelectPane(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+                Ok(response) => (
+                    Response::SelectPane(response),
+                    title_changed_target,
+                    title_state_event,
+                ),
+                Err(error) => (Response::Error(ErrorResponse { error }), None, None),
             }
         };
 
         if matches!(response, Response::SelectPane(_)) {
+            if let Some((pane_id, generation, old, new)) = title_state_event {
+                self.record_pane_state_change(
+                    pane_id,
+                    Some(generation),
+                    PaneStateChange::TitleChanged { old, new },
+                );
+            }
+            if let Some(target) = title_changed_target {
+                self.emit(LifecycleEvent::PaneTitleChanged { target }).await;
+            }
             self.refresh_attached_session(&session_name).await;
             self.refresh_control_session(&session_name).await;
         }
 
         response
     }
+}
+
+fn pane_id_for_select_target(
+    state: &crate::pane_terminals::HandlerState,
+    target: &PaneTarget,
+) -> Option<rmux_core::PaneId> {
+    state
+        .sessions
+        .session(target.session_name())
+        .and_then(|session| session.window_at(target.window_index()))
+        .and_then(|window| window.pane(target.pane_index()))
+        .map(|pane| pane.id())
 }

@@ -570,6 +570,7 @@ fn publish_pane_bytes(context: PanePublishContext<'_>, bytes: Vec<u8>) -> Vec<u8
             pane_id,
             bell_count: append_result.bell_count,
             title_changed: append_result.title_changed,
+            title_change: append_result.title_change.clone(),
             clipboard_set,
             queue_activity_alert: emit_no_bell_alert || append_result.bell_count > 0,
             generation,
@@ -1114,7 +1115,7 @@ finally:
 }
 
 #[cfg(all(test, windows))]
-mod tests {
+mod windows_tests {
     use std::error::Error;
     use std::sync::{mpsc, Arc};
     use std::time::{Duration, Instant};

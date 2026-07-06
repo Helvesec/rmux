@@ -81,7 +81,7 @@ impl CrossPlatformHarness {
         let mut last = String::new();
         while Instant::now() < deadline {
             last = self.stdout(["capture-pane", "-p", "-t", target])?;
-            if last.contains(needle) {
+            if capture_contains_terminal_text(&last, needle) {
                 return Ok(());
             }
             thread::sleep(Duration::from_millis(100));
@@ -91,6 +91,18 @@ impl CrossPlatformHarness {
         )
         .into())
     }
+}
+
+fn capture_contains_terminal_text(capture: &str, needle: &str) -> bool {
+    if capture.contains(needle) {
+        return true;
+    }
+
+    let unwrapped: String = capture
+        .chars()
+        .filter(|ch| !matches!(ch, '\r' | '\n'))
+        .collect();
+    unwrapped.contains(needle)
 }
 
 impl Drop for CrossPlatformHarness {
@@ -140,6 +152,18 @@ fn unique_id(label: &str) -> String {
         }
     })
     .collect()
+}
+
+#[test]
+fn capture_contains_terminal_text_accepts_soft_wrapped_needles() {
+    assert!(capture_contains_terminal_text(
+        "prompt>rename_capture_marker\n_1234\n",
+        "rename_capture_marker_1234"
+    ));
+    assert!(!capture_contains_terminal_text(
+        "prompt>rename_capture_marker\n_wrong\n",
+        "rename_capture_marker_1234"
+    ));
 }
 
 fn temp_root() -> PathBuf {

@@ -87,6 +87,22 @@ handle, and send best-effort cancel requests on drop/timeout. On Windows,
 Inventory impact: none for tmux command inventory. The behavior may be
 documented only as SDK transport policy, not as a tmux CLI feature.
 
+### C-D13: Windows status-right defaults to host_short
+
+tmux 3.7b defaults `status-right` to `#{=21:pane_title}`. RMUX keeps
+`#{=21:host_short}` on Windows because ConPTY pane titles are noisy and often
+reflect shell or host process paths rather than useful session state. Unix-like
+platforms keep the tmux 3.7b `pane_title` default.
+
+Test/fixture:
+`crates/rmux-core/src/options/tests/effects_defaults.rs` locks the platform
+split, and `crates/rmux-server/src/handler_attach_tests/attach_render.rs`
+locks the Windows attach render path.
+
+Inventory impact: RMUX may document the Windows default as an intentional
+product divergence. Cross-platform compatibility claims must not say the
+Windows `status-right` default is byte-for-byte tmux 3.7b behavior.
+
 ## Deferred decisions
 
 ### C-D32: floating panes and new-pane remain deferred

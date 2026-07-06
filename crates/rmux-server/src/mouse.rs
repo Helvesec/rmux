@@ -293,9 +293,9 @@ fn classify_current_mouse_event(
     };
     let mut attached_event = hit_to_attached_event(layout, attached_raw, hit, ignore)?;
 
-    if matches!(kind, MouseEventKind::MouseDown) {
-        state.drag_start_event = Some(attached_event.clone());
-    } else if matches!(kind, MouseEventKind::MouseDrag) && state.drag_start_event.is_none() {
+    if matches!(kind, MouseEventKind::MouseDown)
+        || (matches!(kind, MouseEventKind::MouseDrag) && state.drag_start_event.is_none())
+    {
         state.drag_start_event = Some(attached_event.clone());
     }
 

@@ -283,20 +283,28 @@ pub(super) fn default_scalar_text(default: DefaultValue) -> &'static str {
 pub(super) fn build_mutation_outcome(
     query: &OptionQuery,
     scope: OptionScopeSelector,
+    old_explicit: Option<String>,
+    new_explicit: Option<String>,
 ) -> OptionMutationOutcome {
     let notification = OptionNotification {
         name: query.canonical_name().to_owned(),
         scope: scope.clone(),
         effects: query.effects(),
     };
+    let changed = old_explicit != new_explicit;
     OptionMutationOutcome {
         name: query.canonical_name().to_owned(),
+        scope,
         known_option: query.known_option(),
+        old_explicit,
+        new_explicit,
+        changed,
         notifications: if notification.effects.is_empty() {
             Vec::new()
         } else {
             vec![notification]
         },
+        related: Vec::new(),
     }
 }
 

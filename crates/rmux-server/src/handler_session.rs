@@ -38,9 +38,9 @@ const DEFERRED_INITIAL_PANE_READY_TIMEOUT: Duration = Duration::from_millis(250)
 #[cfg(windows)]
 const DEFERRED_INITIAL_PANE_READY_SETTLE: Duration = Duration::from_millis(100);
 #[cfg(windows)]
-const DEFERRED_INITIAL_PANE_CONSOLE_INPUT_RETRIES: usize = 8;
-#[cfg(windows)]
-const DEFERRED_INITIAL_PANE_CONSOLE_INPUT_RETRY_DELAY: Duration = Duration::from_millis(50);
+// Keep immediate post-new-session console control input queued until the
+// autostarted ConPTY console is safely isolated from the launching client.
+const DEFERRED_INITIAL_PANE_INPUT_GRACE: Duration = Duration::from_secs(2);
 
 use client_environment::{
     new_session_client_environment, new_session_raw_client_environment,
@@ -534,8 +534,15 @@ impl RequestHandler {
         self.wait_for_deferred_initial_pane_ready(&runtime_session_name, pane_id)
             .await;
 
+        let input_grace_deadline = tokio::time::Instant::now() + DEFERRED_INITIAL_PANE_INPUT_GRACE;
         loop {
             if let Some(flush) = pending {
+                let now = tokio::time::Instant::now();
+                if now < input_grace_deadline {
+                    pending = Some(flush);
+                    tokio::time::sleep(input_grace_deadline - now).await;
+                    continue;
+                }
                 let write_result = Self::flush_deferred_initial_pane_input(flush).await;
                 if let Err(error) = write_result {
                     let mut state = self.state.lock().await;
@@ -550,13 +557,23 @@ impl RequestHandler {
 
             let drained = {
                 let mut state = self.state.lock().await;
-                state.drain_or_finish_deferred_initial_pane_input(&runtime_session_name, pane_id)
+                state.drain_deferred_initial_pane_input(&runtime_session_name, pane_id)
             };
             match drained {
                 Ok(Some(next)) => {
                     pending = Some(next);
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    let now = tokio::time::Instant::now();
+                    if now < input_grace_deadline {
+                        pending = None;
+                        tokio::time::sleep(input_grace_deadline - now).await;
+                        continue;
+                    }
+                    let mut state = self.state.lock().await;
+                    state.finish_deferred_initial_pane_input(&runtime_session_name, pane_id);
+                    break;
+                }
                 Err(error) => {
                     let mut state = self.state.lock().await;
                     state.add_message(error.to_string());
@@ -643,37 +660,18 @@ impl RequestHandler {
         pane_pid: rmux_pty::ProcessId,
         action: crate::pane_terminals::DeferredInitialPaneConsoleInputAction,
     ) -> std::io::Result<()> {
-        for attempt in 0..=DEFERRED_INITIAL_PANE_CONSOLE_INPUT_RETRIES {
-            let result = match action {
-                crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Key(key) => {
-                    rmux_pty::write_windows_console_key(pane_pid, key)
-                }
-                crate::pane_terminals::DeferredInitialPaneConsoleInputAction::KeyThenInterrupt(
-                    key,
-                ) => rmux_pty::write_windows_console_key_then_interrupt_if_processed(pane_pid, key),
-                crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Interrupt => {
-                    rmux_pty::send_windows_console_interrupt(pane_pid)
-                }
-                crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Noop => Ok(()),
-            };
-            match result {
-                Ok(()) => return Ok(()),
-                Err(error)
-                    if attempt < DEFERRED_INITIAL_PANE_CONSOLE_INPUT_RETRIES
-                        && Self::is_transient_deferred_initial_console_input_error(&error) =>
-                {
-                    std::thread::sleep(DEFERRED_INITIAL_PANE_CONSOLE_INPUT_RETRY_DELAY);
-                }
-                Err(error) => return Err(error),
+        crate::windows_console_input::write_with_transient_retry(|| match action {
+            crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Key(key) => {
+                rmux_pty::write_windows_console_key(pane_pid, key)
             }
-        }
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    fn is_transient_deferred_initial_console_input_error(error: &std::io::Error) -> bool {
-        const ERROR_GEN_FAILURE: i32 = 31;
-        error.raw_os_error() == Some(ERROR_GEN_FAILURE)
+            crate::pane_terminals::DeferredInitialPaneConsoleInputAction::KeyThenInterrupt(key) => {
+                rmux_pty::write_windows_console_key_then_interrupt_if_processed(pane_pid, key)
+            }
+            crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Interrupt => {
+                rmux_pty::send_windows_console_interrupt(pane_pid)
+            }
+            crate::pane_terminals::DeferredInitialPaneConsoleInputAction::Noop => Ok(()),
+        })
     }
 
     #[cfg(windows)]
@@ -1053,11 +1051,8 @@ fn should_defer_windows_initial_pane(
 ) -> bool {
     #[cfg(windows)]
     {
-        detached
-            && !print_session_info
-            && !grouped
-            && !has_command
-            && windows_deferred_initial_pane_enabled()
+        let _ = has_command;
+        detached && !print_session_info && !grouped && windows_deferred_initial_pane_enabled()
     }
     #[cfg(not(windows))]
     {

@@ -1,7 +1,7 @@
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
-    CommandOutput, ErrorResponse, HookName, Response, ScopeSelector, SessionId, SessionName,
-    Target, WindowTarget,
+    CommandOutput, ErrorResponse, HookName, PaneStateClosedReason, Response, ScopeSelector,
+    SessionId, SessionName, Target, WindowTarget,
 };
 
 use super::super::{
@@ -12,6 +12,7 @@ use super::super::{
 use crate::format_runtime::render_runtime_template;
 use crate::hook_runtime::PendingInlineHookFormat;
 use crate::pane_io::AttachControl;
+use crate::pane_state_journal::PaneStateChange;
 use crate::pane_terminals::HandlerState;
 use crate::terminal::validate_process_command;
 
@@ -569,6 +570,15 @@ impl RequestHandler {
             self.emit_prepared(event);
         }
         if matches!(response, Response::KillPane(_)) {
+            for pane_id in &removed_pane_ids {
+                self.record_pane_state_change(
+                    *pane_id,
+                    None,
+                    PaneStateChange::Closed {
+                        reason: PaneStateClosedReason::Killed,
+                    },
+                );
+            }
             self.cleanup_pane_output_subscriptions(&removed_subscription_keys)
                 .await;
             if session_destroyed {

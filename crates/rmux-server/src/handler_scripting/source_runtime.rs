@@ -19,7 +19,7 @@ use super::super::target_support::{
 use super::super::{ConfigLoadingGuard, RequestHandler};
 use super::command_args::CommandListArgument;
 use super::config_engine::{
-    append_error_output, config_error_lines, nonempty_stdout, ConfigLoadOrigin, ConfigLoadRequest,
+    append_error_output, config_error_lines, nonempty_stdout, ConfigLoadRequest,
 };
 use super::format_context::{
     format_context_for_target_with_server_values, global_format_context,
@@ -487,7 +487,7 @@ impl RequestHandler {
         command: &ParsedSourceFileCommand,
         depth: usize,
     ) -> Result<LoadedSourceFile, RmuxError> {
-        self.load_source_file_command(command, depth, ConfigLoadOrigin::Startup, false, true)
+        self.load_source_file_command(command, depth, false, true)
             .await
     }
 
@@ -497,14 +497,8 @@ impl RequestHandler {
         depth: usize,
         explicit_target: bool,
     ) -> Result<LoadedSourceFile, RmuxError> {
-        self.load_source_file_command(
-            command,
-            depth,
-            ConfigLoadOrigin::ExplicitSourceFile,
-            explicit_target,
-            !explicit_target,
-        )
-        .await
+        self.load_source_file_command(command, depth, explicit_target, !explicit_target)
+            .await
     }
 
     async fn load_nested_source_file_command(
@@ -513,27 +507,19 @@ impl RequestHandler {
         depth: usize,
         explicit_target: bool,
     ) -> Result<LoadedSourceFile, RmuxError> {
-        self.load_source_file_command(
-            command,
-            depth,
-            ConfigLoadOrigin::NestedSourceFile,
-            explicit_target,
-            !explicit_target,
-        )
-        .await
+        self.load_source_file_command(command, depth, explicit_target, !explicit_target)
+            .await
     }
 
     async fn load_source_file_command(
         &self,
         command: &ParsedSourceFileCommand,
         depth: usize,
-        origin: ConfigLoadOrigin,
         explicit_target: bool,
         implicit_target_refresh: bool,
     ) -> Result<LoadedSourceFile, RmuxError> {
         let request = ConfigLoadRequest::from_source_command(
             command,
-            origin,
             explicit_target,
             implicit_target_refresh,
             depth,
@@ -545,7 +531,6 @@ impl RequestHandler {
         &self,
         command: &ParsedSourceFileCommand,
         depth: usize,
-        origin: ConfigLoadOrigin,
     ) -> Result<LoadedSourceFile, RmuxError> {
         if depth > super::SOURCE_FILE_NESTING_LIMIT {
             return Err(RmuxError::Server("too many nested files".to_owned()));
@@ -598,7 +583,6 @@ impl RequestHandler {
                         command.target.as_ref(),
                         command.parse_only,
                         command.syntax,
-                        origin == ConfigLoadOrigin::NestedSourceFile,
                     )
                     .await
                 {
@@ -713,7 +697,6 @@ impl RequestHandler {
         target: Option<&PaneTarget>,
         stop_at_first_error: bool,
         syntax: SourceSyntax,
-        recover_lookup_errors: bool,
     ) -> Result<ParsedSourceInput, RmuxError> {
         let attached_count = if let Some(target) = target {
             self.attached_count(target.session_name()).await
@@ -745,8 +728,8 @@ impl RequestHandler {
                 0,
                 &mut parsed,
             );
-        } else if syntax == SourceSyntax::TmuxCompat || recover_lookup_errors {
-            parse_source_fragment_recovering_lookup_errors(
+        } else if syntax == SourceSyntax::TmuxCompat {
+            parse_source_fragment_recovering_for_import_compat(
                 &parser,
                 input,
                 &input.contents,
@@ -1190,17 +1173,25 @@ fn strip_execution_error_prefixes(line: &str) -> &str {
 }
 
 fn strip_source_file_line_prefix(line: &str) -> &str {
-    let Some((_, rest)) = line.split_once(':') else {
-        return line;
-    };
-    let Some((line_number, message)) = rest.split_once(':') else {
-        return line;
-    };
-    if !line_number.is_empty() && line_number.bytes().all(|byte| byte.is_ascii_digit()) {
-        message.strip_prefix(' ').unwrap_or(message)
-    } else {
-        line
+    let bytes = line.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b':' {
+            index += 1;
+            continue;
+        }
+
+        let mut cursor = index + 1;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor > index + 1 && cursor < bytes.len() && bytes[cursor] == b':' {
+            let message = &line[cursor + 1..];
+            return message.strip_prefix(' ').unwrap_or(message);
+        }
+        index += 1;
     }
+    line
 }
 
 fn source_error_has_line_prefix(error: &RmuxError) -> bool {
@@ -1226,7 +1217,7 @@ fn source_error_has_line_prefix(error: &RmuxError) -> bool {
     })
 }
 
-fn parse_source_fragment_recovering_lookup_errors(
+fn parse_source_fragment_recovering_for_import_compat(
     parser: &CommandParser,
     input: &SourceInput,
     contents: &str,
@@ -1602,6 +1593,24 @@ mod tests {
     use crate::test_env::EnvVarGuard;
     use crate::DaemonConfig;
     use rmux_proto::OptionName;
+
+    #[test]
+    fn execution_error_prefix_stripping_handles_windows_paths() {
+        assert_eq!(
+            super::strip_source_file_line_prefix(
+                r"C:\tmp\rmux\main.conf:12: invalid option: xyzzy"
+            ),
+            "invalid option: xyzzy"
+        );
+        assert_eq!(
+            super::strip_source_file_line_prefix("/tmp/rmux/main.conf:12: invalid option: xyzzy"),
+            "invalid option: xyzzy"
+        );
+        assert_eq!(
+            super::strip_source_file_line_prefix("invalid option: xyzzy"),
+            "invalid option: xyzzy"
+        );
+    }
 
     #[tokio::test]
     async fn config_loading_guard_marks_handler_busy_until_dropped() {

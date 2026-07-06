@@ -873,8 +873,8 @@ fn ledger_active_size_matches_request_and_response_variant_count() {
         .iter()
         .filter(|entry| matches!(entry.status, FrameStatus::Active))
         .count();
-    // Active entries = 121 Request variants + 94 Response variants.
-    assert_eq!(active_count, 121 + 94, "active ledger size mismatch");
+    // Active entries = 127 Request variants + 101 Response variants.
+    assert_eq!(active_count, 127 + 101, "active ledger size mismatch");
 }
 
 #[test]

@@ -52,6 +52,13 @@ SDK clients should call `rmux capabilities --json` or use
 `Rmux::capabilities()` to negotiate daemon features. `rmux diagnose --json`
 reports build, platform, and runtime support details for debugging.
 
+Pane-local SDK metadata and state streams require the daemon capabilities
+`sdk.pane.options`, `sdk.pane.state_events`, and, when foreground process data
+is requested, `sdk.pane.foreground`. The foreground contract is best-effort:
+Unix reports the foreground process group when available, while Windows reports
+the ConPTY root process plus OSC7/process/profile cwd fallbacks without trying
+to classify agent names.
+
 ## Examples
 
 Run the crate examples from the repository:
@@ -61,4 +68,6 @@ cargo run -p rmux-sdk --example wait_for_text
 cargo run -p rmux-sdk --example assert_visible_text
 cargo run -p rmux-sdk --example sdk_demo_snapshot
 cargo run -p rmux-sdk --example collect_until_exit
+cargo run -p rmux-sdk --example pane_options
+cargo run -p rmux-sdk --example pane_state_events
 ```

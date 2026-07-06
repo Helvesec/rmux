@@ -173,12 +173,18 @@ impl Window {
         self.activity_at
     }
 
-    /// Records window activity at the current time.
-    pub fn touch_activity(&mut self) {
+    /// Records output activity for a specific pane in this window.
+    pub fn touch_activity_for_pane(&mut self, pane_index: u32) -> bool {
+        let Some(position) = self
+            .panes
+            .iter()
+            .position(|pane| pane.index() == pane_index)
+        else {
+            return false;
+        };
         self.activity_at = current_unix_timestamp();
-        if let Some(pane) = self.pane_mut(self.active_pane) {
-            pane.touch_activity();
-        }
+        self.panes[position].touch_activity();
+        true
     }
 
     /// Returns the panes in window order.

@@ -245,7 +245,7 @@ impl HandlerState {
         }))
     }
 
-    pub(crate) fn drain_or_finish_deferred_initial_pane_input(
+    pub(crate) fn drain_deferred_initial_pane_input(
         &mut self,
         runtime_session_name: &SessionName,
         pane_id: PaneId,
@@ -259,7 +259,6 @@ impl HandlerState {
         };
 
         if starting.queued_input.is_empty() {
-            let _ = self.remove_starting_pane(runtime_session_name, pane_id);
             return Ok(None);
         }
 
@@ -288,6 +287,14 @@ impl HandlerState {
             pane_pid,
             queued_input,
         }))
+    }
+
+    pub(crate) fn finish_deferred_initial_pane_input(
+        &mut self,
+        runtime_session_name: &SessionName,
+        pane_id: PaneId,
+    ) {
+        let _ = self.remove_starting_pane(runtime_session_name, pane_id);
     }
 
     pub(crate) fn finish_deferred_initial_pane_input_after_error(

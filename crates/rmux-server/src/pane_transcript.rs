@@ -41,6 +41,7 @@ pub(crate) struct PaneGroundTimer {
 pub(crate) struct PaneAppendResult {
     pub(crate) bell_count: u64,
     pub(crate) title_changed: bool,
+    pub(crate) title_change: Option<(String, String)>,
     pub(crate) passthroughs: Vec<TerminalPassthrough>,
     pub(crate) dropped_passthrough_count: u64,
     pub(crate) replies: Vec<u8>,
@@ -110,7 +111,8 @@ impl PaneTranscript {
         }
         let title_before = self.terminal.screen().title().to_owned();
         self.terminal.feed(bytes);
-        let title_changed = self.terminal.screen().title() != title_before;
+        let title_after = self.terminal.screen().title().to_owned();
+        let title_changed = title_after != title_before;
         let passthroughs = self.terminal.take_terminal_passthrough();
         let dropped_passthrough_count = self.terminal.take_terminal_passthrough_dropped_count();
         let replies = self.terminal.take_replies();
@@ -118,6 +120,7 @@ impl PaneTranscript {
         PaneAppendResult {
             bell_count: self.terminal.screen_mut().take_bell_count(),
             title_changed,
+            title_change: title_changed.then_some((title_before, title_after)),
             passthroughs,
             dropped_passthrough_count,
             replies,
@@ -500,8 +503,11 @@ impl PaneTranscript {
         self.terminal.screen().title()
     }
 
-    pub(crate) fn set_title(&mut self, title: impl Into<String>) {
-        self.terminal.screen_mut().set_title(title);
+    pub(crate) fn set_title(&mut self, title: impl Into<String>) -> Option<(String, String)> {
+        let old_title = self.terminal.screen().title().to_owned();
+        let new_title = title.into();
+        self.terminal.screen_mut().set_title(new_title.clone());
+        (old_title != new_title).then_some((old_title, new_title))
     }
 
     pub(crate) fn path(&self) -> &str {
@@ -914,11 +920,20 @@ mod tests {
 
         let result = transcript.append_bytes_and_take_replies(b"\x1b]2;alpha\x07");
         assert!(result.title_changed);
+        assert_eq!(
+            result.title_change,
+            Some(("".to_owned(), "alpha".to_owned()))
+        );
 
         let result = transcript.append_bytes_and_take_replies(b"\x1b]2;alpha\x07");
         assert!(!result.title_changed);
+        assert_eq!(result.title_change, None);
 
         let result = transcript.append_bytes_and_take_replies(b"\x1b]2;beta\x07");
         assert!(result.title_changed);
+        assert_eq!(
+            result.title_change,
+            Some(("alpha".to_owned(), "beta".to_owned()))
+        );
     }
 }

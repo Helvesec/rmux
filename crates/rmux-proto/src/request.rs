@@ -31,15 +31,16 @@ pub use layout::{
 mod pane;
 pub use pane::{
     BreakPaneRequest, DisplayPanesRequest, JoinPaneRequest, KillPaneRequest, LastPaneRequest,
-    MovePaneRequest, PaneBroadcastInputRequest, PaneInputRequest, PaneKillRequest,
-    PaneOutputCursorRequest, PaneOutputSubscriptionStart, PaneResizeRequest, PaneRespawnRequest,
-    PaneSelectRequest, PaneSnapshotRefRequest, PaneSnapshotRequest, PaneSplitSize, PipePaneRequest,
-    ResizePaneRequest, ResizePaneTargetActionRequest, RespawnPaneRequest,
+    MovePaneRequest, PaneBroadcastInputRequest, PaneForegroundStateRequest, PaneInputRequest,
+    PaneKillRequest, PaneOptionGetRequest, PaneOptionSetRequest, PaneOutputCursorRequest,
+    PaneOutputSubscriptionStart, PaneResizeRequest, PaneRespawnRequest, PaneSelectRequest,
+    PaneSnapshotRefRequest, PaneSnapshotRequest, PaneSplitSize, PaneStateCursorRequest,
+    PipePaneRequest, ResizePaneRequest, ResizePaneTargetActionRequest, RespawnPaneRequest,
     SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneMarkRequest, SelectPaneRequest,
     SendKeysExt2Request, SendKeysExtRequest, SendKeysRequest, SplitWindowExtRequest,
     SplitWindowRequest, SplitWindowTarget, SplitWindowTargetActionRequest,
-    SubscribePaneOutputRefRequest, SubscribePaneOutputRequest, SwapPaneDirection, SwapPaneRequest,
-    UnsubscribePaneOutputRequest,
+    SubscribePaneOutputRefRequest, SubscribePaneOutputRequest, SubscribePaneStateRequest,
+    SwapPaneDirection, SwapPaneRequest, UnsubscribePaneOutputRequest, UnsubscribePaneStateRequest,
 };
 
 #[path = "request/window.rs"]
@@ -355,6 +356,18 @@ pub enum Request {
     ResizePaneTargetAction(ResizePaneTargetActionRequest),
     /// `capture-pane` with raw target text resolved server-side.
     CapturePaneTargetAction(Box<CapturePaneTargetActionRequest>),
+    /// SDK pane option mutation endpoint with stable pane-id targeting.
+    PaneOptionSet(PaneOptionSetRequest),
+    /// SDK pane option lookup endpoint with stable pane-id targeting.
+    PaneOptionGet(PaneOptionGetRequest),
+    /// SDK pane-state subscription endpoint with stable pane-id targeting.
+    SubscribePaneState(SubscribePaneStateRequest),
+    /// SDK pane-state cursor endpoint.
+    PaneStateCursor(PaneStateCursorRequest),
+    /// SDK pane-state unsubscription endpoint.
+    UnsubscribePaneState(UnsubscribePaneStateRequest),
+    /// SDK pane foreground-state endpoint with stable pane-id targeting.
+    PaneForegroundState(PaneForegroundStateRequest),
 }
 
 impl Request {
@@ -428,6 +441,12 @@ impl Request {
             Self::PaneRespawn(_) => "respawn-pane",
             Self::PaneSnapshotRef(_) => "pane-snapshot",
             Self::PaneSelect(_) => "select-pane",
+            Self::PaneOptionSet(_) => "pane-option-set",
+            Self::PaneOptionGet(_) => "pane-option-get",
+            Self::SubscribePaneState(_) => "subscribe-pane-state",
+            Self::PaneStateCursor(_) => "pane-state-cursor",
+            Self::UnsubscribePaneState(_) => "unsubscribe-pane-state",
+            Self::PaneForegroundState(_) => "pane-foreground-state",
             Self::DisplayMessage(_) | Self::DisplayMessageExt(_) => "display-message",
             Self::ResolveTarget(_) => "resolve-target",
             Self::RunShell(_) => "run-shell",

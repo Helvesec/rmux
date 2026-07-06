@@ -91,6 +91,26 @@ impl PaneOutputSubscriptionId {
     }
 }
 
+/// Stable identifier for one pane-state event subscription on a live server
+/// connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PaneStateSubscriptionId(u64);
+
+impl PaneStateSubscriptionId {
+    /// Wraps a raw subscription identifier.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the raw subscription identifier.
+    #[must_use]
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
 /// Opaque owner token for daemon-backed SDK waits.
 ///
 /// The SDK assigns one owner token to each transport connection and then

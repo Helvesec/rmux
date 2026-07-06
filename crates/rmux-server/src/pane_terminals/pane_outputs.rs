@@ -447,7 +447,7 @@ impl HandlerState {
         next
     }
 
-    pub(in crate::pane_terminals) fn pane_output_generation(
+    pub(crate) fn pane_output_generation(
         &self,
         session_name: &SessionName,
         pane_id: PaneId,
