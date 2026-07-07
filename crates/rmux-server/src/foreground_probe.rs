@@ -16,6 +16,7 @@ pub(crate) struct ForegroundProbeSeed {
     root_pid: Option<u32>,
     foreground_pid: Option<u32>,
     runtime_name: Option<String>,
+    shell_path: Option<String>,
     shell_name: Option<String>,
     profile_cwd: Option<String>,
     osc7_path: Option<String>,
@@ -71,20 +72,18 @@ pub(crate) fn capture_foreground_probe_seed(
             target.pane_index(),
         )
         .ok();
-    let shell_name = profile.and_then(|profile| {
+    let shell_path = profile
+        .as_ref()
+        .map(|profile| profile.shell().to_string_lossy().into_owned());
+    let shell_name = profile.as_ref().and_then(|profile| {
         profile
             .shell()
             .file_name()
             .and_then(|name| name.to_str())
             .map(str::to_owned)
     });
-    let profile_cwd = state
-        .pane_profile_in_window(
-            target.session_name(),
-            target.window_index(),
-            target.pane_index(),
-        )
-        .ok()
+    let profile_cwd = profile
+        .as_ref()
         .map(|profile| profile.cwd().to_string_lossy().into_owned());
     let osc7_path = state
         .pane_screen_state(target.session_name(), pane_id)
@@ -108,6 +107,7 @@ pub(crate) fn capture_foreground_probe_seed(
         root_pid,
         foreground_pid,
         runtime_name,
+        shell_path,
         shell_name,
         profile_cwd,
         osc7_path,
@@ -128,11 +128,14 @@ pub(crate) fn probe_foreground(seed: &ForegroundProbeSeed) -> ForegroundStateDto
     let cwd = foreground_cwd(seed);
     sources.cwd = cwd.as_ref().map(|(_, source)| *source);
 
+    let exe = foreground_exe(seed);
+    sources.exe = exe.as_ref().map(|(_, source)| *source);
+
     ForegroundStateDto {
         pid: pid.map(|(pid, _)| pid),
         command: command.map(|(command, _)| command),
         cwd: cwd.map(|(cwd, _)| cwd),
-        exe: None,
+        exe: exe.map(|(exe, _)| exe),
         sources,
     }
 }
@@ -213,6 +216,30 @@ fn foreground_command(seed: &ForegroundProbeSeed) -> Option<(String, ForegroundF
 }
 
 #[cfg(unix)]
+fn foreground_exe(seed: &ForegroundProbeSeed) -> Option<(String, ForegroundFieldSource)> {
+    seed.foreground_pid
+        .and_then(process::executable_path)
+        .map(|path| (path, ForegroundFieldSource::Process))
+        .or_else(|| {
+            seed.shell_path
+                .clone()
+                .map(|path| (path, ForegroundFieldSource::Profile))
+        })
+}
+
+#[cfg(windows)]
+fn foreground_exe(seed: &ForegroundProbeSeed) -> Option<(String, ForegroundFieldSource)> {
+    seed.root_pid
+        .and_then(process::executable_path)
+        .map(|path| (path, ForegroundFieldSource::RootProcess))
+        .or_else(|| {
+            seed.shell_path
+                .clone()
+                .map(|path| (path, ForegroundFieldSource::Profile))
+        })
+}
+
+#[cfg(unix)]
 fn foreground_cwd(seed: &ForegroundProbeSeed) -> Option<(String, ForegroundFieldSource)> {
     seed.foreground_pid
         .and_then(process::current_path)
@@ -264,4 +291,39 @@ fn foreground_cwd(seed: &ForegroundProbeSeed) -> Option<(String, ForegroundField
                 .clone()
                 .map(|path| (path, ForegroundFieldSource::Environment))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seed_with_profile_shell(shell_path: &str) -> ForegroundProbeSeed {
+        ForegroundProbeSeed {
+            pane_id: PaneId::new(1),
+            generation: 1,
+            root_pid: None,
+            foreground_pid: None,
+            runtime_name: None,
+            shell_path: Some(shell_path.to_owned()),
+            shell_name: Some("pwsh.exe".to_owned()),
+            profile_cwd: None,
+            osc7_path: None,
+            env_pwd: None,
+            env_home: None,
+            env_userprofile: None,
+        }
+    }
+
+    #[test]
+    fn probe_foreground_falls_back_to_profile_executable_path() {
+        let state = probe_foreground(&seed_with_profile_shell(
+            "C:/Program Files/PowerShell/7/pwsh.exe",
+        ));
+
+        assert_eq!(
+            state.exe.as_deref(),
+            Some("C:/Program Files/PowerShell/7/pwsh.exe")
+        );
+        assert_eq!(state.sources.exe, Some(ForegroundFieldSource::Profile));
+    }
 }

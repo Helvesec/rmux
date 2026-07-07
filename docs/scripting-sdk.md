@@ -56,8 +56,16 @@ Pane-local SDK metadata and state streams require the daemon capabilities
 `sdk.pane.options`, `sdk.pane.state_events`, and, when foreground process data
 is requested, `sdk.pane.foreground`. The foreground contract is best-effort:
 Unix reports the foreground process group when available, while Windows reports
-the ConPTY root process plus OSC7/process/profile cwd fallbacks without trying
-to classify agent names.
+the ConPTY root process plus OSC7/process/profile cwd fallbacks. The executable
+path is best-effort from the observed process, falling back to the configured
+profile shell when process inspection is unavailable; RMUX does not try to
+classify agent names.
+
+Pane-state `Closed` events are terminal stream events: explicit kill/remove
+operations and normal pane removal close the stream. A pane kept by
+`remain-on-exit` remains addressable, so the SDK does not synthesize a terminal
+`Closed` event for that retained pane; callers should inspect snapshots or pane
+metadata if they need to distinguish retained exited content from removed panes.
 
 ## Examples
 

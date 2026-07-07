@@ -6,10 +6,10 @@ use std::time::Duration;
 use rmux_core::{OptionMutationOutcome, PaneId};
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
-    ErrorResponse, PaneForegroundStateResponse, PaneOptionEntry, PaneStateCursorRequest,
-    PaneStateCursorResponse, PaneStateLagResponse, PaneStateSnapshot, PaneStateSubscriptionId,
-    PaneTarget, Response, RmuxError, SubscribePaneStateRequest, SubscribePaneStateResponse,
-    UnsubscribePaneStateRequest, UnsubscribePaneStateResponse,
+    ErrorResponse, ForegroundStateDto, PaneForegroundStateResponse, PaneOptionEntry,
+    PaneStateCursorRequest, PaneStateCursorResponse, PaneStateLagResponse, PaneStateSnapshot,
+    PaneStateSubscriptionId, PaneTarget, Response, RmuxError, SubscribePaneStateRequest,
+    SubscribePaneStateResponse, UnsubscribePaneStateRequest, UnsubscribePaneStateResponse,
 };
 
 use crate::foreground_probe::{
@@ -23,7 +23,10 @@ use crate::pane_terminals::HandlerState;
 use super::pane_support::resolve_pane_target_ref;
 use super::RequestHandler;
 
+#[cfg(not(test))]
 const PANE_STATE_WAIT_CAP: Duration = Duration::from_secs(25);
+#[cfg(test)]
+const PANE_STATE_WAIT_CAP: Duration = Duration::from_millis(50);
 const FOREGROUND_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const FOREGROUND_MAX_PANES_PER_TICK: usize = 32;
 
@@ -32,6 +35,42 @@ impl RequestHandler {
         self.pane_state_journal
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn lock_foreground_state_cache(
+        &self,
+    ) -> MutexGuard<'_, HashMap<PaneId, (u64, ForegroundStateDto)>> {
+        self.foreground_state_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn seed_foreground_state_cache(
+        &self,
+        pane_id: PaneId,
+        generation: u64,
+        state: ForegroundStateDto,
+    ) {
+        self.lock_foreground_state_cache()
+            .insert(pane_id, (generation, state));
+    }
+
+    fn replace_foreground_state_cache(
+        &self,
+        pane_id: PaneId,
+        generation: u64,
+        state: ForegroundStateDto,
+    ) -> Option<(u64, ForegroundStateDto)> {
+        self.lock_foreground_state_cache()
+            .insert(pane_id, (generation, state))
+    }
+
+    fn remove_foreground_state_cache(&self, pane_id: PaneId) {
+        self.lock_foreground_state_cache().remove(&pane_id);
+    }
+
+    fn clear_foreground_state_cache(&self) {
+        self.lock_foreground_state_cache().clear();
     }
 
     pub(in crate::handler) async fn handle_subscribe_pane_state(
@@ -63,7 +102,9 @@ impl RequestHandler {
         };
 
         if let Some(seed) = foreground_seed {
-            snapshot.foreground = Some(probe_foreground(&seed));
+            let foreground = probe_foreground(&seed);
+            self.seed_foreground_state_cache(seed.pane_id(), seed.generation(), foreground.clone());
+            snapshot.foreground = Some(foreground);
         }
         if include.foreground {
             self.start_foreground_watch_if_needed();
@@ -110,6 +151,9 @@ impl RequestHandler {
         };
 
         loop {
+            let notified = self.pane_state_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             let mut events = Vec::new();
             let read = {
                 let journal = self.lock_pane_state_journal();
@@ -128,22 +172,26 @@ impl RequestHandler {
                     event_count,
                     ..
                 }) if event_count > 0 || !request.wait => {
+                    if pane_state_events_include_closed(&events) {
+                        self.lock_pane_state_journal()
+                            .remove_closed_subscription(connection_id, request.subscription_id);
+                        self.pane_state_notify.notify_waiters();
+                    }
                     return Response::PaneStateCursor(PaneStateCursorResponse {
                         subscription_id: request.subscription_id,
                         events,
                         next_revision,
                     });
                 }
-                Ok(PaneStateRead::Ready { .. }) => {
-                    let notified = self.pane_state_notify.notified();
-                    if tokio::time::timeout(PANE_STATE_WAIT_CAP, notified)
+                Ok(PaneStateRead::Ready { next_revision, .. }) => {
+                    if tokio::time::timeout(PANE_STATE_WAIT_CAP, notified.as_mut())
                         .await
                         .is_err()
                     {
                         return Response::PaneStateCursor(PaneStateCursorResponse {
                             subscription_id: request.subscription_id,
                             events: Vec::new(),
-                            next_revision: request.after_revision,
+                            next_revision,
                         });
                     }
                 }
@@ -212,6 +260,9 @@ impl RequestHandler {
                 journal.mark_pane_closed(pane_id);
             }
         }
+        if closes_pane {
+            self.remove_foreground_state_cache(pane_id);
+        }
         self.pane_state_notify.notify_waiters();
     }
 
@@ -230,13 +281,14 @@ impl RequestHandler {
     }
 
     async fn watch_foreground_subscriptions(&self) {
-        let mut cache: HashMap<PaneId, (u64, rmux_proto::ForegroundStateDto)> = HashMap::new();
+        let mut foreground_cursor = 0;
         loop {
             let pane_ids = {
                 let journal = self.lock_pane_state_journal();
                 if journal.foreground_subscription_count() == 0 {
                     self.foreground_watch_started
                         .store(false, Ordering::Release);
+                    self.clear_foreground_state_cache();
                     if journal.foreground_subscription_count() == 0 {
                         return;
                     }
@@ -250,8 +302,9 @@ impl RequestHandler {
                 }
                 journal.pane_ids_with_foreground_subscriptions()
             };
+            let poll_batch = foreground_poll_batch(&pane_ids, &mut foreground_cursor);
 
-            for pane_id in pane_ids.into_iter().take(FOREGROUND_MAX_PANES_PER_TICK) {
+            for pane_id in poll_batch {
                 let seed = {
                     let state = self.state.lock().await;
                     let Some(target) = pane_target_for_pane_id(&state, pane_id) else {
@@ -263,21 +316,19 @@ impl RequestHandler {
                     }
                 };
                 let next = probe_foreground(&seed);
-                match cache.insert(pane_id, (seed.generation(), next.clone())) {
-                    Some((generation, previous))
-                        if generation == seed.generation()
-                            && foreground_state_changed(&previous, &next) =>
-                    {
-                        self.record_pane_state_change(
-                            pane_id,
-                            Some(seed.generation()),
-                            PaneStateChange::ForegroundChanged {
-                                old: previous,
-                                new: next,
-                            },
-                        );
-                    }
-                    _ => {}
+                let previous =
+                    self.replace_foreground_state_cache(pane_id, seed.generation(), next.clone());
+                if let Some(previous) =
+                    foreground_change_from_previous(previous, seed.generation(), &next)
+                {
+                    self.record_pane_state_change(
+                        pane_id,
+                        Some(seed.generation()),
+                        PaneStateChange::ForegroundChanged {
+                            old: previous,
+                            new: next,
+                        },
+                    );
                 }
             }
 
@@ -338,7 +389,9 @@ impl RequestHandler {
             pane_state_snapshot_locked(&state, &target, info.pane_id, info.include, revision)
         };
         if let Some(seed) = foreground_seed {
-            snapshot.foreground = Some(probe_foreground(&seed));
+            let foreground = probe_foreground(&seed);
+            self.seed_foreground_state_cache(seed.pane_id(), seed.generation(), foreground.clone());
+            snapshot.foreground = Some(foreground);
         }
         Ok(snapshot)
     }
@@ -438,9 +491,131 @@ fn state_cursor_limit(requested: Option<u16>) -> Result<usize, RmuxError> {
     }
 }
 
-fn foreground_state_changed(
-    previous: &rmux_proto::ForegroundStateDto,
-    next: &rmux_proto::ForegroundStateDto,
-) -> bool {
-    previous.pid != next.pid || previous.command != next.command || previous.cwd != next.cwd
+fn foreground_state_changed(previous: &ForegroundStateDto, next: &ForegroundStateDto) -> bool {
+    previous.pid != next.pid
+        || previous.command != next.command
+        || previous.cwd != next.cwd
+        || previous.exe != next.exe
+}
+
+fn pane_state_events_include_closed(events: &[rmux_proto::PaneStateEventDto]) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, rmux_proto::PaneStateEventDto::Closed { .. }))
+}
+
+fn foreground_change_from_previous(
+    previous: Option<(u64, ForegroundStateDto)>,
+    generation: u64,
+    next: &ForegroundStateDto,
+) -> Option<ForegroundStateDto> {
+    match previous {
+        Some((previous_generation, previous))
+            if previous_generation == generation && foreground_state_changed(&previous, next) =>
+        {
+            Some(previous)
+        }
+        _ => None,
+    }
+}
+
+fn foreground_poll_batch(pane_ids: &[PaneId], cursor: &mut usize) -> Vec<PaneId> {
+    if pane_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let count = pane_ids.len().min(FOREGROUND_MAX_PANES_PER_TICK);
+    let start = *cursor % pane_ids.len();
+    let mut batch = Vec::with_capacity(count);
+    for offset in 0..count {
+        batch.push(pane_ids[(start + offset) % pane_ids.len()]);
+    }
+    *cursor = (start + count) % pane_ids.len();
+    batch
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn foreground_state(pid: u32, command: &str, cwd: &str) -> ForegroundStateDto {
+        ForegroundStateDto {
+            pid: Some(pid),
+            command: Some(command.to_owned()),
+            cwd: Some(cwd.to_owned()),
+            exe: None,
+            sources: rmux_proto::ForegroundSourcesDto::default(),
+        }
+    }
+
+    fn foreground_state_with_exe(
+        pid: u32,
+        command: &str,
+        cwd: &str,
+        exe: &str,
+    ) -> ForegroundStateDto {
+        ForegroundStateDto {
+            exe: Some(exe.to_owned()),
+            sources: rmux_proto::ForegroundSourcesDto {
+                exe: Some(rmux_proto::ForegroundFieldSource::Process),
+                ..Default::default()
+            },
+            ..foreground_state(pid, command, cwd)
+        }
+    }
+
+    #[test]
+    fn foreground_poll_batch_rotates_beyond_first_thirty_two_panes() {
+        let pane_ids = (1..=40).map(PaneId::new).collect::<Vec<_>>();
+        let mut cursor = 0;
+
+        let first = foreground_poll_batch(&pane_ids, &mut cursor);
+        let second = foreground_poll_batch(&pane_ids, &mut cursor);
+
+        assert_eq!(first.len(), FOREGROUND_MAX_PANES_PER_TICK);
+        assert_eq!(first[0], PaneId::new(1));
+        assert!(first.contains(&PaneId::new(32)));
+        assert!(!first.contains(&PaneId::new(33)));
+        assert_eq!(second[0], PaneId::new(33));
+        assert!(second.contains(&PaneId::new(40)));
+        assert!(second.contains(&PaneId::new(1)));
+    }
+
+    #[test]
+    fn seeded_foreground_cache_exposes_first_transition() {
+        let handler = RequestHandler::new();
+        let pane_id = PaneId::new(7);
+        let old_state = foreground_state(10, "cmd", "C:/old");
+        let new_state = foreground_state(10, "cmd", "C:/new");
+
+        handler.seed_foreground_state_cache(pane_id, 3, old_state.clone());
+        let previous = handler
+            .replace_foreground_state_cache(pane_id, 3, new_state.clone())
+            .expect("seeded snapshot baseline is preserved");
+
+        assert_eq!(previous, (3, old_state.clone()));
+        assert_eq!(
+            foreground_change_from_previous(Some(previous), 3, &new_state),
+            Some(old_state)
+        );
+    }
+
+    #[test]
+    fn foreground_cache_ignores_generation_reset_as_transition() {
+        let old_state = foreground_state(10, "cmd", "C:/old");
+        let new_state = foreground_state(11, "cmd", "C:/new");
+
+        assert_eq!(
+            foreground_change_from_previous(Some((2, old_state)), 3, &new_state),
+            None
+        );
+    }
+
+    #[test]
+    fn foreground_state_changed_observes_executable_path() {
+        let old_state = foreground_state_with_exe(10, "cmd", "C:/work", "C:/Windows/cmd.exe");
+        let new_state = foreground_state_with_exe(10, "cmd", "C:/work", "C:/Tools/cmd.exe");
+
+        assert!(foreground_state_changed(&old_state, &new_state));
+    }
 }

@@ -1270,7 +1270,7 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         ACTIVE,
         "PaneOptionSetRequest",
         FrameFeature::Panes,
-        None,
+        Some("pane_option_set_request"),
         "SDK pane option mutation request; pinned bincode tag 121.",
     ),
     entry(
@@ -1279,7 +1279,7 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         ACTIVE,
         "PaneOptionGetRequest",
         FrameFeature::Panes,
-        None,
+        Some("pane_option_get_request"),
         "SDK pane option lookup request; pinned bincode tag 122.",
     ),
     entry(
@@ -1288,7 +1288,7 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         ACTIVE,
         "SubscribePaneStateRequest",
         FrameFeature::Panes,
-        None,
+        Some("subscribe_pane_state_request"),
         "SDK pane-state subscription request; pinned bincode tag 123.",
     ),
     entry(
@@ -1297,7 +1297,7 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         ACTIVE,
         "PaneStateCursorRequest",
         FrameFeature::Panes,
-        None,
+        Some("pane_state_cursor_request"),
         "SDK pane-state cursor request; pinned bincode tag 124.",
     ),
     entry(
@@ -1306,7 +1306,7 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         ACTIVE,
         "UnsubscribePaneStateRequest",
         FrameFeature::Panes,
-        None,
+        Some("unsubscribe_pane_state_request"),
         "SDK pane-state unsubscribe request; pinned bincode tag 125.",
     ),
     entry(
@@ -1315,7 +1315,7 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         ACTIVE,
         "PaneForegroundStateRequest",
         FrameFeature::Panes,
-        None,
+        Some("pane_foreground_state_request"),
         "SDK pane foreground-state request; pinned bincode tag 126.",
     ),
     // Reserved client→server slot. Removed values must be listed and never reused.
@@ -2190,7 +2190,7 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         ACTIVE,
         "PaneOptionSetResponse",
         FrameFeature::Panes,
-        None,
+        Some("pane_option_set_response"),
         "SDK pane option mutation response; pinned bincode tag 94.",
     ),
     entry(
@@ -2199,7 +2199,7 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         ACTIVE,
         "PaneOptionGetResponse",
         FrameFeature::Panes,
-        None,
+        Some("pane_option_get_response"),
         "SDK pane option lookup response; pinned bincode tag 95.",
     ),
     entry(
@@ -2208,7 +2208,7 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         ACTIVE,
         "SubscribePaneStateResponse",
         FrameFeature::Panes,
-        None,
+        Some("subscribe_pane_state_response"),
         "SDK pane-state subscription response; pinned bincode tag 96.",
     ),
     entry(
@@ -2217,7 +2217,7 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         ACTIVE,
         "PaneStateCursorResponse",
         FrameFeature::Panes,
-        None,
+        Some("pane_state_cursor_response"),
         "SDK pane-state cursor response; pinned bincode tag 97.",
     ),
     entry(
@@ -2226,7 +2226,7 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         ACTIVE,
         "PaneStateLagResponse",
         FrameFeature::Panes,
-        None,
+        Some("pane_state_lag_response"),
         "SDK pane-state lag response; pinned bincode tag 98.",
     ),
     entry(
@@ -2235,7 +2235,7 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         ACTIVE,
         "UnsubscribePaneStateResponse",
         FrameFeature::Panes,
-        None,
+        Some("unsubscribe_pane_state_response"),
         "SDK pane-state unsubscribe response; pinned bincode tag 99.",
     ),
     entry(
@@ -2244,7 +2244,7 @@ pub const V1_FRAME_LEDGER: &[FrameLedgerEntry] = &[
         ACTIVE,
         "PaneForegroundStateResponse",
         FrameFeature::Panes,
-        None,
+        Some("pane_foreground_state_response"),
         "SDK pane foreground-state response; pinned bincode tag 100.",
     ),
     // Reserved server→client slot. Removed values must be listed and never reused.

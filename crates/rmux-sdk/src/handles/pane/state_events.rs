@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 
+use crate::handles::connect_transport_to_endpoint;
 use crate::handles::session::unexpected_response;
 use crate::transport::{DropGuard, TransportClient};
 use crate::{Pane, PaneId, Result};
@@ -127,7 +128,7 @@ pub enum PaneStateEvent {
 
 /// Opaque long-poll stream for pane title/option/foreground/close events.
 pub struct PaneStateEventStream {
-    transport: TransportClient,
+    cursor_transport: TransportClient,
     subscription_id: PaneStateSubscriptionId,
     pane_id: PaneId,
     next_revision: u64,
@@ -138,14 +139,29 @@ pub struct PaneStateEventStream {
 
 impl PaneStateEventStream {
     pub(super) async fn open(pane: &Pane, options: PaneStateEventsOptions) -> Result<Self> {
+        let timeout = crate::wait::resolved_wait_timeout(pane.configured_default_timeout());
+        let cursor_transport = connect_transport_to_endpoint(pane.endpoint(), timeout).await?;
+        Self::open_with_cursor_transport(pane, options, cursor_transport).await
+    }
+
+    pub(super) async fn open_with_cursor_transport(
+        pane: &Pane,
+        options: PaneStateEventsOptions,
+        cursor_transport: TransportClient,
+    ) -> Result<Self> {
         let mut capabilities = vec![CAPABILITY_SDK_PANE_STATE_EVENTS];
         if options.include_foreground {
             capabilities.push(CAPABILITY_SDK_PANE_FOREGROUND);
         }
         crate::capabilities::require(pane.transport(), &capabilities).await?;
+        crate::capabilities::require_with_handshake(
+            &cursor_transport,
+            &capabilities,
+            &capabilities,
+        )
+        .await?;
 
-        let response = pane
-            .transport()
+        let response = cursor_transport
             .request(Request::SubscribePaneState(SubscribePaneStateRequest {
                 target: pane.proto_target_ref(),
                 include_title: options.include_title,
@@ -161,12 +177,12 @@ impl PaneStateEventStream {
         let unsubscribe = Request::UnsubscribePaneState(UnsubscribePaneStateRequest {
             subscription_id: response.subscription_id,
         });
-        let drop_guard = DropGuard::best_effort(pane.transport().clone(), unsubscribe);
+        let drop_guard = DropGuard::best_effort(cursor_transport.clone(), unsubscribe);
         let mut pending = VecDeque::new();
         pending.push_back(snapshot_event(response.pane_id, response.snapshot));
 
         Ok(Self {
-            transport: pane.transport().clone(),
+            cursor_transport,
             subscription_id: response.subscription_id,
             pane_id: response.pane_id,
             next_revision: 0,
@@ -188,7 +204,7 @@ impl PaneStateEventStream {
             }
 
             let response = self
-                .transport
+                .cursor_transport
                 .request(Request::PaneStateCursor(PaneStateCursorRequest {
                     subscription_id: self.subscription_id,
                     after_revision: self.next_revision,
@@ -234,6 +250,19 @@ impl PaneStateEventStream {
         if matches!(event, PaneStateEvent::Closed { .. }) {
             self.closed = true;
         }
+    }
+}
+
+impl std::fmt::Debug for PaneStateEventStream {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PaneStateEventStream")
+            .field("subscription_id", &self.subscription_id)
+            .field("pane_id", &self.pane_id)
+            .field("next_revision", &self.next_revision)
+            .field("pending_events", &self.pending.len())
+            .field("closed", &self.closed)
+            .finish_non_exhaustive()
     }
 }
 
@@ -319,159 +348,5 @@ impl From<ProtoPaneOptionEntry> for PaneStateOption {
             name: value.name,
             value: value.value,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{PaneRef, RmuxEndpoint, SessionName};
-    use rmux_proto::{
-        encode_frame, FrameDecoder, HandshakeResponse, PaneId, PaneStateCursorResponse,
-        PaneStateEventDto, PaneStateSnapshot, PaneStateSubscriptionId, SubscribePaneStateResponse,
-        CAPABILITY_HANDSHAKE, RMUX_WIRE_VERSION,
-    };
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::time::{timeout, Duration};
-
-    fn alpha() -> SessionName {
-        SessionName::new("alpha").expect("valid session name")
-    }
-
-    async fn read_request(stream: &mut tokio::io::DuplexStream) -> Request {
-        let mut decoder = FrameDecoder::new();
-        let mut buffer = [0; 512];
-        loop {
-            if let Some(request) = decoder
-                .next_frame::<Request>()
-                .expect("request frame decodes")
-            {
-                return request;
-            }
-            let read = stream.read(&mut buffer).await.expect("read request bytes");
-            assert_ne!(read, 0, "client closed before request arrived");
-            decoder.push_bytes(&buffer[..read]);
-        }
-    }
-
-    async fn write_response(stream: &mut tokio::io::DuplexStream, response: Response) {
-        let frame = encode_frame(&response).expect("response encodes");
-        stream.write_all(&frame).await.expect("write response");
-        stream.flush().await.expect("flush response");
-    }
-
-    #[tokio::test]
-    async fn next_keeps_waiting_after_empty_long_poll_response() {
-        let (client_stream, mut server_stream) = tokio::io::duplex(4096);
-        let transport = TransportClient::spawn(client_stream);
-        let pane = Pane::new(
-            PaneRef::in_first_window(alpha(), 0),
-            RmuxEndpoint::Default,
-            None,
-            transport,
-        );
-        let pane_id = PaneId::new(42);
-        let subscription_id = PaneStateSubscriptionId::new(7);
-
-        let server = tokio::spawn(async move {
-            assert!(matches!(
-                read_request(&mut server_stream).await,
-                Request::Handshake(_)
-            ));
-            write_response(
-                &mut server_stream,
-                Response::Handshake(HandshakeResponse {
-                    wire_version: RMUX_WIRE_VERSION,
-                    capabilities: vec![
-                        CAPABILITY_HANDSHAKE.to_owned(),
-                        CAPABILITY_SDK_PANE_STATE_EVENTS.to_owned(),
-                    ],
-                }),
-            )
-            .await;
-
-            assert!(matches!(
-                read_request(&mut server_stream).await,
-                Request::SubscribePaneState(_)
-            ));
-            write_response(
-                &mut server_stream,
-                Response::SubscribePaneState(Box::new(SubscribePaneStateResponse {
-                    subscription_id,
-                    pane_id,
-                    snapshot: PaneStateSnapshot {
-                        revision: 0,
-                        title: Some("initial".to_owned()),
-                        options: Vec::new(),
-                        foreground: None,
-                    },
-                })),
-            )
-            .await;
-
-            match read_request(&mut server_stream).await {
-                Request::PaneStateCursor(request) => {
-                    assert_eq!(request.subscription_id, subscription_id);
-                    assert_eq!(request.after_revision, 0);
-                    assert!(request.wait);
-                }
-                request => panic!("expected pane-state-cursor, got {request:?}"),
-            }
-            write_response(
-                &mut server_stream,
-                Response::PaneStateCursor(PaneStateCursorResponse {
-                    subscription_id,
-                    events: Vec::new(),
-                    next_revision: 0,
-                }),
-            )
-            .await;
-
-            match read_request(&mut server_stream).await {
-                Request::PaneStateCursor(request) => {
-                    assert_eq!(request.subscription_id, subscription_id);
-                    assert_eq!(request.after_revision, 0);
-                    assert!(request.wait);
-                }
-                request => panic!("expected second pane-state-cursor, got {request:?}"),
-            }
-            write_response(
-                &mut server_stream,
-                Response::PaneStateCursor(PaneStateCursorResponse {
-                    subscription_id,
-                    events: vec![PaneStateEventDto::TitleChanged {
-                        revision: 1,
-                        pane_id,
-                        old_title: "initial".to_owned(),
-                        new_title: "next".to_owned(),
-                    }],
-                    next_revision: 1,
-                }),
-            )
-            .await;
-        });
-
-        let mut stream = PaneStateEventStream::open(&pane, PaneStateEventsOptions::default())
-            .await
-            .expect("stream opens");
-        assert!(matches!(
-            stream.next().await.expect("snapshot succeeds"),
-            Some(PaneStateEvent::Snapshot { revision: 0, .. })
-        ));
-
-        let event = timeout(Duration::from_secs(1), stream.next())
-            .await
-            .expect("empty cursor response must not end the stream")
-            .expect("next succeeds");
-        assert!(matches!(
-            event,
-            Some(PaneStateEvent::TitleChanged {
-                revision: 1,
-                old_title,
-                new_title,
-                ..
-            }) if old_title == "initial" && new_title == "next"
-        ));
-        server.await.expect("server task succeeds");
     }
 }

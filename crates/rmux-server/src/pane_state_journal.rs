@@ -165,6 +165,20 @@ impl PaneStateJournal {
             .retain(|_, subscription| subscription.connection_id != connection_id);
     }
 
+    pub(crate) fn remove_closed_subscription(
+        &mut self,
+        connection_id: u64,
+        subscription_id: PaneStateSubscriptionId,
+    ) -> bool {
+        let Some(subscription) = self.subscriptions.get(&subscription_id) else {
+            return false;
+        };
+        if subscription.connection_id != connection_id || !subscription.closed {
+            return false;
+        }
+        self.subscriptions.remove(&subscription_id).is_some()
+    }
+
     pub(crate) fn mark_pane_closed(&mut self, pane_id: PaneId) {
         for subscription in self.subscriptions.values_mut() {
             if subscription.pane_id == pane_id {
@@ -515,5 +529,10 @@ mod tests {
                 ..
             }]
         ));
+        assert!(journal.remove_closed_subscription(7, subscription));
+        assert_eq!(
+            journal.read_after(7, subscription, 1, 16, &mut Vec::new()),
+            Err("subscription not found")
+        );
     }
 }

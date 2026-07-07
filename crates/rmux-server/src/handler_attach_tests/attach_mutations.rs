@@ -179,6 +179,56 @@ async fn switch_client_updates_the_tracked_session_for_follow_up_refreshes() {
 }
 
 #[tokio::test]
+async fn choose_tree_renders_after_cli_switch_client() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let alpha = session_name("alpha");
+    let beta = session_name("beta");
+    let mut control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: beta.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+    drain_attach_controls(&mut control_rx);
+
+    let switched = handler
+        .dispatch(
+            requester_pid,
+            Request::SwitchClient(SwitchClientRequest {
+                target: beta.clone(),
+            }),
+        )
+        .await
+        .response;
+    assert_eq!(
+        switched,
+        Response::SwitchClient(rmux_proto::SwitchClientResponse { session_name: beta })
+    );
+    let _ = recv_matching_attach_control(&mut control_rx, "switch to beta", |control| {
+        matches!(control, AttachControl::Switch(_))
+    })
+    .await;
+    drain_attach_controls(&mut control_rx);
+
+    handler
+        .handle_attached_live_input_for_test(requester_pid, b"\x02s")
+        .await
+        .expect("prefix s opens choose-tree after switch-client");
+
+    let overlay = recv_overlay_frame(&mut control_rx, "choose-tree after switch-client").await;
+    assert!(
+        overlay.contains("sort:") && overlay.contains("alpha") && overlay.contains("beta"),
+        "choose-tree should render sessions after CLI switch-client, got: {overlay:?}"
+    );
+}
+
+#[tokio::test]
 async fn terminal_feature_mutations_refresh_attached_targets_with_client_context() {
     let handler = RequestHandler::new();
     let requester_pid = 42;

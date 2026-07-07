@@ -199,6 +199,8 @@ pub(crate) struct RequestHandler {
     pane_state_journal: Arc<StdMutex<PaneStateJournal>>,
     pane_state_notify: Arc<Notify>,
     foreground_watch_started: Arc<AtomicBool>,
+    foreground_state_cache:
+        Arc<StdMutex<HashMap<rmux_core::PaneId, (u64, rmux_proto::ForegroundStateDto)>>>,
     #[cfg(all(any(unix, windows), feature = "web"))]
     web_shares: Arc<WebShareRegistry>,
     #[cfg(all(any(unix, windows), feature = "web"))]
@@ -254,6 +256,7 @@ impl Clone for RequestHandler {
             pane_state_journal: self.pane_state_journal.clone(),
             pane_state_notify: self.pane_state_notify.clone(),
             foreground_watch_started: self.foreground_watch_started.clone(),
+            foreground_state_cache: self.foreground_state_cache.clone(),
             #[cfg(all(any(unix, windows), feature = "web"))]
             web_shares: self.web_shares.clone(),
             #[cfg(all(any(unix, windows), feature = "web"))]
@@ -300,6 +303,8 @@ pub(crate) struct WeakRequestHandler {
     pane_state_journal: Weak<StdMutex<PaneStateJournal>>,
     pane_state_notify: Weak<Notify>,
     foreground_watch_started: Weak<AtomicBool>,
+    foreground_state_cache:
+        Weak<StdMutex<HashMap<rmux_core::PaneId, (u64, rmux_proto::ForegroundStateDto)>>>,
     #[cfg(all(any(unix, windows), feature = "web"))]
     web_shares: Weak<WebShareRegistry>,
     #[cfg(all(any(unix, windows), feature = "web"))]
@@ -343,6 +348,7 @@ impl WeakRequestHandler {
             pane_state_journal: self.pane_state_journal.upgrade()?,
             pane_state_notify: self.pane_state_notify.upgrade()?,
             foreground_watch_started: self.foreground_watch_started.upgrade()?,
+            foreground_state_cache: self.foreground_state_cache.upgrade()?,
             #[cfg(all(any(unix, windows), feature = "web"))]
             web_shares: self.web_shares.upgrade()?,
             #[cfg(all(any(unix, windows), feature = "web"))]
@@ -502,6 +508,7 @@ impl RequestHandler {
             pane_state_journal: Arc::new(StdMutex::new(PaneStateJournal::default())),
             pane_state_notify: Arc::new(Notify::new()),
             foreground_watch_started: Arc::new(AtomicBool::new(false)),
+            foreground_state_cache: Arc::new(StdMutex::new(HashMap::new())),
             #[cfg(all(any(unix, windows), feature = "web"))]
             web_shares: Arc::new(WebShareRegistry::default()),
             #[cfg(all(any(unix, windows), feature = "web"))]
@@ -549,6 +556,7 @@ impl RequestHandler {
             pane_state_journal: Arc::downgrade(&self.pane_state_journal),
             pane_state_notify: Arc::downgrade(&self.pane_state_notify),
             foreground_watch_started: Arc::downgrade(&self.foreground_watch_started),
+            foreground_state_cache: Arc::downgrade(&self.foreground_state_cache),
             #[cfg(all(any(unix, windows), feature = "web"))]
             web_shares: Arc::downgrade(&self.web_shares),
             #[cfg(all(any(unix, windows), feature = "web"))]
@@ -752,3 +760,7 @@ mod pane_pipe_tests;
 #[cfg(test)]
 #[path = "handler_pane_exit_format_tests.rs"]
 mod pane_exit_format_tests;
+
+#[cfg(test)]
+#[path = "handler_pane_state_tests.rs"]
+mod pane_state_tests;

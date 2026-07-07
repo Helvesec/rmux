@@ -138,6 +138,10 @@ pub(super) fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
 }
 
 pub(super) fn command_name(pid: u32) -> io::Result<Option<String>> {
+    Ok(executable_path(pid)?.and_then(|path| super::executable_name(&path)))
+}
+
+pub(super) fn executable_path(pid: u32) -> io::Result<Option<String>> {
     let handle = unsafe {
         // SAFETY: OpenProcess validates the pid and returns either a handle or null.
         OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
@@ -157,8 +161,7 @@ pub(super) fn command_name(pid: u32) -> io::Result<Option<String>> {
         return Err(io::Error::last_os_error());
     }
     buffer.truncate(usize::try_from(len).map_err(|_| io::ErrorKind::InvalidData)?);
-    let path = wide_to_string_lossy(&buffer);
-    Ok(super::executable_name(&path))
+    Ok(Some(wide_to_string_lossy(&buffer)))
 }
 
 pub(super) fn descendant_command_names(pid: u32) -> io::Result<Vec<String>> {

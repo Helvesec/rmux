@@ -38,6 +38,11 @@ impl ProcessInspector {
         command_name_impl(pid)
     }
 
+    /// Returns the executable path for `pid`, when available.
+    pub fn executable_path(&self, pid: u32) -> io::Result<Option<String>> {
+        executable_path_impl(pid)
+    }
+
     /// Returns the path for a process file descriptor, when available.
     pub fn fd_path(&self, pid: u32, fd: i32) -> io::Result<Option<PathBuf>> {
         if fd < 0 {
@@ -85,6 +90,12 @@ pub fn current_path(pid: u32) -> Option<String> {
 #[must_use]
 pub fn command_name(pid: u32) -> Option<String> {
     ProcessInspector.command_name(pid).ok().flatten()
+}
+
+/// Returns the executable path for `pid`, when available.
+#[must_use]
+pub fn executable_path(pid: u32) -> Option<String> {
+    ProcessInspector.executable_path(pid).ok().flatten()
 }
 
 /// Returns the path for a process file descriptor, when the platform exposes it.
@@ -172,6 +183,15 @@ fn linux_cwd_path_string(path: PathBuf) -> String {
 #[cfg(target_os = "linux")]
 fn command_name_impl(pid: u32) -> io::Result<Option<String>> {
     Ok(command_name_from_linux_cmdline(pid).or_else(|| command_name_from_linux_comm(pid)))
+}
+
+#[cfg(target_os = "linux")]
+fn executable_path_impl(pid: u32) -> io::Result<Option<String>> {
+    match std::fs::read_link(format!("/proc/{pid}/exe")) {
+        Ok(path) => Ok(Some(path.to_string_lossy().into_owned())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -269,7 +289,17 @@ fn command_name_impl(pid: u32) -> io::Result<Option<String>> {
 }
 
 #[cfg(target_os = "macos")]
+fn executable_path_impl(pid: u32) -> io::Result<Option<String>> {
+    Ok(macos_pidpath(pid))
+}
+
+#[cfg(target_os = "macos")]
 fn command_name_from_macos_pidpath(pid: u32) -> Option<String> {
+    executable_name(&macos_pidpath(pid)?)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_pidpath(pid: u32) -> Option<String> {
     let mut buffer = [0 as libc::c_char; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     let written = unsafe {
         // SAFETY: `buffer` is writable for the size passed to `proc_pidpath`.
@@ -282,7 +312,7 @@ fn command_name_from_macos_pidpath(pid: u32) -> Option<String> {
     if written <= 0 {
         return None;
     }
-    executable_name(&string_from_c_chars(buffer.as_ptr())?)
+    string_from_c_chars(buffer.as_ptr())
 }
 
 #[cfg(target_os = "macos")]
@@ -389,6 +419,11 @@ fn current_path_impl(pid: u32) -> io::Result<Option<String>> {
 #[cfg(windows)]
 fn command_name_impl(pid: u32) -> io::Result<Option<String>> {
     windows_process::command_name(pid)
+}
+
+#[cfg(windows)]
+fn executable_path_impl(pid: u32) -> io::Result<Option<String>> {
+    windows_process::executable_path(pid)
 }
 
 #[cfg(windows)]
