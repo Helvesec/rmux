@@ -1,9 +1,10 @@
+use rmux_core::LifecycleEvent;
 use rmux_proto::{
     DaemonStatusResponse, KillServerResponse, Response, ShutdownIfIdleResponse, RMUX_WIRE_VERSION,
 };
 use std::sync::atomic::Ordering;
 
-use super::{PendingShutdownReason, RequestHandler};
+use super::{prepare_lifecycle_event, PendingShutdownReason, RequestHandler};
 
 impl RequestHandler {
     pub(in crate::handler) async fn handle_daemon_status(
@@ -46,10 +47,33 @@ impl RequestHandler {
     }
 
     pub(in crate::handler) async fn handle_kill_server(&self) -> Response {
+        let queued_lifecycle_events = {
+            let mut state = self.state.lock().await;
+            let sessions = state
+                .sessions
+                .iter()
+                .map(|(session_name, session)| (session_name.clone(), session.id()))
+                .collect::<Vec<_>>();
+            sessions
+                .into_iter()
+                .map(|(session_name, session_id)| {
+                    prepare_lifecycle_event(
+                        &mut state,
+                        &LifecycleEvent::SessionClosed {
+                            session_name,
+                            session_id: Some(session_id.as_u32()),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         self.retained_exited_outputs
             .lock()
             .expect("retained exited output mutex must not be poisoned")
             .clear();
+        for event in queued_lifecycle_events {
+            self.emit_prepared(event);
+        }
         self.queue_shutdown_request(PendingShutdownReason::KillServer);
         Response::KillServer(KillServerResponse)
     }

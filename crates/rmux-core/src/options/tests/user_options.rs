@@ -394,6 +394,58 @@ fn window_unset_reports_related_pane_override_mutations() {
 }
 
 #[test]
+fn failed_window_set_does_not_clear_pane_overrides() {
+    let mut store = OptionStore::new();
+    let session = session_name("alpha");
+    let window = WindowTarget::with_window(session.clone(), 0);
+    let pane = PaneTarget::with_window(session.clone(), 0, 1);
+
+    store
+        .set_by_name(
+            OptionScopeSelector::Window(window.clone()),
+            "@agent.state",
+            Some("window".to_owned()),
+            SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect("window option set succeeds");
+    store
+        .set_by_name(
+            OptionScopeSelector::Pane(pane),
+            "@agent.state",
+            Some("pane".to_owned()),
+            SetOptionMode::Replace,
+            false,
+            false,
+            false,
+        )
+        .expect("pane option set succeeds");
+
+    let error = store
+        .set_by_name(
+            OptionScopeSelector::Window(window),
+            "@agent.state",
+            Some("next".to_owned()),
+            SetOptionMode::Replace,
+            true,
+            false,
+            true,
+        )
+        .expect_err("only-if-unset should reject the existing window option");
+
+    assert_eq!(
+        error,
+        RmuxError::InvalidSetOption("@agent.state is already set".to_owned())
+    );
+    assert_eq!(
+        store.resolve_name_for_pane(&session, 0, 1, "@agent.state"),
+        Some("pane".to_owned())
+    );
+}
+
+#[test]
 fn pane_overrides_follow_pane_index_remap() {
     let mut store = OptionStore::new();
     let alpha = session_name("alpha");

@@ -62,10 +62,9 @@ profile shell when process inspection is unavailable; RMUX does not try to
 classify agent names.
 
 Pane-state `Closed` events are terminal stream events: explicit kill/remove
-operations and normal pane removal close the stream. A pane kept by
-`remain-on-exit` remains addressable, so the SDK does not synthesize a terminal
-`Closed` event for that retained pane; callers should inspect snapshots or pane
-metadata if they need to distinguish retained exited content from removed panes.
+operations, normal pane removal, and panes retained by `remain-on-exit` close
+the stream. Retained panes use `PaneStateClosedReason::DiedKept`; the pane
+remains addressable for snapshots and captures after the state stream closes.
 
 ## Examples
 

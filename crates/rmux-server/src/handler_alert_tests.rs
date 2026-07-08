@@ -433,7 +433,14 @@ async fn assert_no_lifecycle_hooks(
 }
 
 fn is_lifecycle_noise(hook_name: HookName) -> bool {
-    matches!(hook_name, HookName::PaneTitleChanged)
+    matches!(
+        hook_name,
+        HookName::ClientActive
+            | HookName::ClientFocusIn
+            | HookName::ClientFocusOut
+            | HookName::PaneSetClipboard
+            | HookName::PaneTitleChanged
+    )
 }
 
 async fn recv_attach_control(
@@ -801,6 +808,7 @@ async fn pane_state_title_alert_ignores_stale_generation() {
                             | PaneStateEventDto::Closed { revision, .. } => {
                                 after_revision = after_revision.max(revision);
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -848,6 +856,204 @@ async fn pane_state_title_alert_ignores_stale_generation() {
         ),
         response => panic!("pane-state-cursor failed: {response:?}"),
     }
+}
+
+#[tokio::test]
+async fn pane_state_reports_pane_option_unset_from_handler() {
+    let handler = RequestHandler::new();
+    let session = create_session(&handler, "pane-option-unset-handler").await;
+    let target = PaneTarget::with_window(session.clone(), 0, 0);
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0).map(|pane| pane.id()))
+            .expect("pane exists")
+    };
+    let subscription_id = match handler
+        .handle_subscribe_pane_state(
+            72,
+            SubscribePaneStateRequest {
+                target: PaneTargetRef::slot(target.clone()),
+                include_title: false,
+                include_options: true,
+                include_foreground: false,
+            },
+        )
+        .await
+    {
+        Response::SubscribePaneState(response) => response.subscription_id,
+        response => panic!("subscribe-pane-state failed: {response:?}"),
+    };
+
+    let set = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::Pane(target.clone()),
+            name: "@agent.state".to_owned(),
+            value: Some("waiting".to_owned()),
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: false,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    assert!(matches!(set, Response::SetOptionByName(_)), "{set:?}");
+
+    let unset = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::Pane(target),
+            name: "@agent.state".to_owned(),
+            value: None,
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: true,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    assert!(matches!(unset, Response::SetOptionByName(_)), "{unset:?}");
+
+    let cursor = handler
+        .handle_pane_state_cursor(
+            72,
+            PaneStateCursorRequest {
+                subscription_id,
+                after_revision: 0,
+                wait: false,
+                max_events: Some(16),
+            },
+        )
+        .await;
+    let Response::PaneStateCursor(cursor) = cursor else {
+        panic!("pane-state-cursor failed: {cursor:?}");
+    };
+    assert!(cursor.events.iter().any(|event| matches!(
+        event,
+        PaneStateEventDto::OptionUnset {
+            pane_id: event_pane_id,
+            name,
+            old_value,
+            ..
+        } if *event_pane_id == pane_id
+            && name == "@agent.state"
+            && old_value.as_deref() == Some("waiting")
+    )));
+}
+
+#[tokio::test]
+async fn pane_state_reports_related_pane_option_unset_from_window_mass_unset() {
+    let handler = RequestHandler::new();
+    let session = create_session(&handler, "pane-option-related-unset").await;
+    let target = PaneTarget::with_window(session.clone(), 0, 0);
+    let window = WindowTarget::with_window(session.clone(), 0);
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(0).map(|pane| pane.id()))
+            .expect("pane exists")
+    };
+    let subscription_id = match handler
+        .handle_subscribe_pane_state(
+            73,
+            SubscribePaneStateRequest {
+                target: PaneTargetRef::slot(target.clone()),
+                include_title: false,
+                include_options: true,
+                include_foreground: false,
+            },
+        )
+        .await
+    {
+        Response::SubscribePaneState(response) => response.subscription_id,
+        response => panic!("subscribe-pane-state failed: {response:?}"),
+    };
+
+    let set_window = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::Window(window.clone()),
+            name: "@agent.state".to_owned(),
+            value: Some("window".to_owned()),
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: false,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    assert!(
+        matches!(set_window, Response::SetOptionByName(_)),
+        "{set_window:?}"
+    );
+    let set_pane = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::Pane(target),
+            name: "@agent.state".to_owned(),
+            value: Some("pane".to_owned()),
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: false,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    assert!(
+        matches!(set_pane, Response::SetOptionByName(_)),
+        "{set_pane:?}"
+    );
+
+    let unset_window = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::Window(window),
+            name: "@agent.state".to_owned(),
+            value: None,
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: true,
+            unset_pane_overrides: true,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    assert!(
+        matches!(unset_window, Response::SetOptionByName(_)),
+        "{unset_window:?}"
+    );
+
+    let cursor = handler
+        .handle_pane_state_cursor(
+            73,
+            PaneStateCursorRequest {
+                subscription_id,
+                after_revision: 0,
+                wait: false,
+                max_events: Some(16),
+            },
+        )
+        .await;
+    let Response::PaneStateCursor(cursor) = cursor else {
+        panic!("pane-state-cursor failed: {cursor:?}");
+    };
+    assert!(cursor.events.iter().any(|event| matches!(
+        event,
+        PaneStateEventDto::OptionUnset {
+            pane_id: event_pane_id,
+            name,
+            old_value,
+            ..
+        } if *event_pane_id == pane_id
+            && name == "@agent.state"
+            && old_value.as_deref() == Some("pane")
+    )));
 }
 
 #[tokio::test]

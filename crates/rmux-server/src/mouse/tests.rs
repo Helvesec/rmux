@@ -521,6 +521,8 @@ fn border_drag_stays_routed_to_border_after_cursor_moves_into_pane() {
     )
     .expect("first drag");
     assert_eq!(first_drag.event.location, MouseLocation::Border);
+    assert_eq!(first_drag.event.raw.lx, 41);
+    assert_eq!(first_drag.event.raw.ly, 6);
     assert_eq!(
         first_drag.key,
         key_string_lookup_string("MouseDrag1Border").unwrap()
@@ -544,6 +546,8 @@ fn border_drag_stays_routed_to_border_after_cursor_moves_into_pane() {
     )
     .expect("later drag");
     assert_eq!(later_drag.event.location, MouseLocation::Border);
+    assert_eq!(later_drag.event.raw.lx, 39);
+    assert_eq!(later_drag.event.raw.ly, 6);
     assert_eq!(
         later_drag.key,
         key_string_lookup_string("MouseDrag1Border").unwrap()

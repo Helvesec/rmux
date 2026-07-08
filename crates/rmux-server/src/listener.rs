@@ -503,7 +503,9 @@ fn request_cancels_on_peer_disconnect(request: &Request) -> bool {
             if matches!(wait.mode, WaitForMode::Wait | WaitForMode::Lock)
     ) || matches!(
         request,
-        Request::SdkWaitForOutput(_) | Request::SdkWaitForOutputRef(_)
+        Request::SdkWaitForOutput(_)
+            | Request::SdkWaitForOutputRef(_)
+            | Request::PaneStateCursor(rmux_proto::PaneStateCursorRequest { wait: true, .. })
     )
 }
 
@@ -580,12 +582,12 @@ mod tests {
     use super::*;
     use crate::server_access::AccessMode;
     use rmux_proto::{
-        CancelSdkWaitResponse, DaemonStatusRequest, ErrorResponse, HandshakeRequest,
-        ListSessionsRequest, NewSessionRequest, PaneOutputSubscriptionStart, PaneTarget,
-        RenameSessionRequest, RmuxError, SdkWaitForOutputRequest, SdkWaitForOutputResponse,
-        SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId, SessionName, ShutdownIfIdleRequest,
-        ShutdownIfIdleResponse, TerminalSize, WaitForMode, WaitForRequest, WaitForResponse,
-        RMUX_WIRE_VERSION,
+        AttachSessionRequest, CancelSdkWaitResponse, DaemonStatusRequest, ErrorResponse,
+        HandshakeRequest, ListSessionsRequest, NewSessionRequest, PaneOutputSubscriptionStart,
+        PaneTarget, RenameSessionRequest, RmuxError, SdkWaitForOutputRequest,
+        SdkWaitForOutputResponse, SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId, SessionName,
+        ShutdownIfIdleRequest, ShutdownIfIdleResponse, TerminalSize, WaitForMode, WaitForRequest,
+        WaitForResponse, RMUX_WIRE_VERSION,
     };
 
     #[tokio::test]
@@ -930,6 +932,48 @@ mod tests {
             })
         ));
         assert!(read_task.await.expect("read task")?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attach_upgrade_preserves_only_already_read_bounded_remainder() -> io::Result<()> {
+        let (server, mut client) = LocalStream::pair()?;
+        let mut connection = Connection::new(server);
+        let read_capacity = connection.read_buffer.len();
+        let mut bytes = encode_frame(&Request::AttachSession(AttachSessionRequest {
+            target: SessionName::new("alpha").expect("valid session"),
+        }))
+        .map_err(io::Error::other)?;
+        let extra = vec![b'x'; read_capacity + 256];
+        bytes.extend_from_slice(&extra);
+
+        let writer = tokio::spawn(async move {
+            client.write_all(&bytes).await?;
+            client.shutdown().await
+        });
+
+        let request = tokio::time::timeout(Duration::from_secs(5), connection.read_request())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "read_request timed out"))??;
+        assert!(matches!(request, Some(Request::AttachSession(_))));
+        let (mut stream, buffered_bytes) = connection.into_raw_parts();
+        let mut stream_remainder = Vec::new();
+        stream.read_to_end(&mut stream_remainder).await?;
+        writer.await.expect("writer task")?;
+
+        assert!(
+            buffered_bytes.len() <= read_capacity,
+            "attach upgrade remainder must be bounded by the server read buffer"
+        );
+        assert!(
+            buffered_bytes.len() < extra.len(),
+            "bytes not yet read by the detached decoder must remain in the stream"
+        );
+        assert_eq!(&buffered_bytes, &extra[..buffered_bytes.len()]);
+
+        let mut observed_extra = buffered_bytes;
+        observed_extra.extend_from_slice(&stream_remainder);
+        assert_eq!(observed_extra, extra);
         Ok(())
     }
 

@@ -12,6 +12,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+$assertCargoFilter = Join-Path $PSScriptRoot "assert-cargo-filter-nonempty.ps1"
 
 function Fail([string]$Message) {
     Write-Error "error: $Message"
@@ -33,6 +34,14 @@ function Invoke-NativeCapture([string]$Program, [string[]]$Arguments) {
     [pscustomobject]@{
         Output = $output
         Status = $status
+    }
+}
+
+function Assert-CargoFilter([int]$MinTests, [string[]]$CargoArguments) {
+    $arguments = @([string]$MinTests, "--") + $CargoArguments
+    & $assertCargoFilter @arguments
+    if ($LASTEXITCODE -ne 0) {
+        Fail "cargo filter check failed for cargo $($CargoArguments -join ' ')"
     }
 }
 
@@ -101,17 +110,14 @@ function NewPortableAliasSmoke([string]$Binary, [string]$Root) {
     try {
         New-Item -ItemType SymbolicLink -Path $alias -Target $Binary -ErrorAction Stop | Out-Null
     } catch {
-        Copy-Item -LiteralPath (Split-Path -Parent $Binary) -Destination $links -Recurse -Force
-        $copied = Join-Path $links (Join-Path ([System.IO.Path]::GetFileName((Split-Path -Parent $Binary))) ([System.IO.Path]::GetFileName($Binary)))
-        if (-not (Test-Path -LiteralPath $copied -PathType Leaf)) {
-            Fail "failed to create portable alias smoke copy after symlink failure: $_"
-        }
-        $alias = $copied
+        Fail "portable alias smoke requires a symlink alias and could not create one: $($_.Exception.Message)"
     }
 
     [pscustomobject]@{
+        Available = $true
         Binary = $alias
         Directory = Split-Path -Parent $alias
+        Reason = ""
     }
 }
 
@@ -165,6 +171,15 @@ function InvokeSdkWindowsSmoke([string]$Binary) {
     $previousBinary = $env:RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN
     try {
         $env:RMUX_SDK_WINDOWS_SMOKE_RMUX_BIN = [System.IO.Path]::GetFullPath($Binary)
+        Assert-CargoFilter 1 @(
+            "test",
+            "--locked",
+            "-p",
+            "rmux-sdk",
+            "--test",
+            "smoke_v1_windows",
+            "daemon_backed_sdk_windows_happy_path_uses_named_pipe_and_cleans_daemon"
+        )
         & cargo @(
             "test",
             "--locked",
@@ -217,9 +232,16 @@ function InvokeCtrlMatrixSmoke([string]$Binary) {
         & (Join-Path $PSScriptRoot "windows_ctrl_matrix.ps1") `
             -Rmux ([System.IO.Path]::GetFullPath($Binary)) `
             -OutDir $outDir `
-            -PortableSmokeOnly
+            -PortableSmokeOnly `
+            -AllowPortableSmokeSkip
         if ($LASTEXITCODE -ne 0) {
             Fail "Windows Ctrl matrix package smoke failed with exit code $LASTEXITCODE"
+        }
+        if (Test-Path (Join-Path $outDir "portable-smoke.skip.txt")) {
+            Write-Warning "windows ctrl-matrix portable smoke skipped (non-interactive session); run it manually on an interactive Windows session before tagging (RELEASING.md)"
+            if ($env:GITHUB_ACTIONS) {
+                Write-Host "::warning::windows ctrl-matrix portable smoke skipped (non-interactive session); run it manually on an interactive Windows session before tagging (RELEASING.md)"
+            }
         }
     } finally {
         Remove-Item -LiteralPath $outDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -359,6 +381,9 @@ try {
     $portableAlias = $null
     if ($RunBinary -or $RunDaemonSmoke) {
         $portableAlias = NewPortableAliasSmoke $binary $tmpRoot
+        if (-not $portableAlias.Available) {
+            Fail "portable alias smoke unexpectedly returned unavailable: $($portableAlias.Reason)"
+        }
     }
 
     if ($RunBinary) {
@@ -367,12 +392,14 @@ try {
         AssertSuccess $helperBinary @("-V") | Out-Null
         AssertDaemonBinary $daemonBinary
         AssertSuccess $binary @("diagnose", "--json") | Out-Null
-        AssertSuccess $portableAlias.Binary @("-V") | Out-Null
-        AssertHelperFallback $portableAlias.Binary
-        AssertSuccess $portableAlias.Binary @("diagnose", "--json") | Out-Null
-        InvokeWithPathPrefix $portableAlias.Directory {
-            AssertHelperFallback "rmux"
-            AssertSuccess "rmux" @("diagnose", "--json") | Out-Null
+        if ($portableAlias.Available) {
+            AssertSuccess $portableAlias.Binary @("-V") | Out-Null
+            AssertHelperFallback $portableAlias.Binary
+            AssertSuccess $portableAlias.Binary @("diagnose", "--json") | Out-Null
+            InvokeWithPathPrefix $portableAlias.Directory {
+                AssertHelperFallback "rmux"
+                AssertSuccess "rmux" @("diagnose", "--json") | Out-Null
+            }
         }
         InvokeWithPackageOnlyPath $packageRoot {
             AssertSuccess "rmux" @("-V") | Out-Null
@@ -435,18 +462,20 @@ try {
             & $binary "-L" $fallbackLabel "kill-server" | Out-Null
         }
 
-        $portableAliasLabel = "package-alias-smoke-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-        try {
-            InvokeWithPathPrefix $portableAlias.Directory {
-                AssertSuccessNoCapture "rmux" @("-L", $portableAliasLabel, "new-session", "-d", "-s", "package_alias_smoke", "cmd.exe", "/d", "/q", "/k")
-                $sessions = AssertSuccess "rmux" @("-L", $portableAliasLabel, "list-sessions", "-F", "#{session_name}")
-                if (($sessions -join "`n") -notmatch 'package_alias_smoke') {
-                    Fail "portable alias daemon smoke did not list package_alias_smoke session"
+        if ($portableAlias.Available) {
+            $portableAliasLabel = "package-alias-smoke-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+            try {
+                InvokeWithPathPrefix $portableAlias.Directory {
+                    AssertSuccessNoCapture "rmux" @("-L", $portableAliasLabel, "new-session", "-d", "-s", "package_alias_smoke", "cmd.exe", "/d", "/q", "/k")
+                    $sessions = AssertSuccess "rmux" @("-L", $portableAliasLabel, "list-sessions", "-F", "#{session_name}")
+                    if (($sessions -join "`n") -notmatch 'package_alias_smoke') {
+                        Fail "portable alias daemon smoke did not list package_alias_smoke session"
+                    }
                 }
-            }
-        } finally {
-            InvokeWithPathPrefix $portableAlias.Directory {
-                & "rmux" "-L" $portableAliasLabel "kill-server" | Out-Null
+            } finally {
+                InvokeWithPathPrefix $portableAlias.Directory {
+                    & "rmux" "-L" $portableAliasLabel "kill-server" | Out-Null
+                }
             }
         }
     }

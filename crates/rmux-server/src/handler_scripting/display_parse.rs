@@ -569,7 +569,7 @@ fn verbose_token_is_simple_variable(token: &str) -> bool {
 }
 
 fn is_display_message_compact_cluster(flag: &str) -> bool {
-    parse_compact_flag_cluster(flag, "aIlNpv", "cdFt").is_some()
+    parse_compact_flag_cluster(flag, "aCIlNpv", "cdFt").is_some()
 }
 
 fn display_all_formats_template() -> String {

@@ -1,4 +1,5 @@
 use super::*;
+use rmux_proto::{ErrorResponse, RmuxError};
 #[tokio::test]
 async fn run_shell_foreground_returns_stdout_like_tmux() {
     let handler = RequestHandler::new();
@@ -217,6 +218,89 @@ async fn queued_run_shell_command_mode_ignores_positional_arguments_like_tmux() 
             .expect("show-buffer output")
             .stdout(),
         b"-"
+    );
+}
+
+#[tokio::test]
+async fn run_shell_command_mode_attach_session_requires_terminal_like_tmux() {
+    let handler = RequestHandler::new();
+    create_named_session(&handler, "run-shell-attach-target").await;
+
+    let response = handler
+        .handle(Request::RunShell(Box::new(RunShellRequest {
+            command: "attach-session -t run-shell-attach-target".to_owned(),
+            arguments: Vec::new(),
+            background: false,
+            as_commands: true,
+            show_stderr: false,
+            delay_seconds: None,
+            start_directory: None,
+            target: None,
+            source_depth: None,
+        })))
+        .await;
+
+    assert!(matches!(
+        response,
+        Response::Error(ErrorResponse {
+            error: RmuxError::Server(message)
+        }) if message == "open terminal failed: not a terminal"
+    ));
+}
+
+#[tokio::test]
+async fn run_shell_command_mode_rejects_nested_and_implicit_attach_like_tmux() {
+    // Oracle probe 2026-07-08: tmux 3.7b fails run-shell -C with
+    // "open terminal failed: not a terminal" for attach-session nested in a
+    // brace body and for a non-detached new-session (and creates nothing).
+    let handler = RequestHandler::new();
+    create_named_session(&handler, "run-shell-nested-attach").await;
+
+    for command in [
+        "if-shell -F 1 { attach-session -t run-shell-nested-attach }",
+        "new-session",
+    ] {
+        let response = handler
+            .handle(Request::RunShell(Box::new(RunShellRequest {
+                command: command.to_owned(),
+                arguments: Vec::new(),
+                background: false,
+                as_commands: true,
+                show_stderr: false,
+                delay_seconds: None,
+                start_directory: None,
+                target: None,
+                source_depth: None,
+            })))
+            .await;
+
+        assert!(
+            matches!(
+                &response,
+                Response::Error(ErrorResponse {
+                    error: RmuxError::Server(message)
+                }) if message == "open terminal failed: not a terminal"
+            ),
+            "command {command:?} must be rejected, got {response:?}"
+        );
+    }
+
+    let detached = handler
+        .handle(Request::RunShell(Box::new(RunShellRequest {
+            command: "new-session -d -s run-shell-detached-ok".to_owned(),
+            arguments: Vec::new(),
+            background: false,
+            as_commands: true,
+            show_stderr: false,
+            delay_seconds: None,
+            start_directory: None,
+            target: None,
+            source_depth: None,
+        })))
+        .await;
+    assert!(
+        !matches!(detached, Response::Error(_)),
+        "detached new-session must stay allowed, got {detached:?}"
     );
 }
 

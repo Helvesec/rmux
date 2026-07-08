@@ -151,18 +151,18 @@ impl OptionStore {
         }
 
         let query = validate_option_name_mutation(name, &scope, mode, value.as_deref(), unset)?;
-
-        let related = if unset_pane_overrides {
-            self.unset_window_pane_overrides(&scope, &query)
-        } else {
-            Vec::new()
-        };
+        let unset_pane_scope = unset_pane_overrides.then(|| scope.clone());
 
         let mut outcome = if unset {
             self.unset_query(scope, &query, only_if_unset)
         } else {
             self.set_query(scope, &query, value.as_deref(), mode, only_if_unset)
         }?;
+        let related = if let Some(scope) = unset_pane_scope {
+            self.unset_window_pane_overrides(&scope, &query)
+        } else {
+            Vec::new()
+        };
         outcome.related.extend(related);
         Ok(outcome)
     }

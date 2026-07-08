@@ -3,8 +3,9 @@ use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::AttachControl;
 use rmux_proto::{
     DeleteBufferRequest, ErrorResponse, ListBuffersRequest, LoadBufferRequest, NewSessionRequest,
-    OptionName, PaneTarget, PasteBufferRequest, Request, Response, RmuxError, ScopeSelector,
-    SetBufferRequest, SetOptionMode, SetOptionRequest, ShowBufferRequest, TerminalSize,
+    OptionName, PaneTarget, PasteBufferRequest, Request, RespawnPaneRequest, Response, RmuxError,
+    ScopeSelector, SetBufferRequest, SetOptionMode, SetOptionRequest, ShowBufferRequest,
+    TerminalSize,
 };
 use std::fs;
 use std::sync::Arc;
@@ -64,6 +65,31 @@ async fn create_session(handler: &RequestHandler, name: &str) {
     handler
         .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session_name, 0))
         .await;
+}
+
+async fn wait_for_dead_pane(
+    handler: &RequestHandler,
+    session_name: &rmux_proto::SessionName,
+    window_index: u32,
+    pane_index: u32,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let exited = {
+            let mut state = handler.state.lock().await;
+            state
+                .clone_pane_master_if_alive(session_name, window_index, pane_index)
+                .is_err()
+        };
+        if exited {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for pane {session_name}:{window_index}.{pane_index} to exit"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 fn take_write(control: AttachControl) -> Vec<u8> {
@@ -541,6 +567,61 @@ async fn paste_buffer_nonexistent_pane_returns_error() {
     assert!(matches!(response, Response::Error(_)));
 
     // Buffer should still exist (not deleted on write failure)
+    let show = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest { name: None }))
+        .await;
+    assert!(matches!(show, Response::ShowBuffer(_)));
+}
+
+#[tokio::test]
+async fn paste_buffer_dead_remain_on_exit_pane_returns_clean_error() {
+    let handler = RequestHandler::new();
+    let alpha_name = "alpha-dead-paste";
+    let alpha = session_name(alpha_name);
+    create_session(&handler, alpha_name).await;
+
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
+                option: OptionName::RemainOnExit,
+                value: "on".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+    assert!(matches!(
+        handler
+            .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+                target: PaneTarget::with_window(alpha.clone(), 0, 0),
+                kill: true,
+                start_directory: None,
+                environment: None,
+                command: Some(vec!["exit 0".to_owned()]),
+                process_command: None,
+            })))
+            .await,
+        Response::RespawnPane(_)
+    ));
+    wait_for_dead_pane(&handler, &alpha, 0, 0).await;
+
+    handler
+        .handle(Request::SetBuffer(set_buffer_request(None, b"data")))
+        .await;
+
+    let response = handler
+        .handle(Request::PasteBuffer(Box::new(paste_buffer_request(
+            None,
+            PaneTarget::with_window(alpha, 0, 0),
+            true,
+        ))))
+        .await;
+
+    assert!(
+        matches!(&response, Response::Error(error) if error.error.to_string().contains("target pane has exited")),
+        "expected dead-pane error, got {response:?}"
+    );
     let show = handler
         .handle(Request::ShowBuffer(ShowBufferRequest { name: None }))
         .await;

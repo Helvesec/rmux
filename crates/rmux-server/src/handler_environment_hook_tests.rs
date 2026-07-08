@@ -1,13 +1,13 @@
 use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::RequestHandler;
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
     ErrorResponse, HookLifecycle, HookName, NewSessionExtRequest, NewSessionRequest,
-    NewWindowRequest, OptionName, Request, Response, RmuxError, ScopeSelector, SessionName,
-    SetEnvironmentRequest, SetHookRequest, SetOptionMode, SetOptionRequest, ShowEnvironmentRequest,
-    ShowOptionsRequest, TerminalSize,
+    NewWindowRequest, OptionName, PaneTarget, ProcessCommand, Request, Response, RmuxError,
+    ScopeSelector, SessionName, SetEnvironmentRequest, SetHookRequest, SetOptionMode,
+    SetOptionRequest, ShowEnvironmentRequest, ShowOptionsRequest, TerminalSize,
 };
 
 fn session_name(value: &str) -> SessionName {
@@ -33,6 +33,44 @@ async fn create_session(handler: &RequestHandler, name: &str) {
         .await;
 
     assert!(matches!(response, Response::NewSession(_)));
+}
+
+async fn set_global_hook(handler: &RequestHandler, hook: HookName, command: &str) {
+    assert!(matches!(
+        handler
+            .handle(Request::SetHook(SetHookRequest {
+                scope: ScopeSelector::Global,
+                hook,
+                command: command.to_owned(),
+                lifecycle: HookLifecycle::Persistent,
+            }))
+            .await,
+        Response::SetHook(_)
+    ));
+}
+
+async fn wait_for_buffer(handler: &RequestHandler, name: &str, expected: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let actual = buffer_text(handler, name).await;
+        if actual.as_deref() == Some(expected) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for buffer {name:?} to equal {expected:?}, got {actual:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn buffer_text(handler: &RequestHandler, name: &str) -> Option<String> {
+    let state = handler.state.lock().await;
+    state
+        .buffers
+        .show(Some(name))
+        .ok()
+        .map(|(_, content)| String::from_utf8_lossy(content).into_owned())
 }
 
 #[tokio::test]
@@ -470,6 +508,217 @@ async fn window_unlinked_hooks_keep_removed_window_name_and_id() {
         .show(Some("unlinked"))
         .expect("unlinked buffer exists");
     assert_eq!(String::from_utf8_lossy(content), "ok");
+}
+
+#[tokio::test]
+async fn kill_session_emits_window_unlinked_for_removed_windows() {
+    let handler = RequestHandler::new();
+    create_session(&handler, "alpha").await;
+
+    let response = handler
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
+            target: session_name("alpha"),
+            name: Some("logs".to_owned()),
+            detached: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: None,
+            target_window_index: None,
+            insert_at_target: false,
+        })))
+        .await;
+    let Response::NewWindow(success) = response else {
+        panic!("new-window should succeed");
+    };
+    let window_id = {
+        let state = handler.state.lock().await;
+        let session = state
+            .sessions
+            .session(&session_name("alpha"))
+            .expect("alpha session exists");
+        session
+            .window_at(success.target.window_index())
+            .expect("logs window exists")
+            .id()
+            .as_u32()
+    };
+
+    assert!(matches!(
+        handler
+            .handle(Request::SetHook(SetHookRequest {
+                scope: ScopeSelector::Global,
+                hook: HookName::WindowUnlinked,
+                command: format!(
+                    "if-shell -F '#{{==:#{{hook_window_name}} #{{hook_window}},logs @{window_id}}}' 'set-buffer -b kill-session-unlinked ok' 'set-buffer -b kill-session-unlinked bad'"
+                ),
+                lifecycle: HookLifecycle::Persistent,
+            }))
+            .await,
+        Response::SetHook(_)
+    ));
+
+    assert!(matches!(
+        handler
+            .handle(Request::KillSession(rmux_proto::KillSessionRequest {
+                target: session_name("alpha"),
+                kill_all_except_target: false,
+                clear_alerts: false,
+                kill_group: false,
+            }))
+            .await,
+        Response::KillSession(_)
+    ));
+
+    let state = handler.state.lock().await;
+    let (_, content) = state
+        .buffers
+        .show(Some("kill-session-unlinked"))
+        .expect("unlinked buffer exists");
+    assert_eq!(String::from_utf8_lossy(content), "ok");
+}
+
+#[tokio::test]
+async fn kill_session_emits_session_closed_before_window_unlinked() {
+    let handler = RequestHandler::new();
+    create_session(&handler, "alpha").await;
+    create_session(&handler, "keeper").await;
+    assert!(matches!(
+        handler
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                target: session_name("alpha"),
+                name: Some("logs".to_owned()),
+                detached: true,
+                start_directory: None,
+                environment: None,
+                command: None,
+                process_command: None,
+                target_window_index: None,
+                insert_at_target: false,
+            })))
+            .await,
+        Response::NewWindow(_)
+    ));
+    set_global_hook(
+        &handler,
+        HookName::SessionClosed,
+        "set-buffer -a -b kill-session-order session-closed,",
+    )
+    .await;
+    set_global_hook(
+        &handler,
+        HookName::WindowUnlinked,
+        "set-buffer -a -b kill-session-order unlinked,",
+    )
+    .await;
+
+    assert_eq!(
+        handler
+            .handle(Request::KillSession(rmux_proto::KillSessionRequest {
+                target: session_name("alpha"),
+                kill_all_except_target: false,
+                clear_alerts: false,
+                kill_group: false,
+            }))
+            .await,
+        Response::KillSession(rmux_proto::KillSessionResponse { existed: true })
+    );
+
+    wait_for_buffer(
+        &handler,
+        "kill-session-order",
+        "session-closed,unlinked,unlinked,",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn last_pane_shell_exit_emits_window_unlinked_before_session_closed() {
+    let handler = RequestHandler::new();
+    create_session(&handler, "alpha").await;
+    create_session(&handler, "keeper").await;
+    set_global_hook(
+        &handler,
+        HookName::WindowUnlinked,
+        "set-buffer -a -b last-pane-order unlinked,",
+    )
+    .await;
+    set_global_hook(
+        &handler,
+        HookName::SessionClosed,
+        "set-buffer -a -b last-pane-order session-closed,",
+    )
+    .await;
+    let mut lifecycle_events = handler.subscribe_lifecycle_events();
+
+    assert!(matches!(
+        handler
+            .handle(Request::RespawnPane(Box::new(
+                rmux_proto::RespawnPaneRequest {
+                    target: PaneTarget::new(session_name("alpha"), 0),
+                    kill: true,
+                    start_directory: None,
+                    environment: None,
+                    command: None,
+                    process_command: Some(ProcessCommand::Shell("exit 0".to_owned())),
+                }
+            )))
+            .await,
+        Response::RespawnPane(_)
+    ));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let actual = buffer_text(&handler, "last-pane-order").await;
+        if actual.as_deref() == Some("unlinked,session-closed,") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for last-pane hooks, got {actual:?}"
+        );
+        match tokio::time::timeout(Duration::from_millis(200), lifecycle_events.recv()).await {
+            Ok(Ok(event)) => handler.dispatch_lifecycle_hook(event).await,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                panic!("lifecycle event channel closed")
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn kill_server_emits_session_closed_without_window_unlinked() {
+    let handler = RequestHandler::new();
+    create_session(&handler, "alpha").await;
+    create_session(&handler, "beta").await;
+    set_global_hook(
+        &handler,
+        HookName::SessionClosed,
+        "set-buffer -a -b kill-server-hooks session-closed,",
+    )
+    .await;
+    set_global_hook(
+        &handler,
+        HookName::WindowUnlinked,
+        "set-buffer -a -b kill-server-hooks unlinked,",
+    )
+    .await;
+
+    assert_eq!(
+        handler
+            .handle(Request::KillServer(rmux_proto::KillServerRequest))
+            .await,
+        Response::KillServer(rmux_proto::KillServerResponse)
+    );
+
+    wait_for_buffer(
+        &handler,
+        "kill-server-hooks",
+        "session-closed,session-closed,",
+    )
+    .await;
 }
 
 #[tokio::test]

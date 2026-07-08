@@ -2601,16 +2601,19 @@ fn show_options_global_pane_combination_matches_tmux_scope_precedence() -> Resul
     let _daemon = harness.start_hidden_daemon()?;
     assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
 
-    for args in [
-        &["show-options", "-gp"][..],
-        &["show-options", "-gp", "pane-border-style"][..],
-        &["show-options", "-pg", "remain-on-exit"][..],
-    ] {
-        let output = harness.run(args)?;
-        assert_eq!(output.status.code(), Some(0), "{args:?}");
-        assert!(stdout(&output).is_empty(), "{args:?}: {}", stdout(&output));
-        assert!(stderr(&output).is_empty(), "{args:?}: {}", stderr(&output));
-    }
+    let pane_global = harness.run(&["set-option", "-gp", "pane-border-style", "fg=red"])?;
+    assert_success(&pane_global);
+    let pane_global_shown = harness.run(&["show-options", "-gpqv", "pane-border-style"])?;
+    assert_eq!(pane_global_shown.status.code(), Some(0));
+    assert_eq!(stdout(&pane_global_shown), "fg=red\n");
+    assert!(stderr(&pane_global_shown).is_empty());
+
+    let user_pane_global = harness.run(&["set-option", "-gp", "@pane-global", "yes"])?;
+    assert_success(&user_pane_global);
+    let user_pane_global_shown = harness.run(&["show-options", "-gpqv", "@pane-global"])?;
+    assert_eq!(user_pane_global_shown.status.code(), Some(0));
+    assert_eq!(stdout(&user_pane_global_shown), "yes\n");
+    assert!(stderr(&user_pane_global_shown).is_empty());
 
     let status = harness.run(&["show-options", "-gp", "status"])?;
     assert_eq!(status.status.code(), Some(0));
@@ -2624,7 +2627,7 @@ fn show_options_global_pane_combination_matches_tmux_scope_precedence() -> Resul
 
     let queued = harness.run(&["run-shell", "-C", "show-options -gp pane-border-style"])?;
     assert_eq!(queued.status.code(), Some(0));
-    assert!(stdout(&queued).is_empty());
+    assert_eq!(stdout(&queued), "pane-border-style fg=red\n");
     assert!(stderr(&queued).is_empty());
 
     let queued_status = harness.run(&["run-shell", "-C", "show-options -gp status"])?;

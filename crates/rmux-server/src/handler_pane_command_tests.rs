@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::RequestHandler;
-use crate::pane_io::AttachControl;
+use crate::pane_io::{AttachControl, PaneAlertEvent};
 use crate::pane_terminals::PaneLifecycleProcessState;
 use rmux_proto::{
     BreakPaneRequest, DisplayPanesRequest, KillPaneRequest, ListPanesRequest, ListWindowsRequest,
@@ -107,6 +107,15 @@ async fn create_session(handler: &RequestHandler, session_name: &SessionName) {
     assert!(matches!(created, rmux_proto::Response::NewSession(_)));
 }
 
+fn list_stdout(response: Response) -> String {
+    match response {
+        Response::ListPanes(response) => {
+            String::from_utf8(response.output.stdout).expect("list-panes stdout is utf8")
+        }
+        response => panic!("expected list-panes success, got {response:?}"),
+    }
+}
+
 async fn attach_to_existing_session(
     handler: &RequestHandler,
     requester_pid: u32,
@@ -169,6 +178,95 @@ async fn wait_for_pipe_child_count_to_return_to(baseline: usize) {
         );
         sleep(Duration::from_millis(25)).await;
     }
+}
+
+#[tokio::test]
+async fn list_panes_activity_sort_is_inert_like_tmux() {
+    let handler = RequestHandler::new();
+    let session = session_name("list-panes-activity-sort");
+    create_session(&handler, &session).await;
+    let split = handler
+        .handle(Request::SplitWindow(SplitWindowRequest {
+            target: SplitWindowTarget::Session(session.clone()),
+            direction: SplitDirection::Horizontal,
+            before: false,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+    let second_pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session)
+            .and_then(|session| session.window_at(0))
+            .and_then(|window| window.pane(1))
+            .map(|pane| pane.id())
+            .expect("second pane exists")
+    };
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        handler
+            .handle_pane_alert_event(PaneAlertEvent {
+                session_name: session.clone(),
+                pane_id: second_pane_id,
+                bell_count: 0,
+                title_changed: false,
+                title_change: None,
+                clipboard_set: false,
+                queue_activity_alert: false,
+                generation: None,
+            })
+            .await;
+        let (first_activity, second_activity) = {
+            let state = handler.state.lock().await;
+            let window = state
+                .sessions
+                .session(&session)
+                .and_then(|session| session.window_at(0))
+                .expect("window exists");
+            (
+                window.pane(0).expect("first pane exists").activity_at(),
+                window.pane(1).expect("second pane exists").activity_at(),
+            )
+        };
+        if second_activity > first_activity {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for pane activity to advance; first={first_activity}, second={second_activity}"
+        );
+        sleep(Duration::from_millis(25)).await;
+    }
+
+    let stdout = list_stdout(
+        handler
+            .handle(Request::ListPanes(Box::new(ListPanesRequest {
+                target: session.clone(),
+                target_window_index: Some(0),
+                format: Some("#{pane_index}".to_owned()),
+                filter: None,
+                sort_order: Some("activity".to_owned()),
+                reversed: false,
+            })))
+            .await,
+    );
+    assert_eq!(stdout, "0\n1\n");
+    let reversed_stdout = list_stdout(
+        handler
+            .handle(Request::ListPanes(Box::new(ListPanesRequest {
+                target: session,
+                target_window_index: Some(0),
+                format: Some("#{pane_index}".to_owned()),
+                filter: None,
+                sort_order: Some("activity".to_owned()),
+                reversed: true,
+            })))
+            .await,
+    );
+    assert_eq!(reversed_stdout, "0\n1\n");
 }
 
 async fn wait_for_dead_pane(
@@ -987,6 +1085,51 @@ async fn break_pane_print_target_refreshes_automatic_window_name() {
     assert!(
         !current_command.is_empty(),
         "pane_current_command sanity check, got {output:?}"
+    );
+}
+
+#[tokio::test]
+async fn attached_input_to_dead_kept_pane_does_not_fail_liveness_probe() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    create_session(&handler, &alpha).await;
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
+                option: OptionName::RemainOnExit,
+                value: "on".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+
+    let respawned = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target: PaneTarget::with_window(alpha.clone(), 0, 0),
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: Some(vec!["exit 0".to_owned()]),
+            process_command: None,
+        })))
+        .await;
+    assert!(matches!(respawned, Response::RespawnPane(_)));
+    wait_for_dead_pane(&handler, &alpha, 0, 0).await;
+
+    let requester_pid = 44_200_u32;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let result = handler
+        .handle_attached_live_input_for_test(requester_pid, b"x")
+        .await;
+    assert!(
+        !matches!(&result, Err(error) if error.to_string().contains("target pane has exited")),
+        "attached input must not use child-process liveness as a pane liveness gate: {result:?}"
     );
 }
 

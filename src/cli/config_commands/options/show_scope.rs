@@ -45,13 +45,7 @@ pub(in crate::cli::config_commands) fn resolve_show_options_scope(
             }
             Ok(ShowOptionsScope::CurrentWindow)
         }
-        (false, true, _) if args.global => Ok(if let Some(name) = args.name.as_deref() {
-            rmux_core::default_global_scope_for_option_name(name)
-                .map_err(option_lookup_exit_failure)?
-        } else {
-            OptionScopeSelector::SessionGlobal
-        }
-        .into()),
+        (false, true, _) if args.global => show_global_pane_options_scope(args),
         (false, true, Some(target)) => {
             if let Some(name) = args.name.as_deref() {
                 if !option_supports_show_scope(name, &dummy_pane_scope()) {
@@ -132,6 +126,35 @@ impl ShowOptionsScope {
 impl From<OptionScopeSelector> for ShowOptionsScope {
     fn from(scope: OptionScopeSelector) -> Self {
         Self::Resolved(scope)
+    }
+}
+
+fn show_global_pane_options_scope(args: &ShowOptionsArgs) -> Result<ShowOptionsScope, ExitFailure> {
+    let pane_scope = dummy_pane_scope();
+    if let Some(name) = args.name.as_deref() {
+        match rmux_core::resolve_option_name(name) {
+            Ok(query) if query.is_user() || query.supports_scope(&pane_scope) => {
+                return show_pane_scope(args.target.as_ref());
+            }
+            Ok(_) => {
+                return Ok(rmux_core::default_global_scope_for_option_name(name)
+                    .map_err(option_lookup_exit_failure)?
+                    .into());
+            }
+            Err(error) => return Err(option_lookup_exit_failure(error)),
+        }
+    }
+
+    show_pane_scope(args.target.as_ref())
+}
+
+fn show_pane_scope(target: Option<&TargetSpec>) -> Result<ShowOptionsScope, ExitFailure> {
+    match target {
+        Some(target) => Ok(ShowOptionsScope::Unresolved {
+            target: target.clone(),
+            kind: UnresolvedShowOptionsScope::Pane,
+        }),
+        None => Ok(ShowOptionsScope::CurrentPane),
     }
 }
 

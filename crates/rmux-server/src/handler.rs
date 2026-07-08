@@ -65,6 +65,8 @@ mod shutdown_support;
 pub(crate) use shutdown_support::DetachedRequestGuard;
 #[path = "handler_subscriptions.rs"]
 mod subscription_support;
+#[path = "handler_switch_target.rs"]
+mod switch_target_support;
 #[path = "handler_target_actions.rs"]
 mod target_action_support;
 #[path = "handler_targets.rs"]
@@ -92,7 +94,7 @@ pub(crate) use web_support::{
 };
 #[path = "handler_window.rs"]
 mod window_support;
-use crate::pane_state_journal::PaneStateJournal;
+use crate::pane_state_journal::{PaneStateJournal, PANE_STATE_JOURNAL_CAPACITY};
 use crate::pane_terminals::HandlerState;
 use crate::server_access::{current_owner_uid, AccessMode, ServerAccessStore};
 use crate::wait_for::WaitForStore;
@@ -129,6 +131,7 @@ use option_support::option_value_u32;
 use pane_support::PaneSnapshotRevisionRegistry;
 use session_lease_support::SessionLeaseStore;
 use subscription_support::OutputSubscriptionState;
+pub(in crate::handler) use switch_target_support::switch_client_target_find_type;
 pub(in crate::handler) use target_support::{
     active_session_target, active_window_target, fallback_current_target,
     resolve_existing_session_target, resolve_session_lookup, target_for_request_response,
@@ -505,7 +508,10 @@ impl RequestHandler {
             pane_snapshot_revisions: Arc::new(StdMutex::new(
                 PaneSnapshotRevisionRegistry::default(),
             )),
-            pane_state_journal: Arc::new(StdMutex::new(PaneStateJournal::default())),
+            pane_state_journal: Arc::new(StdMutex::new(PaneStateJournal::with_limits(
+                PANE_STATE_JOURNAL_CAPACITY,
+                subscription_limits,
+            ))),
             pane_state_notify: Arc::new(Notify::new()),
             foreground_watch_started: Arc::new(AtomicBool::new(false)),
             foreground_state_cache: Arc::new(StdMutex::new(HashMap::new())),

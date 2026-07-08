@@ -32,6 +32,16 @@ class Metric:
 
 
 @dataclass(frozen=True)
+class Artifact:
+    path: Path
+    schema: object
+    kind: str | None
+    platform: str | None
+    machine: str | None
+    metrics: dict[str, Metric]
+
+
+@dataclass(frozen=True)
 class MetricDiff:
     name: str
     base: Metric
@@ -46,11 +56,13 @@ class MetricDiff:
     status: str
 
 
-def load_metrics(path: Path) -> dict[str, Metric]:
+def load_artifact(path: Path) -> Artifact:
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
 
     source = payload.get("source", payload)
+    if not isinstance(source, dict):
+        raise ValueError(f"{path}: source payload is not an object")
     metrics = source.get("metrics")
     if not isinstance(metrics, list):
         raise ValueError(f"{path}: missing metrics array")
@@ -70,7 +82,52 @@ def load_metrics(path: Path) -> dict[str, Metric]:
             p95_ms=float(item["p95_ms"]),
             mean_ms=float(item.get("mean_ms", statistics.fmean(samples))),
         )
-    return result
+
+    environment = payload.get("environment") if isinstance(payload, dict) else None
+    if not isinstance(environment, dict):
+        environment = {}
+    platform = first_non_empty(environment.get("platform"), source.get("platform"), payload.get("platform"))
+    machine = first_non_empty(environment.get("machine"), source.get("machine"), payload.get("machine"))
+    return Artifact(
+        path=path,
+        schema=payload.get("schema"),
+        kind=payload.get("kind"),
+        platform=platform,
+        machine=machine,
+        metrics=result,
+    )
+
+
+def first_non_empty(*values: object) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    return None
+
+
+def validate_artifact_pair(baseline: Artifact, current: Artifact) -> None:
+    if baseline.path.resolve() == current.path.resolve():
+        raise ValueError("baseline and current perf JSON paths must be distinct")
+    if current.kind == "rmux-perf-baseline":
+        raise ValueError("current perf JSON must be a fresh perf-bench artifact, not a baseline wrapper")
+    if baseline.platform is None:
+        raise ValueError(f"{baseline.path}: missing platform metadata")
+    if current.platform is None:
+        raise ValueError(f"{current.path}: missing platform metadata")
+    if baseline.platform != current.platform:
+        raise ValueError(
+            "perf platform mismatch: "
+            f"baseline={baseline.platform} current={current.platform}; regenerate a same-platform baseline/current pair"
+        )
+    if baseline.machine is not None and current.machine is not None and baseline.machine != current.machine:
+        raise ValueError(
+            "perf machine mismatch: "
+            f"baseline={baseline.machine} current={current.machine}; regenerate a same-machine baseline/current pair"
+        )
+
+
+def load_metrics(path: Path) -> dict[str, Metric]:
+    return load_artifact(path).metrics
 
 
 def pct_delta(base: float, current: float) -> float:
@@ -332,6 +389,44 @@ def run_self_test() -> None:
     method, _, _, _ = select_p_value(tail_base, tail_current, DEFAULT_METHOD)
     assert method == "mann-whitney"
 
+    base_artifact = Artifact(
+        path=Path("baseline.json"),
+        schema=2,
+        kind="rmux-perf-baseline",
+        platform="darwin",
+        machine="arm64",
+        metrics={"stable": unchanged_base},
+    )
+    current_artifact = Artifact(
+        path=Path("current.json"),
+        schema=1,
+        kind=None,
+        platform="linux",
+        machine="x86_64",
+        metrics={"stable": unchanged_current},
+    )
+    try:
+        validate_artifact_pair(base_artifact, current_artifact)
+    except ValueError as error:
+        assert "platform mismatch" in str(error)
+    else:
+        raise AssertionError("platform mismatch must fail closed")
+
+    baseline_as_current = Artifact(
+        path=Path("current.json"),
+        schema=2,
+        kind="rmux-perf-baseline",
+        platform="darwin",
+        machine="arm64",
+        metrics={"stable": unchanged_current},
+    )
+    try:
+        validate_artifact_pair(base_artifact, baseline_as_current)
+    except ValueError as error:
+        assert "not a baseline wrapper" in str(error)
+    else:
+        raise AssertionError("baseline wrapper used as current must fail closed")
+
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -362,9 +457,12 @@ def main(argv: list[str]) -> int:
     if args.regression_pct < 0.0:
         raise SystemExit("--regression-pct must be non-negative")
 
+    baseline = load_artifact(args.baseline)
+    current = load_artifact(args.current)
+    validate_artifact_pair(baseline, current)
     diffs = compare_metrics(
-        load_metrics(args.baseline),
-        load_metrics(args.current),
+        baseline.metrics,
+        current.metrics,
         alpha=args.alpha,
         regression_pct=args.regression_pct,
         method=args.method,
@@ -380,5 +478,8 @@ def main(argv: list[str]) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main(sys.argv[1:]))
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        raise SystemExit(2)
     except BrokenPipeError:
         raise SystemExit(1)

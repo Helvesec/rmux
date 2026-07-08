@@ -305,6 +305,18 @@ fn run_shell_command_mode_ignores_trailing_positional_arguments() -> Result<(), 
 }
 
 #[test]
+fn run_shell_command_mode_attach_session_requires_terminal() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("run-shell-c-attach-requires-terminal")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    let output = harness.run(&["run-shell", "-C", "attach-session -t alpha"])?;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty());
+    assert_eq!(stderr(&output), "open terminal failed: not a terminal\n");
+    Ok(())
+}
+
+#[test]
 fn run_shell_empty_command_forms_are_noops() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("run-shell-empty-noops")?;
     let _daemon = harness.start_hidden_daemon()?;

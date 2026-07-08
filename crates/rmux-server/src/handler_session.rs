@@ -765,11 +765,12 @@ impl RequestHandler {
             self.cancel_session_silence_timers(session_name).await;
         }
 
-        let (response, queued_session_closed, removed_pane_ids, removed_sessions) = {
+        let (response, queued_lifecycle_events, removed_pane_ids, removed_sessions) = {
             let mut state = self.state.lock().await;
             let mut queued_events = Vec::new();
             let mut removed_pane_ids = Vec::new();
             let mut removed_sessions: Vec<(SessionName, SessionId)> = Vec::new();
+            let mut response_error = None;
 
             for session_name in &sessions_to_remove {
                 if !state.sessions.contains_session(session_name) {
@@ -803,6 +804,20 @@ impl RequestHandler {
                                 session_id: Some(removed_session.id().as_u32()),
                             },
                         ));
+                        for (window_index, window) in removed_session.windows() {
+                            queued_events.push(prepare_lifecycle_event(
+                                &mut state,
+                                &LifecycleEvent::WindowUnlinked {
+                                    session_name: session_name.clone(),
+                                    target: Some(WindowTarget::with_window(
+                                        session_name.clone(),
+                                        *window_index,
+                                    )),
+                                    window_id: Some(window.id().as_u32()),
+                                    window_name: Some(window.name().unwrap_or_default().to_owned()),
+                                },
+                            ));
+                        }
                         let _ = state.options.remove_session(session_name);
                         let _ = state.environment.remove_session(session_name);
                         let _ = state.hooks.remove_session(session_name);
@@ -811,22 +826,23 @@ impl RequestHandler {
                             current_runtime_owner.as_ref(),
                             next_runtime_owner.as_ref(),
                         ) {
-                            return Response::Error(ErrorResponse { error });
+                            response_error = Some(error);
+                            break;
                         }
                     }
                     Err(RmuxError::SessionNotFound(_)) => {}
                     Err(error) => {
-                        return Response::Error(ErrorResponse { error });
+                        response_error = Some(error);
+                        break;
                     }
                 }
             }
 
-            (
-                Response::KillSession(KillSessionResponse { existed: true }),
-                queued_events,
-                removed_pane_ids,
-                removed_sessions,
-            )
+            let response = response_error.map_or_else(
+                || Response::KillSession(KillSessionResponse { existed: true }),
+                |error| Response::Error(ErrorResponse { error }),
+            );
+            (response, queued_events, removed_pane_ids, removed_sessions)
         };
 
         #[cfg(all(any(unix, windows), feature = "web"))]
@@ -836,11 +852,16 @@ impl RequestHandler {
         let _ = &removed_sessions;
         if !removed_pane_ids.is_empty() {
             self.forget_pane_snapshot_coalescers(&removed_pane_ids);
+            self.record_panes_closed_as_killed(&removed_pane_ids);
         }
-        for event in queued_session_closed {
+        for event in queued_lifecycle_events {
             self.emit_prepared(event);
         }
-        self.remove_session_leases(&sessions_to_remove);
+        let removed_session_names = removed_sessions
+            .iter()
+            .map(|(session_name, _)| session_name.clone())
+            .collect::<Vec<_>>();
+        self.remove_session_leases(&removed_session_names);
 
         let _ = self.queue_shutdown_if_server_empty().await;
 

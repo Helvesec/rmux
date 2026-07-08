@@ -7,6 +7,7 @@ use super::super::{
 };
 use crate::format_runtime::render_runtime_template;
 use crate::hook_runtime::PendingInlineHookFormat;
+use crate::pane_terminal_lookup::pane_id_for_target;
 
 impl RequestHandler {
     pub(in crate::handler) async fn handle_pipe_pane(
@@ -74,7 +75,7 @@ impl RequestHandler {
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
         let attached_count = self.attached_count(&session_name).await;
-        let response = {
+        let (response, respawned_pane_id) = {
             let mut state = self.state.lock().await;
             request.start_directory = match render_start_directory_template(
                 &state,
@@ -85,6 +86,15 @@ impl RequestHandler {
                 Ok(start_directory) => start_directory,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
+            let pane_id = match pane_id_for_target(
+                &state.sessions,
+                request.target.session_name(),
+                request.target.window_index(),
+                request.target.pane_index(),
+            ) {
+                Ok(pane_id) => pane_id,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
             match state.respawn_pane(
                 request,
                 &socket_path,
@@ -93,12 +103,15 @@ impl RequestHandler {
                 Some(self.pane_exit_callback()),
                 |_, _| {},
             ) {
-                Ok(response) => Response::RespawnPane(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+                Ok(response) => {
+                    self.reopen_pane_state(pane_id);
+                    (Response::RespawnPane(response), Some(pane_id))
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), None),
             }
         };
 
-        if matches!(response, Response::RespawnPane(_)) {
+        if respawned_pane_id.is_some() {
             self.refresh_attached_session(&session_name).await;
         }
 

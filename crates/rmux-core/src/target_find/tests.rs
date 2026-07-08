@@ -613,12 +613,17 @@ fn command_metadata_captures_find_type_and_flags() {
         .flags
         .contains(TargetFindFlags::CANFAIL));
 
-    let switch_client = command_target_metadata("switch-client").expect("metadata exists");
-    assert!(switch_client
+    let attach_session = command_target_metadata("attach-session").expect("metadata exists");
+    assert!(attach_session
         .target
         .expect("target spec")
         .flags
         .contains(TargetFindFlags::PREFER_UNATTACHED));
+
+    let switch_client = command_target_metadata("switch-client").expect("metadata exists");
+    let switch_client_target = switch_client.target.expect("target spec");
+    assert_eq!(switch_client_target.find_type, TargetFindType::Window);
+    assert_eq!(switch_client_target.flags, TargetFindFlags::NONE);
 
     let respawn_window = command_target_metadata("respawn-window").expect("metadata exists");
     assert_eq!(

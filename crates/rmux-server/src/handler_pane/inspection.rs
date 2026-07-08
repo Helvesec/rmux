@@ -770,7 +770,6 @@ fn collect_list_pane_output_with_selection(
                     size: pane.geometry(),
                     title: render_runtime_template("#{pane_title}", &runtime, false),
                     created_at: pane.created_at(),
-                    activity_at: pane.activity_at(),
                     rendered: render_list_panes_line(&runtime, format),
                 });
                 continue;
@@ -833,7 +832,6 @@ struct PaneListLine {
     size: rmux_core::PaneGeometry,
     title: String,
     created_at: i64,
-    activity_at: i64,
     rendered: String,
 }
 
@@ -847,7 +845,10 @@ fn sort_pane_list_lines(rows: &mut [PaneListLine], sort_order: PaneListSortOrder
             PaneListSortOrder::Size => {
                 (left.size.cols(), left.size.rows()).cmp(&(right.size.cols(), right.size.rows()))
             }
-            PaneListSortOrder::Activity => left.activity_at.cmp(&right.activity_at),
+            // Probed 2026-07-08 against the pinned tmux 3.7b oracle:
+            // list-panes -O activity is inert (index order, even with -r)
+            // because tmux tracks activity per window, not per pane.
+            PaneListSortOrder::Activity => std::cmp::Ordering::Equal,
             PaneListSortOrder::Creation => left.created_at.cmp(&right.created_at),
         };
         let primary = if reversed { primary.reverse() } else { primary };

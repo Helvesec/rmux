@@ -636,6 +636,7 @@ fn request_waits_for_windows_deferred_panes(request: &Request) -> bool {
             | Request::SaveBuffer(_)
             | Request::CapturePane(_)
             | Request::CapturePaneTargetAction(_)
+            | Request::PaneOptionGet(_)
             | Request::PaneSnapshot(_)
             | Request::SubscribePaneOutput(_)
             | Request::SubscribePaneOutputRef(_)

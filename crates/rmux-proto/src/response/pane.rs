@@ -186,6 +186,7 @@ pub struct PaneOptionEntry {
 
 /// Source labels for best-effort foreground fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum ForegroundFieldSource {
     /// Read from the foreground process or foreground process group.
     Process,
@@ -256,6 +257,7 @@ pub struct PaneStateSnapshot {
 
 /// Terminal reason for a pane-state stream close event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum PaneStateClosedReason {
     /// The pane process exited and the pane was removed.
     Exited,
@@ -267,6 +269,7 @@ pub enum PaneStateClosedReason {
 
 /// One revisioned pane-state event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum PaneStateEventDto {
     /// The pane title changed.
     TitleChanged {

@@ -149,7 +149,11 @@ impl RequestHandler {
             let Some(handler) = handler.upgrade() else {
                 return;
             };
-            if let Some((old, new)) = event.title_change.clone() {
+            if let Some((old, new)) = event
+                .title_change
+                .clone()
+                .filter(|_| handler.pane_state_has_title_subscriptions())
+            {
                 let title_handler = handler.clone();
                 let session_name = event.session_name.clone();
                 let pane_id = event.pane_id;

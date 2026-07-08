@@ -5,13 +5,14 @@ use crate::handles::session::unexpected_response;
 use crate::transport::{DropGuard, TransportClient};
 use crate::{Pane, PaneId, Result};
 use rmux_proto::{
-    PaneOptionEntry as ProtoPaneOptionEntry, PaneStateClosedReason, PaneStateCursorRequest,
-    PaneStateEventDto, PaneStateSnapshot, PaneStateSubscriptionId, Request, Response,
-    SubscribePaneStateRequest, UnsubscribePaneStateRequest, CAPABILITY_SDK_PANE_FOREGROUND,
-    CAPABILITY_SDK_PANE_STATE_EVENTS,
+    PaneOptionEntry as ProtoPaneOptionEntry, PaneStateCursorRequest, PaneStateEventDto,
+    PaneStateSnapshot, PaneStateSubscriptionId, Request, Response, SubscribePaneStateRequest,
+    UnsubscribePaneStateRequest, CAPABILITY_SDK_PANE_FOREGROUND, CAPABILITY_SDK_PANE_STATE_EVENTS,
 };
 
 use super::foreground::ForegroundState;
+
+pub use rmux_proto::PaneStateClosedReason;
 
 const PANE_STATE_BATCH_SIZE: u16 = 256;
 
@@ -249,6 +250,7 @@ impl PaneStateEventStream {
         }
         if matches!(event, PaneStateEvent::Closed { .. }) {
             self.closed = true;
+            self.pending.clear();
         }
     }
 }
@@ -324,6 +326,7 @@ impl From<PaneStateEventDto> for PaneStateEvent {
                 pane_id,
                 reason,
             },
+            _ => unreachable!("unknown pane-state event variant from this rmux-proto version"),
         }
     }
 }

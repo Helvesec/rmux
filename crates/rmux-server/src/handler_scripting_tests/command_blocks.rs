@@ -236,6 +236,57 @@ async fn parsed_set_option_scope_flags_use_tmux_precedence_and_natural_tables() 
         .await
         .expect("show-options global status executes");
     assert_eq!(output.stdout(), b"off\n");
+
+    let parsed = CommandParser::new()
+        .parse("set-option -gp pane-border-style fg=red")
+        .expect("set-option -gp pane option parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("set-option -gp pane option executes");
+    let output = handler
+        .execute_parsed_commands_for_test(
+            std::process::id(),
+            CommandParser::new()
+                .parse("show-options -gpqv pane-border-style")
+                .expect("show-options -gp pane option parses"),
+        )
+        .await
+        .expect("show-options -gp pane option executes");
+    assert_eq!(output.stdout(), b"fg=red\n");
+
+    let parsed = CommandParser::new()
+        .parse("set-option -gp @pane-global pane-global")
+        .expect("set-option -gp user option parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("set-option -gp user option executes");
+    let output = handler
+        .execute_parsed_commands_for_test(
+            std::process::id(),
+            CommandParser::new()
+                .parse("show-options -gpqv @pane-global")
+                .expect("show-options -gp user option parses"),
+        )
+        .await
+        .expect("show-options -gp user option executes");
+    assert_eq!(output.stdout(), b"pane-global\n");
+
+    let parsed = CommandParser::new()
+        .parse("set-option -p -t alpha:0.0 pane-border-style fg=blue")
+        .expect("pane-local option parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("pane-local option executes");
+    let parsed = CommandParser::new()
+        .parse("set-option -U -t alpha:0 pane-border-style")
+        .expect("set-option -U without value parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("set-option -U unsets pane overrides without a value");
 }
 
 #[tokio::test]

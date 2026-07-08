@@ -524,13 +524,23 @@ fn lag_dto(gap: &OutputGap) -> PaneOutputLagNotice {
     }
 }
 
-fn subscription_limit_error(error: SubscriptionLimitError) -> RmuxError {
+pub(in crate::handler) fn subscription_limit_error(error: SubscriptionLimitError) -> RmuxError {
+    subscription_limit_error_for("pane output", error)
+}
+
+pub(in crate::handler) fn pane_state_subscription_limit_error(
+    error: SubscriptionLimitError,
+) -> RmuxError {
+    subscription_limit_error_for("pane state", error)
+}
+
+fn subscription_limit_error_for(kind: &str, error: SubscriptionLimitError) -> RmuxError {
     match error {
         SubscriptionLimitError::PerConnection { limit } => RmuxError::Server(format!(
-            "pane output subscription limit exceeded for connection (limit {limit})"
+            "{kind} subscription limit exceeded for connection (limit {limit})"
         )),
         SubscriptionLimitError::PerPane { limit } => RmuxError::Server(format!(
-            "pane output subscription limit exceeded for pane (limit {limit})"
+            "{kind} subscription limit exceeded for pane (limit {limit})"
         )),
     }
 }

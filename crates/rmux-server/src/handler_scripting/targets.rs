@@ -9,7 +9,7 @@ use rmux_proto::{
     Target, WindowTarget,
 };
 
-use super::super::target_support::pane_id_target;
+use super::super::{switch_client_target_find_type, target_support::pane_id_target};
 use super::values::{missing_argument, parse_u32};
 
 pub(super) fn resolve_queue_target_arguments(
@@ -312,6 +312,8 @@ fn queue_target_spec_for_flag(
     } else if command_name == "new-window" && flag == 't' && new_window_target_is_session(value) {
         spec.find_type = TargetFindType::Session;
         spec.flags = TargetFindFlags::NONE;
+    } else if command_name == "switch-client" && flag == 't' {
+        spec.find_type = switch_client_target_find_type(value);
     } else if command_name == "set-option" && flag == 't' {
         spec.find_type = set_option_target_find_type(arguments);
     } else if matches!(command_name, "set-hook" | "show-hooks") && flag == 't' {
@@ -1006,6 +1008,215 @@ mod tests {
         .expect("send-keys mouse target resolves");
 
         assert_eq!(resolved, ["-X", "-t", "alpha:0.0", "select-word"]);
+    }
+
+    #[test]
+    fn queue_resolves_status_mouse_switch_client_target_as_pane() {
+        let mut sessions = session_store_with_alpha_beta();
+        let (window_index, _) = sessions
+            .session_mut(&session_name("alpha"))
+            .expect("alpha session exists")
+            .create_window(rmux_proto::TerminalSize { cols: 80, rows: 24 })
+            .expect("second alpha window can be created");
+        let mouse_target = Target::Window(WindowTarget::with_window(
+            session_name("alpha"),
+            window_index,
+        ));
+        let context = TargetFindContext::new(None).with_mouse_target(Some(mouse_target));
+
+        let resolved = resolve_queue_target_arguments(
+            "switch-client",
+            vec!["-t=".to_owned()],
+            &sessions,
+            &context,
+        )
+        .expect("switch-client mouse target resolves");
+
+        assert_eq!(resolved, ["-t", "alpha:1.0"]);
+    }
+
+    #[test]
+    fn queue_resolves_switch_client_bare_target_as_session() {
+        let mut sessions = session_store_with_alpha_beta();
+        sessions
+            .create_session(
+                session_name("2"),
+                rmux_proto::TerminalSize { cols: 80, rows: 24 },
+            )
+            .expect("numeric session create succeeds");
+        let alpha = sessions
+            .session_mut(&session_name("alpha"))
+            .expect("alpha session exists");
+        alpha
+            .create_window(rmux_proto::TerminalSize { cols: 80, rows: 24 })
+            .expect("second alpha window can be created");
+        alpha
+            .create_window(rmux_proto::TerminalSize { cols: 80, rows: 24 })
+            .expect("third alpha window can be created");
+
+        let resolved = resolve_queue_target_arguments(
+            "switch-client",
+            vec!["-t".to_owned(), "2".to_owned()],
+            &sessions,
+            &TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+                session_name("alpha"),
+                0,
+                0,
+            )))),
+        )
+        .expect("switch-client bare target resolves");
+
+        assert_eq!(resolved, ["-t", "2"]);
+    }
+
+    #[test]
+    fn queue_resolves_switch_client_bare_target_as_session_when_window_name_collides() {
+        let mut sessions = session_store_with_alpha_beta();
+        sessions
+            .create_session(
+                session_name("editor"),
+                rmux_proto::TerminalSize { cols: 80, rows: 24 },
+            )
+            .expect("editor session create succeeds");
+        let editor_window = sessions
+            .session_mut(&session_name("alpha"))
+            .expect("alpha session exists")
+            .create_window(rmux_proto::TerminalSize { cols: 80, rows: 24 })
+            .expect("second alpha window can be created")
+            .0;
+        sessions
+            .session_mut(&session_name("alpha"))
+            .expect("alpha session exists")
+            .rename_window(editor_window, "editor".to_owned())
+            .expect("alpha window rename succeeds");
+
+        let resolved = resolve_queue_target_arguments(
+            "switch-client",
+            vec!["-t".to_owned(), "editor".to_owned()],
+            &sessions,
+            &TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+                session_name("alpha"),
+                0,
+                0,
+            )))),
+        )
+        .expect("switch-client bare collision target resolves");
+
+        assert_eq!(resolved, ["-t", "editor"]);
+        assert_ne!(editor_window, 0);
+    }
+
+    #[test]
+    fn queue_rejects_switch_client_bare_numeric_window_without_session_match() {
+        let mut sessions = session_store_with_alpha_beta();
+        let alpha = sessions
+            .session_mut(&session_name("alpha"))
+            .expect("alpha session exists");
+        alpha
+            .create_window(rmux_proto::TerminalSize { cols: 80, rows: 24 })
+            .expect("second alpha window can be created");
+        alpha
+            .create_window(rmux_proto::TerminalSize { cols: 80, rows: 24 })
+            .expect("third alpha window can be created");
+
+        let error = resolve_queue_target_arguments(
+            "switch-client",
+            vec!["-t".to_owned(), "2".to_owned()],
+            &sessions,
+            &TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+                session_name("alpha"),
+                0,
+                0,
+            )))),
+        )
+        .expect_err("switch-client bare numeric window index requires a session match");
+
+        assert!(error.to_string().contains("can't find session: 2"));
+    }
+
+    #[test]
+    fn queue_resolves_switch_client_window_id_target_as_window() {
+        let mut sessions = session_store_with_alpha_beta();
+        let (window_index, _) = sessions
+            .session_mut(&session_name("alpha"))
+            .expect("alpha session exists")
+            .create_window(rmux_proto::TerminalSize { cols: 80, rows: 24 })
+            .expect("second alpha window can be created");
+        let window_id = sessions
+            .session(&session_name("alpha"))
+            .and_then(|session| session.window_at(window_index))
+            .map(|window| window.id().to_string())
+            .expect("second alpha window id exists");
+
+        let resolved = resolve_queue_target_arguments(
+            "switch-client",
+            vec!["-t".to_owned(), window_id],
+            &sessions,
+            &TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+                session_name("beta"),
+                0,
+                0,
+            )))),
+        )
+        .expect("switch-client window id target resolves");
+
+        assert_eq!(
+            resolved,
+            vec!["-t".to_owned(), format!("alpha:{window_index}")]
+        );
+    }
+
+    #[test]
+    fn queue_preserves_switch_client_equals_prefixed_session_target() {
+        let mut sessions = session_store_with_alpha_beta();
+        sessions
+            .create_session(
+                session_name("2"),
+                rmux_proto::TerminalSize { cols: 80, rows: 24 },
+            )
+            .expect("equals-prefixed session create succeeds");
+        let alpha = sessions
+            .session_mut(&session_name("alpha"))
+            .expect("alpha session exists");
+        alpha
+            .create_window(rmux_proto::TerminalSize { cols: 80, rows: 24 })
+            .expect("second alpha window can be created");
+        alpha
+            .create_window(rmux_proto::TerminalSize { cols: 80, rows: 24 })
+            .expect("third alpha window can be created");
+
+        let resolved = resolve_queue_target_arguments(
+            "switch-client",
+            vec!["-t".to_owned(), "=2".to_owned()],
+            &sessions,
+            &TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+                session_name("alpha"),
+                0,
+                0,
+            )))),
+        )
+        .expect("switch-client equals-prefixed session target resolves");
+
+        assert_eq!(resolved, ["-t", "2"]);
+    }
+
+    #[test]
+    fn queue_preserves_switch_client_pane_qualified_target() {
+        let sessions = session_store_with_alpha_beta();
+
+        let resolved = resolve_queue_target_arguments(
+            "switch-client",
+            vec!["-t".to_owned(), "beta:0.0".to_owned()],
+            &sessions,
+            &TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+                session_name("alpha"),
+                0,
+                0,
+            )))),
+        )
+        .expect("switch-client pane target resolves");
+
+        assert_eq!(resolved, ["-t", "beta:0.0"]);
     }
 
     #[test]

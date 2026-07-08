@@ -43,6 +43,7 @@ impl RequestHandler {
                         .iter()
                         .any(|notification| notification.effects.affects_alerts());
                     pane_option_events = pane_option_events_for_outcome(&state, &outcome);
+                    let mut resize_error = None;
                     if let Some(option) = outcome.known_option {
                         if let Some(scope) = option_scope_to_legacy_scope(&scope) {
                             state.refresh_transcript_limits_for_scope(&scope, option);
@@ -59,27 +60,31 @@ impl RequestHandler {
                         if let Err(error) =
                             resize_terminals_for_named_option_change(&mut state, option, &scope)
                         {
-                            return Response::Error(ErrorResponse { error });
+                            resize_error = Some(error);
                         }
                     }
-                    refresh_session = Some(target.session_name().clone());
-                    alert_scope = Some(scope);
-                    Response::PaneOptionSet(Box::new(PaneOptionSetResponse {
-                        pane_id,
-                        name: outcome.name,
-                        old_value: outcome.old_explicit,
-                        new_value: outcome.new_explicit,
-                        changed: outcome.changed,
-                    }))
+                    if let Some(error) = resize_error {
+                        Response::Error(ErrorResponse { error })
+                    } else {
+                        refresh_session = Some(target.session_name().clone());
+                        alert_scope = Some(scope);
+                        Response::PaneOptionSet(Box::new(PaneOptionSetResponse {
+                            pane_id,
+                            name: outcome.name,
+                            old_value: outcome.old_explicit,
+                            new_value: outcome.new_explicit,
+                            changed: outcome.changed,
+                        }))
+                    }
                 }
                 Err(error) => Response::Error(ErrorResponse { error }),
             }
         };
 
+        for (pane_id, generation, outcome) in &pane_option_events {
+            self.record_pane_option_mutation(*pane_id, Some(*generation), outcome);
+        }
         if matches!(response, Response::PaneOptionSet(_)) {
-            for (pane_id, generation, outcome) in &pane_option_events {
-                self.record_pane_option_mutation(*pane_id, Some(*generation), outcome);
-            }
             if let Some(session_name) = refresh_session.as_ref() {
                 self.refresh_attached_session(session_name).await;
             }

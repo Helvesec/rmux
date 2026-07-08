@@ -164,6 +164,81 @@ async fn source_file_unquoted_percent_word_is_fatal_syntax_error() {
 }
 
 #[tokio::test]
+async fn source_file_utf8_bom_is_not_stripped_like_tmux() {
+    let handler = RequestHandler::new();
+    let root = temp_root("utf8-bom-syntax");
+    write_config(
+        &root.join("main.conf"),
+        "\u{feff}set-buffer -b bom yes\nset-buffer -b after yes\n",
+    );
+
+    let Response::Error(error) = handler
+        .handle(source_file_request(
+            vec!["main.conf".to_owned()],
+            Some(root.clone()),
+        ))
+        .await
+    else {
+        panic!("source-file should reject BOM-prefixed command");
+    };
+    assert!(
+        error
+            .error
+            .to_string()
+            .contains("main.conf:1: unknown command:"),
+        "unexpected error: {:?}",
+        error
+    );
+    assert!(matches!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("after".to_owned()),
+            }))
+            .await,
+        Response::Error(_)
+    ));
+}
+
+#[tokio::test]
+async fn source_file_reversed_bom_is_not_a_read_error_or_valid_command() {
+    let handler = RequestHandler::new();
+    let root = temp_root("reversed-bom-syntax");
+    fs::create_dir_all(&root).expect("config parent directory");
+    fs::write(
+        root.join("main.conf"),
+        b"\xff\xfeset-buffer -b bom yes\nset-buffer -b after yes\n",
+    )
+    .expect("write config");
+
+    let Response::Error(error) = handler
+        .handle(source_file_request(
+            vec!["main.conf".to_owned()],
+            Some(root.clone()),
+        ))
+        .await
+    else {
+        panic!("source-file should reject reversed-BOM command");
+    };
+    let message = error.error.to_string();
+    assert!(
+        message.contains("main.conf:1: unknown command:"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        !message.contains("stream did not contain valid UTF-8"),
+        "source-file should parse lossy text like tmux, got {message}"
+    );
+    assert!(matches!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("after".to_owned()),
+            }))
+            .await,
+        Response::Error(_)
+    ));
+}
+
+#[tokio::test]
 async fn source_file_execute_verbose_reports_lookup_prefix_without_running_bad_file() {
     let handler = RequestHandler::new();
     let root = temp_root("execute-verbose-lookup-stop");
@@ -883,6 +958,38 @@ async fn queued_source_file_accepts_compact_format_target_with_attached_value() 
 }
 
 #[tokio::test]
+async fn queued_display_message_accepts_compact_print_and_commands_flags() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("display-compact-pc");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let parsed = CommandParser::new()
+        .parse("display-message -pC '#{session_name}'")
+        .expect("display-message -pC parses");
+    let output = handler
+        .execute_parsed_commands(
+            std::process::id(),
+            parsed,
+            QueueExecutionContext::without_caller_cwd()
+                .with_current_target(Some(Target::Session(alpha))),
+        )
+        .await
+        .expect("display-message -pC should execute");
+
+    assert_eq!(output.stdout(), b"display-compact-pc\n");
+}
+
+#[tokio::test]
 async fn nested_source_file_preserves_implicit_target_canfail_behavior() {
     let handler = RequestHandler::new();
     for session in [session_name("alpha"), session_name("beta")] {
@@ -1124,6 +1231,106 @@ async fn source_file_continues_after_runtime_errors_and_reports_error() {
             .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
                 scope: OptionScopeSelector::SessionGlobal,
                 name: Some("@after_runtime".to_owned()),
+                value_only: true,
+                include_inherited: false,
+                quiet: false,
+            }))
+            .await
+            .command_output()
+            .expect("show-options output")
+            .stdout(),
+        b"yes\n"
+    );
+}
+
+#[tokio::test]
+async fn source_file_sets_server_option_without_explicit_scope_or_target() {
+    let handler = RequestHandler::new();
+    let root = temp_root("server-option-no-target");
+    write_config(&root.join("server.conf"), "set escape-time 77\n");
+
+    let response = handler
+        .handle(source_file_request(
+            vec!["server.conf".to_owned()],
+            Some(root),
+        ))
+        .await;
+
+    let Response::SourceFile(response) = response else {
+        panic!("source-file should accept server option without target, got {response:?}");
+    };
+    assert_eq!(response.exit_status(), None);
+    assert!(response.stderr().is_empty());
+    assert_eq!(
+        handler
+            .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
+                scope: OptionScopeSelector::ServerGlobal,
+                name: Some("escape-time".to_owned()),
+                value_only: true,
+                include_inherited: false,
+                quiet: false,
+            }))
+            .await
+            .command_output()
+            .expect("show-options output")
+            .stdout(),
+        b"77\n"
+    );
+}
+
+#[tokio::test]
+async fn source_file_sets_bare_server_option_with_current_runtime_target() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    let root = temp_root("server-option-current-target");
+    write_config(
+        &root.join("server.conf"),
+        "set escape-time 77\nset -q escape-time 78\nset -g @after_runtime_escape yes\n",
+    );
+    let mut request = match source_file_request(vec!["server.conf".to_owned()], Some(root)) {
+        Request::SourceFile(request) => request,
+        _ => unreachable!("source file request"),
+    };
+    request.target = Some(PaneTarget::with_window(alpha, 0, 0));
+
+    let response = handler.handle(Request::SourceFile(request)).await;
+
+    let Response::SourceFile(response) = response else {
+        panic!("source-file should accept server option with current target, got {response:?}");
+    };
+    assert_eq!(response.exit_status(), None);
+    assert!(response.stderr().is_empty());
+    assert_eq!(
+        handler
+            .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
+                scope: OptionScopeSelector::ServerGlobal,
+                name: Some("escape-time".to_owned()),
+                value_only: true,
+                include_inherited: false,
+                quiet: false,
+            }))
+            .await
+            .command_output()
+            .expect("show-options output")
+            .stdout(),
+        b"78\n"
+    );
+    assert_eq!(
+        handler
+            .handle(Request::ShowOptions(rmux_proto::ShowOptionsRequest {
+                scope: OptionScopeSelector::SessionGlobal,
+                name: Some("@after_runtime_escape".to_owned()),
                 value_only: true,
                 include_inherited: false,
                 quiet: false,

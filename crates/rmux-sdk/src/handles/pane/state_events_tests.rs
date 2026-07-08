@@ -173,6 +173,99 @@ async fn next_keeps_waiting_after_empty_long_poll_response() {
 }
 
 #[tokio::test]
+async fn closed_event_discards_trailing_same_batch_events() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let (cursor_client_stream, mut cursor_server_stream) = tokio::io::duplex(4096);
+    let transport = TransportClient::spawn(client_stream);
+    let cursor_transport = TransportClient::spawn(cursor_client_stream);
+    let pane = Pane::new(
+        PaneRef::in_first_window(alpha(), 0),
+        RmuxEndpoint::Default,
+        None,
+        transport,
+    );
+    let pane_id = PaneId::new(42);
+    let subscription_id = PaneStateSubscriptionId::new(7);
+
+    let server = tokio::spawn(async move {
+        answer_handshake(&mut server_stream, state_event_capabilities()).await;
+    });
+
+    let cursor_server = tokio::spawn(async move {
+        answer_handshake(&mut cursor_server_stream, state_event_capabilities()).await;
+
+        assert!(matches!(
+            read_request(&mut cursor_server_stream).await,
+            Request::SubscribePaneState(_)
+        ));
+        write_response(
+            &mut cursor_server_stream,
+            Response::SubscribePaneState(Box::new(SubscribePaneStateResponse {
+                subscription_id,
+                pane_id,
+                snapshot: PaneStateSnapshot {
+                    revision: 0,
+                    title: Some("initial".to_owned()),
+                    options: Vec::new(),
+                    foreground: None,
+                },
+            })),
+        )
+        .await;
+
+        assert!(matches!(
+            read_request(&mut cursor_server_stream).await,
+            Request::PaneStateCursor(_)
+        ));
+        write_response(
+            &mut cursor_server_stream,
+            Response::PaneStateCursor(PaneStateCursorResponse {
+                subscription_id,
+                events: vec![
+                    PaneStateEventDto::Closed {
+                        revision: 1,
+                        pane_id,
+                        reason: PaneStateClosedReason::Killed,
+                    },
+                    PaneStateEventDto::TitleChanged {
+                        revision: 2,
+                        pane_id,
+                        old_title: "stale".to_owned(),
+                        new_title: "after-close".to_owned(),
+                    },
+                ],
+                next_revision: 2,
+            }),
+        )
+        .await;
+    });
+
+    let mut stream = PaneStateEventStream::open_with_cursor_transport(
+        &pane,
+        PaneStateEventsOptions::default(),
+        cursor_transport,
+    )
+    .await
+    .expect("stream opens");
+    assert!(matches!(
+        stream.next().await.expect("snapshot succeeds"),
+        Some(PaneStateEvent::Snapshot { revision: 0, .. })
+    ));
+    assert!(matches!(
+        stream.next().await.expect("closed event succeeds"),
+        Some(PaneStateEvent::Closed { revision: 1, .. })
+    ));
+    assert!(stream
+        .next()
+        .await
+        .expect("closed stream returns cleanly")
+        .is_none());
+
+    server.await.expect("server task succeeds");
+    cursor_server.await.expect("cursor server task succeeds");
+}
+
+#[tokio::test]
 async fn cursor_long_poll_uses_dedicated_transport_without_blocking_main_requests() {
     let (main_client_stream, mut main_server_stream) = tokio::io::duplex(4096);
     let (cursor_client_stream, mut cursor_server_stream) = tokio::io::duplex(4096);

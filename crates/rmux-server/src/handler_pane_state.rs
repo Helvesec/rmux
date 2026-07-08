@@ -7,9 +7,10 @@ use rmux_core::{OptionMutationOutcome, PaneId};
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
     ErrorResponse, ForegroundStateDto, PaneForegroundStateResponse, PaneOptionEntry,
-    PaneStateCursorRequest, PaneStateCursorResponse, PaneStateLagResponse, PaneStateSnapshot,
-    PaneStateSubscriptionId, PaneTarget, Response, RmuxError, SubscribePaneStateRequest,
-    SubscribePaneStateResponse, UnsubscribePaneStateRequest, UnsubscribePaneStateResponse,
+    PaneStateClosedReason, PaneStateCursorRequest, PaneStateCursorResponse, PaneStateLagResponse,
+    PaneStateSnapshot, PaneStateSubscriptionId, PaneTarget, Response, RmuxError,
+    SubscribePaneStateRequest, SubscribePaneStateResponse, UnsubscribePaneStateRequest,
+    UnsubscribePaneStateResponse,
 };
 
 use crate::foreground_probe::{
@@ -51,8 +52,18 @@ impl RequestHandler {
         generation: u64,
         state: ForegroundStateDto,
     ) {
-        self.lock_foreground_state_cache()
-            .insert(pane_id, (generation, state));
+        let mut cache = self.lock_foreground_state_cache();
+        match cache.entry(pane_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert((generation, state));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry)
+                if generation > entry.get().0 =>
+            {
+                entry.insert((generation, state));
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {}
+        }
     }
 
     fn replace_foreground_state_cache(
@@ -95,7 +106,16 @@ impl RequestHandler {
             };
             let mut journal = self.lock_pane_state_journal();
             let revision = journal.current_revision();
-            let subscription_id = journal.subscribe(connection_id, pane_id, include);
+            let subscription_id = match journal.subscribe(connection_id, pane_id, include) {
+                Ok(subscription_id) => subscription_id,
+                Err(error) => {
+                    return Response::Error(ErrorResponse {
+                        error: super::subscription_support::pane_state_subscription_limit_error(
+                            error,
+                        ),
+                    });
+                }
+            };
             let (snapshot, foreground_seed) =
                 pane_state_snapshot_locked(&state, &target, pane_id, include, revision);
             (subscription_id, pane_id, snapshot, foreground_seed)
@@ -150,6 +170,10 @@ impl RequestHandler {
             Err(error) => return Response::Error(ErrorResponse { error }),
         };
 
+        let wait_deadline = request
+            .wait
+            .then(|| tokio::time::Instant::now() + PANE_STATE_WAIT_CAP);
+
         loop {
             let notified = self.pane_state_notify.notified();
             tokio::pin!(notified);
@@ -184,7 +208,14 @@ impl RequestHandler {
                     });
                 }
                 Ok(PaneStateRead::Ready { next_revision, .. }) => {
-                    if tokio::time::timeout(PANE_STATE_WAIT_CAP, notified.as_mut())
+                    let Some(deadline) = wait_deadline else {
+                        return Response::PaneStateCursor(PaneStateCursorResponse {
+                            subscription_id: request.subscription_id,
+                            events: Vec::new(),
+                            next_revision,
+                        });
+                    };
+                    if tokio::time::timeout_at(deadline, notified.as_mut())
                         .await
                         .is_err()
                     {
@@ -200,7 +231,11 @@ impl RequestHandler {
                     resume_revision,
                 }) => {
                     return match self
-                        .snapshot_for_subscription(connection_id, request.subscription_id)
+                        .snapshot_for_subscription(
+                            connection_id,
+                            request.subscription_id,
+                            Some(resume_revision.saturating_sub(1)),
+                        )
                         .await
                     {
                         Ok(snapshot) => Response::PaneStateLag(Box::new(PaneStateLagResponse {
@@ -253,17 +288,40 @@ impl RequestHandler {
         change: PaneStateChange,
     ) {
         let closes_pane = matches!(change, PaneStateChange::Closed { .. });
+        let close_reason = match &change {
+            PaneStateChange::Closed { reason } => Some(*reason),
+            _ => None,
+        };
         {
             let mut journal = self.lock_pane_state_journal();
-            journal.push(pane_id, generation, change);
-            if closes_pane {
-                journal.mark_pane_closed(pane_id);
+            if closes_pane && !journal.mark_pane_closed(pane_id) {
+                return;
+            }
+            let revision = journal.push(pane_id, generation, change);
+            if let Some(reason) = close_reason {
+                journal.remember_pane_closed_event(pane_id, reason, revision);
             }
         }
         if closes_pane {
             self.remove_foreground_state_cache(pane_id);
         }
         self.pane_state_notify.notify_waiters();
+    }
+
+    pub(in crate::handler) fn reopen_pane_state(&self, pane_id: PaneId) {
+        self.lock_pane_state_journal().reopen_pane(pane_id);
+    }
+
+    pub(in crate::handler) fn record_panes_closed_as_killed(&self, pane_ids: &[PaneId]) {
+        for pane_id in pane_ids {
+            self.record_pane_state_change(
+                *pane_id,
+                None,
+                PaneStateChange::Closed {
+                    reason: PaneStateClosedReason::Killed,
+                },
+            );
+        }
     }
 
     fn start_foreground_watch_if_needed(&self) {
@@ -289,16 +347,7 @@ impl RequestHandler {
                     self.foreground_watch_started
                         .store(false, Ordering::Release);
                     self.clear_foreground_state_cache();
-                    if journal.foreground_subscription_count() == 0 {
-                        return;
-                    }
-                    if self
-                        .foreground_watch_started
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_err()
-                    {
-                        return;
-                    }
+                    return;
                 }
                 journal.pane_ids_with_foreground_subscriptions()
             };
@@ -367,10 +416,15 @@ impl RequestHandler {
         self.pane_state_notify.notify_waiters();
     }
 
+    pub(in crate::handler) fn pane_state_has_title_subscriptions(&self) -> bool {
+        self.lock_pane_state_journal().title_subscription_count() > 0
+    }
+
     async fn snapshot_for_subscription(
         &self,
         connection_id: u64,
         subscription_id: PaneStateSubscriptionId,
+        closed_lag_revision: Option<u64>,
     ) -> Result<PaneStateSnapshot, RmuxError> {
         let info = {
             let journal = self.lock_pane_state_journal();
@@ -379,6 +433,31 @@ impl RequestHandler {
                 .map_err(|message| RmuxError::Server(message.to_owned()))?
                 .ok_or_else(|| RmuxError::Server("subscription not found".to_owned()))?
         };
+
+        if info.closed {
+            let revision = closed_lag_revision
+                .unwrap_or_else(|| self.lock_pane_state_journal().current_revision());
+            // Kept-dead panes (remain-on-exit) are still present in state:
+            // report their real title/options instead of a fabricated blank.
+            let state = self.state.lock().await;
+            if let Some(target) = pane_target_for_pane_id(&state, info.pane_id) {
+                let (mut snapshot, _foreground_seed) = pane_state_snapshot_locked(
+                    &state,
+                    &target,
+                    info.pane_id,
+                    info.include,
+                    revision,
+                );
+                snapshot.foreground = None;
+                return Ok(snapshot);
+            }
+            return Ok(PaneStateSnapshot {
+                revision,
+                title: info.include.title.then(String::new),
+                options: Vec::new(),
+                foreground: None,
+            });
+        }
 
         let (mut snapshot, foreground_seed) = {
             let state = self.state.lock().await;
@@ -589,6 +668,7 @@ mod tests {
         let new_state = foreground_state(10, "cmd", "C:/new");
 
         handler.seed_foreground_state_cache(pane_id, 3, old_state.clone());
+        handler.seed_foreground_state_cache(pane_id, 3, new_state.clone());
         let previous = handler
             .replace_foreground_state_cache(pane_id, 3, new_state.clone())
             .expect("seeded snapshot baseline is preserved");
@@ -598,6 +678,23 @@ mod tests {
             foreground_change_from_previous(Some(previous), 3, &new_state),
             Some(old_state)
         );
+    }
+
+    #[test]
+    fn stale_foreground_seed_does_not_replace_newer_generation() {
+        let handler = RequestHandler::new();
+        let pane_id = PaneId::new(8);
+        let old_state = foreground_state(10, "cmd", "C:/old");
+        let new_state = foreground_state(10, "cmd", "C:/new");
+        let latest_state = foreground_state(10, "cmd", "C:/latest");
+
+        handler.seed_foreground_state_cache(pane_id, 5, new_state.clone());
+        handler.seed_foreground_state_cache(pane_id, 4, old_state);
+        let previous = handler
+            .replace_foreground_state_cache(pane_id, 5, latest_state)
+            .expect("newer baseline should survive stale seed");
+
+        assert_eq!(previous, (5, new_state));
     }
 
     #[test]

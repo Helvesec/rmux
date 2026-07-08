@@ -17,6 +17,31 @@ fn argv_semicolons_build_an_ordered_command_queue() {
 }
 
 #[test]
+fn standalone_argv_semicolon_builds_an_ordered_command_queue() {
+    let cli = parse_args(&["attach-session", "-t", "alpha", ";", "detach-client"]).unwrap();
+    let commands = cli.into_command_queue();
+
+    assert_eq!(commands.len(), 2);
+    assert!(matches!(
+        &commands[0],
+        super::super::Command::AttachSession(_)
+    ));
+    assert!(matches!(
+        &commands[1],
+        super::super::Command::DetachClient(_)
+    ));
+}
+
+#[test]
+fn trailing_semicolon_after_send_keys_payload_is_a_queue_separator() {
+    let error = parse_args(&["send-keys", "-t", "alpha:0.0", "xyz;", "final"]).unwrap_err();
+    assert!(
+        error.to_string().contains("unknown command: final"),
+        "{error}"
+    );
+}
+
+#[test]
 fn bare_semicolon_builds_a_noop_command_queue() {
     let cli = parse_args(&[";"]).unwrap();
     let commands = cli.into_command_queue();

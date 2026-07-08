@@ -1,5 +1,7 @@
 #[cfg(windows)]
 use rmux_core::key_string_lookup_string;
+use std::io;
+
 use rmux_core::{key_code_lookup_bits, key_string_lookup_key};
 use rmux_proto::{
     ErrorResponse, OptionName, PaneTarget, Response, RmuxError, SendKeysResponse, SessionName,
@@ -123,7 +125,7 @@ pub(in crate::handler) fn prepare_pane_input_write(
             sink: PaneInputSink::QueuedStarting,
         });
     }
-    let master = state.pane_master_in_window(&session_name, window_index, pane_index)?;
+    let master = state.clone_pane_master(&session_name, window_index, pane_index)?;
     #[cfg(not(any(test, windows)))]
     let _ = bytes;
     Ok(PaneInputWrite {
@@ -741,15 +743,50 @@ pub(in crate::handler) async fn write_bytes_to_target_io(
         PaneInputSink::Disabled => Ok(()),
         #[cfg(windows)]
         PaneInputSink::QueuedStarting => Ok(()),
-        PaneInputSink::Pty(master) => write_pane_bytes(master, bytes).await.map_err(|error| {
-            RmuxError::Server(format!(
+        PaneInputSink::Pty(master) => match write_pane_bytes(master, bytes).await {
+            Ok(()) => Ok(()),
+            Err(error) if is_dead_pane_write_error(&error) => {
+                Err(RmuxError::Server("target pane has exited".to_owned()))
+            }
+            Err(error) => Err(RmuxError::Server(format!(
                 "failed to write to pane {}:{}.{}: {}",
                 session_name, window_index, pane_index, error
-            ))
-        }),
+            ))),
+        },
         #[cfg(test)]
         PaneInputSink::CapturedForTest => Ok(()),
     }
+}
+
+pub(in crate::handler) async fn write_attached_bytes_to_target_io(
+    write: PaneInputWrite,
+    bytes: Vec<u8>,
+) -> Result<(), RmuxError> {
+    match write_bytes_to_target_io(write, bytes).await {
+        Err(error) if is_dead_pane_input_error(&error) => Ok(()),
+        result => result,
+    }
+}
+
+fn is_dead_pane_input_error(error: &RmuxError) -> bool {
+    matches!(error, RmuxError::Server(message) if message == "target pane has exited")
+}
+
+pub(in crate::handler) fn is_dead_pane_write_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+    ) || is_unix_pty_eio(error)
+}
+
+#[cfg(unix)]
+fn is_unix_pty_eio(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error())
+}
+
+#[cfg(not(unix))]
+fn is_unix_pty_eio(_error: &io::Error) -> bool {
+    false
 }
 
 #[cfg(windows)]

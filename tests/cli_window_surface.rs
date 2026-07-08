@@ -696,6 +696,36 @@ fn send_keys_literal_flag_sends_text_without_leaking_the_flag() -> Result<(), Bo
 }
 
 #[test]
+fn send_keys_trailing_semicolon_queue_error_does_not_send_partial_input(
+) -> Result<(), Box<dyn Error>> {
+    let _guard = window_surface_guard();
+    let harness = CliHarness::new("send-keys-trailing-semicolon-error")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "cat"])?);
+
+    let output = harness.run(&["send-keys", "-t", "alpha:0.0", "xyz;", "final"])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("unknown command: final"),
+        "stderr={:?} stdout={:?}",
+        stderr(&output),
+        stdout(&output)
+    );
+    let captured = harness.run(&["capture-pane", "-p", "-t", "alpha:0.0"])?;
+    assert_eq!(captured.status.code(), Some(0));
+    assert!(
+        !stdout(&captured).contains("xyz"),
+        "send-keys should not run before queue validation failure: {:?}",
+        stdout(&captured)
+    );
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
 fn split_window_default_and_horizontal_flag_match_tmux_geometry() -> Result<(), Box<dyn Error>> {
     let _guard = window_surface_guard();
     let harness = CliHarness::new("split-window-direction-geometry")?;

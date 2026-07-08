@@ -426,10 +426,6 @@ fn apply_drag_origin_location(event: &mut AttachedMouseEvent, start: &AttachedMo
     event.pane_id = start.pane_id;
     event.pane_target = start.pane_target.clone();
     event.location = start.location;
-    if start.location == MouseLocation::Border {
-        event.raw.lx = start.raw.x;
-        event.raw.ly = start.raw.y;
-    }
 }
 
 pub(crate) fn copy_mode_mouse_context(

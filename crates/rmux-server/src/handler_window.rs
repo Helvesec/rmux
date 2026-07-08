@@ -172,6 +172,7 @@ impl RequestHandler {
 
         if matches!(response, Response::KillWindow(_)) {
             self.forget_pane_snapshot_coalescers(&removed_pane_ids);
+            self.record_panes_closed_as_killed(&removed_pane_ids);
             let mut affected_sessions = removed_windows
                 .iter()
                 .map(|removed_window| removed_window.target.session_name().clone())
@@ -495,6 +496,7 @@ impl RequestHandler {
 
         if let Response::LinkWindow(success) = &response {
             self.forget_pane_snapshot_coalescers(&removed_destination_pane_ids);
+            self.record_panes_closed_as_killed(&removed_destination_pane_ids);
             self.emit(LifecycleEvent::WindowLinked {
                 session_name: success.target.session_name().clone(),
                 target: Some(success.target.clone()),
@@ -532,6 +534,7 @@ impl RequestHandler {
 
         if matches!(response, Response::MoveWindow(_)) {
             self.forget_pane_snapshot_coalescers(&removed_destination_pane_ids);
+            self.record_panes_closed_as_killed(&removed_destination_pane_ids);
             let lifecycle_events =
                 move_window_lifecycle_events(&response, &request, unlinked_window.as_ref());
             for event in lifecycle_events {
@@ -581,6 +584,7 @@ impl RequestHandler {
             if let Some(removed_window) = removed_window {
                 if kill_if_last && removed_window.link_count == 1 {
                     self.forget_pane_snapshot_coalescers(&removed_window.pane_ids);
+                    self.record_panes_closed_as_killed(&removed_window.pane_ids);
                 }
                 self.emit(LifecycleEvent::WindowUnlinked {
                     session_name: session_name.clone(),
@@ -704,7 +708,7 @@ impl RequestHandler {
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
         let attached_count = self.attached_count(&session_name).await;
-        let response = {
+        let (response, retained_pane_id, removed_pane_ids) = {
             let mut state = self.state.lock().await;
             request.start_directory = match render_start_directory_template(
                 &state,
@@ -714,6 +718,13 @@ impl RequestHandler {
             ) {
                 Ok(start_directory) => start_directory,
                 Err(error) => return Response::Error(ErrorResponse { error }),
+            };
+            let planned_removed_pane_ids = if request.kill {
+                state
+                    .respawn_window_removed_pane_ids(&request.target)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
             };
             match state.respawn_window(
                 request.target,
@@ -730,12 +741,28 @@ impl RequestHandler {
                     },
                 },
             ) {
-                Ok(response) => Response::RespawnWindow(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+                Ok(result) => {
+                    self.reopen_pane_state(result.retained_pane_id);
+                    (
+                        Response::RespawnWindow(result.response),
+                        Some(result.retained_pane_id),
+                        result.removed_pane_ids,
+                    )
+                }
+                Err(error) => (
+                    Response::Error(ErrorResponse { error }),
+                    None,
+                    planned_removed_pane_ids,
+                ),
             }
         };
 
-        if matches!(response, Response::RespawnWindow(_)) {
+        if !removed_pane_ids.is_empty() {
+            self.forget_pane_snapshot_coalescers(&removed_pane_ids);
+            self.record_panes_closed_as_killed(&removed_pane_ids);
+        }
+        if matches!(&response, Response::RespawnWindow(_)) || !removed_pane_ids.is_empty() {
+            let _ = retained_pane_id;
             self.refresh_attached_session(&session_name).await;
         }
 
@@ -920,6 +947,9 @@ fn move_window_replaced_destination_pane_ids(
     if source.session_name() == target.session_name()
         && source.window_index() == target.window_index()
     {
+        return Vec::new();
+    }
+    if state.window_link_count(target.session_name(), target.window_index()) > 1 {
         return Vec::new();
     }
     state

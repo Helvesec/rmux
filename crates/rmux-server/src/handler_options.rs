@@ -93,10 +93,10 @@ impl RequestHandler {
             }
         };
 
+        for (pane_id, generation, outcome) in &pane_option_events {
+            self.record_pane_option_mutation(*pane_id, Some(*generation), outcome);
+        }
         if matches!(response, Response::SetOption(_)) {
-            for (pane_id, generation, outcome) in &pane_option_events {
-                self.record_pane_option_mutation(*pane_id, Some(*generation), outcome);
-            }
             if let Some(scope) = resize_policy_scope.as_ref() {
                 self.reconcile_attached_sizes_for_option_scope(scope).await;
             }
@@ -259,10 +259,10 @@ impl RequestHandler {
             }
         };
 
+        for (pane_id, generation, outcome) in &pane_option_events {
+            self.record_pane_option_mutation(*pane_id, Some(*generation), outcome);
+        }
         if matches!(response, Response::SetOptionByName(_)) {
-            for (pane_id, generation, outcome) in &pane_option_events {
-                self.record_pane_option_mutation(*pane_id, Some(*generation), outcome);
-            }
             if let Some(scope) = resize_policy_scope.as_ref() {
                 self.reconcile_attached_sizes_for_option_scope(scope).await;
             }

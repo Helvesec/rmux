@@ -174,3 +174,194 @@ locks the formatter behavior.
 Inventory impact: RMUX docs may mention the literal trailing `#` behavior, but
 format-token inventory must continue to describe only supported complete
 format expansions.
+
+### C-D37: float-flag expression comparisons render integer booleans
+
+RMUX keeps comparison results as integer boolean text even when the expression
+uses the `f` flag. tmux 3.7b formats the same truthy comparison result as a
+float string.
+
+Test/fixture: `tests/fixtures/tmux_3_7_round4_evidence.md` records the empirical tmux 3.7b
+commands. On July 7, 2026,
+`tmux -L r4 -f /dev/null display-message -p '#{e|==|f:5,5}'`,
+`'#{e|!=|f:5,6}'`, `'#{e|<|f:5,6}'`, `'#{e|<=|f:5,5}'`,
+`'#{e|>|f:6,5}'`, and `'#{e|>=|f:5,5}'` all exited 0 with stdout `1.00`;
+the same RMUX commands exited 0 with stdout `1`.
+
+Inventory impact: this affects format rendering only. RMUX must not claim
+byte-for-byte tmux float formatting for expression comparison results unless
+the formatter is changed and covered by oracle tests.
+
+### C-D38: expression operands with embedded spaces stay permissive
+
+RMUX trims and evaluates spaced arithmetic operands such as ` 5 , 3 `. tmux
+3.7b renders the expression empty. RMUX keeps the permissive behavior for now
+because it accepts user-authored configuration that contains incidental spaces
+without silently failing the whole format.
+
+Test/fixture: `tests/fixtures/tmux_3_7_round4_evidence.md` records
+`tmux -L r4 -f /dev/null display-message -p '#{e|+|: 5 , 3 }'` exiting 0 with
+empty stdout, while RMUX exits 0 with stdout `8`.
+
+Inventory impact: expression-format docs may describe RMUX's permissive operand
+trimming, but compatibility summaries must not call this subcase byte-identical
+to tmux 3.7b.
+
+### C-D39: tmux 3.7b split-window extension flags remain deferred
+
+tmux 3.7b accepts the newer `split-window -k`, `-m`, `-s`, `-S`, and `-R`
+surfaces. RMUX 0.9.0 does not implement their runtime semantics yet, so it
+rejects them instead of accepting flags that would behave incorrectly.
+
+Test/fixture: `tests/fixtures/tmux_3_7_round4_evidence.md` records tmux 3.7b accepting
+`split-window -k` with rc 0 and parsing `split-window -m`, `-s`, `-S`, and
+`-R` far enough to report `expects an argument`; RMUX reports
+`command split-window: unknown flag -k` and the analogous unknown-flag errors
+for `-m`, `-s`, `-S`, and `-R`.
+
+Inventory impact: RMUX must not advertise these split-window flags as supported
+runtime behavior until parser, command inventory, runtime, and oracle fixtures
+land together.
+
+### C-D40: list size ordering uses tuple order rather than area order
+
+For `list-panes -O size` and the equivalent window listing sort, tmux 3.7b
+orders by area. RMUX currently orders by the structured `(cols, rows)` tuple.
+The tuple sort is deterministic and stable, but not tmux-compatible.
+
+Test/fixture: `tests/fixtures/tmux_3_7_round4_evidence.md` records a 3-pane session where
+tmux 3.7b `list-panes -O size -F '#{pane_index}:#{pane_width}x#{pane_height}'`
+prints `1:59x5,2:20x24,0:59x18`, while RMUX prints
+`2:20x24,1:59x5,0:59x18`.
+
+Inventory impact: list command inventory may continue to expose `-O size`, but
+docs must not promise tmux 3.7b area ordering until the comparator changes.
+
+### C-D41: refresh-client subscription flags are parsed but unsupported
+
+tmux 3.7b accepts `refresh-client -A`, `-B`, and `-r` syntactically and then
+requires a current client for the measured detached invocations. RMUX rejects
+the same flags with explicit unsupported-feature errors because subscription
+semantics are not implemented.
+
+Test/fixture: `tests/fixtures/tmux_3_7_round4_evidence.md` records tmux 3.7b
+`refresh-client -A %0:foo`, `refresh-client -B name:what:format`, and
+`refresh-client -r pane:fmt` exiting 1 with `no current client`; RMUX exits 1
+with `refresh-client -A is not supported`, `refresh-client -B is not supported`,
+and `refresh-client -r is not supported`.
+
+Inventory impact: command listings may show the parsed flags only as accepted
+syntax. User-facing docs must describe them as unsupported at runtime until the
+subscription behavior is implemented.
+
+### C-D42: respawn-pane without a command uses the default shell
+
+tmux 3.7b respawns a dead pane with its original command when no command is
+supplied. RMUX respawns with the session default shell. This preserves RMUX's
+current pane creation model, which does not retain enough command provenance to
+reconstruct every original argv safely.
+
+Test/fixture: `tests/fixtures/tmux_3_7_round4_evidence.md` records a `remain-on-exit`
+session with a dead `true` pane. tmux 3.7b `respawn-pane -t w:1.0` exits 0 and
+`display-message -p -t w:1.0 '#{pane_current_command}'` prints `true`; RMUX
+exits 0 and prints `bash`.
+
+Inventory impact: RMUX must not claim tmux-compatible no-argument
+`respawn-pane` command resurrection until command provenance is stored and
+covered by tests.
+
+### C-D43: control-mode attach replays initial pane backlog
+
+tmux 3.7b does not replay existing pane backlog as `%output` during the
+measured control-mode attach. RMUX emits the pane's current backlog as initial
+`%output`, which is useful for RMUX control clients that expect an immediate
+snapshot.
+
+Test/fixture: `tests/fixtures/tmux_3_7_round4_evidence.md` records
+`tmux -C -L r4 -f /dev/null attach -t w` after sending `printf old` producing
+`%begin`, `%end`, `%session-changed $0 w`, `%exit` and no `%output`. The same
+RMUX control attach emits `%output %0 ... printf old ... old ...` before
+`%exit`.
+
+Inventory impact: control-mode compatibility claims must exclude initial
+backlog replay until RMUX either removes it or adds a negotiated mode.
+
+### C-D44: shutdown hook run-shell delivery is best effort
+
+tmux 3.7b drains more shutdown-time `run-shell` hook markers before server exit.
+RMUX treats server shutdown as a hard boundary and does not guarantee that
+asynchronous `run-shell` hook jobs complete after `kill-server` or the last
+session closes.
+
+Test/fixture: `tests/fixtures/tmux_3_7_round4_evidence.md` records a
+single-session shutdown probe measured on July 8, 2026: a `session-closed`
+hook running `run-shell "printf '%s\n' session-closed >> '$out'"` delivered the
+marker under tmux 3.7b, while RMUX wrote no marker before daemon exit. Round4
+intentionally did not change shutdown draining.
+
+Inventory impact: hooks remain listed, but documentation must not promise
+tmux-identical asynchronous `run-shell` delivery during daemon shutdown.
+
+### C-D45: startup config messages without a current session are not surfaced
+
+tmux 3.7b renders some startup config messages before the first client reaches
+the normal pane view. RMUX applies the same final session state but does not
+surface that early config status message.
+
+Test/fixture: `tests/fixtures/tmux_3_7_round4_evidence.md` records a config containing
+`display-message hello`. Under pty startup, tmux 3.7b showed
+`/tmp/r4-startup-...conf:1: hello`; RMUX attached to the created session without
+that config status message.
+
+Inventory impact: source-file and startup config support remain advertised for
+accepted syntax and final state, but first-client diagnostic rendering is not
+byte-identical to tmux 3.7b.
+
+### C-D46: mouse placeholder targets outside mouse events use RMUX diagnostics
+
+tmux 3.7b reports `no mouse target` when `select-window -t=` or
+`kill-window -t=` is run outside a mouse event. RMUX currently reports the
+empty target through its session resolver as `invalid session: `.
+
+Test/fixture: `tests/fixtures/tmux_3_7_round4_evidence.md` records tmux 3.7b
+`select-window -t=` and `kill-window -t=` exiting 1 with `no mouse target`;
+RMUX exits 1 with `invalid session: ` for both commands.
+
+Inventory impact: this is an error-surface divergence only. Mouse binding
+behavior remains covered separately; docs must not claim byte-identical
+diagnostics for bare `-t=` outside mouse events.
+
+### C-D47: kill-window last-window CLI fallback keeps SDK error semantics
+
+tmux 3.7b emits the last-window `window-unlinked` hook before session closure.
+RMUX's CLI falls back from `kill-window` to `kill-session` for the last window
+so the server and SDK can keep the documented direct `window.kill()` error for
+the only-window case. That fallback reverses the last-window hook order.
+
+Test/fixture: `tests/fixtures/tmux_3_7_round4_evidence.md` records a
+July 8, 2026 deterministic hook probe: with a second session keeping the
+server alive, `kill-window -t victim:0` on the target session's last window
+produced tmux order `window-unlinked` then `session-closed`, while RMUX
+produced `session-closed` then `window-unlinked`. Round4 code deliberately
+left `crates/rmux-sdk/src/handles/window.rs` only-window kill error semantics
+intact.
+
+Inventory impact: CLI `kill-window` behavior remains available, but hook-order
+parity claims must exclude the last-window fallback path.
+
+### C-D48: queued attach terminal-exit banners are omitted
+
+tmux 3.7b writes terminal-exit banners for queued attached clients, including
+`[detached (from session w)]` and `[server exited]`. RMUX completes the state
+transition and returns the matching exit status, but emits no banner bytes on
+the queued attach path.
+
+Test/fixture: `tests/fixtures/tmux_3_7_round4_evidence.md` records pty probes:
+`attach -t w \; detach-client` exits 0 in both tools, tmux transcript length
+539 with `[detached (from session w)]`, RMUX transcript length 0; `attach -t w
+\; kill-server` exits 1 and leaves no server in both tools, tmux contains
+`[server exited]`, RMUX transcript length 0.
+
+Inventory impact: attach sequencing compatibility may be advertised for exit
+status and final state, but not for terminal-exit banner bytes on queued attach
+until banner rendering is implemented.

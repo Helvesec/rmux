@@ -11,7 +11,9 @@ use super::automation::{
 };
 use super::buffer_commands::{run_load_buffer, run_save_buffer};
 use super::capture_pane::{capture_pane_request, send_capture_pane_request};
-use super::client_commands::run_attach_session;
+use super::client_commands::{
+    run_attach_session, run_attach_session_queued, QueuedAttachSession, QueuedAttachSessionResult,
+};
 use super::command_inventory::run_list_commands;
 use super::command_runner::{
     finish_command_success, inherited_pane_target, run_command, run_command_resolved,
@@ -105,15 +107,36 @@ fn dispatch_commands(
     client_terminal: ClientTerminalContext,
 ) -> Result<i32, ExitFailure> {
     let mut exit_code = 0;
-    for command in commands {
+    let queued_commands = commands.len() > 1;
+    let mut queued_attach_session = None::<QueuedAttachSession>;
+    for (index, command) in commands.iter().cloned().enumerate() {
+        let command_is_detach_client = matches!(&command, Command::DetachClient(_));
+        let command_is_kill_server = matches!(&command, Command::KillServer);
+        let queue_attach_sequence = queued_commands
+            && matches!(&command, Command::AttachSession(_))
+            && attach_sequence_has_terminal_tail(&commands[index + 1..]);
+        let queued_attach_active = queued_attach_session.is_some();
         exit_code = dispatch(
             command,
             socket_path,
             startup.clone(),
             client_terminal.clone(),
+            queue_attach_sequence,
+            &mut queued_attach_session,
         )?;
+        if command_is_kill_server && queued_attach_active && exit_code == 0 {
+            exit_code = 1;
+        }
+        if command_is_detach_client || command_is_kill_server {
+            queued_attach_session = None;
+        }
     }
     Ok(exit_code)
+}
+
+fn attach_sequence_has_terminal_tail(tail: &[Command]) -> bool {
+    tail.iter()
+        .any(|command| matches!(command, Command::DetachClient(_) | Command::KillServer))
 }
 
 fn command_allows_detached_connection_reuse(candidate: &Command) -> bool {
@@ -230,6 +253,8 @@ fn dispatch(
     socket_path: &Path,
     startup: StartupOptions,
     client_terminal: ClientTerminalContext,
+    queue_attach_detach: bool,
+    queued_attach_session: &mut Option<QueuedAttachSession>,
 ) -> Result<i32, ExitFailure> {
     let command_startup = startup.for_command(
         command_has_start_server_flag(&command),
@@ -502,7 +527,22 @@ fn dispatch(
             run_queued_server_command(socket_path, "customize-mode", args.queue_command)
         }
         Command::AttachSession(args) => {
-            run_attach_session(args, socket_path, command_startup, client_terminal)
+            if queue_attach_detach {
+                match run_attach_session_queued(
+                    args,
+                    socket_path,
+                    command_startup,
+                    client_terminal,
+                )? {
+                    QueuedAttachSessionResult::Detached(guard) => {
+                        *queued_attach_session = Some(*guard);
+                        Ok(0)
+                    }
+                    QueuedAttachSessionResult::Completed(exit_code) => Ok(exit_code),
+                }
+            } else {
+                run_attach_session(args, socket_path, command_startup, client_terminal)
+            }
         }
         Command::RefreshClient(args) => super::run_refresh_client(args, socket_path),
         Command::ListClients(args) => super::run_list_clients(args, socket_path),
@@ -603,7 +643,7 @@ fn dispatch(
         }
         Command::RunShell(args) if args.background => {
             let (command, arguments) =
-                run_shell_command_and_arguments(args.command, args.as_commands);
+                run_shell_command_and_arguments(args.command, args.as_commands)?;
             run_command_resolved(socket_path, "run-shell", move |connection| {
                 let target =
                     resolve_run_shell_target(connection, socket_path, args.target.as_ref())?;
@@ -667,7 +707,7 @@ fn run_shell_foreground(
     socket_path: &Path,
     args: crate::cli_args::RunShellArgs,
 ) -> Result<i32, ExitFailure> {
-    let (command, arguments) = run_shell_command_and_arguments(args.command, args.as_commands);
+    let (command, arguments) = run_shell_command_and_arguments(args.command, args.as_commands)?;
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
     let target = resolve_run_shell_target(&mut connection, socket_path, args.target.as_ref())?;
@@ -698,15 +738,15 @@ fn run_shell_foreground(
 fn run_shell_command_and_arguments(
     command: Vec<String>,
     as_commands: bool,
-) -> (String, Vec<String>) {
+) -> Result<(String, Vec<String>), ExitFailure> {
     let mut command = command.into_iter();
     let Some(shell_command) = command.next() else {
-        return (String::new(), Vec::new());
+        return Ok((String::new(), Vec::new()));
     };
     if as_commands {
-        return (shell_command, Vec::new());
+        return Ok((shell_command, Vec::new()));
     }
-    (shell_command, command.collect())
+    Ok((shell_command, command.collect()))
 }
 
 fn resolve_run_shell_target(
@@ -837,4 +877,31 @@ fn run_source_file(
         return Ok(response.exit_status().unwrap_or(0));
     }
     finish_command_success(response, "source-file")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_shell_as_commands_accepts_single_command_string() {
+        let (command, arguments) =
+            run_shell_command_and_arguments(vec!["display-message ok".to_owned()], true)
+                .expect("single command string is valid");
+
+        assert_eq!(command, "display-message ok");
+        assert!(arguments.is_empty());
+    }
+
+    #[test]
+    fn run_shell_as_commands_ignores_trailing_positional_arguments_like_tmux() {
+        let (command, arguments) = run_shell_command_and_arguments(
+            vec!["display-message ok".to_owned(), "discarded".to_owned()],
+            true,
+        )
+        .expect("tmux accepts and ignores trailing -C arguments");
+
+        assert_eq!(command, "display-message ok");
+        assert!(arguments.is_empty());
+    }
 }

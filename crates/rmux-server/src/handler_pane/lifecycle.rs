@@ -46,6 +46,7 @@ enum PaneExitPlan {
         target: PaneTarget,
         removed_pane_ids: Vec<rmux_core::PaneId>,
         pane_event: super::super::QueuedLifecycleEvent,
+        window_event: super::super::QueuedLifecycleEvent,
         session_event: super::super::QueuedLifecycleEvent,
         output: ExitedPaneOutput,
     },
@@ -175,7 +176,7 @@ impl RequestHandler {
                         let window_id = window.id();
                         let window_name = window.name().unwrap_or_default().to_owned();
                         let _ = (session, window);
-                        let window_event = if only_pane_remaining && !only_window_remaining {
+                        let window_event = if only_pane_remaining {
                             Some(prepare_lifecycle_event(
                                 &mut state,
                                 &LifecycleEvent::WindowUnlinked {
@@ -247,6 +248,8 @@ impl RequestHandler {
                                 target,
                                 removed_pane_ids: vec![event.pane_id],
                                 pane_event,
+                                window_event: window_event
+                                    .expect("last pane must unlink its window"),
                                 session_event,
                                 output,
                             })
@@ -402,6 +405,7 @@ impl RequestHandler {
                 target,
                 removed_pane_ids,
                 pane_event,
+                window_event,
                 session_event,
                 output,
             } => {
@@ -429,6 +433,7 @@ impl RequestHandler {
                 self.exit_attached_session(&session_name).await;
                 self.cancel_session_silence_timers(&session_name).await;
                 self.emit_prepared(pane_event);
+                self.emit_prepared(window_event);
                 self.emit_prepared(session_event);
                 self.refresh_control_session(&session_name).await;
                 let _ = self.request_shutdown_if_server_empty().await;

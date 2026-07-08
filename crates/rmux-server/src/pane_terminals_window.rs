@@ -7,8 +7,9 @@ use rmux_core::{
 };
 use rmux_proto::{
     CommandOutput, KillWindowResponse, LastWindowResponse, ListWindowsResponse, NewWindowResponse,
-    NextWindowResponse, OptionName, PreviousWindowResponse, RenameWindowResponse, RmuxError,
-    ScopeSelector, SelectWindowResponse, SessionName, SetOptionMode, WindowListEntry, WindowTarget,
+    NextWindowResponse, OptionName, PaneId, PreviousWindowResponse, RenameWindowResponse,
+    RmuxError, ScopeSelector, SelectWindowResponse, SessionName, SetOptionMode, WindowListEntry,
+    WindowTarget,
 };
 
 #[path = "pane_terminals/window_link_commands.rs"]
@@ -28,7 +29,25 @@ mod window_removal;
 use window_removal::build_window_removal_plan;
 pub(super) use window_removal::window_pane_ids;
 
+pub(crate) struct RespawnWindowResult {
+    pub(crate) response: rmux_proto::RespawnWindowResponse,
+    pub(crate) retained_pane_id: PaneId,
+    pub(crate) removed_pane_ids: Vec<PaneId>,
+}
+
 impl HandlerState {
+    pub(crate) fn respawn_window_removed_pane_ids(
+        &self,
+        target: &WindowTarget,
+    ) -> Result<Vec<PaneId>, RmuxError> {
+        let session = self
+            .sessions
+            .session(target.session_name())
+            .ok_or_else(|| session_not_found(target.session_name()))?;
+        let pane_ids = window_pane_ids(session, target.session_name(), target.window_index())?;
+        Ok(pane_ids.into_iter().skip(1).collect())
+    }
+
     pub(crate) fn create_window(
         &mut self,
         session_name: &SessionName,
@@ -400,7 +419,7 @@ impl HandlerState {
         &mut self,
         target: rmux_proto::WindowTarget,
         options: RespawnWindowOptions<'_>,
-    ) -> Result<rmux_proto::RespawnWindowResponse, RmuxError> {
+    ) -> Result<RespawnWindowResult, RmuxError> {
         let RespawnWindowOptions { kill, spawn } = options;
         let session_name = target.session_name().clone();
         let window_index = target.window_index();
@@ -435,13 +454,18 @@ impl HandlerState {
             .first()
             .copied()
             .ok_or_else(|| RmuxError::Server("window has no panes".to_owned()))?;
+        let removed_pane_ids = pane_ids
+            .iter()
+            .copied()
+            .filter(|id| *id != pane_id)
+            .collect::<Vec<_>>();
         let runtime_session_name =
             self.runtime_session_name_for_window(&session_name, window_index);
         let base_environment =
             self.session_base_environment_for_window(&session_name, window_index);
 
         // Kill terminals for panes that disappear with the old window layout.
-        for removed_pane_id in pane_ids.iter().copied().filter(|id| *id != pane_id) {
+        for removed_pane_id in removed_pane_ids.iter().copied() {
             self.remove_pane_terminal_from_runtime(&runtime_session_name, removed_pane_id);
         }
         if let Some(pipe) = self.remove_pane_pipe(&runtime_session_name, pane_id) {
@@ -471,7 +495,11 @@ impl HandlerState {
         self.synchronize_session_group_from(&session_name)?;
         self.sync_pane_lifecycle_dimensions_for_session(&session_name);
 
-        Ok(rmux_proto::RespawnWindowResponse { target })
+        Ok(RespawnWindowResult {
+            response: rmux_proto::RespawnWindowResponse { target },
+            retained_pane_id: pane_id,
+            removed_pane_ids,
+        })
     }
 
     pub(crate) fn list_windows(

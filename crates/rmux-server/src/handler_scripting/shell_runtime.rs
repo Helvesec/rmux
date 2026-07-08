@@ -164,6 +164,11 @@ impl RequestHandler {
                 .expand_run_shell_command(&request, client_name.as_deref())
                 .await?;
             let parsed = self.parse_command_string_one_group(&command).await?;
+            if parsed_contains_attach_session(&parsed) {
+                return Err(RmuxError::Server(
+                    "open terminal failed: not a terminal".to_owned(),
+                ));
+            }
             let current_target = self
                 .run_shell_commands_current_target(requester_pid, request.target)
                 .await;
@@ -696,6 +701,46 @@ impl RequestHandler {
             command.caller_cwd.as_deref(),
         )
     }
+}
+
+fn parsed_contains_attach_session(parsed: &ParsedCommands) -> bool {
+    parsed.commands().iter().any(command_attaches_client)
+}
+
+fn command_attaches_client(command: &rmux_core::command_parser::ParsedCommand) -> bool {
+    if command.name() == "attach-session" {
+        return true;
+    }
+    // Probed 2026-07-08 against the pinned tmux 3.7b oracle: run-shell -C
+    // "new-session" (without -d) fails with "open terminal failed: not a
+    // terminal" and creates no session, and the same applies to commands
+    // nested in brace bodies.
+    if command.name() == "new-session" && !new_session_is_detached(command) {
+        return true;
+    }
+    command.arguments().iter().any(|argument| match argument {
+        rmux_core::command_parser::CommandArgument::Commands(nested) => {
+            parsed_contains_attach_session(nested)
+        }
+        rmux_core::command_parser::CommandArgument::String(_) => false,
+    })
+}
+
+fn new_session_is_detached(command: &rmux_core::command_parser::ParsedCommand) -> bool {
+    command
+        .arguments()
+        .iter()
+        .filter_map(rmux_core::command_parser::CommandArgument::as_string)
+        .any(|argument| {
+            argument.len() >= 2
+                && argument.starts_with('-')
+                && !argument.starts_with("--")
+                && argument
+                    .bytes()
+                    .skip(1)
+                    .all(|byte| byte.is_ascii_alphabetic())
+                && argument.bytes().skip(1).any(|byte| byte == b'd')
+        })
 }
 
 fn pane_id_for_target(

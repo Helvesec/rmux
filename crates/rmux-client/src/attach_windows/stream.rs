@@ -635,6 +635,9 @@ struct AttachOutputSpool {
     path: Option<PathBuf>,
     frames: VecDeque<AttachOutputSpoolFrame>,
     end_offset: u64,
+    outstanding_bytes: u64,
+    strict_frames: usize,
+    render_frames: usize,
 }
 
 #[derive(Debug)]
@@ -646,19 +649,41 @@ struct AttachOutputSpoolFrame {
 
 impl AttachOutputSpool {
     fn push(&mut self, frame: AttachOutputFrame) -> io::Result<()> {
-        let offset = self.next_write_offset(frame.kind);
-        let len = frame.len();
-        let next_end_offset = checked_spool_end_offset(offset, len)?;
-        if next_end_offset > ATTACH_OUTPUT_SPOOL_MAX_BYTES {
+        self.push_with_limit(frame, ATTACH_OUTPUT_SPOOL_MAX_BYTES)
+    }
+
+    fn push_with_limit(&mut self, frame: AttachOutputFrame, max_bytes: u64) -> io::Result<()> {
+        let replaced_tail_len = self.tail_render_len_if_replacing(frame.kind);
+        let outstanding_after_replace = self
+            .outstanding_bytes
+            .saturating_sub(replaced_tail_len.unwrap_or(0) as u64);
+        let next_outstanding = checked_spool_end_offset(outstanding_after_replace, frame.len())?;
+        if next_outstanding > max_bytes {
             return Err(io::Error::other(format!(
-                "attach output spool exceeded {ATTACH_OUTPUT_SPOOL_MAX_BYTES} bytes"
+                "attach output spool exceeded {max_bytes} bytes"
             )));
         }
         self.replace_tail_render_if_needed(frame.kind)?;
+        let offset = self.next_write_offset(frame.kind);
+        let len = frame.len();
+        let next_end_offset = checked_spool_end_offset(offset, len)?;
+        if self.should_compact_for_write(next_end_offset, max_bytes) {
+            self.compact()?;
+        }
+        let offset = self.next_write_offset(frame.kind);
+        let next_end_offset = checked_spool_end_offset(offset, len)?;
+        let physical_limit = spool_physical_limit(max_bytes);
+        if next_end_offset > physical_limit {
+            return Err(io::Error::other(format!(
+                "attach output spool exceeded {physical_limit} bytes"
+            )));
+        }
         let file = self.file()?;
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(&frame.bytes)?;
         self.end_offset = next_end_offset;
+        self.outstanding_bytes = next_outstanding;
+        self.add_frame_kind(frame.kind);
         self.frames.push_back(AttachOutputSpoolFrame {
             kind: frame.kind,
             offset,
@@ -676,6 +701,8 @@ impl AttachOutputSpool {
         file.seek(SeekFrom::Start(frame.offset))?;
         let mut bytes = vec![0_u8; frame.len];
         file.read_exact(&mut bytes)?;
+        self.outstanding_bytes = self.outstanding_bytes.saturating_sub(frame.len as u64);
+        self.remove_frame_kind(frame.kind);
         if self.frames.is_empty() {
             self.cleanup()?;
         }
@@ -683,15 +710,11 @@ impl AttachOutputSpool {
     }
 
     fn contains_strict(&self) -> bool {
-        self.frames
-            .iter()
-            .any(|frame| frame.kind == AttachOutputFrameKind::Strict)
+        self.strict_frames > 0
     }
 
     fn contains_render(&self) -> bool {
-        self.frames
-            .iter()
-            .any(|frame| frame.kind == AttachOutputFrameKind::Render)
+        self.render_frames > 0
     }
 
     fn is_empty(&self) -> bool {
@@ -707,6 +730,28 @@ impl AttachOutputSpool {
         self.end_offset
     }
 
+    fn should_compact_for_write(&self, next_end_offset: u64, max_bytes: u64) -> bool {
+        if next_end_offset <= max_bytes {
+            return false;
+        }
+        next_end_offset > spool_physical_limit(max_bytes)
+            || self.reclaimable_bytes() >= spool_compact_threshold(max_bytes)
+    }
+
+    fn reclaimable_bytes(&self) -> u64 {
+        self.frames.front().map_or(0, |frame| frame.offset)
+    }
+
+    fn tail_render_len_if_replacing(&self, kind: AttachOutputFrameKind) -> Option<usize> {
+        if kind != AttachOutputFrameKind::Render {
+            return None;
+        }
+        self.frames
+            .back()
+            .filter(|frame| frame.is_render())
+            .map(|frame| frame.len)
+    }
+
     fn replace_tail_render_if_needed(&mut self, kind: AttachOutputFrameKind) -> io::Result<()> {
         if kind != AttachOutputFrameKind::Render
             || !self
@@ -720,10 +765,37 @@ impl AttachOutputSpool {
         let Some(frame) = self.frames.pop_back() else {
             return Ok(());
         };
+        self.outstanding_bytes = self.outstanding_bytes.saturating_sub(frame.len as u64);
+        self.remove_frame_kind(frame.kind);
         self.end_offset = frame.offset;
         if let Some(file) = self.file.as_mut() {
             file.set_len(self.end_offset)?;
         }
+        Ok(())
+    }
+
+    fn compact(&mut self) -> io::Result<()> {
+        if self.frames.is_empty() {
+            self.cleanup()?;
+            return Ok(());
+        }
+        let file = self.file.as_mut().ok_or_else(|| {
+            io::Error::other("attach output spool has frames without a backing file")
+        })?;
+        let mut next_offset = 0_u64;
+        for frame in &mut self.frames {
+            if frame.offset != next_offset {
+                file.seek(SeekFrom::Start(frame.offset))?;
+                let mut bytes = vec![0_u8; frame.len];
+                file.read_exact(&mut bytes)?;
+                file.seek(SeekFrom::Start(next_offset))?;
+                file.write_all(&bytes)?;
+                frame.offset = next_offset;
+            }
+            next_offset = checked_spool_end_offset(next_offset, frame.len)?;
+        }
+        file.set_len(next_offset)?;
+        self.end_offset = next_offset;
         Ok(())
     }
 
@@ -744,6 +816,9 @@ impl AttachOutputSpool {
     fn cleanup(&mut self) -> io::Result<()> {
         self.frames.clear();
         self.end_offset = 0;
+        self.outstanding_bytes = 0;
+        self.strict_frames = 0;
+        self.render_frames = 0;
         drop(self.file.take());
         if let Some(path) = self.path.take() {
             match remove_file(path) {
@@ -753,6 +828,28 @@ impl AttachOutputSpool {
             }
         }
         Ok(())
+    }
+
+    fn add_frame_kind(&mut self, kind: AttachOutputFrameKind) {
+        match kind {
+            AttachOutputFrameKind::Strict => {
+                self.strict_frames = self.strict_frames.saturating_add(1);
+            }
+            AttachOutputFrameKind::Render => {
+                self.render_frames = self.render_frames.saturating_add(1);
+            }
+        }
+    }
+
+    fn remove_frame_kind(&mut self, kind: AttachOutputFrameKind) {
+        match kind {
+            AttachOutputFrameKind::Strict => {
+                self.strict_frames = self.strict_frames.saturating_sub(1);
+            }
+            AttachOutputFrameKind::Render => {
+                self.render_frames = self.render_frames.saturating_sub(1);
+            }
+        }
     }
 }
 
@@ -791,6 +888,14 @@ fn checked_spool_end_offset(offset: u64, len: usize) -> io::Result<u64> {
     offset
         .checked_add(len)
         .ok_or_else(|| io::Error::other("attach output spool offset overflowed"))
+}
+
+fn spool_compact_threshold(max_bytes: u64) -> u64 {
+    (max_bytes / 4).max(1)
+}
+
+fn spool_physical_limit(max_bytes: u64) -> u64 {
+    max_bytes.saturating_add(spool_compact_threshold(max_bytes))
 }
 
 fn cleanup_orphaned_attach_output_spools() {
@@ -921,23 +1026,14 @@ struct DrainContext<'context> {
 #[derive(Debug, Default)]
 struct WindowsConsoleMouseTracker {
     enabled: bool,
+    normal_tracking: bool,
+    button_tracking: bool,
+    any_tracking: bool,
     tail: Vec<u8>,
 }
 
 impl WindowsConsoleMouseTracker {
     fn observe(&mut self, bytes: &[u8]) -> Option<bool> {
-        const ENABLE: [&[u8]; 4] = [
-            b"\x1b[?1000h",
-            b"\x1b[?1002h",
-            b"\x1b[?1003h",
-            b"\x1b[?1006h",
-        ];
-        const DISABLE: [&[u8]; 4] = [
-            b"\x1b[?1000l",
-            b"\x1b[?1002l",
-            b"\x1b[?1003l",
-            b"\x1b[?1006l",
-        ];
         const TAIL_LEN: usize = 7;
 
         if bytes.is_empty() {
@@ -950,16 +1046,29 @@ impl WindowsConsoleMouseTracker {
 
         let mut observed = None;
         for index in 0..combined.len() {
-            if ENABLE
-                .iter()
-                .any(|sequence| combined[index..].starts_with(sequence))
-            {
-                observed = Some(true);
-            } else if DISABLE
-                .iter()
-                .any(|sequence| combined[index..].starts_with(sequence))
-            {
-                observed = Some(false);
+            let tail = &combined[index..];
+            if tail.starts_with(b"\x1b[?1000h") {
+                self.normal_tracking = true;
+                observed = Some(self.mouse_input_enabled());
+            } else if tail.starts_with(b"\x1b[?1000l") {
+                self.normal_tracking = false;
+                observed = Some(self.mouse_input_enabled());
+            } else if tail.starts_with(b"\x1b[?1002h") {
+                self.button_tracking = true;
+                observed = Some(self.mouse_input_enabled());
+            } else if tail.starts_with(b"\x1b[?1002l") {
+                self.button_tracking = false;
+                observed = Some(self.mouse_input_enabled());
+            } else if tail.starts_with(b"\x1b[?1003h") {
+                self.any_tracking = true;
+                observed = Some(self.mouse_input_enabled());
+            } else if tail.starts_with(b"\x1b[?1003l") {
+                self.any_tracking = false;
+                observed = Some(self.mouse_input_enabled());
+            } else if tail.starts_with(b"\x1b[?1006h") {
+                // SGR mouse encoding is independent from DECSET 1000/1002/1003 tracking.
+            } else if tail.starts_with(b"\x1b[?1006l") {
+                // Disabling SGR encoding must not disable Windows console mouse input.
             }
         }
 
@@ -973,6 +1082,10 @@ impl WindowsConsoleMouseTracker {
         }
         self.enabled = enabled;
         Some(enabled)
+    }
+
+    const fn mouse_input_enabled(&self) -> bool {
+        self.normal_tracking || self.button_tracking || self.any_tracking
     }
 }
 

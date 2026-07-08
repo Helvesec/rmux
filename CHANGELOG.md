@@ -20,6 +20,14 @@
   [hook lifecycle tests](tests/scripting.rs),
   [attach flow tests](tests/cli_attach_flow.rs), and
   [control-mode oracle rows](tests/tmux_compat_surface_matrix/client_control.rs).
+- Aligns tmux 3.7b expression-format arithmetic for `%` modulo parsing,
+  NaN/inf operands, and signed integer sentinel edge cases, including the
+  `-9223372036854775808 / -1` overflow case.
+- Matches tmux queued attach sequencing: `attach-session ; detach-client` and
+  `attach-session ; <command> ; detach-client` use a real queued attached
+  client when a terminal is present, `attach-session ; kill-server` exits with
+  the server gone, and an `attach-session` that is final or has no terminal
+  tail still performs the normal terminal attach instead of being dropped.
 - Updated the command inventory so `list-commands`, help text, parser
   acceptance, source-file handling, and runtime support stay coherent for the
   tmux-compatible 0.9.0 surface.
@@ -44,6 +52,8 @@
   backpressure.
 - Documented the detached RPC 0.9.0 wire policy as exact-versioned and added
   fuzz coverage for the detached frame decoder.
+- Bumped the detached RPC frame envelope from wire version 3 to 4 for the
+  0.9.0 SDK pane-state and pane-option extension boundary.
 - Locked SDK armed waits behind capabilities, including the Windows 250ms
   post-ACK settle and the documented best-effort cancellation transport.
 
@@ -124,10 +134,8 @@
 - Restored tmux 3.4-compatible binary boolean format semantics for `&&:` and
   `||:`; use nested boolean formats for portable multi-operand conditions.
 - Matched tmux 3.4 expression-format arithmetic for empty operands, `0x`
-  integer literals, invalid `%` operators, and integer divide/modulo-by-zero
-  sentinel results.
-- Matched tmux expression-format overflow sentinels for the
-  `-9223372036854775808 / -1` integer edge case.
+  integer literals, and integer divide-by-zero sentinel results covered by the
+  0.8 compatibility gate.
 - Matched tmux 3.4 substitution-format behavior for empty and zero-width
   regex patterns, avoiding synthetic insertions that tmux leaves untouched.
 - Matched tmux control-mode escaping for DEL and fixed HEAD responses to omit

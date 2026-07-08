@@ -42,8 +42,12 @@ pub fn command_target_metadata(command_name: &str) -> Option<CommandTargetMetada
             Some(spec('s', Type::Window, Flags::DEFAULT_MARKED)),
             Some(spec('t', Type::Window, Flags::NONE)),
         )),
-        "attach-session" | "display-panes" | "has-session" | "kill-session" | "last-window"
-        | "list-windows" | "next-window" | "previous-window" | "rename-session" => {
+        "attach-session" => Some(metadata(
+            None,
+            Some(spec('t', Type::Session, Flags::PREFER_UNATTACHED)),
+        )),
+        "display-panes" | "has-session" | "kill-session" | "last-window" | "list-windows"
+        | "next-window" | "previous-window" | "rename-session" => {
             Some(metadata(None, Some(spec('t', Type::Session, Flags::NONE))))
         }
         "set-hook" => Some(metadata(None, Some(spec('t', Type::Pane, Flags::CANFAIL)))),
@@ -51,10 +55,7 @@ pub fn command_target_metadata(command_name: &str) -> Option<CommandTargetMetada
             None,
             Some(spec('t', Type::Session, Flags::CANFAIL)),
         )),
-        "switch-client" => Some(metadata(
-            None,
-            Some(spec('t', Type::Session, Flags::PREFER_UNATTACHED)),
-        )),
+        "switch-client" => Some(metadata(None, Some(spec('t', Type::Window, Flags::NONE)))),
         "set-option" => Some(metadata(
             None,
             Some(spec('t', Type::Session, Flags::CANFAIL)),

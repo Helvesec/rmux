@@ -17,6 +17,7 @@ use super::pane_windows_console_sequence::prepare_single_pane_windows_console_in
 use super::{encode_tokens_for_target, prepare_pane_input_write, write_bytes_to_target};
 use crate::hook_runtime::PendingInlineHookFormat;
 use crate::pane_state_journal::PaneStateChange;
+use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::pane_terminals::{session_not_found, HandlerState};
 
 impl RequestHandler {
@@ -271,6 +272,7 @@ impl RequestHandler {
 
         if !removed_pane_ids.is_empty() {
             self.forget_pane_snapshot_coalescers(&removed_pane_ids);
+            self.record_panes_closed_as_killed(&removed_pane_ids);
         }
         if let Some(event) = queued_pane_exited {
             self.emit_prepared(event);
@@ -311,7 +313,7 @@ impl RequestHandler {
     ) -> Response {
         let session_name = request.target.session_name().clone();
         let socket_path = self.socket_path();
-        let response = {
+        let (response, respawned_pane_id) = {
             let mut state = self.state.lock().await;
             let target = match resolve_pane_target_ref(&state, &request.target) {
                 Ok(target) => target,
@@ -335,6 +337,15 @@ impl RequestHandler {
                 command: request.command,
                 process_command: request.process_command,
             };
+            let pane_id = match pane_id_for_target(
+                &state.sessions,
+                request.target.session_name(),
+                request.target.window_index(),
+                request.target.pane_index(),
+            ) {
+                Ok(pane_id) => pane_id,
+                Err(error) => return Response::Error(ErrorResponse { error }),
+            };
             match state.respawn_pane(
                 request,
                 &socket_path,
@@ -343,12 +354,15 @@ impl RequestHandler {
                 Some(self.pane_exit_callback()),
                 |_, _| {},
             ) {
-                Ok(response) => Response::RespawnPane(response),
-                Err(error) => Response::Error(ErrorResponse { error }),
+                Ok(response) => {
+                    self.reopen_pane_state(pane_id);
+                    (Response::RespawnPane(response), Some(pane_id))
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), None),
             }
         };
 
-        if matches!(response, Response::RespawnPane(_)) {
+        if respawned_pane_id.is_some() {
             self.refresh_attached_session(&session_name).await;
         }
 

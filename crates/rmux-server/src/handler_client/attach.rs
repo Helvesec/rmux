@@ -96,7 +96,16 @@ impl RequestHandler {
             },
         };
         if let Some(target_spec) = request.target_spec.as_deref() {
-            match self.apply_switch_target(target_spec, false).await {
+            let current_session = self.current_session_candidate(requester_pid).await;
+            match self
+                .apply_switch_target(
+                    target_spec,
+                    current_session.as_ref(),
+                    rmux_core::TargetFindFlags::PREFER_UNATTACHED,
+                    false,
+                )
+                .await
+            {
                 Ok(next_session_name) => session_name = next_session_name,
                 Err(error) => {
                     return HandleOutcome::response(Response::Error(ErrorResponse { error }));

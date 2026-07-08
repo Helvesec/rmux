@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -52,12 +53,80 @@ pub(super) fn client_terminal_context_from_cli(cli: &Cli) -> ClientTerminalConte
     client_terminal_context_from_parts(terminal_features, cli.utf8)
 }
 
+struct PreparedAttachSession {
+    connection: Connection,
+    request: AttachSessionExt2Request,
+    nested_context: bool,
+    nested_target: Option<String>,
+    nested_skip_environment_update: bool,
+    nested_toggle_read_only: bool,
+}
+
+pub(super) struct QueuedAttachSession {
+    _connection: Connection,
+}
+
+pub(super) enum QueuedAttachSessionResult {
+    Detached(Box<QueuedAttachSession>),
+    Completed(i32),
+}
+
 pub(super) fn run_attach_session(
     args: AttachSessionArgs,
     socket_path: &Path,
     startup: StartupOptions,
     client_terminal: ClientTerminalContext,
 ) -> Result<i32, ExitFailure> {
+    let prepared = prepare_attach_session(args, socket_path, startup, client_terminal)?;
+    if prepared.nested_context {
+        return run_nested_attach_session_as_switch_client(prepared);
+    }
+
+    let PreparedAttachSession {
+        connection,
+        request,
+        ..
+    } = prepared;
+    attach_with_connection(connection, request)
+}
+
+pub(super) fn run_attach_session_queued(
+    args: AttachSessionArgs,
+    socket_path: &Path,
+    startup: StartupOptions,
+    client_terminal: ClientTerminalContext,
+) -> Result<QueuedAttachSessionResult, ExitFailure> {
+    let prepared = prepare_attach_session(args, socket_path, startup, client_terminal)?;
+    if prepared.nested_context {
+        return run_nested_attach_session_as_switch_client(prepared)
+            .map(QueuedAttachSessionResult::Completed);
+    }
+    if !stdin_can_attach_terminal() {
+        return Err(ExitFailure::new(1, "open terminal failed: not a terminal"));
+    }
+
+    let PreparedAttachSession {
+        mut connection,
+        request,
+        ..
+    } = prepared;
+    let response = connection
+        .attach_session_with_target_spec_detached(request)
+        .map_err(ExitFailure::from_client)?;
+    expect_command_success(response, "attach-session")?;
+    Ok(QueuedAttachSessionResult::Detached(Box::new(
+        QueuedAttachSession {
+            _connection: connection,
+        },
+    )))
+}
+
+fn prepare_attach_session(
+    args: AttachSessionArgs,
+    socket_path: &Path,
+    startup: StartupOptions,
+    client_terminal: ClientTerminalContext,
+) -> Result<PreparedAttachSession, ExitFailure> {
     let nested_context =
         detect_context() == ClientContext::Nested && inherited_rmux_socket_matches(socket_path);
     if nested_context {
@@ -90,25 +159,41 @@ pub(super) fn run_attach_session(
         client_size: current_terminal_size(),
     };
 
-    if nested_context {
-        return run_switch_client_on_connection(
-            &mut connection,
-            SwitchClientExt3Request {
-                target_client: None,
-                target: nested_target,
-                key_table: None,
-                last_session: false,
-                next_session: false,
-                previous_session: false,
-                toggle_read_only: nested_toggle_read_only,
-                sort_order: None,
-                skip_environment_update: nested_skip_environment_update,
-                zoom: false,
-            },
-        );
-    }
+    Ok(PreparedAttachSession {
+        connection,
+        request,
+        nested_context,
+        nested_target,
+        nested_skip_environment_update,
+        nested_toggle_read_only,
+    })
+}
 
-    attach_with_connection(connection, request)
+fn run_nested_attach_session_as_switch_client(
+    prepared: PreparedAttachSession,
+) -> Result<i32, ExitFailure> {
+    let PreparedAttachSession {
+        mut connection,
+        nested_target,
+        nested_skip_environment_update,
+        nested_toggle_read_only,
+        ..
+    } = prepared;
+    run_switch_client_on_connection(
+        &mut connection,
+        SwitchClientExt3Request {
+            target_client: None,
+            target: nested_target,
+            key_table: None,
+            last_session: false,
+            next_session: false,
+            previous_session: false,
+            toggle_read_only: nested_toggle_read_only,
+            sort_order: None,
+            skip_environment_update: nested_skip_environment_update,
+            zoom: false,
+        },
+    )
 }
 
 fn inherited_rmux_socket_matches(socket_path: &Path) -> bool {
@@ -119,7 +204,7 @@ fn inherited_rmux_socket_matches_from_env(rmux: Option<&OsStr>, socket_path: &Pa
     let Some(inherited_socket) = rmux.and_then(rmux_socket_path_from_env) else {
         return false;
     };
-    socket_paths_match(&inherited_socket, socket_path)
+    rmux_os::path::socket_paths_match(&inherited_socket, socket_path)
 }
 
 fn rmux_socket_path_from_env(value: &OsStr) -> Option<PathBuf> {
@@ -128,32 +213,6 @@ fn rmux_socket_path_from_env(value: &OsStr) -> Option<PathBuf> {
         .split_once(',')
         .map_or(value.as_ref(), |(path, _)| path);
     (!path.is_empty()).then(|| PathBuf::from(path))
-}
-
-fn socket_paths_match(left: &Path, right: &Path) -> bool {
-    let left = canonical_socket_path(left);
-    let right = canonical_socket_path(right);
-    #[cfg(windows)]
-    {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy())
-    }
-    #[cfg(not(windows))]
-    {
-        left == right
-    }
-}
-
-fn canonical_socket_path(path: &Path) -> PathBuf {
-    if let Ok(canonical) = std::fs::canonicalize(path) {
-        return canonical;
-    }
-    match (path.parent(), path.file_name()) {
-        (Some(parent), Some(file_name)) => std::fs::canonicalize(parent)
-            .map(|canonical_parent| canonical_parent.join(file_name))
-            .unwrap_or_else(|_| path.to_path_buf()),
-        _ => path.to_path_buf(),
-    }
 }
 
 fn validate_nested_attach_session(args: &AttachSessionArgs) -> Result<(), ExitFailure> {
@@ -432,6 +491,10 @@ fn attach_terminal_exit_failure(error: ClientError) -> ExitFailure {
     } else {
         ExitFailure::from_client(error)
     }
+}
+
+fn stdin_can_attach_terminal() -> bool {
+    std::io::stdin().is_terminal()
 }
 
 #[cfg(unix)]

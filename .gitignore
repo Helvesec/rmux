@@ -26,6 +26,7 @@ SDK demo/playwright-report/
 /.rmux-audit/
 /scripts/bench/README.md
 /.claude/settings.local.json
+/AGENTS.md
 
 # Local secret material and environment overrides.
 .env

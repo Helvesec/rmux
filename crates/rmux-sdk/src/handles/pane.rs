@@ -57,7 +57,8 @@ pub use spawn::PaneSpawnBuilder;
 use split::split_pane;
 pub use split_builder::PaneSplitBuilder;
 pub use state_events::{
-    PaneStateEvent, PaneStateEventStream, PaneStateEventsOptions, PaneStateOption,
+    PaneStateClosedReason, PaneStateEvent, PaneStateEventStream, PaneStateEventsOptions,
+    PaneStateOption,
 };
 pub(crate) use target::is_already_closed_pane_error;
 use title::{get_title, set_title};

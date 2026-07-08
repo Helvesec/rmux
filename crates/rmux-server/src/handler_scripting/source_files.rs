@@ -373,7 +373,7 @@ pub(super) fn source_inputs_for_path_with_diagnostics(
         return Ok(SourcePathRead {
             inputs: vec![SourceInput {
                 current_file: "-".to_owned(),
-                contents: strip_utf8_bom(stdin.to_owned()),
+                contents: stdin.to_owned(),
             }],
             error: None,
         });
@@ -402,7 +402,7 @@ pub(super) fn source_inputs_for_path_with_diagnostics(
         match read_source_entry(&entry, read_policy) {
             Ok(contents) => inputs.push(SourceInput {
                 current_file: source_entry_display_path(&entry),
-                contents: strip_utf8_bom(contents),
+                contents,
             }),
             Err(error) if quiet && error.kind() == io::ErrorKind::NotFound => {}
             Err(_) if read_policy == SourceReadPolicy::BestEffort => {}
@@ -456,13 +456,13 @@ fn read_limited_source_entry(entry: &Path) -> io::Result<String> {
     let file = open_strict_source_entry(entry)?;
     let metadata = file.metadata()?;
     validate_strict_source_metadata(&metadata)?;
-    let mut contents = String::new();
+    let mut contents = Vec::new();
     let mut reader = file.take(MAX_SOURCE_CONFIG_BYTES + 1);
-    reader.read_to_string(&mut contents)?;
+    reader.read_to_end(&mut contents)?;
     if contents.len() as u64 > MAX_SOURCE_CONFIG_BYTES {
         return Err(oversized_source_config_error());
     }
-    Ok(contents)
+    Ok(String::from_utf8_lossy(&contents).into_owned())
 }
 
 fn validate_strict_source_metadata(metadata: &fs::Metadata) -> io::Result<()> {
@@ -510,13 +510,13 @@ fn read_tmux_compat_source_entry(entry: &Path) -> io::Result<String> {
     let metadata = file.metadata()?;
     validate_tmux_compat_regular_metadata(&metadata)?;
 
-    let mut contents = String::new();
+    let mut contents = Vec::new();
     let mut reader = file.take(MAX_SOURCE_CONFIG_BYTES + 1);
-    reader.read_to_string(&mut contents)?;
+    reader.read_to_end(&mut contents)?;
     if contents.len() as u64 > MAX_SOURCE_CONFIG_BYTES {
         return Err(oversized_source_config_error());
     }
-    Ok(contents)
+    Ok(String::from_utf8_lossy(&contents).into_owned())
 }
 
 fn validate_tmux_compat_regular_metadata(metadata: &fs::Metadata) -> io::Result<()> {
@@ -552,13 +552,6 @@ fn open_tmux_compat_regular_file(entry: &Path) -> io::Result<File> {
 
 fn oversized_source_config_error() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "source file exceeds 16 MiB")
-}
-
-fn strip_utf8_bom(mut contents: String) -> String {
-    if contents.starts_with('\u{feff}') {
-        contents.replace_range(..'\u{feff}'.len_utf8(), "");
-    }
-    contents
 }
 
 #[cfg(unix)]
@@ -648,25 +641,13 @@ mod tests {
     use super::glob_pattern_for_source_path;
 
     use super::{
-        source_inputs_for_path, source_inputs_for_path_with_diagnostics, strip_utf8_bom,
-        LoadedSourceFile, SourceReadPolicy,
+        source_inputs_for_path, source_inputs_for_path_with_diagnostics, LoadedSourceFile,
+        SourceReadPolicy,
     };
     use rmux_proto::RmuxError;
 
     #[test]
-    fn strips_utf8_bom_from_source_text() {
-        assert_eq!(
-            strip_utf8_bom("\u{feff}set -g status off".to_owned()),
-            "set -g status off"
-        );
-        assert_eq!(
-            strip_utf8_bom("set -g status off".to_owned()),
-            "set -g status off"
-        );
-    }
-
-    #[test]
-    fn source_file_stdin_strips_utf8_bom() {
+    fn source_file_stdin_preserves_utf8_bom_like_tmux() {
         let inputs = source_inputs_for_path(
             "-",
             None,
@@ -676,11 +657,11 @@ mod tests {
         )
         .expect("stdin source should load");
 
-        assert_eq!(inputs[0].contents, "set -g status off");
+        assert_eq!(inputs[0].contents, "\u{feff}set -g status off");
     }
 
     #[test]
-    fn source_file_path_strips_utf8_bom() {
+    fn source_file_path_preserves_utf8_bom_like_tmux() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time before unix epoch")
@@ -701,7 +682,32 @@ mod tests {
         .expect("file source should load");
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(inputs[0].contents, "set -g status-left ok");
+        assert_eq!(inputs[0].contents, "\u{feff}set -g status-left ok");
+    }
+
+    #[test]
+    fn source_file_path_decodes_reversed_bom_lossily_like_tmux() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rmux-source-reversed-bom-{}-{unique}.conf",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"\xff\xfeset -g status-left ok").expect("write source file");
+
+        let inputs = source_inputs_for_path(
+            &path.to_string_lossy(),
+            None,
+            false,
+            None,
+            SourceReadPolicy::Strict,
+        )
+        .expect("file source should load");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(inputs[0].contents, "\u{fffd}\u{fffd}set -g status-left ok");
     }
 
     #[test]

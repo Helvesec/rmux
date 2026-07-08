@@ -669,29 +669,113 @@ async fn later_frames_stay_behind_existing_spool_even_when_memory_has_room(
 }
 
 #[test]
-fn spool_cap_rejects_replacement_without_truncating_existing_render() {
+fn spool_cap_rejects_frames_that_exceed_outstanding_backlog_limit() {
     let mut spool = AttachOutputSpool::default();
-    spool.frames.push_back(AttachOutputSpoolFrame {
-        kind: AttachOutputFrameKind::Render,
-        offset: ATTACH_OUTPUT_SPOOL_MAX_BYTES - 1,
-        len: 1,
-    });
-    spool.end_offset = ATTACH_OUTPUT_SPOOL_MAX_BYTES;
+    spool.outstanding_bytes = ATTACH_OUTPUT_SPOOL_MAX_BYTES;
 
     let error = spool
-        .push(AttachOutputFrame::render(vec![b'x'; 2]))
-        .expect_err("replacement render beyond the cap must fail before mutation");
+        .push(AttachOutputFrame::strict(vec![b'x']))
+        .expect_err("backlog beyond the cap must fail before mutation");
 
     assert!(
         error.to_string().contains("attach output spool exceeded"),
         "unexpected error: {error}"
     );
-    assert_eq!(spool.frames.len(), 1);
-    assert_eq!(spool.frames[0].kind, AttachOutputFrameKind::Render);
-    assert_eq!(spool.frames[0].offset, ATTACH_OUTPUT_SPOOL_MAX_BYTES - 1);
-    assert_eq!(spool.end_offset, ATTACH_OUTPUT_SPOOL_MAX_BYTES);
+    assert!(spool.frames.is_empty());
+    assert_eq!(spool.outstanding_bytes, ATTACH_OUTPUT_SPOOL_MAX_BYTES);
     assert!(spool.file.is_none());
     assert!(spool.path.is_none());
+}
+
+#[test]
+fn spool_compacts_when_physical_offset_reaches_cap_but_backlog_fits() {
+    let mut spool = AttachOutputSpool::default();
+
+    spool
+        .push_with_limit(AttachOutputFrame::strict(b"abcd".to_vec()), 8)
+        .expect("first frame fits");
+    spool
+        .push_with_limit(AttachOutputFrame::strict(b"efgh".to_vec()), 8)
+        .expect("second frame reaches cap");
+    assert_eq!(
+        spool
+            .pop()
+            .expect("pop succeeds")
+            .expect("first frame exists")
+            .bytes,
+        b"abcd"
+    );
+    assert_eq!(spool.end_offset, 8);
+    assert_eq!(spool.outstanding_bytes, 4);
+
+    spool
+        .push_with_limit(AttachOutputFrame::strict(b"ij".to_vec()), 8)
+        .expect("small backlog compacts instead of tripping cumulative cap");
+
+    assert_eq!(spool.end_offset, 6);
+    assert_eq!(spool.outstanding_bytes, 6);
+    assert_eq!(
+        spool
+            .pop()
+            .expect("pop succeeds")
+            .expect("second frame exists")
+            .bytes,
+        b"efgh"
+    );
+    assert_eq!(
+        spool
+            .pop()
+            .expect("pop succeeds")
+            .expect("third frame exists")
+            .bytes,
+        b"ij"
+    );
+    assert!(spool.pop().expect("empty pop succeeds").is_none());
+}
+
+#[test]
+fn spool_defers_compaction_for_small_reclaimable_prefix_near_cap() {
+    let mut spool = AttachOutputSpool::default();
+
+    spool
+        .push_with_limit(AttachOutputFrame::strict(b"a".to_vec()), 16)
+        .expect("first frame fits");
+    spool
+        .push_with_limit(AttachOutputFrame::strict(vec![b'b'; 15]), 16)
+        .expect("second frame reaches logical cap");
+    assert_eq!(
+        spool
+            .pop()
+            .expect("pop succeeds")
+            .expect("first frame exists")
+            .bytes,
+        b"a"
+    );
+
+    spool
+        .push_with_limit(AttachOutputFrame::strict(b"c".to_vec()), 16)
+        .expect("one-byte refill fits in physical slack without compaction");
+
+    assert_eq!(spool.end_offset, 17);
+    assert_eq!(spool.outstanding_bytes, 16);
+    assert_eq!(spool.frames.front().map(|frame| frame.offset), Some(1));
+    assert_eq!(
+        spool
+            .pop()
+            .expect("pop succeeds")
+            .expect("second frame exists")
+            .bytes,
+        vec![b'b'; 15]
+    );
+    assert_eq!(
+        spool
+            .pop()
+            .expect("pop succeeds")
+            .expect("third frame exists")
+            .bytes,
+        b"c"
+    );
+    assert!(spool.pop().expect("empty pop succeeds").is_none());
 }
 
 #[test]
@@ -701,7 +785,7 @@ fn pending_render_replacement_survives_spool_cap_failure() {
         .pending
         .push_back(AttachOutputFrame::render(b"old-render".to_vec()));
     queue.pending_bytes = ATTACH_OUTPUT_PENDING_MAX_BYTES + b"old-render".len() - 1;
-    queue.spool.end_offset = ATTACH_OUTPUT_SPOOL_MAX_BYTES;
+    queue.spool.outstanding_bytes = ATTACH_OUTPUT_SPOOL_MAX_BYTES;
 
     let error = queue
         .push_pending(AttachOutputFrame::render(vec![b'x'; 2]))
@@ -840,6 +924,23 @@ async fn mouse_sequences_toggle_windows_console_mouse_actions(
     Ok(())
 }
 
+#[test]
+fn mouse_tracker_keeps_console_mouse_enabled_when_only_sgr_is_disabled() {
+    let mut tracker = WindowsConsoleMouseTracker::default();
+
+    assert_eq!(tracker.observe(b"\x1b[?1000h\x1b[?1006h"), Some(true));
+    assert_eq!(tracker.observe(b"\x1b[?1006l"), None);
+    assert_eq!(tracker.observe(b"\x1b[?1000l"), Some(false));
+}
+
+#[test]
+fn split_sgr_mouse_sequence_does_not_enable_windows_console_mouse() {
+    let mut tracker = WindowsConsoleMouseTracker::default();
+
+    assert_eq!(tracker.observe(b"\x1b[?10"), None);
+    assert_eq!(tracker.observe(b"06h"), None);
+}
+
 #[tokio::test]
 async fn split_mouse_sequence_toggles_windows_console_mouse(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -848,7 +949,7 @@ async fn split_mouse_sequence_toggles_windows_console_mouse(
     let mut server = scenario.take_server();
 
     write_server_message(&mut server, AttachMessage::Data(b"\x1b[?10".to_vec())).await?;
-    write_server_message(&mut server, AttachMessage::Data(b"06h".to_vec())).await?;
+    write_server_message(&mut server, AttachMessage::Data(b"00h".to_vec())).await?;
     actions
         .wait_for_call("mouse:true", Duration::from_secs(1))
         .await?;

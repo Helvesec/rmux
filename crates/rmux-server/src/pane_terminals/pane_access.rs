@@ -306,7 +306,7 @@ impl HandlerState {
         )
     }
 
-    pub(crate) fn pane_master_in_window(
+    pub(crate) fn clone_pane_master(
         &self,
         session_name: &SessionName,
         window_index: u32,
@@ -314,12 +314,6 @@ impl HandlerState {
     ) -> Result<PtyMaster, RmuxError> {
         let pane_id = pane_id_for_target(&self.sessions, session_name, window_index, pane_index)?;
         let runtime_session_name = self.runtime_session_name_for_window(session_name, window_index);
-        #[cfg(windows)]
-        if self.pane_is_starting_in_window(session_name, window_index, pane_index) {
-            return Err(RmuxError::Server(format!(
-                "pane {session_name}:{window_index}.{pane_index} is still starting"
-            )));
-        }
         self.terminals
             .clone_pane_master(&runtime_session_name, pane_id, window_index, pane_index)
     }

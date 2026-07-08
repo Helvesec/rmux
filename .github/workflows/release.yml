@@ -249,8 +249,11 @@ jobs:
           cargo test -p rmux-client --locked output_writer_failure_wakes -- --test-threads=1
           ./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux-client --locked blocked_console_output_does_not_block_input_forwarding
           cargo test -p rmux-client --locked blocked_console_output_does_not_block_input_forwarding -- --test-threads=1
+          ./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux-client --locked output_backpressure_keeps_local_input_and_resize_live
+          cargo test -p rmux-client --locked output_backpressure_keeps_local_input_and_resize_live -- --test-threads=1
           ./scripts/windows_ctrl_matrix.ps1 -StaticMatrixSpec
-          ./scripts/windows_ctrl_matrix.ps1 -PortableSmokeOnly -OutDir target/windows-ctrl-matrix
+          ./scripts/windows_ctrl_matrix.ps1 -PortableSmokeOnly -OutDir target/windows-ctrl-matrix -AllowPortableSmokeSkip
+          if (Test-Path target/windows-ctrl-matrix/portable-smoke.skip.txt) { Write-Host "::warning::windows ctrl-matrix portable smoke skipped (non-interactive runner session); run it manually on an interactive Windows session before tagging (RELEASING.md)" }
           ./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux --locked --test windows_ctrl_matrix_spec
           cargo test -p rmux --locked --test windows_ctrl_matrix_spec -- --test-threads=1
           ./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux --locked --test windows_attach_exit
@@ -654,7 +657,6 @@ jobs:
             exit 1
           fi
           gh release upload "$tag" --repo "$GITHUB_REPOSITORY" "${assets[@]}" --clobber
-          gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --draft=false
 
       - name: Deploy Linux package repositories
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
@@ -733,6 +735,11 @@ jobs:
           git add _headers index.html debian rpm
           git commit -m "packages: publish rmux $RELEASE_REF"
           git push "$package_repo_url" "HEAD:$RMUX_PACKAGE_REPO_BRANCH"
+
+      - name: Publish GitHub release
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
+        shell: bash
+        run: gh release edit "$RELEASE_REF" --repo "$GITHUB_REPOSITORY" --draft=false
 
   publish-snap:
     name: Publish Snap ${{ matrix.snap-arch }} candidate

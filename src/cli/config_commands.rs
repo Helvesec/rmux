@@ -7,8 +7,8 @@ mod options;
 
 use rmux_client::{connect, ClientError};
 use rmux_proto::{
-    ErrorResponse, PaneTarget, Request, Response, RmuxError, ScopeSelector, SessionName,
-    SetEnvironmentMode, SetOptionByNameRequest,
+    ErrorResponse, Request, Response, RmuxError, ScopeSelector, SetEnvironmentMode,
+    SetOptionByNameRequest,
 };
 
 use crate::cli::target_resolution::resolve_session_target_spec;
@@ -93,9 +93,6 @@ pub(crate) fn run_show_options(
 ) -> Result<i32, ExitFailure> {
     let command_name = command.command_name();
     let quiet = args.quiet;
-    if show_options_global_pane_is_noop(command, &args) {
-        return Ok(0);
-    }
     let scope = match resolve_show_options_scope(command, &args) {
         Ok(scope) => scope,
         Err(error) if quiet && quiet_option_failure(&error) => return Ok(0),
@@ -130,34 +127,6 @@ pub(crate) fn run_show_options(
             Ok(0)
         }
     }
-}
-
-fn show_options_global_pane_is_noop(
-    command: ShowOptionsCommandKind,
-    args: &ShowOptionsArgs,
-) -> bool {
-    matches!(command, ShowOptionsCommandKind::ShowOptions)
-        && args.global
-        && args.pane
-        && args
-            .name
-            .as_deref()
-            .map(option_name_supports_pane_show_scope)
-            .unwrap_or(true)
-}
-
-fn option_name_supports_pane_show_scope(name: &str) -> bool {
-    rmux_core::resolve_option_name(name)
-        .map(|query| query.supports_scope(&dummy_pane_scope()))
-        .unwrap_or(false)
-}
-
-fn dummy_pane_scope() -> rmux_proto::types::OptionScopeSelector {
-    rmux_proto::types::OptionScopeSelector::Pane(PaneTarget::with_window(
-        SessionName::new("show-options").expect("valid session name"),
-        0,
-        0,
-    ))
 }
 
 fn show_options_exit_failure(error: ClientError) -> ExitFailure {

@@ -105,9 +105,9 @@ pub use handles::{
     CleanupPolicy, ForegroundSource, ForegroundSources, ForegroundState, LeaseState,
     NewWindowBuilder, OwnedSession, OwnedSessionBuilder, OwnedSessionSignalHandlers, Pane,
     PaneCapture, PaneCaptureBuilder, PaneCloseOutcome, PaneOptionMutation, PaneRespawnOptions,
-    PaneSpawnBuilder, PaneSplitBuilder, PaneStateEvent, PaneStateEventStream,
-    PaneStateEventsOptions, PaneStateOption, Rmux, RmuxBuilder, Session, SplitDirection, Window,
-    WindowCloseOutcome, WindowPane,
+    PaneSpawnBuilder, PaneSplitBuilder, PaneStateClosedReason, PaneStateEvent,
+    PaneStateEventStream, PaneStateEventsOptions, PaneStateOption, Rmux, RmuxBuilder, Session,
+    SplitDirection, Window, WindowCloseOutcome, WindowPane,
 };
 pub use info::{InfoSnapshot, PaneExitState, PaneInfo, PaneProcessState, SessionInfo, WindowInfo};
 pub use input::{

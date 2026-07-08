@@ -51,6 +51,223 @@ fn list_pane_widths(harness: &CliHarness, target: &str) -> TestResult<Vec<PaneWi
         .collect()
 }
 
+#[test]
+fn queued_attach_session_detach_client_requires_terminal_when_detached() -> TestResult<()> {
+    let harness = CliHarness::new("queued-attach-detach-notty")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let output = harness.run(&["attach-session", "-t", "alpha", ";", "detach-client"])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(common::stdout(&output), "");
+    assert_eq!(
+        common::stderr(&output),
+        "open terminal failed: not a terminal\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn queued_attach_session_detach_client_completes_in_terminal() -> TestResult<()> {
+    let harness = CliHarness::new("queued-attach-detach-pty")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let mut attach = AttachedSession::spawn_command(
+        &harness,
+        &["attach-session", "-t", "alpha", ";", "detach-client"],
+        TerminalSize::new(80, 24),
+    )?;
+
+    let (status, output) = attach.wait_for_exit_with_output(IO_TIMEOUT)?;
+    assert!(status.success(), "attach ; detach-client failed: {status}");
+    assert!(
+        output.is_empty(),
+        "queued attach/detach should not draw an attach frame, got {}",
+        String::from_utf8_lossy(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn queued_attach_session_runs_intermediate_commands_before_detach() -> TestResult<()> {
+    let harness = CliHarness::new("queued-attach-select-detach")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["new-window", "-t", "alpha"])?);
+
+    let mut attach = AttachedSession::spawn_command(
+        &harness,
+        &[
+            "attach-session",
+            "-t",
+            "alpha",
+            ";",
+            "select-window",
+            "-t",
+            "0",
+            ";",
+            "detach-client",
+        ],
+        TerminalSize::new(80, 24),
+    )?;
+
+    let (status, _output) = attach.wait_for_exit_with_output(IO_TIMEOUT)?;
+    assert!(
+        status.success(),
+        "attach ; select-window ; detach-client failed: {status}"
+    );
+    let windows = harness.run(&[
+        "list-windows",
+        "-t",
+        "alpha",
+        "-F",
+        "#{window_index}:#{window_active}",
+    ])?;
+    assert_eq!(windows.status.code(), Some(0));
+    assert!(
+        common::stdout(&windows).lines().any(|line| line == "0:1"),
+        "select-window in queued attach sequence did not make window 0 active:\n{}",
+        common::stdout(&windows)
+    );
+    Ok(())
+}
+
+#[test]
+fn queued_attach_session_kill_server_stops_attached_server() -> TestResult<()> {
+    let harness = CliHarness::new("queued-attach-kill-server")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let mut attach = AttachedSession::spawn_command(
+        &harness,
+        &["attach-session", "-t", "alpha", ";", "kill-server"],
+        TerminalSize::new(80, 24),
+    )?;
+
+    let (status, _output) = attach.wait_for_exit_with_output(IO_TIMEOUT)?;
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "attach ; kill-server should exit like an attached client whose server exited"
+    );
+    let sessions = harness.run(&["list-sessions"])?;
+    assert_eq!(sessions.status.code(), Some(1));
+    Ok(())
+}
+
+#[test]
+fn queued_attach_switch_client_accepts_exact_session_prefix() -> TestResult<()> {
+    let harness = CliHarness::new("queued-attach-switch-exact")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "w"])?);
+    assert_success(&harness.run(&["new-window", "-t", "w"])?);
+    assert_success(&harness.run(&["new-window", "-t", "w"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "2"])?);
+
+    let mut attach = AttachedSession::spawn_command(
+        &harness,
+        &[
+            "attach-session",
+            "-t",
+            "w",
+            ";",
+            "switch-client",
+            "-t",
+            "=2",
+            ";",
+            "detach-client",
+        ],
+        TerminalSize::new(80, 24),
+    )?;
+
+    let (status, _output) = attach.wait_for_exit_with_output(IO_TIMEOUT)?;
+    assert!(
+        status.success(),
+        "attach ; switch-client -t =2 ; detach-client failed: {status}"
+    );
+    Ok(())
+}
+
+#[test]
+fn queued_attach_session_without_terminal_tail_stays_interactive() -> TestResult<()> {
+    let harness = CliHarness::new("queued-attach-list-panes")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let mut attach = AttachedSession::spawn_command(
+        &harness,
+        &["attach-session", "-t", "alpha", ";", "list-panes"],
+        TerminalSize::new(80, 24),
+    )?;
+
+    attach.wait_for_raw_mode(IO_TIMEOUT)?;
+    assert!(
+        attach.child_mut().try_wait()?.is_none(),
+        "attach ; list-panes exited before the interactive attach was detached"
+    );
+    attach.send_bytes(b"\x02d")?;
+    let (status, output) = attach.wait_for_exit_with_output(IO_TIMEOUT)?;
+    assert!(
+        status.success(),
+        "detach from attach ; list-panes failed: {status}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output).contains(": ["),
+        "list-panes did not run after detaching from interactive attach:\n{}",
+        String::from_utf8_lossy(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn queued_attach_session_without_detach_enters_terminal_attach() -> TestResult<()> {
+    let harness = CliHarness::new("queued-attach-final")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let mut attach = AttachedSession::spawn_command(
+        &harness,
+        &[
+            "new-window",
+            "-t",
+            "alpha",
+            ";",
+            "attach-session",
+            "-t",
+            "alpha",
+        ],
+        TerminalSize::new(80, 24),
+    )?;
+
+    attach.wait_for_raw_mode(IO_TIMEOUT)?;
+    let _ = read_until_contains(attach.master_mut(), "[alpha]", IO_TIMEOUT)?;
+    assert!(
+        attach.child_mut().try_wait()?.is_none(),
+        "attach command exited instead of staying attached"
+    );
+    attach.send_bytes(b"\x02d")?;
+    let status = attach.wait_for_exit(IO_TIMEOUT)?;
+    assert!(
+        status.success(),
+        "detach from queued attach failed: {status}"
+    );
+    Ok(())
+}
+
+#[test]
+fn queued_attach_session_before_non_detach_stops_queue_when_terminal_is_missing() -> TestResult<()>
+{
+    let harness = CliHarness::new("queued-attach-before-tail")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let output = harness.run(&["attach-session", "-t", "alpha", ";", "kill-server"])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        common::stderr(&output),
+        "open terminal failed: not a terminal\n"
+    );
+    let sessions = harness.run(&["list-sessions"])?;
+    assert_eq!(sessions.status.code(), Some(0));
+    assert!(common::stdout(&sessions).contains("alpha:"));
+    Ok(())
+}
+
 fn list_pane_geometry(harness: &CliHarness, target: &str) -> Result<Vec<String>, Box<dyn Error>> {
     let output = harness.run(&[
         "list-panes",

@@ -74,6 +74,16 @@ fn tmux_quote_argument(argument: &str) -> String {
     if argument == ";" {
         return argument.to_owned();
     }
+    if let Some(base) = argument.strip_suffix(';') {
+        if let Some(escaped_base) = base.strip_suffix('\\') {
+            return tmux_quote_value(&format!("{escaped_base};"));
+        }
+        return format!("{};", tmux_quote_value(base));
+    }
+    tmux_quote_value(argument)
+}
+
+fn tmux_quote_value(argument: &str) -> String {
     if argument
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':' | '='))
@@ -107,8 +117,12 @@ mod tests {
     #[test]
     fn tmux_quote_preserves_command_separators_and_quotes_values() {
         assert_eq!(tmux_quote_argument(";"), ";");
+        assert_eq!(tmux_quote_argument("xyz;"), "xyz;");
+        assert_eq!(tmux_quote_argument("hello world;"), "'hello world';");
+        assert_eq!(tmux_quote_argument("xyz\\;"), "'xyz;'");
         assert_eq!(tmux_quote_argument("display-message"), "display-message");
         assert_eq!(tmux_quote_argument("hello world"), "'hello world'");
+        assert_eq!(tmux_quote_argument("semi;colon"), "'semi;colon'");
         assert_eq!(tmux_quote_argument("it's"), "'it'\\''s'");
     }
 

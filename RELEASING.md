@@ -99,8 +99,16 @@ scripts/unsafe-check.sh
 scripts/no-network-in-runtime.sh
 scripts/check-platform-neutrality.sh
 scripts/no-debug-assert-side-effects.sh
-scripts/release-review-gate.sh
+RMUX_PERF_AUTO_CURRENT=1 scripts/release-review-gate.sh
 ```
+
+The perf comparator is enforced on the darwin release machine (where the
+pinned baseline was recorded); on platforms without a committed same-class
+baseline the gate reports an explicit `perf-comparator=skipped-no-<platform>-baseline`
+line (a `::warning::` annotation in CI) instead of comparing cross-machine
+noise. The Windows ctrl-matrix portable smoke likewise cannot run in a
+non-interactive CI session: CI reports an explicit skip warning and the
+smoke must be run manually on an interactive Windows session before tagging.
 
 If release packaging, Web Share, or the site changed, also run the matching
 package and WASM provenance gates before tagging. For the WebSocket fuzz target,
@@ -172,10 +180,13 @@ attestations verify.
 2. Wait for each crate version to become visible on crates.io before publishing
    dependents.
 3. Skip crates already published at the target version.
-4. Finish with:
+4. The root `rmux` binary crate is intentionally `publish = false`; do not
+   expect `cargo install rmux --version X.Y.Z` to work for this release line.
+   Finish Rust crate publishing with the published SDK/support crates, then
+   smoke the binary via the Git tag path:
 
    ```sh
-   cargo install rmux --locked --version X.Y.Z
+   cargo install --git https://github.com/Helvesec/rmux --tag vX.Y.Z rmux --locked
    rmux -V
    ```
 
@@ -233,7 +244,7 @@ Before closing a release, verify or request verification for:
 - Windows WinGet: `winget install rmux` or `winget install -e --id Helvesec.RMUX`
 - Windows Scoop: `scoop bucket add rmux https://github.com/Helvesec/scoop-rmux && scoop install rmux`
 - Windows Chocolatey: `choco install rmux`
-- Rust: `cargo install rmux --locked --version X.Y.Z`
+- Rust git tag: `cargo install --git https://github.com/Helvesec/rmux --tag vX.Y.Z rmux --locked`
 
 Every public smoke must end with:
 

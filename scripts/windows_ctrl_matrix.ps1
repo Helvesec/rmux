@@ -6,7 +6,8 @@ param(
     [string[]]$OnlyProgram = @(),
     [string[]]$OnlyKey = @(),
     [switch]$StaticMatrixSpec,
-    [switch]$PortableSmokeOnly
+    [switch]$PortableSmokeOnly,
+    [switch]$AllowPortableSmokeSkip
 )
 
 Set-StrictMode -Version Latest
@@ -51,6 +52,8 @@ if ($StaticMatrixSpec) {
         "WezTerm",
         "Alacritty",
         "PortableSmokeOnly",
+        "AllowPortableSmokeSkip",
+        "windows-ctrl-matrix-portable-smoke requires an interactive session",
         "Ctrl-C",
         "Ctrl-D",
         "Ctrl-A",
@@ -93,9 +96,12 @@ if ($PortableSmokeOnly -and -not $env:RMUX_FORCE_WINDOWS_CTRL_MATRIX_GUI) {
             "owner=release-engineering"
             "cadence=release-candidate-and-manual-windows-review"
         )
-        Write-Host $skipMessage
-        Write-Host "Set RMUX_FORCE_WINDOWS_CTRL_MATRIX_GUI=1 to force the GUI focus smoke from this session."
-        exit 0
+        if ($AllowPortableSmokeSkip -or $env:RMUX_ALLOW_WINDOWS_CTRL_MATRIX_SKIP -eq '1') {
+            Write-Host $skipMessage
+            Write-Host "Set RMUX_FORCE_WINDOWS_CTRL_MATRIX_GUI=1 to force the GUI focus smoke from this session."
+            exit 0
+        }
+        throw "windows-ctrl-matrix-portable-smoke requires an interactive session; set RMUX_FORCE_WINDOWS_CTRL_MATRIX_GUI=1 to force it or pass -AllowPortableSmokeSkip only for an explicitly accepted manual skip."
     }
 }
 
@@ -195,26 +201,6 @@ $script:LastGuiKind = $null
 
 function New-Directory([string]$Path) {
     New-Item -ItemType Directory -Force -Path $Path | Out-Null
-}
-
-function Escape-SendKeysText([string]$Text) {
-    $builder = [System.Text.StringBuilder]::new()
-    foreach ($ch in $Text.ToCharArray()) {
-        switch ($ch) {
-            "+" { [void]$builder.Append("{+}") }
-            "^" { [void]$builder.Append("{^}") }
-            "%" { [void]$builder.Append("{%}") }
-            "~" { [void]$builder.Append("{~}") }
-            "(" { [void]$builder.Append("{(}") }
-            ")" { [void]$builder.Append("{)}") }
-            "{" { [void]$builder.Append("{{}") }
-            "}" { [void]$builder.Append("{}}") }
-            "[" { [void]$builder.Append("{[}") }
-            "]" { [void]$builder.Append("{]}") }
-            default { [void]$builder.Append($ch) }
-        }
-    }
-    $builder.ToString()
 }
 
 function Send-Line([string]$Text) {
@@ -369,6 +355,12 @@ function Close-Window([string]$Title) {
 
 function Command-Exists([string]$Name) {
     [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+function Wsl-Command-Exists([string]$Name) {
+    if (-not (Command-Exists "wsl.exe")) { return $false }
+    & wsl.exe --exec sh -lc "command -v '$Name' >/dev/null 2>&1"
+    $LASTEXITCODE -eq 0
 }
 
 function Find-FirstPath([string[]]$Candidates) {
@@ -545,7 +537,7 @@ function ConvertTo-MsysPath([string]$Path) {
 }
 
 function Python-Literal([string]$Value) {
-    "'" + $Value.Replace("\", "\\").Replace("'", "\\'") + "'"
+    "'" + $Value.Replace("\", "\\").Replace("'", "\'") + "'"
 }
 
 function Write-PythonCaseScript([string]$Path, [string]$MarkerPath, [string]$Body) {
@@ -838,6 +830,7 @@ foreach ($terminal in $terminalSpecs) {
             if ($shell -eq "pwsh" -and -not (Command-Exists "pwsh.exe")) { continue }
             if ($shell -eq "powershell.exe" -and -not (Command-Exists "powershell.exe")) { continue }
             if ($shell -eq "wsl-bash" -and -not (Command-Exists "wsl.exe")) { continue }
+            if ($case.Program -eq "fzf" -and -not (Command-Exists "fzf.exe")) { continue }
             if ($shell -eq "git-bash") {
                 try {
                     [void](Shell-Spec "git-bash" "probe" "direct" "" "")
@@ -845,7 +838,13 @@ foreach ($terminal in $terminalSpecs) {
                     continue
                 }
             }
-            if (-not (Command-Exists "python.exe") -and $case.Program.StartsWith("python")) { continue }
+            if ($case.Program.StartsWith("python")) {
+                if ($shell -eq "wsl-bash") {
+                    if (-not (Wsl-Command-Exists "python3")) { continue }
+                } elseif (-not (Command-Exists "python.exe")) {
+                    continue
+                }
+            }
             $caseIndex++
             $caseName = "c{0:D3}" -f $caseIndex
             $caseDir = Join-Path $OutDir $caseName

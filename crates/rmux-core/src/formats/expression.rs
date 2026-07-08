@@ -44,7 +44,15 @@ fn numeric_operation(operator: &str, left: &str, right: &str) -> Option<f64> {
         "-" => left - right,
         "*" => left * right,
         "/" => left / right,
-        "m" => left % right,
+        // Oracle probe 2026-07-08: '%' is not a tmux e-operator (renders
+        // empty); only 'm' is. Float modulo by zero renders "nan".
+        "m" => {
+            if right == 0.0 {
+                f64::NAN
+            } else {
+                left % right
+            }
+        }
         _ => return None,
     })
 }
@@ -54,25 +62,30 @@ fn integer_operation(operator: &str, left: &str, right: &str) -> Option<String> 
         return None;
     }
 
-    let left = integer_operand(left)?;
-    let right = integer_operand(right)?;
-    if operator == "m" && right == 0.0 {
-        return Some("0".to_owned());
-    }
+    let left = arithmetic_operand(left)?;
+    let right = arithmetic_operand(right)?;
     let value = match operator {
         "+" => left + right,
         "-" => left - right,
         "*" => left * right,
         "/" => left / right,
-        "m" => left % right,
+        // Oracle probe 2026-07-08: tmux 3.7b renders integer modulo by zero
+        // as 0 (division by zero saturates instead).
+        "m" => {
+            if right == 0.0 {
+                0.0
+            } else {
+                left % right
+            }
+        }
         _ => return None,
     };
     Some(integer_result(value))
 }
 
 fn numeric_compare(operator: &str, left: &str, right: &str) -> Option<bool> {
-    let left = integer_operand(left)?;
-    let right = integer_operand(right)?;
+    let left = comparison_operand(left)?;
+    let right = comparison_operand(right)?;
     Some(match operator {
         "==" => left == right,
         "!=" => left != right,
@@ -84,15 +97,17 @@ fn numeric_compare(operator: &str, left: &str, right: &str) -> Option<bool> {
     })
 }
 
-fn integer_operand(value: &str) -> Option<f64> {
+fn arithmetic_operand(value: &str) -> Option<f64> {
+    // The pinned tmux 3.7b oracle (arm64) rounds operands through a
+    // saturating long long cast: NaN -> 0, +/-inf and out-of-range values
+    // saturate (AArch64 fcvtzs semantics). Rust `as` casts match exactly.
     let value = parse_number(value)?;
-    if value.is_nan() {
-        return Some(0.0);
-    }
-    if value.is_finite() && value > i64::MIN as f64 && value < i64::MAX as f64 {
-        return Some((value as i64) as f64);
-    }
-    Some(value)
+    Some((value as i64) as f64)
+}
+
+fn comparison_operand(value: &str) -> Option<f64> {
+    let value = parse_number(value)?;
+    Some((value as i64) as f64)
 }
 
 fn parse_number(value: &str) -> Option<f64> {
@@ -134,16 +149,10 @@ fn parse_prefixed_integer(value: &str) -> Option<i64> {
 }
 
 fn integer_result(value: f64) -> String {
-    if value.is_nan() {
-        return "0".to_owned();
-    }
-    if value == f64::INFINITY || value >= i64::MAX as f64 {
-        return "9223372036854775808".to_owned();
-    }
-    if value == f64::NEG_INFINITY || value < i64::MIN as f64 {
-        return i64::MIN.to_string();
-    }
-    (value as i64).to_string()
+    // The oracle prints the result after the same saturating long long
+    // round-trip as the operands, so e.g. an overflowing multiply renders
+    // as 9223372036854775808 ((double)LLONG_MAX), not as a MIN sentinel.
+    format!("{:.0}", (value as i64) as f64)
 }
 
 fn is_comparison_operator(operator: &str) -> bool {
@@ -174,6 +183,7 @@ fn bool_string(value: bool) -> String {
 
 fn format_float_value(value: f64, precision: usize) -> String {
     if value.is_nan() {
+        // The pinned tmux 3.7b oracle (arm64 libc) prints NaN unsigned.
         return "nan".to_owned();
     }
     format!("{value:.precision$}")

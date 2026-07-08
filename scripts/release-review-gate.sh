@@ -20,6 +20,10 @@ Options:
   --skip-package-build Reuse --layout without rebuilding it.
   --no-tmux            Skip tmux authority checks inside the package smoke.
   -h, --help           Show this help.
+
+Environment:
+  RMUX_PERF_CURRENT_JSON  Required current-run perf JSON for release comparison.
+  RMUX_PERF_AUTO_CURRENT  Set to 1 to generate current perf JSON locally.
 USAGE
 }
 
@@ -78,7 +82,13 @@ while [ "$#" -gt 0 ]; do
 done
 
 cd "$repo_root"
-perf_baseline="benches/perf/baselines/release-0.9.0.json"
+gate_platform="$(uname -s | tr '[:upper:]' '[:lower:]')"
+if [ "$gate_platform" = "darwin" ]; then
+  perf_baseline="benches/perf/baselines/release-0.9.0.json"
+else
+  perf_baseline="benches/perf/baselines/release-0.9.0-${gate_platform}.json"
+fi
+perf_current="${RMUX_PERF_CURRENT_JSON:-}"
 
 case "$target_dir" in
   /*) ;;
@@ -87,7 +97,7 @@ esac
 export CARGO_TARGET_DIR="$target_dir"
 export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
-export RMUX_REQUIRE_TMUX="${RMUX_REQUIRE_TMUX:-1}"
+export RMUX_REQUIRE_TMUX=1
 
 run_step "release versions" scripts/check-release-versions.sh
 run_step "changelog release audit" python3 scripts/check-changelog-release.py CHANGELOG.md
@@ -95,14 +105,41 @@ run_step "tmux divergence ledger" python3 scripts/check-tmux-release-ledger.py
 run_step "feature inventory" \
   cargo run --locked --package xtask -- feature-inventory --check
 run_step "formatting" cargo fmt --all -- --check
-run_step "perf baseline JSON" \
-  bash -c 'test -s "$1" && python3 -m json.tool "$1" >/dev/null' _ "$perf_baseline"
-run_step "perf baseline Lot 9 coverage" python3 scripts/check-perf-baseline.py "$perf_baseline"
-run_step "perf comparator" \
-  python3 scripts/perf-diff.py "$perf_baseline" "$perf_baseline" \
-    --fail-on-regression \
-    --json-out "$target_dir/perf-baseline-self-diff.json"
 run_step "perf comparator self-test" python3 scripts/perf-diff.py --self-test
+if [ ! -f "$perf_baseline" ]; then
+  # Perf comparison is only statistically meaningful against a baseline
+  # recorded on the same platform and machine class; the pinned baseline was
+  # recorded on the darwin release machine. Platforms without a committed
+  # baseline report an explicit, visible skip instead of comparing
+  # cross-machine noise (RELEASING.md: the comparator is enforced on the
+  # darwin release machine before tagging).
+  [ -z "$perf_current" ] || die "RMUX_PERF_CURRENT_JSON is set but no $gate_platform baseline exists at $perf_baseline; record one with scripts/perf-bench.sh on the $gate_platform release machine first"
+  printf 'perf-comparator=skipped-no-%s-baseline enforcement=darwin-release-machine see=RELEASING.md\n' "$gate_platform"
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    printf '::warning::release-review perf comparator skipped: no %s baseline is committed; the perf regression gate is enforced on the darwin release machine (see RELEASING.md)\n' "$gate_platform"
+  fi
+else
+  run_step "perf baseline JSON" \
+    bash -c 'test -s "$1" && python3 -m json.tool "$1" >/dev/null' _ "$perf_baseline"
+  run_step "perf baseline Lot 9 coverage" python3 scripts/check-perf-baseline.py "$perf_baseline"
+  if [ -z "$perf_current" ]; then
+    if [ "${RMUX_PERF_AUTO_CURRENT:-0}" != "1" ]; then
+      die "RMUX_PERF_CURRENT_JSON is required; set RMUX_PERF_AUTO_CURRENT=1 only for local regenerated-current runs"
+    fi
+    perf_current_dir="$target_dir/perf-current"
+    perf_current_log="$target_dir/perf-current.log"
+    mkdir -p "$perf_current_dir"
+    run_step "perf current benchmark" \
+      bash -c 'set -o pipefail; scripts/perf-bench.sh --output-dir "$1" | tee "$2"' _ \
+        "$perf_current_dir" "$perf_current_log"
+    perf_current="$(awk -F= '/^json=/{print $2}' "$perf_current_log" | tail -n1)"
+    [ -n "$perf_current" ] || die "current perf benchmark did not report a JSON path"
+  fi
+  run_step "perf comparator" \
+    python3 scripts/perf-diff.py "$perf_baseline" "$perf_current" \
+      --fail-on-regression \
+      --json-out "$target_dir/perf-current-diff.json"
+fi
 run_step "worktree hygiene" scripts/check-worktree-hygiene.sh
 run_step "platform neutrality" scripts/check-platform-neutrality.sh
 run_step "workspace clippy" \

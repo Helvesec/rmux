@@ -1,5 +1,6 @@
 use std::io;
 use std::os::windows::io::RawHandle;
+use std::sync::OnceLock;
 
 use rmux_proto::AttachedWindowsConsoleKey;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -126,9 +127,7 @@ impl ConsoleInputReader {
                         // SAFETY: EventType says this union currently holds a MOUSE_EVENT_RECORD.
                         record.Event.MouseEvent
                     };
-                    if let Some(bytes) =
-                        encode_mouse_event(event, &mut self.last_mouse_button_state)
-                    {
+                    for bytes in encode_mouse_event(event, &mut self.last_mouse_button_state) {
                         inputs.push(AttachInput::bytes(bytes));
                     }
                 }
@@ -143,6 +142,7 @@ impl ConsoleInputReader {
 const SGR_BTN_LEFT: u16 = 0;
 const SGR_BTN_MIDDLE: u16 = 1;
 const SGR_BTN_RIGHT: u16 = 2;
+const SGR_BTN_NONE: u16 = 3;
 const SGR_WHEEL_UP: u16 = 64;
 const SGR_WHEEL_DOWN: u16 = 65;
 const SGR_WHEEL_LEFT: u16 = 66;
@@ -152,10 +152,10 @@ const SGR_MOD_ALT: u16 = 8;
 const SGR_MOD_CTRL: u16 = 16;
 const SGR_DRAG_FLAG: u16 = 32;
 
-/// Encode a Win32 console `MOUSE_EVENT_RECORD` into an SGR mouse sequence
+/// Encode a Win32 console `MOUSE_EVENT_RECORD` into SGR mouse sequences
 /// (`\x1b[<b;x;yM` press/wheel, `\x1b[<b;x;ym` release). The rmux server gates these
 /// against the active mouse mode, so we always emit and let the server decide.
-fn encode_mouse_event(event: MOUSE_EVENT_RECORD, last_button_state: &mut u32) -> Option<Vec<u8>> {
+fn encode_mouse_event(event: MOUSE_EVENT_RECORD, last_button_state: &mut u32) -> Vec<Vec<u8>> {
     let x = u16::try_from(event.dwMousePosition.X.max(0)).unwrap_or(0) + 1;
     let y = u16::try_from(event.dwMousePosition.Y.max(0)).unwrap_or(0) + 1;
     let buttons = event.dwButtonState;
@@ -169,7 +169,7 @@ fn encode_mouse_event(event: MOUSE_EVENT_RECORD, last_button_state: &mut u32) ->
         } else {
             SGR_WHEEL_DOWN
         };
-        return Some(format_sgr_mouse(base | modifiers, x, y, 'M'));
+        return vec![format_sgr_mouse(base | modifiers, x, y, 'M')];
     }
     if event.dwEventFlags & MOUSE_HWHEELED != 0 {
         // High word of dwButtonState is the signed horizontal wheel delta;
@@ -180,14 +180,14 @@ fn encode_mouse_event(event: MOUSE_EVENT_RECORD, last_button_state: &mut u32) ->
         } else {
             SGR_WHEEL_LEFT
         };
-        return Some(format_sgr_mouse(base | modifiers, x, y, 'M'));
+        return vec![format_sgr_mouse(base | modifiers, x, y, 'M')];
     }
 
     // Ignore bare double-click flags; movement is handled below.
     let previous = *last_button_state;
-    *last_button_state = buttons;
     let pressed = buttons & !previous;
     let released = previous & !buttons;
+    *last_button_state = buttons;
 
     let is_move = event.dwEventFlags & MOUSE_MOVED != 0;
 
@@ -195,22 +195,31 @@ fn encode_mouse_event(event: MOUSE_EVENT_RECORD, last_button_state: &mut u32) ->
         if is_move {
             // Drag (motion with a button held) or bare hover motion.
             if let Some(button) = sgr_button_for_state(buttons) {
-                return Some(format_sgr_mouse(
+                return vec![format_sgr_mouse(
                     button | SGR_DRAG_FLAG | modifiers,
                     x,
                     y,
                     'M',
-                ));
+                )];
             }
+            return vec![format_sgr_mouse(
+                SGR_BTN_NONE | SGR_DRAG_FLAG | modifiers,
+                x,
+                y,
+                'M',
+            )];
         }
-        return None;
+        return Vec::new();
     }
 
-    if let Some(button) = sgr_button_for_state(pressed) {
-        Some(format_sgr_mouse(button | modifiers, x, y, 'M'))
-    } else {
-        sgr_button_for_state(released).map(|button| format_sgr_mouse(button | modifiers, x, y, 'm'))
+    let mut output = Vec::new();
+    for button in sgr_buttons_for_state(released) {
+        output.push(format_sgr_mouse(button | modifiers, x, y, 'm'));
     }
+    for button in sgr_buttons_for_state(pressed) {
+        output.push(format_sgr_mouse(button | modifiers, x, y, 'M'));
+    }
+    output
 }
 
 fn sgr_button_for_state(buttons: u32) -> Option<u16> {
@@ -223,6 +232,20 @@ fn sgr_button_for_state(buttons: u32) -> Option<u16> {
     } else {
         None
     }
+}
+
+fn sgr_buttons_for_state(buttons: u32) -> Vec<u16> {
+    let mut encoded = Vec::new();
+    if buttons & FROM_LEFT_1ST_BUTTON_PRESSED != 0 {
+        encoded.push(SGR_BTN_LEFT);
+    }
+    if buttons & RIGHTMOST_BUTTON_PRESSED != 0 {
+        encoded.push(SGR_BTN_RIGHT);
+    }
+    if buttons & (FROM_LEFT_2ND_BUTTON_PRESSED | FROM_LEFT_3RD_BUTTON_PRESSED) != 0 {
+        encoded.push(SGR_BTN_MIDDLE);
+    }
+    encoded
 }
 
 fn sgr_modifier_bits(control_key_state: u32) -> u16 {
@@ -294,7 +317,8 @@ fn windows_console_key_for_event(
 }
 
 fn trace_windows_console_key(key: AttachedWindowsConsoleKey, bytes: &[u8]) {
-    if std::env::var_os("RMUX_TRACE_WINDOWS_KEYS").is_none() {
+    static TRACE_WINDOWS_KEYS: OnceLock<bool> = OnceLock::new();
+    if !*TRACE_WINDOWS_KEYS.get_or_init(|| std::env::var_os("RMUX_TRACE_WINDOWS_KEYS").is_some()) {
         return;
     }
     tracing::debug!(
@@ -941,7 +965,8 @@ mod tests {
     }
 
     fn encode_mouse(event: MOUSE_EVENT_RECORD, last: &mut u32) -> Option<String> {
-        encode_mouse_event(event, last).map(|bytes| String::from_utf8(bytes).unwrap())
+        let bytes = encode_mouse_event(event, last).concat();
+        (!bytes.is_empty()).then(|| String::from_utf8(bytes).unwrap())
     }
 
     #[test]
@@ -1065,6 +1090,30 @@ mod tests {
     }
 
     #[test]
+    fn mouse_coalesced_release_and_press_emits_both_transitions() {
+        let mut last = RIGHTMOST_BUTTON_PRESSED;
+        let swapped = mouse_event(FROM_LEFT_1ST_BUTTON_PRESSED, 0, 0, 3, 4);
+
+        assert_eq!(
+            encode_mouse(swapped, &mut last).as_deref(),
+            Some("\x1b[<2;4;5m\x1b[<0;4;5M")
+        );
+        assert_eq!(last, FROM_LEFT_1ST_BUTTON_PRESSED);
+    }
+
+    #[test]
+    fn mouse_coalesced_multiple_releases_emits_each_release() {
+        let mut last = FROM_LEFT_1ST_BUTTON_PRESSED | RIGHTMOST_BUTTON_PRESSED;
+        let released = mouse_event(0, 0, 0, 2, 2);
+
+        assert_eq!(
+            encode_mouse(released, &mut last).as_deref(),
+            Some("\x1b[<0;3;3m\x1b[<2;3;3m")
+        );
+        assert_eq!(last, 0);
+    }
+
+    #[test]
     fn mouse_modifiers_are_or_ed_into_button() {
         let mut last = 0;
         // Ctrl+Shift wheel up -> 64 | 4 (shift) | 16 (ctrl) = 84.
@@ -1112,9 +1161,12 @@ mod tests {
     }
 
     #[test]
-    fn mouse_idle_move_without_button_is_ignored() {
+    fn mouse_idle_move_without_button_encodes_sgr_hover_motion() {
         let mut last = 0;
         let event = mouse_event(0, MOUSE_MOVED, 0, 5, 5);
-        assert_eq!(encode_mouse(event, &mut last), None);
+        assert_eq!(
+            encode_mouse(event, &mut last).as_deref(),
+            Some("\x1b[<35;6;6M")
+        );
     }
 }

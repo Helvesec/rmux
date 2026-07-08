@@ -22,6 +22,8 @@ fn windows_ctrl_matrix_script_keeps_direct_attach_send_keys_axes() {
         "WezTerm",
         "Alacritty",
         "PortableSmokeOnly",
+        "AllowPortableSmokeSkip",
+        "windows-ctrl-matrix-portable-smoke requires an interactive session",
         "portable-smoke.skip.txt",
         "owner=release-engineering",
         "cadence=release-candidate-and-manual-windows-review",

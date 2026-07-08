@@ -13,7 +13,7 @@ use rmux_pty::WindowsConsoleKeyEvent;
 use super::super::super::{prompt_support::PromptInputEvent, RequestHandler};
 use super::super::io_other;
 use super::super::pane_io_encoding::{
-    prepare_attached_pane_input_writes, write_bytes_to_target_io,
+    is_dead_pane_write_error, prepare_attached_pane_input_writes, write_attached_bytes_to_target_io,
 };
 use super::super::pane_prompt_input::{
     decode_utf8_char, is_extended_key_prefix, is_utf8_lead_byte, utf8_expected_len,
@@ -692,7 +692,7 @@ impl RequestHandler {
         self.emit_attached_client_active_if_changed(attach_pid, &target, active_emit_cache)
             .await;
         for write in writes {
-            write_bytes_to_target_io(write, bytes.to_vec())
+            write_attached_bytes_to_target_io(write, bytes.to_vec())
                 .await
                 .map_err(io_other)?;
         }
@@ -787,7 +787,12 @@ impl RequestHandler {
 
         self.emit_attached_client_active_if_changed(attach_pid, target, active_emit_cache)
             .await;
-        match master.try_write_immediate(bytes)? {
+        let written = match master.try_write_immediate(bytes) {
+            Ok(written) => written,
+            Err(error) if is_dead_pane_write_error(&error) => return Ok(Some(true)),
+            Err(error) => return Err(error),
+        };
+        match written {
             written if written == bytes.len() => {
                 if clear_alerts_changed {
                     let handler = self.clone();
@@ -804,11 +809,17 @@ impl RequestHandler {
             written => {
                 let suffix = bytes[written..].to_vec();
                 let master = master.try_clone().map_err(io::Error::other)?;
-                tokio::task::spawn_blocking(move || master.write_all(&suffix))
+                let write_result = tokio::task::spawn_blocking(move || master.write_all(&suffix))
                     .await
                     .map_err(|error| {
                         io::Error::other(format!("pane write task failed: {error}"))
-                    })??;
+                    })?;
+                if let Err(error) = write_result {
+                    if is_dead_pane_write_error(&error) {
+                        return Ok(Some(true));
+                    }
+                    return Err(error);
+                }
                 if clear_alerts_changed {
                     let handler = self.clone();
                     let refresh_session_name = session_name.clone();
