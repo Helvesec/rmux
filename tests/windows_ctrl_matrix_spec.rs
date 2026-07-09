@@ -94,9 +94,11 @@ fn windows_release_gate_runs_ctrl_matrix_and_nonempty_cargo_filters() {
     let package_verify = include_str!("../scripts/verify-package-windows.ps1");
 
     for required in [
-        "./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux-client --locked output_writer_failure_wakes",
-        "./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux --locked --test windows_attach_exit",
-        "./scripts/windows_ctrl_matrix.ps1 -PortableSmokeOnly -OutDir target/windows-ctrl-matrix",
+        r#"Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux-client", "--locked", "output_writer_failure_wakes")"#,
+        r#"Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux", "--locked", "--test", "windows_attach_exit")"#,
+        r#"Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux", "--locked", "--test", "windows_cli_queue_formats")"#,
+        r#"Run "./scripts/windows_ctrl_matrix.ps1" @("-PortableSmokeOnly", "-OutDir", "target/windows-ctrl-matrix", "-AllowPortableSmokeSkip")"#,
+        r#"if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"#,
         "rmux-${{ env.RELEASE_REF }}-${{ matrix.target }}-windows-ctrl-matrix",
         "-RunCtrlMatrixSmoke",
     ] {

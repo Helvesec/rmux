@@ -942,6 +942,10 @@ fn attach_output_spool_owner_is_running(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
+    // SAFETY: OpenProcess is called with a plain PID and no inherited handle;
+    // the returned handle is checked for null before use, passed only to
+    // GetExitCodeProcess with a valid out-pointer to a local, and always
+    // released with CloseHandle on the non-null path.
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {

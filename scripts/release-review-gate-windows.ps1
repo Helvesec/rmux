@@ -260,6 +260,10 @@ Step "Windows attach stream queue regressions" {
     Assert-CargoFilter 1 @("test", "-p", "rmux-client", "--locked", "output_backpressure_keeps_local_input_and_resize_live")
     Run "cargo" @("test", "-p", "rmux-client", "--locked", "output_backpressure_keeps_local_input_and_resize_live", "--", "--test-threads=1")
 }
+Step "Windows CLI queue formats" {
+    Assert-CargoFilter 1 @("test", "-p", "rmux", "--locked", "--test", "windows_cli_queue_formats")
+    Run "cargo" @("test", "--locked", "-p", "rmux", "--test", "windows_cli_queue_formats", "--", "--test-threads=1")
+}
 Step "Windows Ctrl matrix spec" {
     Run "powershell" @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\windows_ctrl_matrix.ps1", "-StaticMatrixSpec")
     Run "cargo" @("test", "--locked", "-p", "rmux", "--test", "windows_ctrl_matrix_spec", "--", "--test-threads=1")

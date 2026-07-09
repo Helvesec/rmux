@@ -246,23 +246,34 @@ jobs:
           $env:CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG = "0"
           $env:CARGO_PROFILE_TEST_DEBUG = "0"
           $env:RUSTFLAGS = "-Clink-arg=/DEBUG:NONE"
-          ./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux-client --locked output_writer_failure_wakes
-          cargo test -p rmux-client --locked output_writer_failure_wakes -- --test-threads=1
-          ./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux-client --locked blocked_console_output_does_not_block_input_forwarding
-          cargo test -p rmux-client --locked blocked_console_output_does_not_block_input_forwarding -- --test-threads=1
-          ./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux-client --locked output_backpressure_keeps_local_input_and_resize_live
-          cargo test -p rmux-client --locked output_backpressure_keeps_local_input_and_resize_live -- --test-threads=1
-          ./scripts/windows_ctrl_matrix.ps1 -StaticMatrixSpec
-          ./scripts/windows_ctrl_matrix.ps1 -PortableSmokeOnly -OutDir target/windows-ctrl-matrix -AllowPortableSmokeSkip
+          # GitHub Actions pwsh only checks the LAST native exit code, so a
+          # failing intermediate assert or cargo test would be masked by any
+          # later success; fail closed after every native command instead,
+          # using array splatting like the local Windows gate so bare "--"
+          # separators reach cargo instead of the parameter binder.
+          function Run([string]$Program, [string[]]$Arguments) {
+            & $Program @Arguments
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux-client", "--locked", "output_writer_failure_wakes")
+          Run "cargo" @("test", "-p", "rmux-client", "--locked", "output_writer_failure_wakes", "--", "--test-threads=1")
+          Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux-client", "--locked", "blocked_console_output_does_not_block_input_forwarding")
+          Run "cargo" @("test", "-p", "rmux-client", "--locked", "blocked_console_output_does_not_block_input_forwarding", "--", "--test-threads=1")
+          Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux-client", "--locked", "output_backpressure_keeps_local_input_and_resize_live")
+          Run "cargo" @("test", "-p", "rmux-client", "--locked", "output_backpressure_keeps_local_input_and_resize_live", "--", "--test-threads=1")
+          Run "./scripts/windows_ctrl_matrix.ps1" @("-StaticMatrixSpec")
+          Run "./scripts/windows_ctrl_matrix.ps1" @("-PortableSmokeOnly", "-OutDir", "target/windows-ctrl-matrix", "-AllowPortableSmokeSkip")
           if (Test-Path target/windows-ctrl-matrix/portable-smoke.skip.txt) { Write-Host "::warning::windows ctrl-matrix portable smoke skipped (non-interactive runner session); run it manually on an interactive Windows session before tagging (RELEASING.md)" }
-          ./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux --locked --test windows_ctrl_matrix_spec
-          cargo test -p rmux --locked --test windows_ctrl_matrix_spec -- --test-threads=1
-          ./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux --locked --test windows_attach_exit
-          cargo test -p rmux --locked --test windows_attach_exit -- --test-threads=1
-          ./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux --locked --test automation_cli_windows
-          cargo test -p rmux --locked --test automation_cli_windows -- --test-threads=1
-          ./scripts/assert-cargo-filter-nonempty.ps1 1 -- test -p rmux --locked --test internal_daemon_windows
-          cargo test -p rmux --locked --test internal_daemon_windows -- --nocapture --test-threads=1
+          Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux", "--locked", "--test", "windows_ctrl_matrix_spec")
+          Run "cargo" @("test", "-p", "rmux", "--locked", "--test", "windows_ctrl_matrix_spec", "--", "--test-threads=1")
+          Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux", "--locked", "--test", "windows_cli_queue_formats")
+          Run "cargo" @("test", "-p", "rmux", "--locked", "--test", "windows_cli_queue_formats", "--", "--test-threads=1")
+          Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux", "--locked", "--test", "windows_attach_exit")
+          Run "cargo" @("test", "-p", "rmux", "--locked", "--test", "windows_attach_exit", "--", "--test-threads=1")
+          Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux", "--locked", "--test", "automation_cli_windows")
+          Run "cargo" @("test", "-p", "rmux", "--locked", "--test", "automation_cli_windows", "--", "--test-threads=1")
+          Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux", "--locked", "--test", "internal_daemon_windows")
+          Run "cargo" @("test", "-p", "rmux", "--locked", "--test", "internal_daemon_windows", "--", "--nocapture", "--test-threads=1")
 
       - name: Upload Windows Ctrl matrix smoke artifacts
         if: runner.os == 'Windows' && always()

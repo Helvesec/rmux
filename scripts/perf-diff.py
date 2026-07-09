@@ -232,6 +232,13 @@ def compare_metrics(
     method: str,
 ) -> list[MetricDiff]:
     diffs: list[MetricDiff] = []
+    missing_names = sorted(set(base_metrics) - set(current_metrics))
+    if missing_names:
+        raise ValueError(
+            "current perf JSON is missing baseline metrics: "
+            + ", ".join(missing_names)
+            + "; a partial current run cannot stand in for the full benchmark"
+        )
     common_names = sorted(set(base_metrics) & set(current_metrics))
     if not common_names:
         raise ValueError("no metric names overlap between inputs")
@@ -388,6 +395,19 @@ def run_self_test() -> None:
     tail_current = synthetic_metric("tail", [10.0] * 35 + [150.0] * 5)
     method, _, _, _ = select_p_value(tail_base, tail_current, DEFAULT_METHOD)
     assert method == "mann-whitney"
+
+    try:
+        compare_metrics(
+            {"stable": unchanged_base, "slow": regressed_base},
+            {"stable": unchanged_current},
+            alpha=DEFAULT_ALPHA,
+            regression_pct=DEFAULT_REGRESSION_PCT,
+            method=DEFAULT_METHOD,
+        )
+    except ValueError as error:
+        assert "missing baseline metrics: slow" in str(error), error
+    else:
+        raise AssertionError("partial current with missing baseline metrics must fail")
 
     base_artifact = Artifact(
         path=Path("baseline.json"),

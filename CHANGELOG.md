@@ -20,9 +20,36 @@
   [hook lifecycle tests](tests/scripting.rs),
   [attach flow tests](tests/cli_attach_flow.rs), and
   [control-mode oracle rows](tests/tmux_compat_surface_matrix/client_control.rs).
-- Aligns tmux 3.7b expression-format arithmetic for `%` modulo parsing,
-  NaN/inf operands, and signed integer sentinel edge cases, including the
-  `-9223372036854775808 / -1` overflow case.
+- Accepts `%`, `%%`, and `m` as expression-format modulo spellings and
+  normalizes the undefined expression-arithmetic cases (divide/modulo by zero,
+  NaN/inf and out-of-range operands, and the `-9223372036854775808 / -1`
+  overflow) to RMUX's deterministic Linux-oracle sentinel behavior. tmux 3.7b
+  leaves these cases to CPU-dependent C conversions, so they are documented as
+  an intentional divergence in the
+  [tmux divergence ledger entry C-D49](docs/compat/tmux-3.7-divergences.md)
+  rather than claimed byte-identical on every CPU.
+- Matches the tmux 3.7b `set-option -U` scope matrix: plain `-U` unsets the
+  session copy only, `-pU` the pane copy only, and `-wU` the window copy plus
+  the window's pane overrides, replacing the previous RMUX-specific
+  window-scope error, backed by
+  [CLI scope matrix tests](tests/cli_surface.rs) and
+  [option effect tests](crates/rmux-core/src/options/tests/effects_defaults.rs).
+- Matches tmux 3.7b `run-shell -C` semantics: trailing positional arguments
+  are accepted and ignored, and nested `attach-session` or non-detached
+  `new-session` fail with `open terminal failed: not a terminal`, backed by
+  [scripting tests](tests/scripting.rs) and
+  [queued run-shell tests](crates/rmux-server/src/handler_scripting_tests/run_shell.rs).
+- Matches tmux 3.7b `split-window -d` semantics: a detached split no longer
+  activates the new pane, fabricates a last pane, or advances the
+  `list-panes -O activity` selection counter, backed by
+  [window surface tests](tests/cli_window_surface.rs).
+- Rejects `paste-buffer` into a dead remain-on-exit pane with the tmux
+  `target pane has exited` error while `send-keys` and attached input keep
+  tmux's silent tolerance for dead panes, backed by
+  [buffer handler tests](crates/rmux-server/src/handler_buffer_tests.rs).
+- Resolves `show-options -gp` and `set-option -gp` against the real global
+  pane scope instead of treating the combination as a silent no-op, backed by
+  [CLI scope matrix tests](tests/cli_surface.rs).
 - Matches tmux queued attach sequencing: `attach-session ; detach-client` and
   `attach-session ; <command> ; detach-client` use a real queued attached
   client when a terminal is present, `attach-session ; kill-server` exits with
