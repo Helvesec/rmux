@@ -144,14 +144,14 @@ impl OptionStore {
         unset: bool,
         unset_pane_overrides: bool,
     ) -> Result<OptionMutationOutcome, RmuxError> {
-        if unset_pane_overrides && !matches!(scope, OptionScopeSelector::Window(_)) {
-            return Err(RmuxError::InvalidSetOption(
-                "unset pane overrides only supports window scope".to_owned(),
-            ));
-        }
-
+        // tmux 3.7b -U (oracle-probed 2026-07-09): acts like -u at the
+        // resolved scope, and additionally clears the window's pane
+        // overrides only when that scope is a window. Plain `set -U` unsets
+        // the session copy alone; `set -pU` unsets the pane copy alone.
         let query = validate_option_name_mutation(name, &scope, mode, value.as_deref(), unset)?;
-        let unset_pane_scope = unset_pane_overrides.then(|| scope.clone());
+        let unset_pane_scope = (unset_pane_overrides
+            && matches!(scope, OptionScopeSelector::Window(_)))
+        .then(|| scope.clone());
 
         let mut outcome = if unset {
             self.unset_query(scope, &query, only_if_unset)

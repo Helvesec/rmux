@@ -6,7 +6,7 @@ use rmux_proto::{
 use super::super::RequestHandler;
 use super::{
     encode_tokens_for_target, prepare_pane_input_write, resolve_pane_target_ref,
-    write_bytes_to_target_io,
+    write_bytes_to_target_io, PaneInputLiveness,
 };
 use crate::pane_terminals::HandlerState;
 
@@ -92,7 +92,7 @@ fn prepare_one_broadcast_write(
         encode_tokens_for_target(state, &target, &request.keys)?
     };
     let pane_id = pane_id_for_target(state, &target);
-    let write = prepare_pane_input_write(state, &target, &bytes)?;
+    let write = prepare_pane_input_write(state, &target, &bytes, PaneInputLiveness::TolerateDead)?;
 
     Ok(PreparedBroadcastWrite {
         target_index,

@@ -65,6 +65,11 @@ fn windows_ctrl_matrix_script_keeps_direct_attach_send_keys_axes() {
             && implementation.contains("Windows Ctrl matrix found"),
         "Windows Ctrl matrix must fail closed on empty or NO GO results"
     );
+
+    assert!(
+        implementation.contains("Windows Ctrl matrix executed no cases (all skipped)"),
+        "Windows Ctrl matrix must fail closed when every case is skipped"
+    );
 }
 
 fn windows_ctrl_matrix_implementation(script: &str) -> String {

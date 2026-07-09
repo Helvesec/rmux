@@ -10,7 +10,7 @@ use rmux_proto::{
     SaveBufferResponse, SetBufferResponse, ShowBufferResponse,
 };
 
-use super::pane_support::{prepare_pane_input_write, write_bytes_to_target_io};
+use super::pane_support::{prepare_pane_input_write, write_bytes_to_target_io, PaneInputLiveness};
 use super::RequestHandler;
 use crate::outer_terminal::OuterTerminal;
 use crate::pane_io::AttachControl;
@@ -148,7 +148,12 @@ impl RequestHandler {
         let payload = bracketed_paste_payload(payload, bracketed_mode);
         let write = {
             let mut state = self.state.lock().await;
-            match prepare_pane_input_write(&mut state, &request.target, &payload) {
+            match prepare_pane_input_write(
+                &mut state,
+                &request.target,
+                &payload,
+                PaneInputLiveness::RejectDead,
+            ) {
                 Ok(write) => write,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             }

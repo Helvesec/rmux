@@ -9,7 +9,8 @@ use super::pane_io_encoding::{
     WindowsConsoleInputAction,
 };
 use super::{
-    encode_tokens_for_target, prepare_pane_input_write, write_bytes_to_targets, PaneInputWrite,
+    encode_tokens_for_target, prepare_pane_input_write, write_bytes_to_targets, PaneInputLiveness,
+    PaneInputWrite,
 };
 use crate::limits::bounded_repeat_count;
 use crate::pane_terminals::HandlerState;
@@ -91,8 +92,12 @@ fn prepare_windows_console_input_sequence_for_scope(
                             &input_target,
                             &single_token,
                         ) {
-                            let write =
-                                prepare_pane_input_write(state, &input_target, &console_bytes)?;
+                            let write = prepare_pane_input_write(
+                                state,
+                                &input_target,
+                                &console_bytes,
+                                PaneInputLiveness::TolerateDead,
+                            )?;
                             steps.push(PreparedWindowsConsoleInputStep::Bytes {
                                 writes: vec![write],
                                 bytes: console_bytes,
@@ -116,7 +121,12 @@ fn prepare_windows_console_input_sequence_for_scope(
                 }
 
                 let bytes = encode_tokens_for_target(state, &input_target, &single_token)?;
-                let write = prepare_pane_input_write(state, &input_target, &bytes)?;
+                let write = prepare_pane_input_write(
+                    state,
+                    &input_target,
+                    &bytes,
+                    PaneInputLiveness::TolerateDead,
+                )?;
                 steps.push(PreparedWindowsConsoleInputStep::Bytes {
                     writes: vec![write],
                     bytes,

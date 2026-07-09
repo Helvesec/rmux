@@ -97,9 +97,11 @@ pub(super) fn parse_set_option_invocation(
             }
             "-U" if !force_window => {
                 let _ = args.optional();
+                // tmux -U acts like -u at whatever scope -p/-w/-g select
+                // (session by default); the pane-override sweep applies only
+                // when the resolved scope is a window.
                 flags.unset_pane_overrides = true;
                 flags.unset = true;
-                flags.select_window();
             }
             "-t" => {
                 let _ = args.optional();
@@ -699,7 +701,7 @@ fn resolve_set_option_scope(
         return Ok(default_scope.into());
     };
 
-    let scope = match target {
+    let scope = match target.clone() {
         Target::Session(session_name) => OptionScopeSelector::Session(session_name),
         Target::Window(target) => {
             if is_user {
@@ -730,9 +732,11 @@ fn resolve_set_option_scope(
     };
 
     if !is_user && !supports_scope(&scope) {
-        return Err(RmuxError::Server(
-            "target scope is not supported for this option".to_owned(),
-        ));
+        // Fall back to the option's natural table scope (mirroring the
+        // explicit-flag path, which trusts natural_known_set_option_scope):
+        // e.g. a flagless `set -U -t alpha:0 pane-border-style` resolves at
+        // window scope like tmux instead of dead-ending at session scope.
+        return Ok(natural_known_set_option_scope(option, Some(target))?.into());
     }
 
     Ok(scope.into())

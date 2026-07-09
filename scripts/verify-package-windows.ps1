@@ -110,7 +110,7 @@ function NewPortableAliasSmoke([string]$Binary, [string]$Root) {
     try {
         New-Item -ItemType SymbolicLink -Path $alias -Target $Binary -ErrorAction Stop | Out-Null
     } catch {
-        Fail "portable alias smoke requires a symlink alias and could not create one: $($_.Exception.Message)"
+        Fail "portable alias smoke requires a symlink alias and could not create one. Enable Windows Developer Mode or rerun from an elevated PowerShell before using -RunBinary/-RunDaemonSmoke. Original error: $($_.Exception.Message)"
     }
 
     [pscustomobject]@{

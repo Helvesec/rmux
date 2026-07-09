@@ -292,10 +292,31 @@ fn invalid_number_values_use_tmux_error_text() {
 }
 
 #[test]
-fn unset_pane_overrides_rejects_non_window_scopes() {
+fn unset_pane_overrides_at_non_window_scope_acts_like_plain_unset() {
+    // Oracle probe 2026-07-09: tmux `set -U` at a non-window scope behaves
+    // exactly like -u there and leaves pane overrides untouched.
     let mut store = OptionStore::new();
+    let alpha = session_name("alpha");
+    let pane = PaneTarget::with_window(alpha.clone(), 1, 0);
 
-    let error = store
+    store
+        .set(
+            ScopeSelector::Global,
+            OptionName::WindowStyle,
+            "fg=colour7".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("global set succeeds");
+    store
+        .set(
+            ScopeSelector::Pane(pane.clone()),
+            OptionName::WindowStyle,
+            "fg=colour8".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("pane set succeeds");
+
+    store
         .set_by_name(
             OptionScopeSelector::SessionGlobal,
             "window-style",
@@ -305,11 +326,12 @@ fn unset_pane_overrides_rejects_non_window_scopes() {
             true,
             true,
         )
-        .expect_err("session scope must fail for -U");
+        .expect("-U at session scope acts like -u");
 
     assert_eq!(
-        error,
-        RmuxError::InvalidSetOption("unset pane overrides only supports window scope".to_owned())
+        store.pane_value(&pane, OptionName::WindowStyle),
+        Some("fg=colour8"),
+        "-U at a non-window scope must not clear pane overrides"
     );
 }
 

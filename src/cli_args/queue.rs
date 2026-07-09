@@ -519,7 +519,10 @@ fn set_option_scope(
         while let Some(flag) = chars.next() {
             match flag {
                 's' => scopes.server = true,
-                'w' | 'U' => scopes.window = true,
+                // -U is an unset modifier, not a scope selector: plain
+                // `set -U` targets the session copy (oracle 2026-07-09) and
+                // -p/-w keep their own precedence when combined with it.
+                'w' => scopes.window = true,
                 'p' => scopes.pane = true,
                 't' => {
                     if chars.peek().is_none() {

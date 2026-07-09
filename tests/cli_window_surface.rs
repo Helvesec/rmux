@@ -163,6 +163,53 @@ fn list_panes_sort_activity_creation_match_tmux() -> Result<(), Box<dyn Error>> 
 }
 
 #[test]
+fn detached_splits_leave_activity_order_and_last_pane_untouched_like_tmux(
+) -> Result<(), Box<dyn Error>> {
+    // Oracle probes 2026-07-09 (pinned tmux 3.7b): a detached split never
+    // activates anything, so before any selection `list-panes -O activity`
+    // stays in index order (forward AND reversed), and `select-pane -l`
+    // fails with "no last pane". This is pinned at the CLI level because
+    // the CLI detached-split path (SplitWindowExt) previously activated
+    // the new pane and re-selected the old one, stamping active_point
+    // twice per split while handler-level tests stayed green.
+    let _guard = window_surface_guard();
+    let harness = CliHarness::new("detached-split-activity-last-pane")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:0.0"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:0.0"])?);
+
+    let list_activity = |reversed: bool| -> Result<Vec<String>, Box<dyn Error>> {
+        let mut args = vec!["list-panes", "-t", "alpha:0", "-O", "activity"];
+        if reversed {
+            args.push("-r");
+        }
+        args.extend(["-F", "#{pane_index}"]);
+        let output = harness.run(&args)?;
+        assert_eq!(output.status.code(), Some(0));
+        assert!(stderr(&output).is_empty());
+        Ok(stdout(&output).lines().map(str::to_owned).collect())
+    };
+
+    assert_eq!(list_activity(false)?, ["0", "1", "2"]);
+    assert_eq!(list_activity(true)?, ["0", "1", "2"]);
+
+    let last_pane = harness.run(&["select-pane", "-l", "-t", "alpha:0.0"])?;
+    assert_eq!(last_pane.status.code(), Some(1));
+    assert!(
+        stderr(&last_pane).contains("no last pane"),
+        "detached splits must not create a last pane, got: {}",
+        stderr(&last_pane)
+    );
+
+    let active = harness.run(&["display-message", "-t", "alpha:0", "-p", "#{pane_index}"])?;
+    assert_eq!(stdout(&active).trim_end(), "0");
+
+    Ok(())
+}
+
+#[test]
 fn new_window_detached_keeps_session_target_commands_on_the_current_window(
 ) -> Result<(), Box<dyn Error>> {
     let _guard = window_surface_guard();

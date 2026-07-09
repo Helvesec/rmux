@@ -102,11 +102,15 @@ scripts/no-debug-assert-side-effects.sh
 RMUX_PERF_AUTO_CURRENT=1 scripts/release-review-gate.sh
 ```
 
-The perf comparator is enforced on the darwin release machine (where the
-pinned baseline was recorded); on platforms without a committed same-class
-baseline the gate reports an explicit `perf-comparator=skipped-no-<platform>-baseline`
-line (a `::warning::` annotation in CI) instead of comparing cross-machine
-noise. The Windows ctrl-matrix portable smoke likewise cannot run in a
+The perf comparator is enforced on release Linux and darwin machines with a
+committed same-platform baseline. Darwin uses
+`benches/perf/baselines/release-0.9.0.json`; Linux requires
+`benches/perf/baselines/release-0.9.0-linux.json` recorded with
+`scripts/perf-baseline.sh` on the Linux release machine before the release gate
+can pass. Other platforms without a committed same-class baseline report an
+explicit `perf-comparator=skipped-no-<platform>-baseline` line (a `::warning::`
+annotation in CI) instead of comparing cross-machine noise. The Windows
+ctrl-matrix portable smoke likewise cannot run in a
 non-interactive CI session: CI reports an explicit skip warning and the
 smoke must be run manually on an interactive Windows session before tagging.
 

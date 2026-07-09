@@ -108,15 +108,16 @@ run_step "formatting" cargo fmt --all -- --check
 run_step "perf comparator self-test" python3 scripts/perf-diff.py --self-test
 if [ ! -f "$perf_baseline" ]; then
   # Perf comparison is only statistically meaningful against a baseline
-  # recorded on the same platform and machine class; the pinned baseline was
-  # recorded on the darwin release machine. Platforms without a committed
-  # baseline report an explicit, visible skip instead of comparing
-  # cross-machine noise (RELEASING.md: the comparator is enforced on the
-  # darwin release machine before tagging).
+  # recorded on the same platform and machine class. Linux release gates fail
+  # closed without their committed baseline; other platforms without a baseline
+  # report an explicit, visible skip instead of comparing cross-machine noise.
+  if [ "$gate_platform" = linux ]; then
+    die "missing linux perf baseline at $perf_baseline; record one with scripts/perf-baseline.sh on the linux release machine before running the release gate"
+  fi
   [ -z "$perf_current" ] || die "RMUX_PERF_CURRENT_JSON is set but no $gate_platform baseline exists at $perf_baseline; record one with scripts/perf-bench.sh on the $gate_platform release machine first"
-  printf 'perf-comparator=skipped-no-%s-baseline enforcement=darwin-release-machine see=RELEASING.md\n' "$gate_platform"
+  printf 'perf-comparator=skipped-no-%s-baseline enforcement=same-platform-baseline see=RELEASING.md\n' "$gate_platform"
   if [ -n "${GITHUB_ACTIONS:-}" ]; then
-    printf '::warning::release-review perf comparator skipped: no %s baseline is committed; the perf regression gate is enforced on the darwin release machine (see RELEASING.md)\n' "$gate_platform"
+    printf '::warning::release-review perf comparator skipped: no %s baseline is committed; perf regression enforcement requires a same-platform baseline (see RELEASING.md)\n' "$gate_platform"
   fi
 else
   run_step "perf baseline JSON" \

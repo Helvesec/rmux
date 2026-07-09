@@ -14,7 +14,9 @@ use super::pane_io_encoding::{
 };
 #[cfg(windows)]
 use super::pane_windows_console_sequence::prepare_single_pane_windows_console_input_sequence;
-use super::{encode_tokens_for_target, prepare_pane_input_write, write_bytes_to_target};
+use super::{
+    encode_tokens_for_target, prepare_pane_input_write, write_bytes_to_target, PaneInputLiveness,
+};
 use crate::hook_runtime::PendingInlineHookFormat;
 use crate::pane_state_journal::PaneStateChange;
 use crate::pane_terminal_lookup::pane_id_for_target;
@@ -69,7 +71,12 @@ impl RequestHandler {
                     windows_console_input_for_target_tokens(&state, &target, &request.keys, 1)
                 {
                     if tokens_route_windows_control_as_pty_bytes(&state, &target, &request.keys) {
-                        let write = match prepare_pane_input_write(&mut state, &target, &bytes) {
+                        let write = match prepare_pane_input_write(
+                            &mut state,
+                            &target,
+                            &bytes,
+                            PaneInputLiveness::TolerateDead,
+                        ) {
                             Ok(write) => write,
                             Err(error) => return Response::Error(ErrorResponse { error }),
                         };
@@ -114,7 +121,12 @@ impl RequestHandler {
                         .await;
                 }
             }
-            let write = match prepare_pane_input_write(&mut state, &target, &bytes) {
+            let write = match prepare_pane_input_write(
+                &mut state,
+                &target,
+                &bytes,
+                PaneInputLiveness::TolerateDead,
+            ) {
                 Ok(write) => write,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };

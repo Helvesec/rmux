@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::RequestHandler;
-use crate::pane_io::{AttachControl, PaneAlertEvent};
+use crate::pane_io::AttachControl;
 use crate::pane_terminals::PaneLifecycleProcessState;
 use rmux_proto::{
     BreakPaneRequest, DisplayPanesRequest, KillPaneRequest, ListPanesRequest, ListWindowsRequest,
@@ -181,92 +181,71 @@ async fn wait_for_pipe_child_count_to_return_to(baseline: usize) {
 }
 
 #[tokio::test]
-async fn list_panes_activity_sort_is_inert_like_tmux() {
+async fn list_panes_activity_sort_follows_selection_counter_like_tmux() {
+    // Oracle probes 2026-07-09 (pinned tmux 3.7b): pane "activity" ordering
+    // is the active_point selection counter, ascending. Scenario A: fresh
+    // window, detached splits, no selections -> index order, identical when
+    // reversed. Scenario B: select pane 1 then pane 0 -> "2 1 0", reversed
+    // "0 1 2". Output/alert activity does not reorder anything.
     let handler = RequestHandler::new();
     let session = session_name("list-panes-activity-sort");
     create_session(&handler, &session).await;
-    let split = handler
-        .handle(Request::SplitWindow(SplitWindowRequest {
-            target: SplitWindowTarget::Session(session.clone()),
-            direction: SplitDirection::Horizontal,
-            before: false,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
-    let second_pane_id = {
-        let state = handler.state.lock().await;
-        state
-            .sessions
-            .session(&session)
-            .and_then(|session| session.window_at(0))
-            .and_then(|window| window.pane(1))
-            .map(|pane| pane.id())
-            .expect("second pane exists")
-    };
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        handler
-            .handle_pane_alert_event(PaneAlertEvent {
-                session_name: session.clone(),
-                pane_id: second_pane_id,
-                bell_count: 0,
-                title_changed: false,
-                title_change: None,
-                clipboard_set: false,
-                queue_activity_alert: false,
-                generation: None,
-            })
+    for _ in 0..2 {
+        let split = handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(session.clone()),
+                direction: SplitDirection::Horizontal,
+                before: false,
+                environment: None,
+            }))
             .await;
-        let (first_activity, second_activity) = {
-            let state = handler.state.lock().await;
-            let window = state
-                .sessions
-                .session(&session)
-                .and_then(|session| session.window_at(0))
-                .expect("window exists");
-            (
-                window.pane(0).expect("first pane exists").activity_at(),
-                window.pane(1).expect("second pane exists").activity_at(),
-            )
-        };
-        if second_activity > first_activity {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for pane activity to advance; first={first_activity}, second={second_activity}"
-        );
-        sleep(Duration::from_millis(25)).await;
+        assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
     }
 
-    let stdout = list_stdout(
-        handler
-            .handle(Request::ListPanes(Box::new(ListPanesRequest {
-                target: session.clone(),
-                target_window_index: Some(0),
-                format: Some("#{pane_index}".to_owned()),
-                filter: None,
-                sort_order: Some("activity".to_owned()),
-                reversed: false,
-            })))
-            .await,
-    );
-    assert_eq!(stdout, "0\n1\n");
-    let reversed_stdout = list_stdout(
-        handler
-            .handle(Request::ListPanes(Box::new(ListPanesRequest {
-                target: session,
-                target_window_index: Some(0),
-                format: Some("#{pane_index}".to_owned()),
-                filter: None,
-                sort_order: Some("activity".to_owned()),
-                reversed: true,
-            })))
-            .await,
-    );
-    assert_eq!(reversed_stdout, "0\n1\n");
+    let list = |reversed: bool| {
+        let handler = handler.clone();
+        let session = session.clone();
+        async move {
+            list_stdout(
+                handler
+                    .handle(Request::ListPanes(Box::new(ListPanesRequest {
+                        target: session,
+                        target_window_index: Some(0),
+                        format: Some("#{pane_index}".to_owned()),
+                        filter: None,
+                        sort_order: Some("activity".to_owned()),
+                        reversed,
+                    })))
+                    .await,
+            )
+        }
+    };
+
+    let select = |pane_index: u32| {
+        let handler = handler.clone();
+        let session = session.clone();
+        async move {
+            let response = handler
+                .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+                    target: PaneTarget::with_window(session, 0, pane_index),
+                    title: None,
+                    input_disabled: None,
+                    preserve_zoom: false,
+                    style: None,
+                })))
+                .await;
+            assert!(matches!(response, Response::SelectPane(_)), "{response:?}");
+        }
+    };
+
+    // Scenario A: no explicit selection yet -> index order.
+    assert_eq!(list(false).await, "0\n1\n2\n");
+
+    // Scenario B: selections define the order.
+    select(1).await;
+    select(0).await;
+    assert_eq!(list(false).await, "2\n1\n0\n");
+    assert_eq!(list(true).await, "0\n1\n2\n");
 }
 
 async fn wait_for_dead_pane(

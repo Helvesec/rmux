@@ -80,6 +80,7 @@ fn build_resolved_set_option_command(
     } else {
         SetOptionMode::Replace
     };
+    let unset = args.unset || args.unset_pane_overrides;
 
     if !args.format {
         rmux_core::validate_option_name_mutation(
@@ -87,7 +88,7 @@ fn build_resolved_set_option_command(
             &scope,
             mode,
             args.value.as_deref(),
-            args.unset,
+            unset,
         )
         .map_err(|error| {
             ExitFailure::new(1, tmux_cli_error_message(command.command_name(), &error))
@@ -100,7 +101,7 @@ fn build_resolved_set_option_command(
         value: args.value,
         mode,
         only_if_unset: args.only_if_unset,
-        unset: args.unset,
+        unset,
         unset_pane_overrides: args.unset_pane_overrides,
         format: args.format,
         format_target,
@@ -196,11 +197,11 @@ fn resolve_set_option_scope(
         .is_some_and(|base| base.starts_with('@'));
     let supports_scope =
         |scope: &OptionScopeSelector| option_name_supports_scope(request.option, scope);
+    let window = request.window || force_window;
 
     if request.pane
         && !request.server
-        && !request.window
-        && !force_window
+        && !window
         && (is_user || option_supports_pane_scope(request.option))
     {
         let target = match request.target {
@@ -219,10 +220,7 @@ fn resolve_set_option_scope(
         return Ok(OptionScopeSelector::Pane(target).into());
     }
 
-    if request.global
-        && !is_user
-        && (request.server || request.pane || request.window || force_window)
-    {
+    if request.global && !is_user && (request.server || request.pane || window) {
         let scope = rmux_core::default_global_scope_for_option_name(request.option)
             .map_err(|error| ExitFailure::new(1, error.to_string()))?;
         if supports_scope(&scope) {
@@ -234,10 +232,7 @@ fn resolve_set_option_scope(
         ));
     }
 
-    if !request.global
-        && !is_user
-        && (request.server || request.pane || request.window || force_window)
-    {
+    if !request.global && !is_user && (request.server || request.pane || window) {
         let scope = resolve_natural_known_set_option_scope(
             request.option,
             request.target,
@@ -297,7 +292,7 @@ fn resolve_set_option_scope(
         return Ok(scope.into());
     }
 
-    if request.window || force_window {
+    if window {
         if request.global {
             let scope = OptionScopeSelector::WindowGlobal;
             return Ok(scope.into());

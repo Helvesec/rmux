@@ -51,6 +51,19 @@ impl Window {
         direction: SplitDirection,
         before: bool,
     ) -> u32 {
+        self.split_at_position_with_id_and_direction_detached(
+            position, pane_id, direction, before, false,
+        )
+    }
+
+    pub(crate) fn split_at_position_with_id_and_direction_detached(
+        &mut self,
+        position: usize,
+        pane_id: PaneId,
+        direction: SplitDirection,
+        before: bool,
+        detached: bool,
+    ) -> u32 {
         assert!(
             position < self.panes.len(),
             "split target position must reference an existing pane"
@@ -62,6 +75,10 @@ impl Window {
         self.auto_unzoom();
         self.layout = layout_for_split(direction);
         let previous_active_pane_id = self.active_pane().map(Pane::id);
+        let previous_last_pane_id = self
+            .last_pane
+            .and_then(|pane_index| self.pane(pane_index))
+            .map(Pane::id);
         let new_index = self.allocate_pane_index();
         let insert_at = if before { position } else { position + 1 };
         self.panes.insert(
@@ -80,9 +97,39 @@ impl Window {
         } else {
             self.apply_layout_tree();
         }
-        self.renumber_panes_by_position(pane_id, previous_active_pane_id);
-        self.mark_pane_active(self.active_pane);
-        self.active_pane
+        self.commit_split_renumber(
+            pane_id,
+            previous_active_pane_id,
+            previous_last_pane_id,
+            detached,
+        );
+        self.pane_index_for_id(pane_id)
+            .expect("new pane id must survive split renumbering")
+    }
+
+    /// Finalizes pane numbering after a split. A detached spawn (tmux `-d`,
+    /// oracle-probed 2026-07-09) keeps the active pane, the last pane, and
+    /// every active_point untouched (`select-pane -l` after `split -d`
+    /// errors "no last pane"); a non-detached split activates the new pane,
+    /// records the previous one as last, and stamps active_point only when
+    /// the active identity actually changed.
+    pub(crate) fn commit_split_renumber(
+        &mut self,
+        new_pane_id: PaneId,
+        previous_active_pane_id: Option<PaneId>,
+        previous_last_pane_id: Option<PaneId>,
+        detached: bool,
+    ) {
+        if detached {
+            let active_pane_id =
+                previous_active_pane_id.expect("split source window must have an active pane");
+            self.renumber_panes_by_position(active_pane_id, previous_last_pane_id);
+            return;
+        }
+        self.renumber_panes_by_position(new_pane_id, previous_active_pane_id);
+        if self.active_pane().map(Pane::id) != previous_active_pane_id {
+            self.mark_pane_active(self.active_pane);
+        }
     }
 
     pub(crate) fn extract_pane(&mut self, pane_index: u32) -> Option<Pane> {

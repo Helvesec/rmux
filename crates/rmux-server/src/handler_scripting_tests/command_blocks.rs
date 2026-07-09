@@ -287,6 +287,17 @@ async fn parsed_set_option_scope_flags_use_tmux_precedence_and_natural_tables() 
         .execute_parsed_commands_for_test(std::process::id(), parsed)
         .await
         .expect("set-option -U unsets pane overrides without a value");
+
+    let output = handler
+        .execute_parsed_commands_for_test(
+            std::process::id(),
+            CommandParser::new()
+                .parse("show-options -pqv -t alpha:0.0 pane-border-style")
+                .expect("show pane option parses"),
+        )
+        .await
+        .expect("show pane option executes");
+    assert_eq!(output.stdout(), b"");
 }
 
 #[tokio::test]

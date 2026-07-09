@@ -74,6 +74,7 @@ if ($StaticMatrixSpec) {
         "fzf",
         '$Direct.Returned -eq $Attach.Returned -and $Direct.Returned -eq $Send.Returned',
         '$Results.Count -eq 0',
+        'Windows Ctrl matrix executed no cases (all skipped)',
         'Where-Object { $_.Verdict -eq "NO GO" }',
         "Windows Ctrl matrix found"
     )
@@ -89,14 +90,14 @@ if ($StaticMatrixSpec) {
 if ($PortableSmokeOnly -and -not $env:RMUX_FORCE_WINDOWS_CTRL_MATRIX_GUI) {
     $currentSession = (Get-Process -Id $PID).SessionId
     if ($currentSession -eq 0) {
-        New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
         $skipMessage = "windows-ctrl-matrix-portable-smoke=skipped reason=non-interactive-session-0"
-        Set-Content -LiteralPath (Join-Path $OutDir "portable-smoke.skip.txt") -Encoding ASCII -Value @(
-            $skipMessage
-            "owner=release-engineering"
-            "cadence=release-candidate-and-manual-windows-review"
-        )
         if ($AllowPortableSmokeSkip -or $env:RMUX_ALLOW_WINDOWS_CTRL_MATRIX_SKIP -eq '1') {
+            New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+            Set-Content -LiteralPath (Join-Path $OutDir "portable-smoke.skip.txt") -Encoding ASCII -Value @(
+                $skipMessage
+                "owner=release-engineering"
+                "cadence=release-candidate-and-manual-windows-review"
+            )
             Write-Host $skipMessage
             Write-Host "Set RMUX_FORCE_WINDOWS_CTRL_MATRIX_GUI=1 to force the GUI focus smoke from this session."
             exit 0
@@ -359,7 +360,7 @@ function Command-Exists([string]$Name) {
 
 function Wsl-Command-Exists([string]$Name) {
     if (-not (Command-Exists "wsl.exe")) { return $false }
-    & wsl.exe --exec sh -lc "command -v '$Name' >/dev/null 2>&1"
+    & wsl.exe --exec sh -lc "command -v '$Name' >/dev/null 2>&1" *> $null
     $LASTEXITCODE -eq 0
 }
 
@@ -765,6 +766,20 @@ function Add-Result($Terminal, $Shell, $Program, $Key, $Direct, $Attach, $Send) 
     })
 }
 
+function Add-SkipResult([string]$Terminal, [string]$Shell, [string]$Program, [string]$Key, [string]$Reason) {
+    $detail = "skipped/$Reason"
+    $Results.Add([pscustomobject]@{
+        Terminal = $Terminal
+        Shell = $Shell
+        Programme = $Program
+        Touche = $Key
+        "Direct natif" = $detail
+        "RMUX attach" = $detail
+        "RMUX send-keys" = $detail
+        Verdict = "SKIP"
+    })
+}
+
 function New-FailedOutcome([string]$Stage, [object]$ErrorRecord) {
     $message = if ($ErrorRecord -and $ErrorRecord.Exception) { $ErrorRecord.Exception.Message } else { [string]$ErrorRecord }
     if ($message.Length -gt 80) {
@@ -827,21 +842,50 @@ foreach ($terminal in $terminalSpecs) {
             if ($OnlyShell.Count -gt 0 -and $OnlyShell -notcontains $shell) { continue }
             if ($OnlyProgram.Count -gt 0 -and $OnlyProgram -notcontains $case.Program) { continue }
             if ($OnlyKey.Count -gt 0 -and $OnlyKey -notcontains $case.Key) { continue }
-            if ($shell -eq "pwsh" -and -not (Command-Exists "pwsh.exe")) { continue }
-            if ($shell -eq "powershell.exe" -and -not (Command-Exists "powershell.exe")) { continue }
-            if ($shell -eq "wsl-bash" -and -not (Command-Exists "wsl.exe")) { continue }
-            if ($case.Program -eq "fzf" -and -not (Command-Exists "fzf.exe")) { continue }
+            if ($shell -eq "pwsh" -and -not (Command-Exists "pwsh.exe")) {
+                Add-SkipResult $terminal.Name $shell $case.Program $case.Key "missing pwsh.exe"
+                continue
+            }
+            if ($shell -eq "powershell.exe" -and -not (Command-Exists "powershell.exe")) {
+                Add-SkipResult $terminal.Name $shell $case.Program $case.Key "missing powershell.exe"
+                continue
+            }
+            if ($shell -eq "wsl-bash" -and -not (Command-Exists "wsl.exe")) {
+                Add-SkipResult $terminal.Name $shell $case.Program $case.Key "missing wsl.exe"
+                continue
+            }
+            if ($case.Program.StartsWith("wsl ") -and -not (Command-Exists "wsl.exe")) {
+                Add-SkipResult $terminal.Name $shell $case.Program $case.Key "missing wsl.exe"
+                continue
+            }
+            if ($case.Program -eq "fzf" -and -not (Command-Exists "fzf.exe")) {
+                Add-SkipResult $terminal.Name $shell $case.Program $case.Key "missing fzf.exe"
+                continue
+            }
             if ($shell -eq "git-bash") {
                 try {
-                    [void](Shell-Spec "git-bash" "probe" "direct" "" "")
+                    $gitBashSpec = Shell-Spec "git-bash" "probe" "direct" "" ""
                 } catch {
+                    Add-SkipResult $terminal.Name $shell $case.Program $case.Key "missing git-bash"
+                    continue
+                }
+                if (-not $gitBashSpec) {
+                    Add-SkipResult $terminal.Name $shell $case.Program $case.Key "missing git-bash"
                     continue
                 }
             }
+            if ($case.Program.StartsWith("wsl ") -and -not (Wsl-Command-Exists "python3")) {
+                Add-SkipResult $terminal.Name $shell $case.Program $case.Key "wsl python3 unavailable"
+                continue
+            }
             if ($case.Program.StartsWith("python")) {
                 if ($shell -eq "wsl-bash") {
-                    if (-not (Wsl-Command-Exists "python3")) { continue }
+                    if (-not (Wsl-Command-Exists "python3")) {
+                        Add-SkipResult $terminal.Name $shell $case.Program $case.Key "wsl python3 unavailable"
+                        continue
+                    }
                 } elseif (-not (Command-Exists "python.exe")) {
+                    Add-SkipResult $terminal.Name $shell $case.Program $case.Key "missing python.exe"
                     continue
                 }
             }
@@ -885,8 +929,18 @@ $lines | Set-Content -LiteralPath $md -Encoding UTF8
 Write-Host "Results: $md"
 $lines | ForEach-Object { Write-Host $_ }
 
+$skipped = @($Results | Where-Object { $_.Verdict -eq "SKIP" })
+if ($skipped.Count -gt 0) {
+    Write-Warning "Windows Ctrl matrix skipped $($skipped.Count) non-executable case(s); see $md"
+}
+
 if ($Results.Count -eq 0) {
     throw "Windows Ctrl matrix produced no cases"
+}
+
+$executed = @($Results | Where-Object { $_.Verdict -ne "SKIP" })
+if ($executed.Count -eq 0) {
+    throw "Windows Ctrl matrix executed no cases (all skipped); see $md"
 }
 
 $failed = @($Results | Where-Object { $_.Verdict -eq "NO GO" })

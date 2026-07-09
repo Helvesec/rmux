@@ -88,10 +88,21 @@ impl WindowsConsoleInputAction {
     }
 }
 
+/// Whether resolving a pane input write should treat an exited child process
+/// as an error. Paste-buffer rejects dead remain-on-exit panes like tmux;
+/// attached input and send-keys must not use child-process liveness as a pane
+/// liveness gate (dead-pane write errors are tolerated downstream instead).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(in crate::handler) enum PaneInputLiveness {
+    TolerateDead,
+    RejectDead,
+}
+
 pub(in crate::handler) fn prepare_pane_input_write(
     state: &mut HandlerState,
     target: &PaneTarget,
     bytes: &[u8],
+    liveness: PaneInputLiveness,
 ) -> Result<PaneInputWrite, RmuxError> {
     let session_name = target.session_name().clone();
     let window_index = target.window_index();
@@ -125,7 +136,14 @@ pub(in crate::handler) fn prepare_pane_input_write(
             sink: PaneInputSink::QueuedStarting,
         });
     }
-    let master = state.clone_pane_master(&session_name, window_index, pane_index)?;
+    let master = match liveness {
+        PaneInputLiveness::RejectDead => {
+            state.clone_pane_master_if_alive(&session_name, window_index, pane_index)?
+        }
+        PaneInputLiveness::TolerateDead => {
+            state.clone_pane_master(&session_name, window_index, pane_index)?
+        }
+    };
     #[cfg(not(any(test, windows)))]
     let _ = bytes;
     Ok(PaneInputWrite {
@@ -647,7 +665,9 @@ pub(super) fn prepare_synchronized_pane_input_writes(
 ) -> Result<Vec<PaneInputWrite>, RmuxError> {
     synchronized_input_targets(state, target)?
         .into_iter()
-        .map(|target| prepare_pane_input_write(state, &target, bytes))
+        .map(|target| {
+            prepare_pane_input_write(state, &target, bytes, PaneInputLiveness::TolerateDead)
+        })
         .collect()
 }
 

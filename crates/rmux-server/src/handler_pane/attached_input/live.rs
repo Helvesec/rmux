@@ -12,8 +12,10 @@ use rmux_pty::WindowsConsoleKeyEvent;
 
 use super::super::super::{prompt_support::PromptInputEvent, RequestHandler};
 use super::super::io_other;
+#[cfg(unix)]
+use super::super::pane_io_encoding::is_dead_pane_write_error;
 use super::super::pane_io_encoding::{
-    is_dead_pane_write_error, prepare_attached_pane_input_writes, write_attached_bytes_to_target_io,
+    prepare_attached_pane_input_writes, write_attached_bytes_to_target_io,
 };
 use super::super::pane_prompt_input::{
     decode_utf8_char, is_extended_key_prefix, is_utf8_lead_byte, utf8_expected_len,

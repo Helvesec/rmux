@@ -373,6 +373,38 @@ mod tests {
     }
 
     #[test]
+    fn set_option_unset_pane_overrides_implies_unset_at_session_scope() {
+        // Oracle probe 2026-07-09: plain `set -U` unsets the session copy
+        // only; the pane-override sweep applies only when -w selects a
+        // window scope.
+        let session = SessionName::new("alpha").expect("valid session");
+        let resolved = resolve_set_option_args(
+            SetOptionCommandKind::SetOption,
+            SetOptionArgs {
+                global: false,
+                server: false,
+                window: false,
+                pane: false,
+                quiet: false,
+                append: false,
+                format: false,
+                only_if_unset: false,
+                unset: false,
+                unset_pane_overrides: true,
+                target: Some(target_spec("alpha:0.1")),
+                option: "@agent.state".to_owned(),
+                value: None,
+            },
+        )
+        .expect("set-option -U resolves without requiring a value");
+
+        assert_eq!(resolved.scope, OptionScopeSelector::Session(session));
+        assert!(resolved.unset);
+        assert!(resolved.unset_pane_overrides);
+        assert_eq!(resolved.value, None);
+    }
+
+    #[test]
     fn set_option_global_flag_uses_the_named_option_global_root() {
         for (option, value, expected) in [
             ("message-limit", "77", OptionScopeSelector::ServerGlobal),

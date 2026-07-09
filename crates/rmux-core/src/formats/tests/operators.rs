@@ -161,33 +161,62 @@ fn bang_prefix_is_not_a_boolean_modifier() {
 }
 
 #[test]
+fn expression_double_percent_is_a_modulo_alias_like_linux_tmux() {
+    // The Linux glibc oracle evaluates both '%' and '%%' as modulo; the
+    // darwin oracle's BSD strftime doubles '%%' into '%' before the format
+    // parser, so both oracles agree the doubled spelling must evaluate.
+    assert_eq!(render_template("#{e|%%|:5,2}", &StaticWindowValues), "1");
+    assert_eq!(
+        render_template("#{e|%%|f:5,2}", &StaticWindowValues),
+        "1.00"
+    );
+}
+
+#[test]
+fn expression_float_nan_results_render_deterministically() {
+    // Every NaN producer must render "-nan" (Linux deployment oracle), not
+    // the platform-dependent hardware NaN sign.
+    assert_eq!(render_template("#{e|m|f:5,0}", &StaticWindowValues), "-nan");
+    assert_eq!(
+        render_template("#{e|m|f:inf,2}", &StaticWindowValues),
+        "-nan"
+    );
+    assert_eq!(render_template("#{e|/|f:0,0}", &StaticWindowValues), "-nan");
+    assert_eq!(
+        render_template("#{e|-|f:inf,inf}", &StaticWindowValues),
+        "-nan"
+    );
+    assert_eq!(
+        render_template("#{e|*|f:inf,0}", &StaticWindowValues),
+        "-nan"
+    );
+}
+
+#[test]
 fn expression_arithmetic_defaults_to_integer_output() {
     assert_eq!(render_template("#{e|+|:2,3}", &StaticWindowValues), "5");
     assert_eq!(render_template("#{e|-|:2,3}", &StaticWindowValues), "-1");
     assert_eq!(render_template("#{e|*|:2,3}", &StaticWindowValues), "6");
     assert_eq!(render_template("#{e|/|:5,2}", &StaticWindowValues), "2");
-    // '%' is not a tmux e-operator (oracle probe 2026-07-08: empty).
-    assert_eq!(render_template("#{e|%|:5,2}", &StaticWindowValues), "");
+    assert_eq!(render_template("#{e|%|:5,2}", &StaticWindowValues), "1");
     assert_eq!(render_template("#{e|+|:2.9,3.9}", &StaticWindowValues), "5");
     assert_eq!(render_template("#{e|*|:2.9,3.9}", &StaticWindowValues), "6");
     assert_eq!(render_template("#{e|m|:7,2}", &StaticWindowValues), "1");
 }
 
 #[test]
-fn expression_integer_overflow_matches_tmux() {
-    // Oracle probe 2026-07-08: out-of-range operands saturate (arm64
-    // long long semantics), so the sum renders as (double)LLONG_MAX.
+fn expression_integer_overflow_uses_deterministic_sentinel() {
     assert_eq!(
         render_template("#{e|+|:999999999999999999999,1}", &StaticWindowValues),
-        "9223372036854775808"
+        i64::MIN.to_string()
     );
     assert_eq!(
         render_template("#{e|+|:9223372036854775807,1}", &StaticWindowValues),
-        "9223372036854775808"
+        i64::MIN.to_string()
     );
     assert_eq!(
         render_template("#{e|+|:9223372036854775807,2}", &StaticWindowValues),
-        "9223372036854775808"
+        i64::MIN.to_string()
     );
     assert_eq!(
         render_template("#{e|-|:-9223372036854775808,1}", &StaticWindowValues),
@@ -199,11 +228,11 @@ fn expression_integer_overflow_matches_tmux() {
     );
     assert_eq!(
         render_template("#{e|*|:4611686018427387904,2}", &StaticWindowValues),
-        "9223372036854775808"
+        i64::MIN.to_string()
     );
     assert_eq!(
         render_template("#{e|*|:3037000500,3037000500}", &StaticWindowValues),
-        "9223372036854775808"
+        i64::MIN.to_string()
     );
     assert_eq!(
         render_template("#{e|*|:3037000499,3037000499}", &StaticWindowValues),
@@ -215,40 +244,42 @@ fn expression_integer_overflow_matches_tmux() {
 fn expression_integer_minimum_division_overflow_does_not_panic() {
     assert_eq!(
         render_template("#{e|/|:-9223372036854775808,-1}", &StaticWindowValues),
-        "9223372036854775808"
+        i64::MIN.to_string()
     );
     assert_eq!(
         render_template("#{e|m|:-9223372036854775808,-1}", &StaticWindowValues),
         "0"
     );
-    // '%' is not a tmux e-operator (oracle renders empty).
     assert_eq!(
         render_template("#{e|%|:-9223372036854775808,-1}", &StaticWindowValues),
-        ""
+        "0"
     );
 }
 
 #[test]
-fn expression_division_by_zero_matches_tmux_oracle() {
-    // Oracle probe 2026-07-08: division by zero saturates, integer modulo
-    // by zero renders 0, float modulo by zero renders "nan" (unsigned),
-    // and '%' is not a valid e-operator (renders empty).
+fn expression_division_by_zero_uses_deterministic_sentinel() {
     assert_eq!(
         render_template("#{e|/|:5,0}", &StaticWindowValues),
-        "9223372036854775808"
+        i64::MIN.to_string()
     );
     assert_eq!(render_template("#{e|m|:5,2}", &StaticWindowValues), "1");
-    assert_eq!(render_template("#{e|%|:5,2}", &StaticWindowValues), "");
-    assert_eq!(render_template("#{e|%|:5,0}", &StaticWindowValues), "");
-    assert_eq!(render_template("#{e|m|:5,0}", &StaticWindowValues), "0");
+    assert_eq!(render_template("#{e|%|:5,2}", &StaticWindowValues), "1");
+    assert_eq!(
+        render_template("#{e|%|:5,0}", &StaticWindowValues),
+        i64::MIN.to_string()
+    );
+    assert_eq!(
+        render_template("#{e|m|:5,0}", &StaticWindowValues),
+        i64::MIN.to_string()
+    );
     assert_eq!(render_template("#{e|/|f:5,0}", &StaticWindowValues), "inf");
-    assert_eq!(render_template("#{e|m|f:5,0}", &StaticWindowValues), "nan");
-    assert_eq!(render_template("#{e|%|f:5,2}", &StaticWindowValues), "");
-    assert_eq!(render_template("#{e|%|f:5,0}", &StaticWindowValues), "");
+    assert_eq!(render_template("#{e|m|f:5,0}", &StaticWindowValues), "-nan");
+    assert_eq!(render_template("#{e|%|f:5,2}", &StaticWindowValues), "1.00");
+    assert_eq!(render_template("#{e|%|f:5,0}", &StaticWindowValues), "-nan");
 }
 
 #[test]
-fn expression_empty_and_prefixed_integer_operands_match_tmux() {
+fn expression_empty_and_prefixed_integer_operands_use_tmux_parsing() {
     assert_eq!(render_template("#{e|+|:5,}", &StaticWindowValues), "5");
     assert_eq!(render_template("#{e|+|:0x10,1}", &StaticWindowValues), "17");
     assert_eq!(
@@ -257,33 +288,33 @@ fn expression_empty_and_prefixed_integer_operands_match_tmux() {
     );
     assert_eq!(
         render_template("#{e|+|:inf,1}", &StaticWindowValues),
-        "9223372036854775808"
+        i64::MIN.to_string()
     );
     assert_eq!(render_template("#{e|q|:inf,1}", &StaticWindowValues), "");
 }
 
 #[test]
-fn expression_non_finite_and_wide_integer_operands_saturate_like_tmux_oracle() {
-    // Expectations recorded 2026-07-08 against the pinned tmux 3.7b oracle
-    // (arm64): operands and results round-trip through a saturating
-    // long long cast (NaN -> 0, +/-inf and out-of-range saturate).
+fn expression_non_finite_and_wide_integer_operands_use_deterministic_sentinel() {
     assert_eq!(
         render_template("#{e|/|:9223372036854775808,2}", &StaticWindowValues),
-        "4611686018427387904"
+        "-4611686018427387904"
     );
     assert_eq!(
         render_template("#{e|*|:9223372036854775808,2}", &StaticWindowValues),
-        "9223372036854775808"
+        i64::MIN.to_string()
     );
     assert_eq!(
         render_template("#{e|m|:9223372036854775808,3}", &StaticWindowValues),
-        "2"
+        "-2"
     );
     assert_eq!(
         render_template("#{e|/|:inf,2}", &StaticWindowValues),
-        "4611686018427387904"
+        "-4611686018427387904"
     );
-    assert_eq!(render_template("#{e|*|:nan,2}", &StaticWindowValues), "0");
+    assert_eq!(
+        render_template("#{e|*|:nan,2}", &StaticWindowValues),
+        i64::MIN.to_string()
+    );
 }
 
 #[test]
@@ -312,11 +343,9 @@ fn expression_numeric_comparisons() {
 }
 
 #[test]
-fn expression_non_finite_comparisons_match_tmux_oracle() {
-    // Oracle probe 2026-07-08: comparison operands take the same saturating
-    // long long round-trip (inf -> LLONG_MAX, nan -> 0).
-    assert_eq!(render_template("#{e|>|:inf,1}", &StaticWindowValues), "1");
-    assert_eq!(render_template("#{e|<|:inf,1}", &StaticWindowValues), "0");
+fn expression_non_finite_comparisons_use_deterministic_sentinel() {
+    assert_eq!(render_template("#{e|>|:inf,1}", &StaticWindowValues), "0");
+    assert_eq!(render_template("#{e|<|:inf,1}", &StaticWindowValues), "1");
     assert_eq!(
         render_template("#{e|==|:inf,inf}", &StaticWindowValues),
         "1"
@@ -333,18 +362,18 @@ fn expression_non_finite_comparisons_match_tmux_oracle() {
         render_template("#{e|!=|:nan,nan}", &StaticWindowValues),
         "0"
     );
-    assert_eq!(render_template("#{e|==|:nan,0}", &StaticWindowValues), "1");
-    assert_eq!(render_template("#{e|!=|:nan,0}", &StaticWindowValues), "0");
+    assert_eq!(render_template("#{e|==|:nan,0}", &StaticWindowValues), "0");
+    assert_eq!(render_template("#{e|!=|:nan,0}", &StaticWindowValues), "1");
     assert_eq!(render_template("#{e|<|:nan,1}", &StaticWindowValues), "1");
     assert_eq!(render_template("#{e|>|:nan,1}", &StaticWindowValues), "0");
     assert_eq!(render_template("#{e|<=|:nan,1}", &StaticWindowValues), "1");
     assert_eq!(
         render_template("#{e|==|:inf,-inf}", &StaticWindowValues),
-        "0"
+        "1"
     );
     assert_eq!(
         render_template("#{e|>|:inf,-inf}", &StaticWindowValues),
-        "1"
+        "0"
     );
 }
 

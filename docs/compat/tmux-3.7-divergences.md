@@ -365,3 +365,29 @@ Test/fixture: `tests/fixtures/tmux_3_7_round4_evidence.md` records pty probes:
 Inventory impact: attach sequencing compatibility may be advertised for exit
 status and final state, but not for terminal-exit banner bytes on queued attach
 until banner rendering is implemented.
+
+### C-D49: undefined expression arithmetic is deterministic
+
+tmux 3.7b evaluates expression arithmetic in IEEE doubles and converts
+operands and integer results through C `(long long)` casts. The conversion of
+non-finite or out-of-range doubles to `long long` is undefined behavior in C
+and diverges by CPU (x86_64 produces the `-9223372036854775808` sentinel,
+AArch64 saturates), and the sign glibc/BSD printf gives a NaN differs by
+platform too. RMUX normalizes both classes to the Linux x86_64 oracle:
+undefined integer results (and the comparison operands derived the same way)
+become the sentinel `-9223372036854775808`, and every float NaN result
+renders `-nan`, so release behavior is deterministic across CPUs. RMUX
+accepts `m`, `%`, and `%%` as modulo spellings: glibc tmux evaluates both `%`
+forms, while the darwin oracle's BSD strftime consumes a lone `%` before the
+format parser ever sees it (a libc artifact upstream of the expression
+engine, visible as `x%:y` -> `x:y`).
+
+Test/fixture: `crates/rmux-core/src/formats/tests/operators.rs` and
+`tests/display_message.rs` cover the modulo spellings, the sentinel cases for
+integer divide-by-zero, modulo-by-zero, non-finite and out-of-range operands,
+non-finite comparisons, and the deterministic `-nan` float renders.
+
+Inventory impact: format rendering remains advertised, but compatibility
+claims for expression arithmetic must describe these undefined cases as RMUX's
+deterministic Linux-oracle behavior rather than byte-identical tmux behavior on
+every CPU.

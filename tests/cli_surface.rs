@@ -2638,6 +2638,75 @@ fn show_options_global_pane_combination_matches_tmux_scope_precedence() -> Resul
 }
 
 #[test]
+fn set_option_unset_scope_matrix_matches_tmux() -> Result<(), Box<dyn Error>> {
+    // Oracle probe 2026-07-09 (pinned tmux 3.7b): with @agent.state set at
+    // session, window, and pane scopes, plain `set -U` unsets the session
+    // copy only; `set -pU` unsets the pane copy only; `set -wU` unsets the
+    // window copy and clears the window's pane overrides.
+    let harness = CliHarness::new("set-option-unset-scope-matrix")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let set_all = |harness: &CliHarness| -> Result<(), Box<dyn Error>> {
+        assert_success(&harness.run(&["set-option", "-t", "alpha", "@agent.state", "session"])?);
+        assert_success(&harness.run(&[
+            "set-option",
+            "-w",
+            "-t",
+            "alpha:0",
+            "@agent.state",
+            "window",
+        ])?);
+        assert_success(&harness.run(&[
+            "set-option",
+            "-p",
+            "-t",
+            "alpha:0.0",
+            "@agent.state",
+            "pane",
+        ])?);
+        Ok(())
+    };
+    let values = |harness: &CliHarness| -> Result<(String, String, String), Box<dyn Error>> {
+        let session = harness.run(&["show-options", "-qv", "-t", "alpha", "@agent.state"])?;
+        let window = harness.run(&["show-options", "-wqv", "-t", "alpha:0", "@agent.state"])?;
+        let pane = harness.run(&["show-options", "-pqv", "-t", "alpha:0.0", "@agent.state"])?;
+        Ok((
+            stdout(&session).trim_end().to_owned(),
+            stdout(&window).trim_end().to_owned(),
+            stdout(&pane).trim_end().to_owned(),
+        ))
+    };
+
+    set_all(&harness)?;
+    assert_success(&harness.run(&["set-option", "-U", "-t", "alpha:0.0", "@agent.state"])?);
+    assert_eq!(
+        values(&harness)?,
+        (String::new(), "window".to_owned(), "pane".to_owned()),
+        "plain -U unsets the session copy only"
+    );
+
+    set_all(&harness)?;
+    assert_success(&harness.run(&["set-option", "-pU", "-t", "alpha:0.0", "@agent.state"])?);
+    assert_eq!(
+        values(&harness)?,
+        ("session".to_owned(), "window".to_owned(), String::new()),
+        "-pU unsets the pane copy only"
+    );
+
+    set_all(&harness)?;
+    assert_success(&harness.run(&["set-option", "-wU", "-t", "alpha:0", "@agent.state"])?);
+    assert_eq!(
+        values(&harness)?,
+        ("session".to_owned(), String::new(), String::new()),
+        "-wU unsets the window copy and clears pane overrides"
+    );
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
 fn set_option_explicit_scopes_coerce_known_options_to_natural_table() -> Result<(), Box<dyn Error>>
 {
     let harness = CliHarness::new("set-option-explicit-scope-known-natural")?;

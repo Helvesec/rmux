@@ -75,7 +75,9 @@ impl Pane {
         self.geometry
     }
 
-    pub(crate) const fn active_point(&self) -> u64 {
+    /// Monotonic per-window activation counter (tmux `active_point`):
+    /// bumped each time this pane becomes the window's active pane.
+    pub const fn active_point(&self) -> u64 {
         self.active_point
     }
 

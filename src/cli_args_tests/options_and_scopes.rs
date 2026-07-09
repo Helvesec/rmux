@@ -19,6 +19,33 @@ fn set_option_accepts_default_scope_like_tmux() {
 }
 
 #[test]
+fn set_option_unset_pane_overrides_accepts_missing_value() {
+    let cli = parse_args(&["set-option", "-U", "-t", "alpha:0.1", "@agent.state"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::SetOption(args) => {
+            assert!(args.unset_pane_overrides);
+            assert!(!args.unset);
+            assert_eq!(
+                args.target
+                    .as_ref()
+                    .and_then(|target| target.exact().cloned()),
+                Some(rmux_proto::Target::Pane(
+                    rmux_proto::PaneTarget::with_window(
+                        rmux_proto::SessionName::new("alpha").unwrap(),
+                        0,
+                        1
+                    )
+                ))
+            );
+            assert_eq!(args.option, "@agent.state");
+            assert_eq!(args.value, None);
+        }
+        _ => panic!("expected SetOption command"),
+    }
+}
+
+#[test]
 fn set_option_accepts_global_and_target_for_server_scope_compatibility() {
     let cli = parse_args(&["set-option", "-gs", "-t", "alpha", "buffer-limit", "10"]).unwrap();
 

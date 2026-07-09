@@ -36,3 +36,44 @@ fn display_message_queued_path_preserves_windows_quoting_and_dollar_anchor(
     assert_eq!(queued, direct);
     Ok(())
 }
+
+#[test]
+fn set_option_unset_pane_overrides_clears_window_and_pane_user_options(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("windows-set-option-unset-pane-overrides")?;
+
+    harness.success(["new-session", "-d", "-s", "alpha"])?;
+    harness.success([
+        "set-option",
+        "-w",
+        "-t",
+        "alpha:0",
+        "@agent.state",
+        "window",
+    ])?;
+    harness.success([
+        "set-option",
+        "-p",
+        "-t",
+        "alpha:0.0",
+        "@agent.state",
+        "pane",
+    ])?;
+
+    assert_eq!(
+        harness.stdout(["show-options", "-pqv", "-t", "alpha:0.0", "@agent.state"])?,
+        "pane\n"
+    );
+
+    harness.success(["set-option", "-U", "-t", "alpha:0.0", "@agent.state"])?;
+
+    assert_eq!(
+        harness.stdout(["show-options", "-wqv", "-t", "alpha:0", "@agent.state"])?,
+        ""
+    );
+    assert_eq!(
+        harness.stdout(["show-options", "-pqv", "-t", "alpha:0.0", "@agent.state"])?,
+        ""
+    );
+    Ok(())
+}

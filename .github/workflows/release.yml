@@ -102,6 +102,7 @@ jobs:
         env:
           RMUX_FROZEN_TMUX: ${{ runner.temp }}/rmux-oracle/tmux
           RMUX_REQUIRE_TMUX: "1"
+          RMUX_PERF_AUTO_CURRENT: "1"
         run: scripts/release-review-gate.sh --target-dir target/release-review
 
   build:

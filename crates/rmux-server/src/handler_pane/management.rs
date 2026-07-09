@@ -428,6 +428,7 @@ impl RequestHandler {
                 keep_alive_on_exit,
                 split_effects.size,
                 full_size,
+                detached,
                 Some(self.pane_alert_callback()),
                 Some(self.pane_exit_callback()),
             ) {

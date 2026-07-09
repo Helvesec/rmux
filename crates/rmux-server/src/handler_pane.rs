@@ -50,7 +50,9 @@ use pane_io_encoding::{
     expand_send_key_tokens, pane_id_for_input_target, prepare_synchronized_pane_input_writes,
     write_bytes_to_target, write_bytes_to_targets, PaneInputWrite,
 };
-pub(super) use pane_io_encoding::{prepare_pane_input_write, write_bytes_to_target_io};
+pub(super) use pane_io_encoding::{
+    prepare_pane_input_write, write_bytes_to_target_io, PaneInputLiveness,
+};
 pub(in crate::handler) use pane_management::SplitWindowParts;
 pub(super) use pane_prompt_input::decode_prompt_input_event;
 pub(in crate::handler) use pane_snapshot::PaneSnapshotRevisionRegistry;

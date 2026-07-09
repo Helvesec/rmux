@@ -5,7 +5,6 @@ use crate::pane_terminals::HandlerState;
 #[derive(Debug, Clone)]
 pub(super) struct SplitWindowEffects {
     pub(super) detached_anchor: Option<PaneTarget>,
-    detached_restore: Option<PaneTarget>,
     pub(super) size: Option<u32>,
 }
 
@@ -33,7 +32,6 @@ pub(super) fn split_window_effects(
             "pane index does not exist in session",
         )
     })?;
-    let active_before = window.active_pane_index();
     let split_size = size
         .map(|size| split_size_cells(size, direction, pane.geometry()))
         .transpose()?;
@@ -41,8 +39,6 @@ pub(super) fn split_window_effects(
     Ok(SplitWindowEffects {
         detached_anchor: detached
             .then(|| PaneTarget::with_window(session_name.clone(), window_index, pane_index)),
-        detached_restore: detached
-            .then(|| PaneTarget::with_window(session_name, window_index, active_before)),
         size: split_size,
     })
 }
@@ -69,14 +65,6 @@ pub(super) fn apply_split_window_effects(
             }
             Ok(())
         })?;
-    }
-
-    if let Some(restore) = effects.detached_restore {
-        state
-            .sessions
-            .session_mut(restore.session_name())
-            .ok_or_else(|| RmuxError::SessionNotFound(restore.session_name().to_string()))?
-            .select_pane_in_window(restore.window_index(), restore.pane_index())?;
     }
 
     Ok(())
