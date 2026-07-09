@@ -214,6 +214,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $stageDir "libexec/rmux") |
 Copy-Item -LiteralPath $binary -Destination (Join-Path $stageDir "rmux.exe")
 Copy-Item -LiteralPath $helperBinary -Destination (Join-Path $stageDir "libexec/rmux/rmux.exe")
 Copy-Item -LiteralPath $daemonBinary -Destination (Join-Path $stageDir "rmux-daemon.exe")
+Copy-Item -LiteralPath "scripts/install-windows.ps1" -Destination (Join-Path $stageDir "install.ps1")
 Copy-Item -LiteralPath "README.md", "LICENSE-APACHE", "LICENSE-MIT", "docs/man/rmux.1" -Destination $stageDir
 $completionDir = Join-Path ([System.IO.Path]::GetTempPath()) "rmux-completions-$([System.Guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Force -Path $completionDir | Out-Null

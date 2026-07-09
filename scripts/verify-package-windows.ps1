@@ -209,6 +209,26 @@ function InvokeMouseBorderSmoke([string]$Binary) {
     }
 }
 
+function AssertArchiveInstaller([string]$InstallScript, [string]$Root) {
+    $installRoot = Join-Path $Root "installed-rmux"
+    $installBin = Join-Path $installRoot "bin"
+
+    & $InstallScript -InstallDir $installBin
+    if (-not $?) {
+        Fail "archive install.ps1 failed"
+    }
+
+    foreach ($required in @("bin\rmux.exe", "libexec\rmux\rmux.exe", "rmux-daemon.exe", "share\rmux\artifact-metadata.json")) {
+        if (-not (Test-Path -LiteralPath (Join-Path $installRoot $required) -PathType Leaf)) {
+            Fail "install.ps1 did not install required file: $required"
+        }
+    }
+
+    $installedBinary = Join-Path $installBin "rmux.exe"
+    AssertSuccess $installedBinary @("-V") | Out-Null
+    AssertHelperFallback $installedBinary
+}
+
 function VerifyChecksumManifest([string]$Root, [string]$Manifest) {
     $rootFull = [System.IO.Path]::GetFullPath($Root)
     foreach ($line in Get-Content -LiteralPath $Manifest) {
@@ -277,7 +297,7 @@ try {
         Fail "archive root directory is missing: $([System.IO.Path]::GetFileNameWithoutExtension($archiveName))"
     }
 
-    foreach ($required in @("rmux.exe", "libexec/rmux/rmux.exe", "rmux-daemon.exe", "SHA256SUMS.txt", "share/rmux/artifact-metadata.json", "README.md", "LICENSE-APACHE", "LICENSE-MIT", "rmux.1")) {
+    foreach ($required in @("rmux.exe", "libexec/rmux/rmux.exe", "rmux-daemon.exe", "install.ps1", "SHA256SUMS.txt", "share/rmux/artifact-metadata.json", "README.md", "LICENSE-APACHE", "LICENSE-MIT", "rmux.1")) {
         if (-not (Test-Path -LiteralPath (Join-Path $packageRoot $required))) {
             Fail "missing package file: $required"
         }
@@ -321,6 +341,7 @@ try {
     }
 
     if ($RunBinary) {
+        AssertArchiveInstaller (Join-Path $packageRoot "install.ps1") $tmpRoot
         AssertSuccess $binary @("-V") | Out-Null
         AssertHelperFallback $binary
         AssertSuccess $helperBinary @("-V") | Out-Null
