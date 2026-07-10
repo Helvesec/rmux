@@ -203,3 +203,51 @@ fn all_17_states_exist() {
 }
 
 // ─── MODSET/MODOFF tests ──────────────────────────────────────────
+
+// ─── OSC 10/11/12 colour queries ────────────────────────────────────
+//
+// Detached sessions have no attached terminal to answer colour queries, so
+// the emulator replies itself (theme-detecting TUIs mis-render otherwise).
+// NOTE: these assert the compiled-in defaults; the RMUX_DEFAULT_* env
+// overrides are read once per process, so they are not exercised here.
+
+#[test]
+fn osc_10_fg_query_replies_with_default_st() {
+    let (p, _w) = parse(b"\x1b]10;?\x1b\\");
+    let replies = String::from_utf8_lossy(&p.reply_buf);
+    assert_eq!(replies.as_ref(), "\x1b]10;rgb:cccc/cccc/cccc\x1b\\");
+}
+
+#[test]
+fn osc_11_bg_query_replies_with_default_bel() {
+    let (p, _w) = parse(b"\x1b]11;?\x07");
+    let replies = String::from_utf8_lossy(&p.reply_buf);
+    assert_eq!(replies.as_ref(), "\x1b]11;rgb:0000/0000/0000\x07");
+}
+
+#[test]
+fn osc_12_cursor_query_replies_with_default() {
+    let (p, _w) = parse(b"\x1b]12;?\x1b\\");
+    let replies = String::from_utf8_lossy(&p.reply_buf);
+    assert_eq!(replies.as_ref(), "\x1b]12;rgb:cccc/cccc/cccc\x1b\\");
+}
+
+#[test]
+fn osc_11_set_then_query_round_trips() {
+    let (p, _w) = parse(b"\x1b]11;rgb:1111/2222/3333\x1b\\\x1b]11;?\x1b\\");
+    let replies = String::from_utf8_lossy(&p.reply_buf);
+    assert_eq!(replies.as_ref(), "\x1b]11;rgb:1111/2222/3333\x1b\\");
+}
+
+#[test]
+fn osc_111_reset_restores_default_bg() {
+    let (p, _w) = parse(b"\x1b]11;rgb:1111/2222/3333\x1b\\\x1b]111\x1b\\\x1b]11;?\x1b\\");
+    let replies = String::from_utf8_lossy(&p.reply_buf);
+    assert_eq!(replies.as_ref(), "\x1b]11;rgb:0000/0000/0000\x1b\\");
+}
+
+#[test]
+fn osc_10_set_still_reaches_writer() {
+    let (_p, w) = parse(b"\x1b]10;rgb:eeee/eeee/eeee\x1b\\");
+    assert!(w.has_call("osc_fg_colour("));
+}
