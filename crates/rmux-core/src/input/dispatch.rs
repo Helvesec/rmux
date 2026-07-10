@@ -9,7 +9,7 @@ use super::csi_helpers::{
 use super::mode;
 use super::sgr;
 use super::tables;
-use super::{InputParser, INPUT_LAST};
+use super::{InputEndType, InputParser, OscColourSlot, INPUT_LAST};
 
 // ─── C0 dispatch ───────────────────────────────────────────────────
 
@@ -494,7 +494,9 @@ pub(crate) fn dispatch_osc<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
         i += 1;
     }
 
-    let data = String::from_utf8_lossy(&buf[i..]);
+    // Owned: the OSC 10/11/12 arms below mutate parser state (stored colours
+    // and the reply buffer) while the payload is still in use.
+    let data = String::from_utf8_lossy(&buf[i..]).into_owned();
     let end = parser.input_end;
 
     match option {
@@ -506,14 +508,32 @@ pub(crate) fn dispatch_osc<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
             parser.cell.cell.link = writer.current_hyperlink_id();
         }
         9 => writer.osc_notification(&data),
-        10 => writer.osc_fg_colour(&data, end),
-        11 => writer.osc_bg_colour(&data, end),
-        12 => writer.osc_cursor_colour(&data, end),
+        10 if !answer_osc_colour_query(parser, OscColourSlot::Foreground, &data, end) => {
+            parser.set_osc_colour(OscColourSlot::Foreground, &data);
+            writer.osc_fg_colour(&data, end);
+        }
+        11 if !answer_osc_colour_query(parser, OscColourSlot::Background, &data, end) => {
+            parser.set_osc_colour(OscColourSlot::Background, &data);
+            writer.osc_bg_colour(&data, end);
+        }
+        12 if !answer_osc_colour_query(parser, OscColourSlot::Cursor, &data, end) => {
+            parser.set_osc_colour(OscColourSlot::Cursor, &data);
+            writer.osc_cursor_colour(&data, end);
+        }
         52 => writer.osc_clipboard(&data, end),
         104 => writer.osc_reset_palette(&data),
-        110 => writer.osc_reset_fg(),
-        111 => writer.osc_reset_bg(),
-        112 => writer.osc_reset_cursor(),
+        110 => {
+            parser.reset_osc_colour(OscColourSlot::Foreground);
+            writer.osc_reset_fg();
+        }
+        111 => {
+            parser.reset_osc_colour(OscColourSlot::Background);
+            writer.osc_reset_bg();
+        }
+        112 => {
+            parser.reset_osc_colour(OscColourSlot::Cursor);
+            writer.osc_reset_cursor();
+        }
         133 => writer.osc_shell_integration(&data),
         _ => {}
     }
@@ -545,4 +565,32 @@ pub(crate) fn dispatch_dcs<W: ScreenWriter + ?Sized>(parser: &mut InputParser, w
         payload.extend_from_slice(buf);
         writer.sixel_passthrough(&payload);
     }
+}
+
+/// Answers an OSC 10/11/12 colour QUERY (`?` payload) from the emulator, the
+/// way an attached terminal would (`OSC <n>;rgb:RRRR/GGGG/BBBB`, terminated
+/// like the query). Detached sessions have no terminal to forward the query
+/// to, and theme-detecting TUIs otherwise mis-render. Returns false for
+/// set-colour payloads, which callers handle as before.
+fn answer_osc_colour_query(
+    parser: &mut InputParser,
+    slot: OscColourSlot,
+    data: &str,
+    end: InputEndType,
+) -> bool {
+    if data != "?" {
+        return false;
+    }
+
+    let reply = format!(
+        "\x1b]{};{}{}",
+        slot.osc_number(),
+        parser.osc_colour(slot),
+        match end {
+            InputEndType::Bel => "\x07",
+            InputEndType::St => "\x1b\\",
+        }
+    );
+    parser.reply(&reply);
+    true
 }

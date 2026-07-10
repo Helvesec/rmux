@@ -200,6 +200,16 @@ impl ScreenWriter for RecordingWriter {
     fn osc_hyperlink(&mut self, data: &str) {
         self.calls.push(format!("osc_hyperlink({data:?})"));
     }
+    fn osc_fg_colour(&mut self, data: &str, end: InputEndType) {
+        self.calls.push(format!("osc_fg_colour({data:?}, {end:?})"));
+    }
+    fn osc_bg_colour(&mut self, data: &str, end: InputEndType) {
+        self.calls.push(format!("osc_bg_colour({data:?}, {end:?})"));
+    }
+    fn osc_cursor_colour(&mut self, data: &str, end: InputEndType) {
+        self.calls
+            .push(format!("osc_cursor_colour({data:?}, {end:?})"));
+    }
     fn osc_clipboard(&mut self, data: &str, end: InputEndType) {
         self.calls.push(format!("osc_clipboard({data:?}, {end:?})"));
     }
