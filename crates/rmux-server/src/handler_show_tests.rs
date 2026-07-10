@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use super::RequestHandler;
 use rmux_core::events::SubscriptionLimits;
 use rmux_proto::{
-    ErrorResponse, NewSessionRequest, OptionName, PaneTarget, Request, Response, RmuxError,
-    ScopeSelector, SetEnvironmentMode, SetEnvironmentRequest, SetOptionMode, SetOptionRequest,
-    ShowEnvironmentRequest, ShowHooksRequest, ShowOptionsRequest, SplitDirection,
+    ErrorResponse, HookLifecycle, HookName, NewSessionRequest, OptionName, PaneTarget, Request,
+    Response, RmuxError, ScopeSelector, SetEnvironmentMode, SetEnvironmentRequest, SetOptionMode,
+    SetOptionRequest, ShowEnvironmentRequest, ShowHooksRequest, ShowOptionsRequest, SplitDirection,
     SplitWindowRequest, SplitWindowTarget, TerminalSize, WindowTarget,
 };
 
@@ -50,6 +50,7 @@ async fn show_options_returns_command_output_for_session_and_server_scopes() {
             value_only: false,
             include_inherited: true,
             quiet: false,
+            include_hooks: false,
         }))
         .await;
     let output = response
@@ -66,6 +67,7 @@ async fn show_options_returns_command_output_for_session_and_server_scopes() {
             value_only: true,
             include_inherited: true,
             quiet: false,
+            include_hooks: false,
         }))
         .await;
     let output = response
@@ -88,6 +90,7 @@ async fn show_options_without_a_omits_inherited_values() {
             value_only: false,
             include_inherited: false,
             quiet: false,
+            include_hooks: false,
         }))
         .await;
     let output = response
@@ -109,6 +112,7 @@ async fn show_options_global_scope_resolves_named_defaults_without_a_marker() {
             value_only: true,
             include_inherited: false,
             quiet: false,
+            include_hooks: false,
         }))
         .await;
     let output = response
@@ -130,6 +134,7 @@ async fn show_options_a_marks_inherited_values() {
             value_only: false,
             include_inherited: true,
             quiet: false,
+            include_hooks: false,
         }))
         .await;
     let output = response
@@ -137,6 +142,117 @@ async fn show_options_a_marks_inherited_values() {
         .expect("show-options -A should return command output");
 
     assert_eq!(output.stdout(), b"status* on\n");
+}
+
+#[tokio::test]
+async fn show_options_h_appends_hooks_and_named_hooks_do_not_require_h() {
+    let handler = RequestHandler::new();
+    create_session(&handler, "alpha").await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .hooks
+            .set(
+                ScopeSelector::Global,
+                HookName::AfterNewWindow,
+                "display-message global-hook".to_owned(),
+                HookLifecycle::Persistent,
+            )
+            .expect("set global hook");
+    }
+
+    let without_hooks = handler
+        .handle(Request::ShowOptions(ShowOptionsRequest {
+            scope: rmux_proto::OptionScopeSelector::SessionGlobal,
+            name: None,
+            value_only: false,
+            include_inherited: false,
+            quiet: false,
+            include_hooks: false,
+        }))
+        .await;
+    let without_hooks = std::str::from_utf8(
+        without_hooks
+            .command_output()
+            .expect("show-options output")
+            .stdout(),
+    )
+    .expect("utf8 output");
+    assert!(!without_hooks.contains("after-new-window"));
+
+    let with_hooks = handler
+        .handle(Request::ShowOptions(ShowOptionsRequest {
+            scope: rmux_proto::OptionScopeSelector::SessionGlobal,
+            name: None,
+            value_only: false,
+            include_inherited: false,
+            quiet: false,
+            include_hooks: true,
+        }))
+        .await;
+    let with_hooks = std::str::from_utf8(
+        with_hooks
+            .command_output()
+            .expect("show-options -H output")
+            .stdout(),
+    )
+    .expect("utf8 output");
+    let status = with_hooks.find("status on\n").expect("session option line");
+    let hook = with_hooks
+        .find("after-new-window[0] display-message global-hook\n")
+        .expect("hook line");
+    assert!(status < hook, "hooks follow options as in tmux 3.7b");
+
+    let named = handler
+        .handle(Request::ShowOptions(ShowOptionsRequest {
+            scope: rmux_proto::OptionScopeSelector::SessionGlobal,
+            name: Some("after-new-window[0]".to_owned()),
+            value_only: true,
+            include_inherited: false,
+            quiet: false,
+            include_hooks: false,
+        }))
+        .await;
+    assert_eq!(
+        named.command_output().expect("named hook output").stdout(),
+        b"display-message global-hook\n"
+    );
+}
+
+#[tokio::test]
+async fn show_options_a_marks_inherited_hook_bindings() {
+    let handler = RequestHandler::new();
+    create_session(&handler, "alpha").await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .hooks
+            .set(
+                ScopeSelector::Global,
+                HookName::AfterNewWindow,
+                "display-message inherited".to_owned(),
+                HookLifecycle::Persistent,
+            )
+            .expect("set global hook");
+    }
+
+    let response = handler
+        .handle(Request::ShowOptions(ShowOptionsRequest {
+            scope: rmux_proto::OptionScopeSelector::Session(session_name("alpha")),
+            name: Some("after-new-window".to_owned()),
+            value_only: false,
+            include_inherited: true,
+            quiet: false,
+            include_hooks: true,
+        }))
+        .await;
+    assert_eq!(
+        response
+            .command_output()
+            .expect("inherited hook output")
+            .stdout(),
+        b"after-new-window[0]* display-message inherited\n"
+    );
 }
 
 #[tokio::test]
@@ -251,6 +367,7 @@ async fn show_options_window_global_scope_is_a_valid_explicit_request() {
             value_only: false,
             include_inherited: true,
             quiet: false,
+            include_hooks: false,
         }))
         .await;
     assert!(matches!(response, Response::ShowOptions(_)));
@@ -374,6 +491,7 @@ async fn show_options_for_nonexistent_session_returns_session_not_found() {
                 value_only: false,
                 include_inherited: true,
                 quiet: false,
+                include_hooks: false,
             }))
             .await,
         Response::Error(ErrorResponse {
@@ -409,6 +527,7 @@ async fn show_options_at_window_scope_resolves_window_then_session_then_global()
             value_only: false,
             include_inherited: true,
             quiet: false,
+            include_hooks: false,
         }))
         .await;
     let output = response

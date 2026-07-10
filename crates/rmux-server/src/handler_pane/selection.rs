@@ -59,7 +59,7 @@ impl RequestHandler {
         let title = request.title.clone();
         let style = request.style.clone();
         let input_disabled = request.input_disabled;
-        let (response, pane_changed, title_changed_target, title_state_event, pane_option_event) = {
+        let (response, pane_changed, title_changed_target) = {
             let mut state = self.state.lock().await;
             let pane_changed = title.is_none()
                 && input_disabled.is_none()
@@ -121,6 +121,7 @@ impl RequestHandler {
                         false,
                         false,
                     )?;
+                    state.synchronize_pane_alias_options_from_target(&request.target)?;
                     if outcome.changed {
                         if let Some(pane_id) = pane_id_for_select_target(&state, &request.target) {
                             let generation = state
@@ -138,34 +139,31 @@ impl RequestHandler {
                     target: response_target,
                 })
             })() {
-                Ok(response) => (
-                    Response::SelectPane(response),
-                    pane_changed,
-                    title_changed_target,
-                    title_state_event,
-                    pane_option_event,
-                ),
-                Err(error) => (
-                    Response::Error(ErrorResponse { error }),
-                    false,
-                    None,
-                    None,
-                    None,
-                ),
+                Ok(response) => {
+                    if let Some((pane_id, generation, old, new)) = &title_state_event {
+                        self.record_pane_state_change(
+                            *pane_id,
+                            Some(*generation),
+                            PaneStateChange::TitleChanged {
+                                old: old.clone(),
+                                new: new.clone(),
+                            },
+                        );
+                    }
+                    if let Some((pane_id, generation, outcome)) = pane_option_event.as_ref() {
+                        self.record_pane_option_mutation(*pane_id, Some(*generation), outcome);
+                    }
+                    (
+                        Response::SelectPane(response),
+                        pane_changed,
+                        title_changed_target,
+                    )
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), false, None),
             }
         };
 
         if matches!(response, Response::SelectPane(_)) {
-            if let Some((pane_id, generation, old, new)) = title_state_event {
-                self.record_pane_state_change(
-                    pane_id,
-                    Some(generation),
-                    PaneStateChange::TitleChanged { old, new },
-                );
-            }
-            if let Some((pane_id, generation, outcome)) = pane_option_event.as_ref() {
-                self.record_pane_option_mutation(*pane_id, Some(*generation), outcome);
-            }
             if pane_changed {
                 self.emit(LifecycleEvent::WindowPaneChanged {
                     target: WindowTarget::with_window(session_name.clone(), window_index),
@@ -250,7 +248,7 @@ impl RequestHandler {
     ) -> Response {
         let session_name = request.target.session_name().clone();
         let window_index = request.target.window_index();
-        let (response, title_changed_target, title_state_event) = {
+        let (response, title_changed_target) = {
             let mut state = self.state.lock().await;
             let mut title_changed_target = None;
             let mut title_state_event = None;
@@ -292,23 +290,24 @@ impl RequestHandler {
                     ),
                 })
             })() {
-                Ok(response) => (
-                    Response::SelectPane(response),
-                    title_changed_target,
-                    title_state_event,
-                ),
-                Err(error) => (Response::Error(ErrorResponse { error }), None, None),
+                Ok(response) => {
+                    if let Some((pane_id, generation, old, new)) = &title_state_event {
+                        self.record_pane_state_change(
+                            *pane_id,
+                            Some(*generation),
+                            PaneStateChange::TitleChanged {
+                                old: old.clone(),
+                                new: new.clone(),
+                            },
+                        );
+                    }
+                    (Response::SelectPane(response), title_changed_target)
+                }
+                Err(error) => (Response::Error(ErrorResponse { error }), None),
             }
         };
 
         if matches!(response, Response::SelectPane(_)) {
-            if let Some((pane_id, generation, old, new)) = title_state_event {
-                self.record_pane_state_change(
-                    pane_id,
-                    Some(generation),
-                    PaneStateChange::TitleChanged { old, new },
-                );
-            }
             if let Some(target) = title_changed_target {
                 self.emit(LifecycleEvent::PaneTitleChanged { target }).await;
             }

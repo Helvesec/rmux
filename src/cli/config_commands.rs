@@ -107,13 +107,15 @@ pub(crate) fn run_show_options(
         Err(error) => return Err(error),
     };
     let include_inherited = args.include_inherited;
+    let include_hooks = args.include_hooks;
     let response = connection
-        .show_options(
+        .show_options_extended(
             scope,
             args.name,
             args.value_only,
             include_inherited,
             args.quiet,
+            include_hooks,
         )
         .map_err(show_options_exit_failure)?;
     match response {
@@ -280,6 +282,7 @@ mod tests {
     fn show_global_args(name: Option<&str>) -> ShowOptionsArgs {
         ShowOptionsArgs {
             include_inherited: false,
+            include_hooks: false,
             global: true,
             server: false,
             window: false,
@@ -721,6 +724,7 @@ mod tests {
             ShowOptionsCommandKind::ShowWindowOptions,
             &ShowOptionsArgs {
                 include_inherited: false,
+                include_hooks: false,
                 global: false,
                 server: false,
                 window: false,
@@ -748,6 +752,7 @@ mod tests {
             ShowOptionsCommandKind::ShowWindowOptions,
             &ShowOptionsArgs {
                 include_inherited: false,
+                include_hooks: false,
                 global: true,
                 server: false,
                 window: false,
@@ -772,6 +777,7 @@ mod tests {
             ShowOptionsCommandKind::ShowOptions,
             &ShowOptionsArgs {
                 include_inherited: false,
+                include_hooks: false,
                 global: true,
                 server: true,
                 window: false,
@@ -796,6 +802,7 @@ mod tests {
             ShowOptionsCommandKind::ShowWindowOptions,
             &ShowOptionsArgs {
                 include_inherited: false,
+                include_hooks: false,
                 global: true,
                 server: false,
                 window: false,

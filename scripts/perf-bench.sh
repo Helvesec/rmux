@@ -90,6 +90,7 @@ fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+source "$repo_root/scripts/perf-provenance.sh"
 
 if [ -z "$binary" ]; then
     binary="${CARGO_TARGET_DIR:-target}/release/rmux"
@@ -106,11 +107,25 @@ fi
 
 binary="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"
 case "$binary" in
-    */debug/rmux)
-        echo "perf bench requires a release artifact, got debug binary: $binary" >&2
+    */release/rmux) ;;
+    *)
+        echo "perf bench requires the release-profile rmux binary, got: $binary" >&2
         exit 2
         ;;
 esac
+
+rmux_perf_capture_current_identity "$binary" "$skip_build"
+git_commit="$RMUX_PERF_GIT_COMMIT"
+git_describe="$RMUX_PERF_GIT_DESCRIBE"
+platform="$RMUX_PERF_PLATFORM"
+machine="$RMUX_PERF_MACHINE"
+host_fingerprint="$RMUX_PERF_HOST_FINGERPRINT_VALUE"
+expected_git_commit="$RMUX_PERF_EXPECTED_COMMIT_VALUE"
+expected_platform="$RMUX_PERF_EXPECTED_PLATFORM_VALUE"
+provenance_invocation="$RMUX_PERF_PROVENANCE_VALUE"
+binary_sha256="$RMUX_PERF_BINARY_SHA256"
+binary_version="$RMUX_PERF_BINARY_VERSION"
+build_mode="$RMUX_PERF_BUILD_MODE"
 mkdir -p "$output_dir"
 
 metric_names=()
@@ -522,12 +537,19 @@ markdown_path="$output_dir/unix-$timestamp.txt"
 
 {
     printf '{\n'
-    printf '  "schema": 1,\n'
-    printf '  "timestamp": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    printf '  "platform": "%s",\n' "$(uname -s | tr '[:upper:]' '[:lower:]')"
-    printf '  "binary": "%s",\n' "$binary"
-    printf '  "iterations": %s,\n' "$iterations"
-    printf '  "line_count": %s,\n' "$line_count"
+    printf '  "schema": 2,\n'
+    printf '  "kind": "rmux-perf-current",\n'
+    printf '  "timestamp": %s,\n' "$(json_string "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+    printf '  "git": {"commit":%s,"describe":%s,"dirty":false},\n' \
+        "$(json_string "$git_commit")" "$(json_string "$git_describe")"
+    printf '  "environment": {"platform":%s,"machine":%s,"host_fingerprint":%s},\n' \
+        "$(json_string "$platform")" "$(json_string "$machine")" "$(json_string "$host_fingerprint")"
+    printf '  "binary": {"path":%s,"sha256":%s,"version":%s,"configuration":"release"},\n' \
+        "$(json_string "$binary")" "$(json_string "$binary_sha256")" "$(json_string "$binary_version")"
+    printf '  "provenance": {"generator":"scripts/perf-bench.sh","invocation":%s,"expected_git_commit":%s,"expected_platform":%s,"build_mode":%s},\n' \
+        "$(json_string "$provenance_invocation")" "$(json_string "$expected_git_commit")" \
+        "$(json_string "$expected_platform")" "$(json_string "$build_mode")"
+    printf '  "parameters": {"iterations":%s,"line_count":%s},\n' "$iterations" "$line_count"
     printf '  "metrics": [\n'
     for ((i = 0; i < ${#metric_names[@]}; i++)); do
         [ "$i" -gt 0 ] && printf ',\n'
@@ -543,6 +565,9 @@ markdown_path="$output_dir/unix-$timestamp.txt"
 {
     printf '# RMUX Unix Performance Bench\n\n'
     printf -- '- Binary: `%s`\n' "$binary"
+    printf -- '- Binary SHA-256: `%s`\n' "$binary_sha256"
+    printf -- '- Git commit: `%s`\n' "$git_commit"
+    printf -- '- Provenance: `%s`\n' "$provenance_invocation"
     printf -- '- Iterations: `%s`\n' "$iterations"
     printf -- '- Line count: `%s`\n\n' "$line_count"
     printf '| Metric | p50 ms | p95 ms | Budget p95 ms | Status |\n'

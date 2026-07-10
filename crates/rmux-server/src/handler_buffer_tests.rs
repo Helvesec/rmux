@@ -22,6 +22,7 @@ fn set_buffer_request(name: Option<&str>, content: &[u8]) -> SetBufferRequest {
         append: false,
         new_name: None,
         set_clipboard: false,
+        target_client: None,
     }
 }
 
@@ -31,6 +32,7 @@ fn load_buffer_request(path: &str) -> LoadBufferRequest {
         cwd: None,
         name: None,
         set_clipboard: false,
+        target_client: None,
     }
 }
 
@@ -104,7 +106,9 @@ async fn set_buffer_creates_unnamed_buffer() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::SetBuffer(set_buffer_request(None, b"hello")))
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            None, b"hello",
+        ))))
         .await;
 
     match response {
@@ -118,10 +122,10 @@ async fn set_buffer_creates_named_buffer() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::SetBuffer(set_buffer_request(
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
             Some("my-buf"),
             b"data",
-        )))
+        ))))
         .await;
 
     match response {
@@ -135,14 +139,16 @@ async fn set_buffer_skips_existing_named_buffer_pattern_for_unnamed() {
     let handler = RequestHandler::new();
 
     handler
-        .handle(Request::SetBuffer(set_buffer_request(
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
             Some("buffer0"),
             b"named",
-        )))
+        ))))
         .await;
 
     let response = handler
-        .handle(Request::SetBuffer(set_buffer_request(None, b"unnamed")))
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            None, b"unnamed",
+        ))))
         .await;
 
     match response {
@@ -176,7 +182,10 @@ async fn set_buffer_rejects_empty_name() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::SetBuffer(set_buffer_request(Some(""), b"data")))
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            Some(""),
+            b"data",
+        ))))
         .await;
 
     assert!(matches!(response, Response::Error(_)));
@@ -187,7 +196,10 @@ async fn set_buffer_accepts_colon_in_name() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::SetBuffer(set_buffer_request(Some("a:b"), b"data")))
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            Some("a:b"),
+            b"data",
+        ))))
         .await;
 
     match response {
@@ -201,7 +213,7 @@ async fn set_buffer_empty_content_does_not_create_buffer() {
     let handler = RequestHandler::new();
 
     let response = handler
-        .handle(Request::SetBuffer(set_buffer_request(None, b"")))
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(None, b""))))
         .await;
 
     match response {
@@ -220,7 +232,10 @@ async fn show_buffer_returns_content() {
     let handler = RequestHandler::new();
 
     handler
-        .handle(Request::SetBuffer(set_buffer_request(None, b"hello world")))
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            None,
+            b"hello world",
+        ))))
         .await;
 
     let response = handler
@@ -261,10 +276,10 @@ async fn delete_buffer_removes_stack_head() {
     let handler = RequestHandler::new();
 
     handler
-        .handle(Request::SetBuffer(set_buffer_request(None, b"a")))
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(None, b"a"))))
         .await;
     handler
-        .handle(Request::SetBuffer(set_buffer_request(None, b"b")))
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(None, b"b"))))
         .await;
 
     let response = handler
@@ -311,13 +326,15 @@ async fn list_buffers_returns_formatted_output() {
     let handler = RequestHandler::new();
 
     handler
-        .handle(Request::SetBuffer(set_buffer_request(None, b"first")))
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            None, b"first",
+        ))))
         .await;
     handler
-        .handle(Request::SetBuffer(set_buffer_request(
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
             Some("named"),
             b"second",
-        )))
+        ))))
         .await;
 
     let response = handler
@@ -352,7 +369,10 @@ async fn paste_buffer_writes_to_pty() {
     create_session(&handler, "alpha").await;
 
     handler
-        .handle(Request::SetBuffer(set_buffer_request(None, b"paste-me")))
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            None,
+            b"paste-me",
+        ))))
         .await;
 
     let response = handler
@@ -381,10 +401,10 @@ async fn paste_buffer_with_delete_removes_buffer_after_write() {
     create_session(&handler, "alpha").await;
 
     handler
-        .handle(Request::SetBuffer(set_buffer_request(
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
             None,
             b"paste-then-delete",
-        )))
+        ))))
         .await;
 
     let response = handler
@@ -410,10 +430,10 @@ async fn paste_buffer_with_delete_keeps_newer_named_replacements() {
     create_session(handler.as_ref(), "alpha").await;
 
     handler
-        .handle(Request::SetBuffer(set_buffer_request(
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
             Some("shared"),
             b"old",
-        )))
+        ))))
         .await;
 
     let pause = handler.install_paste_buffer_delete_pause();
@@ -433,10 +453,10 @@ async fn paste_buffer_with_delete_keeps_newer_named_replacements() {
         .expect("paste-buffer should pause before deleting");
 
     let replace = handler
-        .handle(Request::SetBuffer(set_buffer_request(
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
             Some("shared"),
             b"new",
-        )))
+        ))))
         .await;
     assert!(matches!(replace, Response::SetBuffer(_)));
 
@@ -463,7 +483,9 @@ async fn paste_buffer_nonexistent_session_returns_error() {
     let handler = RequestHandler::new();
 
     handler
-        .handle(Request::SetBuffer(set_buffer_request(None, b"data")))
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            None, b"data",
+        ))))
         .await;
 
     let response = handler
@@ -498,16 +520,21 @@ async fn implicit_show_buffer_ignores_newer_named_buffers() {
     let handler = RequestHandler::new();
 
     handler
-        .handle(Request::SetBuffer(set_buffer_request(Some("alpha"), b"v1")))
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            Some("alpha"),
+            b"v1",
+        ))))
         .await;
     handler
-        .handle(Request::SetBuffer(set_buffer_request(None, b"unnamed")))
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            None, b"unnamed",
+        ))))
         .await;
     handler
-        .handle(Request::SetBuffer(set_buffer_request(
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
             Some("alpha"),
             b"value-two",
-        )))
+        ))))
         .await;
 
     let show = handler
@@ -523,13 +550,15 @@ async fn implicit_paste_buffer_ignores_newer_named_buffers() {
     create_session(&handler, "alpha").await;
 
     handler
-        .handle(Request::SetBuffer(set_buffer_request(None, b"unnamed")))
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            None, b"unnamed",
+        ))))
         .await;
     handler
-        .handle(Request::SetBuffer(set_buffer_request(
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
             Some("named"),
             b"value-two",
-        )))
+        ))))
         .await;
 
     let response = handler
@@ -552,7 +581,9 @@ async fn paste_buffer_nonexistent_pane_returns_error() {
     create_session(&handler, "alpha").await;
 
     handler
-        .handle(Request::SetBuffer(set_buffer_request(None, b"data")))
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            None, b"data",
+        ))))
         .await;
 
     // Pane 5 doesn't exist in window 0
@@ -607,7 +638,9 @@ async fn paste_buffer_dead_remain_on_exit_pane_returns_clean_error() {
     wait_for_dead_pane(&handler, &alpha, 0, 0).await;
 
     handler
-        .handle(Request::SetBuffer(set_buffer_request(None, b"data")))
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            None, b"data",
+        ))))
         .await;
 
     let response = handler
@@ -634,7 +667,9 @@ async fn paste_buffer_with_delete_nonexistent_pane_preserves_buffer() {
     create_session(&handler, "alpha").await;
 
     handler
-        .handle(Request::SetBuffer(set_buffer_request(None, b"data")))
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            None, b"data",
+        ))))
         .await;
 
     // Pane 5 doesn't exist - paste fails, buffer should NOT be deleted
@@ -660,16 +695,16 @@ async fn delete_buffer_by_explicit_name_works() {
     let handler = RequestHandler::new();
 
     handler
-        .handle(Request::SetBuffer(set_buffer_request(
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
             Some("target"),
             b"data",
-        )))
+        ))))
         .await;
     handler
-        .handle(Request::SetBuffer(set_buffer_request(
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
             Some("other"),
             b"keep",
-        )))
+        ))))
         .await;
 
     let response = handler
@@ -697,7 +732,10 @@ async fn set_buffer_empty_content_is_not_listed() {
     let handler = RequestHandler::new();
 
     let set = handler
-        .handle(Request::SetBuffer(set_buffer_request(Some("empty"), b"")))
+        .handle(Request::SetBuffer(Box::new(set_buffer_request(
+            Some("empty"),
+            b"",
+        ))))
         .await;
     match set {
         Response::SetBuffer(response) => assert!(response.buffer_name.is_empty()),
@@ -738,7 +776,7 @@ async fn set_buffer_clipboard_write_uses_attached_terminal_features() {
     let mut request = set_buffer_request(None, b"hello clipboard");
     request.set_clipboard = true;
     let response = handler
-        .dispatch(41, Request::SetBuffer(request))
+        .dispatch(41, Request::SetBuffer(Box::new(request)))
         .await
         .response;
     assert!(matches!(response, Response::SetBuffer(_)));
@@ -776,7 +814,7 @@ async fn set_buffer_clipboard_write_flag_overrides_set_clipboard_off() {
     let mut request = set_buffer_request(None, b"forced clipboard");
     request.set_clipboard = true;
     let response = handler
-        .dispatch(41, Request::SetBuffer(request))
+        .dispatch(41, Request::SetBuffer(Box::new(request)))
         .await
         .response;
     assert!(matches!(response, Response::SetBuffer(_)));
@@ -814,7 +852,10 @@ async fn clipboard_writes_require_explicit_buffer_command_flag() {
         .await;
 
     let response = handler
-        .dispatch(41, Request::SetBuffer(set_buffer_request(None, b"private")))
+        .dispatch(
+            41,
+            Request::SetBuffer(Box::new(set_buffer_request(None, b"private"))),
+        )
         .await
         .response;
     assert!(matches!(response, Response::SetBuffer(_)));
@@ -835,9 +876,9 @@ async fn clipboard_writes_require_explicit_buffer_command_flag() {
     let response = handler
         .dispatch(
             41,
-            Request::LoadBuffer(load_buffer_request(
+            Request::LoadBuffer(Box::new(load_buffer_request(
                 temp_path.to_str().expect("utf8 temp path"),
-            )),
+            ))),
         )
         .await
         .response;
@@ -877,12 +918,111 @@ async fn set_buffer_clipboard_write_is_suppressed_without_unique_attached_client
     let mut request = set_buffer_request(None, b"ambiguous");
     request.set_clipboard = true;
     let response = handler
-        .dispatch(303, Request::SetBuffer(request))
+        .dispatch(303, Request::SetBuffer(Box::new(request)))
         .await
         .response;
     assert!(matches!(response, Response::SetBuffer(_)));
     assert!(first_rx.try_recv().is_err());
     assert!(second_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn set_buffer_target_client_writes_only_to_the_selected_client() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    create_session(&handler, "alpha").await;
+
+    let terminal = OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]);
+    let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach_with_terminal_context(101, alpha.clone(), first_tx, terminal.clone())
+        .await;
+    let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach_with_terminal_context(202, alpha, second_tx, terminal)
+        .await;
+
+    let mut request = set_buffer_request(Some("targeted"), b"selected clipboard");
+    request.set_clipboard = true;
+    request.target_client = Some("202".to_owned());
+    let response = handler
+        .dispatch(303, Request::SetBuffer(Box::new(request)))
+        .await
+        .response;
+
+    assert!(matches!(response, Response::SetBuffer(_)));
+    assert!(first_rx.try_recv().is_err());
+    assert_eq!(
+        take_write(second_rx.try_recv().expect("selected clipboard write")),
+        b"\x1b]52;;c2VsZWN0ZWQgY2xpcGJvYXJk\x07"
+    );
+}
+
+#[tokio::test]
+async fn load_buffer_target_client_writes_only_to_the_selected_client() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    create_session(&handler, "alpha").await;
+
+    let terminal = OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]);
+    let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach_with_terminal_context(101, alpha.clone(), first_tx, terminal.clone())
+        .await;
+    let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler
+        .register_attach_with_terminal_context(202, alpha, second_tx, terminal)
+        .await;
+
+    let temp_path = std::env::temp_dir().join(format!(
+        "rmux-load-buffer-target-client-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time after epoch")
+            .as_nanos()
+    ));
+    fs::write(&temp_path, b"loaded selected").expect("write test buffer");
+    let mut request = load_buffer_request(temp_path.to_str().expect("utf8 temp path"));
+    request.set_clipboard = true;
+    request.target_client = Some("101".to_owned());
+    let response = handler
+        .dispatch(303, Request::LoadBuffer(Box::new(request)))
+        .await
+        .response;
+    let _ = fs::remove_file(&temp_path);
+
+    assert!(matches!(response, Response::LoadBuffer(_)));
+    assert_eq!(
+        take_write(first_rx.try_recv().expect("selected clipboard write")),
+        b"\x1b]52;;bG9hZGVkIHNlbGVjdGVk\x07"
+    );
+    assert!(second_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn missing_buffer_target_client_is_a_successful_clipboard_noop() {
+    let handler = RequestHandler::new();
+    let mut request = set_buffer_request(Some("stored"), b"still stored");
+    request.set_clipboard = true;
+    request.target_client = Some("missing-client".to_owned());
+
+    let response = handler
+        .dispatch(303, Request::SetBuffer(Box::new(request)))
+        .await
+        .response;
+    assert!(matches!(response, Response::SetBuffer(_)));
+    assert_eq!(
+        handler
+            .handle(Request::ShowBuffer(ShowBufferRequest {
+                name: Some("stored".to_owned()),
+            }))
+            .await
+            .command_output()
+            .expect("stored buffer")
+            .stdout(),
+        b"still stored"
+    );
 }
 
 #[tokio::test]
@@ -924,7 +1064,7 @@ async fn load_buffer_clipboard_write_flag_overrides_set_clipboard_off() {
     let mut request = load_buffer_request(temp_path.to_str().expect("utf8 temp path"));
     request.set_clipboard = true;
     let response = handler
-        .dispatch(77, Request::LoadBuffer(request))
+        .dispatch(77, Request::LoadBuffer(Box::new(request)))
         .await
         .response;
     let _ = fs::remove_file(&temp_path);

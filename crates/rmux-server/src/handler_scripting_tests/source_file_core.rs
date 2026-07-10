@@ -1,4 +1,89 @@
 use super::*;
+use crate::pane_io::AttachControl;
+
+#[tokio::test]
+async fn source_file_preserves_target_client_and_show_hooks_flags() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("source-target-client");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
+    handler.register_attach(202, alpha, control_tx).await;
+    while control_rx.try_recv().is_ok() {}
+
+    let root = temp_root("target-client-flags");
+    write_config(&root.join("input.txt"), "loaded from source");
+    write_config(
+        &root.join("flags.conf"),
+        "set-buffer -b set-from-source -t 202 payload\n\
+         load-buffer -b loaded-from-source -t 202 input.txt\n\
+         show-options -gH after-load-buffer\n\
+         display-panes -b -d 5000 -t 202\n",
+    );
+
+    let response = handler
+        .handle(source_file_request(
+            vec!["flags.conf".to_owned()],
+            Some(root),
+        ))
+        .await;
+    let output = response
+        .command_output()
+        .expect("source-file command output");
+    assert_eq!(output.stdout(), b"after-load-buffer\n");
+    assert!(matches!(
+        control_rx.try_recv(),
+        Ok(AttachControl::Overlay(_))
+    ));
+
+    for (name, expected) in [
+        ("set-from-source", b"payload".as_slice()),
+        ("loaded-from-source", b"loaded from source".as_slice()),
+    ] {
+        assert_eq!(
+            handler
+                .handle(Request::ShowBuffer(ShowBufferRequest {
+                    name: Some(name.to_owned()),
+                }))
+                .await
+                .command_output()
+                .expect("source-created buffer")
+                .stdout(),
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn source_file_show_window_options_rejects_h() {
+    let handler = RequestHandler::new();
+    let root = temp_root("show-window-options-h");
+    let config = root.join("bad.conf");
+    write_config(&config, "show-window-options -H\n");
+
+    let response = handler
+        .handle(source_file_request(vec!["bad.conf".to_owned()], Some(root)))
+        .await;
+    let Response::Error(response) = response else {
+        panic!("expected source-file flag error");
+    };
+    assert_eq!(
+        response.error,
+        rmux_proto::RmuxError::Server(format!(
+            "{}:1: command show-window-options: unknown flag -H",
+            config.display()
+        ))
+    );
+}
 
 #[tokio::test]
 async fn source_file_uses_shared_parser_for_conditions_comments_and_continuations() {
@@ -1234,6 +1319,7 @@ async fn source_file_continues_after_runtime_errors_and_reports_error() {
                 value_only: true,
                 include_inherited: false,
                 quiet: false,
+                include_hooks: false,
             }))
             .await
             .command_output()
@@ -1269,6 +1355,7 @@ async fn source_file_sets_server_option_without_explicit_scope_or_target() {
                 value_only: true,
                 include_inherited: false,
                 quiet: false,
+                include_hooks: false,
             }))
             .await
             .command_output()
@@ -1319,6 +1406,7 @@ async fn source_file_sets_bare_server_option_with_current_runtime_target() {
                 value_only: true,
                 include_inherited: false,
                 quiet: false,
+                include_hooks: false,
             }))
             .await
             .command_output()
@@ -1334,6 +1422,7 @@ async fn source_file_sets_bare_server_option_with_current_runtime_target() {
                 value_only: true,
                 include_inherited: false,
                 quiet: false,
+                include_hooks: false,
             }))
             .await
             .command_output()
@@ -1377,6 +1466,7 @@ async fn source_file_continues_after_non_quiet_legacy_option_lookup_errors() {
                     value_only: true,
                     include_inherited: false,
                     quiet: false,
+                    include_hooks: false,
                 }))
                 .await
                 .command_output()

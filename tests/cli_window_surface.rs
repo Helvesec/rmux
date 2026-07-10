@@ -210,6 +210,84 @@ fn detached_splits_leave_activity_order_and_last_pane_untouched_like_tmux(
 }
 
 #[test]
+fn pane_transfers_and_zoomed_detached_splits_keep_tmux_activity_semantics(
+) -> Result<(), Box<dyn Error>> {
+    // Oracle probes 2026-07-10 (pinned tmux 3.7b): a non-detached join-pane
+    // stamps the moved pane's active_point (it sorts last in
+    // `list-panes -O activity`), a non-detached cross-window swap-pane
+    // stamps the arriving pane in both windows, and `split-window -d -Z`
+    // zooms the window around the still-active pane without changing the
+    // active pane, fabricating a last pane, or advancing any active_point.
+    let _guard = window_surface_guard();
+    let harness = CliHarness::new("pane-transfer-activity-semantics")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    let activity = |target: &str| -> Result<Vec<String>, Box<dyn Error>> {
+        let output = harness.run(&[
+            "list-panes",
+            "-t",
+            target,
+            "-O",
+            "activity",
+            "-F",
+            "#{pane_index}",
+        ])?;
+        assert_eq!(output.status.code(), Some(0));
+        assert!(stderr(&output).is_empty());
+        Ok(stdout(&output).lines().map(str::to_owned).collect())
+    };
+
+    // Non-detached join-pane stamps the moved pane.
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:1"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:0.0"])?);
+    assert_success(&harness.run(&["join-pane", "-s", "alpha:1.0", "-t", "alpha:0.0"])?);
+    assert_eq!(activity("alpha:0")?, ["0", "2", "1"]);
+    let active = harness.run(&["display-message", "-t", "alpha:0", "-p", "#{pane_index}"])?;
+    assert_eq!(stdout(&active).trim_end(), "1");
+
+    // Non-detached cross-window swap-pane stamps the arriving pane on both
+    // sides.
+    assert_success(&harness.run(&["new-session", "-d", "-s", "beta"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "beta:1"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-t", "beta:0.0"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-t", "beta:1.0"])?);
+    assert_success(&harness.run(&["select-pane", "-t", "beta:0.1"])?);
+    assert_success(&harness.run(&["select-pane", "-t", "beta:0.0"])?);
+    assert_success(&harness.run(&["swap-pane", "-s", "beta:0.1", "-t", "beta:1.1"])?);
+    assert_eq!(activity("beta:0")?, ["0", "1"]);
+    assert_eq!(activity("beta:1")?, ["0", "1"]);
+    let active = harness.run(&["display-message", "-t", "beta:0", "-p", "#{pane_index}"])?;
+    assert_eq!(stdout(&active).trim_end(), "1");
+    let active = harness.run(&["display-message", "-t", "beta:1", "-p", "#{pane_index}"])?;
+    assert_eq!(stdout(&active).trim_end(), "1");
+
+    // split -d -Z zooms around the still-active pane with no activation
+    // side effects (the preserve_zoom anchor used to re-select its target).
+    assert_success(&harness.run(&["new-session", "-d", "-s", "gamma"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-t", "gamma:0.0"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-Z", "-t", "gamma:0.1"])?);
+    let zoomed = harness.run(&[
+        "display-message",
+        "-t",
+        "gamma:0",
+        "-p",
+        "#{window_zoomed_flag} #{pane_index}",
+    ])?;
+    assert_eq!(stdout(&zoomed).trim_end(), "1 0");
+    assert_eq!(activity("gamma:0")?, ["0", "1", "2"]);
+    let last_pane = harness.run(&["select-pane", "-l", "-t", "gamma:0.0"])?;
+    assert_eq!(last_pane.status.code(), Some(1));
+    assert!(
+        stderr(&last_pane).contains("no last pane"),
+        "zoomed detached split must not create a last pane, got: {}",
+        stderr(&last_pane)
+    );
+
+    Ok(())
+}
+
+#[test]
 fn new_window_detached_keeps_session_target_commands_on_the_current_window(
 ) -> Result<(), Box<dyn Error>> {
     let _guard = window_surface_guard();
@@ -539,13 +617,26 @@ fn new_window_kill_existing_replaces_only_window() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
-fn new_window_select_existing_selects_matching_name() -> Result<(), Box<dyn Error>> {
+fn new_window_select_existing_matches_tmux_target_print_and_detach_semantics(
+) -> Result<(), Box<dyn Error>> {
     let _guard = window_surface_guard();
     let harness = CliHarness::new("new-window-select-existing")?;
     let mut daemon = harness.start_hidden_daemon()?;
 
     assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
     assert_success(&harness.run(&["new-window", "-d", "-t", "alpha", "-n", "reuse"])?);
+    let format_without_print = harness.run(&[
+        "new-window",
+        "-d",
+        "-t",
+        "alpha:3",
+        "-F",
+        "SHOULD-NOT-PRINT",
+        "-n",
+        "silent",
+    ])?;
+    assert_success(&format_without_print);
+    assert!(stdout(&format_without_print).is_empty());
     assert_success(&harness.run(&["select-window", "-t", "alpha:0"])?);
 
     let selected = harness.run(&[
@@ -561,10 +652,43 @@ fn new_window_select_existing_selects_matching_name() -> Result<(), Box<dyn Erro
     ])?;
 
     assert_eq!(selected.status.code(), Some(0));
-    assert_eq!(stdout(&selected), "1:reuse\n");
+    assert!(
+        stdout(&selected).is_empty(),
+        "tmux -S returns before -P output when it selects an existing window"
+    );
     assert!(stderr(&selected).is_empty());
     let active = harness.run(&["display-message", "-p", "-t", "alpha", "#{window_index}"])?;
     assert_eq!(stdout(&active), "1\n");
+
+    assert_success(&harness.run(&["select-window", "-t", "alpha:0"])?);
+    let detached = harness.run(&[
+        "new-window",
+        "-S",
+        "-d",
+        "-t",
+        "alpha:",
+        "-P",
+        "-n",
+        "reuse",
+    ])?;
+    assert_eq!(detached.status.code(), Some(0));
+    assert!(stdout(&detached).is_empty());
+    let active = harness.run(&["display-message", "-p", "-t", "alpha", "#{window_index}"])?;
+    assert_eq!(stdout(&active), "0\n");
+
+    let explicit_index =
+        harness.run(&["new-window", "-S", "-d", "-t", "alpha:1", "-n", "reuse"])?;
+    assert_eq!(explicit_index.status.code(), Some(1));
+    assert!(stderr(&explicit_index).contains("index 1 in use"));
+
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:2", "-n", "reuse"])?);
+    let ambiguous = harness.run(&["new-window", "-S", "-t", "alpha:", "-n", "reuse"])?;
+    assert_eq!(ambiguous.status.code(), Some(1));
+    assert!(
+        stderr(&ambiguous).contains("multiple windows named reuse"),
+        "stderr={:?}",
+        stderr(&ambiguous)
+    );
 
     terminate_child(daemon.child_mut())?;
     Ok(())
@@ -2186,6 +2310,19 @@ fn select_layout_accepts_mirrored_layout_names_like_tmux() -> Result<(), Box<dyn
         assert!(stdout(&output).is_empty(), "layout={layout}");
         assert!(stderr(&output).is_empty(), "layout={layout}");
     }
+
+    let config = harness.tmpdir().join("mirrored-layouts.conf");
+    fs::write(
+        &config,
+        "select-layout -t alpha:0 main-horizontal-mirrored\n\
+         select-layout -t alpha:0 main-vertical-mirrored\n",
+    )?;
+    assert_success(&harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?);
+    assert_success(&harness.run(&[
+        "run-shell",
+        "-C",
+        "select-layout -t alpha:0 main-horizontal-mirrored",
+    ])?);
 
     terminate_child(daemon.child_mut())?;
     Ok(())
@@ -4141,6 +4278,48 @@ fn detach_client_requires_a_reachable_server() -> Result<(), Box<dyn Error>> {
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("no server running on "));
     assert!(stdout(&output).is_empty());
+    Ok(())
+}
+
+#[test]
+fn unique_session_prefixes_resolve_across_full_and_tiny_window_paths() -> Result<(), Box<dyn Error>>
+{
+    let _guard = window_surface_guard();
+    let harness = CliHarness::new("unique-session-prefixes")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alphabet", "-n", "zero"])?);
+
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alph", "-n", "one"])?);
+    let panes = harness.run(&[
+        "list-panes",
+        "-t",
+        "alph:0",
+        "-F",
+        "#{session_name}:#{window_index}.#{pane_index}",
+    ])?;
+    assert_eq!(panes.status.code(), Some(0));
+    assert_eq!(stdout(&panes), "alphabet:0.0\n");
+
+    assert_success(&harness.run(&["rename-window", "-t", "alph:0", "renamed"])?);
+    assert_success(&harness.run(&["select-window", "-t", "alph:1"])?);
+    let active = harness.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        "alphabet",
+        "#{window_index}:#{window_name}",
+    ])?;
+    assert_eq!(active.status.code(), Some(0));
+    assert_eq!(stdout(&active), "1:one\n");
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alphanumeric"])?);
+    let ambiguous = harness.run(&["new-window", "-d", "-t", "al", "-n", "nope"])?;
+    assert_eq!(ambiguous.status.code(), Some(1));
+    assert!(
+        stderr(&ambiguous).contains("ambiguous"),
+        "{}",
+        stderr(&ambiguous)
+    );
     Ok(())
 }
 

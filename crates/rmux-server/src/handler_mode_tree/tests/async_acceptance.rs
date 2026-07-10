@@ -174,13 +174,14 @@ async fn mode_tree_commands_without_attached_client_mark_target_pane_mode() {
         if needs_buffer {
             assert!(matches!(
                 handler
-                    .handle(Request::SetBuffer(rmux_proto::SetBufferRequest {
+                    .handle(Request::SetBuffer(Box::new(rmux_proto::SetBufferRequest {
                         name: Some("buf".to_owned()),
                         content: b"hello".to_vec(),
                         append: false,
                         new_name: None,
                         set_clipboard: false,
-                    }))
+                        target_client: None,
+                    })))
                     .await,
                 Response::SetBuffer(_)
             ));

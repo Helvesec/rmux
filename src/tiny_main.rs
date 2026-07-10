@@ -706,7 +706,7 @@ impl TinyCommand {
             Self::NewWindow {
                 socket_path,
                 request,
-            } => run_new_window(&socket_path, request),
+            } => run_new_window(original_args, &socket_path, request),
             Self::NewSession {
                 socket_path,
                 request,
@@ -723,19 +723,19 @@ impl TinyCommand {
             Self::RenameWindow {
                 socket_path,
                 request,
-            } => run_rename_window(&socket_path, request),
+            } => run_rename_window(original_args, &socket_path, request),
             Self::SelectWindow {
                 socket_path,
                 request,
-            } => run_select_window(&socket_path, request),
+            } => run_select_window(original_args, &socket_path, request),
             Self::KillPane {
                 socket_path,
                 request,
-            } => run_kill_pane(&socket_path, request),
+            } => run_kill_pane(original_args, &socket_path, request),
             Self::JoinPane {
                 socket_path,
                 request,
-            } => run_join_pane(&socket_path, request),
+            } => run_join_pane(original_args, &socket_path, request),
             Self::SetOption {
                 socket_path,
                 request,
@@ -1063,7 +1063,11 @@ fn run_send_keys(socket_path: &Path, request: TinySendKeys) -> Result<i32, Strin
     write_response_output_or_error(response, "send-keys")
 }
 
-fn run_new_window(socket_path: &Path, request: TinyNewWindow) -> Result<i32, String> {
+fn run_new_window(
+    original_args: &[OsString],
+    socket_path: &Path,
+    request: TinyNewWindow,
+) -> Result<i32, String> {
     let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
     let response = connection
         .new_window_at_with_environment(
@@ -1077,6 +1081,9 @@ fn run_new_window(socket_path: &Path, request: TinyNewWindow) -> Result<i32, Str
             false,
         )
         .map_err(|error| error.to_string())?;
+    if response_needs_session_resolution_retry(&response) {
+        return exec_full_helper(original_args);
+    }
     write_response_output_or_error(response, "new-window")
 }
 
@@ -1112,31 +1119,56 @@ fn run_show_options(
     write_response_output_or_error(response, command_name)
 }
 
-fn run_rename_window(socket_path: &Path, request: TinyRenameWindow) -> Result<i32, String> {
+fn run_rename_window(
+    original_args: &[OsString],
+    socket_path: &Path,
+    request: TinyRenameWindow,
+) -> Result<i32, String> {
     let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
     let response = connection
         .rename_window(request.target, request.name.replace('\\', r"\\"))
         .map_err(|error| error.to_string())?;
+    if response_needs_session_resolution_retry(&response) {
+        return exec_full_helper(original_args);
+    }
     write_response_output_or_error(response, "rename-window")
 }
 
-fn run_select_window(socket_path: &Path, request: TinySelectWindow) -> Result<i32, String> {
+fn run_select_window(
+    original_args: &[OsString],
+    socket_path: &Path,
+    request: TinySelectWindow,
+) -> Result<i32, String> {
     let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
     let response = connection
         .select_window(request.target)
         .map_err(|error| error.to_string())?;
+    if response_needs_session_resolution_retry(&response) {
+        return exec_full_helper(original_args);
+    }
     write_response_output_or_error(response, "select-window")
 }
 
-fn run_kill_pane(socket_path: &Path, request: TinyKillPane) -> Result<i32, String> {
+fn run_kill_pane(
+    original_args: &[OsString],
+    socket_path: &Path,
+    request: TinyKillPane,
+) -> Result<i32, String> {
     let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
     let response = connection
         .kill_pane(request.target)
         .map_err(|error| error.to_string())?;
+    if response_needs_session_resolution_retry(&response) {
+        return exec_full_helper(original_args);
+    }
     write_response_output_or_error(response, "kill-pane")
 }
 
-fn run_join_pane(socket_path: &Path, request: TinyJoinPane) -> Result<i32, String> {
+fn run_join_pane(
+    original_args: &[OsString],
+    socket_path: &Path,
+    request: TinyJoinPane,
+) -> Result<i32, String> {
     let mut connection = connect(socket_path).map_err(|error| client_error(socket_path, error))?;
     let response = connection
         .join_pane(JoinPaneRequest {
@@ -1149,6 +1181,9 @@ fn run_join_pane(socket_path: &Path, request: TinyJoinPane) -> Result<i32, Strin
             size: None,
         })
         .map_err(|error| error.to_string())?;
+    if response_needs_session_resolution_retry(&response) {
+        return exec_full_helper(original_args);
+    }
     write_response_output_or_error(response, "join-pane")
 }
 

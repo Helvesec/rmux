@@ -924,14 +924,6 @@ pub(super) fn parse_layout_name(value: &str) -> Result<rmux_proto::LayoutName, R
     value.parse()
 }
 
-pub(super) fn is_unsupported_named_layout(layout: rmux_proto::LayoutName) -> bool {
-    matches!(
-        layout,
-        rmux_proto::LayoutName::MainHorizontalMirrored
-            | rmux_proto::LayoutName::MainVerticalMirrored
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

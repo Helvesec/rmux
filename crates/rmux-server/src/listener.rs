@@ -13,7 +13,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::{JoinError, JoinSet};
 use tracing::{debug, warn};
 
-use crate::control::{self, ControlLifecycle, ControlServerEvent};
+use crate::control::{self, ControlLifecycle, ControlServerEvent, ControlUpgradeInput};
 use crate::daemon::ShutdownHandle;
 use crate::handler::{
     attach_support::AttachRegistration, ControlRegistration, DetachedRequestGuard, PreparedSdkWait,
@@ -332,7 +332,11 @@ async fn serve_connection(
                     return result;
                 }
                 if let Some(control_upgrade) = outcome.control {
-                    let (server_event_tx, server_event_rx) = tokio::sync::mpsc::unbounded_channel::<ControlServerEvent>();
+                    let initial_command_count = control_upgrade.initial_command_count as usize;
+                    let (server_event_tx, server_event_rx) =
+                        tokio::sync::mpsc::channel::<ControlServerEvent>(
+                            control::CONTROL_SERVER_EVENT_CAPACITY,
+                        );
                     let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
                     let control_id = handler
                         .register_control_with_access(
@@ -354,7 +358,7 @@ async fn serve_connection(
                         stream,
                         Arc::clone(&handler),
                         requester.pid,
-                        buffered_bytes,
+                        ControlUpgradeInput::new(buffered_bytes, initial_command_count),
                         shutdown,
                         server_event_rx,
                         ControlLifecycle {
@@ -567,7 +571,7 @@ impl Connection {
     }
 
     async fn write_response(&mut self, response: &Response) -> io::Result<()> {
-        let frame = encode_frame(response).map_err(io::Error::other)?;
+        let frame = encode_response_frame(response).map_err(io::Error::other)?;
         self.stream.write_all(&frame).await
     }
 
@@ -577,18 +581,45 @@ impl Connection {
     }
 }
 
+fn encode_response_frame(response: &Response) -> Result<Vec<u8>, rmux_proto::RmuxError> {
+    match encode_frame(response) {
+        Ok(frame) => Ok(frame),
+        Err(error @ rmux_proto::RmuxError::FrameTooLarge { .. }) => {
+            // A handler must not turn one oversized, otherwise valid RPC
+            // result into an unexplained transport disconnect. Keep the
+            // stream synchronized and surface the typed codec failure.
+            encode_frame(&Response::Error(ErrorResponse { error }))
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::server_access::AccessMode;
     use rmux_proto::{
-        AttachSessionRequest, CancelSdkWaitResponse, DaemonStatusRequest, ErrorResponse,
-        HandshakeRequest, ListSessionsRequest, NewSessionRequest, PaneOutputSubscriptionStart,
-        PaneTarget, RenameSessionRequest, RmuxError, SdkWaitForOutputRequest,
-        SdkWaitForOutputResponse, SdkWaitId, SdkWaitOutcome, SdkWaitOwnerId, SessionName,
-        ShutdownIfIdleRequest, ShutdownIfIdleResponse, TerminalSize, WaitForMode, WaitForRequest,
-        WaitForResponse, RMUX_WIRE_VERSION,
+        decode_frame, AttachSessionRequest, CancelSdkWaitResponse, DaemonStatusRequest,
+        ErrorResponse, HandshakeRequest, ListSessionsRequest, NewSessionRequest,
+        PaneOutputSubscriptionStart, PaneTarget, RenameSessionRequest, RmuxError,
+        SdkWaitForOutputRequest, SdkWaitForOutputResponse, SdkWaitId, SdkWaitOutcome,
+        SdkWaitOwnerId, SessionName, ShutdownIfIdleRequest, ShutdownIfIdleResponse, TerminalSize,
+        WaitForMode, WaitForRequest, WaitForResponse, RMUX_WIRE_VERSION,
     };
+
+    #[test]
+    fn oversized_response_is_replaced_by_a_framed_error() {
+        let response = Response::Error(ErrorResponse {
+            error: RmuxError::Server("x".repeat(rmux_proto::DEFAULT_MAX_DETACHED_FRAME_LENGTH)),
+        });
+        let frame = encode_response_frame(&response).expect("fallback error encodes");
+        assert!(matches!(
+            decode_frame::<Response>(&frame).expect("fallback frame decodes"),
+            Response::Error(ErrorResponse {
+                error: RmuxError::FrameTooLarge { .. }
+            })
+        ));
+    }
 
     #[tokio::test]
     async fn client_disconnect_cancels_plain_waiter() -> io::Result<()> {

@@ -7,6 +7,8 @@ use rmux_proto::{
     RunShellRequest, RunShellResponse, SessionName, Target,
 };
 
+#[cfg(windows)]
+use super::super::pane_support::format_references_pane_pid;
 use super::super::RequestHandler;
 use super::command_args::CommandListArgument;
 use super::format_context::{format_context_for_target_with_server_values, global_format_context};
@@ -292,6 +294,10 @@ impl RequestHandler {
         request: &RunShellRequest,
         client_name: Option<&str>,
     ) -> Result<String, RmuxError> {
+        #[cfg(windows)]
+        if format_references_pane_pid(Some(&request.command)) {
+            self.wait_for_windows_deferred_all_pane_pids().await;
+        }
         let target = request.target.as_ref();
         let attached_count = if let Some(target) = target {
             self.attached_count(target.session_name()).await
@@ -428,6 +434,10 @@ impl RequestHandler {
         request: &IfShellRequest,
         client_name: Option<&str>,
     ) -> Result<String, RmuxError> {
+        #[cfg(windows)]
+        if format_references_pane_pid(Some(&request.condition)) {
+            self.wait_for_windows_deferred_all_pane_pids().await;
+        }
         let fallback_target = if request.target.is_none() {
             self.preferred_session_name().await.ok()
         } else {

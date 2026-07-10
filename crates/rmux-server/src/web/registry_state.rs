@@ -15,6 +15,13 @@ pub(crate) struct ExpiredWebShare {
 }
 
 #[derive(Debug)]
+pub(crate) enum WebShareExpiryPoll {
+    Expired(ExpiredWebShare),
+    Pending(SystemTime),
+    Gone,
+}
+
+#[derive(Debug)]
 pub(super) struct WebShareState {
     pub(super) records: HashMap<String, WebShareRecord>,
     pub(super) expired_actions: HashMap<String, ExpiredWebShare>,
@@ -152,22 +159,26 @@ impl WebShareState {
         }
     }
 
-    pub(super) fn expire_if_due(&mut self, share_id: &str) -> Option<ExpiredWebShare> {
+    pub(super) fn poll_expiry(&mut self, share_id: &str) -> WebShareExpiryPoll {
         if let Some(expired) = self.expired_actions.remove(share_id) {
-            return Some(expired);
+            return WebShareExpiryPoll::Expired(expired);
         }
         let now = SystemTime::now();
-        let due = self
+        let Some(expires_at) = self
             .records
             .get(share_id)
             .and_then(|record| record.expires_at)
-            .is_some_and(|expires| expires <= now);
-        if !due {
-            return None;
+        else {
+            return WebShareExpiryPoll::Gone;
+        };
+        if expires_at > now {
+            return WebShareExpiryPoll::Pending(expires_at);
         }
-        let record = self.records.remove(share_id)?;
+        let Some(record) = self.records.remove(share_id) else {
+            return WebShareExpiryPoll::Gone;
+        };
         self.remove_tokens(&record);
-        Some(expire_record(record))
+        WebShareExpiryPoll::Expired(expire_record(record))
     }
 
     fn remove_tokens(&mut self, record: &WebShareRecord) {

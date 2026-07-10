@@ -324,6 +324,9 @@ pub struct DisplayPanesRequest {
     /// Optional template command executed after pane selection.
     #[serde(default)]
     pub template: Option<String>,
+    /// Optional attached client that should receive the pane overlay.
+    #[serde(default)]
+    pub target_client: Option<String>,
 }
 
 /// Request payload for `pipe-pane`.

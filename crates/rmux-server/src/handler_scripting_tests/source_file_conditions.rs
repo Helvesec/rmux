@@ -392,6 +392,7 @@ async fn source_file_ignores_server_scope_for_non_server_options_like_tmux() {
             value_only: true,
             include_inherited: false,
             quiet: false,
+            include_hooks: false,
         }))
         .await;
     assert_eq!(
@@ -431,7 +432,7 @@ async fn source_file_routes_window_show_commands_and_global_show_scope_compatibi
                 "set-option -s message-limit 77\n\
 set -gq status off\n\
 set -gw pane-border-style fg=colour3\n\
-set-window-option -gw pane-active-border-style fg=colour5\n\
+set-window-option -g pane-active-border-style fg=colour5\n\
 set -gw copy-mode-selection-style bg=cyan,fg=black\n\
 set-option -ag status-left append\n\
 	show-options -gqsv -t alpha message-limit\n\

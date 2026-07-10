@@ -6,8 +6,11 @@ use rmux_proto::{
     format_continue_line, format_exit_line, CONTROL_BUFFER_LOW, CONTROL_MAXIMUM_AGE_MS,
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::time::timeout;
 
 use super::ControlClientFlags;
+
+const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub(super) struct ControlBlock {
@@ -57,10 +60,8 @@ pub(super) async fn flush_output_queue(
             && !flags.uses_extended_output()
             && block.enqueued_at.elapsed() > Duration::from_millis(CONTROL_MAXIMUM_AGE_MS)
         {
-            writer
-                .write_all(format_exit_line(Some("too far behind")).as_bytes())
-                .await?;
-            writer.flush().await?;
+            write_all_bounded(writer, format_exit_line(Some("too far behind")).as_bytes()).await?;
+            flush_bounded(writer).await?;
             return Err(io::Error::other("too far behind"));
         }
 
@@ -68,20 +69,30 @@ pub(super) async fn flush_output_queue(
             .blocks
             .pop_front()
             .expect("front block must exist");
-        writer.write_all(&block.bytes).await?;
+        write_all_bounded(writer, &block.bytes).await?;
         output_queue.buffered_bytes = output_queue
             .buffered_bytes
             .saturating_sub(block.bytes.len());
         if output_queue.buffered_bytes <= CONTROL_BUFFER_LOW && !paused_panes.is_empty() {
             let pane_ids = paused_panes.drain().collect::<Vec<_>>();
             for pane_id in pane_ids {
-                writer
-                    .write_all(format_continue_line(pane_id).as_bytes())
-                    .await?;
+                write_all_bounded(writer, format_continue_line(pane_id).as_bytes()).await?;
             }
         }
     }
-    writer.flush().await
+    flush_bounded(writer).await
+}
+
+async fn write_all_bounded(writer: &mut (impl AsyncWrite + Unpin), bytes: &[u8]) -> io::Result<()> {
+    timeout(CONTROL_WRITE_TIMEOUT, writer.write_all(bytes))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control client write timed out"))?
+}
+
+async fn flush_bounded(writer: &mut (impl AsyncWrite + Unpin)) -> io::Result<()> {
+    timeout(CONTROL_WRITE_TIMEOUT, writer.flush())
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "control client flush timed out"))?
 }
 
 pub(super) fn ensure_control_newline(mut bytes: Vec<u8>) -> Vec<u8> {

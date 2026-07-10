@@ -2,12 +2,12 @@ use std::collections::VecDeque;
 
 use crate::handles::connect_transport_to_endpoint;
 use crate::handles::session::unexpected_response;
-use crate::transport::{DropGuard, TransportClient};
+use crate::transport::TransportClient;
 use crate::{Pane, PaneId, Result};
 use rmux_proto::{
     PaneOptionEntry as ProtoPaneOptionEntry, PaneStateCursorRequest, PaneStateEventDto,
     PaneStateSnapshot, PaneStateSubscriptionId, Request, Response, SubscribePaneStateRequest,
-    UnsubscribePaneStateRequest, CAPABILITY_SDK_PANE_FOREGROUND, CAPABILITY_SDK_PANE_STATE_EVENTS,
+    CAPABILITY_SDK_PANE_FOREGROUND, CAPABILITY_SDK_PANE_STATE_EVENTS,
 };
 
 use super::foreground::ForegroundState;
@@ -135,7 +135,7 @@ pub struct PaneStateEventStream {
     next_revision: u64,
     pending: VecDeque<PaneStateEvent>,
     closed: bool,
-    _drop_guard: DropGuard,
+    cursor_request: Option<tokio::task::JoinHandle<Result<Response>>>,
 }
 
 impl PaneStateEventStream {
@@ -175,10 +175,6 @@ impl PaneStateEventStream {
             Response::SubscribePaneState(response) => *response,
             response => return Err(unexpected_response("subscribe-pane-state", response)),
         };
-        let unsubscribe = Request::UnsubscribePaneState(UnsubscribePaneStateRequest {
-            subscription_id: response.subscription_id,
-        });
-        let drop_guard = DropGuard::best_effort(cursor_transport.clone(), unsubscribe);
         let mut pending = VecDeque::new();
         pending.push_back(snapshot_event(response.pane_id, response.snapshot));
 
@@ -189,7 +185,7 @@ impl PaneStateEventStream {
             next_revision: 0,
             pending,
             closed: false,
-            _drop_guard: drop_guard,
+            cursor_request: None,
         })
     }
 
@@ -204,15 +200,31 @@ impl PaneStateEventStream {
                 return Ok(None);
             }
 
-            let response = self
-                .cursor_transport
-                .request(Request::PaneStateCursor(PaneStateCursorRequest {
+            if self.cursor_request.is_none() {
+                let cursor_transport = self.cursor_transport.clone();
+                let request = Request::PaneStateCursor(PaneStateCursorRequest {
                     subscription_id: self.subscription_id,
                     after_revision: self.next_revision,
                     wait: true,
                     max_events: Some(PANE_STATE_BATCH_SIZE),
-                }))
-                .await?;
+                });
+                self.cursor_request = Some(tokio::spawn(async move {
+                    cursor_transport.request(request).await
+                }));
+            }
+            let response = self
+                .cursor_request
+                .as_mut()
+                .expect("cursor request exists")
+                .await;
+            self.cursor_request = None;
+            let response = response.map_err(|error| {
+                crate::RmuxError::transport(
+                    "join pane-state cursor poll",
+                    std::io::Error::other(error.to_string()),
+                )
+            })?;
+            let response = response?;
 
             match response {
                 Response::PaneStateCursor(response) => {
@@ -255,6 +267,18 @@ impl PaneStateEventStream {
     }
 }
 
+impl Drop for PaneStateEventStream {
+    fn drop(&mut self) {
+        if let Some(request) = self.cursor_request.take() {
+            request.abort();
+        }
+        // This transport is dedicated to this stream. Closing it is both
+        // cancellation-safe and sufficient for server-side subscription
+        // cleanup, unlike queueing an unsubscribe behind a pending long poll.
+        self.cursor_transport.abort();
+    }
+}
+
 impl std::fmt::Debug for PaneStateEventStream {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -264,6 +288,7 @@ impl std::fmt::Debug for PaneStateEventStream {
             .field("next_revision", &self.next_revision)
             .field("pending_events", &self.pending.len())
             .field("closed", &self.closed)
+            .field("cursor_request_in_flight", &self.cursor_request.is_some())
             .finish_non_exhaustive()
     }
 }

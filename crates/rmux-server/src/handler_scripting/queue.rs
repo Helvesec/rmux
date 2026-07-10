@@ -9,6 +9,7 @@ use rmux_proto::{CommandOutput, ErrorResponse, Request, Response, RmuxError, Tar
 
 use crate::mouse::AttachedMouseEvent;
 
+use super::list_commands_runtime::ParsedListCommandsCommand;
 use super::list_parse::ParsedListPanesAllCommand;
 use super::pane_parse::ParsedSplitWindowCommand;
 use super::prompt_parse::{
@@ -152,6 +153,7 @@ pub(super) enum QueueInvocation {
     Request(Request),
     NoOp,
     StartServer,
+    ListCommands(ParsedListCommandsCommand),
     NewWindow(ParsedNewWindowCommand),
     IfShell(ParsedIfShellCommand),
     SourceFile(ParsedSourceFileCommand),

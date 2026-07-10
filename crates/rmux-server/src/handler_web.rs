@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use rmux_os::identity::UserIdentity;
 use rmux_proto::{
@@ -24,7 +24,10 @@ use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::{self, AttachControl, LiveAttachInputContext, PaneOutputReceiver};
 use crate::pane_terminal_lookup::pane_id_for_target;
 use crate::server_access::current_owner_uid;
-use crate::web::{ResolvedCreateWebShareRequest, WebSessionTarget, WebShareAccess, WebShareTarget};
+use crate::web::{
+    ResolvedCreateWebShareRequest, WebSessionTarget, WebShareAccess, WebShareExpiryPoll,
+    WebShareTarget,
+};
 use rmux_core::{input::mode, PaneId};
 
 const WEB_ATTACH_PID_BASE: u32 = 0x8000_0000;
@@ -734,20 +737,16 @@ impl RequestHandler {
         expires_at_unix: Option<u64>,
         kill_target: Option<WebSessionTarget>,
     ) {
-        let Some(expires_at_unix) = expires_at_unix else {
+        if expires_at_unix.is_none() {
             return;
-        };
+        }
         let handler = self.clone();
         tokio::spawn(async move {
-            // The public response carries whole Unix seconds, while the registry
-            // keeps the exact SystemTime deadline. First wake at the advertised
-            // second, then retry briefly so sub-second TTLs do not check early
-            // and leave the share expired-but-not-enforced.
-            tokio::time::sleep(duration_until_unix(expires_at_unix)).await;
-            let Some(expired) = handler
-                .wait_for_web_share_expiry(&share_id, expires_at_unix)
-                .await
-            else {
+            // The wire response exposes whole Unix seconds, but the registry
+            // retains the exact SystemTime deadline. Poll that exact deadline
+            // atomically with record presence so rounding cannot leave an
+            // expired share unenforced and stopping a share cannot leak a task.
+            let Some(expired) = handler.wait_for_web_share_expiry(&share_id).await else {
                 return;
             };
             tracing::info!(share_id = %expired.share_id, "web_share_expired");
@@ -767,19 +766,15 @@ impl RequestHandler {
     async fn wait_for_web_share_expiry(
         &self,
         share_id: &str,
-        expires_at_unix: u64,
     ) -> Option<crate::web::ExpiredWebShare> {
-        let retry_until = UNIX_EPOCH
-            .checked_add(Duration::from_secs(expires_at_unix))
-            .and_then(|deadline| deadline.checked_add(Duration::from_secs(1)))?;
         loop {
-            if let Some(expired) = self.web_shares.expire_if_due(share_id) {
-                return Some(expired);
+            match self.web_shares.poll_expiry(share_id) {
+                WebShareExpiryPoll::Expired(expired) => return Some(expired),
+                WebShareExpiryPoll::Pending(deadline) => {
+                    tokio::time::sleep(duration_until(deadline)).await;
+                }
+                WebShareExpiryPoll::Gone => return None,
             }
-            if SystemTime::now() >= retry_until {
-                return None;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
@@ -902,10 +897,7 @@ impl RequestHandler {
     }
 }
 
-fn duration_until_unix(expires_at_unix: u64) -> Duration {
-    let Some(deadline) = UNIX_EPOCH.checked_add(Duration::from_secs(expires_at_unix)) else {
-        return Duration::ZERO;
-    };
+fn duration_until(deadline: SystemTime) -> Duration {
     deadline
         .duration_since(SystemTime::now())
         .unwrap_or(Duration::ZERO)

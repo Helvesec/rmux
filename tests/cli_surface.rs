@@ -295,6 +295,47 @@ fn alias_fallback_incompatible_wire_error_keeps_socket_context() -> Result<(), B
 }
 
 #[test]
+fn command_alias_fallback_preserves_an_empty_argument() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("command-alias-empty-argument")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&[
+        "set-option",
+        "-g",
+        "command-alias[6]",
+        "xx=display-message -p",
+    ])?);
+
+    let output = harness.run(&["xx", ""])?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "\n");
+    assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
+fn unknown_subcommand_fallback_rejects_source_syntax() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("unknown-command-alias-only")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let output = harness.run(&["FOO=bar", "display-message", "-p", "hi"])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty());
+    assert!(
+        stderr(&output).contains("unknown command: FOO=bar"),
+        "stderr={:?}",
+        stderr(&output)
+    );
+    let environment = harness.run(&["show-environment", "-g", "FOO"])?;
+    assert_eq!(environment.status.code(), Some(1));
+    assert!(stdout(&environment).is_empty());
+    Ok(())
+}
+
+#[test]
 fn version_flag_reports_rmux_version_without_server_contact() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("version-flag")?;
     let output = harness.run(&["-V"])?;
@@ -369,6 +410,16 @@ fn list_commands_is_client_local_and_supports_formatting() -> Result<(), Box<dyn
     assert_eq!(filtered.status.code(), Some(0));
     assert_eq!(stdout(&filtered).trim(), "list-commands=lscm");
     assert!(stderr(&filtered).is_empty());
+
+    let conditional = harness.run(&[
+        "list-commands",
+        "-F",
+        "#{?command_list_alias,alias,none}",
+        "list-commands",
+    ])?;
+    assert_eq!(conditional.status.code(), Some(0));
+    assert_eq!(stdout(&conditional).trim(), "alias");
+    assert!(stderr(&conditional).is_empty());
 
     let choose_alias = harness.run(&[
         "list-commands",
@@ -762,6 +813,56 @@ fn list_commands_filters_by_name_alias_or_unique_prefix() -> Result<(), Box<dyn 
     assert!(stdout(&parser_alias).starts_with("choose-tree "));
     assert!(stderr(&parser_alias).is_empty());
 
+    assert!(!harness.socket_path().exists());
+    Ok(())
+}
+
+#[test]
+fn list_commands_matches_tmux_3_7b_signatures_for_optional_arguments() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("list-commands-signatures")?;
+    for (command, expected) in [
+        (
+            "send-keys",
+            "send-keys (send) [-FHKlMRX] [-c target-client] [-N repeat-count] [-t target-pane] [key ...]\n",
+        ),
+        (
+            "set-buffer",
+            "set-buffer (setb) [-aw] [-b buffer-name] [-n new-buffer-name] [-t target-client] [data]\n",
+        ),
+        (
+            "set-environment",
+            "set-environment (setenv) [-Fhgru] [-t target-session] variable [value]\n",
+        ),
+        (
+            "show-environment",
+            "show-environment (showenv) [-hgs] [-t target-session] [variable]\n",
+        ),
+        (
+            "show-hooks",
+            "show-hooks [-gpw] [-t target-pane] [hook]\n",
+        ),
+        (
+            "switch-client",
+            "switch-client (switchc) [-ElnprZ] [-c target-client] [-t target-session] [-T key-table] [-O order]\n",
+        ),
+    ] {
+        let result = harness.run(&["list-commands", command])?;
+        assert_eq!(result.status.code(), Some(0), "{command}");
+        assert_eq!(stdout(&result), expected, "{command}");
+        assert!(stderr(&result).is_empty(), "{command}");
+    }
+    assert!(!harness.socket_path().exists());
+    Ok(())
+}
+
+#[test]
+fn packaged_display_message_rejects_multiple_positionals() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("display-message-arity")?;
+    let output = harness.run(&["display-message", "-p", "one", "two"])?;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).contains("too many arguments"));
     assert!(!harness.socket_path().exists());
     Ok(())
 }
@@ -1363,6 +1464,67 @@ fn control_mode_argv_command_uses_initial_flags_zero_frame() -> Result<(), Box<d
     );
     assert!(rendered.contains("one\n"));
     assert!(rendered.contains("two\n"));
+    Ok(())
+}
+
+#[test]
+fn control_stdin_queue_routes_named_inventory_start_server_and_new_window_flags(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("control-queue-inventory-new-window")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-n", "zero"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:1", "-n", "old"])?);
+
+    let mut child = harness
+        .base_command()
+        .arg("-C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child.stdin.take().expect("control stdin").write_all(
+        concat!(
+            "start-server\n",
+            "list-commands -F '#{command_list_name}|#{command_list_usage}' send-keys\n",
+            "list-commands -F '#{command_list_name}|#{command_list_usage}' set-buffer\n",
+            "list-commands -F '#{command_list_name}|#{command_list_usage}' set-environment\n",
+            "list-commands -F '#{command_list_name}|#{command_list_usage}' show-environment\n",
+            "list-commands -F '#{command_list_name}|#{command_list_usage}' show-hooks\n",
+            "list-commands -F '#{command_list_name}|#{command_list_usage}' switch-client\n",
+            "new-window -dF 'IGNORED' -t alpha:3 -n silent\n",
+            "new-window -dkP -F 'NW=#{window_index}|#{window_name}' -t alpha:1 -n replacement\n",
+            "new-window -d -t alpha:2 -n reuse\n",
+            "select-window -t alpha:0\n",
+            "new-window -SP -F 'SHOULD-NOT-PRINT' -t alpha: -n reuse\n",
+            "display-message -p -t alpha 'ACTIVE=#{window_index}'\n",
+            "\n",
+        )
+        .as_bytes(),
+    )?;
+    let output = child.wait_with_output()?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty(), "stderr={:?}", stderr(&output));
+    let rendered = stdout(&output);
+    for expected in [
+        "send-keys|[-FHKlMRX] [-c target-client] [-N repeat-count] [-t target-pane] [key ...]",
+        "set-buffer|[-aw] [-b buffer-name] [-n new-buffer-name] [-t target-client] [data]",
+        "set-environment|[-Fhgru] [-t target-session] variable [value]",
+        "show-environment|[-hgs] [-t target-session] [variable]",
+        "show-hooks|[-gpw] [-t target-pane] [hook]",
+        "switch-client|[-ElnprZ] [-c target-client] [-t target-session] [-T key-table] [-O order]",
+        "NW=1|replacement",
+        "ACTIVE=2",
+    ] {
+        assert!(
+            rendered.lines().any(|line| line == expected),
+            "missing {expected:?} in control output: {rendered:?}"
+        );
+    }
+    assert!(!rendered.contains("IGNORED"), "{rendered:?}");
+    assert!(!rendered.contains("SHOULD-NOT-PRINT"), "{rendered:?}");
+    assert!(!rendered.contains("%error "), "{rendered:?}");
+    assert!(rendered.contains("%exit"), "{rendered:?}");
     Ok(())
 }
 
@@ -2089,6 +2251,49 @@ fn show_options_default_shell_reports_resolved_shell() -> Result<(), Box<dyn Err
 }
 
 #[test]
+fn show_options_h_uses_full_helper_while_plain_g_remains_tiny() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("show-options-hooks-helper-paths")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "after-new-window",
+        "display-message hook-fired",
+    ])?);
+
+    let plain = harness.run(&["show-options", "-g"])?;
+    assert_eq!(plain.status.code(), Some(0));
+    assert!(stderr(&plain).is_empty());
+    assert!(!stdout(&plain).contains("after-new-window"));
+
+    let hooks = harness.run(&["show-options", "-gH"])?;
+    assert_eq!(hooks.status.code(), Some(0));
+    assert!(stderr(&hooks).is_empty());
+    assert!(
+        stdout(&hooks).contains("after-new-window[0] display-message hook-fired\n"),
+        "{}",
+        stdout(&hooks)
+    );
+
+    let named = harness.run(&["show-options", "-gHv", "after-new-window"])?;
+    assert_eq!(named.status.code(), Some(0));
+    assert!(stderr(&named).is_empty());
+    assert_eq!(stdout(&named), "display-message hook-fired\n");
+
+    let rejected = harness.run(&["show-window-options", "-H"])?;
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(
+        stderr(&rejected).contains("command show-window-options: unknown flag -H"),
+        "{}",
+        stderr(&rejected)
+    );
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
 fn show_options_default_shell_preserves_explicit_value() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("show-options-default-shell-explicit")?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -2175,6 +2380,58 @@ fn queued_prompt_history_commands_use_source_file_dispatch_and_preserve_cli_cont
     assert!(stderr(&cleared).is_empty());
 
     terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn queued_commands_preserve_an_earlier_nonzero_exit_status() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("queued-command-exit-status")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let config = harness.tmpdir().join("failing-source.conf");
+    fs::write(&config, "kill-session -t definitely-missing-session\n")?;
+
+    let output = harness.run(&[
+        "source-file",
+        config.to_str().expect("utf-8 config path"),
+        ";",
+        "set-buffer",
+        "-b",
+        "after",
+        "yes",
+    ])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("definitely-missing-session"),
+        "stderr={:?}",
+        stderr(&output)
+    );
+    let buffer = harness.run(&["show-buffer", "-b", "after"])?;
+    assert_eq!(buffer.status.code(), Some(0));
+    assert_eq!(stdout(&buffer), "yes");
+    assert!(stderr(&buffer).is_empty());
+    Ok(())
+}
+
+#[test]
+fn source_file_list_commands_accept_compact_value_clusters() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("source-list-compact-flags")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let config = harness.tmpdir().join("compact-list-flags.conf");
+    fs::write(
+        &config,
+        "list-sessions -rF '#{session_name}'\n\
+         list-windows -rF '#{window_index}'\n\
+         list-panes -rF '#{pane_index}'\n",
+    )?;
+
+    let output = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(stdout(&output), "alpha\n0\n0\n");
+    assert!(stderr(&output).is_empty());
     Ok(())
 }
 
@@ -2700,6 +2957,56 @@ fn set_option_unset_scope_matrix_matches_tmux() -> Result<(), Box<dyn Error>> {
         values(&harness)?,
         ("session".to_owned(), String::new(), String::new()),
         "-wU unsets the window copy and clears pane overrides"
+    );
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn set_option_unset_clusters_queued_match_tmux() -> Result<(), Box<dyn Error>> {
+    // Oracle probe 2026-07-10 (pinned tmux 3.7b): -U combined with a
+    // non-scope flag in one cluster on the queued path must behave exactly
+    // like the split-token CLI form — `run-shell -C "set -qU"` unsets the
+    // session copy only, and `run-shell -C "set -gU"` unsets the global copy
+    // only. The scripting cluster parser used to coerce window scope for
+    // any cluster containing 'U'.
+    let harness = CliHarness::new("set-option-unset-clusters-queued")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    assert_success(&harness.run(&["set-option", "-t", "alpha", "@x", "sv"])?);
+    assert_success(&harness.run(&["set-option", "-w", "-t", "alpha:0", "@x", "wv"])?);
+    assert_success(&harness.run(&["set-option", "-p", "-t", "alpha:0.0", "@x", "pv"])?);
+    assert_success(&harness.run(&["run-shell", "-C", "set-option -qU -t alpha:0.0 @x"])?);
+    let session = harness.run(&["show-options", "-qv", "-t", "alpha", "@x"])?;
+    let window = harness.run(&["show-options", "-wqv", "-t", "alpha:0", "@x"])?;
+    let pane = harness.run(&["show-options", "-pqv", "-t", "alpha:0.0", "@x"])?;
+    assert_eq!(
+        (
+            stdout(&session).trim_end(),
+            stdout(&window).trim_end(),
+            stdout(&pane).trim_end(),
+        ),
+        ("", "wv", "pv"),
+        "queued -qU unsets the session copy only"
+    );
+
+    assert_success(&harness.run(&["set-option", "-g", "@y", "gv"])?);
+    assert_success(&harness.run(&["set-option", "-t", "alpha", "@y", "sv"])?);
+    assert_success(&harness.run(&["set-option", "-w", "-t", "alpha:0", "@y", "wv"])?);
+    assert_success(&harness.run(&["run-shell", "-C", "set-option -gU @y"])?);
+    let global = harness.run(&["show-options", "-gqv", "@y"])?;
+    let session = harness.run(&["show-options", "-qv", "-t", "alpha", "@y"])?;
+    let window = harness.run(&["show-options", "-wqv", "-t", "alpha:0", "@y"])?;
+    assert_eq!(
+        (
+            stdout(&global).trim_end(),
+            stdout(&session).trim_end(),
+            stdout(&window).trim_end(),
+        ),
+        ("", "sv", "wv"),
+        "queued -gU unsets the global copy only"
     );
 
     terminate_child(daemon.child_mut())?;

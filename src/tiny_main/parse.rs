@@ -700,7 +700,7 @@ pub(super) fn parse_display_message(args: &[OsString]) -> Option<TinyDisplayMess
         match arg {
             "--" => {
                 index += 1;
-                message = parse_joined_tail(&args[index..])?;
+                message = parse_single_tail(&args[index..])?;
                 break;
             }
             "-p" => print = true,
@@ -720,7 +720,7 @@ pub(super) fn parse_display_message(args: &[OsString]) -> Option<TinyDisplayMess
             "-c" | "-d" => return None,
             value if value.starts_with('-') => return None,
             _ => {
-                message = parse_joined_tail(&args[index..])?;
+                message = parse_single_tail(&args[index..])?;
                 break;
             }
         }
@@ -917,6 +917,13 @@ fn parse_joined_tail(args: &[OsString]) -> Option<Option<String>> {
         return None;
     }
     parse_string_tail(args).map(|values| Some(values.join(" ")))
+}
+
+fn parse_single_tail(args: &[OsString]) -> Option<Option<String>> {
+    let [value] = args else {
+        return None;
+    };
+    value.to_str().map(|value| Some(value.to_owned()))
 }
 
 fn parse_string_tail(args: &[OsString]) -> Option<Vec<String>> {

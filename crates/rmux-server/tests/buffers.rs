@@ -32,13 +32,14 @@ async fn set_and_show_buffer_round_trips_through_real_socket() -> Result<(), Box
 
     let set_response = send_request(
         harness.socket_path(),
-        &Request::SetBuffer(SetBufferRequest {
+        &Request::SetBuffer(Box::new(SetBufferRequest {
             name: None,
             content: b"hello world".to_vec(),
             append: false,
             new_name: None,
             set_clipboard: false,
-        }),
+            target_client: None,
+        })),
     )
     .await?;
 
@@ -69,25 +70,27 @@ async fn list_buffers_returns_formatted_output_through_real_socket() -> Result<(
 
     send_request(
         harness.socket_path(),
-        &Request::SetBuffer(SetBufferRequest {
+        &Request::SetBuffer(Box::new(SetBufferRequest {
             name: Some("alpha".to_owned()),
             content: b"first".to_vec(),
             append: false,
             new_name: None,
             set_clipboard: false,
-        }),
+            target_client: None,
+        })),
     )
     .await?;
 
     send_request(
         harness.socket_path(),
-        &Request::SetBuffer(SetBufferRequest {
+        &Request::SetBuffer(Box::new(SetBufferRequest {
             name: None,
             content: b"second".to_vec(),
             append: false,
             new_name: None,
             set_clipboard: false,
-        }),
+            target_client: None,
+        })),
     )
     .await?;
 
@@ -115,25 +118,27 @@ async fn delete_buffer_removes_stack_head_through_real_socket() -> Result<(), Bo
 
     send_request(
         harness.socket_path(),
-        &Request::SetBuffer(SetBufferRequest {
+        &Request::SetBuffer(Box::new(SetBufferRequest {
             name: None,
             content: b"a".to_vec(),
             append: false,
             new_name: None,
             set_clipboard: false,
-        }),
+            target_client: None,
+        })),
     )
     .await?;
 
     send_request(
         harness.socket_path(),
-        &Request::SetBuffer(SetBufferRequest {
+        &Request::SetBuffer(Box::new(SetBufferRequest {
             name: None,
             content: b"b".to_vec(),
             append: false,
             new_name: None,
             set_clipboard: false,
-        }),
+            target_client: None,
+        })),
     )
     .await?;
 
@@ -169,13 +174,14 @@ async fn paste_buffer_to_session_pane_through_real_socket() -> Result<(), Box<dy
 
     send_request(
         harness.socket_path(),
-        &Request::SetBuffer(SetBufferRequest {
+        &Request::SetBuffer(Box::new(SetBufferRequest {
             name: None,
             content: b"paste-me".to_vec(),
             append: false,
             new_name: None,
             set_clipboard: false,
-        }),
+            target_client: None,
+        })),
     )
     .await?;
 
@@ -249,13 +255,14 @@ async fn paste_buffer_with_delete_removes_buffer_through_real_socket() -> Result
 
     send_request(
         harness.socket_path(),
-        &Request::SetBuffer(SetBufferRequest {
+        &Request::SetBuffer(Box::new(SetBufferRequest {
             name: None,
             content: b"temp".to_vec(),
             append: false,
             new_name: None,
             set_clipboard: false,
-        }),
+            target_client: None,
+        })),
     )
     .await?;
 

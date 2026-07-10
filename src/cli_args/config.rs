@@ -138,6 +138,8 @@ pub(crate) struct SetEnvironmentArgs {
 pub(crate) struct ShowOptionsArgs {
     #[arg(short = 'A', action = ArgAction::SetTrue)]
     pub(crate) include_inherited: bool,
+    #[arg(short = 'H', action = ArgAction::SetTrue)]
+    pub(crate) include_hooks: bool,
     #[arg(short = 'g', action = ArgAction::SetTrue)]
     pub(crate) global: bool,
     #[arg(short = 's', action = ArgAction::SetTrue, group = "scope")]
@@ -164,6 +166,9 @@ impl ShowOptionsArgs {
             }
             if self.include_inherited {
                 return Err(unknown_flag_error(kind.command_name(), "-A"));
+            }
+            if self.include_hooks {
+                return Err(unknown_flag_error(kind.command_name(), "-H"));
             }
             if self.server {
                 return Err(unknown_flag_error(kind.command_name(), "-s"));

@@ -15,34 +15,15 @@ impl RequestHandler {
             .await
     }
 
-    pub(super) async fn resolve_overlay_client(
+    pub(in crate::handler) async fn resolve_overlay_client(
         &self,
         requester_pid: u32,
         target_client: Option<&str>,
         command_name: &str,
     ) -> Result<u32, RmuxError> {
-        if let Some(target_client) = target_client {
-            if target_client == "=" {
-                return self
-                    .resolve_attached_client_pid(requester_pid, command_name)
-                    .await;
-            }
-            let pid = target_client.parse::<u32>().map_err(|_| {
-                RmuxError::Server(format!("invalid {command_name} client '{target_client}'"))
-            })?;
-            let active_attach = self.active_attach.lock().await;
-            if active_attach.by_pid.contains_key(&pid) {
-                Ok(pid)
-            } else {
-                Err(RmuxError::Server(format!(
-                    "{command_name} client {pid} is not attached"
-                )))
-            }
-        } else {
-            self.resolve_attached_client_pid(requester_pid, command_name)
-                .await
-                .map_err(|error| overlay_client_error(error, command_name))
-        }
+        self.resolve_target_attach_client_pid(requester_pid, target_client, command_name)
+            .await
+            .map_err(|error| overlay_client_error(error, command_name))
     }
 
     pub(super) async fn resolve_overlay_target(

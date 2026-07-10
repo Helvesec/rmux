@@ -54,6 +54,20 @@ use subscriptions::{
 
 #[cfg(any(unix, windows))]
 const MAX_DEFERRED_CONTROL_NOTIFICATIONS: usize = 1024;
+#[cfg(any(unix, windows))]
+const MAX_DEFERRED_CONTROL_NOTIFICATION_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(any(unix, windows))]
+const CONTROL_PANE_EVENT_CAPACITY: usize = 256;
+#[cfg(any(unix, windows))]
+pub(crate) const CONTROL_SERVER_EVENT_CAPACITY: usize = 256;
+#[cfg(any(unix, windows))]
+const MAX_INITIAL_CONTROL_COMMANDS: usize = 1024;
+#[cfg(any(unix, windows))]
+const MAX_CONTROL_LINE_BYTES: usize = 1024 * 1024;
+#[cfg(any(unix, windows))]
+const MAX_QUEUED_CONTROL_LINES: usize = 1024;
+#[cfg(any(unix, windows))]
+const MAX_QUEUED_CONTROL_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct ControlClientFlags {
@@ -93,30 +107,88 @@ pub(crate) struct ControlLifecycle {
     pub(crate) shutdown_handle: ShutdownHandle,
 }
 
+#[derive(Debug)]
+#[cfg(any(unix, windows))]
+pub(crate) struct ControlUpgradeInput {
+    buffered_bytes: Vec<u8>,
+    initial_command_count: usize,
+}
+
+#[cfg(any(unix, windows))]
+impl ControlUpgradeInput {
+    pub(crate) fn new(buffered_bytes: Vec<u8>, initial_command_count: usize) -> Self {
+        Self {
+            buffered_bytes,
+            initial_command_count,
+        }
+    }
+}
+
 #[cfg(any(unix, windows))]
 pub(crate) async fn forward_control(
     stream: LocalStream,
     handler: Arc<RequestHandler>,
     requester_pid: u32,
-    initial_socket_bytes: Vec<u8>,
+    upgrade_input: ControlUpgradeInput,
     mut shutdown: watch::Receiver<()>,
-    mut server_events: mpsc::UnboundedReceiver<ControlServerEvent>,
+    mut server_events: mpsc::Receiver<ControlServerEvent>,
     lifecycle: ControlLifecycle,
 ) -> io::Result<()> {
-    let (pane_event_tx, mut pane_event_rx) = mpsc::unbounded_channel();
+    let ControlUpgradeInput {
+        buffered_bytes: initial_socket_bytes,
+        initial_command_count,
+    } = upgrade_input;
+    if initial_command_count > MAX_INITIAL_CONTROL_COMMANDS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "too many initial control-mode commands: {initial_command_count} (maximum {MAX_INITIAL_CONTROL_COMMANDS})"
+            ),
+        ));
+    }
+    let (pane_event_tx, mut pane_event_rx) = mpsc::channel(CONTROL_PANE_EVENT_CAPACITY);
     let (mut read_half, mut write_half) = tokio::io::split(stream);
-    let mut input_buffer = initial_socket_bytes;
-    let mut queued_lines: VecDeque<String> =
-        extract_complete_control_lines(&mut input_buffer).into();
-    let initial_command_count = queued_lines
-        .iter()
-        .take_while(|line| !line.is_empty())
-        .count();
+    let mut input_buffer = Vec::new();
+    let mut queued_lines = VecDeque::new();
+    let mut queued_input_bytes = 0_usize;
+    append_control_input(
+        &mut input_buffer,
+        &mut queued_lines,
+        &mut queued_input_bytes,
+        &initial_socket_bytes,
+    )?;
+    let mut read_buffer = [0_u8; 8192];
+    while queued_lines.len() < initial_command_count {
+        let bytes_read = read_half.read(&mut read_buffer).await?;
+        if bytes_read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "control-mode stream closed after {} of {initial_command_count} initial commands",
+                    queued_lines.len()
+                ),
+            ));
+        }
+        append_control_input(
+            &mut input_buffer,
+            &mut queued_lines,
+            &mut queued_input_bytes,
+            &read_buffer[..bytes_read],
+        )?;
+    }
     let mut output_queue = ControlOutputQueue::default();
     let mut subscriptions = HashMap::new();
     let mut paused_panes = HashSet::new();
     let mut deferred_server_events = DeferredServerEvents::default();
     let mut input_closed = false;
+    #[cfg(windows)]
+    if consume_control_eof_marker(
+        &mut input_buffer,
+        &mut queued_lines,
+        &mut queued_input_bytes,
+    ) {
+        input_closed = true;
+    }
     let mut session_name: Option<SessionName> = handler.control_session_name(requester_pid).await;
     let mut flags: ControlClientFlags = handler
         .control_client_flags(requester_pid)
@@ -205,11 +277,13 @@ pub(crate) async fn forward_control(
             let Some(line) = queued_lines.pop_front() else {
                 break;
             };
+            queued_input_bytes = queued_input_bytes.saturating_sub(line.len());
             #[cfg(windows)]
             if line == CONTROL_STDIN_EOF_MARKER {
                 input_closed = true;
                 input_buffer.clear();
                 queued_lines.clear();
+                queued_input_bytes = 0;
                 break;
             }
             if line.is_empty() {
@@ -301,12 +375,25 @@ pub(crate) async fn forward_control(
                 flush_output_queue(&mut output_queue, &mut write_half, flags, &mut paused_panes).await?;
                 return Ok(());
             }
-            result = read_half.read_buf(&mut input_buffer), if !input_closed => {
+            result = read_half.read(&mut read_buffer), if !input_closed => {
                 let bytes_read = result?;
                 if bytes_read == 0 {
                     input_closed = true;
                 } else {
-                    queued_lines.extend(extract_complete_control_lines(&mut input_buffer));
+                    append_control_input(
+                        &mut input_buffer,
+                        &mut queued_lines,
+                        &mut queued_input_bytes,
+                        &read_buffer[..bytes_read],
+                    )?;
+                    #[cfg(windows)]
+                    if consume_control_eof_marker(
+                        &mut input_buffer,
+                        &mut queued_lines,
+                        &mut queued_input_bytes,
+                    ) {
+                        input_closed = true;
+                    }
                 }
             }
             Some(event) = server_events.recv() => {
@@ -515,7 +602,7 @@ async fn handle_server_event(
 
 #[cfg(any(unix, windows))]
 async fn flush_deferred_server_events(context: &mut ServerEventContext<'_>) -> io::Result<bool> {
-    while let Some(line) = context.deferred.notifications.pop_front() {
+    while let Some(line) = context.deferred.pop_notification() {
         if handle_server_event(ControlServerEvent::Notification(line), context, false).await? {
             return Ok(true);
         }
@@ -546,8 +633,8 @@ struct ServerEventContext<'a> {
     requester_pid: u32,
     session_name: &'a mut Option<SessionName>,
     subscriptions: &'a mut HashMap<u32, PaneSubscription>,
-    pane_event_tx: mpsc::UnboundedSender<PaneEvent>,
-    pane_event_rx: &'a mut mpsc::UnboundedReceiver<PaneEvent>,
+    pane_event_tx: mpsc::Sender<PaneEvent>,
+    pane_event_rx: &'a mut mpsc::Receiver<PaneEvent>,
     output_queue: &'a mut ControlOutputQueue,
     write_half: &'a mut WriteHalf<LocalStream>,
     paused_panes: &'a mut HashSet<u32>,
@@ -559,6 +646,7 @@ struct ServerEventContext<'a> {
 #[cfg(any(unix, windows))]
 struct DeferredServerEvents {
     notifications: VecDeque<String>,
+    notification_bytes: usize,
     session_change: Option<Option<SessionName>>,
     exit_reason: Option<Option<String>>,
 }
@@ -569,12 +657,23 @@ impl DeferredServerEvents {
         if self.exit_reason.is_some() {
             return;
         }
-        if self.notifications.len() >= MAX_DEFERRED_CONTROL_NOTIFICATIONS {
+        let next_bytes = self.notification_bytes.saturating_add(line.len());
+        if self.notifications.len() >= MAX_DEFERRED_CONTROL_NOTIFICATIONS
+            || next_bytes > MAX_DEFERRED_CONTROL_NOTIFICATION_BYTES
+        {
             self.notifications.clear();
+            self.notification_bytes = 0;
             self.exit_reason = Some(Some("control notification queue exceeded".to_owned()));
             return;
         }
+        self.notification_bytes = next_bytes;
         self.notifications.push_back(line);
+    }
+
+    fn pop_notification(&mut self) -> Option<String> {
+        let line = self.notifications.pop_front()?;
+        self.notification_bytes = self.notification_bytes.saturating_sub(line.len());
+        Some(line)
     }
 
     fn defer_session_change(&mut self, next_session: Option<SessionName>) {
@@ -658,6 +757,68 @@ fn extract_complete_control_lines(buffer: &mut Vec<u8>) -> Vec<String> {
 }
 
 #[cfg(any(unix, windows))]
+fn append_control_input(
+    input_buffer: &mut Vec<u8>,
+    queued_lines: &mut VecDeque<String>,
+    queued_input_bytes: &mut usize,
+    bytes: &[u8],
+) -> io::Result<()> {
+    input_buffer.extend_from_slice(bytes);
+    let lines = extract_complete_control_lines(input_buffer);
+    if input_buffer.len() > MAX_CONTROL_LINE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("control input line exceeds {MAX_CONTROL_LINE_BYTES} bytes without a newline"),
+        ));
+    }
+    for line in lines {
+        if line.len() > MAX_CONTROL_LINE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("control input line exceeds {MAX_CONTROL_LINE_BYTES} bytes"),
+            ));
+        }
+        let next_line_count = queued_lines.len().saturating_add(1);
+        let next_byte_count = queued_input_bytes.saturating_add(line.len());
+        if next_line_count > MAX_QUEUED_CONTROL_LINES || next_byte_count > MAX_QUEUED_CONTROL_BYTES
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "control input queue exceeds {MAX_QUEUED_CONTROL_LINES} lines or {MAX_QUEUED_CONTROL_BYTES} bytes"
+                ),
+            ));
+        }
+        *queued_input_bytes = next_byte_count;
+        queued_lines.push_back(line);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn consume_control_eof_marker(
+    input_buffer: &mut Vec<u8>,
+    queued_lines: &mut VecDeque<String>,
+    queued_input_bytes: &mut usize,
+) -> bool {
+    let Some(marker_index) = queued_lines
+        .iter()
+        .position(|line| line == CONTROL_STDIN_EOF_MARKER)
+    else {
+        return false;
+    };
+
+    // The Windows client writes this private terminal marker immediately
+    // before closing its named-pipe writer. Observe it even while a blocking
+    // command is active; waiting for the normal command-dequeue path would
+    // deadlock because wait-for cancellation itself depends on input_closed.
+    queued_lines.truncate(marker_index);
+    *queued_input_bytes = queued_lines.iter().map(String::len).sum();
+    input_buffer.clear();
+    true
+}
+
+#[cfg(any(unix, windows))]
 fn unix_epoch_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -667,7 +828,10 @@ fn unix_epoch_seconds() -> i64 {
 
 #[cfg(all(test, any(unix, windows)))]
 mod deferred_tests {
-    use super::{DeferredServerEvents, MAX_DEFERRED_CONTROL_NOTIFICATIONS};
+    use super::{
+        DeferredServerEvents, MAX_DEFERRED_CONTROL_NOTIFICATIONS,
+        MAX_DEFERRED_CONTROL_NOTIFICATION_BYTES,
+    };
 
     #[test]
     fn deferred_control_notifications_are_bounded() {
@@ -693,6 +857,30 @@ mod deferred_tests {
 
         deferred.defer_notification("%message after-overflow".to_owned());
         assert!(deferred.notifications.is_empty());
+    }
+
+    #[test]
+    fn deferred_control_notification_bytes_are_bounded_and_accounted_on_pop() {
+        let mut deferred = DeferredServerEvents::default();
+        let first = "x".repeat(MAX_DEFERRED_CONTROL_NOTIFICATION_BYTES / 2);
+        let second = "y".repeat(MAX_DEFERRED_CONTROL_NOTIFICATION_BYTES / 2);
+        deferred.defer_notification(first.clone());
+        deferred.defer_notification(second);
+        assert_eq!(
+            deferred.notification_bytes,
+            MAX_DEFERRED_CONTROL_NOTIFICATION_BYTES
+        );
+
+        assert_eq!(deferred.pop_notification(), Some(first));
+        assert_eq!(
+            deferred.notification_bytes,
+            MAX_DEFERRED_CONTROL_NOTIFICATION_BYTES / 2
+        );
+
+        deferred.defer_notification("z".repeat(MAX_DEFERRED_CONTROL_NOTIFICATION_BYTES / 2 + 1));
+        assert!(deferred.notifications.is_empty());
+        assert_eq!(deferred.notification_bytes, 0);
+        assert!(deferred.exit_reason.is_some());
     }
 }
 

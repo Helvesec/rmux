@@ -219,13 +219,17 @@ fn prefix_q_display_panes_timeout_matches_tmux_when_frozen_tmux_is_available(
     write_attached_keys(&mut rmux_attach, b"\x02q", &deadline)?;
     write_attached_keys(&mut tmux_attach, b"\x02q", &deadline)?;
 
+    let mut saw_rmux_overlay = false;
+    let mut saw_tmux_overlay = false;
     for _ in 0..10 {
         std::thread::sleep(Duration::from_millis(100));
         rmux_bytes.extend(drain_pty(&mut rmux_attach)?);
         tmux_bytes.extend(drain_pty(&mut tmux_attach)?);
-        if display_panes_overlay_visible(&render_transcript(&rmux_bytes, 80, 24))
-            && display_panes_overlay_visible(&render_transcript(&tmux_bytes, 80, 24))
-        {
+        saw_rmux_overlay |=
+            display_panes_overlay_visible(String::from_utf8_lossy(&rmux_bytes).as_ref());
+        saw_tmux_overlay |=
+            display_panes_overlay_visible(String::from_utf8_lossy(&tmux_bytes).as_ref());
+        if saw_rmux_overlay && saw_tmux_overlay {
             break;
         }
     }
@@ -233,11 +237,11 @@ fn prefix_q_display_panes_timeout_matches_tmux_when_frozen_tmux_is_available(
     let rmux_early = render_transcript(&rmux_bytes, 80, 24);
     let tmux_early = render_transcript(&tmux_bytes, 80, 24);
     assert!(
-        display_panes_overlay_visible(&rmux_early),
+        saw_rmux_overlay,
         "rmux should show display-panes shortly after prefix q, got {rmux_early:?}"
     );
     assert!(
-        display_panes_overlay_visible(&tmux_early),
+        saw_tmux_overlay,
         "tmux should show display-panes shortly after prefix q, got {tmux_early:?}"
     );
 

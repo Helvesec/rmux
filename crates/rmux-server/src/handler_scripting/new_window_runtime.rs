@@ -1,8 +1,9 @@
 use rmux_core::{LifecycleEvent, SessionStore};
 use rmux_proto::request::Request;
 use rmux_proto::{
-    ErrorResponse, HookName, NewWindowRequest, PaneTarget, Response, RmuxError, ScopeSelector,
-    Target,
+    DisplayMessageRequest, ErrorResponse, HookName, KillWindowRequest, MoveWindowRequest,
+    MoveWindowTarget, NewWindowRequest, NewWindowResponse, PaneTarget, Response, RmuxError,
+    ScopeSelector, SelectWindowRequest, Target, WindowTarget,
 };
 
 use super::format_context_for_target_with_server_values;
@@ -28,6 +29,10 @@ impl RequestHandler {
             insert_at_target,
             name,
             detached,
+            print_target,
+            format,
+            kill_existing,
+            select_existing,
             start_directory,
             environment,
             command,
@@ -53,8 +58,37 @@ impl RequestHandler {
             can_write,
         )?;
 
+        if select_existing && target_window_index.is_none() {
+            if let Some(name) = name.as_deref() {
+                if let Some(existing) = self.find_existing_new_window_by_name(&target, name).await?
+                {
+                    if detached {
+                        return Ok(empty_new_window_action());
+                    }
+                    return queue_action_from_response(
+                        self.handle_select_window(
+                            Some(requester_pid),
+                            SelectWindowRequest { target: existing },
+                        )
+                        .await,
+                    );
+                }
+            }
+        }
+
+        let (target_window_index, replace_after_create) = self
+            .prepare_queued_new_window_kill_existing(
+                &target,
+                target_window_index,
+                insert_at_target,
+                kill_existing,
+            )
+            .await?;
+
         let socket_path = self.socket_path();
         let attached_count = self.attached_count(&target).await;
+        #[cfg(windows)]
+        self.wait_for_windows_deferred_all_pane_pids().await;
         let rendered_command = self
             .render_queued_new_window_command(
                 command.as_deref(),
@@ -68,8 +102,6 @@ impl RequestHandler {
             crate::legacy_command::from_legacy_command(rendered_command.as_deref());
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
-        #[cfg(windows)]
-        self.wait_for_windows_deferred_all_pane_pids().await;
         let (response, inline_hooks) = capture_inline_hooks(async {
             let response = {
                 let mut state = self.state.lock().await;
@@ -130,6 +162,13 @@ impl RequestHandler {
             response
         })
         .await;
+        let response = match replace_after_create {
+            Some(window_index) => {
+                self.move_queued_new_window_to_replacement_index(response, window_index, detached)
+                    .await
+            }
+            None => response,
+        };
 
         let inline_hook_names = inline_hooks
             .iter()
@@ -146,7 +185,135 @@ impl RequestHandler {
         )
         .await;
 
-        queue_action_from_response(response)
+        self.queued_new_window_action(requester_pid, print_target, format, response)
+            .await
+    }
+
+    async fn find_existing_new_window_by_name(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        name: &str,
+    ) -> Result<Option<WindowTarget>, RmuxError> {
+        let state = self.state.lock().await;
+        let session = state
+            .sessions
+            .session(session_name)
+            .ok_or_else(|| RmuxError::SessionNotFound(session_name.to_string()))?;
+        let matches = session
+            .windows()
+            .iter()
+            .filter_map(|(index, window)| (window.name() == Some(name)).then_some(*index))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [window_index] => Ok(Some(WindowTarget::with_window(
+                session_name.clone(),
+                *window_index,
+            ))),
+            _ => Err(RmuxError::Server(format!("multiple windows named {name}"))),
+        }
+    }
+
+    async fn prepare_queued_new_window_kill_existing(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        target_window_index: Option<u32>,
+        insert_at_target: bool,
+        kill_existing: bool,
+    ) -> Result<(Option<u32>, Option<u32>), RmuxError> {
+        let Some(window_index) = target_window_index else {
+            return Ok((None, None));
+        };
+        if !kill_existing || insert_at_target {
+            return Ok((Some(window_index), None));
+        }
+
+        let existing_window_count = {
+            let state = self.state.lock().await;
+            let session = state
+                .sessions
+                .session(session_name)
+                .ok_or_else(|| RmuxError::SessionNotFound(session_name.to_string()))?;
+            session
+                .window_at(window_index)
+                .map(|_| session.windows().len())
+        };
+        match existing_window_count {
+            None => Ok((Some(window_index), None)),
+            Some(1) => Ok((None, Some(window_index))),
+            Some(_) => match self
+                .handle_kill_window(KillWindowRequest {
+                    target: WindowTarget::with_window(session_name.clone(), window_index),
+                    kill_all_others: false,
+                })
+                .await
+            {
+                Response::KillWindow(_) => Ok((Some(window_index), None)),
+                Response::Error(ErrorResponse { error }) => Err(error),
+                response => Err(RmuxError::Server(format!(
+                    "unexpected kill-window response while replacing new-window target: {response:?}"
+                ))),
+            },
+        }
+    }
+
+    async fn move_queued_new_window_to_replacement_index(
+        &self,
+        response: Response,
+        window_index: u32,
+        detached: bool,
+    ) -> Response {
+        let Response::NewWindow(created) = response else {
+            return response;
+        };
+        let destination =
+            WindowTarget::with_window(created.target.session_name().clone(), window_index);
+        match self
+            .handle_move_window(MoveWindowRequest {
+                source: Some(created.target),
+                target: MoveWindowTarget::Window(destination.clone()),
+                renumber: false,
+                kill_destination: true,
+                detached,
+                after: false,
+                before: false,
+            })
+            .await
+        {
+            Response::MoveWindow(moved) => Response::NewWindow(NewWindowResponse {
+                target: moved.target.unwrap_or(destination),
+            }),
+            response => response,
+        }
+    }
+
+    async fn queued_new_window_action(
+        &self,
+        requester_pid: u32,
+        print_target: bool,
+        format: String,
+        response: Response,
+    ) -> Result<QueueCommandAction, RmuxError> {
+        let pane = match &response {
+            Response::NewWindow(response) if print_target => PaneTarget::with_window(
+                response.target.session_name().clone(),
+                response.target.window_index(),
+                0,
+            ),
+            _ => return queue_action_from_response(response),
+        };
+        queue_action_from_response(
+            self.handle_display_message(
+                requester_pid,
+                DisplayMessageRequest {
+                    target: Some(Target::Pane(pane)),
+                    print: true,
+                    message: Some(format),
+                    empty_target_context: false,
+                },
+            )
+            .await,
+        )
     }
     async fn render_queued_new_window_command(
         &self,
@@ -184,6 +351,15 @@ impl RequestHandler {
                 .map(|argument| render_runtime_template(argument, &runtime, false))
                 .collect(),
         ))
+    }
+}
+
+fn empty_new_window_action() -> QueueCommandAction {
+    QueueCommandAction::Normal {
+        output: None,
+        error: None,
+        source_file_error: None,
+        exit_status: None,
     }
 }
 

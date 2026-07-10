@@ -5,6 +5,8 @@ use super::super::{
     scripting_support::{format_context_for_target, render_start_directory_template},
     RequestHandler,
 };
+#[cfg(windows)]
+use super::format_references_pane_pid;
 use crate::format_runtime::render_runtime_template;
 use crate::hook_runtime::PendingInlineHookFormat;
 use crate::pane_terminal_lookup::pane_id_for_target;
@@ -69,6 +71,12 @@ impl RequestHandler {
         requester_pid: u32,
         mut request: rmux_proto::RespawnPaneRequest,
     ) -> Response {
+        #[cfg(windows)]
+        if request.start_directory.as_ref().is_some_and(|path| {
+            format_references_pane_pid(Some(path.as_os_str().to_string_lossy().as_ref()))
+        }) {
+            self.wait_for_windows_deferred_all_pane_pids().await;
+        }
         let session_name = request.target.session_name().clone();
         let target = request.target.clone();
         let socket_path = self.socket_path();
@@ -104,7 +112,7 @@ impl RequestHandler {
                 |_, _| {},
             ) {
                 Ok(response) => {
-                    self.reopen_pane_state(pane_id);
+                    self.record_pane_respawn_boundary(pane_id);
                     (Response::RespawnPane(response), Some(pane_id))
                 }
                 Err(error) => (Response::Error(ErrorResponse { error }), None),

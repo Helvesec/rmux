@@ -157,7 +157,10 @@ impl RequestHandler {
             return HandleOutcome::response(response);
         }
         if let Request::DaemonStatus(_request) = request {
-            return HandleOutcome::response(self.handle_daemon_status(connection_id).await);
+            return HandleOutcome::response(
+                self.handle_daemon_status(requester_pid, connection_id)
+                    .await,
+            );
         }
 
         #[cfg(windows)]
@@ -308,7 +311,7 @@ impl RequestHandler {
                     .await,
             ),
             Request::DisplayPanes(request) => {
-                HandleOutcome::response(self.handle_display_panes(request).await)
+                HandleOutcome::response(self.handle_display_panes(requester_pid, *request).await)
             }
             Request::ListPanes(request) => {
                 HandleOutcome::response(self.handle_list_panes(*request).await)
@@ -412,7 +415,7 @@ impl RequestHandler {
                 HandleOutcome::response(self.handle_list_sessions(request).await)
             }
             Request::SetBuffer(request) => {
-                HandleOutcome::response(self.handle_set_buffer(requester_pid, request).await)
+                HandleOutcome::response(self.handle_set_buffer(requester_pid, *request).await)
             }
             Request::ShowBuffer(request) => {
                 HandleOutcome::response(self.handle_show_buffer(request).await)
@@ -427,7 +430,7 @@ impl RequestHandler {
                 HandleOutcome::response(self.handle_delete_buffer(request).await)
             }
             Request::LoadBuffer(request) => {
-                HandleOutcome::response(self.handle_load_buffer(requester_pid, request).await)
+                HandleOutcome::response(self.handle_load_buffer(requester_pid, *request).await)
             }
             Request::SaveBuffer(request) => {
                 HandleOutcome::response(self.handle_save_buffer(request).await)
@@ -547,6 +550,7 @@ impl RequestHandler {
                     crate::control::ControlModeUpgrade {
                         mode: request.mode,
                         terminal_context,
+                        initial_command_count: request.initial_command_count,
                     },
                 )
             }

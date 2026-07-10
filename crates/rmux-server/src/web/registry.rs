@@ -33,7 +33,7 @@ use super::secrets::{
 use super::settings::WebShareSettings;
 use super::tunnel::TunnelInfo;
 use output::{created_output, list_output, lookup_output, stopped_output, CreatedOutput};
-pub(crate) use state::ExpiredWebShare;
+pub(crate) use state::{ExpiredWebShare, WebShareExpiryPoll};
 use state::{WebListenerState, WebShareState};
 
 const MAX_TTL_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -316,11 +316,11 @@ impl WebShareRegistry {
         })
     }
 
-    pub(crate) fn expire_if_due(&self, share_id: &str) -> Option<ExpiredWebShare> {
+    pub(crate) fn poll_expiry(&self, share_id: &str) -> WebShareExpiryPoll {
         self.inner
             .lock()
             .expect("web-share registry mutex must not be poisoned")
-            .expire_if_due(share_id)
+            .poll_expiry(share_id)
     }
 
     pub(crate) fn list(&self, _request: ListWebSharesRequest) -> WebShareListResponse {

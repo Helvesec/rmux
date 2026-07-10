@@ -60,7 +60,7 @@ pub(super) fn parse_set_option_invocation(
                 let _ = args.optional();
                 flags.global = true;
             }
-            "-s" => {
+            "-s" if !force_window => {
                 let _ = args.optional();
                 flags.select_server();
             }
@@ -76,8 +76,8 @@ pub(super) fn parse_set_option_invocation(
                 let _ = args.optional();
                 flags.quiet = true;
             }
-            "-w" if force_window => {
-                let _ = args.optional();
+            "-s" | "-w" | "-p" | "-U" if force_window => {
+                return Err(unsupported_flag(command_name, token));
             }
             "-a" => {
                 let _ = args.optional();
@@ -107,11 +107,11 @@ pub(super) fn parse_set_option_invocation(
                 let _ = args.optional();
                 target = Some(parse_target_arg("set-option", args.required("-t target")?)?);
             }
-            token if is_set_option_flag_cluster(token, force_window) => {
+            token if is_set_option_flag_cluster(token) => {
                 let token = args
                     .optional()
                     .expect("peeked set-option flag cluster must be present");
-                flags.apply_cluster(command_name, &token)?;
+                flags.apply_cluster(command_name, &token, force_window)?;
             }
             _ => break,
         }
@@ -258,8 +258,16 @@ impl SetOptionFlags {
         }
     }
 
-    fn apply_cluster(&mut self, command_name: &str, token: &str) -> Result<(), RmuxError> {
+    fn apply_cluster(
+        &mut self,
+        command_name: &str,
+        token: &str,
+        force_window: bool,
+    ) -> Result<(), RmuxError> {
         for flag in token[1..].chars() {
+            if force_window && matches!(flag, 's' | 'w' | 'p' | 'U') {
+                return Err(unsupported_flag(command_name, &format!("-{flag}")));
+            }
             match flag {
                 'g' => self.global = true,
                 's' => self.select_server(),
@@ -270,10 +278,13 @@ impl SetOptionFlags {
                 'F' => self.format = true,
                 'o' => self.only_if_unset = true,
                 'u' => self.unset = true,
+                // -U is an unset modifier, not a scope selector: plain
+                // `set -U` targets the session copy (oracle 2026-07-09) and
+                // -p/-w keep their own precedence when combined with it, so
+                // clusters such as -qU or -gU must not coerce window scope.
                 'U' => {
                     self.unset_pane_overrides = true;
                     self.unset = true;
-                    self.select_window();
                 }
                 _ => return Err(unsupported_flag(command_name, &format!("-{flag}"))),
             }
@@ -294,14 +305,15 @@ impl SetOptionFlags {
     }
 }
 
-fn is_set_option_flag_cluster(token: &str, force_window: bool) -> bool {
+fn is_set_option_flag_cluster(token: &str) -> bool {
     token.starts_with('-')
         && !token.starts_with("--")
         && token.len() > 2
         && token[1..].chars().all(|flag| {
-            matches!(flag, 'g' | 'a' | 'F' | 'o' | 'q' | 'u')
-                || (!force_window && matches!(flag, 's' | 'w' | 'p' | 'U'))
-                || (force_window && flag == 'w')
+            matches!(
+                flag,
+                'g' | 'a' | 'F' | 'o' | 'q' | 'u' | 's' | 'w' | 'p' | 'U'
+            )
         })
 }
 
@@ -390,6 +402,7 @@ pub(super) fn parse_show_options(
     let mut pane = false;
     let mut value_only = false;
     let mut include_inherited = false;
+    let mut include_hooks = false;
     let mut quiet = false;
     let mut target = None;
     let mut name = None;
@@ -436,6 +449,11 @@ pub(super) fn parse_show_options(
                 let _ = args.optional();
                 include_inherited = true;
             }
+            "-H" if force_window => return Err(unsupported_flag(command_name, "-H")),
+            "-H" => {
+                let _ = args.optional();
+                include_hooks = true;
+            }
             "-q" if force_window => return Err(unsupported_flag(command_name, "-q")),
             "-q" => {
                 let _ = args.optional();
@@ -458,6 +476,8 @@ pub(super) fn parse_show_options(
                         'v' => value_only = true,
                         'A' if !force_window => include_inherited = true,
                         'A' => return Err(unsupported_flag(command_name, "-A")),
+                        'H' if !force_window => include_hooks = true,
+                        'H' => return Err(unsupported_flag(command_name, "-H")),
                         'q' if force_window => return Err(unsupported_flag(command_name, "-q")),
                         'q' => quiet = true,
                         's' => return Err(unsupported_flag(command_name, "-s")),
@@ -494,6 +514,7 @@ pub(super) fn parse_show_options(
         value_only,
         include_inherited,
         quiet,
+        include_hooks,
     }))
 }
 
@@ -555,7 +576,7 @@ fn is_show_options_flag_cluster(token: &str) -> bool {
         && token.len() > 2
         && token[1..]
             .chars()
-            .all(|flag| matches!(flag, 'A' | 'g' | 's' | 'w' | 'p' | 'v' | 'q'))
+            .all(|flag| matches!(flag, 'A' | 'H' | 'g' | 's' | 'w' | 'p' | 'v' | 'q'))
 }
 
 fn build_global_or_session_scope(
@@ -866,6 +887,13 @@ fn resolve_show_options_scope(
         )));
     }
 
+    let hook = name.and_then(show_options_hook_name);
+    if !global && !server && !window && !pane {
+        if let Some(hook) = hook {
+            return natural_hook_option_scope(hook, target, sessions, find_context, command);
+        }
+    }
+
     if !global {
         if let Some(name) = name {
             if let Some(scope) = natural_known_show_options_scope(
@@ -938,6 +966,9 @@ fn resolve_show_options_global_scope(
     let Some(name) = name else {
         return Ok(OptionScopeSelector::SessionGlobal);
     };
+    if let Some(hook) = show_options_hook_name(name) {
+        return Ok(global_hook_option_scope(hook));
+    }
     match rmux_core::default_global_scope_for_option_name(name) {
         Ok(scope) => Ok(scope),
         Err(error) if quiet && show_options_quiet_suppresses(&error) => {
@@ -956,6 +987,9 @@ fn resolve_show_options_global_pane_scope(
     command: &str,
 ) -> Result<OptionScopeSelector, RmuxError> {
     if let Some(name) = name {
+        if show_options_hook_name(name).is_some() {
+            return resolve_show_options_pane_scope(target, sessions, find_context, command);
+        }
         match rmux_core::resolve_option_name(name) {
             Ok(query) if query.is_user() || query.supports_scope(&dummy_pane_scope()) => {
                 return resolve_show_options_pane_scope(target, sessions, find_context, command);
@@ -1065,4 +1099,61 @@ fn show_options_lookup_error(message: &str) -> bool {
     message.starts_with("unknown option: ")
         || message.starts_with("invalid option: ")
         || message.starts_with("ambiguous option: ")
+}
+
+fn show_options_hook_name(value: &str) -> Option<rmux_proto::HookName> {
+    let name = match value.rsplit_once('[') {
+        Some((name, index)) if index.strip_suffix(']')?.parse::<u32>().is_ok() => name,
+        Some(_) => return None,
+        None => value,
+    };
+    rmux_proto::HookName::from_str(name)
+}
+
+fn global_hook_option_scope(hook: rmux_proto::HookName) -> OptionScopeSelector {
+    match rmux_core::hook_global_root(hook) {
+        rmux_core::HookGlobalRoot::Session => OptionScopeSelector::SessionGlobal,
+        rmux_core::HookGlobalRoot::Window => OptionScopeSelector::WindowGlobal,
+    }
+}
+
+fn natural_hook_option_scope(
+    hook: rmux_proto::HookName,
+    target: Option<Target>,
+    sessions: &SessionStore,
+    find_context: &TargetFindContext,
+    command: &str,
+) -> Result<OptionScopeSelector, RmuxError> {
+    let target = match target {
+        Some(Target::Session(session_name)) => {
+            let session = sessions
+                .session(&session_name)
+                .ok_or_else(|| RmuxError::SessionNotFound(session_name.to_string()))?;
+            rmux_core::hook_natural_scope_for_session_target(
+                hook,
+                session_name,
+                session.active_window_index(),
+                session.active_pane_index(),
+            )
+        }
+        Some(target) => rmux_core::hook_natural_scope_for_target(hook, target),
+        None => {
+            let session_name = implicit_session_name(sessions, find_context, command)?;
+            let session = sessions
+                .session(&session_name)
+                .expect("implicit session exists");
+            rmux_core::hook_natural_scope_for_session_target(
+                hook,
+                session_name,
+                session.active_window_index(),
+                session.active_pane_index(),
+            )
+        }
+    };
+    Ok(match target {
+        ScopeSelector::Global => unreachable!("natural hook scope is local"),
+        ScopeSelector::Session(session_name) => OptionScopeSelector::Session(session_name),
+        ScopeSelector::Window(target) => OptionScopeSelector::Window(target),
+        ScopeSelector::Pane(target) => OptionScopeSelector::Pane(target),
+    })
 }

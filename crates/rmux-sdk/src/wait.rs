@@ -63,7 +63,10 @@ impl ArmedWait {
             _wait_client: wait_client,
             wait_id,
             cancel_guard,
-            timeout: timeout.map(|duration| Box::pin(tokio::time::sleep(duration))),
+            // Arm lazily on the first poll so platform dispatch-settle work
+            // performed before this value is returned cannot consume the
+            // caller's wait budget.
+            timeout: None,
             timeout_duration: timeout,
             operation,
         }
@@ -92,6 +95,9 @@ impl Future for ArmedWait {
         }
 
         if let Some(duration) = self.timeout_duration {
+            if self.timeout.is_none() {
+                self.timeout = Some(Box::pin(tokio::time::sleep(duration)));
+            }
             if let Some(timeout) = self.timeout.as_mut() {
                 if timeout.as_mut().poll(cx).is_ready() {
                     self.cancel_guard.trigger();

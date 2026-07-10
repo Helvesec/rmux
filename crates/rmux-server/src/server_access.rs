@@ -620,13 +620,14 @@ mod tests {
                 empty_target_context: false,
             },
         )));
-        assert_read_only_rejected(Request::DisplayPanes(DisplayPanesRequest {
+        assert_read_only_rejected(Request::DisplayPanes(Box::new(DisplayPanesRequest {
             target: session_name(),
             duration_ms: None,
             non_blocking: false,
             no_command: false,
             template: None,
-        }));
+            target_client: None,
+        })));
     }
 
     #[test]

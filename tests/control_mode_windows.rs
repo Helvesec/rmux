@@ -131,6 +131,60 @@ fn plain_control_mode_exits_after_stdin_eof_without_empty_line() -> Result<(), B
     Ok(())
 }
 
+#[test]
+fn blocking_wait_for_is_cancelled_when_redirected_stdin_reaches_eof() -> Result<(), Box<dyn Error>>
+{
+    let _serial_guard = windows_cli_serial::acquire("control-wait-for-eof")?;
+    let label = unique_label("control-wait-for-eof-windows")?;
+    let _server = ServerGuard::new(label.clone());
+
+    assert_command_success(
+        rmux_command()
+            .args(["-L", &label, "start-server"])
+            .stdin(Stdio::null())
+            .output()?,
+        "start control-mode server",
+    )?;
+
+    let input_path = temp_file_path(&label, "wait-in");
+    let output_path = temp_file_path(&label, "wait-out");
+    let error_path = temp_file_path(&label, "wait-err");
+    fs::write(&input_path, b"wait-for control-eof-never-signalled\n")?;
+
+    let mut child = rmux_command()
+        .args(["-L", &label, "-C"])
+        .stdin(Stdio::from(File::open(&input_path)?))
+        .stdout(Stdio::from(File::create(&output_path)?))
+        .stderr(Stdio::from(File::create(&error_path)?))
+        .spawn()?;
+    let status = wait_for_child_exit(&mut child, CONTROL_TIMEOUT)?;
+    let rendered = fs::read_to_string(&output_path)?;
+    let stderr = fs::read_to_string(&error_path)?;
+    let _ = fs::remove_file(&input_path);
+    let _ = fs::remove_file(&output_path);
+    let _ = fs::remove_file(&error_path);
+
+    assert_eq!(status.code(), Some(0));
+    assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
+    assert!(
+        rendered.contains("%begin "),
+        "missing begin guard: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("%end "),
+        "missing end guard: {rendered:?}"
+    );
+    assert!(
+        !rendered.contains("%error "),
+        "EOF is a clean cancellation: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("%exit"),
+        "missing terminal exit: {rendered:?}"
+    );
+    Ok(())
+}
+
 fn rmux_command() -> Command {
     Command::new(env!("CARGO_BIN_EXE_rmux"))
 }

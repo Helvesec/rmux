@@ -796,6 +796,7 @@ async fn wait_for_global_option_value(handler: &RequestHandler, name: &str, expe
                 value_only: true,
                 include_inherited: false,
                 quiet: false,
+                include_hooks: false,
             }))
             .await;
         if let Some(output) = response.command_output() {

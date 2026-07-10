@@ -40,9 +40,8 @@ use super::session_commands::{
     run_has_session, run_kill_session, run_list_sessions, run_new_session, run_rename_session,
 };
 use super::target_resolution::{
-    display_panes_client_target_error, resolve_current_pane_target, resolve_pane_target_or_current,
-    resolve_pane_target_spec, resolve_select_layout_target_spec, resolve_session_target_or_current,
-    resolve_window_target_or_current,
+    resolve_current_pane_target, resolve_current_session_target, resolve_pane_target_or_current,
+    resolve_pane_target_spec, resolve_select_layout_target_spec, resolve_window_target_or_current,
 };
 use super::web_commands::run_web_share;
 use super::window_commands::{
@@ -116,19 +115,39 @@ fn dispatch_commands(
             && matches!(&command, Command::AttachSession(_))
             && attach_sequence_has_terminal_tail(&commands[index + 1..]);
         let queued_attach_active = queued_attach_session.is_some();
-        exit_code = dispatch(
+        let dispatch_result = dispatch(
             command,
             socket_path,
             startup.clone(),
             client_terminal.clone(),
             queue_attach_sequence,
             &mut queued_attach_session,
-        )?;
-        if command_is_kill_server && queued_attach_active && exit_code == 0 {
-            exit_code = 1;
+        );
+        let mut command_exit_code = match dispatch_result {
+            Ok(exit_code) => exit_code,
+            // tmux makes a queued kill-server terminal and successful when
+            // the server is already absent; a standalone kill-server still
+            // reports the connection error.
+            Err(error) if command_is_kill_server && queued_commands && error.is_server_absent() => {
+                0
+            }
+            Err(error) => return Err(error),
+        };
+        if command_is_kill_server && queued_attach_active && command_exit_code == 0 {
+            command_exit_code = 1;
+        }
+        if command_exit_code != 0 {
+            exit_code = command_exit_code;
         }
         if command_is_detach_client || command_is_kill_server {
             queued_attach_session = None;
+        }
+        if command_is_kill_server {
+            // tmux treats kill-server as terminal for the current command
+            // queue, even when there was no server before the invocation.
+            // Continuing would feed startup options to the tail and recreate
+            // the daemon that this command just stopped.
+            break;
         }
     }
     Ok(exit_code)
@@ -409,42 +428,18 @@ fn dispatch(
         Command::ResizePane(args) => run_resize_pane(args, socket_path),
         Command::DisplayPanes(args) => {
             let template = args.template_command();
-            let raw_target = args.target.as_ref().map(|target| target.raw().to_owned());
             run_command_resolved(socket_path, "display-panes", move |connection| {
-                let target = match resolve_session_target_or_current(
-                    connection,
-                    args.target.as_ref(),
-                    "display-panes",
-                ) {
-                    Ok(target) => target,
-                    Err(_error) if raw_target.is_some() => {
-                        return Err(display_panes_client_target_error(
-                            raw_target.as_deref().expect("target checked above"),
-                        ))
-                    }
-                    Err(error) => return Err(error),
-                };
-                let response = connection
-                    .display_panes(
+                let target = resolve_current_session_target(connection)?;
+                connection
+                    .display_panes_target_client(
                         target,
                         args.duration_ms,
                         args.non_blocking,
                         args.no_command,
                         template,
+                        args.target_client,
                     )
-                    .map_err(ExitFailure::from_client)?;
-                if raw_target.is_some()
-                    && matches!(
-                        &response,
-                        Response::Error(ErrorResponse { error })
-                            if error.to_string() == "no current client"
-                    )
-                {
-                    return Err(display_panes_client_target_error(
-                        raw_target.as_deref().expect("target checked above"),
-                    ));
-                }
-                Ok(response)
+                    .map_err(ExitFailure::from_client)
             })
         }
         Command::ListPanes(args) => run_list_panes(args, socket_path),
@@ -566,12 +561,13 @@ fn dispatch(
         Command::SetHook(args) => run_set_hook(args, socket_path),
         Command::ShowHooks(args) => run_show_hooks(args, socket_path),
         Command::SetBuffer(args) => run_command(socket_path, "set-buffer", move |connection| {
-            connection.set_buffer(
+            connection.set_buffer_target_client(
                 args.name,
                 args.content.unwrap_or_default().into_bytes(),
                 args.append,
                 args.new_name,
                 args.set_clipboard,
+                args.target_client,
             )
         }),
         Command::ShowBuffer(args) => {

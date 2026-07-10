@@ -44,13 +44,17 @@ pub(super) async fn execute_attached_binding_commands(
 
     if attached_live_input && parsed_commands_are_plain_display_panes(&commands) {
         match handler
-            .handle_display_panes(DisplayPanesRequest {
-                target: session_name.clone(),
-                duration_ms: None,
-                non_blocking: true,
-                no_command: false,
-                template: None,
-            })
+            .handle_display_panes(
+                requester_pid,
+                DisplayPanesRequest {
+                    target: session_name.clone(),
+                    duration_ms: None,
+                    non_blocking: true,
+                    no_command: false,
+                    template: None,
+                    target_client: Some(attached_client_name(attach_pid)),
+                },
+            )
             .await
         {
             Response::DisplayPanes(_) => return Ok(()),

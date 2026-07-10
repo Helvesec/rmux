@@ -33,6 +33,33 @@ fn standalone_argv_semicolon_builds_an_ordered_command_queue() {
 }
 
 #[test]
+fn target_client_and_hook_flags_survive_argv_queue_parsing() {
+    let cli = parse_args(&[
+        "load-buffer",
+        "-wt",
+        "/dev/pts/10",
+        "/tmp/input",
+        ";",
+        "show-options",
+        "-gH",
+    ])
+    .unwrap();
+    let commands = cli.into_command_queue();
+
+    match &commands[0] {
+        super::super::Command::LoadBuffer(args) => {
+            assert!(args.set_clipboard);
+            assert_eq!(args.target_client.as_deref(), Some("/dev/pts/10"));
+        }
+        other => panic!("expected load-buffer, got {other:?}"),
+    }
+    match &commands[1] {
+        super::super::Command::ShowOptions(args) => assert!(args.include_hooks),
+        other => panic!("expected show-options, got {other:?}"),
+    }
+}
+
+#[test]
 fn trailing_semicolon_after_send_keys_payload_is_a_queue_separator() {
     let error = parse_args(&["send-keys", "-t", "alpha:0.0", "xyz;", "final"]).unwrap_err();
     assert!(

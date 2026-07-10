@@ -146,6 +146,8 @@ impl HandlerState {
             synchronized.push(member_name);
         }
 
+        self.synchronize_pane_alias_options_from_session(&source_session)?;
+
         Ok(synchronized)
     }
 

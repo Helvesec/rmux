@@ -7,7 +7,9 @@ param(
     [switch]$RunSdkSmoke,
     [switch]$RunMouseBorderSmoke,
     [switch]$RunCtrlMatrixSmoke,
-    [switch]$RequireReleaseArtifact
+    [switch]$RequireReleaseArtifact,
+    [string]$ExpectedGitSha = $env:RMUX_EXPECTED_GIT_SHA,
+    [string]$CtrlMatrixEvidence = ""
 )
 
 Set-StrictMode -Version Latest
@@ -225,24 +227,35 @@ function InvokeMouseBorderSmoke([string]$Binary) {
     }
 }
 
-function InvokeCtrlMatrixSmoke([string]$Binary) {
+function InvokeCtrlMatrixSmoke([string]$Binary, [string]$GitSha, [string]$Evidence) {
+    if ($GitSha -notmatch '^[0-9a-fA-F]{40}$') {
+        Fail "Windows Ctrl matrix package smoke requires a full expected Git SHA"
+    }
     $outDir = Join-Path ([System.IO.Path]::GetTempPath()) "rmux-package-ctrl-matrix-$PID-$([guid]::NewGuid().ToString('N'))"
     try {
         $global:LASTEXITCODE = 0
-        & (Join-Path $PSScriptRoot "windows_ctrl_matrix.ps1") `
-            -Rmux ([System.IO.Path]::GetFullPath($Binary)) `
-            -OutDir $outDir `
-            -PortableSmokeOnly `
-            -AllowPortableSmokeSkip
+        $arguments = @(
+            "-Rmux", [System.IO.Path]::GetFullPath($Binary),
+            "-OutDir", $outDir,
+            "-PortableSmokeOnly",
+            "-ExpectedGitSha", $GitSha
+        )
+        if (-not [string]::IsNullOrWhiteSpace($Evidence)) {
+            $arguments += @("-EvidencePath", [System.IO.Path]::GetFullPath($Evidence))
+        }
+        & (Join-Path $PSScriptRoot "windows_ctrl_matrix.ps1") @arguments
         if ($LASTEXITCODE -ne 0) {
             Fail "Windows Ctrl matrix package smoke failed with exit code $LASTEXITCODE"
         }
-        if (Test-Path (Join-Path $outDir "portable-smoke.skip.txt")) {
-            Write-Warning "windows ctrl-matrix portable smoke skipped (non-interactive session); run it manually on an interactive Windows session before tagging (RELEASING.md)"
-            if ($env:GITHUB_ACTIONS) {
-                Write-Host "::warning::windows ctrl-matrix portable smoke skipped (non-interactive session); run it manually on an interactive Windows session before tagging (RELEASING.md)"
-            }
+        $resultEvidence = Join-Path $outDir "portable-smoke.evidence.json"
+        if (-not (Test-Path -LiteralPath $resultEvidence -PathType Leaf)) {
+            Fail "Windows Ctrl matrix package smoke produced no passing evidence"
         }
+        $payload = Get-Content -LiteralPath $resultEvidence -Raw | ConvertFrom-Json
+        if ($payload.status -ne "passed" -or $payload.git_commit -ne $GitSha.ToLowerInvariant()) {
+            Fail "Windows Ctrl matrix package evidence is not a passing result for $GitSha"
+        }
+        return "passed"
     } finally {
         Remove-Item -LiteralPath $outDir -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -361,6 +374,9 @@ try {
         if (-not ($metadata.PSObject.Properties.Name -contains "release_artifact") -or
             $metadata.release_artifact -ne $true) {
             Fail "metadata release_artifact is not true"
+        }
+        if ($metadata.configuration -ne "release") {
+            Fail "release artifact metadata configuration is not release"
         }
     }
     $packagedBinaryHash = Sha256File $binary
@@ -488,8 +504,9 @@ try {
         InvokeMouseBorderSmoke $binary
     }
 
+    $ctrlMatrixStatus = "not-requested"
     if ($RunCtrlMatrixSmoke) {
-        InvokeCtrlMatrixSmoke $binary
+        $ctrlMatrixStatus = InvokeCtrlMatrixSmoke $binary $ExpectedGitSha $CtrlMatrixEvidence
     }
 
     Write-Output "archive=$archiveFull"
@@ -502,6 +519,7 @@ try {
     Write-Output "run_sdk_smoke=$($RunSdkSmoke.ToString().ToLowerInvariant())"
     Write-Output "run_mouse_border_smoke=$($RunMouseBorderSmoke.ToString().ToLowerInvariant())"
     Write-Output "run_ctrl_matrix_smoke=$($RunCtrlMatrixSmoke.ToString().ToLowerInvariant())"
+    Write-Output "ctrl_matrix_status=$ctrlMatrixStatus"
     Write-Output "require_release_artifact=$($RequireReleaseArtifact.ToString().ToLowerInvariant())"
 } finally {
     Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue

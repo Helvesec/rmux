@@ -128,13 +128,14 @@ pub(super) fn parse_session_request(
             alerts_only,
         })),
         "last-window" => Ok(Request::LastWindow(LastWindowRequest { target })),
-        "display-panes" => Ok(Request::DisplayPanes(DisplayPanesRequest {
+        "display-panes" => Ok(Request::DisplayPanes(Box::new(DisplayPanesRequest {
             target,
             duration_ms: None,
             non_blocking: false,
             no_command: false,
             template: None,
-        })),
+            target_client: None,
+        }))),
         "switch-client" => Ok(Request::SwitchClient(SwitchClientRequest { target })),
         "lock-session" => Ok(Request::LockSession(LockSessionRequest { target })),
         _ => Err(RmuxError::Server(format!(

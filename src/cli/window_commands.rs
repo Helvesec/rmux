@@ -666,7 +666,7 @@ pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<
     } else {
         resolve_new_window_target_spec(&mut connection, args.target.as_ref())?
     };
-    if select_existing {
+    if select_existing && target_window_index.is_none() {
         if let Some(existing) = name
             .as_deref()
             .and_then(|name| find_window_by_name(&mut connection, &target, name).transpose())
@@ -676,19 +676,6 @@ pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<
                 connection
                     .select_window(existing.clone())
                     .map_err(ExitFailure::from_client)?;
-            }
-            if print_target {
-                let pane = rmux_proto::PaneTarget::with_window(
-                    existing.session_name().clone(),
-                    existing.window_index(),
-                    0,
-                );
-                print_target_format(
-                    &mut connection,
-                    "new-window",
-                    rmux_proto::Target::Pane(pane),
-                    &print_format,
-                )?;
             }
             return Ok(0);
         }
@@ -773,6 +760,7 @@ fn find_window_by_name(
         )
         .map_err(ExitFailure::from_client)?;
     let output = expect_command_output(&response, "list-windows")?;
+    let mut matched = None;
     for line in String::from_utf8_lossy(output.stdout()).lines() {
         let Some((index, window_name)) = line.split_once(LIST_WINDOWS_FILTER_SEPARATOR) else {
             continue;
@@ -781,13 +769,16 @@ fn find_window_by_name(
             let window_index = index
                 .parse::<u32>()
                 .map_err(|_| ExitFailure::new(1, format!("invalid window index: {index}")))?;
-            return Ok(Some(rmux_proto::WindowTarget::with_window(
-                session_name.clone(),
-                window_index,
-            )));
+            let target = rmux_proto::WindowTarget::with_window(session_name.clone(), window_index);
+            if matched.replace(target).is_some() {
+                return Err(ExitFailure::new(
+                    1,
+                    format!("multiple windows named {name}"),
+                ));
+            }
         }
     }
-    Ok(None)
+    Ok(matched)
 }
 
 fn kill_existing_window_at(
@@ -913,23 +904,8 @@ fn resolve_new_window_target_spec(
         ));
     }
 
-    match target.exact() {
-        Some(rmux_proto::Target::Session(session_name)) => {
-            return Ok((session_name.clone(), None));
-        }
-        Some(rmux_proto::Target::Window(window_target)) => {
-            return Ok((
-                window_target.session_name().clone(),
-                Some(window_target.window_index()),
-            ));
-        }
-        Some(rmux_proto::Target::Pane(_)) => {}
-        None => {
-            if let Some(session_name) = resolve_new_window_session_only_target(connection, target)?
-            {
-                return Ok((session_name, None));
-            }
-        }
+    if let Some(session_name) = resolve_new_window_session_only_target(connection, target)? {
+        return Ok((session_name, None));
     }
 
     match resolve_target_spec(connection, target, ResolveTargetType::Session, false, false)? {
@@ -989,6 +965,7 @@ fn resolve_new_window_bare_window_target(
         Ok(_) => Ok(None),
         Err(window_error) => match resolve_session_target_spec(connection, target, false) {
             Ok(_) => Ok(None),
+            Err(session_error) if session_error.is_ambiguous_target() => Err(session_error),
             Err(_) => Err(window_error),
         },
     }

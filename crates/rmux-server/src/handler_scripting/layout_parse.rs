@@ -8,8 +8,8 @@ use rmux_proto::{
 use super::tokens::CommandTokens;
 use super::values::{parse_percentage, parse_u64};
 use super::{
-    implicit_pane_target, implicit_session_name, implicit_window_target,
-    is_unsupported_named_layout, parse_layout_name, parse_pane_target, parse_select_layout_target,
+    implicit_pane_target, implicit_session_name, implicit_window_target, parse_layout_name,
+    parse_pane_target, parse_select_layout_target,
 };
 
 pub(super) fn parse_display_panes(
@@ -20,6 +20,7 @@ pub(super) fn parse_display_panes(
     let mut duration_ms = None;
     let mut non_blocking = false;
     let mut no_command = false;
+    let mut target_client = None;
 
     while let Some(token) = args.peek() {
         match token {
@@ -45,9 +46,7 @@ pub(super) fn parse_display_panes(
             }
             "-t" => {
                 let _ = args.optional();
-                return Err(display_panes_client_target_not_found(
-                    &args.required("-t target-client")?,
-                ));
+                target_client = Some(args.required("-t target-client")?);
             }
             _ => break,
         }
@@ -55,20 +54,14 @@ pub(super) fn parse_display_panes(
 
     let template = (!args.is_empty()).then(|| args.remaining_joined());
 
-    Ok(Request::DisplayPanes(DisplayPanesRequest {
+    Ok(Request::DisplayPanes(Box::new(DisplayPanesRequest {
         target: implicit_session_name(sessions, find_context, "display-panes")?,
         duration_ms,
         non_blocking,
         no_command,
         template,
-    }))
-}
-
-fn display_panes_client_target_not_found(raw_target: &str) -> RmuxError {
-    RmuxError::Message(format!(
-        "can't find client: {}",
-        raw_target.strip_suffix(':').unwrap_or(raw_target)
-    ))
+        target_client,
+    })))
 }
 
 pub(super) fn parse_select_layout(
@@ -125,9 +118,6 @@ pub(super) fn parse_select_layout(
     args.no_extra("select-layout")?;
 
     match parse_layout_name(&layout) {
-        Ok(layout) if is_unsupported_named_layout(layout) => {
-            Err(RmuxError::Server(format!("invalid layout: {layout}")))
-        }
         Ok(layout) => Ok(Request::SelectLayout(SelectLayoutRequest {
             target,
             layout,

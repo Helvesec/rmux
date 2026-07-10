@@ -6,4 +6,5 @@ use crate::outer_terminal::OuterTerminalContext;
 pub(crate) struct ControlModeUpgrade {
     pub(crate) mode: ControlMode,
     pub(crate) terminal_context: OuterTerminalContext,
+    pub(crate) initial_command_count: u32,
 }

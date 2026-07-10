@@ -7,7 +7,9 @@ param(
     [string[]]$OnlyKey = @(),
     [switch]$StaticMatrixSpec,
     [switch]$PortableSmokeOnly,
-    [switch]$AllowPortableSmokeSkip
+    [switch]$AllowPortableSmokeSkip,
+    [string]$ExpectedGitSha = $env:RMUX_EXPECTED_GIT_SHA,
+    [string]$EvidencePath = ""
 )
 
 Set-StrictMode -Version Latest
@@ -53,6 +55,11 @@ if ($StaticMatrixSpec) {
         "Alacritty",
         "PortableSmokeOnly",
         "AllowPortableSmokeSkip",
+        "ExpectedGitSha",
+        "portable-smoke.evidence.json",
+        "binary_sha256",
+        "matrix_script_sha256",
+        "executed_cases",
         "windows-ctrl-matrix-portable-smoke requires an interactive session",
         "Ctrl-C",
         "Ctrl-D",
@@ -87,22 +94,101 @@ if ($StaticMatrixSpec) {
     exit 0
 }
 
+function Get-Sha256([string]$Path) {
+    return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+}
+
+function Write-PortableJson([string]$Name, [object]$Payload) {
+    New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+    $Payload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $OutDir $Name) -Encoding utf8
+}
+
+function Assert-PortableEvidence([string]$Path, [string]$GitSha, [string]$BinarySha, [string]$ScriptSha) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Windows Ctrl matrix evidence file was not found: $Path"
+    }
+    $evidence = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    if ($evidence.schema -ne 1 -or $evidence.kind -ne "rmux-windows-ctrl-matrix-evidence") {
+        throw "Windows Ctrl matrix evidence has an unsupported schema or kind"
+    }
+    if ($evidence.status -ne "passed" -or $evidence.execution -ne "interactive") {
+        throw "Windows Ctrl matrix evidence is not an interactive passing result"
+    }
+    if ($evidence.git_commit -ne $GitSha) {
+        throw "Windows Ctrl matrix evidence Git SHA mismatch: expected=$GitSha evidence=$($evidence.git_commit)"
+    }
+    if ($evidence.binary_sha256 -ne $BinarySha) {
+        throw "Windows Ctrl matrix evidence binary SHA-256 mismatch"
+    }
+    if ($evidence.matrix_script_sha256 -ne $ScriptSha) {
+        throw "Windows Ctrl matrix evidence script SHA-256 mismatch"
+    }
+    if ([int]$evidence.session_id -le 0 -or [int]$evidence.executed_cases -le 0) {
+        throw "Windows Ctrl matrix evidence does not prove an interactive executed case"
+    }
+    return $evidence
+}
+
+if ($PortableSmokeOnly) {
+    if ($ExpectedGitSha -notmatch '^[0-9a-fA-F]{40}$') {
+        throw "Portable Ctrl smoke requires -ExpectedGitSha with a full 40-character Git SHA"
+    }
+    $ExpectedGitSha = $ExpectedGitSha.ToLowerInvariant()
+    if (-not (Test-Path -LiteralPath $Rmux -PathType Leaf)) {
+        throw "rmux binary not found: $Rmux"
+    }
+    $portableBinarySha = Get-Sha256 $Rmux
+    $portableScriptSha = Get-Sha256 $PSCommandPath
+}
+
 if ($PortableSmokeOnly -and -not $env:RMUX_FORCE_WINDOWS_CTRL_MATRIX_GUI) {
     $currentSession = (Get-Process -Id $PID).SessionId
     if ($currentSession -eq 0) {
-        $skipMessage = "windows-ctrl-matrix-portable-smoke=skipped reason=non-interactive-session-0"
+        if (-not [string]::IsNullOrWhiteSpace($EvidencePath)) {
+            try {
+                $verified = Assert-PortableEvidence $EvidencePath $ExpectedGitSha $portableBinarySha $portableScriptSha
+                Write-PortableJson "portable-smoke.evidence.json" $verified
+                Write-Host "windows-ctrl-matrix-portable-smoke=verified-evidence git=$ExpectedGitSha binary_sha256=$portableBinarySha"
+                $global:LASTEXITCODE = 0
+                return
+            } catch {
+                Write-PortableJson "portable-smoke.unavailable.json" ([ordered]@{
+                    schema = 1
+                    kind = "rmux-windows-ctrl-matrix-unavailable"
+                    status = "failed"
+                    reason = "invalid-evidence"
+                    git_commit = $ExpectedGitSha
+                    binary_sha256 = $portableBinarySha
+                    matrix_script_sha256 = $portableScriptSha
+                    detail = $_.Exception.Message
+                })
+                throw
+            }
+        }
+        $skipMessage = "windows-ctrl-matrix-portable-smoke=unavailable reason=non-interactive-session-0"
+        Write-PortableJson "portable-smoke.unavailable.json" ([ordered]@{
+            schema = 1
+            kind = "rmux-windows-ctrl-matrix-unavailable"
+            status = "unavailable"
+            reason = "non-interactive-session-0"
+            git_commit = $ExpectedGitSha
+            binary_sha256 = $portableBinarySha
+            matrix_script_sha256 = $portableScriptSha
+        })
         if ($AllowPortableSmokeSkip -or $env:RMUX_ALLOW_WINDOWS_CTRL_MATRIX_SKIP -eq '1') {
-            New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
             Set-Content -LiteralPath (Join-Path $OutDir "portable-smoke.skip.txt") -Encoding ASCII -Value @(
                 $skipMessage
+                "status=non-passing"
+                "git_commit=$ExpectedGitSha"
+                "binary_sha256=$portableBinarySha"
                 "owner=release-engineering"
                 "cadence=release-candidate-and-manual-windows-review"
             )
             Write-Host $skipMessage
             Write-Host "Set RMUX_FORCE_WINDOWS_CTRL_MATRIX_GUI=1 to force the GUI focus smoke from this session."
-            exit 0
+            exit 3
         }
-        throw "windows-ctrl-matrix-portable-smoke requires an interactive session; set RMUX_FORCE_WINDOWS_CTRL_MATRIX_GUI=1 to force it or pass -AllowPortableSmokeSkip only for an explicitly accepted manual skip."
+        throw "windows-ctrl-matrix-portable-smoke requires an interactive session or passing -EvidencePath bound to this Git SHA and binary; session-0 evidence is unavailable."
     }
 }
 
@@ -946,4 +1032,22 @@ if ($executed.Count -eq 0) {
 $failed = @($Results | Where-Object { $_.Verdict -eq "NO GO" })
 if ($failed.Count -gt 0) {
     throw "Windows Ctrl matrix found $($failed.Count) NO GO case(s); see $md"
+}
+
+if ($PortableSmokeOnly) {
+    $currentSession = (Get-Process -Id $PID).SessionId
+    Write-PortableJson "portable-smoke.evidence.json" ([ordered]@{
+        schema = 1
+        kind = "rmux-windows-ctrl-matrix-evidence"
+        status = "passed"
+        execution = "interactive"
+        git_commit = $ExpectedGitSha
+        binary_sha256 = $portableBinarySha
+        matrix_script_sha256 = $portableScriptSha
+        session_id = $currentSession
+        executed_cases = $executed.Count
+        generated_at_utc = (Get-Date).ToUniversalTime().ToString("o")
+    })
+    Write-Host "windows-ctrl-matrix-portable-smoke=passed git=$ExpectedGitSha binary_sha256=$portableBinarySha executed=$($executed.Count)"
+    $global:LASTEXITCODE = 0
 }

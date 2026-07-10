@@ -34,6 +34,8 @@ mod hook_commands;
 mod key_parse;
 #[path = "handler_scripting/layout_parse.rs"]
 mod layout_parse;
+#[path = "handler_scripting/list_commands_runtime.rs"]
+mod list_commands_runtime;
 #[path = "handler_scripting/list_parse.rs"]
 mod list_parse;
 #[path = "handler_scripting/mode_parse.rs"]
@@ -95,11 +97,10 @@ pub(crate) use self::request_parse::parse_request_from_parts;
 pub(super) use self::runtime::spawn_background_async;
 use self::targets::{
     implicit_pane_target, implicit_session_name, implicit_split_target, implicit_window_target,
-    is_unsupported_named_layout, marked_pane_target, marked_pane_target_or_current,
-    parse_layout_name, parse_move_window_target, parse_new_window_target_argument,
-    parse_pane_target, parse_select_layout_target, parse_session_name, parse_split_window_target,
-    parse_target_arg, parse_window_target, queue_target_find_context,
-    resolve_target_argument_with_spec, QueueTargetFindContextInput,
+    marked_pane_target, marked_pane_target_or_current, parse_layout_name, parse_move_window_target,
+    parse_new_window_target_argument, parse_pane_target, parse_select_layout_target,
+    parse_session_name, parse_split_window_target, parse_target_arg, parse_window_target,
+    queue_target_find_context, resolve_target_argument_with_spec, QueueTargetFindContextInput,
 };
 use super::target_support::requester_environment_pane_id;
 
@@ -492,6 +493,7 @@ impl RequestHandler {
                 source_file_error: None,
                 exit_status: None,
             }),
+            QueueInvocation::ListCommands(command) => self.execute_queued_list_commands(command),
             QueueInvocation::NewWindow(command) => {
                 self.execute_queued_new_window(requester_pid, command, context)
                     .await
@@ -707,6 +709,7 @@ fn queue_invocation_allowed_for_read_only(invocation: &QueueInvocation) -> bool 
         QueueInvocation::Request(_)
             | QueueInvocation::NoOp
             | QueueInvocation::StartServer
+            | QueueInvocation::ListCommands(_)
             | QueueInvocation::NewWindow(_)
             | QueueInvocation::ListPanesAll(_)
             | QueueInvocation::SplitWindow(_)

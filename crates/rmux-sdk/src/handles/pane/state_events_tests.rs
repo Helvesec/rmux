@@ -396,6 +396,103 @@ async fn cursor_long_poll_uses_dedicated_transport_without_blocking_main_request
 }
 
 #[tokio::test]
+async fn cancelled_next_reuses_one_inflight_cursor_poll() {
+    let (client_stream, mut server_stream) = tokio::io::duplex(4096);
+    let (cursor_client_stream, mut cursor_server_stream) = tokio::io::duplex(4096);
+    let transport = TransportClient::spawn(client_stream);
+    let cursor_transport = TransportClient::spawn(cursor_client_stream);
+    let pane = Pane::new(
+        PaneRef::in_first_window(alpha(), 0),
+        RmuxEndpoint::Default,
+        None,
+        transport,
+    );
+    let pane_id = PaneId::new(42);
+    let subscription_id = PaneStateSubscriptionId::new(7);
+
+    let server = tokio::spawn(async move {
+        answer_handshake(&mut server_stream, state_event_capabilities()).await;
+    });
+    let cursor_server = tokio::spawn(async move {
+        answer_handshake(&mut cursor_server_stream, state_event_capabilities()).await;
+        assert!(matches!(
+            read_request(&mut cursor_server_stream).await,
+            Request::SubscribePaneState(_)
+        ));
+        write_response(
+            &mut cursor_server_stream,
+            Response::SubscribePaneState(Box::new(SubscribePaneStateResponse {
+                subscription_id,
+                pane_id,
+                snapshot: PaneStateSnapshot {
+                    revision: 0,
+                    title: Some("initial".to_owned()),
+                    options: Vec::new(),
+                    foreground: None,
+                },
+            })),
+        )
+        .await;
+
+        assert!(matches!(
+            read_request(&mut cursor_server_stream).await,
+            Request::PaneStateCursor(_)
+        ));
+        assert!(
+            timeout(
+                Duration::from_millis(120),
+                read_request(&mut cursor_server_stream)
+            )
+            .await
+            .is_err(),
+            "cancelling next() must not enqueue another cursor request"
+        );
+        write_response(
+            &mut cursor_server_stream,
+            Response::PaneStateCursor(PaneStateCursorResponse {
+                subscription_id,
+                events: vec![PaneStateEventDto::Closed {
+                    revision: 1,
+                    pane_id,
+                    reason: PaneStateClosedReason::Killed,
+                }],
+                next_revision: 1,
+            }),
+        )
+        .await;
+    });
+
+    let mut stream = PaneStateEventStream::open_with_cursor_transport(
+        &pane,
+        PaneStateEventsOptions::default(),
+        cursor_transport,
+    )
+    .await
+    .expect("stream opens");
+    assert!(matches!(
+        stream.next().await.expect("snapshot succeeds"),
+        Some(PaneStateEvent::Snapshot { revision: 0, .. })
+    ));
+    for _ in 0..3 {
+        assert!(
+            timeout(Duration::from_millis(20), stream.next())
+                .await
+                .is_err(),
+            "long poll should still be pending"
+        );
+    }
+    assert!(matches!(
+        timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("original cursor poll completes")
+            .expect("next succeeds"),
+        Some(PaneStateEvent::Closed { revision: 1, .. })
+    ));
+    server.await.expect("server task succeeds");
+    cursor_server.await.expect("cursor server task succeeds");
+}
+
+#[tokio::test]
 async fn stream_open_refuses_cursor_transport_without_state_event_capability() {
     let (main_client_stream, mut main_server_stream) = tokio::io::duplex(4096);
     let (cursor_client_stream, mut cursor_server_stream) = tokio::io::duplex(4096);

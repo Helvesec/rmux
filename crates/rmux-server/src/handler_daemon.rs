@@ -4,11 +4,13 @@ use rmux_proto::{
 };
 use std::sync::atomic::Ordering;
 
+use super::target_support::requester_environment_context;
 use super::{prepare_lifecycle_event, PendingShutdownReason, RequestHandler};
 
 impl RequestHandler {
     pub(in crate::handler) async fn handle_daemon_status(
         &self,
+        requester_pid: u32,
         requester_connection_id: u64,
     ) -> Response {
         let (session_count, client_count) = self
@@ -19,8 +21,16 @@ impl RequestHandler {
             wire_version: RMUX_WIRE_VERSION,
             session_count,
             client_count,
-            config_loading: self.config_loading_active(),
+            config_loading: self.config_loading_for_requester(requester_pid),
         })
+    }
+
+    fn config_loading_for_requester(&self, requester_pid: u32) -> bool {
+        if !self.config_loading_active() {
+            return false;
+        }
+        let context = requester_environment_context(requester_pid, &self.socket_path());
+        context.source_depth.is_none()
     }
 
     pub(in crate::handler) async fn handle_shutdown_if_idle(

@@ -158,13 +158,14 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
             target: pane.clone(),
             adjustment: ResizePaneAdjustment::AbsoluteWidth { columns: 34 },
         }),
-        Request::DisplayPanes(DisplayPanesRequest {
+        Request::DisplayPanes(Box::new(DisplayPanesRequest {
             target: beta.clone(),
             duration_ms: None,
             non_blocking: false,
             no_command: false,
             template: None,
-        }),
+            target_client: None,
+        })),
         Request::SelectPane(Box::new(SelectPaneRequest {
             target: pane.clone(),
             title: None,
@@ -240,13 +241,14 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
             run_immediately: false,
             index: Some(3),
         }),
-        Request::SetBuffer(SetBufferRequest {
+        Request::SetBuffer(Box::new(SetBufferRequest {
             name: Some("named".to_owned()),
             content: b"buffer".to_vec(),
             append: false,
             new_name: None,
             set_clipboard: false,
-        }),
+            target_client: None,
+        })),
         Request::ShowBuffer(ShowBufferRequest {
             name: Some("named".to_owned()),
         }),
@@ -261,12 +263,13 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
         })),
         Request::ListBuffers(ListBuffersRequest::default()),
         Request::DeleteBuffer(DeleteBufferRequest { name: None }),
-        Request::LoadBuffer(LoadBufferRequest {
+        Request::LoadBuffer(Box::new(LoadBufferRequest {
             path: "/tmp/input".to_owned(),
             cwd: None,
             name: Some("loaded".to_owned()),
             set_clipboard: false,
-        }),
+            target_client: None,
+        })),
         Request::SaveBuffer(SaveBufferRequest {
             path: "/tmp/output".to_owned(),
             cwd: None,
@@ -379,6 +382,7 @@ fn every_request_variant_round_trips_through_the_frame_codec() {
         Request::ControlMode(ControlModeRequest {
             mode: ControlMode::ControlControl,
             client_terminal: crate::ClientTerminalContext::default(),
+            initial_command_count: 2,
         }),
         Request::ClockMode(ClockModeRequest {
             target: Some(PaneTarget::with_window(

@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::time::Duration;
 
 use rmux_core::{
     command_parser::{
@@ -13,6 +12,8 @@ use rmux_proto::{
     SourceFileResponse, Target,
 };
 
+#[cfg(windows)]
+use super::super::pane_support::format_references_pane_pid;
 use super::super::target_support::{
     pane_id_target, requester_environment_context, requester_environment_pane_id,
 };
@@ -43,10 +44,6 @@ use crate::{ConfigFileSelection, ConfigLoadOptions};
 const STARTUP_CONFIG_ERROR_LIMIT: usize = 256;
 const SOURCE_PARSE_RECOVERY_ERROR_LIMIT: usize = 256;
 const CONFIG_MESSAGE_MAX_BYTES: usize = 512;
-#[cfg(not(test))]
-const STARTUP_READINESS_BUDGET: Duration = Duration::from_secs(2);
-#[cfg(test)]
-const STARTUP_READINESS_BUDGET: Duration = Duration::from_millis(100);
 
 impl RequestHandler {
     #[cfg(test)]
@@ -123,7 +120,7 @@ impl RequestHandler {
             errors.push(error);
         }
         let execution = self
-            .execute_startup_source_file_with_readiness_budget(
+            .execute_startup_source_file(
                 loaded,
                 QueueExecutionContext::new(command.caller_cwd.clone()),
                 guard,
@@ -140,23 +137,15 @@ impl RequestHandler {
         }
     }
 
-    async fn execute_startup_source_file_with_readiness_budget(
+    async fn execute_startup_source_file(
         &self,
         loaded: LoadedSourceFile,
         context: QueueExecutionContext,
         guard: ConfigLoadingGuard,
     ) -> SourceFileExecution {
-        let execution = self.execute_loaded_source_file(std::process::id(), loaded, context, 1);
-        tokio::pin!(execution);
-        let mut guard = Some(guard);
-        let result = tokio::select! {
-            biased;
-            result = &mut execution => result,
-            _ = tokio::time::sleep(STARTUP_READINESS_BUDGET) => {
-                drop(guard.take());
-                execution.await
-            }
-        };
+        let result = self
+            .execute_loaded_source_file(std::process::id(), loaded, context, 1)
+            .await;
         drop(guard);
         result
     }
@@ -668,6 +657,10 @@ impl RequestHandler {
         target: Option<&PaneTarget>,
         current_file: Option<&str>,
     ) -> Result<String, RmuxError> {
+        #[cfg(windows)]
+        if format_references_pane_pid(Some(path)) {
+            self.wait_for_windows_deferred_all_pane_pids().await;
+        }
         let attached_count = if let Some(target) = target {
             self.attached_count(target.session_name()).await
         } else {
@@ -1634,11 +1627,11 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn startup_readiness_clears_before_blocking_run_shell_finishes() {
+    async fn startup_readiness_remains_busy_until_blocking_run_shell_finishes() {
         let _lock = crate::test_env::lock_async().await;
         let root = unique_temp_root("slow-run-shell-readiness");
         let config_path = root.join("slow.conf");
-        write_test_config(config_path.clone(), "run-shell 'sleep 3'\n");
+        write_test_config(config_path.clone(), "run-shell 'sleep 0.25'\n");
         let handler = RequestHandler::new();
         let config = DaemonConfig::new(root.join("rmux.sock")).with_config_files(
             vec![config_path],
@@ -1657,21 +1650,29 @@ mod tests {
                 .await;
         });
 
-        let readiness = async {
+        let premature_readiness = async {
             while handler.config_loading_active() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         };
-        tokio::time::timeout(Duration::from_secs(1), readiness)
-            .await
-            .expect("readiness should clear before the blocking run-shell finishes");
-
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), premature_readiness)
+                .await
+                .is_err(),
+            "startup readiness must remain busy while the sourced command is running"
+        );
         assert!(
             !task.is_finished(),
-            "startup config should still be executing after readiness clears"
+            "startup config should still be executing during the readiness check"
         );
-
-        task.abort();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("startup config should finish")
+            .expect("startup config task should not panic");
+        assert!(
+            !handler.config_loading_active(),
+            "readiness should clear after the complete source queue finishes"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

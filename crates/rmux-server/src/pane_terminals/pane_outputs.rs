@@ -459,6 +459,18 @@ impl HandlerState {
             .unwrap_or(0)
     }
 
+    pub(in crate::pane_terminals) fn seed_pane_output_generation(
+        &mut self,
+        session_name: &SessionName,
+        pane_id: PaneId,
+        generation: u64,
+    ) {
+        self.pane_output_generations
+            .entry(session_name.clone())
+            .or_default()
+            .insert(pane_id, generation);
+    }
+
     pub(crate) fn move_pane_outputs_between_sessions(
         &mut self,
         source_session: &SessionName,

@@ -52,17 +52,30 @@ pub(super) fn apply_split_window_effects(
     if preserve_zoom {
         let zoom_target = effects.detached_anchor.as_ref().unwrap_or(pane);
         let session_name = zoom_target.session_name().clone();
+        let detached = effects.detached_anchor.is_some();
         state.mutate_session_and_resize_terminals(&session_name, |session| {
-            let should_zoom = session
-                .window_at(zoom_target.window_index())
-                .is_some_and(|window| !window.is_zoomed());
-            if should_zoom {
-                session.resize_pane_in_window(
-                    zoom_target.window_index(),
-                    zoom_target.pane_index(),
-                    ResizePaneAdjustment::Zoom,
-                )?;
+            let window_index = zoom_target.window_index();
+            let Some(window) = session.window_at(window_index) else {
+                return Ok(());
+            };
+            if window.is_zoomed() {
+                return Ok(());
             }
+            // tmux `split-window -d -Z` zooms the window around the pane
+            // that is already active; only a non-detached -Z zooms (and
+            // activates) the new pane. Zooming the anchor target here used
+            // to re-select it, re-introducing the active/last/active_point
+            // side effects a detached split must not have.
+            let zoom_pane_index = if detached {
+                window.active_pane_index()
+            } else {
+                zoom_target.pane_index()
+            };
+            session.resize_pane_in_window(
+                window_index,
+                zoom_pane_index,
+                ResizePaneAdjustment::Zoom,
+            )?;
             Ok(())
         })?;
     }

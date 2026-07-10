@@ -4,7 +4,7 @@
   "release": "release-0.9.0",
   "timestamp": "2026-07-09T14:28:32Z",
   "git": {"branch":"release/0.9.0-finale","commit":"9dbcd0711c5d1a3c24a08743634ecde4f0666f17","describe":"v0.8.0-67-g9dbcd0711"},
-  "environment": {"platform":"linux","kernel":"6.17.0-35-generic","machine":"x86_64","rustc":"rustc 1.96.1 (31fca3adb 2026-06-26)","rustc_verbose":"rustc 1.96.1 (31fca3adb 2026-06-26);binary: rustc;commit-hash: 31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd;commit-date: 2026-06-26;host: x86_64-unknown-linux-gnu;release: 1.96.1;LLVM version: 22.1.2","toolchain":"1.96.1-x86_64-unknown-linux-gnu (overridden by '/home/pingu/Projects/final/rmux/rust-toolchain.toml')","allocator":"system","cpu_governor":"powersave"},
+  "environment": {"platform":"linux","kernel":"6.17.0-35-generic","machine":"x86_64","host_fingerprint":"40c43d3415675c38","rustc":"rustc 1.96.1 (31fca3adb 2026-06-26)","rustc_verbose":"rustc 1.96.1 (31fca3adb 2026-06-26);binary: rustc;commit-hash: 31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd;commit-date: 2026-06-26;host: x86_64-unknown-linux-gnu;release: 1.96.1;LLVM version: 22.1.2","toolchain":"1.96.1-x86_64-unknown-linux-gnu (overridden by '/home/pingu/Projects/final/rmux/rust-toolchain.toml')","allocator":"system","cpu_governor":"powersave"},
   "versions": {"rmux":"rmux 0.9.0","tmux":"tmux 3.7b","rustc":"rustc 1.96.1 (31fca3adb 2026-06-26)"},
   "binary": {"path":"/home/pingu/Projects/final/rmux/target/release/rmux","size_bytes":13412584},
   "memory": {"rss_proxy_kib":4900,"status":"collected","note":"/usr/bin/time -v diagnose --json proxy"},

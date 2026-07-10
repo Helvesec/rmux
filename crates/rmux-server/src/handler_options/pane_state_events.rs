@@ -25,6 +25,21 @@ pub(super) fn pane_option_events_for_outcome(
     events
 }
 
+pub(super) fn synchronize_pane_option_aliases_for_outcome(
+    state: &mut crate::pane_terminals::HandlerState,
+    outcome: &OptionMutationOutcome,
+) -> Result<(), RmuxError> {
+    if outcome.changed {
+        if let OptionScopeSelector::Pane(target) = &outcome.scope {
+            state.synchronize_pane_alias_options_from_target(target)?;
+        }
+    }
+    for related in &outcome.related {
+        synchronize_pane_option_aliases_for_outcome(state, related)?;
+    }
+    Ok(())
+}
+
 fn collect_pane_option_events(
     state: &crate::pane_terminals::HandlerState,
     outcome: &OptionMutationOutcome,

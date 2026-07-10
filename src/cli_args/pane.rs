@@ -769,8 +769,8 @@ pub(crate) struct DisplayPanesArgs {
     pub(crate) duration_ms: Option<u64>,
     #[arg(short = 'N', action = ArgAction::SetTrue)]
     pub(crate) no_command: bool,
-    #[arg(short = 't', value_parser = parse_target_spec, allow_hyphen_values = true)]
-    pub(crate) target: Option<TargetSpec>,
+    #[arg(short = 't', allow_hyphen_values = true)]
+    pub(crate) target_client: Option<String>,
     #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
     pub(crate) template: Vec<String>,
 }

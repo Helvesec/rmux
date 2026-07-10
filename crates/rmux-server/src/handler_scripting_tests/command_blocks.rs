@@ -413,3 +413,111 @@ async fn parsed_queue_set_hook_session_target_uses_hook_natural_window_scope() {
         Some("display-message -p -- renamed")
     );
 }
+
+#[tokio::test]
+async fn parsed_hook_commands_resolve_implicit_current_scopes() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha-implicit-hooks");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let state = handler.state.lock().await;
+    let current = TargetFindContext::new(Some(Target::Pane(PaneTarget::with_window(
+        alpha.clone(),
+        0,
+        0,
+    ))));
+    for (arguments, expected_scope) in [
+        (vec![], ScopeSelector::Session(alpha.clone())),
+        (
+            vec!["-w".to_owned()],
+            ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+        ),
+        (
+            vec!["-p".to_owned()],
+            ScopeSelector::Pane(PaneTarget::with_window(alpha.clone(), 0, 0)),
+        ),
+    ] {
+        let request = crate::handler::scripting_support::parse_request_from_parts(
+            "show-hooks".to_owned(),
+            arguments,
+            None,
+            &state.sessions,
+            &state.options,
+            &current,
+        )
+        .expect("show-hooks resolves its implicit current target");
+        let Request::ShowHooks(request) = request else {
+            panic!("expected ShowHooks request");
+        };
+        assert_eq!(request.scope, expected_scope);
+    }
+
+    for (arguments, expected_scope) in [
+        (
+            vec![
+                "-w".to_owned(),
+                "window-renamed".to_owned(),
+                "display-message window".to_owned(),
+            ],
+            ScopeSelector::Window(WindowTarget::with_window(alpha.clone(), 0)),
+        ),
+        (
+            vec![
+                "-p".to_owned(),
+                "pane-mode-changed".to_owned(),
+                "display-message pane".to_owned(),
+            ],
+            ScopeSelector::Pane(PaneTarget::with_window(alpha, 0, 0)),
+        ),
+    ] {
+        let request = crate::handler::scripting_support::parse_request_from_parts(
+            "set-hook".to_owned(),
+            arguments,
+            None,
+            &state.sessions,
+            &state.options,
+            &current,
+        )
+        .expect("set-hook resolves its implicit current target");
+        let Request::SetHookMutation(request) = request else {
+            panic!("expected SetHookMutation request");
+        };
+        assert_eq!(request.scope, expected_scope);
+    }
+}
+
+#[test]
+fn parsed_set_window_option_rejects_non_window_scope_flags() {
+    let handler = RequestHandler::new();
+    let state = handler.state.blocking_lock();
+    for token in ["-s", "-w", "-p", "-U", "-gs", "-gw", "-gp", "-gU"] {
+        let error = crate::handler::scripting_support::parse_request_from_parts(
+            "set-window-option".to_owned(),
+            vec![
+                token.to_owned(),
+                "-g".to_owned(),
+                "pane-border-style".to_owned(),
+                "fg=red".to_owned(),
+            ],
+            None,
+            &state.sessions,
+            &state.options,
+            &TargetFindContext::new(None),
+        )
+        .expect_err("set-window-option rejects incompatible scope flags");
+        assert!(
+            error.to_string().contains("unknown flag"),
+            "unexpected error for {token}: {error}"
+        );
+    }
+}

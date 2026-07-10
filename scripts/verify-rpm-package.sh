@@ -29,6 +29,10 @@ sha256_file() {
   sha256sum "$1" | awk '{print $1}'
 }
 
+version_ge() {
+  [ "$(printf '%s\n%s\n' "$2" "$1" | LC_ALL=C sort -V | tail -n 1)" = "$1" ]
+}
+
 archive=""
 checksums=""
 run_binary=0
@@ -89,9 +93,12 @@ actual_hash="$(sha256_file "$archive_abs")"
 name_field="$(rpm -qp --qf '%{NAME}' "$archive_abs")"
 version_field="$(rpm -qp --qf '%{VERSION}' "$archive_abs")"
 arch_field="$(rpm -qp --qf '%{ARCH}' "$archive_abs")"
+requires_field="$(rpm -qp --requires "$archive_abs")"
 [ "$name_field" = "rmux" ] || die "unexpected package name: $name_field"
 [ -n "$version_field" ] || die "missing RPM Version field"
 case "$arch_field" in x86_64|aarch64) ;; *) die "unexpected RPM Architecture field: $arch_field" ;; esac
+declared_glibc_min="$(printf '%s\n' "$requires_field" | awk '$1 == "glibc" && $2 == ">=" { print $3; exit }')"
+[ -n "$declared_glibc_min" ] || die "RPM requirements do not declare a versioned glibc floor"
 
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/rmux-rpm-verify.XXXXXX")"
 trap 'rm -rf "$tmpdir"' EXIT
@@ -122,6 +129,7 @@ grep -q '"artifact_kind"[[:space:]]*:[[:space:]]*"rpm-package-binary"' "$metadat
 grep -q '"package_layout"[[:space:]]*:[[:space:]]*"rmux-rpm-package-v2"' "$metadata" || die "metadata package_layout is not rmux-rpm-package-v2"
 if [ "$require_release_artifact" -eq 1 ]; then
   grep -q '"release_artifact"[[:space:]]*:[[:space:]]*true' "$metadata" || die "metadata release_artifact is not true"
+  grep -q '"configuration"[[:space:]]*:[[:space:]]*"release"' "$metadata" || die "release artifact metadata configuration is not release"
 fi
 metadata_binary_hash="$(sed -n 's/.*"binary_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$metadata" | head -n 1 | tr 'A-F' 'a-f')"
 [ -n "$metadata_binary_hash" ] || die "metadata binary_sha256 is missing or invalid"
@@ -136,6 +144,28 @@ metadata_daemon_hash="$(sed -n 's/.*"daemon_binary_sha256"[[:space:]]*:[[:space:
 packaged_daemon_hash="$(sha256_file "$tmpdir/usr/bin/rmux-daemon")"
 [ "$metadata_daemon_hash" = "$packaged_daemon_hash" ] || die "metadata daemon_binary_sha256 does not match packaged daemon binary"
 
+glibc_floor_script="$script_dir/glibc-symbol-floor.sh"
+binary_glibc_min="$($glibc_floor_script "$tmpdir/usr/bin/rmux")"
+helper_binary_glibc_min="$($glibc_floor_script "$tmpdir/usr/libexec/rmux/rmux")"
+daemon_binary_glibc_min="$($glibc_floor_script "$tmpdir/usr/bin/rmux-daemon")"
+required_glibc_min="$($glibc_floor_script \
+  "$tmpdir/usr/bin/rmux" \
+  "$tmpdir/usr/libexec/rmux/rmux" \
+  "$tmpdir/usr/bin/rmux-daemon")"
+version_ge "$declared_glibc_min" "$required_glibc_min" ||
+  die "RPM glibc floor $declared_glibc_min is older than imported GLIBC_$required_glibc_min symbols"
+for field_and_value in \
+  "binary_glibc_min:$binary_glibc_min" \
+  "helper_binary_glibc_min:$helper_binary_glibc_min" \
+  "daemon_binary_glibc_min:$daemon_binary_glibc_min" \
+  "package_glibc_min:$required_glibc_min"
+do
+  field="${field_and_value%%:*}"
+  expected="${field_and_value#*:}"
+  grep -q "\"$field\"[[:space:]]*:[[:space:]]*\"$expected\"" "$metadata" ||
+    die "metadata $field does not match imported GLIBC symbols ($expected)"
+done
+
 if [ "$run_binary" -eq 1 ]; then
   "$tmpdir/usr/bin/rmux" -V >/dev/null
   "$script_dir/smoke-installed-rmux.sh" "$tmpdir/usr/bin/rmux" >/dev/null
@@ -146,4 +176,5 @@ printf 'sha256=%s\n' "$actual_hash"
 printf 'binary_sha256=%s\n' "$packaged_binary_hash"
 printf 'helper_binary_sha256=%s\n' "$packaged_helper_hash"
 printf 'daemon_binary_sha256=%s\n' "$packaged_daemon_hash"
+printf 'glibc_min=%s\n' "$required_glibc_min"
 printf 'run_binary=%s\n' "$([ "$run_binary" -eq 1 ] && printf true || printf false)"

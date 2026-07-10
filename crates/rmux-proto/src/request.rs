@@ -159,7 +159,7 @@ pub enum Request {
     /// `resize-pane`
     ResizePane(ResizePaneRequest),
     /// `display-panes`
-    DisplayPanes(DisplayPanesRequest),
+    DisplayPanes(Box<DisplayPanesRequest>),
     /// `select-pane`
     SelectPane(Box<SelectPaneRequest>),
     /// `select-pane -U/-D/-L/-R`
@@ -187,7 +187,7 @@ pub enum Request {
     /// `show-environment`
     ShowEnvironment(ShowEnvironmentRequest),
     /// `set-buffer`
-    SetBuffer(SetBufferRequest),
+    SetBuffer(Box<SetBufferRequest>),
     /// `show-buffer`
     ShowBuffer(ShowBufferRequest),
     /// `paste-buffer`
@@ -197,7 +197,7 @@ pub enum Request {
     /// `delete-buffer`
     DeleteBuffer(DeleteBufferRequest),
     /// `load-buffer`
-    LoadBuffer(LoadBufferRequest),
+    LoadBuffer(Box<LoadBufferRequest>),
     /// `save-buffer`
     SaveBuffer(SaveBufferRequest),
     /// `capture-pane`
@@ -1058,6 +1058,29 @@ mod tests {
             filter: Some("#{==:#{pane_active},1}".to_owned()),
             sort_order: Some("index".to_owned()),
             reversed: true,
+        });
+        assert_box_serializes_like_value(DisplayPanesRequest {
+            target: alpha(),
+            duration_ms: Some(1_000),
+            non_blocking: true,
+            no_command: false,
+            template: Some("select-pane -t '%%'".to_owned()),
+            target_client: Some("/dev/pts/1".to_owned()),
+        });
+        assert_box_serializes_like_value(SetBufferRequest {
+            name: Some("named".to_owned()),
+            content: b"buffer".to_vec(),
+            append: false,
+            new_name: None,
+            set_clipboard: true,
+            target_client: Some("/dev/pts/1".to_owned()),
+        });
+        assert_box_serializes_like_value(LoadBufferRequest {
+            path: "/tmp/input".to_owned(),
+            cwd: Some(PathBuf::from("/tmp")),
+            name: Some("loaded".to_owned()),
+            set_clipboard: true,
+            target_client: Some("/dev/pts/1".to_owned()),
         });
         assert_box_serializes_like_value(AttachSessionExt3Request::from_ext2(
             AttachSessionExt2Request {

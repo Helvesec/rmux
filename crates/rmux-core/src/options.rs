@@ -354,6 +354,21 @@ impl OptionStore {
         self.panes.remove(target).map(OptionNode::into_known_values)
     }
 
+    /// Copies exact pane-local overrides between two aliases of one pane.
+    pub fn copy_pane_overrides(&mut self, source: &PaneTarget, target: &PaneTarget) {
+        if source == target {
+            return;
+        }
+        if let Some(source_pane) = self.panes.get(source).cloned() {
+            self.panes.insert(
+                target.clone(),
+                source_pane.with_scope(OptionScopeSelector::Pane(target.clone())),
+            );
+        } else {
+            self.panes.remove(target);
+        }
+    }
+
     /// Rekeys pane-local overrides after pane indices change within one window.
     pub fn remap_pane_indices(
         &mut self,

@@ -217,13 +217,14 @@ async fn buffer_capture_and_scripting_requests_round_trip_over_real_socket(
     assert!(matches!(
         send_request(
             harness.socket_path(),
-            &Request::SetBuffer(SetBufferRequest {
+            &Request::SetBuffer(Box::new(SetBufferRequest {
                 name: Some("empty".to_owned()),
                 content: Vec::new(),
                 append: false,
                 new_name: None,
                 set_clipboard: false,
-            }),
+                target_client: None,
+            })),
         )
         .await?,
         Response::SetBuffer(_)
@@ -240,13 +241,14 @@ async fn buffer_capture_and_scripting_requests_round_trip_over_real_socket(
     assert!(matches!(
         send_request(
             harness.socket_path(),
-            &Request::SetBuffer(SetBufferRequest {
+            &Request::SetBuffer(Box::new(SetBufferRequest {
                 name: Some("delete-me".to_owned()),
                 content: b"x".to_vec(),
                 append: false,
                 new_name: None,
                 set_clipboard: false,
-            }),
+                target_client: None,
+            })),
         )
         .await?,
         Response::SetBuffer(_)
@@ -255,13 +257,14 @@ async fn buffer_capture_and_scripting_requests_round_trip_over_real_socket(
     assert!(matches!(
         send_request(
             harness.socket_path(),
-            &Request::SetBuffer(SetBufferRequest {
+            &Request::SetBuffer(Box::new(SetBufferRequest {
                 name: Some("pastecmd".to_owned()),
                 content: paste_command.clone().into_bytes(),
                 append: false,
                 new_name: None,
                 set_clipboard: false,
-            }),
+                target_client: None,
+            })),
         )
         .await?,
         Response::SetBuffer(_)
@@ -301,12 +304,13 @@ async fn buffer_capture_and_scripting_requests_round_trip_over_real_socket(
     assert!(matches!(
         send_request(
             harness.socket_path(),
-            &Request::LoadBuffer(LoadBufferRequest {
+            &Request::LoadBuffer(Box::new(LoadBufferRequest {
                 path: load_path.to_string_lossy().into_owned(),
                 cwd: None,
                 name: Some("loaded".to_owned()),
                 set_clipboard: false,
-            }),
+                target_client: None,
+            })),
         )
         .await?,
         Response::LoadBuffer(_)

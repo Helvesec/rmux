@@ -8,6 +8,8 @@ use rmux_proto::{
     ShowEnvironmentResponse, ShowHooksResponse, ShowOptionsResponse, WindowTarget,
 };
 
+#[cfg(windows)]
+use super::pane_support::format_references_pane_pid;
 use super::RequestHandler;
 use crate::format_runtime::render_runtime_template;
 use crate::handler_support::{ensure_option_scope_exists, ensure_scope_session_exists};
@@ -16,6 +18,9 @@ use crate::hook_compat::{
     normalize_set_hook_request,
 };
 use crate::terminal::TerminalProfile;
+
+#[path = "handler_config/show_options.rs"]
+mod show_options;
 
 impl RequestHandler {
     pub(super) async fn handle_set_environment(
@@ -35,6 +40,11 @@ impl RequestHandler {
 
         if let Err(error) = validate_set_environment_request(&request) {
             return Response::Error(ErrorResponse { error });
+        }
+
+        #[cfg(windows)]
+        if request.format && format_references_pane_pid(Some(&request.value)) {
+            self.wait_for_windows_deferred_all_pane_pids().await;
         }
 
         let mut state = self.state.lock().await;
@@ -202,6 +212,13 @@ impl RequestHandler {
             return Response::Error(ErrorResponse { error });
         }
 
+        if let Some(lines) = show_options::render_named_hook(&state, &request) {
+            return Response::ShowOptions(ShowOptionsResponse {
+                scope: request.scope,
+                output: command_output_from_lines(&lines),
+            });
+        }
+
         let mode = if request.include_inherited {
             rmux_core::ShowOptionsMode::ResolvedWithInheritanceMarkers
         } else if matches!(
@@ -221,7 +238,10 @@ impl RequestHandler {
             mode,
         ) {
             Ok(lines) => {
-                let lines = self.render_runtime_show_options_lines(&state, &request, lines);
+                let mut lines = self.render_runtime_show_options_lines(&state, &request, lines);
+                if request.include_hooks && request.name.is_none() {
+                    lines.extend(show_options::render_included_hooks(&state, &request));
+                }
                 Response::ShowOptions(ShowOptionsResponse {
                     scope: request.scope,
                     output: command_output_from_lines(&lines),

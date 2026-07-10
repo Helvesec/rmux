@@ -4,7 +4,6 @@ use std::sync::MutexGuard;
 use std::time::Duration;
 
 use rmux_core::{OptionMutationOutcome, PaneId};
-use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
     ErrorResponse, ForegroundStateDto, PaneForegroundStateResponse, PaneOptionEntry,
     PaneStateClosedReason, PaneStateCursorRequest, PaneStateCursorResponse, PaneStateLagResponse,
@@ -17,7 +16,8 @@ use crate::foreground_probe::{
     capture_foreground_probe_seed, probe_foreground, ForegroundProbeSeed,
 };
 use crate::pane_state_journal::{
-    PaneStateChange, PaneStateInclude, PaneStateJournal, PaneStateRead, PANE_STATE_CURSOR_BATCH,
+    PaneStateChange, PaneStateInclude, PaneStateJournal, PaneStateRead, PaneStateSubscriptionError,
+    PANE_STATE_CURSOR_BATCH,
 };
 use crate::pane_terminals::HandlerState;
 
@@ -110,9 +110,7 @@ impl RequestHandler {
                 Ok(subscription_id) => subscription_id,
                 Err(error) => {
                     return Response::Error(ErrorResponse {
-                        error: super::subscription_support::pane_state_subscription_limit_error(
-                            error,
-                        ),
+                        error: pane_state_subscription_error(error),
                     });
                 }
             };
@@ -230,12 +228,9 @@ impl RequestHandler {
                     missed_from_revision,
                     resume_revision,
                 }) => {
+                    self.pause_before_pane_state_lag_snapshot().await;
                     return match self
-                        .snapshot_for_subscription(
-                            connection_id,
-                            request.subscription_id,
-                            Some(resume_revision.saturating_sub(1)),
-                        )
+                        .snapshot_for_subscription(connection_id, request.subscription_id)
                         .await
                     {
                         Ok(snapshot) => Response::PaneStateLag(Box::new(PaneStateLagResponse {
@@ -308,8 +303,36 @@ impl RequestHandler {
         self.pane_state_notify.notify_waiters();
     }
 
+    #[cfg(test)]
     pub(in crate::handler) fn reopen_pane_state(&self, pane_id: PaneId) {
         self.lock_pane_state_journal().reopen_pane(pane_id);
+    }
+
+    pub(in crate::handler) fn record_pane_respawn_boundary(&self, pane_id: PaneId) {
+        let recorded_close = {
+            let mut journal = self.lock_pane_state_journal();
+            let recorded_close = journal.mark_pane_closed(pane_id);
+            if recorded_close {
+                let revision = journal.push(
+                    pane_id,
+                    None,
+                    PaneStateChange::Closed {
+                        reason: PaneStateClosedReason::Killed,
+                    },
+                );
+                journal.remember_pane_closed_event(
+                    pane_id,
+                    PaneStateClosedReason::Killed,
+                    revision,
+                );
+            }
+            journal.reopen_pane(pane_id);
+            recorded_close
+        };
+        self.remove_foreground_state_cache(pane_id);
+        if recorded_close {
+            self.pane_state_notify.notify_waiters();
+        }
     }
 
     pub(in crate::handler) fn record_panes_closed_as_killed(&self, pane_ids: &[PaneId]) {
@@ -424,48 +447,54 @@ impl RequestHandler {
         &self,
         connection_id: u64,
         subscription_id: PaneStateSubscriptionId,
-        closed_lag_revision: Option<u64>,
     ) -> Result<PaneStateSnapshot, RmuxError> {
-        let info = {
-            let journal = self.lock_pane_state_journal();
-            journal
-                .subscription_info(connection_id, subscription_id)
-                .map_err(|message| RmuxError::Server(message.to_owned()))?
-                .ok_or_else(|| RmuxError::Server("subscription not found".to_owned()))?
-        };
-
-        if info.closed {
-            let revision = closed_lag_revision
-                .unwrap_or_else(|| self.lock_pane_state_journal().current_revision());
-            // Kept-dead panes (remain-on-exit) are still present in state:
-            // report their real title/options instead of a fabricated blank.
-            let state = self.state.lock().await;
-            if let Some(target) = pane_target_for_pane_id(&state, info.pane_id) {
-                let (mut snapshot, _foreground_seed) = pane_state_snapshot_locked(
-                    &state,
-                    &target,
-                    info.pane_id,
-                    info.include,
-                    revision,
-                );
-                snapshot.foreground = None;
-                return Ok(snapshot);
-            }
-            return Ok(PaneStateSnapshot {
-                revision,
-                title: info.include.title.then(String::new),
-                options: Vec::new(),
-                foreground: None,
-            });
-        }
-
         let (mut snapshot, foreground_seed) = {
             let state = self.state.lock().await;
-            let target = pane_target_for_pane_id(&state, info.pane_id).ok_or_else(|| {
-                RmuxError::Server(format!("pane {} not found", info.pane_id.as_u32()))
-            })?;
-            let revision = self.lock_pane_state_journal().current_revision();
-            pane_state_snapshot_locked(&state, &target, info.pane_id, info.include, revision)
+            // Pane lifecycle mutations use the same state -> journal lock
+            // order. Reading both while state is held prevents a kill from
+            // leaving an open subscription paired with an already-removed
+            // pane during lag rebase.
+            let (info, revision) = {
+                let journal = self.lock_pane_state_journal();
+                let info = journal
+                    .subscription_info(connection_id, subscription_id)
+                    .map_err(|message| RmuxError::Server(message.to_owned()))?
+                    .ok_or_else(|| RmuxError::Server("subscription not found".to_owned()))?;
+                (info, journal.current_revision())
+            };
+
+            match pane_target_for_pane_id(&state, info.pane_id) {
+                Some(target) => {
+                    let (mut snapshot, foreground_seed) = pane_state_snapshot_locked(
+                        &state,
+                        &target,
+                        info.pane_id,
+                        info.include,
+                        revision,
+                    );
+                    if info.closed {
+                        snapshot.foreground = None;
+                        (snapshot, None)
+                    } else {
+                        (snapshot, foreground_seed)
+                    }
+                }
+                None if info.closed => (
+                    PaneStateSnapshot {
+                        revision,
+                        title: info.include.title.then(String::new),
+                        options: Vec::new(),
+                        foreground: None,
+                    },
+                    None,
+                ),
+                None => {
+                    return Err(RmuxError::Server(format!(
+                        "pane {} not found",
+                        info.pane_id.as_u32()
+                    )))
+                }
+            }
         };
         if let Some(seed) = foreground_seed {
             let foreground = probe_foreground(&seed);
@@ -473,6 +502,17 @@ impl RequestHandler {
             snapshot.foreground = Some(foreground);
         }
         Ok(snapshot)
+    }
+}
+
+fn pane_state_subscription_error(error: PaneStateSubscriptionError) -> RmuxError {
+    match error {
+        PaneStateSubscriptionError::Limit(error) => {
+            super::subscription_support::pane_state_subscription_limit_error(error)
+        }
+        PaneStateSubscriptionError::Capacity { limit } => RmuxError::Server(format!(
+            "pane state subscription capacity exceeded (limit {limit})"
+        )),
     }
 }
 
@@ -491,8 +531,8 @@ fn pane_state_snapshot_locked(
     });
     let options = if include.options {
         state
-            .options
-            .explicit_entries_for_scope(&OptionScopeSelector::Pane(target.clone()))
+            .pane_explicit_option_entries(target)
+            .unwrap_or_default()
             .into_iter()
             .map(|(name, value)| PaneOptionEntry { name, value })
             .collect()

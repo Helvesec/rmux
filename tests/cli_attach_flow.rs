@@ -870,7 +870,8 @@ fn attach_session_display_panes_renders_overlay_to_the_real_client() -> Result<(
     std::thread::sleep(Duration::from_millis(200));
     drain_attach_output(attach.master_mut())?;
 
-    assert_success(&harness.run(&["display-panes", "-t", "alpha"])?);
+    let attach_pid = attach.child_mut().id().to_string();
+    assert_success(&harness.run(&["display-panes", "-t", attach_pid.as_str()])?);
 
     let overlay = read_until_contains_all(attach.master_mut(), &["\x1b[?25l", "x"], IO_TIMEOUT)?;
     assert!(

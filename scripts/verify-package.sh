@@ -173,6 +173,8 @@ grep -q '"package_layout"[[:space:]]*:[[:space:]]*"rmux-package-v2"' "$metadata"
 if [ "$require_release_artifact" -eq 1 ]; then
   grep -q '"release_artifact"[[:space:]]*:[[:space:]]*true' "$metadata" ||
     die "metadata release_artifact is not true"
+  grep -q '"configuration"[[:space:]]*:[[:space:]]*"release"' "$metadata" ||
+    die "release artifact metadata configuration is not release"
 fi
 
 if [ "$run_binary" -eq 1 ]; then

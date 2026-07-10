@@ -11,6 +11,8 @@ pub const INVALID_SORT_ORDER: &str = "invalid sort order";
 
 mod box_lines;
 mod buffers;
+/// Shared tmux-compatible `list-commands` inventory and renderer.
+pub mod command_inventory;
 pub mod command_parser;
 pub mod command_queue;
 mod dec_modes;

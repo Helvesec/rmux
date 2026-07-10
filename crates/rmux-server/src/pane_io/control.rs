@@ -372,11 +372,13 @@ pub(super) async fn apply_pending_attach_controls(
             }
             Ok(AttachControl::LockShellCommand(command)) => {
                 *locked = true;
+                emit_attach_stop(stream, current_target).await?;
                 emit_attach_message(stream, &AttachMessage::LockShellCommand(command)).await?;
                 should_drop_output = true;
             }
             Ok(AttachControl::Suspend) => {
                 *locked = true;
+                emit_attach_stop(stream, current_target).await?;
                 emit_attach_message(stream, &AttachMessage::Suspend).await?;
                 should_drop_output = true;
             }

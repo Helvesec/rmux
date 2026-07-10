@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use rmux_proto::{
     decode_attach_data_frame, encode_attach_data, encode_attach_data_into_slice,
-    encode_attach_message, AttachFrameDecoder, AttachMessage, RmuxError, TerminalGeometry,
-    TerminalSize, ATTACH_DATA_HEADER_LEN,
+    encode_attach_message, AttachFrameDecoder, AttachMessage, AttachShellCommand, RmuxError,
+    TerminalGeometry, TerminalSize, ATTACH_DATA_HEADER_LEN,
 };
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use rustix::process::{kill_process, Signal};
@@ -351,6 +351,13 @@ where
             return Ok(());
         }
 
+        // The server can request a lock or suspend while this thread is
+        // asleep in poll. Recheck after the wakeup and before touching the
+        // shared terminal input so the lock command remains the sole reader.
+        if locked.load(Ordering::SeqCst) {
+            continue;
+        }
+
         let ready = fds[0].revents();
         if ready.is_empty() {
             continue;
@@ -497,10 +504,7 @@ where
                         &mut pending_render_started_at,
                     )?;
                     locked.store(true, Ordering::SeqCst);
-                    send_attach_action(
-                        &event_tx,
-                        ClientAttachAction::Lock(command.command().to_owned()),
-                    )?;
+                    send_attach_action(&event_tx, ClientAttachAction::LockShell(command))?;
                 }
                 AttachMessage::Suspend => {
                     flush_pending_render_state(
@@ -538,10 +542,7 @@ where
                         &mut pending_render_started_at,
                     )?;
                     closed.store(true, Ordering::SeqCst);
-                    send_attach_action(
-                        &event_tx,
-                        ClientAttachAction::DetachExec(command.command().to_owned()),
-                    )?;
+                    send_attach_action(&event_tx, ClientAttachAction::DetachExecShell(command))?;
                     return Ok(());
                 }
                 AttachMessage::Unlock => {
@@ -759,6 +760,20 @@ fn handle_attach_action(
             locked.store(false, Ordering::SeqCst);
             Ok(())
         }
+        ClientAttachAction::LockShell(command) => {
+            let Some(raw_terminal) = raw_terminal else {
+                locked.store(false, Ordering::SeqCst);
+                return Err(ClientError::Protocol(RmuxError::Decode(
+                    "received unexpected lock request without a managed terminal".to_owned(),
+                )));
+            };
+            raw_terminal
+                .run_lock_shell_command(&command)
+                .map_err(ClientError::from)?;
+            write_attach_message(lock_stream, AttachMessage::Unlock)?;
+            locked.store(false, Ordering::SeqCst);
+            Ok(())
+        }
         ClientAttachAction::Suspend => {
             let Some(raw_terminal) = raw_terminal else {
                 locked.store(false, Ordering::SeqCst);
@@ -787,6 +802,16 @@ fn handle_attach_action(
             };
             raw_terminal
                 .run_detach_exec_command(&command)
+                .map_err(ClientError::from)
+        }
+        ClientAttachAction::DetachExecShell(command) => {
+            let Some(raw_terminal) = raw_terminal else {
+                return Err(ClientError::Protocol(RmuxError::Decode(
+                    "received unexpected detach exec request without a managed terminal".to_owned(),
+                )));
+            };
+            raw_terminal
+                .run_detach_exec_shell_command(&command)
                 .map_err(ClientError::from)
         }
     }
@@ -850,9 +875,11 @@ fn shutdown_attach_writes(stream: &UnixStream) -> std::result::Result<(), Client
 #[derive(Debug)]
 enum ClientAttachAction {
     Lock(String),
+    LockShell(AttachShellCommand),
     Suspend,
     DetachKill,
     DetachExec(String),
+    DetachExecShell(AttachShellCommand),
 }
 
 #[derive(Debug)]

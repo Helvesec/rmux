@@ -16,6 +16,23 @@ use super::{
 };
 
 impl HandlerState {
+    pub(crate) fn pane_ids_no_longer_referenced(
+        &self,
+        pane_ids: impl IntoIterator<Item = PaneId>,
+    ) -> Vec<PaneId> {
+        let mut seen = std::collections::HashSet::new();
+        pane_ids
+            .into_iter()
+            .filter(|pane_id| seen.insert(*pane_id))
+            .filter(|pane_id| {
+                !self
+                    .sessions
+                    .iter()
+                    .any(|(_, session)| session.window_index_for_pane_id(*pane_id).is_some())
+            })
+            .collect()
+    }
+
     pub(crate) fn set_pane_input_disabled(
         &mut self,
         target: &PaneTarget,

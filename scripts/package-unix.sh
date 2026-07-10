@@ -304,7 +304,7 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
   git_dirty=true
 fi
 release_artifact=true
-if [ "$skip_build" -eq 1 ] || [ "$git_dirty" = true ]; then
+if [ "$configuration" != "release" ] || [ "$skip_build" -eq 1 ] || [ "$git_dirty" = true ]; then
   release_artifact=false
 fi
 generated_at_utc="$(commit_time_iso)"

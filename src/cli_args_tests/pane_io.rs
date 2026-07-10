@@ -76,7 +76,7 @@ fn display_panes_accepts_duration_no_command_and_template_flags() {
             assert!(args.non_blocking);
             assert_eq!(args.duration_ms, Some(250));
             assert!(args.no_command);
-            assert_eq!(target_text(&args.target), "alpha");
+            assert_eq!(args.target_client.as_deref(), Some("alpha"));
             assert_eq!(
                 args.template_command().as_deref(),
                 Some("select-pane -t %%")

@@ -2,8 +2,8 @@
 """Compare RMUX perf JSON artifacts.
 
 This is intentionally dependency-free so it can run in release worktrees and CI
-without preparing a Python environment. It accepts the schema-1 output from
-scripts/perf-bench.sh and the schema-2 wrapper output from scripts/perf-baseline.sh.
+without preparing a Python environment. It accepts the provenance-bound schema-2
+output from scripts/perf-bench.sh and its schema-2 baseline wrapper.
 """
 
 from __future__ import annotations
@@ -13,8 +13,20 @@ import json
 import math
 import statistics
 import sys
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from perf_artifact import (
+    ArtifactIdentity,
+    CURRENT_GENERATOR,
+    CURRENT_KIND,
+    CURRENT_SCHEMA,
+    load_payload,
+    sha256_file,
+    validate_current_identity,
+)
 
 
 DEFAULT_ALPHA = 0.01
@@ -34,10 +46,7 @@ class Metric:
 @dataclass(frozen=True)
 class Artifact:
     path: Path
-    schema: object
-    kind: str | None
-    platform: str | None
-    machine: str | None
+    identity: ArtifactIdentity
     metrics: dict[str, Metric]
 
 
@@ -57,12 +66,7 @@ class MetricDiff:
 
 
 def load_artifact(path: Path) -> Artifact:
-    with path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-
-    source = payload.get("source", payload)
-    if not isinstance(source, dict):
-        raise ValueError(f"{path}: source payload is not an object")
+    _, source, identity = load_payload(path)
     metrics = source.get("metrics")
     if not isinstance(metrics, list):
         raise ValueError(f"{path}: missing metrics array")
@@ -83,46 +87,43 @@ def load_artifact(path: Path) -> Artifact:
             mean_ms=float(item.get("mean_ms", statistics.fmean(samples))),
         )
 
-    environment = payload.get("environment") if isinstance(payload, dict) else None
-    if not isinstance(environment, dict):
-        environment = {}
-    platform = first_non_empty(environment.get("platform"), source.get("platform"), payload.get("platform"))
-    machine = first_non_empty(environment.get("machine"), source.get("machine"), payload.get("machine"))
     return Artifact(
         path=path,
-        schema=payload.get("schema"),
-        kind=payload.get("kind"),
-        platform=platform,
-        machine=machine,
+        identity=identity,
         metrics=result,
     )
-
-
-def first_non_empty(*values: object) -> str | None:
-    for value in values:
-        if isinstance(value, str) and value.strip():
-            return value.strip().lower()
-    return None
 
 
 def validate_artifact_pair(baseline: Artifact, current: Artifact) -> None:
     if baseline.path.resolve() == current.path.resolve():
         raise ValueError("baseline and current perf JSON paths must be distinct")
-    if current.kind == "rmux-perf-baseline":
-        raise ValueError("current perf JSON must be a fresh perf-bench artifact, not a baseline wrapper")
-    if baseline.platform is None:
+    if baseline.identity.kind != "rmux-perf-baseline":
+        raise ValueError(f"{baseline.path}: baseline kind must be rmux-perf-baseline")
+    if baseline.identity.platform is None:
         raise ValueError(f"{baseline.path}: missing platform metadata")
-    if current.platform is None:
+    if current.identity.platform is None:
         raise ValueError(f"{current.path}: missing platform metadata")
-    if baseline.platform != current.platform:
+    if baseline.identity.platform != current.identity.platform:
         raise ValueError(
             "perf platform mismatch: "
-            f"baseline={baseline.platform} current={current.platform}; regenerate a same-platform baseline/current pair"
+            f"baseline={baseline.identity.platform} current={current.identity.platform}; "
+            "regenerate a same-platform baseline/current pair"
         )
-    if baseline.machine is not None and current.machine is not None and baseline.machine != current.machine:
+    if baseline.identity.machine is None or current.identity.machine is None:
+        raise ValueError("baseline and current perf artifacts must include machine metadata")
+    if baseline.identity.machine != current.identity.machine:
         raise ValueError(
             "perf machine mismatch: "
-            f"baseline={baseline.machine} current={current.machine}; regenerate a same-machine baseline/current pair"
+            f"baseline={baseline.identity.machine} current={current.identity.machine}; "
+            "regenerate a same-machine baseline/current pair"
+        )
+    if baseline.identity.host_fingerprint is None or current.identity.host_fingerprint is None:
+        raise ValueError("baseline and current perf artifacts must include host fingerprints")
+    if baseline.identity.host_fingerprint != current.identity.host_fingerprint:
+        raise ValueError(
+            "perf host fingerprint mismatch: "
+            f"baseline={baseline.identity.host_fingerprint} "
+            f"current={current.identity.host_fingerprint}; regenerate on the baseline owner host"
         )
 
 
@@ -409,22 +410,14 @@ def run_self_test() -> None:
     else:
         raise AssertionError("partial current with missing baseline metrics must fail")
 
-    base_artifact = Artifact(
-        path=Path("baseline.json"),
-        schema=2,
-        kind="rmux-perf-baseline",
-        platform="darwin",
-        machine="arm64",
-        metrics={"stable": unchanged_base},
+    base_identity = synthetic_identity(
+        Path("baseline.json"), kind="rmux-perf-baseline", platform="darwin", machine="arm64"
     )
-    current_artifact = Artifact(
-        path=Path("current.json"),
-        schema=1,
-        kind=None,
-        platform="linux",
-        machine="x86_64",
-        metrics={"stable": unchanged_current},
+    current_identity = synthetic_identity(
+        Path("current.json"), kind=CURRENT_KIND, platform="linux", machine="x86_64"
     )
+    base_artifact = Artifact(Path("baseline.json"), base_identity, {"stable": unchanged_base})
+    current_artifact = Artifact(Path("current.json"), current_identity, {"stable": unchanged_current})
     try:
         validate_artifact_pair(base_artifact, current_artifact)
     except ValueError as error:
@@ -432,20 +425,75 @@ def run_self_test() -> None:
     else:
         raise AssertionError("platform mismatch must fail closed")
 
-    baseline_as_current = Artifact(
-        path=Path("current.json"),
-        schema=2,
-        kind="rmux-perf-baseline",
-        platform="darwin",
-        machine="arm64",
-        metrics={"stable": unchanged_current},
+    run_identity_self_test()
+
+
+def synthetic_identity(path: Path, *, kind: str, platform: str, machine: str) -> ArtifactIdentity:
+    return ArtifactIdentity(
+        path=path,
+        schema=CURRENT_SCHEMA,
+        kind=kind,
+        timestamp="2026-07-10T00:00:00Z",
+        platform=platform,
+        machine=machine,
+        host_fingerprint="host-a",
+        git_commit="a" * 40,
+        git_describe="v0.9.0",
+        git_dirty=False,
+        binary_path="/tmp/rmux",
+        binary_sha256="b" * 64,
+        binary_version="rmux 0.9.0",
+        binary_configuration="release",
+        provenance_generator=CURRENT_GENERATOR,
+        provenance_invocation="self-test",
+        provenance_expected_commit="a" * 40,
+        provenance_expected_platform=platform,
+        provenance_build_mode="rebuilt",
     )
-    try:
-        validate_artifact_pair(base_artifact, baseline_as_current)
-    except ValueError as error:
-        assert "not a baseline wrapper" in str(error)
-    else:
-        raise AssertionError("baseline wrapper used as current must fail closed")
+
+
+def run_identity_self_test() -> None:
+    now = datetime(2026, 7, 10, tzinfo=timezone.utc)
+    with tempfile.TemporaryDirectory(prefix="rmux-perf-artifact-") as directory:
+        binary = Path(directory) / "rmux"
+        binary.write_bytes(b"release-binary")
+        current = replace(
+            synthetic_identity(binary.with_suffix(".json"), kind=CURRENT_KIND, platform="linux", machine="x86_64"),
+            timestamp=now.isoformat().replace("+00:00", "Z"),
+            binary_path=str(binary.resolve()),
+            binary_sha256=sha256_file(binary),
+        )
+        validation_args = {
+            "expected_commit": "a" * 40,
+            "expected_platform": "linux",
+            "expected_machine": "x86_64",
+            "expected_host_fingerprint": "host-a",
+            "expected_provenance": "self-test",
+            "expected_binary_version": "rmux 0.9.0",
+            "max_age_seconds": 3600,
+            "now": now,
+        }
+        validate_current_identity(current, **validation_args)
+
+        invalid_cases = [
+            (replace(current, git_commit="c" * 40), "Git SHA mismatch"),
+            (replace(current, git_dirty=True), "dirty worktree"),
+            (replace(current, host_fingerprint="host-b"), "host fingerprint mismatch"),
+            (replace(current, provenance_invocation="stale-run"), "provenance invocation mismatch"),
+            (replace(current, provenance_build_mode="reused"), "build mode mismatch"),
+            (
+                replace(current, timestamp=(now - timedelta(hours=2)).isoformat()),
+                "artifact is stale",
+            ),
+            (replace(current, binary_sha256="d" * 64), "binary digest mismatch"),
+        ]
+        for invalid, expected_error in invalid_cases:
+            try:
+                validate_current_identity(invalid, **validation_args)
+            except ValueError as error:
+                assert expected_error in str(error), (expected_error, error)
+            else:
+                raise AssertionError(f"invalid current identity did not fail: {expected_error}")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -461,6 +509,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--fail-on-regression", action="store_true")
+    parser.add_argument("--expected-current-commit")
+    parser.add_argument("--expected-current-platform")
+    parser.add_argument("--expected-current-machine")
+    parser.add_argument("--expected-current-host-fingerprint")
+    parser.add_argument("--expected-current-provenance")
+    parser.add_argument("--expected-current-binary-version")
+    parser.add_argument("--max-current-age-seconds", type=int, default=21600)
     parser.add_argument("--self-test", action="store_true")
     return parser.parse_args(argv)
 
@@ -479,6 +534,27 @@ def main(argv: list[str]) -> int:
 
     baseline = load_artifact(args.baseline)
     current = load_artifact(args.current)
+    required_identity_args = {
+        "--expected-current-commit": args.expected_current_commit,
+        "--expected-current-platform": args.expected_current_platform,
+        "--expected-current-machine": args.expected_current_machine,
+        "--expected-current-host-fingerprint": args.expected_current_host_fingerprint,
+        "--expected-current-provenance": args.expected_current_provenance,
+        "--expected-current-binary-version": args.expected_current_binary_version,
+    }
+    missing = [name for name, value in required_identity_args.items() if not value]
+    if missing:
+        raise SystemExit("missing required current identity option(s): " + ", ".join(missing))
+    validate_current_identity(
+        current.identity,
+        expected_commit=args.expected_current_commit,
+        expected_platform=args.expected_current_platform,
+        expected_machine=args.expected_current_machine,
+        expected_host_fingerprint=args.expected_current_host_fingerprint,
+        expected_provenance=args.expected_current_provenance,
+        expected_binary_version=args.expected_current_binary_version,
+        max_age_seconds=args.max_current_age_seconds,
+    )
     validate_artifact_pair(baseline, current)
     diffs = compare_metrics(
         baseline.metrics,

@@ -95,13 +95,14 @@ async fn display_panes_sends_overlay_to_attached_session_without_waiting_for_cle
     handler.register_attach(42, alpha.clone(), control_tx).await;
 
     let response = handler
-        .handle(Request::DisplayPanes(DisplayPanesRequest {
+        .handle(Request::DisplayPanes(Box::new(DisplayPanesRequest {
             target: alpha.clone(),
             duration_ms: None,
             non_blocking: false,
             no_command: false,
             template: None,
-        }))
+            target_client: None,
+        })))
         .await;
 
     assert_eq!(
@@ -162,13 +163,14 @@ async fn display_panes_counts_only_labels_that_were_rendered() {
     handler.register_attach(43, alpha.clone(), control_tx).await;
 
     let response = handler
-        .handle(Request::DisplayPanes(DisplayPanesRequest {
+        .handle(Request::DisplayPanes(Box::new(DisplayPanesRequest {
             target: alpha.clone(),
             duration_ms: None,
             non_blocking: false,
             no_command: false,
             template: None,
-        }))
+            target_client: None,
+        })))
         .await;
 
     assert_eq!(

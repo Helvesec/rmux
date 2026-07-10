@@ -359,6 +359,11 @@ jobs:
           RMUX_FROZEN_TMUX: ${{ runner.temp }}/rmux-oracle/tmux
           RMUX_REQUIRE_TMUX: "1"
           RMUX_PERF_AUTO_CURRENT: "1"
+          RMUX_PERF_GATE_MODE: portable-budget
+          RMUX_PERF_EXPECTED_GIT_SHA: ${{ github.sha }}
+          RMUX_PERF_EXPECTED_PLATFORM: linux
+          RMUX_PERF_EXPECTED_PROVENANCE: github-actions:${{ github.repository }}:${{ github.workflow }}:${{ github.job }}:${{ github.run_id }}:${{ github.run_attempt }}
+          RMUX_PERF_MAX_CURRENT_AGE_SECONDS: "21600"
         run: scripts/release-review-gate.sh --skip-package --target-dir target/release-review-ci
 
   snap-package:
@@ -451,6 +456,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       RUST_MIN_STACK: "8388608"
+      RMUX_PERF_EXPECTED_GIT_SHA: ${{ github.sha }}
+      RMUX_PERF_EXPECTED_PLATFORM: linux
+      RMUX_PERF_EXPECTED_PROVENANCE: github-actions:${{ github.repository }}:${{ github.workflow }}:${{ github.job }}:${{ github.run_id }}:${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 

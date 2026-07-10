@@ -216,6 +216,13 @@ impl RequestHandler {
         };
         let group_target = request.group_target;
         let working_directory = request.working_directory;
+        #[cfg(windows)]
+        if working_directory
+            .as_ref()
+            .is_some_and(|path| format_references_pane_pid(Some(path.as_str())))
+        {
+            self.wait_for_windows_deferred_all_pane_pids().await;
+        }
         let requester_cwd_pane_id = if working_directory
             .as_ref()
             .is_some_and(|path| path.contains("#{"))
@@ -365,6 +372,19 @@ impl RequestHandler {
                     .session_mut(&session_name)
                     .expect("newly created session must accept cwd assignment");
                 session.set_cwd((!rendered.is_empty()).then(|| PathBuf::from(rendered)));
+            }
+
+            if let Some(template_session) = created_group
+                .as_ref()
+                .and_then(|created| created.template_session.as_ref())
+                .and_then(|template| state.sessions.session(template))
+                .cloned()
+            {
+                if let Err(error) =
+                    state.synchronize_pane_alias_options_from_session(&template_session)
+                {
+                    return Response::Error(ErrorResponse { error });
+                }
             }
 
             let needs_terminal = created_group
@@ -555,23 +575,22 @@ impl RequestHandler {
                 }
             }
 
+            let now = tokio::time::Instant::now();
+            if now < input_grace_deadline {
+                pending = None;
+                tokio::time::sleep(input_grace_deadline - now).await;
+                continue;
+            }
+
             let drained = {
                 let mut state = self.state.lock().await;
-                state.drain_deferred_initial_pane_input(&runtime_session_name, pane_id)
+                state.take_deferred_initial_pane_input_or_finish(&runtime_session_name, pane_id)
             };
             match drained {
                 Ok(Some(next)) => {
                     pending = Some(next);
                 }
                 Ok(None) => {
-                    let now = tokio::time::Instant::now();
-                    if now < input_grace_deadline {
-                        pending = None;
-                        tokio::time::sleep(input_grace_deadline - now).await;
-                        continue;
-                    }
-                    let mut state = self.state.lock().await;
-                    state.finish_deferred_initial_pane_input(&runtime_session_name, pane_id);
                     break;
                 }
                 Err(error) => {
@@ -842,6 +861,8 @@ impl RequestHandler {
                 || Response::KillSession(KillSessionResponse { existed: true }),
                 |error| Response::Error(ErrorResponse { error }),
             );
+            let removed_pane_ids = state.pane_ids_no_longer_referenced(removed_pane_ids);
+            self.record_panes_closed_as_killed(&removed_pane_ids);
             (response, queued_events, removed_pane_ids, removed_sessions)
         };
 
@@ -852,7 +873,6 @@ impl RequestHandler {
         let _ = &removed_sessions;
         if !removed_pane_ids.is_empty() {
             self.forget_pane_snapshot_coalescers(&removed_pane_ids);
-            self.record_panes_closed_as_killed(&removed_pane_ids);
         }
         for event in queued_lifecycle_events {
             self.emit_prepared(event);

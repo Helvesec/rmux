@@ -7,8 +7,10 @@ use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
 
 use super::{
-    ensure_control_newline, extract_complete_control_lines, forward_control, ActiveControlCommand,
-    ControlCommandResult, ControlLifecycle, ControlOutputQueue, ControlServerEvent,
+    append_control_input, ensure_control_newline, extract_complete_control_lines, forward_control,
+    ActiveControlCommand, ControlCommandResult, ControlLifecycle, ControlOutputQueue,
+    ControlServerEvent, ControlUpgradeInput, CONTROL_SERVER_EVENT_CAPACITY, MAX_CONTROL_LINE_BYTES,
+    MAX_QUEUED_CONTROL_LINES,
 };
 use crate::daemon::ShutdownHandle;
 use crate::handler::RequestHandler;
@@ -56,6 +58,40 @@ fn multiple_empty_lines_are_preserved() {
 }
 
 #[test]
+fn control_input_rejects_unterminated_oversize_lines() {
+    let mut input_buffer = Vec::new();
+    let mut queued_lines = std::collections::VecDeque::new();
+    let mut queued_bytes = 0;
+    let oversized = vec![b'x'; MAX_CONTROL_LINE_BYTES + 1];
+
+    let error = append_control_input(
+        &mut input_buffer,
+        &mut queued_lines,
+        &mut queued_bytes,
+        &oversized,
+    )
+    .expect_err("unterminated oversized input must be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn control_input_rejects_excessive_queued_lines() {
+    let mut input_buffer = Vec::new();
+    let mut queued_lines = std::collections::VecDeque::new();
+    let mut queued_bytes = 0;
+    let input = "x\n".repeat(MAX_QUEUED_CONTROL_LINES + 1);
+
+    let error = append_control_input(
+        &mut input_buffer,
+        &mut queued_lines,
+        &mut queued_bytes,
+        input.as_bytes(),
+    )
+    .expect_err("an excessive command backlog must be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
 fn stdout_lines_are_newline_terminated() {
     assert_eq!(ensure_control_newline(b"hello".to_vec()), b"hello\n");
     assert_eq!(ensure_control_newline(b"hello\n".to_vec()), b"hello\n");
@@ -86,7 +122,7 @@ async fn notifications_wait_until_after_the_active_command_block() {
     let handler = Arc::new(RequestHandler::new());
     let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
     let (_shutdown_tx, shutdown_rx) = watch::channel(());
-    let (server_event_tx, server_event_rx) = mpsc::unbounded_channel();
+    let (server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
     let _requester_access_guard = handler.begin_detached_requester_access(4242, true);
@@ -95,7 +131,7 @@ async fn notifications_wait_until_after_the_active_command_block() {
         server_stream,
         Arc::clone(&handler),
         4242,
-        b"wait-for control-test-block\n\n".to_vec(),
+        ControlUpgradeInput::new(b"wait-for control-test-block\n\n".to_vec(), 1),
         shutdown_rx,
         server_event_rx,
         ControlLifecycle {
@@ -121,6 +157,7 @@ async fn notifications_wait_until_after_the_active_command_block() {
         .send(ControlServerEvent::Notification(
             "%message command-notification-finished".to_owned(),
         ))
+        .await
         .expect("notification send succeeds");
     drop(server_event_tx);
     let response = handler
@@ -158,7 +195,7 @@ async fn eof_on_empty_input_emits_bare_exit() {
     let handler = Arc::new(RequestHandler::new());
     let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
     let (_shutdown_tx, shutdown_rx) = watch::channel(());
-    let (_server_event_tx, server_event_rx) = mpsc::unbounded_channel();
+    let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
 
@@ -166,7 +203,7 @@ async fn eof_on_empty_input_emits_bare_exit() {
         server_stream,
         Arc::clone(&handler),
         4242,
-        Vec::new(),
+        ControlUpgradeInput::new(Vec::new(), 0),
         shutdown_rx,
         server_event_rx,
         ControlLifecycle {
@@ -198,7 +235,7 @@ async fn eof_after_command_block_appends_exit() {
     let handler = Arc::new(RequestHandler::new());
     let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
     let (_shutdown_tx, shutdown_rx) = watch::channel(());
-    let (_server_event_tx, server_event_rx) = mpsc::unbounded_channel();
+    let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
 
@@ -206,7 +243,7 @@ async fn eof_after_command_block_appends_exit() {
         server_stream,
         Arc::clone(&handler),
         4242,
-        b"display-message -p ok\n".to_vec(),
+        ControlUpgradeInput::new(b"display-message -p ok\n".to_vec(), 1),
         shutdown_rx,
         server_event_rx,
         ControlLifecycle {
@@ -261,7 +298,7 @@ async fn eof_while_finite_control_command_is_pending_waits_for_completion() {
     let handler = Arc::new(RequestHandler::new());
     let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
     let (_shutdown_tx, shutdown_rx) = watch::channel(());
-    let (_server_event_tx, server_event_rx) = mpsc::unbounded_channel();
+    let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
     let _requester_access_guard = handler.begin_detached_requester_access(4242, true);
@@ -270,7 +307,10 @@ async fn eof_while_finite_control_command_is_pending_waits_for_completion() {
         server_stream,
         Arc::clone(&handler),
         4242,
-        b"if-shell 'sleep 0.2; true' 'display-message -p ok'\n".to_vec(),
+        ControlUpgradeInput::new(
+            b"if-shell 'sleep 0.2; true' 'display-message -p ok'\n".to_vec(),
+            1,
+        ),
         shutdown_rx,
         server_event_rx,
         ControlLifecycle {
@@ -330,7 +370,7 @@ async fn stdin_command_after_upgrade_uses_flags_one_after_initial_ack() {
     let handler = Arc::new(RequestHandler::new());
     let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
     let (_shutdown_tx, shutdown_rx) = watch::channel(());
-    let (_server_event_tx, server_event_rx) = mpsc::unbounded_channel();
+    let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
 
@@ -338,7 +378,7 @@ async fn stdin_command_after_upgrade_uses_flags_one_after_initial_ack() {
         server_stream,
         Arc::clone(&handler),
         4242,
-        Vec::new(),
+        ControlUpgradeInput::new(Vec::new(), 0),
         shutdown_rx,
         server_event_rx,
         ControlLifecycle {
@@ -389,11 +429,64 @@ async fn stdin_command_after_upgrade_uses_flags_one_after_initial_ack() {
 }
 
 #[tokio::test]
+async fn fragmented_argv_command_stays_initial_without_synthetic_ack() {
+    let handler = Arc::new(RequestHandler::new());
+    let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
+    let closing = Arc::new(AtomicBool::new(false));
+    let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
+
+    let control_task = tokio::spawn(forward_control(
+        server_stream,
+        Arc::clone(&handler),
+        4242,
+        ControlUpgradeInput::new(Vec::new(), 1),
+        shutdown_rx,
+        server_event_rx,
+        ControlLifecycle {
+            closing: Arc::clone(&closing),
+            shutdown_handle,
+        },
+    ));
+
+    for fragment in [b"display-message -p ".as_slice(), b"initial", b"\n"] {
+        client_stream
+            .write_all(fragment)
+            .await
+            .expect("fragment writes");
+        tokio::task::yield_now().await;
+    }
+    client_stream
+        .shutdown()
+        .await
+        .expect("client write half closes");
+
+    let mut rendered = Vec::new();
+    read_control_to_end(&mut client_stream, &mut rendered).await;
+    control_task
+        .await
+        .expect("forward control task joins")
+        .expect("forward control succeeds");
+
+    let rendered = String::from_utf8(rendered).expect("utf-8 control stream");
+    let begins = parse_guard_lines(&rendered, "%begin ");
+    let ends = parse_guard_lines(&rendered, "%end ");
+    assert_eq!(begins.len(), 1, "no empty ACK is allowed: {rendered:?}");
+    assert_eq!(ends.len(), 1, "no empty ACK is allowed: {rendered:?}");
+    assert_eq!(begins[0].command_number, 1);
+    assert_eq!(begins[0].flags, 0);
+    assert_eq!(ends[0].command_number, 1);
+    assert_eq!(ends[0].flags, 0);
+    assert!(rendered.contains("initial\n"), "{rendered:?}");
+}
+
+#[tokio::test]
 async fn command_with_more_than_one_thousand_arguments_errors() {
     let handler = Arc::new(RequestHandler::new());
     let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
     let (_shutdown_tx, shutdown_rx) = watch::channel(());
-    let (_server_event_tx, server_event_rx) = mpsc::unbounded_channel();
+    let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
     let mut input = String::from("display-message");
@@ -407,7 +500,7 @@ async fn command_with_more_than_one_thousand_arguments_errors() {
         server_stream,
         Arc::clone(&handler),
         4242,
-        input.into_bytes(),
+        ControlUpgradeInput::new(input.into_bytes(), 1),
         shutdown_rx,
         server_event_rx,
         ControlLifecycle {
@@ -449,7 +542,7 @@ async fn nested_command_with_more_than_one_thousand_arguments_errors() {
     let handler = Arc::new(RequestHandler::new());
     let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
     let (_shutdown_tx, shutdown_rx) = watch::channel(());
-    let (_server_event_tx, server_event_rx) = mpsc::unbounded_channel();
+    let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
     let mut input = String::from("bind-key x { display-message");
@@ -463,7 +556,7 @@ async fn nested_command_with_more_than_one_thousand_arguments_errors() {
         server_stream,
         Arc::clone(&handler),
         4242,
-        input.into_bytes(),
+        ControlUpgradeInput::new(input.into_bytes(), 1),
         shutdown_rx,
         server_event_rx,
         ControlLifecycle {
@@ -505,7 +598,7 @@ async fn pending_control_command_waits_for_completion_without_execution_timeout(
     let handler = Arc::new(RequestHandler::new());
     let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
     let (_shutdown_tx, shutdown_rx) = watch::channel(());
-    let (_server_event_tx, server_event_rx) = mpsc::unbounded_channel();
+    let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
     let _requester_access_guard = handler.begin_detached_requester_access(4242, true);
@@ -514,7 +607,7 @@ async fn pending_control_command_waits_for_completion_without_execution_timeout(
         server_stream,
         Arc::clone(&handler),
         4242,
-        b"wait-for control-timeout-block\n\n".to_vec(),
+        ControlUpgradeInput::new(b"wait-for control-timeout-block\n\n".to_vec(), 1),
         shutdown_rx,
         server_event_rx,
         ControlLifecycle {
@@ -579,7 +672,7 @@ async fn eof_while_control_command_is_pending_closes_guard_and_exits() {
     let handler = Arc::new(RequestHandler::new());
     let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
     let (_shutdown_tx, shutdown_rx) = watch::channel(());
-    let (_server_event_tx, server_event_rx) = mpsc::unbounded_channel();
+    let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
     let _requester_access_guard = handler.begin_detached_requester_access(4242, true);
@@ -588,7 +681,7 @@ async fn eof_while_control_command_is_pending_closes_guard_and_exits() {
         server_stream,
         Arc::clone(&handler),
         4242,
-        b"wait-for control-eof-block\n".to_vec(),
+        ControlUpgradeInput::new(b"wait-for control-eof-block\n".to_vec(), 1),
         shutdown_rx,
         server_event_rx,
         ControlLifecycle {
@@ -709,7 +802,7 @@ async fn empty_line_input_emits_initial_frame_and_bare_exit() {
     let handler = Arc::new(RequestHandler::new());
     let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
     let (_shutdown_tx, shutdown_rx) = watch::channel(());
-    let (_server_event_tx, server_event_rx) = mpsc::unbounded_channel();
+    let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
 
@@ -717,7 +810,7 @@ async fn empty_line_input_emits_initial_frame_and_bare_exit() {
         server_stream,
         Arc::clone(&handler),
         4242,
-        b"\n".to_vec(),
+        ControlUpgradeInput::new(b"\n".to_vec(), 0),
         shutdown_rx,
         server_event_rx,
         ControlLifecycle {
@@ -746,7 +839,7 @@ async fn crlf_empty_line_also_emits_bare_exit() {
     let handler = Arc::new(RequestHandler::new());
     let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
     let (_shutdown_tx, shutdown_rx) = watch::channel(());
-    let (_server_event_tx, server_event_rx) = mpsc::unbounded_channel();
+    let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
 
@@ -754,7 +847,7 @@ async fn crlf_empty_line_also_emits_bare_exit() {
         server_stream,
         Arc::clone(&handler),
         4242,
-        b"\r\n".to_vec(),
+        ControlUpgradeInput::new(b"\r\n".to_vec(), 0),
         shutdown_rx,
         server_event_rx,
         ControlLifecycle {
@@ -785,7 +878,7 @@ async fn incomplete_trailing_line_is_discarded_on_eof() {
     let handler = Arc::new(RequestHandler::new());
     let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
     let (_shutdown_tx, shutdown_rx) = watch::channel(());
-    let (_server_event_tx, server_event_rx) = mpsc::unbounded_channel();
+    let (_server_event_tx, server_event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
 
@@ -793,7 +886,7 @@ async fn incomplete_trailing_line_is_discarded_on_eof() {
         server_stream,
         Arc::clone(&handler),
         4242,
-        b"display-message -p hello".to_vec(),
+        ControlUpgradeInput::new(b"display-message -p hello".to_vec(), 0),
         shutdown_rx,
         server_event_rx,
         ControlLifecycle {

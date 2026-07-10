@@ -875,6 +875,7 @@ async fn after_show_options_runs_without_triggering_nested_notify_hooks() {
                 value_only: false,
                 include_inherited: true,
                 quiet: false,
+                include_hooks: false,
             }))
             .await,
         Response::ShowOptions(_)

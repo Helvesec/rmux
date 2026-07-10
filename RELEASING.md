@@ -102,14 +102,20 @@ scripts/no-debug-assert-side-effects.sh
 RMUX_PERF_AUTO_CURRENT=1 scripts/release-review-gate.sh
 ```
 
-The perf comparator is enforced on release Linux and darwin machines with a
-committed same-platform baseline. Darwin uses
-`benches/perf/baselines/release-0.9.0.json`; Linux requires
+The perf comparator is enforced only on the machine that recorded the
+committed baseline: baselines and current runs carry a hashed
+`host_fingerprint` (from `/etc/machine-id` or the hostname, never stored in
+clear), and the gate compares timings only when the fingerprints match. Any
+other host — GitHub hosted runners included — reports an explicit
+`perf-comparator=skipped-host-mismatch` line (a `::warning::` annotation in
+CI) instead of failing on cross-machine noise or silently passing on it.
+Darwin uses `benches/perf/baselines/release-0.9.0.json`; Linux requires
 `benches/perf/baselines/release-0.9.0-linux.json` recorded with
-`scripts/perf-baseline.sh` on the Linux release machine before the release gate
-can pass. Other platforms without a committed same-class baseline report an
-explicit `perf-comparator=skipped-no-<platform>-baseline` line (a `::warning::`
-annotation in CI) instead of comparing cross-machine noise. The Windows
+`scripts/perf-baseline.sh` on the Linux release machine before the release
+gate can pass there, and a Linux baseline without a fingerprint fails closed.
+Platforms without a committed same-class baseline report
+`perf-comparator=skipped-no-<platform>-baseline`. Before tagging, the perf
+gate must have run green on each release machine that owns a baseline. The Windows
 ctrl-matrix portable smoke likewise cannot run in a
 non-interactive CI session: CI reports an explicit skip warning and the
 smoke must be run manually on an interactive Windows session before tagging.

@@ -2,7 +2,7 @@ use super::*;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use crate::control::{ControlModeUpgrade, ControlServerEvent};
+use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
 use crate::handler::ControlRegistration;
 use crate::outer_terminal::OuterTerminalContext;
 use rmux_os::identity::UserIdentity;
@@ -234,11 +234,12 @@ async fn parsed_queue_lock_client_defaults_to_current_client() {
 }
 
 async fn register_read_only_control_client(handler: &RequestHandler, requester_pid: u32) {
-    let (event_tx, _event_rx) = mpsc::unbounded_channel::<ControlServerEvent>();
+    let (event_tx, _event_rx) = mpsc::channel::<ControlServerEvent>(CONTROL_SERVER_EVENT_CAPACITY);
     handler
         .register_control_with_access(
             requester_pid,
             ControlModeUpgrade {
+                initial_command_count: 0,
                 mode: rmux_proto::ControlMode::Plain,
                 terminal_context: OuterTerminalContext::default(),
             },

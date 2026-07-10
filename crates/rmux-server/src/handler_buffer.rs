@@ -33,6 +33,7 @@ impl RequestHandler {
         requester_pid: u32,
         request: rmux_proto::SetBufferRequest,
     ) -> Response {
+        let target_client = request.target_client.clone();
         if let Some(new_name) = request.new_name {
             return match self.rename_buffer(request.name, new_name).await {
                 Ok(buffer_name) => Response::SetBuffer(SetBufferResponse { buffer_name }),
@@ -63,6 +64,7 @@ impl RequestHandler {
                                 requester_pid,
                                 "set-buffer",
                                 bytes,
+                                target_client.as_deref(),
                             )
                             .await;
                         }
@@ -239,6 +241,7 @@ impl RequestHandler {
         requester_pid: u32,
         request: rmux_proto::LoadBufferRequest,
     ) -> Response {
+        let target_client = request.target_client.clone();
         let resolved_path = resolve_buffer_path(&request.path, request.cwd.as_deref());
         let content = match fs::read(&resolved_path) {
             Ok(content) => content,
@@ -261,8 +264,13 @@ impl RequestHandler {
         match self.store_buffer(request.name, content).await {
             Ok(buffer_name) => {
                 if let Some(bytes) = clipboard_bytes.as_deref() {
-                    self.copy_bytes_to_attached_clipboard(requester_pid, "load-buffer", bytes)
-                        .await;
+                    self.copy_bytes_to_attached_clipboard(
+                        requester_pid,
+                        "load-buffer",
+                        bytes,
+                        target_client.as_deref(),
+                    )
+                    .await;
                 }
                 Response::LoadBuffer(LoadBufferResponse { buffer_name })
             }
@@ -443,11 +451,26 @@ impl RequestHandler {
         requester_pid: u32,
         command_name: &str,
         bytes: &[u8],
+        target_client: Option<&str>,
     ) {
-        let Some((attach_pid, terminal_context)) = self
-            .clipboard_attach_for_requester(requester_pid, command_name)
-            .await
-        else {
+        let target = match target_client {
+            Some(target_client) => {
+                let Ok(Some(attach_pid)) = self
+                    .find_target_attach_client_pid(requester_pid, target_client, command_name)
+                    .await
+                else {
+                    return;
+                };
+                self.terminal_context_for_attached_client(attach_pid)
+                    .await
+                    .map(|terminal_context| (attach_pid, terminal_context))
+            }
+            None => {
+                self.clipboard_attach_for_requester(requester_pid, command_name)
+                    .await
+            }
+        };
+        let Some((attach_pid, terminal_context)) = target else {
             return;
         };
         let payload = {

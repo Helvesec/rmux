@@ -1,15 +1,17 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rmux_core::alternate_screen_exit_sequence;
 use rmux_proto::{
-    encode_attach_message, AttachFrameDecoder, AttachMessage, TerminalGeometry, TerminalPixels,
+    encode_attach_message, AttachFrameDecoder, AttachMessage, AttachShellCommand, TerminalGeometry,
+    TerminalPixels,
 };
 use rmux_pty::PtyPair;
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
@@ -612,6 +614,43 @@ fn fallback_attach_stop_sequence_disables_mouse_and_exits_alt_screen() {
             .any(|window| window == expected_alt_exit),
         "fallback stop should leave the alternate screen"
     );
+}
+
+#[test]
+fn structured_shell_commands_use_server_resolved_shell_and_cwd(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "rmux-client-shell-context-{}-{nonce}",
+        std::process::id()
+    ));
+    let cwd = root.join("cwd");
+    std::fs::create_dir_all(&cwd)?;
+    let shell = root.join("shell-wrapper");
+    std::fs::write(
+        &shell,
+        b"#!/bin/sh\nprintf wrapper > wrapper.txt\nexec /bin/sh \"$@\"\n",
+    )?;
+    let mut permissions = std::fs::metadata(&shell)?.permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&shell, permissions)?;
+
+    let pair = PtyPair::open_with_size(rmux_pty::TerminalSize::new(80, 24))?;
+    let (_master, slave) = pair.into_split();
+    let terminal = File::from(slave.into_owned_fd());
+    let raw = RawTerminal::from_fd(&terminal)?;
+    let command = AttachShellCommand::new(
+        "printf command > command.txt".to_owned(),
+        shell.to_string_lossy().into_owned(),
+        cwd.to_string_lossy().into_owned(),
+    );
+    raw.run_lock_shell_command(&command)?;
+    drop(raw);
+
+    assert_eq!(std::fs::read_to_string(cwd.join("wrapper.txt"))?, "wrapper");
+    assert_eq!(std::fs::read_to_string(cwd.join("command.txt"))?, "command");
+    std::fs::remove_dir_all(root)?;
+    Ok(())
 }
 
 #[test]

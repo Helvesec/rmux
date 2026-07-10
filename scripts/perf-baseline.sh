@@ -93,6 +93,13 @@ fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
+source "$repo_root/scripts/perf-provenance.sh"
+
+git_head="$(git rev-parse HEAD)"
+platform_name="$(uname -s | tr '[:upper:]' '[:lower:]')"
+export RMUX_PERF_EXPECTED_GIT_SHA="${RMUX_PERF_EXPECTED_GIT_SHA:-$git_head}"
+export RMUX_PERF_EXPECTED_PLATFORM="${RMUX_PERF_EXPECTED_PLATFORM:-$platform_name}"
+export RMUX_PERF_EXPECTED_PROVENANCE="${RMUX_PERF_EXPECTED_PROVENANCE:-baseline:$release_name:$git_head}"
 
 if [ -z "$binary" ]; then
     binary="${CARGO_TARGET_DIR:-target}/release/rmux"
@@ -166,14 +173,6 @@ if [ -x /usr/bin/time ]; then
     fi
 fi
 
-json_escape() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
-
-json_string() {
-    printf '"%s"' "$(json_escape "$1")"
-}
-
 command_or_unknown() {
     local fallback="$1"
     shift
@@ -183,6 +182,10 @@ command_or_unknown() {
 git_commit="$(command_or_unknown unknown git rev-parse HEAD)"
 git_branch="$(command_or_unknown unknown git rev-parse --abbrev-ref HEAD)"
 git_describe="$(command_or_unknown unknown git describe --tags --always --dirty)"
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    echo "perf baseline requires a clean tracked worktree" >&2
+    exit 2
+fi
 rustc_version="$(command_or_unknown unknown rustc -V)"
 rustc_verbose="$(command_or_unknown unknown rustc -Vv | tr '\n' ';' | sed 's/;*$//')"
 toolchain="$(command_or_unknown unknown rustup show active-toolchain)"
@@ -191,6 +194,7 @@ tmux_version="$(command_or_unknown unavailable tmux -V)"
 platform="$(uname -s | tr '[:upper:]' '[:lower:]')"
 kernel="$(uname -r)"
 machine="$(uname -m)"
+host_fingerprint="$(rmux_perf_host_fingerprint)"
 cpu_governor="unknown"
 if [ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]; then
     cpu_governor="$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
@@ -226,10 +230,10 @@ target_json_line() {
     printf '  "kind": "rmux-perf-baseline",\n'
     printf '  "release": %s,\n' "$(json_string "$release_name")"
     printf '  "timestamp": %s,\n' "$(json_string "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
-    printf '  "git": {"branch":%s,"commit":%s,"describe":%s},\n' \
+    printf '  "git": {"branch":%s,"commit":%s,"describe":%s,"dirty":false},\n' \
         "$(json_string "$git_branch")" "$(json_string "$git_commit")" "$(json_string "$git_describe")"
-    printf '  "environment": {"platform":%s,"kernel":%s,"machine":%s,"rustc":%s,"rustc_verbose":%s,"toolchain":%s,"allocator":%s,"cpu_governor":%s},\n' \
-        "$(json_string "$platform")" "$(json_string "$kernel")" "$(json_string "$machine")" \
+    printf '  "environment": {"platform":%s,"kernel":%s,"machine":%s,"host_fingerprint":%s,"rustc":%s,"rustc_verbose":%s,"toolchain":%s,"allocator":%s,"cpu_governor":%s},\n' \
+        "$(json_string "$platform")" "$(json_string "$kernel")" "$(json_string "$machine")" "$(json_string "$host_fingerprint")" \
         "$(json_string "$rustc_version")" "$(json_string "$rustc_verbose")" \
         "$(json_string "$toolchain")" "$(json_string "$allocator")" "$(json_string "$cpu_governor")"
     printf '  "versions": {"rmux":%s,"tmux":%s,"rustc":%s},\n' \

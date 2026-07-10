@@ -377,7 +377,13 @@ fn source_file_list_panes_all_preserves_filter_sort_and_reverse() -> Result<(), 
     )?;
 
     let output = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
-    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={:?}, stderr={:?}",
+        stdout(&output),
+        stderr(&output)
+    );
     assert_eq!(stdout(&output), "alpha:1\nalpha:0\nbeta:1\nbeta:0\n");
     assert!(stderr(&output).is_empty());
 
@@ -863,6 +869,186 @@ fn startup_config_run_shell_can_call_back_into_daemon() -> Result<(), Box<dyn Er
 
     assert_success(&output);
     wait_for_file(&marker)?;
+    let callback_output = fs::read_to_string(&marker)?;
+    assert!(
+        callback_output.contains("base-index"),
+        "startup source callback must execute against the still-loading daemon: {callback_output:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn startup_readiness_waits_for_the_complete_slow_source_queue() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("startup-readiness-complete-source")?;
+    let config = harness.tmpdir().join("slow-startup.conf");
+    fs::write(
+        &config,
+        "run-shell 'sleep 2.25'\nset-option -g base-index 7\n",
+    )?;
+
+    let output = harness.run(&[
+        "-f",
+        config.to_str().expect("utf-8 config path"),
+        "new-session",
+        "-d",
+        "-s",
+        "slow",
+    ])?;
+
+    assert_success(&output);
+    let windows = harness.run(&["list-windows", "-t", "slow", "-F", "#{window_index}"])?;
+    assert_eq!(windows.status.code(), Some(0));
+    assert_eq!(stdout(&windows), "7\n");
+    assert!(stderr(&windows).is_empty());
+    Ok(())
+}
+
+#[test]
+fn source_queue_routes_inventory_start_server_and_new_window_flags() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("source-queue-inventory-new-window")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-n", "zero"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "solo", "-n", "old"])?);
+    let solo_before = harness.run(&[
+        "display-message",
+        "-p",
+        "-t",
+        "solo:0",
+        "#{window_id}|#{pane_id}",
+    ])?;
+    assert_eq!(solo_before.status.code(), Some(0));
+    assert!(stderr(&solo_before).is_empty());
+
+    let config = harness.tmpdir().join("queued-command-surface.conf");
+    fs::write(
+        &config,
+        concat!(
+            "new-window -dF 'IGNORED=#{window_index}' -t alpha:1 -n old\n",
+            "new-window -dkP -F 'K=#{window_index}|#{window_name}' -t alpha:1 -n replacement\n",
+            "new-window -d -t alpha:2 -n reuse\n",
+            "select-window -t alpha:0\n",
+            "new-window -SP -F 'SHOULD-NOT-PRINT' -t alpha: -n reuse\n",
+            "new-window -dkP -F 'SOLO=#{window_index}|#{window_id}|#{pane_id}|#{window_name}' -t solo:0 -n replacement\n",
+            "start-server\n",
+            "list-commands -F '#{command_list_name}|#{command_list_usage}' send-keys\n",
+            "list-commands -F '#{command_list_name}|#{command_list_usage}' set-buffer\n",
+            "list-commands -F '#{command_list_name}|#{command_list_usage}' set-environment\n",
+            "list-commands -F '#{command_list_name}|#{command_list_usage}' show-environment\n",
+            "list-commands -F '#{command_list_name}|#{command_list_usage}' show-hooks\n",
+            "list-commands -F '#{command_list_name}|#{command_list_usage}' switch-client\n",
+            "display-message -p AFTER\n",
+        ),
+    )?;
+
+    let output = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stderr(&output).is_empty(), "stderr={:?}", stderr(&output));
+    let lines = stdout(&output)
+        .lines()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(lines[0], "K=1|replacement");
+    let solo_fields = lines[1].split('|').collect::<Vec<_>>();
+    assert_eq!(solo_fields.len(), 4, "solo output={:?}", lines[1]);
+    assert_eq!(solo_fields[0], "SOLO=0");
+    assert_eq!(solo_fields[3], "replacement");
+    let previous_ids = stdout(&solo_before);
+    assert!(
+        !previous_ids.contains(solo_fields[1]) && !previous_ids.contains(solo_fields[2]),
+        "queued -k must allocate fresh window and pane ids: before={previous_ids:?}, after={:?}",
+        lines[1]
+    );
+    assert_eq!(
+        &lines[2..],
+        &[
+            "send-keys|[-FHKlMRX] [-c target-client] [-N repeat-count] [-t target-pane] [key ...]",
+            "set-buffer|[-aw] [-b buffer-name] [-n new-buffer-name] [-t target-client] [data]",
+            "set-environment|[-Fhgru] [-t target-session] variable [value]",
+            "show-environment|[-hgs] [-t target-session] [variable]",
+            "show-hooks|[-gpw] [-t target-pane] [hook]",
+            "switch-client|[-ElnprZ] [-c target-client] [-t target-session] [-T key-table] [-O order]",
+            "AFTER",
+        ]
+    );
+
+    let active = harness.run(&["display-message", "-p", "-t", "alpha", "#{window_index}"])?;
+    assert_eq!(stdout(&active), "2\n");
+    Ok(())
+}
+
+#[test]
+fn nested_command_list_routes_inventory_start_server_and_new_window_printing(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("nested-command-list-inventory-new-window")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-n", "zero"])?);
+
+    let output = harness.run(&[
+        "run-shell",
+        "-C",
+        "start-server ; new-window -dP -F 'NESTED=##{window_index}|##{window_name}' -t alpha:4 -n nested ; new-window -dP -t alpha:5 -n default-print ; list-commands -F '##{command_list_name}|##{command_list_usage}' show-hooks",
+    ])?;
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        stdout(&output),
+        "NESTED=4|nested\nalpha:5.0\nshow-hooks|[-gpw] [-t target-pane] [hook]\n"
+    );
+    assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
+fn startup_queue_routes_inventory_start_server_and_new_window_flags() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("startup-queue-inventory-new-window")?;
+    let config = harness.tmpdir().join("startup-command-surface.conf");
+    fs::write(
+        &config,
+        concat!(
+            "start-server\n",
+            "list-commands send-keys\n",
+            "list-commands set-buffer\n",
+            "list-commands set-environment\n",
+            "list-commands show-environment\n",
+            "list-commands show-hooks\n",
+            "list-commands switch-client\n",
+            "new-session -d -s configured -n zero\n",
+            "new-window -dF 'IGNORED' -t configured:1 -n old\n",
+            "new-window -dkP -F 'REPLACED=#{window_index}' -t configured:1 -n replacement\n",
+            "new-window -d -t configured:2 -n reuse\n",
+            "select-window -t configured:0\n",
+            "new-window -SP -F 'SHOULD-NOT-PRINT' -t configured: -n reuse\n",
+            "set-option -g @startup-queue-complete yes\n",
+        ),
+    )?;
+
+    let output = harness.run(&[
+        "-f",
+        config.to_str().expect("utf-8 config path"),
+        "new-session",
+        "-d",
+        "-s",
+        "outer",
+    ])?;
+    assert_success(&output);
+
+    let windows = harness.run(&[
+        "list-windows",
+        "-t",
+        "configured",
+        "-F",
+        "#{window_index}|#{window_name}|#{window_active}",
+    ])?;
+    assert_eq!(stdout(&windows), "0|zero|0\n1|replacement|0\n2|reuse|1\n");
+    let complete = harness.run(&["show-options", "-gqv", "@startup-queue-complete"])?;
+    assert_eq!(stdout(&complete), "yes\n");
+    let messages = harness.run(&["show-messages"])?;
+    assert!(
+        !stdout(&messages).contains("config error:"),
+        "startup queue commands must not record config errors: {:?}",
+        stdout(&messages)
+    );
     Ok(())
 }
 

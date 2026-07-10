@@ -93,13 +93,14 @@ async fn show_top_buffer_bytes(handler: &RequestHandler) -> Vec<u8> {
 async fn set_top_buffer_bytes(handler: &RequestHandler, bytes: &[u8]) {
     assert!(matches!(
         handler
-            .handle(Request::SetBuffer(rmux_proto::SetBufferRequest {
+            .handle(Request::SetBuffer(Box::new(rmux_proto::SetBufferRequest {
                 name: None,
                 content: bytes.to_vec(),
                 append: false,
                 new_name: None,
                 set_clipboard: false,
-            }))
+                target_client: None,
+            })))
             .await,
         Response::SetBuffer(_)
     ));

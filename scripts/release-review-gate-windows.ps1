@@ -320,6 +320,10 @@ if (-not $SkipPackage) {
 if ($RunCtrlMatrixSmoke) {
     Step "Windows Ctrl matrix portable smoke" {
         $rmux = Join-Path $TargetDir "x86_64-pc-windows-msvc\release\rmux.exe"
+        $expectedGitSha = (& git rev-parse HEAD).Trim()
+        if ($LASTEXITCODE -ne 0 -or $expectedGitSha -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "unable to resolve the expected Git SHA for Windows Ctrl matrix evidence"
+        }
         Run "powershell" @(
             "-NoProfile",
             "-ExecutionPolicy",
@@ -328,7 +332,9 @@ if ($RunCtrlMatrixSmoke) {
             "scripts\windows_ctrl_matrix.ps1",
             "-Rmux",
             $rmux,
-            "-PortableSmokeOnly"
+            "-PortableSmokeOnly",
+            "-ExpectedGitSha",
+            $expectedGitSha
         )
     }
 }

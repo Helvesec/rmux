@@ -489,6 +489,47 @@ async fn respawn_window_succeeds_with_kill_flag() {
 }
 
 #[tokio::test]
+async fn failed_respawn_window_preserves_the_old_layout_terminal_and_lifecycle() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("respawn-window-rollback");
+    create_session(&handler, alpha.as_str()).await;
+    handler.wait_for_initial_panes_for_test().await;
+    let (session_before, pane_id, lifecycle_before) = {
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&alpha).expect("session exists");
+        let pane_id = session
+            .pane_id_in_window(0, 0)
+            .expect("initial pane exists");
+        (
+            session.clone(),
+            pane_id,
+            state
+                .pane_lifecycle(pane_id)
+                .expect("pane lifecycle exists")
+                .clone(),
+        )
+    };
+
+    let response = handler
+        .handle(Request::RespawnWindow(Box::new(RespawnWindowRequest {
+            target: WindowTarget::with_window(alpha.clone(), 0),
+            kill: true,
+            start_directory: None,
+            environment: Some(vec!["INVALID".to_owned()]),
+            command: None,
+        })))
+        .await;
+    assert!(matches!(response, Response::Error(_)), "{response:?}");
+
+    let state = handler.state.lock().await;
+    assert_eq!(state.sessions.session(&alpha), Some(&session_before));
+    state
+        .ensure_panes_exist(&alpha, &[pane_id])
+        .expect("failed respawn must retain the old terminal");
+    assert_eq!(state.pane_lifecycle(pane_id), Some(&lifecycle_before));
+}
+
+#[tokio::test]
 async fn respawn_window_retains_surviving_pane_lifecycle_counters_and_redacts_env() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");

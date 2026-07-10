@@ -64,6 +64,35 @@ fn cli_acceptance_matrix_exercises_real_daemon_state() -> Result<(), Box<dyn Err
     Ok(())
 }
 
+#[test]
+fn kill_server_is_terminal_for_the_cli_command_queue() -> Result<(), Box<dyn Error>> {
+    for existing_server in [false, true] {
+        let harness = AcceptanceHarness::new(if existing_server {
+            "kill-server-terminal-existing"
+        } else {
+            "kill-server-terminal-absent"
+        })?;
+        if existing_server {
+            harness.success(["new-session", "-d", "-s", "seed"])?;
+        }
+
+        harness.success([
+            "kill-server",
+            ";",
+            "new-session",
+            "-d",
+            "-s",
+            "must-not-exist",
+        ])?;
+        let probe = harness.run(["has-session", "-t", "must-not-exist"])?;
+        assert!(
+            !probe.status.success(),
+            "commands after kill-server must not recreate the daemon"
+        );
+    }
+    Ok(())
+}
+
 struct AcceptanceHarness {
     label: String,
     tmpdir: PathBuf,

@@ -2,7 +2,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use super::RequestHandler;
-use crate::control::{ControlModeUpgrade, ControlServerEvent};
+use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
 use rmux_proto::{
     ClientTerminalContext, ControlMode, KillSessionRequest, KillWindowRequest, NewSessionRequest,
     NewWindowRequest, Request, Response, SessionName, TerminalSize, WindowTarget,
@@ -50,12 +50,13 @@ async fn register_control_session(
     handler: &RequestHandler,
     requester_pid: u32,
     session_name: SessionName,
-) -> mpsc::UnboundedReceiver<ControlServerEvent> {
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
+) -> mpsc::Receiver<ControlServerEvent> {
+    let (event_tx, event_rx) = mpsc::channel(CONTROL_SERVER_EVENT_CAPACITY);
     let _control_id = handler
         .register_control_with_closing(
             requester_pid,
             ControlModeUpgrade {
+                initial_command_count: 0,
                 mode: ControlMode::Plain,
                 terminal_context: crate::outer_terminal::OuterTerminalContext::default()
                     .with_client_terminal(&ClientTerminalContext {
@@ -94,9 +95,7 @@ async fn dispatch_as(handler: &RequestHandler, requester_pid: u32, request: Requ
     outcome.response
 }
 
-fn drain_control_events(
-    rx: &mut mpsc::UnboundedReceiver<ControlServerEvent>,
-) -> Vec<ControlServerEvent> {
+fn drain_control_events(rx: &mut mpsc::Receiver<ControlServerEvent>) -> Vec<ControlServerEvent> {
     let mut events = Vec::new();
     while let Ok(event) = rx.try_recv() {
         events.push(event);

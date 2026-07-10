@@ -364,6 +364,24 @@ impl Window {
             .filter(|pane_index| *pane_index != self.active_pane);
     }
 
+    /// [`Self::renumber_panes_by_position`] for non-detached transfers
+    /// (join/move/swap without `-d`): tmux routes those activations through
+    /// `window_set_active_pane`, so the newly active pane must also receive
+    /// an `active_point` stamp when the active identity actually changed.
+    /// The caller passes the pre-transfer active pane id because the window
+    /// is mid-surgery and its own active index is not reliable here.
+    pub(crate) fn renumber_panes_by_position_stamping(
+        &mut self,
+        active_pane_id: PaneId,
+        last_pane_id: Option<PaneId>,
+        previous_active_pane_id: Option<PaneId>,
+    ) {
+        self.renumber_panes_by_position(active_pane_id, last_pane_id);
+        if previous_active_pane_id != Some(active_pane_id) {
+            self.mark_pane_active(self.active_pane);
+        }
+    }
+
     fn allocate_pane_index(&mut self) -> u32 {
         let next_pane_index = self.next_pane_index;
         assert_ne!(next_pane_index, u32::MAX, "pane index space exhausted");

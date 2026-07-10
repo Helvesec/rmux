@@ -245,7 +245,7 @@ impl HandlerState {
         }))
     }
 
-    pub(crate) fn drain_deferred_initial_pane_input(
+    pub(crate) fn take_deferred_initial_pane_input_or_finish(
         &mut self,
         runtime_session_name: &SessionName,
         pane_id: PaneId,
@@ -259,6 +259,11 @@ impl HandlerState {
         };
 
         if starting.queued_input.is_empty() {
+            // Finish under the same state lock used to observe the empty
+            // queue. A writer can now either enqueue before this removal and
+            // be drained, or observe no StartingPane and write to the live
+            // terminal; it can never enqueue into an entry removed later.
+            let _ = self.remove_starting_pane(runtime_session_name, pane_id);
             return Ok(None);
         }
 
@@ -287,14 +292,6 @@ impl HandlerState {
             pane_pid,
             queued_input,
         }))
-    }
-
-    pub(crate) fn finish_deferred_initial_pane_input(
-        &mut self,
-        runtime_session_name: &SessionName,
-        pane_id: PaneId,
-    ) {
-        let _ = self.remove_starting_pane(runtime_session_name, pane_id);
     }
 
     pub(crate) fn finish_deferred_initial_pane_input_after_error(

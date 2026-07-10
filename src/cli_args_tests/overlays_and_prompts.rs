@@ -1,6 +1,25 @@
 use super::*;
 
 #[test]
+fn overlay_client_flags_preserve_list_clients_names() {
+    let menu = parse_args(&["display-menu", "-c", "/dev/pts/11", "Item", "i", "true"]).unwrap();
+    match menu.command.expect("parsed command") {
+        super::super::Command::DisplayMenu(args) => {
+            assert_eq!(args.target_client.as_deref(), Some("/dev/pts/11"));
+        }
+        other => panic!("expected display-menu, got {other:?}"),
+    }
+
+    let popup = parse_args(&["display-popup", "-c", "/dev/pts/12", "true"]).unwrap();
+    match popup.command.expect("parsed command") {
+        super::super::Command::DisplayPopup(args) => {
+            assert_eq!(args.target_client.as_deref(), Some("/dev/pts/12"));
+        }
+        other => panic!("expected display-popup, got {other:?}"),
+    }
+}
+
+#[test]
 fn display_menu_parses_overlay_flags_and_queue_command() {
     let cli = parse_args(&[
         "display-menu",

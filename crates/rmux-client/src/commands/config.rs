@@ -136,12 +136,27 @@ impl Connection {
         include_inherited: bool,
         quiet: bool,
     ) -> Result<Response, ClientError> {
+        self.show_options_extended(scope, name, value_only, include_inherited, quiet, false)
+    }
+
+    /// Sends an extended `show-options` request.
+    #[allow(clippy::too_many_arguments)]
+    pub fn show_options_extended(
+        &mut self,
+        scope: OptionScopeSelector,
+        name: Option<String>,
+        value_only: bool,
+        include_inherited: bool,
+        quiet: bool,
+        include_hooks: bool,
+    ) -> Result<Response, ClientError> {
         self.roundtrip(&Request::ShowOptions(ShowOptionsRequest {
             scope,
             name,
             value_only,
             include_inherited,
             quiet,
+            include_hooks,
         }))
     }
 

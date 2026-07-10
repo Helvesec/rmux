@@ -30,6 +30,12 @@ pub(super) enum AttachAction {
     LegacyDetachExec(String),
 }
 
+impl AttachAction {
+    pub(super) const fn requires_exclusive_input(&self) -> bool {
+        !matches!(self, Self::MouseInputEnabled(_))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AttachActionOutcome {
     Continue,

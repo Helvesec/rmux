@@ -251,10 +251,10 @@ fn set_buffer_and_show_aliases_accept_tmux_short_forms() {
 
 #[test]
 fn set_buffer_accepts_target_and_rename_with_trailing_content() {
-    let cli = parse_args(&["set-buffer", "-t", "alpha", "payload"]).unwrap();
+    let cli = parse_args(&["set-buffer", "-t", "/dev/pts/8", "payload"]).unwrap();
     match cli.command.expect("parsed command") {
         super::super::Command::SetBuffer(args) => {
-            assert_eq!(args.target.expect("target").to_string(), "alpha");
+            assert_eq!(args.target_client.as_deref(), Some("/dev/pts/8"));
             assert_eq!(args.content.as_deref(), Some("payload"));
         }
         _ => panic!("expected SetBuffer command"),
@@ -268,6 +268,20 @@ fn set_buffer_accepts_target_and_rename_with_trailing_content() {
             assert_eq!(args.content.as_deref(), Some("ignored"));
         }
         _ => panic!("expected SetBuffer command"),
+    }
+}
+
+#[test]
+fn load_buffer_accepts_target_client() {
+    let cli = parse_args(&["load-buffer", "-w", "-t", "/dev/pts/9", "/tmp/input"]).unwrap();
+
+    match cli.command.expect("parsed command") {
+        super::super::Command::LoadBuffer(args) => {
+            assert!(args.set_clipboard);
+            assert_eq!(args.target_client.as_deref(), Some("/dev/pts/9"));
+            assert_eq!(args.path, "/tmp/input");
+        }
+        _ => panic!("expected LoadBuffer command"),
     }
 }
 

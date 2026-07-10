@@ -9,6 +9,7 @@ Generate the RMUX WinGet multi-file manifest from GitHub Release checksums.
 
 Options:
   --version <semver|vsemver>   Release version, for example 1.2.3 or v1.2.3
+  --release-tag <tag>          GitHub tag containing the assets (default: v<version>)
   --checksums <path>           SHA256SUMS file from the GitHub Release
   --output <path>              Write Helvesec.RMUX.yaml to this path and sibling manifest files beside it
   --repository <owner/repo>    GitHub repository (default: Helvesec/rmux)
@@ -35,6 +36,23 @@ normalize_version() {
   case "$version" in
     [0-9]*.[0-9]*.[0-9]*) printf '%s\n' "$version" ;;
     *) die "version must look like 1.2.3 or v1.2.3, got: $raw" ;;
+  esac
+}
+
+normalize_release_tag() {
+  local raw tag_version rc_number
+  raw="$1"
+  case "$raw" in v*) ;; *) die "release tag must start with v: $raw" ;; esac
+  tag_version="${raw#v}"
+  case "$tag_version" in *[!0-9A-Za-z.-]*|""|*..*|.*|*.) die "invalid release tag: $raw" ;; esac
+  if [ "$tag_version" = "$version" ]; then printf '%s\n' "$raw"; return; fi
+  case "$tag_version" in
+    "$version"-rc.*)
+      rc_number="${tag_version#"$version-rc."}"
+      case "$rc_number" in ''|*[!0-9]*|0|0*) die "release tag RC suffix must be -rc.N with N >= 1 and no leading zero: $raw" ;; esac
+      printf '%s\n' "$raw"
+      ;;
+    *) die "release tag $raw does not contain package version $version" ;;
   esac
 }
 
@@ -69,11 +87,10 @@ EOF
 }
 
 installer_manifest() {
-  local tag asset sha base_url nested_path
-  tag="v$version"
+  local asset sha base_url nested_path
   asset="rmux-$version-windows-x86_64.zip"
   sha="$(asset_sha256 "$asset")"
-  base_url="https://github.com/$repository/releases/download/$tag"
+  base_url="https://github.com/$repository/releases/download/$release_tag"
   nested_path="rmux-$version-windows-x86_64\\rmux.exe"
 
   cat <<EOF
@@ -126,7 +143,7 @@ Tags:
   - rust
   - terminal
   - tmux
-ReleaseNotesUrl: https://github.com/$repository/releases/tag/v$version
+ReleaseNotesUrl: https://github.com/$repository/releases/tag/$release_tag
 ManifestType: defaultLocale
 ManifestVersion: 1.10.0
 EOF
@@ -143,6 +160,7 @@ write_manifest() {
 }
 
 version=""
+release_tag=""
 checksums=""
 output=""
 repository="${RMUX_GITHUB_REPO:-Helvesec/rmux}"
@@ -161,6 +179,11 @@ while [ "$#" -gt 0 ]; do
     --checksums)
       [ "$#" -ge 2 ] || die "--checksums requires a value"
       checksums="$2"
+      shift 2
+      ;;
+    --release-tag)
+      [ "$#" -ge 2 ] || die "--release-tag requires a value"
+      release_tag="$2"
       shift 2
       ;;
     --output)
@@ -204,6 +227,8 @@ while [ "$#" -gt 0 ]; do
 done
 
 [ -n "$version" ] || die "--version is required"
+[ -n "$release_tag" ] || release_tag="v$version"
+release_tag="$(normalize_release_tag "$release_tag")"
 [ -n "$checksums" ] || die "--checksums is required"
 [ -f "$checksums" ] || die "checksums file not found: $checksums"
 [ -n "$output" ] || die "--output is required"

@@ -2,13 +2,15 @@ use rmux_proto::{
     LinkWindowRequest, LinkWindowResponse, RmuxError, UnlinkWindowResponse, WindowTarget,
 };
 
+use super::RemovedWindowHookContext;
 use super::{link_window_destination_index, session_not_found, window_pane_ids, HandlerState};
+use crate::pane_terminals::{LinkedWindowResult, UnlinkedWindowResult};
 
 impl HandlerState {
     pub(crate) fn link_window(
         &mut self,
         request: LinkWindowRequest,
-    ) -> Result<LinkWindowResponse, RmuxError> {
+    ) -> Result<LinkedWindowResult, RmuxError> {
         let source_session_name = request.source.session_name().clone();
         let target_session_name = request.target.session_name().clone();
         let target_window_index = {
@@ -80,6 +82,10 @@ impl HandlerState {
                     )
                 })
         };
+        let replaced_pane_ids = replaced_target
+            .as_ref()
+            .map(|(pane_ids, _, _)| pane_ids.clone())
+            .unwrap_or_default();
 
         let adjusted_source_window_index = if source_session_name == target_session_name
             && (request.after || request.before)
@@ -154,13 +160,19 @@ impl HandlerState {
         if source_session_name != target_session_name {
             self.synchronize_session_group_from(&source_session_name)?;
         }
+        if let Some(source_session) = self.sessions.session(&source_session_name).cloned() {
+            self.synchronize_pane_alias_options_from_session(&source_session)?;
+        }
         self.sync_pane_lifecycle_dimensions_for_session(&target_session_name);
         if source_session_name != target_session_name {
             self.sync_pane_lifecycle_dimensions_for_session(&source_session_name);
         }
 
-        Ok(LinkWindowResponse {
-            target: WindowTarget::with_window(target_session_name, target_window_index),
+        Ok(LinkedWindowResult {
+            response: LinkWindowResponse {
+                target: WindowTarget::with_window(target_session_name, target_window_index),
+            },
+            removed_pane_ids: self.pane_ids_no_longer_referenced(replaced_pane_ids),
         })
     }
 
@@ -168,9 +180,24 @@ impl HandlerState {
         &mut self,
         target: WindowTarget,
         kill_if_last: bool,
-    ) -> Result<UnlinkWindowResponse, RmuxError> {
+    ) -> Result<UnlinkedWindowResult, RmuxError> {
         let session_name = target.session_name().clone();
         let window_index = target.window_index();
+        let removed_window = self
+            .sessions
+            .session(&session_name)
+            .and_then(|session| session.window_at(window_index))
+            .map(|window| RemovedWindowHookContext {
+                target: target.clone(),
+                window_id: window.id().as_u32(),
+                window_name: window.name().unwrap_or_default().to_owned(),
+            })
+            .ok_or_else(|| {
+                RmuxError::invalid_target(
+                    target.to_string(),
+                    "window index does not exist in session",
+                )
+            })?;
         let link_count = self.window_link_count(&session_name, window_index);
         if link_count == 1 {
             if !kill_if_last {
@@ -178,8 +205,13 @@ impl HandlerState {
                     "window only linked to one session".to_owned(),
                 ));
             }
-            return Ok(UnlinkWindowResponse {
-                target: self.kill_window(target, false)?.response.target,
+            let killed = self.kill_window(target, false)?;
+            return Ok(UnlinkedWindowResult {
+                response: UnlinkWindowResponse {
+                    target: killed.response.target,
+                },
+                removed_window,
+                removed_pane_ids: killed.removed_pane_ids,
             });
         }
 
@@ -203,8 +235,12 @@ impl HandlerState {
         let _ = self.detach_window_link_slot(&session_name, window_index);
         self.synchronize_session_group_from(&session_name)?;
 
-        Ok(UnlinkWindowResponse {
-            target: WindowTarget::with_window(session_name, active_window),
+        Ok(UnlinkedWindowResult {
+            response: UnlinkWindowResponse {
+                target: WindowTarget::with_window(session_name, active_window),
+            },
+            removed_window,
+            removed_pane_ids: Vec::new(),
         })
     }
 }

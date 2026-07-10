@@ -234,10 +234,17 @@ pub(super) fn resolve_target_spec(
         .map_err(ExitFailure::from_client)?;
     match response {
         Response::ResolveTarget(response) => Ok(response.target),
-        Response::Error(ErrorResponse { error }) => Err(ExitFailure::new(
-            1,
-            target_resolution_error_message(&error, target_type, target.raw()),
-        )),
+        Response::Error(ErrorResponse { error }) => {
+            let message = target_resolution_error_message(&error, target_type, target.raw());
+            if matches!(
+                &error,
+                RmuxError::InvalidTarget { reason, .. } if reason.starts_with("ambiguous ")
+            ) {
+                Err(ExitFailure::ambiguous_target(message))
+            } else {
+                Err(ExitFailure::new(1, message))
+            }
+        }
         other => Err(unexpected_response("resolve-target", &other)),
     }
 }
@@ -312,16 +319,6 @@ fn window_target_lookup_token(raw_target: &str) -> &str {
     raw_target
         .rsplit_once(':')
         .map_or(raw_target, |(_, window)| window)
-}
-
-pub(super) fn display_panes_client_target_error(raw_target: &str) -> ExitFailure {
-    ExitFailure::new(
-        1,
-        format!(
-            "can't find client: {}",
-            raw_target.strip_suffix(':').unwrap_or(raw_target)
-        ),
-    )
 }
 
 pub(super) fn response_name_for_target(target: &rmux_proto::Target) -> &'static str {

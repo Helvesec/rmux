@@ -417,6 +417,7 @@ async fn output_backpressure_keeps_local_input_and_resize_live(
             Ok(())
         });
     let (output, write_started_rx, release_tx) = BlockingOutput::new();
+    let captured = output.bytes.clone();
     let client = tokio::spawn(async move {
         drive_async_attach(
             reader,
@@ -469,6 +470,15 @@ async fn output_backpressure_keeps_local_input_and_resize_live(
         .join()
         .map_err(|_| io::Error::other("action worker panicked"))??;
     assert!(actions.calls().contains(&"detach-kill".to_owned()));
+    let mut expected = b"blocked".to_vec();
+    for index in 0..(ATTACH_OUTPUT_QUEUE_CAPACITY + 8) {
+        expected.extend_from_slice(format!("queued-{index}\n").as_bytes());
+    }
+    assert_eq!(
+        *captured.lock().expect("output mutex poisoned"),
+        expected,
+        "detach must drain every strict frame already received"
+    );
     Ok(())
 }
 

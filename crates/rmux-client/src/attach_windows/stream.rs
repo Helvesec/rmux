@@ -43,6 +43,7 @@ const ATTACH_OUTPUT_SPOOL_PREFIX: &str = "rmux-attach-output-";
 const ATTACH_OUTPUT_SPOOL_SUFFIX: &str = ".spool";
 const ATTACH_OUTPUT_BACKPRESSURE_RETRY: Duration = Duration::from_millis(5);
 const ATTACH_OUTPUT_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+const ATTACH_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_RENDER_MAX_PENDING: Duration = Duration::from_millis(8);
 
 pub(super) async fn drive_async_attach<Reader, Writer, Output>(
@@ -106,7 +107,8 @@ where
     let mut output = AttachOutputQueue::spawn(output);
     let mut output_failure_rx = output.take_failure_notifications();
 
-    loop {
+    let attach_result = async {
+        loop {
         output.flush_pending()?;
         drain_attach_messages(
             &mut decoder,
@@ -225,7 +227,27 @@ where
                 decoder.push_bytes(&read_buffer[..bytes_read]);
             }
         }
+        }
     }
+    .await;
+
+    let drain_result = finish_attach_output(output).await;
+    match (attach_result, drain_result) {
+        (_, Err(error)) => Err(error),
+        (result, Ok(())) => result,
+    }
+}
+
+async fn finish_attach_output(
+    mut output: AttachOutputQueue,
+) -> std::result::Result<(), ClientError> {
+    tokio::task::spawn_blocking(move || output.finish())
+        .await
+        .map_err(|error| {
+            ClientError::Io(io::Error::other(format!(
+                "attach output drain task failed: {error}"
+            )))
+        })?
 }
 
 fn drain_attach_messages(
@@ -588,6 +610,47 @@ impl AttachOutputQueue {
         self.failure_wake_rx
             .take()
             .expect("attach output failure notifications should only be taken once")
+    }
+
+    fn finish(&mut self) -> std::result::Result<(), ClientError> {
+        self.finish_with_timeout(ATTACH_OUTPUT_DRAIN_TIMEOUT)
+    }
+
+    fn finish_with_timeout(
+        &mut self,
+        drain_timeout: Duration,
+    ) -> std::result::Result<(), ClientError> {
+        let deadline = std::time::Instant::now() + drain_timeout;
+        loop {
+            self.flush_pending()?;
+            self.drain_completed_writes();
+            self.check_failure()?;
+            if self.pending.is_empty() && self.spool.is_empty() && self.queued_frames == 0 {
+                return Ok(());
+            }
+
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(ClientError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out draining strict attach output before shutdown",
+                )));
+            }
+            let wait = (deadline - now).min(ATTACH_OUTPUT_BACKPRESSURE_RETRY);
+            match self.completed_rx.recv_timeout(wait) {
+                Ok(()) => {
+                    self.queued_frames = self.queued_frames.saturating_sub(1);
+                }
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                    self.check_failure()?;
+                    return Err(ClientError::Io(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "attach output writer stopped before pending output drained",
+                    )));
+                }
+            }
+        }
     }
 }
 

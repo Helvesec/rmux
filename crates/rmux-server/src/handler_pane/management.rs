@@ -534,6 +534,7 @@ impl RequestHandler {
                         let _ = state.hooks.remove_pane(&target);
                         None
                     };
+                    self.record_panes_closed_as_killed(&result.removed_pane_ids);
                     (
                         Response::KillPane(result.response),
                         None,
@@ -570,7 +571,6 @@ impl RequestHandler {
             self.emit_prepared(event);
         }
         if matches!(response, Response::KillPane(_)) {
-            self.record_panes_closed_as_killed(&removed_pane_ids);
             self.cleanup_pane_output_subscriptions(&removed_subscription_keys)
                 .await;
             if session_destroyed {

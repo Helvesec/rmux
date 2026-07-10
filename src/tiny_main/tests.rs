@@ -34,6 +34,19 @@ fn assert_tiny_fallback(args: &[&str]) {
     }
 }
 
+fn assert_source_file_dispatch(args: &[&str]) {
+    let command_args = args
+        .iter()
+        .position(|arg| *arg == "source-file")
+        .map(|index| os_args(&args[index + 1..]))
+        .expect("source-file command");
+    if source_file_should_use_tiny(&command_args) {
+        assert_tiny_direct(args, "source-file");
+    } else {
+        assert_tiny_fallback(args);
+    }
+}
+
 fn explicit_socket_path() -> String {
     if cfg!(windows) {
         rmux_client::resolve_socket_path(Some(OsStr::new("benchsock")), None)
@@ -160,7 +173,7 @@ fn display_message_should_use_tiny(args: &[OsString]) -> bool {
         };
         match arg {
             "--" => {
-                if args[index + 1..].is_empty() || !all_utf8(&args[index + 1..]) {
+                if args[index + 1..].len() != 1 || !all_utf8(&args[index + 1..]) {
                     return false;
                 }
                 message = true;
@@ -186,7 +199,7 @@ fn display_message_should_use_tiny(args: &[OsString]) -> bool {
             "-a" | "-I" | "-l" | "-N" | "-v" | "--json" | "-c" | "-d" => return false,
             value if value.starts_with('-') => return false,
             _ => {
-                if !all_utf8(&args[index..]) {
+                if args[index..].len() != 1 || !all_utf8(&args[index..]) {
                     return false;
                 }
                 message = true;
@@ -355,6 +368,7 @@ fn show_options_complex_forms_stay_on_full_helper_path() {
         [].as_slice(),
         ["-g", "status"].as_slice(),
         ["-g", "-v"].as_slice(),
+        ["-gH"].as_slice(),
         ["-w"].as_slice(),
     ] {
         assert!(parse_show_options(&os_args(args), false).is_none());
@@ -756,6 +770,8 @@ fn display_message_complex_forms_fall_back_to_helper() {
         ["-p", "-t", "%1", "#{pane_id}"].as_slice(),
         ["-p", "#{pane_id}", ";", "list-sessions"].as_slice(),
         ["-p", "echo;", "list-sessions"].as_slice(),
+        ["-p", "one", "two"].as_slice(),
+        ["-p", "--", "one", "two"].as_slice(),
     ] {
         assert!(
             parse_display_message(&os_args(args)).is_none(),
@@ -793,17 +809,21 @@ fn send_keys_complex_forms_fall_back_to_helper() {
 }
 
 #[test]
-fn source_file_plain_paths_are_tiny_parseable() {
+fn source_file_plain_paths_follow_nested_context_policy() {
     let args = os_args(&["/tmp/rmux-source-a.conf", "/tmp/rmux-source-b.conf"]);
 
-    let request = parse_source_file(&args).expect("source-file fast path");
-    assert_eq!(
-        request.paths,
-        [
-            "/tmp/rmux-source-a.conf".to_owned(),
-            "/tmp/rmux-source-b.conf".to_owned()
-        ]
-    );
+    if source_file_should_use_tiny(&args) {
+        let request = parse_source_file(&args).expect("source-file fast path");
+        assert_eq!(
+            request.paths,
+            [
+                "/tmp/rmux-source-a.conf".to_owned(),
+                "/tmp/rmux-source-b.conf".to_owned()
+            ]
+        );
+    } else {
+        assert!(parse_source_file(&args).is_none());
+    }
 }
 
 #[test]
@@ -1052,7 +1072,11 @@ fn benchmark_shapes_stay_direct_with_socket_selectors() {
                 )
             })
             .expect("shape contains command");
-        assert_tiny_direct(&shape, command);
+        if *command == "source-file" {
+            assert_source_file_dispatch(&shape);
+        } else {
+            assert_tiny_direct(&shape, command);
+        }
     }
 }
 
@@ -1144,10 +1168,7 @@ fn readme_benchmark_shapes_stay_on_tiny_direct_paths() {
         &["rmux", "send-keys", "-t", "bench:0.0", "true", "Enter"],
         "send-keys",
     );
-    assert_tiny_direct(
-        &["rmux", "source-file", "/tmp/rmux-source.conf"],
-        "source-file",
-    );
+    assert_source_file_dispatch(&["rmux", "source-file", "/tmp/rmux-source.conf"]);
     if std::env::var_os("RMUX").is_none() && std::env::var_os("TMUX").is_none() {
         assert_tiny_direct(&["rmux", "attach-session", "-t", "bench"], "attach-session");
     }

@@ -138,6 +138,84 @@ async fn lock_client_accepts_tty_path_targets() {
     terminate_child(&mut child);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn overlay_commands_resolve_names_published_by_list_clients() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("alpha");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+
+    let mut child = spawn_tty_child().expect("spawn tty child");
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    handler.register_attach(child.id(), alpha, control_tx).await;
+    let other_pid = child.id().saturating_add(10_000);
+    let (other_tx, _other_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(other_pid, session_name("alpha"), other_tx)
+        .await;
+    let published_name = handler
+        .list_clients_snapshot()
+        .await
+        .into_iter()
+        .find(|client| client.pid == child.id())
+        .expect("attached client is listed")
+        .name;
+
+    for command in ["display-menu", "display-popup"] {
+        assert_eq!(
+            handler
+                .resolve_overlay_client(999_999, Some(&published_name), command)
+                .await
+                .expect("published client name resolves"),
+            child.id(),
+            "{command} must accept the name emitted by list-clients"
+        );
+    }
+
+    let menu = handler
+        .parse_control_commands(&format!("display-menu -c {published_name} Item i true"))
+        .await
+        .expect("inventory client name parses for display-menu");
+    handler
+        .execute_parsed_commands_for_test(other_pid, menu)
+        .await
+        .expect("display-menu targets the published client name");
+    let _ = recv_matching_attach_control(&mut control_rx, "targeted menu overlay", |control| {
+        matches!(control, AttachControl::Overlay(_))
+    })
+    .await;
+    {
+        let active = handler.active_attach.lock().await;
+        assert!(active.by_pid[&child.id()].overlay.is_some());
+        assert!(active.by_pid[&other_pid].overlay.is_none());
+    }
+
+    let close = handler
+        .parse_control_commands(&format!("display-popup -C -c {published_name}"))
+        .await
+        .expect("inventory client name parses for display-popup");
+    handler
+        .execute_parsed_commands_for_test(other_pid, close)
+        .await
+        .expect("display-popup targets the published client name");
+    let active = handler.active_attach.lock().await;
+    assert!(active.by_pid[&child.id()].overlay.is_none());
+    assert!(active.by_pid[&other_pid].overlay.is_none());
+    drop(active);
+
+    terminate_child(&mut child);
+}
+
 #[tokio::test]
 async fn server_access_list_returns_server_access_response() {
     let handler = RequestHandler::with_owner_uid(1000);

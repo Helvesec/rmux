@@ -213,6 +213,12 @@ pub(crate) struct RequestHandler {
     cleanup_on_drop: bool,
     #[cfg(test)]
     paste_buffer_delete_pause: Arc<StdMutex<Option<Arc<PasteBufferDeletePause>>>>,
+    #[cfg(test)]
+    window_lifecycle_mutation_pause: Arc<StdMutex<Option<Arc<WindowLifecycleMutationPause>>>>,
+    #[cfg(test)]
+    pane_state_lag_rebase_pause: Arc<StdMutex<Option<Arc<PaneStateLagRebasePause>>>>,
+    #[cfg(test)]
+    pane_option_journal_pause: Arc<StdMutex<Option<Arc<PaneOptionJournalPause>>>>,
 }
 
 pub(crate) struct ConfigLoadingGuard {
@@ -269,6 +275,12 @@ impl Clone for RequestHandler {
             cleanup_on_drop: false,
             #[cfg(test)]
             paste_buffer_delete_pause: self.paste_buffer_delete_pause.clone(),
+            #[cfg(test)]
+            window_lifecycle_mutation_pause: self.window_lifecycle_mutation_pause.clone(),
+            #[cfg(test)]
+            pane_state_lag_rebase_pause: self.pane_state_lag_rebase_pause.clone(),
+            #[cfg(test)]
+            pane_option_journal_pause: self.pane_option_journal_pause.clone(),
         }
     }
 }
@@ -361,6 +373,12 @@ impl WeakRequestHandler {
             cleanup_on_drop: false,
             #[cfg(test)]
             paste_buffer_delete_pause: self.paste_buffer_delete_pause.upgrade()?,
+            #[cfg(test)]
+            window_lifecycle_mutation_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            pane_state_lag_rebase_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            pane_option_journal_pause: Arc::new(StdMutex::new(None)),
         })
     }
 }
@@ -368,6 +386,27 @@ impl WeakRequestHandler {
 #[cfg(test)]
 #[derive(Debug, Default)]
 struct PasteBufferDeletePause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct WindowLifecycleMutationPause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct PaneStateLagRebasePause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct PaneOptionJournalPause {
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -524,6 +563,12 @@ impl RequestHandler {
             cleanup_on_drop: true,
             #[cfg(test)]
             paste_buffer_delete_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            window_lifecycle_mutation_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            pane_state_lag_rebase_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            pane_option_journal_pause: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -677,6 +722,90 @@ impl RequestHandler {
 
     #[cfg(not(test))]
     async fn pause_before_paste_buffer_delete(&self) {}
+
+    #[cfg(test)]
+    fn install_window_lifecycle_mutation_pause(&self) -> Arc<WindowLifecycleMutationPause> {
+        let pause = Arc::new(WindowLifecycleMutationPause::default());
+        *self
+            .window_lifecycle_mutation_pause
+            .lock()
+            .expect("window lifecycle mutation pause") = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_before_window_lifecycle_mutation(&self) {
+        let pause = self
+            .window_lifecycle_mutation_pause
+            .lock()
+            .expect("window lifecycle mutation pause")
+            .take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn pause_before_window_lifecycle_mutation(&self) {}
+
+    #[cfg(test)]
+    fn install_pane_state_lag_rebase_pause(&self) -> Arc<PaneStateLagRebasePause> {
+        let pause = Arc::new(PaneStateLagRebasePause::default());
+        *self
+            .pane_state_lag_rebase_pause
+            .lock()
+            .expect("pane state lag rebase pause") = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_before_pane_state_lag_snapshot(&self) {
+        let pause = self
+            .pane_state_lag_rebase_pause
+            .lock()
+            .expect("pane state lag rebase pause")
+            .take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn pause_before_pane_state_lag_snapshot(&self) {}
+
+    #[cfg(test)]
+    fn install_pane_option_journal_pause(&self) -> Arc<PaneOptionJournalPause> {
+        let pause = Arc::new(PaneOptionJournalPause::default());
+        *self
+            .pane_option_journal_pause
+            .lock()
+            .expect("pane option journal pause") = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_before_pane_option_journal(&self) {
+        let pause = self
+            .pane_option_journal_pause
+            .lock()
+            .expect("pane option journal pause")
+            .take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn pause_before_pane_option_journal(&self) {}
+
+    #[cfg(test)]
+    async fn wait_for_initial_panes_for_test(&self) {
+        #[cfg(windows)]
+        self.wait_for_windows_deferred_all_pane_pids().await;
+    }
 }
 
 #[cfg(test)]
@@ -770,3 +899,11 @@ mod pane_exit_format_tests;
 #[cfg(test)]
 #[path = "handler_pane_state_tests.rs"]
 mod pane_state_tests;
+
+#[cfg(test)]
+#[path = "handler_pane_state_race_tests.rs"]
+mod pane_state_race_tests;
+
+#[cfg(test)]
+#[path = "handler_pane_alias_lifecycle_tests.rs"]
+mod pane_alias_lifecycle_tests;

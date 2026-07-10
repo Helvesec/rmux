@@ -209,23 +209,6 @@ fn resolve_list_panes_target(
         return Ok((session_name, Some(window_index)));
     };
 
-    match target.exact() {
-        Some(rmux_proto::Target::Window(window_target)) => {
-            return Ok((
-                window_target.session_name().clone(),
-                Some(window_target.window_index()),
-            ));
-        }
-        Some(rmux_proto::Target::Pane(_)) => {
-            let pane_target = resolve_pane_target_spec(connection, &target)?;
-            return Ok((
-                pane_target.session_name().clone(),
-                Some(pane_target.window_index()),
-            ));
-        }
-        _ => {}
-    }
-
     match resolve_target_spec(connection, &target, ResolveTargetType::Pane, false, false)? {
         rmux_proto::Target::Window(window_target) => Ok((
             window_target.session_name().clone(),

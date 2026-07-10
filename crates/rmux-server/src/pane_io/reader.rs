@@ -987,7 +987,8 @@ finally:
             PaneReaderRuntime::current().expect("test runtime is active"),
         );
 
-        let contents = wait_for_file_contents(&output, Duration::from_secs(30)).await?;
+        let contents =
+            wait_for_file_contents(&output, b"\x1b[?1;2c".len(), Duration::from_secs(30)).await?;
         let _ = spawned.child_mut().wait();
         output_reader_task.abort();
         let _ = fs::remove_file(&output);
@@ -1074,14 +1075,23 @@ finally:
 
     async fn wait_for_file_contents(
         path: &Path,
+        minimum_len: usize,
         timeout: Duration,
     ) -> Result<Vec<u8>, Box<dyn Error>> {
         let deadline = Instant::now() + timeout;
         loop {
             match fs::read(path) {
-                Ok(contents) => return Ok(contents),
-                Err(_) if Instant::now() < deadline => {
+                Ok(contents) if contents.len() >= minimum_len => return Ok(contents),
+                Ok(_) | Err(_) if Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Ok(contents) => {
+                    return Err(format!(
+                        "timed out waiting for {} to contain at least {minimum_len} bytes; got {}",
+                        path.display(),
+                        contents.len()
+                    )
+                    .into());
                 }
                 Err(error) => {
                     return Err(format!("timed out waiting for {}: {error}", path.display()).into());

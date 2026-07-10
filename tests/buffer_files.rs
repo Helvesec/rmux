@@ -57,6 +57,60 @@ fn load_buffer_accepts_mixed_flag_order() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn buffer_target_client_missing_is_a_successful_direct_cli_noop() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("buffer-target-client-missing")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+    let input_path = harness.tmpdir().join("input.txt");
+    fs::write(&input_path, "loaded despite missing client")?;
+
+    assert_success(&harness.run(&[
+        "set-buffer",
+        "-w",
+        "-t",
+        "missing-client",
+        "-b",
+        "set-targeted",
+        "set despite missing client",
+    ])?);
+    assert_success(&harness.run(&[
+        "load-buffer",
+        "-w",
+        "-t",
+        "missing-client",
+        "-b",
+        "load-targeted",
+        input_path.to_str().expect("utf-8 test path"),
+    ])?);
+    assert_success(&run_with_stdin(
+        &harness,
+        &[
+            "load-buffer",
+            "-w",
+            "-t",
+            "missing-client",
+            "-b",
+            "stdin-targeted",
+            "-",
+        ],
+        b"stdin despite missing client",
+    )?);
+
+    for (name, expected) in [
+        ("set-targeted", "set despite missing client"),
+        ("load-targeted", "loaded despite missing client"),
+        ("stdin-targeted", "stdin despite missing client"),
+    ] {
+        let shown = harness.run(&["show-buffer", "-b", name])?;
+        assert_eq!(shown.status.code(), Some(0));
+        assert_eq!(stdout(&shown), expected);
+        assert!(stderr(&shown).is_empty());
+    }
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
 fn load_buffer_reads_stdin_when_path_is_dash() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("load-buffer-dash")?;
     let mut daemon = harness.start_hidden_daemon()?;

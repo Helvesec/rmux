@@ -8,8 +8,9 @@ use rmux_proto::{
 
 use super::{
     ensure_session_panes_exist, link_window_destination_index, request_target_string,
-    session_not_found, window_pane_ids, HandlerState,
+    session_not_found, window_pane_ids, HandlerState, RemovedWindowHookContext,
 };
+use crate::pane_terminals::MovedWindowResult;
 
 #[path = "window_movement/cross_session.rs"]
 mod cross_session;
@@ -36,6 +37,20 @@ impl HandlerState {
     }
 
     pub(crate) fn move_window(
+        &mut self,
+        request: MoveWindowRequest,
+    ) -> Result<MovedWindowResult, RmuxError> {
+        let unlinked_window = move_window_unlinked_context(self, &request);
+        let replaced_pane_ids = move_window_replaced_pane_ids(self, &request);
+        let response = self.move_window_response(request)?;
+        Ok(MovedWindowResult {
+            response,
+            unlinked_window,
+            removed_pane_ids: self.pane_ids_no_longer_referenced(replaced_pane_ids),
+        })
+    }
+
+    fn move_window_response(
         &mut self,
         request: MoveWindowRequest,
     ) -> Result<MoveWindowResponse, RmuxError> {
@@ -639,6 +654,46 @@ impl HandlerState {
             target: Some(WindowTarget::with_window(session_name, destination_index)),
         })
     }
+}
+
+fn move_window_unlinked_context(
+    state: &HandlerState,
+    request: &MoveWindowRequest,
+) -> Option<RemovedWindowHookContext> {
+    let source = request.source.as_ref()?;
+    let window = state
+        .sessions
+        .session(source.session_name())?
+        .window_at(source.window_index())?;
+    Some(RemovedWindowHookContext {
+        target: source.clone(),
+        window_id: window.id().as_u32(),
+        window_name: window.name().unwrap_or_default().to_owned(),
+    })
+}
+
+fn move_window_replaced_pane_ids(
+    state: &HandlerState,
+    request: &MoveWindowRequest,
+) -> Vec<rmux_core::PaneId> {
+    if request.renumber || !request.kill_destination || request.after || request.before {
+        return Vec::new();
+    }
+    let Some(source) = request.source.as_ref() else {
+        return Vec::new();
+    };
+    let MoveWindowTarget::Window(target) = &request.target else {
+        return Vec::new();
+    };
+    if source == target {
+        return Vec::new();
+    }
+    state
+        .sessions
+        .session(target.session_name())
+        .and_then(|session| session.window_at(target.window_index()))
+        .map(|window| window.panes().iter().map(|pane| pane.id()).collect())
+        .unwrap_or_default()
 }
 
 struct MoveWindowRelativeRollbackState {

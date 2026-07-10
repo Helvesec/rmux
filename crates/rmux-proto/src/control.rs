@@ -70,6 +70,12 @@ pub struct ControlModeRequest {
     /// Terminal/runtime hints captured from the invoking client.
     #[serde(default)]
     pub client_terminal: ClientTerminalContext,
+    /// Number of command-line commands written immediately after the upgrade frame.
+    ///
+    /// This is explicit because local sockets and Windows named pipes are byte
+    /// streams: write boundaries cannot identify argv commands reliably.
+    #[serde(default)]
+    pub initial_command_count: u32,
 }
 
 /// Detached upgrade response acknowledging entry into control mode.

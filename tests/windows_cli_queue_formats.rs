@@ -111,3 +111,65 @@ fn set_option_unset_scope_matrix_matches_tmux() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
+
+#[test]
+fn deferred_pane_pid_is_ready_before_queued_format_evaluation() -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("windows-deferred-pane-pid-format")?;
+
+    let rendered = harness.stdout([
+        "new-session",
+        "-d",
+        "-s",
+        "race",
+        ";",
+        "if-shell",
+        "-F",
+        "-t",
+        "race",
+        "#{pane_pid}",
+        "display-message -p TRUE",
+        "display-message -p FALSE",
+    ])?;
+
+    assert_eq!(rendered.trim(), "TRUE");
+    let pane_pid = harness.stdout(["list-panes", "-t", "race", "-F", "#{pane_pid}"])?;
+    assert!(
+        pane_pid.trim().parse::<u32>().is_ok(),
+        "deferred pane did not publish a numeric PID: {pane_pid:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn rejected_respawn_preserves_deferred_pane_queued_input() -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("windows-respawn-deferred-input-rollback")?;
+    let marker = "RMUX_RESPAWN_REJECTED_QUEUED_INPUT_SURVIVES";
+    let echo_marker = format!("echo {marker}");
+
+    let output = harness.run([
+        "new-session",
+        "-d",
+        "-s",
+        "respawn-rollback",
+        ";",
+        "send-keys",
+        "-t",
+        "respawn-rollback:0.0",
+        echo_marker.as_str(),
+        "Enter",
+        ";",
+        "respawn-pane",
+        "-k",
+        "-t",
+        "respawn-rollback:0.0",
+        "-e",
+        "INVALID",
+    ])?;
+    assert!(
+        !output.status.success(),
+        "invalid respawn environment must be rejected"
+    );
+
+    harness.wait_for_capture_contains("respawn-rollback:0.0", marker)?;
+    Ok(())
+}

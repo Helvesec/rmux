@@ -17,13 +17,28 @@ impl Connection {
         new_name: Option<String>,
         set_clipboard: bool,
     ) -> Result<Response, ClientError> {
-        self.roundtrip(&Request::SetBuffer(SetBufferRequest {
+        self.set_buffer_target_client(name, content, append, new_name, set_clipboard, None)
+    }
+
+    /// Sends a target-client-aware `set-buffer` request.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_buffer_target_client(
+        &mut self,
+        name: Option<String>,
+        content: Vec<u8>,
+        append: bool,
+        new_name: Option<String>,
+        set_clipboard: bool,
+        target_client: Option<String>,
+    ) -> Result<Response, ClientError> {
+        self.roundtrip(&Request::SetBuffer(Box::new(SetBufferRequest {
             name,
             content,
             append,
             new_name,
             set_clipboard,
-        }))
+            target_client,
+        })))
     }
 
     /// Sends a `show-buffer` request over the detached RPC channel.
@@ -82,13 +97,25 @@ impl Connection {
         name: Option<String>,
         set_clipboard: bool,
     ) -> Result<Response, ClientError> {
+        self.load_buffer_target_client(path, name, set_clipboard, None)
+    }
+
+    /// Sends a target-client-aware `load-buffer` request.
+    pub fn load_buffer_target_client(
+        &mut self,
+        path: String,
+        name: Option<String>,
+        set_clipboard: bool,
+        target_client: Option<String>,
+    ) -> Result<Response, ClientError> {
         let cwd = caller_cwd_for_path(&path)?;
-        self.roundtrip(&Request::LoadBuffer(LoadBufferRequest {
+        self.roundtrip(&Request::LoadBuffer(Box::new(LoadBufferRequest {
             path,
             cwd,
             name,
             set_clipboard,
-        }))
+            target_client,
+        })))
     }
 
     /// Sends a `save-buffer` request over the detached RPC channel.

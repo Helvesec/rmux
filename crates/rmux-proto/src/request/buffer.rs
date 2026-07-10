@@ -19,6 +19,9 @@ pub struct SetBufferRequest {
     /// Whether the buffer should also be copied to the client clipboard.
     #[serde(default)]
     pub set_clipboard: bool,
+    /// Optional attached client whose clipboard should receive `-w` output.
+    #[serde(default)]
+    pub target_client: Option<String>,
 }
 
 /// Request payload for `show-buffer`.
@@ -87,6 +90,9 @@ pub struct LoadBufferRequest {
     /// Whether the loaded content should also be copied to the client clipboard.
     #[serde(default)]
     pub set_clipboard: bool,
+    /// Optional attached client whose clipboard should receive `-w` output.
+    #[serde(default)]
+    pub target_client: Option<String>,
 }
 
 /// Request payload for `save-buffer`.

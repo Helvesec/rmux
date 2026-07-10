@@ -54,7 +54,7 @@ pub(super) fn top_level_version_requested(args: &[OsString]) -> bool {
         if bytes == b"--" || !bytes.starts_with(b"-") || bytes == b"-" {
             return false;
         }
-        if !bytes.starts_with(b"--") && bytes.iter().skip(1).any(|flag| *flag == b'V') {
+        if !bytes.starts_with(b"--") && short_option_cluster_requests_version(&bytes) {
             return true;
         }
         if short_option_consumes_next_argument(&bytes) {
@@ -62,6 +62,19 @@ pub(super) fn top_level_version_requested(args: &[OsString]) -> bool {
         }
 
         index += 1;
+    }
+
+    false
+}
+
+fn short_option_cluster_requests_version(bytes: &[u8]) -> bool {
+    for flag in bytes.iter().copied().skip(1) {
+        if flag == b'V' {
+            return true;
+        }
+        if short_option_takes_argument(flag) || !short_option_takes_no_argument(flag) {
+            return false;
+        }
     }
 
     false
@@ -167,6 +180,52 @@ pub(super) fn accept_compatibility_options(cli: &Cli) {
         cli.config_file_selection(),
         cli.terminal_features(),
     );
+}
+
+#[cfg(test)]
+mod top_level_option_tests {
+    use super::top_level_version_requested;
+    use std::ffi::OsString;
+
+    fn requests_version(args: &[&str]) -> bool {
+        let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+        top_level_version_requested(&args)
+    }
+
+    #[test]
+    fn version_scan_stops_at_attached_short_option_values() {
+        for argument in [
+            "-cechoV",
+            "-f/Volumes/rmux.conf",
+            "-LValue",
+            "-S/Volumes/rmux.sock",
+            "-TRGBV",
+            "-vS/Volumes/rmux.sock",
+        ] {
+            assert!(
+                !requests_version(&[argument, "list-sessions"]),
+                "{argument} must treat V as part of the option value"
+            );
+        }
+    }
+
+    #[test]
+    fn version_scan_skips_separate_short_option_values() {
+        for option in ["-c", "-f", "-L", "-S", "-T"] {
+            assert!(!requests_version(&[
+                option,
+                "-Value-containing-V",
+                "list-sessions"
+            ]));
+        }
+    }
+
+    #[test]
+    fn version_scan_still_accepts_real_clustered_version_flags() {
+        assert!(requests_version(&["-V"]));
+        assert!(requests_version(&["-vV"]));
+        assert!(requests_version(&["-CvV"]));
+    }
 }
 
 #[cfg(test)]

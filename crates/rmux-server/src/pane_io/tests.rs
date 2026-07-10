@@ -6,8 +6,9 @@ use std::time::Duration;
 use rmux_core::events::OutputCursorItem;
 use rmux_core::{OptionStore, PaneGeometry, TerminalPassthrough};
 use rmux_proto::{
-    encode_attach_message, AttachFrameDecoder, AttachMessage, AttachedKeystroke, KeyDispatched,
-    NewSessionRequest, PaneTarget, Request, Response, SessionName, TerminalSize,
+    encode_attach_message, AttachFrameDecoder, AttachMessage, AttachShellCommand,
+    AttachedKeystroke, KeyDispatched, NewSessionRequest, PaneTarget, Request, Response,
+    SessionName, TerminalSize,
 };
 use rmux_pty::PtyPair;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -514,6 +515,81 @@ async fn detach_control_emits_stop_and_banner_in_one_data_frame() {
             .any(|window| window == b"[detached (from session alpha)]\r\n"),
         "detach data must contain detached banner"
     );
+}
+
+#[tokio::test]
+async fn lock_control_emits_attach_stop_before_transferring_terminal_ownership() {
+    let alpha = SessionName::new("alpha-lock-stop").expect("valid session name");
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let stream = AttachTransport::from(stream);
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let mut current_target =
+        open_attach_target(test_attach_target(&alpha, b"BASE", None), false).expect("open target");
+    let expected_stop = current_target.outer_terminal.attach_stop_sequence();
+    let mut render_generation = 0_u64;
+    let mut overlay_generation = 0_u64;
+    let mut persistent_overlay = None::<Vec<u8>>;
+    let mut persistent_overlay_visible = false;
+    let mut persistent_overlay_state_id = current_target.persistent_overlay_state_id;
+    let mut locked = false;
+    let mut deferred_controls = VecDeque::new();
+    let command = AttachShellCommand::new(
+        "lock-command".to_owned(),
+        "/bin/sh".to_owned(),
+        "/tmp".to_owned(),
+    );
+    control_tx
+        .send(AttachControl::LockShellCommand(command.clone()))
+        .expect("send lock control");
+
+    let control_backlog = AtomicUsize::new(0);
+    let action = apply_pending_attach_controls(
+        &mut deferred_controls,
+        Some(&mut control_rx),
+        &control_backlog,
+        &mut current_target,
+        &stream,
+        &mut render_generation,
+        &mut overlay_generation,
+        &mut persistent_overlay,
+        &mut persistent_overlay_visible,
+        &mut persistent_overlay_state_id,
+        &mut locked,
+    )
+    .await
+    .expect("apply pending lock");
+    assert!(matches!(action, PendingAttachAction::Continue { .. }));
+    assert!(locked);
+
+    let messages = tokio::time::timeout(Duration::from_secs(1), async {
+        let mut decoder = AttachFrameDecoder::new();
+        let mut messages = Vec::new();
+        let mut bytes = [0_u8; 4096];
+        while messages.len() < 2 {
+            let read = peer.read(&mut bytes).await.expect("read lock frames");
+            assert!(read > 0, "attach stream closed before lock frames");
+            decoder.push_bytes(&bytes[..read]);
+            while let Some(message) = decoder.next_message().expect("decode lock frame") {
+                messages.push(message);
+            }
+        }
+        messages
+    })
+    .await
+    .expect("lock frames timed out");
+
+    let AttachMessage::Data(stop) = &messages[0] else {
+        panic!(
+            "first lock frame must restore the outer terminal: {:?}",
+            messages[0]
+        );
+    };
+    assert!(
+        stop.windows(expected_stop.len())
+            .any(|window| window == expected_stop),
+        "lock must emit the complete attach-stop sequence first"
+    );
+    assert_eq!(messages[1], AttachMessage::LockShellCommand(command));
 }
 
 fn test_attach_target(

@@ -71,6 +71,9 @@ pub(crate) use lifecycle_state::PaneLifecycleProcessState;
 use lifecycle_state::PaneLifecycleSpawn;
 pub(crate) use lifecycle_state::PaneLifecycleState;
 use marked_pane::MarkedPane;
+pub(in crate::pane_terminals) use pane_lifecycle::{
+    terminate_removed_terminals, PreparedWindowTerminal,
+};
 pub(crate) use pane_outputs::PaneExitMetadata;
 use pane_outputs::{AttachedSubmittedLine, PaneOutputSpawn, RemovedPaneOutputs};
 #[cfg(test)]
@@ -254,6 +257,26 @@ pub(crate) struct RemovedWindowHookContext {
 pub(crate) struct KilledWindowResult {
     pub(crate) response: KillWindowResponse,
     pub(crate) removed_windows: Vec<RemovedWindowHookContext>,
+    pub(crate) removed_pane_ids: Vec<PaneId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkedWindowResult {
+    pub(crate) response: rmux_proto::LinkWindowResponse,
+    pub(crate) removed_pane_ids: Vec<PaneId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MovedWindowResult {
+    pub(crate) response: rmux_proto::MoveWindowResponse,
+    pub(crate) unlinked_window: Option<RemovedWindowHookContext>,
+    pub(crate) removed_pane_ids: Vec<PaneId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnlinkedWindowResult {
+    pub(crate) response: rmux_proto::UnlinkWindowResponse,
+    pub(crate) removed_window: RemovedWindowHookContext,
     pub(crate) removed_pane_ids: Vec<PaneId>,
 }
 

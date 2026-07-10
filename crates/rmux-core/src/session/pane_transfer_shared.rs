@@ -80,8 +80,24 @@ pub(super) fn apply_swap_between_windows(
         select_source_in_target,
     );
 
-    source_window.renumber_panes_by_position(source_active_after_id, source_last_after_id);
-    target_window.renumber_panes_by_position(target_active_after_id, target_last_after_id);
+    if select_target_in_source {
+        source_window.renumber_panes_by_position_stamping(
+            source_active_after_id,
+            source_last_after_id,
+            Some(source_active_before_id),
+        );
+    } else {
+        source_window.renumber_panes_by_position(source_active_after_id, source_last_after_id);
+    }
+    if select_source_in_target {
+        target_window.renumber_panes_by_position_stamping(
+            target_active_after_id,
+            target_last_after_id,
+            Some(target_active_before_id),
+        );
+    } else {
+        target_window.renumber_panes_by_position(target_active_after_id, target_last_after_id);
+    }
     source_window.recalculate_geometry();
     target_window.recalculate_geometry();
     source_window.pop_zoom();

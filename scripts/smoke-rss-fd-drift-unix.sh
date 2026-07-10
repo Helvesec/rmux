@@ -28,6 +28,88 @@ for value in "$FD_DRIFT_MAX" "$RSS_DRIFT_KIB_MAX" "$ITERATIONS" "$CHURN_ITERATIO
     is_non_negative_integer "$value" || fail "expected numeric threshold, got: $value"
 done
 
+if [ ! -d /proc ]; then
+    log "skipping: /proc is unavailable"
+    exit 0
+fi
+
+process_is_rmux_daemon() {
+    local pid="$1"
+    local executable name argument has_internal_flag=0
+    executable="$(readlink "/proc/$pid/exe" 2>/dev/null || true)"
+    executable="${executable% (deleted)}"
+    name="${executable##*/}"
+    case "$name" in
+        rmux|rmux-daemon) ;;
+        *) return 1 ;;
+    esac
+    while IFS= read -r -d '' argument; do
+        if [ "$argument" = "--__internal-daemon" ]; then
+            has_internal_flag=1
+            break
+        fi
+    done < "/proc/$pid/cmdline" 2>/dev/null || true
+    [ "$has_internal_flag" -eq 1 ]
+}
+
+process_has_exact_argument() {
+    local pid="$1"
+    local expected="$2"
+    local argument
+    while IFS= read -r -d '' argument; do
+        [ "$argument" = "$expected" ] && return 0
+    done < "/proc/$pid/cmdline" 2>/dev/null || true
+    return 1
+}
+
+process_has_argument_under_root() {
+    local pid="$1"
+    local root="$2"
+    local argument
+    while IFS= read -r -d '' argument; do
+        case "$argument" in
+            "$root"|"$root"/*) return 0 ;;
+        esac
+    done < "/proc/$pid/cmdline" 2>/dev/null || true
+    return 1
+}
+
+find_daemon_pid() {
+    local socket="$1"
+    local proc pid
+    for proc in /proc/[0-9]*; do
+        pid="${proc##*/}"
+        process_is_rmux_daemon "$pid" || continue
+        process_has_exact_argument "$pid" "$socket" || continue
+        printf '%s\n' "$pid"
+        return 0
+    done
+}
+
+find_daemon_pids_under_root() {
+    local root="${1:-$SMOKE_ROOT}"
+    local proc pid
+    for proc in /proc/[0-9]*; do
+        pid="${proc##*/}"
+        process_is_rmux_daemon "$pid" || continue
+        process_has_argument_under_root "$pid" "$root" || continue
+        printf '%s\n' "$pid"
+    done
+}
+
+if [ "${RMUX_RSS_FD_PROCESS_SCAN_SELF_TEST:-0}" = "1" ]; then
+    probe_root="${TMPDIR:-/tmp}/rmux-rss-fd-self-test-$$"
+    python3 -c 'import time; time.sleep(30)' "$probe_root" rmux-daemon &
+    probe_pid=$!
+    trap 'kill "$probe_pid" >/dev/null 2>&1 || true; wait "$probe_pid" >/dev/null 2>&1 || true' EXIT
+    sleep 0.1
+    if find_daemon_pids_under_root "$probe_root" | grep -qx "$probe_pid"; then
+        fail "process scanner matched a foreign process whose arguments merely mentioned rmux-daemon"
+    fi
+    log "process scanner self-test passed"
+    exit 0
+fi
+
 if [ ! -x "$RMUX_BIN" ]; then
     fail "rmux binary is not executable: $RMUX_BIN"
 fi
@@ -37,11 +119,6 @@ case "$RMUX_BIN" in
         ;;
 esac
 
-if [ ! -d /proc ]; then
-    log "skipping: /proc is unavailable"
-    exit 0
-fi
-
 SMOKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/rmux-rss-fd-smoke.XXXXXX")"
 SOCKET_PATH="$SMOKE_ROOT/rmux.sock"
 
@@ -50,24 +127,6 @@ cleanup() {
     rm -rf "$SMOKE_ROOT"
 }
 trap cleanup EXIT
-
-find_daemon_pid() {
-    local socket="$1"
-    ps -eo pid=,args= | awk -v socket="$socket" '
-        index($0, "rmux-daemon") && index($0, socket) {
-            print $1
-            exit
-        }
-    '
-}
-
-find_daemon_pids_under_root() {
-    ps -eo pid=,args= | awk -v root="$SMOKE_ROOT" '
-        index($0, "rmux-daemon") && index($0, root) {
-            print $1
-        }
-    '
-}
 
 wait_for_no_daemons_under_root() {
     local deadline

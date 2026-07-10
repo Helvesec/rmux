@@ -6,10 +6,17 @@ use rmux_core::events::{SubscriptionLimitError, SubscriptionLimits};
 use rmux_core::PaneId;
 use rmux_proto::{
     ForegroundStateDto, PaneStateClosedReason, PaneStateEventDto, PaneStateSubscriptionId,
+    DEFAULT_MAX_DETACHED_FRAME_LENGTH,
 };
+
+#[path = "pane_state_journal/retention.rs"]
+mod retention;
+
+use retention::retained_record_bytes;
 
 pub(crate) const PANE_STATE_JOURNAL_CAPACITY: usize = 4096;
 pub(crate) const PANE_STATE_CURSOR_BATCH: usize = 256;
+pub(crate) const PANE_STATE_JOURNAL_BYTE_CAPACITY: usize = DEFAULT_MAX_DETACHED_FRAME_LENGTH / 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PaneStateInclude {
@@ -61,6 +68,12 @@ pub(crate) enum PaneStateRead {
         missed_from_revision: u64,
         resume_revision: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneStateSubscriptionError {
+    Limit(SubscriptionLimitError),
+    Capacity { limit: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +142,8 @@ pub(crate) struct PaneStateSubscriptionInfo {
 #[derive(Debug)]
 pub(crate) struct PaneStateJournal {
     capacity: usize,
+    byte_capacity: usize,
+    retained_bytes: usize,
     next_revision: u64,
     next_subscription: u64,
     limits: SubscriptionLimits,
@@ -153,8 +168,18 @@ impl PaneStateJournal {
     }
 
     pub(crate) fn with_limits(capacity: usize, limits: SubscriptionLimits) -> Self {
+        Self::with_limits_and_byte_capacity(capacity, PANE_STATE_JOURNAL_BYTE_CAPACITY, limits)
+    }
+
+    fn with_limits_and_byte_capacity(
+        capacity: usize,
+        byte_capacity: usize,
+        limits: SubscriptionLimits,
+    ) -> Self {
         Self {
             capacity: capacity.max(1),
+            byte_capacity: byte_capacity.max(1),
+            retained_bytes: 0,
             next_revision: 0,
             next_subscription: 1,
             limits,
@@ -180,20 +205,28 @@ impl PaneStateJournal {
     ) -> u64 {
         self.next_revision = self.next_revision.saturating_add(1);
         let revision = self.next_revision;
-        self.records.push_back(PaneStateRecord {
+        let record = PaneStateRecord {
             revision,
             pane_id,
             generation,
             change,
-        });
+        };
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_add(retained_record_bytes(&record));
+        self.records.push_back(record);
         increment_count(&mut self.retained_record_counts, pane_id);
-        while self.records.len() > self.capacity {
+        while self.records.len() > self.capacity || self.retained_bytes > self.byte_capacity {
             if let Some(record) = self.records.pop_front() {
+                self.retained_bytes = self
+                    .retained_bytes
+                    .saturating_sub(retained_record_bytes(&record));
                 decrement_count(&mut self.retained_record_counts, record.pane_id);
                 self.record_eviction(&record);
                 self.prune_evicted_revision_for(record.pane_id);
             }
         }
+        debug_assert!(self.retained_bytes <= self.byte_capacity);
         revision
     }
 
@@ -226,28 +259,36 @@ impl PaneStateJournal {
         connection_id: u64,
         pane_id: PaneId,
         include: PaneStateInclude,
-    ) -> Result<PaneStateSubscriptionId, SubscriptionLimitError> {
+    ) -> Result<PaneStateSubscriptionId, PaneStateSubscriptionError> {
         let connection_count = self
             .subscriptions
             .values()
-            .filter(|subscription| {
-                subscription.connection_id == connection_id && !subscription.closed
-            })
+            .filter(|subscription| subscription.connection_id == connection_id)
             .count();
         if connection_count >= self.limits.max_per_connection() {
-            return Err(SubscriptionLimitError::PerConnection {
-                limit: self.limits.max_per_connection(),
-            });
+            return Err(PaneStateSubscriptionError::Limit(
+                SubscriptionLimitError::PerConnection {
+                    limit: self.limits.max_per_connection(),
+                },
+            ));
         }
 
         let pane_count = self
-            .subscriptions
-            .values()
-            .filter(|subscription| subscription.pane_id == pane_id && !subscription.closed)
-            .count();
+            .subscription_counts
+            .get(&pane_id)
+            .copied()
+            .unwrap_or_default();
         if pane_count >= self.limits.max_per_pane() {
-            return Err(SubscriptionLimitError::PerPane {
-                limit: self.limits.max_per_pane(),
+            return Err(PaneStateSubscriptionError::Limit(
+                SubscriptionLimitError::PerPane {
+                    limit: self.limits.max_per_pane(),
+                },
+            ));
+        }
+
+        if self.subscriptions.len() >= self.capacity {
+            return Err(PaneStateSubscriptionError::Capacity {
+                limit: self.capacity,
             });
         }
 
@@ -310,27 +351,6 @@ impl PaneStateJournal {
         self.remove_subscription_entry(subscription_id).is_some()
     }
 
-    fn prune_closed_subscriptions(&mut self) {
-        let closed_count = self
-            .subscriptions
-            .values()
-            .filter(|subscription| subscription.closed)
-            .count();
-        if closed_count <= self.capacity {
-            return;
-        }
-
-        let mut closed_ids = self
-            .subscriptions
-            .iter()
-            .filter_map(|(id, subscription)| subscription.closed.then_some(*id))
-            .collect::<Vec<_>>();
-        closed_ids.sort_unstable();
-        for id in closed_ids.into_iter().take(closed_count - self.capacity) {
-            self.remove_subscription_entry(id);
-        }
-    }
-
     pub(crate) fn mark_pane_closed(&mut self, pane_id: PaneId) -> bool {
         let newly_closed = self.closed_panes.insert(pane_id);
         if newly_closed {
@@ -367,7 +387,6 @@ impl PaneStateJournal {
                 subscription.closed_reason = Some(reason);
             }
         }
-        self.prune_closed_subscriptions();
     }
 
     pub(crate) fn reopen_pane(&mut self, pane_id: PaneId) {
@@ -467,22 +486,19 @@ impl PaneStateJournal {
             if let (Some(revision), Some(reason)) =
                 (subscription.closed_revision, subscription.closed_reason)
             {
-                if after_revision < revision {
-                    output.push(PaneStateEventDto::Closed {
-                        revision,
-                        pane_id: subscription.pane_id,
-                        reason,
-                    });
-                    return Ok(PaneStateRead::Ready {
-                        next_revision: revision,
-                        limited: false,
-                        event_count: output.len(),
-                    });
-                }
+                // Closed is terminal delivery state, not merely a cursor
+                // delta. A lag rebase snapshots current state and may advance
+                // the client's cursor past this revision, but the subscription
+                // must still deliver its one terminal event before removal.
+                output.push(PaneStateEventDto::Closed {
+                    revision,
+                    pane_id: subscription.pane_id,
+                    reason,
+                });
                 return Ok(PaneStateRead::Ready {
                     next_revision: after_revision.max(revision),
                     limited: false,
-                    event_count: 0,
+                    event_count: output.len(),
                 });
             }
             return Ok(PaneStateRead::Ready {
@@ -684,6 +700,77 @@ mod tests {
 
     fn pane_id(value: u32) -> PaneId {
         PaneId::new(value)
+    }
+
+    fn close_pane(journal: &mut PaneStateJournal, pane_id: PaneId) -> u64 {
+        assert!(journal.mark_pane_closed(pane_id));
+        let revision = journal.push(
+            pane_id,
+            Some(9),
+            PaneStateChange::Closed {
+                reason: PaneStateClosedReason::Killed,
+            },
+        );
+        journal.remember_pane_closed_event(pane_id, PaneStateClosedReason::Killed, revision);
+        revision
+    }
+
+    #[test]
+    fn journal_byte_budget_evicts_oversized_records_and_preserves_cursor_progress() {
+        let watched = pane_id(41);
+        let mut journal =
+            PaneStateJournal::with_limits_and_byte_capacity(8, 512, SubscriptionLimits::default());
+        let subscription = journal
+            .subscribe(
+                7,
+                watched,
+                PaneStateInclude {
+                    title: true,
+                    options: false,
+                    foreground: false,
+                },
+            )
+            .expect("subscription fits");
+
+        let oversized_revision = journal.push(
+            watched,
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "a".repeat(512),
+                new: "b".repeat(512),
+            },
+        );
+        assert_eq!(oversized_revision, 1);
+        assert!(journal.records.is_empty());
+        assert_eq!(journal.retained_bytes, 0);
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal
+                .read_after(7, subscription, 0, 8, &mut events)
+                .expect("lag is reported"),
+            PaneStateRead::Lag {
+                missed_from_revision: 0,
+                resume_revision: 1,
+            }
+        );
+        assert!(events.is_empty());
+
+        journal.push(
+            watched,
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "b".to_owned(),
+                new: "c".to_owned(),
+            },
+        );
+        assert!(journal.retained_bytes <= journal.byte_capacity);
+        assert!(matches!(
+            journal
+                .read_after(7, subscription, 1, 8, &mut events)
+                .expect("cursor progresses after rebase"),
+            PaneStateRead::Ready { event_count: 1, .. }
+        ));
     }
 
     #[test]
@@ -898,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_subscriptions_do_not_count_against_limits() {
+    fn unread_closed_subscriptions_count_toward_connection_and_pane_limits() {
         let mut journal = PaneStateJournal::with_limits(
             8,
             SubscriptionLimits::new(1, 1, 16, std::time::Duration::from_secs(60)),
@@ -911,23 +998,35 @@ mod tests {
         let first = journal
             .subscribe(7, pane_id(1), include)
             .expect("first subscription fits the limit");
-        journal.push(
-            pane_id(1),
-            Some(9),
-            PaneStateChange::Closed {
-                reason: PaneStateClosedReason::Killed,
-            },
-        );
-        assert!(journal.mark_pane_closed(pane_id(1)));
+        close_pane(&mut journal, pane_id(1));
 
-        let second = journal
+        assert_eq!(
+            journal.subscribe(7, pane_id(2), include),
+            Err(PaneStateSubscriptionError::Limit(
+                SubscriptionLimitError::PerConnection { limit: 1 }
+            ))
+        );
+        assert_eq!(
+            journal.subscribe(8, pane_id(1), include),
+            Err(PaneStateSubscriptionError::Limit(
+                SubscriptionLimitError::PerPane { limit: 1 }
+            ))
+        );
+
+        assert_eq!(journal.unsubscribe(7, first), Ok(true));
+        let replacement = journal
             .subscribe(7, pane_id(1), include)
-            .expect("closed subscription must not consume connection or pane quota");
-        assert_ne!(second, first);
+            .expect("unsubscribe must release connection and pane quota");
+        close_pane(&mut journal, pane_id(1));
+        journal.remove_connection(7);
+        journal
+            .subscribe(8, pane_id(1), include)
+            .expect("disconnect must release connection and pane quota");
+        assert_ne!(replacement, first);
     }
 
     #[test]
-    fn closed_subscriptions_are_bounded_by_journal_capacity() {
+    fn capacity_rejects_n_plus_one_and_retains_oldest_closed_until_delivery() {
         let mut journal = PaneStateJournal::with_limits(
             2,
             SubscriptionLimits::new(8, 8, 16, std::time::Duration::from_secs(60)),
@@ -938,27 +1037,55 @@ mod tests {
             foreground: true,
         };
 
-        for pane in 1..=4 {
-            let pane_id = pane_id(pane);
-            journal
-                .subscribe(7, pane_id, include)
-                .expect("subscription within limits");
-            let revision = journal.push(
-                pane_id,
+        let oldest = journal
+            .subscribe(7, pane_id(1), include)
+            .expect("first subscription fits capacity");
+        let oldest_closed_revision = close_pane(&mut journal, pane_id(1));
+        journal
+            .subscribe(8, pane_id(2), include)
+            .expect("Nth subscription fits capacity");
+        close_pane(&mut journal, pane_id(2));
+
+        for pane in 3..=4 {
+            journal.push(
+                pane_id(pane),
                 Some(9),
-                PaneStateChange::Closed {
-                    reason: PaneStateClosedReason::Killed,
+                PaneStateChange::TitleChanged {
+                    old: "old".to_owned(),
+                    new: "new".to_owned(),
                 },
             );
-            assert!(journal.mark_pane_closed(pane_id));
-            journal.remember_pane_closed_event(pane_id, PaneStateClosedReason::Killed, revision);
         }
 
+        assert_eq!(
+            journal.subscribe(9, pane_id(3), include),
+            Err(PaneStateSubscriptionError::Capacity { limit: 2 })
+        );
         assert_eq!(journal.subscriptions.len(), 2);
-        assert!(journal
-            .subscriptions
-            .values()
-            .all(|subscription| subscription.closed));
+
+        let mut events = Vec::new();
+        assert_eq!(
+            journal.read_after(7, oldest, 0, 16, &mut events),
+            Ok(PaneStateRead::Ready {
+                next_revision: oldest_closed_revision,
+                limited: false,
+                event_count: 1,
+            })
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [PaneStateEventDto::Closed {
+                revision,
+                reason: PaneStateClosedReason::Killed,
+                ..
+            }] if *revision == oldest_closed_revision
+        ));
+
+        assert!(journal.remove_closed_subscription(7, oldest));
+        journal
+            .subscribe(9, pane_id(3), include)
+            .expect("delivering Closed must release global capacity");
+        assert_eq!(journal.subscriptions.len(), 2);
     }
 
     #[test]
@@ -1521,16 +1648,11 @@ mod tests {
             ] if *revision == closed_revision
         ));
 
+        journal.remove_closed_subscription(7, subscription);
         let mut events = Vec::new();
-        assert_eq!(
-            journal.read_after(7, subscription, closed_revision, 16, &mut events),
-            Ok(PaneStateRead::Ready {
-                next_revision: closed_revision,
-                limited: false,
-                event_count: 0,
-            })
-        );
-        assert!(events.is_empty());
+        assert!(journal
+            .read_after(7, subscription, closed_revision, 16, &mut events)
+            .is_err());
     }
 
     /// Model-based check of docs/design/pane-state-invariants.md I1/I2/I3/I5:
@@ -1591,6 +1713,12 @@ mod tests {
 
     impl InvariantConsumer {
         fn read(&mut self, journal: &PaneStateJournal, max_events: usize) {
+            // The request handler removes terminal subscriptions immediately
+            // after delivering Closed. Model that terminal stream contract
+            // rather than calling the journal again after completion.
+            if self.closed_delivered > 0 {
+                return;
+            }
             let seed = self.seed;
             let mut events = Vec::new();
             match journal
@@ -1635,7 +1763,9 @@ mod tests {
                 PaneStateRead::Lag {
                     resume_revision, ..
                 } => {
-                    // Mirror the handler: snapshot rebase to resume - 1.
+                    // Rebase this journal-only consumer to the first retained
+                    // revision. The handler separately returns a current
+                    // snapshot before draining retained events.
                     let rebased = resume_revision.saturating_sub(1);
                     assert!(
                         rebased >= self.cursor,

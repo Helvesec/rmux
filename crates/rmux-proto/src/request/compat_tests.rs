@@ -558,6 +558,7 @@ fn show_options_request_deserializes_old_payloads_with_defaulted_fields() {
     assert!(decoded.value_only);
     assert!(!decoded.include_inherited);
     assert!(!decoded.quiet);
+    assert!(!decoded.include_hooks);
 }
 
 #[test]

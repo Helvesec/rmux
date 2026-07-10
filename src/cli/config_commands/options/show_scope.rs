@@ -15,9 +15,12 @@ pub(in crate::cli::config_commands) fn resolve_show_options_scope(
     args: &ShowOptionsArgs,
 ) -> Result<ShowOptionsScope, ExitFailure> {
     let force_window = matches!(command, ShowOptionsCommandKind::ShowWindowOptions);
+    let hook = args.name.as_deref().and_then(show_options_hook_name);
     if args.server {
         if let Some(name) = args.name.as_deref() {
-            if !option_supports_show_scope(name, &OptionScopeSelector::ServerGlobal) {
+            if hook.is_none()
+                && !option_supports_show_scope(name, &OptionScopeSelector::ServerGlobal)
+            {
                 return show_named_scope_fallback(args.target.as_ref(), name);
             }
         }
@@ -28,7 +31,9 @@ pub(in crate::cli::config_commands) fn resolve_show_options_scope(
         (true, false, _) if args.global => Ok(OptionScopeSelector::WindowGlobal.into()),
         (true, false, Some(target)) => {
             if let Some(name) = args.name.as_deref() {
-                if !option_supports_show_scope(name, &OptionScopeSelector::WindowGlobal) {
+                if hook.is_none()
+                    && !option_supports_show_scope(name, &OptionScopeSelector::WindowGlobal)
+                {
                     return show_options_scope_for_target(target, Some(name));
                 }
             }
@@ -39,16 +44,19 @@ pub(in crate::cli::config_commands) fn resolve_show_options_scope(
         }
         (true, false, None) => {
             if let Some(name) = args.name.as_deref() {
-                if !option_supports_show_scope(name, &OptionScopeSelector::WindowGlobal) {
+                if hook.is_none()
+                    && !option_supports_show_scope(name, &OptionScopeSelector::WindowGlobal)
+                {
                     return show_named_scope_fallback(None, name);
                 }
             }
             Ok(ShowOptionsScope::CurrentWindow)
         }
+        (false, true, _) if args.global && hook.is_some() => show_pane_scope(args.target.as_ref()),
         (false, true, _) if args.global => show_global_pane_options_scope(args),
         (false, true, Some(target)) => {
             if let Some(name) = args.name.as_deref() {
-                if !option_supports_show_scope(name, &dummy_pane_scope()) {
+                if hook.is_none() && !option_supports_show_scope(name, &dummy_pane_scope()) {
                     return show_options_scope_for_target(target, Some(name));
                 }
             }
@@ -59,13 +67,15 @@ pub(in crate::cli::config_commands) fn resolve_show_options_scope(
         }
         (false, true, None) => {
             if let Some(name) = args.name.as_deref() {
-                if !option_supports_show_scope(name, &dummy_pane_scope()) {
+                if hook.is_none() && !option_supports_show_scope(name, &dummy_pane_scope()) {
                     return show_named_scope_fallback(None, name);
                 }
             }
             Ok(ShowOptionsScope::CurrentPane)
         }
-        (false, false, _) if args.global => Ok(if let Some(name) = args.name.as_deref() {
+        (false, false, _) if args.global => Ok(if let Some(hook) = hook {
+            global_hook_option_scope(hook)
+        } else if let Some(name) = args.name.as_deref() {
             rmux_core::default_global_scope_for_option_name(name)
                 .map_err(option_lookup_exit_failure)?
         } else if force_window {
@@ -74,8 +84,15 @@ pub(in crate::cli::config_commands) fn resolve_show_options_scope(
             OptionScopeSelector::SessionGlobal
         }
         .into()),
+        (false, false, Some(target)) if hook.is_some() => Ok(ShowOptionsScope::Unresolved {
+            target: target.clone(),
+            kind: hook_scope_kind(hook.expect("hook checked above")),
+        }),
         (false, false, Some(target)) => show_options_scope_for_target(target, args.name.as_deref()),
         (false, false, None) if force_window => Ok(ShowOptionsScope::CurrentWindow),
+        (false, false, None) if hook.is_some() => {
+            Ok(current_hook_scope(hook.expect("hook checked above")))
+        }
         (false, false, None) => Ok(ShowOptionsScope::CurrentSession),
         (true, true, _) => unreachable!("clap scope group prevents -w and -p together"),
     }
@@ -269,6 +286,44 @@ fn dummy_pane_scope() -> OptionScopeSelector {
         0,
         0,
     ))
+}
+
+fn show_options_hook_name(value: &str) -> Option<rmux_proto::HookName> {
+    let name = match value.rsplit_once('[') {
+        Some((name, index)) if index.strip_suffix(']')?.parse::<u32>().is_ok() => name,
+        Some(_) => return None,
+        None => value,
+    };
+    rmux_proto::HookName::from_str(name)
+}
+
+fn global_hook_option_scope(hook: rmux_proto::HookName) -> OptionScopeSelector {
+    match rmux_core::hook_global_root(hook) {
+        rmux_core::HookGlobalRoot::Session => OptionScopeSelector::SessionGlobal,
+        rmux_core::HookGlobalRoot::Window => OptionScopeSelector::WindowGlobal,
+    }
+}
+
+fn hook_scope_kind(hook: rmux_proto::HookName) -> UnresolvedShowOptionsScope {
+    let target = Target::Pane(PaneTarget::with_window(
+        SessionName::new("show-hook-scope").expect("valid session name"),
+        0,
+        0,
+    ));
+    match rmux_core::hook_natural_scope_for_target(hook, target) {
+        rmux_proto::ScopeSelector::Session(_) => UnresolvedShowOptionsScope::Session,
+        rmux_proto::ScopeSelector::Window(_) => UnresolvedShowOptionsScope::Window,
+        rmux_proto::ScopeSelector::Pane(_) => UnresolvedShowOptionsScope::Pane,
+        rmux_proto::ScopeSelector::Global => unreachable!("natural hook scope is local"),
+    }
+}
+
+fn current_hook_scope(hook: rmux_proto::HookName) -> ShowOptionsScope {
+    match hook_scope_kind(hook) {
+        UnresolvedShowOptionsScope::Session => ShowOptionsScope::CurrentSession,
+        UnresolvedShowOptionsScope::Window => ShowOptionsScope::CurrentWindow,
+        UnresolvedShowOptionsScope::Pane => ShowOptionsScope::CurrentPane,
+    }
 }
 
 fn option_lookup_exit_failure(error: RmuxError) -> ExitFailure {

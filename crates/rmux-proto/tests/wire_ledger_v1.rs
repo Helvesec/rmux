@@ -121,6 +121,7 @@ fn fixtures() -> Vec<FullFrameFixture> {
     let control_mode = Request::ControlMode(ControlModeRequest {
         mode: ControlMode::ControlControl,
         client_terminal: ClientTerminalContext::default(),
+        initial_command_count: 2,
     });
     let split_target_action =
         Request::SplitWindowTargetAction(Box::new(SplitWindowTargetActionRequest {
@@ -735,6 +736,7 @@ fn cross_section_requests() -> Vec<Request> {
         Request::ControlMode(ControlModeRequest {
             mode: ControlMode::Plain,
             client_terminal: ClientTerminalContext::default(),
+            initial_command_count: 0,
         }),
         Request::ClockMode(ClockModeRequest {
             target: Some(pane.clone()),

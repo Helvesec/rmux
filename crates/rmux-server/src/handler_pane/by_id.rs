@@ -254,6 +254,7 @@ impl RequestHandler {
                         let _ = state.hooks.remove_pane(&target);
                         None
                     };
+                    self.record_panes_closed_as_killed(&result.removed_pane_ids);
                     (
                         Response::KillPane(result.response),
                         None,
@@ -284,7 +285,6 @@ impl RequestHandler {
 
         if !removed_pane_ids.is_empty() {
             self.forget_pane_snapshot_coalescers(&removed_pane_ids);
-            self.record_panes_closed_as_killed(&removed_pane_ids);
         }
         if let Some(event) = queued_pane_exited {
             self.emit_prepared(event);
@@ -331,13 +331,25 @@ impl RequestHandler {
                 Ok(target) => target,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
-            if let Some(keep_alive) = request.keep_alive_on_exit {
-                if let Err(error) = state.options.set(
+            let previous_options = request.keep_alive_on_exit.map(|_| state.options.clone());
+            let keep_alive_outcome = if let Some(keep_alive) = request.keep_alive_on_exit {
+                match state.options.set(
                     ScopeSelector::Pane(target.clone()),
                     OptionName::RemainOnExit,
                     if keep_alive { "on" } else { "off" }.to_owned(),
                     SetOptionMode::Replace,
                 ) {
+                    Ok(outcome) => Some(outcome),
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                }
+            } else {
+                None
+            };
+            if keep_alive_outcome.is_some() {
+                if let Err(error) = state.synchronize_pane_alias_options_from_target(&target) {
+                    if let Some(previous_options) = previous_options {
+                        state.options = previous_options;
+                    }
                     return Response::Error(ErrorResponse { error });
                 }
             }
@@ -367,10 +379,19 @@ impl RequestHandler {
                 |_, _| {},
             ) {
                 Ok(response) => {
-                    self.reopen_pane_state(pane_id);
+                    self.record_pane_respawn_boundary(pane_id);
+                    if let Some(outcome) = keep_alive_outcome.as_ref() {
+                        let generation = state.pane_output_generation(&session_name, pane_id);
+                        self.record_pane_option_mutation(pane_id, Some(generation), outcome);
+                    }
                     (Response::RespawnPane(response), Some(pane_id))
                 }
-                Err(error) => (Response::Error(ErrorResponse { error }), None),
+                Err(error) => {
+                    if let Some(previous_options) = previous_options {
+                        state.options = previous_options;
+                    }
+                    (Response::Error(ErrorResponse { error }), None)
+                }
             }
         };
 
@@ -405,7 +426,7 @@ impl RequestHandler {
     ) -> Response {
         let session_name = request.target.session_name().clone();
         let title = request.title.clone();
-        let (response, pane_changed, window_index, title_changed_target, title_state_event) = {
+        let (response, pane_changed, window_index, title_changed_target) = {
             let mut state = self.state.lock().await;
             let target = match resolve_pane_target_ref(&state, &request.target) {
                 Ok(target) => target,
@@ -448,31 +469,34 @@ impl RequestHandler {
                     target: response_target,
                 })
             })() {
-                Ok(response) => (
-                    Response::SelectPane(response),
-                    pane_changed,
-                    window_index,
-                    title_changed_target,
-                    title_state_event,
-                ),
+                Ok(response) => {
+                    if let Some((pane_id, generation, old, new)) = &title_state_event {
+                        self.record_pane_state_change(
+                            *pane_id,
+                            Some(*generation),
+                            PaneStateChange::TitleChanged {
+                                old: old.clone(),
+                                new: new.clone(),
+                            },
+                        );
+                    }
+                    (
+                        Response::SelectPane(response),
+                        pane_changed,
+                        window_index,
+                        title_changed_target,
+                    )
+                }
                 Err(error) => (
                     Response::Error(ErrorResponse { error }),
                     false,
                     window_index,
-                    None,
                     None,
                 ),
             }
         };
 
         if matches!(response, Response::SelectPane(_)) {
-            if let Some((pane_id, generation, old, new)) = title_state_event {
-                self.record_pane_state_change(
-                    pane_id,
-                    Some(generation),
-                    PaneStateChange::TitleChanged { old, new },
-                );
-            }
             if pane_changed {
                 self.emit(LifecycleEvent::WindowPaneChanged {
                     target: WindowTarget::with_window(session_name.clone(), window_index),

@@ -282,6 +282,26 @@ fn show_window_options_rejects_server_only_include_inherited_flag() {
 }
 
 #[test]
+fn show_options_accepts_include_hooks_but_show_window_options_rejects_it() {
+    let cli = parse_args(&["show-options", "-gH"]).expect("show-options -H parses");
+    match cli.command.expect("parsed command") {
+        super::super::Command::ShowOptions(args) => {
+            assert!(args.global);
+            assert!(args.include_hooks);
+        }
+        _ => panic!("expected ShowOptions command"),
+    }
+
+    let error = parse_args(&["show-window-options", "-H"]).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("command show-window-options: unknown flag -H"),
+        "{error}"
+    );
+}
+
+#[test]
 fn set_environment_accepts_default_global_and_session_scope() {
     parse_args(&["set-environment", "TERM", "screen"]).expect("default set-environment parses");
     parse_args(&["set-environment", "-g", "TERM", "screen"])

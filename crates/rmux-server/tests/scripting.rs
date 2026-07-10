@@ -80,13 +80,14 @@ async fn if_shell_returns_nested_command_output() -> Result<(), Box<dyn Error>> 
 
     let set_buffer = send_request(
         &socket_path,
-        &Request::SetBuffer(SetBufferRequest {
+        &Request::SetBuffer(Box::new(SetBufferRequest {
             name: Some("selected".to_owned()),
             content: b"yes".to_vec(),
             append: false,
             new_name: None,
             set_clipboard: false,
-        }),
+            target_client: None,
+        })),
     )
     .await?;
     assert!(matches!(set_buffer, Response::SetBuffer(_)));

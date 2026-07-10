@@ -7,7 +7,7 @@ use crate::RmuxError;
 /// Magic byte that identifies versioned RMUX detached RPC frames.
 pub const RMUX_FRAME_MAGIC: u8 = 0x52;
 /// Current detached RPC wire version.
-pub const RMUX_WIRE_VERSION: u32 = 4;
+pub const RMUX_WIRE_VERSION: u32 = 5;
 
 /// Supported detached RPC wire-version range for this build.
 ///

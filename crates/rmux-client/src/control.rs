@@ -40,9 +40,15 @@ impl Connection {
         client_terminal: ClientTerminalContext,
         initial_commands: &[String],
     ) -> Result<ControlTransition, ClientError> {
+        let initial_command_count = u32::try_from(initial_commands.len()).map_err(|_| {
+            ClientError::Protocol(rmux_proto::RmuxError::Server(
+                "too many initial control-mode commands".to_owned(),
+            ))
+        })?;
         self.write_request(&Request::ControlMode(ControlModeRequest {
             mode,
             client_terminal,
+            initial_command_count,
         }))?;
         write_initial_control_commands(self.stream_mut(), initial_commands)?;
         let response = read_response_frame_exact(self.stream_mut())?;

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 
 use rmux_core::{
     formats::{is_truthy, render_list_windows_line, FormatContext},
-    Session,
+    OptionStore, Session,
 };
 use rmux_proto::{
     CommandOutput, KillWindowResponse, LastWindowResponse, ListWindowsResponse, NewWindowResponse,
@@ -18,7 +18,7 @@ mod window_link_commands;
 mod window_movement;
 
 use super::{
-    session_not_found, HandlerState, KilledWindowResult, NewWindowOptions,
+    session_not_found, HandlerState, KilledWindowResult, NewWindowOptions, PreparedWindowTerminal,
     RemovedWindowHookContext, RespawnWindowOptions,
 };
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
@@ -36,18 +36,6 @@ pub(crate) struct RespawnWindowResult {
 }
 
 impl HandlerState {
-    pub(crate) fn respawn_window_removed_pane_ids(
-        &self,
-        target: &WindowTarget,
-    ) -> Result<Vec<PaneId>, RmuxError> {
-        let session = self
-            .sessions
-            .session(target.session_name())
-            .ok_or_else(|| session_not_found(target.session_name()))?;
-        let pane_ids = window_pane_ids(session, target.session_name(), target.window_index())?;
-        Ok(pane_ids.into_iter().skip(1).collect())
-    }
-
     pub(crate) fn create_window(
         &mut self,
         session_name: &SessionName,
@@ -231,6 +219,7 @@ impl HandlerState {
         for synchronized_session in sessions_to_synchronize {
             self.synchronize_session_group_from(&synchronized_session)?;
         }
+        let removed_pane_ids = self.pane_ids_no_longer_referenced(removed_pane_ids);
 
         Ok(KilledWindowResult {
             response: KillWindowResponse {
@@ -424,20 +413,12 @@ impl HandlerState {
         let session_name = target.session_name().clone();
         let window_index = target.window_index();
 
-        // Check that the window exists and collect its pane IDs.
-        let pane_ids = {
-            let session = self
-                .sessions
-                .session(&session_name)
-                .ok_or_else(|| session_not_found(&session_name))?;
-            let window = session.window_at(window_index).ok_or_else(|| {
-                RmuxError::invalid_target(
-                    format!("{session_name}:{window_index}"),
-                    "window index does not exist in session",
-                )
-            })?;
-            window.panes().iter().map(|p| p.id()).collect::<Vec<_>>()
-        };
+        let previous_session = self
+            .sessions
+            .session(&session_name)
+            .cloned()
+            .ok_or_else(|| session_not_found(&session_name))?;
+        let pane_ids = window_pane_ids(&previous_session, &session_name, window_index)?;
 
         // Without -k, reject if any pane terminal is still present (i.e. process may be running).
         if !kill
@@ -461,39 +442,77 @@ impl HandlerState {
             .collect::<Vec<_>>();
         let runtime_session_name =
             self.runtime_session_name_for_window(&session_name, window_index);
+        let previous_output_generation =
+            self.pane_output_generation(&runtime_session_name, pane_id);
         let base_environment =
             self.session_base_environment_for_window(&session_name, window_index);
+        let before_pane_options = self.pane_option_slots_for_session(&session_name)?;
 
-        // Kill terminals for panes that disappear with the old window layout.
-        for removed_pane_id in removed_pane_ids.iter().copied() {
-            self.remove_pane_terminal_from_runtime(&runtime_session_name, removed_pane_id);
-        }
-        if let Some(pipe) = self.remove_pane_pipe(&runtime_session_name, pane_id) {
-            pipe.stop();
-        }
-        let _ = self.terminals.remove_pane(&runtime_session_name, pane_id);
-
-        // tmux respawns a window by retaining the first pane's identity and
-        // destroying the rest, rather than allocating a new pane identity.
-        {
-            let session = self
-                .sessions
-                .session_mut(&session_name)
-                .ok_or_else(|| session_not_found(&session_name))?;
-            session.respawn_window_with_pane_id(window_index, pane_id)?;
-            session.select_window(window_index)?;
-        }
-
-        // Spawn the new terminal for the single fresh pane.
-        self.reset_window_terminal_with_base_environment(
-            &session_name,
+        // Prepare the replacement process against a preview of the new layout.
+        // No old runtime state is touched until every fallible spawn step has
+        // succeeded, so profile/PTY/output-reader failures are true no-ops.
+        let mut respawned_session = previous_session.clone();
+        respawned_session.respawn_window_with_pane_id(window_index, pane_id)?;
+        respawned_session.select_window(window_index)?;
+        let prepared = self.prepare_window_terminal(
+            &respawned_session,
             window_index,
             spawn,
             base_environment.as_ref(),
         )?;
+        let automatic_name_applied = apply_prepared_automatic_window_name(
+            &self.options,
+            self.tracks_auto_named_window(&session_name, window_index),
+            &mut respawned_session,
+            window_index,
+            &prepared,
+        );
+
+        let mut removed_terminals = pane_ids
+            .iter()
+            .filter_map(|pane_id| {
+                self.terminals
+                    .remove_pane(&runtime_session_name, *pane_id)
+                    .map(|terminal| (*pane_id, terminal))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut removed_outputs = self.remove_pane_outputs(&runtime_session_name, &pane_ids);
+        self.seed_pane_output_generation(
+            &runtime_session_name,
+            pane_id,
+            previous_output_generation,
+        );
+        self.replace_session(&session_name, respawned_session)?;
+
+        if let Err(error) =
+            self.install_prepared_window_terminal(&runtime_session_name, window_index, prepared)
+        {
+            self.replace_session(&session_name, previous_session)?;
+            self.terminals
+                .insert_existing_panes(&runtime_session_name, removed_terminals)?;
+            self.insert_existing_pane_outputs(&runtime_session_name, removed_outputs);
+            return Err(error);
+        }
+
+        for old_pane_id in &pane_ids {
+            if let Some(pipe) = self.remove_pane_pipe(&runtime_session_name, *old_pane_id) {
+                pipe.stop();
+            }
+        }
+        for removed_pane_id in &removed_pane_ids {
+            self.clear_marked_pane_if_id(*removed_pane_id);
+        }
+        self.remove_pane_lifecycles(&removed_pane_ids);
+        if automatic_name_applied {
+            self.mark_auto_named_window(&session_name, window_index);
+        }
+        self.rekey_pane_options_after_session_change(&before_pane_options, &session_name)?;
+        removed_outputs.abort_output_readers();
+        super::terminate_removed_terminals(&mut removed_terminals);
 
         self.synchronize_session_group_from(&session_name)?;
         self.sync_pane_lifecycle_dimensions_for_session(&session_name);
+        let removed_pane_ids = self.pane_ids_no_longer_referenced(removed_pane_ids);
 
         Ok(RespawnWindowResult {
             response: rmux_proto::RespawnWindowResponse { target },
@@ -532,6 +551,36 @@ impl HandlerState {
 
         Ok(ListWindowsResponse { windows, output })
     }
+}
+
+fn apply_prepared_automatic_window_name(
+    options: &OptionStore,
+    tracked: bool,
+    session: &mut Session,
+    window_index: u32,
+    prepared: &PreparedWindowTerminal,
+) -> bool {
+    let Some(name) = prepared.automatic_window_name() else {
+        return false;
+    };
+    let session_name = session.name().clone();
+    let should_apply = session.window_at(window_index).is_some_and(|window| {
+        window.name().is_none()
+            && crate::automatic_rename::window_allows_automatic_rename(
+                options,
+                &session_name,
+                window_index,
+                window,
+                tracked,
+            )
+    });
+    if should_apply {
+        session
+            .window_at_mut(window_index)
+            .expect("prevalidated respawn window exists")
+            .set_automatic_name(name.to_owned());
+    }
+    should_apply
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

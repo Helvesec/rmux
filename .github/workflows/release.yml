@@ -27,6 +27,11 @@ jobs:
   source-gates:
     name: Release source gates
     runs-on: ubuntu-latest
+    outputs:
+      package_version: ${{ steps.release_identity.outputs.package_version }}
+      release_version: ${{ steps.release_identity.outputs.release_version }}
+      is_prerelease: ${{ steps.release_identity.outputs.is_prerelease }}
+      source_git_sha: ${{ steps.release_identity.outputs.source_git_sha }}
     env:
       RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
       RUSTDOCFLAGS: -D warnings
@@ -49,6 +54,25 @@ jobs:
         with:
           ref: ${{ env.RELEASE_REF }}
           persist-credentials: false
+
+      - name: Resolve release identity
+        id: release_identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS='=' read -r key value; do
+            case "$key" in
+              RELEASE_REF|RELEASE_VERSION|PACKAGE_VERSION|IS_PRERELEASE|SOURCE_GIT_SHA)
+                echo "$key=$value" >> "$GITHUB_ENV"
+                echo "${key,,}=$value" >> "$GITHUB_OUTPUT"
+                ;;
+              *)
+                echo "Unexpected release identity field: $key" >&2
+                exit 1
+                ;;
+            esac
+          done < <(scripts/release-identity.sh "$RELEASE_REF")
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
@@ -103,6 +127,11 @@ jobs:
           RMUX_FROZEN_TMUX: ${{ runner.temp }}/rmux-oracle/tmux
           RMUX_REQUIRE_TMUX: "1"
           RMUX_PERF_AUTO_CURRENT: "1"
+          RMUX_PERF_GATE_MODE: portable-budget
+          RMUX_PERF_EXPECTED_GIT_SHA: ${{ github.sha }}
+          RMUX_PERF_EXPECTED_PLATFORM: linux
+          RMUX_PERF_EXPECTED_PROVENANCE: github-actions:${{ github.repository }}:${{ github.workflow }}:${{ github.job }}:${{ github.run_id }}:${{ github.run_attempt }}
+          RMUX_PERF_MAX_CURRENT_AGE_SECONDS: "21600"
         run: scripts/release-review-gate.sh --target-dir target/release-review
 
   build:
@@ -160,13 +189,19 @@ jobs:
             echo "Invalid release ref: $RELEASE_REF" >&2
             exit 1
           fi
-          echo "TAG=$RELEASE_REF" >> "$GITHUB_ENV"
-          echo "VERSION=${RELEASE_REF#v}" >> "$GITHUB_ENV"
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           ref: ${{ env.RELEASE_REF }}
           persist-credentials: false
+
+      - name: Resolve release identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/release-identity.sh "$RELEASE_REF" | tee release-identity.env
+          cat release-identity.env >> "$GITHUB_ENV"
+          test "$(sed -n 's/^SOURCE_GIT_SHA=//p' release-identity.env)" = "$GITHUB_SHA"
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
@@ -186,6 +221,13 @@ jobs:
         shell: bash
         run: cargo build --package rmux --locked --profile "$BUILD_PROFILE" --target "$TARGET"
 
+      - name: Install Linux package tooling
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binutils cpio rpm createrepo-c
+
       - name: Inspect release binary
         shell: bash
         run: |
@@ -196,10 +238,10 @@ jobs:
             file "$bin"
           fi
           if [[ "$TARGET" == *-unknown-linux-gnu ]]; then
-            max_glibc="$(strings "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -V | tail -n 1 || true)"
-            echo "max GLIBC symbol: ${max_glibc:-none}"
-            if [[ -n "$max_glibc" ]] && [[ "$(printf '%s\n' "$max_glibc" "GLIBC_2.35" | sort -V | tail -n 1)" != "GLIBC_2.35" ]]; then
-              echo "Linux release binary requires $max_glibc; expected GLIBC_2.35 or older" >&2
+            glibc_floor="$(scripts/glibc-symbol-floor.sh "$bin")"
+            echo "max GLIBC symbol: GLIBC_$glibc_floor"
+            if [[ "$(printf '%s\n' "$glibc_floor" "2.35" | sort -V | tail -n 1)" != "2.35" ]]; then
+              echo "Linux release binary requires GLIBC_$glibc_floor; expected GLIBC_2.35 or older" >&2
               exit 1
             fi
           fi
@@ -217,14 +259,7 @@ jobs:
         run: |
           bin="target/$TARGET/$PROFILE_DIR/$BINARY"
           "$bin" -V | tee version.txt
-          grep -F "rmux $VERSION" version.txt
-
-      - name: Install Linux package tooling
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cpio rpm createrepo-c
+          grep -Fx "rmux $PACKAGE_VERSION" version.txt
 
       - name: Windows runtime smoke
         if: runner.os == 'Windows'
@@ -233,11 +268,16 @@ jobs:
           $ErrorActionPreference = "Stop"
           $bin = "target/$env:TARGET/$env:PROFILE_DIR/$env:BINARY"
           & $bin -V
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $bin list-commands | Out-Null
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Windows attach and daemon regression tests
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          RMUX_EXPECTED_GIT_SHA: ${{ github.sha }}
+          RMUX_WINDOWS_CTRL_MATRIX_EVIDENCE_JSON: ${{ secrets.RMUX_WINDOWS_CTRL_MATRIX_EVIDENCE_JSON }}
         run: |
           $ErrorActionPreference = "Stop"
           $env:CARGO_INCREMENTAL = "0"
@@ -262,8 +302,73 @@ jobs:
           Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux-client", "--locked", "output_backpressure_keeps_local_input_and_resize_live")
           Run "cargo" @("test", "-p", "rmux-client", "--locked", "output_backpressure_keeps_local_input_and_resize_live", "--", "--test-threads=1")
           Run "./scripts/windows_ctrl_matrix.ps1" @("-StaticMatrixSpec")
-          Run "./scripts/windows_ctrl_matrix.ps1" @("-PortableSmokeOnly", "-OutDir", "target/windows-ctrl-matrix", "-AllowPortableSmokeSkip")
-          if (Test-Path target/windows-ctrl-matrix/portable-smoke.skip.txt) { Write-Host "::warning::windows ctrl-matrix portable smoke skipped (non-interactive runner session); run it manually on an interactive Windows session before tagging (RELEASING.md)" }
+          $releaseBin = "target/$env:TARGET/$env:PROFILE_DIR/$env:BINARY"
+          $packageHelper = "target/$env:TARGET/$env:PROFILE_DIR/rmux-full.exe"
+          $runtimeHelper = "target/$env:TARGET/$env:PROFILE_DIR/libexec/rmux/rmux.exe"
+          $releaseDaemon = "target/$env:TARGET/$env:PROFILE_DIR/rmux-daemon.exe"
+          Copy-Item -LiteralPath $releaseBin -Destination $packageHelper -Force
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $runtimeHelper) | Out-Null
+          Copy-Item -LiteralPath $releaseBin -Destination $runtimeHelper -Force
+          $testRustFlags = $env:RUSTFLAGS
+          try {
+            Remove-Item Env:\RUSTFLAGS -ErrorAction SilentlyContinue
+            Run "cargo" @(
+              "build", "--package", "rmux", "--locked",
+              "--profile", $env:BUILD_PROFILE,
+              "--target", $env:TARGET,
+              "--bin", "rmux-daemon"
+            )
+            Run "cargo" @(
+              "build", "--package", "rmux", "--locked",
+              "--profile", $env:BUILD_PROFILE,
+              "--target", $env:TARGET,
+              "--features", "tiny-cli",
+              "--bin", "rmux"
+            )
+          } finally {
+            $env:RUSTFLAGS = $testRustFlags
+          }
+          $actualGitSha = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualGitSha -ne $env:RMUX_EXPECTED_GIT_SHA) {
+            throw "release binary manifest Git SHA does not match the checked-out release"
+          }
+          $releaseManifestPath = "target/windows-ctrl-matrix/release-binaries.json"
+          New-Item -ItemType Directory -Force -Path (Split-Path -Parent $releaseManifestPath) | Out-Null
+          $releaseManifest = [ordered]@{
+            schema = 1
+            kind = "rmux-windows-release-binaries"
+            git_commit = $actualGitSha
+            target = $env:TARGET
+            configuration = $env:BUILD_PROFILE
+            binary_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $releaseBin).Hash.ToLowerInvariant()
+            helper_binary_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $packageHelper).Hash.ToLowerInvariant()
+            daemon_binary_sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $releaseDaemon).Hash.ToLowerInvariant()
+          }
+          [System.IO.File]::WriteAllText(
+            $releaseManifestPath,
+            ($releaseManifest | ConvertTo-Json -Depth 3),
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          $ctrlArgs = @(
+            "-Rmux", $releaseBin,
+            "-PortableSmokeOnly",
+            "-OutDir", "target/windows-ctrl-matrix",
+            "-ExpectedGitSha", $env:RMUX_EXPECTED_GIT_SHA
+          )
+          if (-not [string]::IsNullOrWhiteSpace($env:RMUX_WINDOWS_CTRL_MATRIX_EVIDENCE_JSON)) {
+            New-Item -ItemType Directory -Force -Path target/windows-ctrl-matrix | Out-Null
+            $manualEvidence = Join-Path $env:RUNNER_TEMP "rmux-windows-ctrl-matrix-evidence.json"
+            [System.IO.File]::WriteAllText(
+              $manualEvidence,
+              $env:RMUX_WINDOWS_CTRL_MATRIX_EVIDENCE_JSON,
+              [System.Text.UTF8Encoding]::new($false)
+            )
+            $ctrlArgs += @("-EvidencePath", $manualEvidence)
+          }
+          Run "./scripts/windows_ctrl_matrix.ps1" $ctrlArgs
+          if (-not (Test-Path -LiteralPath target/windows-ctrl-matrix/portable-smoke.evidence.json -PathType Leaf)) {
+            throw "Windows Ctrl matrix produced no passing SHA-bound evidence"
+          }
           Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux", "--locked", "--test", "windows_ctrl_matrix_spec")
           Run "cargo" @("test", "-p", "rmux", "--locked", "--test", "windows_ctrl_matrix_spec", "--", "--test-threads=1")
           Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux", "--locked", "--test", "windows_cli_queue_formats")
@@ -281,7 +386,7 @@ jobs:
         with:
           name: rmux-${{ env.RELEASE_REF }}-${{ matrix.target }}-windows-ctrl-matrix
           path: target/windows-ctrl-matrix
-          if-no-files-found: ignore
+          if-no-files-found: error
 
       - name: Create Unix archive
         if: matrix.archive == 'tar.gz'
@@ -328,7 +433,9 @@ jobs:
             -Configuration "$env:BUILD_PROFILE" `
             -Target "$env:TARGET" `
             -OutputDir dist `
-            -PlatformLabel "$env:PLATFORM_LABEL"
+            -PlatformLabel "$env:PLATFORM_LABEL" `
+            -ReuseReleaseBinaries `
+            -ReleaseBinaryManifest "target/windows-ctrl-matrix/release-binaries.json"
           $archive = Get-ChildItem -Path dist -Filter "rmux-*.zip" | Select-Object -First 1
           if ($null -eq $archive) {
             throw "Windows package archive was not generated"
@@ -341,6 +448,8 @@ jobs:
             -RunSdkSmoke `
             -RunMouseBorderSmoke `
             -RunCtrlMatrixSmoke `
+            -ExpectedGitSha "$env:GITHUB_SHA" `
+            -CtrlMatrixEvidence "target/windows-ctrl-matrix/portable-smoke.evidence.json" `
             -RequireReleaseArtifact
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -420,6 +529,10 @@ jobs:
       - snap
     env:
       RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+      PACKAGE_VERSION: ${{ needs.source-gates.outputs.package_version }}
+      RELEASE_VERSION: ${{ needs.source-gates.outputs.release_version }}
+      IS_PRERELEASE: ${{ needs.source-gates.outputs.is_prerelease }}
+      SOURCE_GIT_SHA: ${{ needs.source-gates.outputs.source_git_sha }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -489,14 +602,14 @@ jobs:
             release-assets/SHA256SUMS.sigstore.json
 
       - name: Install repository metadata tooling
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y createrepo-c gnupg rpm
 
       - name: Import Linux repository signing keys
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
         shell: bash
         env:
           RMUX_APT_GPG_PRIVATE_KEY: ${{ secrets.RMUX_APT_GPG_PRIVATE_KEY }}
@@ -533,10 +646,10 @@ jobs:
       - name: Generate Homebrew formula
         shell: bash
         run: |
-          version="${RELEASE_REF#v}"
           mkdir -p target/homebrew/Formula
           scripts/generate-homebrew-formula.sh \
-            --version "$version" \
+            --version "$PACKAGE_VERSION" \
+            --release-tag "$RELEASE_REF" \
             --checksums release-assets/SHA256SUMS \
             --output target/homebrew/Formula/rmux.rb
           if command -v ruby >/dev/null 2>&1; then
@@ -546,7 +659,6 @@ jobs:
       - name: Generate package manager metadata
         shell: bash
         run: |
-          version="${RELEASE_REF#v}"
           mkdir -p \
             target/package-managers/homebrew/Formula \
             target/package-managers/winget \
@@ -554,15 +666,18 @@ jobs:
             target/package-managers/chocolatey
           cp target/homebrew/Formula/rmux.rb target/package-managers/homebrew/Formula/rmux.rb
           scripts/generate-winget-manifest.sh \
-            --version "$version" \
+            --version "$PACKAGE_VERSION" \
+            --release-tag "$RELEASE_REF" \
             --checksums release-assets/SHA256SUMS \
             --output target/package-managers/winget/Helvesec.RMUX.yaml
           scripts/generate-scoop-manifest.sh \
-            --version "$version" \
+            --version "$PACKAGE_VERSION" \
+            --release-tag "$RELEASE_REF" \
             --checksums release-assets/SHA256SUMS \
             --output target/package-managers/scoop/rmux.json
           scripts/generate-chocolatey-package.sh \
-            --version "$version" \
+            --version "$PACKAGE_VERSION" \
+            --release-tag "$RELEASE_REF" \
             --checksums release-assets/SHA256SUMS \
             --output-dir target/package-managers/chocolatey/rmux
           if command -v ruby >/dev/null 2>&1; then
@@ -580,10 +695,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $version = $env:RELEASE_REF.Substring(1)
           ./scripts/validate-winget-manifest.ps1 `
             -Manifest "target/package-managers/winget/Helvesec.RMUX.yaml" `
-            -Version $version `
+            -Version $env:PACKAGE_VERSION `
+            -ReleaseTag $env:RELEASE_REF `
             -Checksums "release-assets/SHA256SUMS" `
             -Repository $env:GITHUB_REPOSITORY
 
@@ -594,7 +709,7 @@ jobs:
           if-no-files-found: error
 
       - name: Generate Linux package repositories
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
         shell: bash
         env:
           RMUX_APT_GPG_KEY: ${{ secrets.RMUX_APT_GPG_KEY }}
@@ -617,10 +732,13 @@ jobs:
             --input-dir release-assets \
             --output-dir target/package-repositories/rpm \
             --baseurl https://packages.rmux.io/rpm \
+            --gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux \
+            --repo-gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux-repository \
             --rpm-signing-key "$RMUX_RPM_GPG_KEY" \
             --repo-signing-key "$rpm_repo_key"
           gpg --armor --export "$RMUX_APT_GPG_KEY" > target/package-repositories/debian/rmux.asc
           gpg --armor --export "$RMUX_RPM_GPG_KEY" > target/package-repositories/rpm/RPM-GPG-KEY-rmux
+          gpg --armor --export "$rpm_repo_key" > target/package-repositories/rpm/RPM-GPG-KEY-rmux-repository
           test -f target/package-repositories/debian/rmux.asc
           test -f target/package-repositories/debian/dists/stable/Release
           test -f target/package-repositories/debian/dists/stable/InRelease
@@ -628,6 +746,7 @@ jobs:
           test -f target/package-repositories/debian/dists/stable/main/binary-amd64/Packages.gz
           test -f target/package-repositories/debian/dists/stable/main/binary-arm64/Packages.gz
           test -f target/package-repositories/rpm/RPM-GPG-KEY-rmux
+          test -f target/package-repositories/rpm/RPM-GPG-KEY-rmux-repository
           test -f target/package-repositories/rpm/repodata/repomd.xml
           test -f target/package-repositories/rpm/repodata/repomd.xml.asc
           test -f target/package-repositories/rpm/rmux.repo
@@ -635,7 +754,7 @@ jobs:
           grep -qx 'repo_gpgcheck=1' target/package-repositories/rpm/rmux.repo
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
         with:
           name: linux-package-repositories-${{ env.RELEASE_REF }}
           path: target/package-repositories
@@ -646,13 +765,18 @@ jobs:
         shell: bash
         run: |
           tag="$RELEASE_REF"
-          version="${tag#v}"
           if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$tag" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "$tag" \
-              --draft \
-              --notes "RMUX $version binary release."
+            release_args=(
+              "$tag"
+              --repo "$GITHUB_REPOSITORY"
+              --title "$tag"
+              --draft
+              --notes "RMUX $PACKAGE_VERSION binary release identity $RELEASE_VERSION."
+            )
+            if [ "$IS_PRERELEASE" = "true" ]; then
+              release_args+=(--prerelease)
+            fi
+            gh release create "${release_args[@]}"
           fi
           shopt -s nullglob
           assets=(
@@ -671,7 +795,7 @@ jobs:
           gh release upload "$tag" --repo "$GITHUB_REPOSITORY" "${assets[@]}" --clobber
 
       - name: Deploy Linux package repositories
-        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
         shell: bash
         env:
           RMUX_PACKAGE_REPO_TOKEN: ${{ secrets.RMUX_PACKAGE_REPO_TOKEN }}
@@ -798,7 +922,6 @@ jobs:
 
       - name: Publish Snap to latest/candidate
         id: publish_snap
-        continue-on-error: true
         uses: snapcore/action-publish@214b86e5ca036ead1668c79afb81e550e6c54d40
         env:
           SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
@@ -806,13 +929,14 @@ jobs:
           snap: ${{ steps.snap.outputs.snap }}
           release: latest/candidate
 
-      - name: Report Snap Store manual review
-        if: steps.publish_snap.outcome == 'failure'
+      - name: Report Snap Store publication failure
+        if: failure()
         shell: bash
         run: |
           cat <<'EOF'
-          Snap Store did not publish this upload automatically.
-          Classic confinement can require manual Store review; the signed .snap artifact remains attached to the GitHub Release.
+          Snap Store publication failed. Authentication, transport, validation,
+          and review-state failures are release failures until the Store reports
+          a typed successful upload/release result.
           EOF
 
   validate-winget:
@@ -820,8 +944,10 @@ jobs:
     runs-on: windows-latest
     needs:
       - publish
+      - source-gates
     env:
       RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+      PACKAGE_VERSION: ${{ needs.source-gates.outputs.package_version }}
     steps:
       - name: Validate release ref
         shell: pwsh
@@ -829,7 +955,7 @@ jobs:
           if ($env:RELEASE_REF -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$') {
             throw "Invalid release ref: $env:RELEASE_REF"
           }
-          "VERSION=$($env:RELEASE_REF.Substring(1))" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VERSION=$env:PACKAGE_VERSION" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -862,6 +988,7 @@ jobs:
           .\scripts\validate-winget-manifest.ps1 `
             -Manifest $manifest `
             -Version $env:VERSION `
+            -ReleaseTag $env:RELEASE_REF `
             -Checksums "release-assets\SHA256SUMS" `
             -Repository $env:GITHUB_REPOSITORY
 
@@ -878,13 +1005,15 @@ jobs:
 
   publish-chocolatey:
     name: Publish Chocolatey package
-    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
     runs-on: windows-latest
     needs:
       - publish
+      - source-gates
     environment: release
     env:
       RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+      PACKAGE_VERSION: ${{ needs.source-gates.outputs.package_version }}
       CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
     steps:
       - name: Validate release ref
@@ -893,7 +1022,7 @@ jobs:
           if ($env:RELEASE_REF -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$') {
             throw "Invalid release ref: $env:RELEASE_REF"
           }
-          "VERSION=$($env:RELEASE_REF.Substring(1))" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VERSION=$env:PACKAGE_VERSION" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:

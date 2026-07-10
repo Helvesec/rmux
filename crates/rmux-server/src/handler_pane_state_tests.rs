@@ -4,16 +4,18 @@ use std::{
 };
 
 use super::RequestHandler;
-use crate::pane_state_journal::{PaneStateChange, PANE_STATE_JOURNAL_CAPACITY};
+use crate::pane_state_journal::{
+    PaneStateChange, PANE_STATE_JOURNAL_BYTE_CAPACITY, PANE_STATE_JOURNAL_CAPACITY,
+};
 use rmux_core::{events::SubscriptionLimits, PaneId};
 use rmux_proto::{
-    ErrorResponse, KillSessionRequest, KillWindowRequest, LinkWindowRequest, MoveWindowRequest,
-    MoveWindowTarget, NewSessionRequest, NewWindowRequest, OptionScopeSelector, PaneKillRequest,
-    PaneOptionSetRequest, PaneStateClosedReason, PaneStateCursorRequest, PaneStateEventDto,
-    PaneTarget, PaneTargetRef, Request, RespawnPaneRequest, RespawnWindowRequest, Response,
-    RmuxError, SelectPaneRequest, SessionName, SetOptionByNameRequest, SetOptionMode,
-    SourceFileRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget,
-    SubscribePaneStateRequest, TerminalSize, UnlinkWindowRequest, WindowTarget,
+    encode_frame, ErrorResponse, KillSessionRequest, KillWindowRequest, LinkWindowRequest,
+    MoveWindowRequest, MoveWindowTarget, NewSessionRequest, NewWindowRequest, OptionScopeSelector,
+    PaneKillRequest, PaneOptionSetRequest, PaneStateClosedReason, PaneStateCursorRequest,
+    PaneStateEventDto, PaneTarget, PaneTargetRef, Request, RespawnPaneRequest,
+    RespawnWindowRequest, Response, RmuxError, SelectPaneRequest, SessionName,
+    SetOptionByNameRequest, SetOptionMode, SourceFileRequest, SplitDirection, SplitWindowRequest,
+    SplitWindowTarget, SubscribePaneStateRequest, TerminalSize, UnlinkWindowRequest, WindowTarget,
 };
 
 fn session_name(value: &str) -> SessionName {
@@ -721,6 +723,65 @@ async fn select_pane_title_origin_emits_pane_state_title_event() {
             ..
         } if event_pane_id == pane_id && new_title == "selected-title"
     ));
+}
+
+#[tokio::test]
+async fn oversized_title_history_rebases_to_a_frameable_snapshot() {
+    let handler = RequestHandler::new();
+    let (_session, target, _pane_id) =
+        create_session_with_pane(&handler, "pane-state-large-title-rebase").await;
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&target)
+        .await;
+    let subscription_id = subscribe(&handler, 985, target.clone(), true, false).await;
+
+    let first_title = "a".repeat(PANE_STATE_JOURNAL_BYTE_CAPACITY + 1024);
+    let response = handler
+        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+            target: target.clone(),
+            title: Some(first_title.clone()),
+            input_disabled: None,
+            preserve_zoom: false,
+            style: None,
+        })))
+        .await;
+    assert!(matches!(response, Response::SelectPane(_)), "{response:?}");
+
+    let first_resume = match read_cursor(&handler, 985, subscription_id, 0).await {
+        Response::PaneStateLag(response) => {
+            assert_eq!(
+                response.snapshot.title.as_deref(),
+                Some(first_title.as_str())
+            );
+            encode_frame(&Response::PaneStateLag(response.clone()))
+                .expect("large rebased snapshot stays below the detached frame limit");
+            response.resume_revision
+        }
+        response => panic!("oversized retained event must rebase: {response:?}"),
+    };
+
+    let second_title = "b".repeat(PANE_STATE_JOURNAL_BYTE_CAPACITY + 1024);
+    let response = handler
+        .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+            target,
+            title: Some(second_title.clone()),
+            input_disabled: None,
+            preserve_zoom: false,
+            style: None,
+        })))
+        .await;
+    assert!(matches!(response, Response::SelectPane(_)), "{response:?}");
+    match read_cursor(&handler, 985, subscription_id, first_resume).await {
+        Response::PaneStateLag(response) => {
+            assert_eq!(
+                response.snapshot.title.as_deref(),
+                Some(second_title.as_str())
+            );
+            encode_frame(&Response::PaneStateLag(response))
+                .expect("repeated large titles must not close the SDK transport");
+        }
+        response => panic!("second oversized retained event must rebase: {response:?}"),
+    }
 }
 
 #[tokio::test]

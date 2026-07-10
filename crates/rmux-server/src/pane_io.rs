@@ -964,11 +964,13 @@ pub(crate) async fn forward_attach(
                         }
                         Some(AttachControl::LockShellCommand(command)) => {
                             locked = true;
+                            emit_attach_stop(&stream, &current_target).await?;
                             emit_attach_message(&stream, &AttachMessage::LockShellCommand(command))
                                 .await?;
                         }
                         Some(AttachControl::Suspend) => {
                             locked = true;
+                            emit_attach_stop(&stream, &current_target).await?;
                             emit_attach_message(&stream, &AttachMessage::Suspend).await?;
                         }
                         None => attach_controls = None,
@@ -1574,6 +1576,19 @@ async fn process_socket_messages(
             }
             AttachMessage::Unlock => {
                 *locked = false;
+                if let Some(current_target) = current_target.as_deref() {
+                    emit_attach_bytes(
+                        stream,
+                        &current_target.outer_terminal.attach_start_sequence(),
+                    )
+                    .await?;
+                    emit_render_frame(
+                        stream,
+                        &current_target.outer_terminal,
+                        &current_target.render_frame,
+                    )
+                    .await?;
+                }
                 live_input
                     .handler
                     .handle_attached_unlock(live_input.attach_pid)
