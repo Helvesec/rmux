@@ -63,6 +63,58 @@ pub enum InputEndType {
     Bel,
 }
 
+/// Colour slots reported to OSC 10/11/12 queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OscColourSlot {
+    /// OSC 10 — default foreground.
+    Foreground,
+    /// OSC 11 — default background.
+    Background,
+    /// OSC 12 — cursor colour.
+    Cursor,
+}
+
+impl OscColourSlot {
+    pub(crate) const fn osc_number(self) -> u32 {
+        match self {
+            Self::Foreground => 10,
+            Self::Background => 11,
+            Self::Cursor => 12,
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Foreground => 0,
+            Self::Background => 1,
+            Self::Cursor => 2,
+        }
+    }
+}
+
+/// Default colours reported to OSC 10/11/12 queries when the application has
+/// not set one. Detached sessions have no attached terminal to answer, so the
+/// daemon impersonates a conventional dark terminal; override per daemon with
+/// `RMUX_DEFAULT_FOREGROUND` / `RMUX_DEFAULT_BACKGROUND` /
+/// `RMUX_DEFAULT_CURSOR_COLOUR` (X11 `rgb:RRRR/GGGG/BBBB` format expected by
+/// query consumers).
+fn default_osc_colours() -> &'static [String; 3] {
+    static DEFAULTS: std::sync::OnceLock<[String; 3]> = std::sync::OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        let var = |name: &str, fallback: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| fallback.to_owned())
+        };
+        [
+            var("RMUX_DEFAULT_FOREGROUND", "rgb:cccc/cccc/cccc"),
+            var("RMUX_DEFAULT_BACKGROUND", "rgb:0000/0000/0000"),
+            var("RMUX_DEFAULT_CURSOR_COLOUR", "rgb:cccc/cccc/cccc"),
+        ]
+    })
+}
+
 /// Per-pane VT input parser, matching tmux `input_ctx`.
 pub struct InputParser {
     /// Current parser state.
@@ -115,6 +167,10 @@ pub struct InputParser {
     reply_buf: Vec<u8>,
     /// Dropped terminal passthrough events caused by parser string limits.
     terminal_passthrough_dropped_count: u64,
+
+    /// Application-set OSC 10/11/12 colours (fg, bg, cursor); `None` falls
+    /// back to the daemon defaults when a query is answered.
+    osc_colours: [Option<String>; 3],
 }
 
 impl InputParser {
@@ -144,7 +200,26 @@ impl InputParser {
             ground_timer_active: false,
             reply_buf: Vec::new(),
             terminal_passthrough_dropped_count: 0,
+            osc_colours: [None, None, None],
         }
+    }
+
+    /// Returns the colour reported for an OSC 10/11/12 query.
+    pub(crate) fn osc_colour(&self, slot: OscColourSlot) -> &str {
+        self.osc_colours[slot.index()]
+            .as_deref()
+            .unwrap_or_else(|| default_osc_colours()[slot.index()].as_str())
+    }
+
+    /// Records an application-set OSC 10/11/12 colour so later queries
+    /// round-trip the value.
+    pub(crate) fn set_osc_colour(&mut self, slot: OscColourSlot, value: &str) {
+        self.osc_colours[slot.index()] = Some(value.to_owned());
+    }
+
+    /// Resets an OSC colour back to the daemon default (OSC 110/111/112).
+    pub(crate) fn reset_osc_colour(&mut self, slot: OscColourSlot) {
+        self.osc_colours[slot.index()] = None;
     }
 
     /// Updates the maximum regular string buffer size used for OSC/DCS input.
