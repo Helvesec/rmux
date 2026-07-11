@@ -81,6 +81,7 @@ struct PaneStateSubscription {
     connection_id: u64,
     pane_id: PaneId,
     include: PaneStateInclude,
+    generation: Option<u64>,
     closed: bool,
     closed_revision: Option<u64>,
     closed_reason: Option<PaneStateClosedReason>,
@@ -136,7 +137,9 @@ impl EvictedPaneStateRevisions {
 pub(crate) struct PaneStateSubscriptionInfo {
     pub(crate) pane_id: PaneId,
     pub(crate) include: PaneStateInclude,
+    pub(crate) generation: Option<u64>,
     pub(crate) closed: bool,
+    pub(crate) closed_revision: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -254,11 +257,22 @@ impl PaneStateJournal {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn subscribe(
         &mut self,
         connection_id: u64,
         pane_id: PaneId,
         include: PaneStateInclude,
+    ) -> Result<PaneStateSubscriptionId, PaneStateSubscriptionError> {
+        self.subscribe_at_generation(connection_id, pane_id, include, None)
+    }
+
+    pub(crate) fn subscribe_at_generation(
+        &mut self,
+        connection_id: u64,
+        pane_id: PaneId,
+        include: PaneStateInclude,
+        generation: Option<u64>,
     ) -> Result<PaneStateSubscriptionId, PaneStateSubscriptionError> {
         let connection_count = self
             .subscriptions
@@ -300,6 +314,7 @@ impl PaneStateJournal {
                 connection_id,
                 pane_id,
                 include,
+                generation,
                 closed: false,
                 closed_revision: None,
                 closed_reason: None,
@@ -423,7 +438,9 @@ impl PaneStateJournal {
         Ok(Some(PaneStateSubscriptionInfo {
             pane_id: subscription.pane_id,
             include: subscription.include,
+            generation: subscription.generation,
             closed: subscription.closed,
+            closed_revision: subscription.closed_revision,
         }))
     }
 

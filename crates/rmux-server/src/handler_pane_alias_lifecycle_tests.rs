@@ -1,11 +1,12 @@
 use super::RequestHandler;
 use rmux_core::PaneId;
 use rmux_proto::{
-    KillSessionRequest, LinkWindowRequest, NewSessionExtRequest, NewSessionRequest,
-    NewWindowRequest, PaneKillRequest, PaneOptionGetRequest, PaneOptionSetRequest,
-    PaneRespawnRequest, PaneStateClosedReason, PaneStateCursorRequest, PaneStateEventDto,
-    PaneStateSnapshot, PaneStateSubscriptionId, PaneTarget, PaneTargetRef, Request,
-    RespawnPaneRequest, RespawnWindowRequest, Response, SessionName, SetOptionMode,
+    ErrorResponse, KillPaneRequest, KillSessionRequest, LinkWindowRequest, NewSessionExtRequest,
+    NewSessionRequest, NewWindowRequest, PaneKillRequest, PaneOptionGetRequest,
+    PaneOptionSetRequest, PaneRespawnRequest, PaneStateClosedReason, PaneStateCursorRequest,
+    PaneStateEventDto, PaneStateSnapshot, PaneStateSubscriptionId, PaneTarget, PaneTargetRef,
+    Request, RespawnPaneRequest, RespawnWindowRequest, Response, RmuxError, SessionName,
+    SetOptionMode, SplitDirection, SplitWindowRequest, SplitWindowTarget,
     SubscribePaneStateRequest, TerminalSize, UnlinkWindowRequest, WindowTarget,
 };
 
@@ -415,6 +416,82 @@ async fn deleting_last_pane_or_link_alias_preserves_the_shared_runtime() {
             .expect("unlinking one alias keeps linked runtime");
     }
     assert_no_events(read_cursor(&handler, 1132, link_subscription, link_snapshot.revision).await);
+}
+
+#[tokio::test]
+async fn grouped_peer_kill_pane_resize_rollback_restores_owner_runtime() {
+    let handler = RequestHandler::new();
+    let owner = create_session(&handler, "kill-rollback-owner").await;
+    let split = handler
+        .handle(Request::SplitWindow(SplitWindowRequest {
+            target: SplitWindowTarget::Session(owner.clone()),
+            direction: SplitDirection::Vertical,
+            before: false,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+    let peer = create_grouped_session(&handler, "kill-rollback-peer", &owner).await;
+    handler.wait_for_initial_panes_for_test().await;
+
+    let (pane_id, pane_pid) = {
+        let mut state = handler.state.lock().await;
+        let pane_id = state
+            .sessions
+            .session(&owner)
+            .and_then(|session| session.pane_id_in_window(0, 1))
+            .expect("second owner pane exists");
+        let pane_pid = state
+            .pane_pid_in_window(&owner, 0, 1)
+            .expect("second owner pane has a runtime process");
+        assert!(state
+            .toggle_marked_pane(&PaneTarget::with_window(owner.clone(), 0, 1))
+            .expect("target pane can be marked"));
+        state.fail_next_resize_for_test();
+        (pane_id, pane_pid)
+    };
+
+    let response = handler
+        .handle(Request::KillPane(KillPaneRequest {
+            target: PaneTarget::with_window(peer.clone(), 0, 1),
+            kill_all_except: false,
+        }))
+        .await;
+    assert_eq!(
+        response,
+        Response::Error(ErrorResponse {
+            error: RmuxError::Server("injected pane terminal resize failure".to_owned()),
+        })
+    );
+
+    let state = handler.state.lock().await;
+    for session_name in [&owner, &peer] {
+        assert_eq!(
+            state
+                .sessions
+                .session(session_name)
+                .and_then(|session| session.pane_id_in_window(0, 1)),
+            Some(pane_id),
+            "rollback must restore the shared pane model for {session_name}"
+        );
+    }
+    state
+        .ensure_panes_exist(&owner, &[pane_id])
+        .expect("rollback must restore the terminal under the runtime owner");
+    state
+        .pane_output_for_target(&owner, 0, 1)
+        .expect("rollback must restore pane output under the runtime owner");
+    assert!(
+        state.pane_is_marked(&PaneTarget::with_window(owner.clone(), 0, 1)),
+        "a failed kill must preserve the marked pane"
+    );
+    assert_eq!(
+        state
+            .pane_pid_in_window(&owner, 0, 1)
+            .expect("restored pane process remains inspectable"),
+        pane_pid,
+        "rollback must preserve the original pane process"
+    );
 }
 
 #[tokio::test]

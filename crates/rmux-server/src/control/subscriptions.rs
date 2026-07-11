@@ -4,8 +4,8 @@ use std::time::Instant;
 
 use rmux_core::events::OutputCursorItem;
 use rmux_proto::{
-    format_extended_output_line, format_output_line, format_pause_line, SessionName,
-    CONTROL_BUFFER_HIGH,
+    format_exit_line, format_extended_output_line, format_output_line, format_pause_line,
+    SessionName, CONTROL_BUFFER_HIGH,
 };
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -105,9 +105,9 @@ pub(super) fn handle_pane_event(
     output_queue: &mut ControlOutputQueue,
     paused_panes: &mut HashSet<u32>,
     flags: ControlClientFlags,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     if flags.no_output {
-        return Ok(());
+        return Ok(false);
     }
 
     match event {
@@ -143,10 +143,12 @@ pub(super) fn handle_pane_event(
                 missed_events,
                 "control pane output cursor lagged"
             );
+            output_queue.enqueue_line(format_exit_line(Some("too far behind")).into_bytes(), false);
+            return Ok(true);
         }
     }
 
-    Ok(())
+    Ok(false)
 }
 
 pub(super) fn drain_ready_pane_events(
@@ -154,12 +156,16 @@ pub(super) fn drain_ready_pane_events(
     output_queue: &mut ControlOutputQueue,
     paused_panes: &mut HashSet<u32>,
     flags: ControlClientFlags,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     loop {
         match pane_event_rx.try_recv() {
-            Ok(event) => handle_pane_event(event, output_queue, paused_panes, flags)?,
-            Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
-            Err(mpsc::error::TryRecvError::Disconnected) => return Ok(()),
+            Ok(event) => {
+                if handle_pane_event(event, output_queue, paused_panes, flags)? {
+                    return Ok(true);
+                }
+            }
+            Err(mpsc::error::TryRecvError::Empty) => return Ok(false),
+            Err(mpsc::error::TryRecvError::Disconnected) => return Ok(false),
         }
     }
 }

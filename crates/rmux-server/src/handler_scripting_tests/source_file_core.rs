@@ -2,6 +2,33 @@ use super::*;
 use crate::pane_io::AttachControl;
 
 #[tokio::test]
+async fn source_file_command_bounds_matches_across_separate_paths() {
+    let handler = RequestHandler::new();
+    let root = temp_root("aggregate-path-count");
+    let mut paths = Vec::new();
+    for index in 0..=256 {
+        let name = format!("{index:04}.conf");
+        write_config(&root.join(&name), "");
+        paths.push(name);
+    }
+
+    let response = handler
+        .handle(source_file_request(paths, Some(root.clone())))
+        .await;
+    fs::remove_dir_all(root).expect("remove aggregate path root");
+
+    let Response::SourceFile(response) = response else {
+        panic!("aggregate source read limit should be a source-file diagnostic: {response:?}");
+    };
+    assert_eq!(response.exit_status(), Some(1));
+    let stderr = std::str::from_utf8(response.stderr()).expect("source diagnostic is UTF-8");
+    assert!(
+        stderr.contains("exceeds 256 matched files"),
+        "unexpected source diagnostic: {stderr:?}"
+    );
+}
+
+#[tokio::test]
 async fn source_file_preserves_target_client_and_show_hooks_flags() {
     let handler = RequestHandler::new();
     let alpha = session_name("source-target-client");

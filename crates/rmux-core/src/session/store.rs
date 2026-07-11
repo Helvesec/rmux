@@ -18,7 +18,7 @@ pub struct GroupedSessionCreation {
 }
 
 /// In-memory storage for all sessions owned by the server.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionStore {
     sessions: HashMap<SessionName, Session>,
     next_session_id: u32,

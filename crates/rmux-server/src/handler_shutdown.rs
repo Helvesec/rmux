@@ -84,6 +84,7 @@ impl RequestHandler {
             .shutdown_reason
             .lock()
             .expect("shutdown reason mutex must not be poisoned");
+        let force_shutdown = matches!(reason, Some(PendingShutdownReason::KillServer));
         if let Some(
             reason
             @ (PendingShutdownReason::ExitEmpty | PendingShutdownReason::SeamlessUpgradeIdle),
@@ -107,15 +108,16 @@ impl RequestHandler {
                 }
             }
         }
-        if !self
-            .subscriptions
-            .lock()
-            .expect("subscription registry mutex must not be poisoned")
-            .is_empty()
+        if !force_shutdown
+            && !self
+                .subscriptions
+                .lock()
+                .expect("subscription registry mutex must not be poisoned")
+                .is_empty()
         {
             return false;
         }
-        let retained_outputs_empty = {
+        let retained_outputs_empty = force_shutdown || {
             let mut retained_outputs = self
                 .retained_exited_outputs
                 .lock()

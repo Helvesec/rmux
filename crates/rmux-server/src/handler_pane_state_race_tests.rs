@@ -2,14 +2,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::RequestHandler;
+use crate::pane_io::PaneExitEvent;
 use crate::pane_state_journal::{PaneStateChange, PANE_STATE_JOURNAL_CAPACITY};
 use rmux_core::PaneId;
 use rmux_proto::{
     LinkWindowRequest, MoveWindowRequest, MoveWindowTarget, NewSessionRequest, NewWindowRequest,
     PaneKillRequest, PaneOptionSetRequest, PaneStateClosedReason, PaneStateCursorRequest,
-    PaneStateEventDto, PaneStateSubscriptionId, PaneTarget, PaneTargetRef, Request, Response,
-    SessionName, SetOptionMode, SubscribePaneStateRequest, TerminalSize, UnlinkWindowRequest,
-    WindowTarget,
+    PaneStateEventDto, PaneStateSubscriptionId, PaneTarget, PaneTargetRef, Request,
+    RespawnPaneRequest, Response, SessionName, SetOptionMode, SubscribePaneStateRequest,
+    TerminalSize, UnlinkWindowRequest, WindowTarget,
 };
 
 fn session_name(value: &str) -> SessionName {
@@ -117,6 +118,47 @@ fn move_request(source: WindowTarget, target: WindowTarget) -> Request {
         after: false,
         before: false,
     })
+}
+
+#[tokio::test]
+async fn natural_exit_journals_closed_before_the_removed_pane_becomes_observable() {
+    let handler = Arc::new(RequestHandler::new());
+    let session = create_session(&handler, "a01-natural-exit").await;
+    handler.wait_for_initial_panes_for_test().await;
+    let target = PaneTarget::with_window(session.clone(), 0, 0);
+    let (subscription_id, revision, pane_id) =
+        subscribe(&handler, 1000, target.clone(), false).await;
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .mark_pane_dead_without_exit_details(&target)
+            .expect("mark pane naturally exited");
+    }
+    let pause = handler.install_pane_exit_commit_pause();
+    let exit_handler = Arc::clone(&handler);
+    let exiting = tokio::spawn(async move {
+        exit_handler
+            .handle_pane_exit_event(PaneExitEvent::eof_published(session, pane_id, None))
+            .await;
+    });
+    tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("natural exit reaches post-commit pause");
+
+    match read_cursor(&handler, 1000, subscription_id, revision).await {
+        Response::PaneStateCursor(response) => assert!(matches!(
+            response.events.as_slice(),
+            [PaneStateEventDto::Closed {
+                pane_id: event_pane_id,
+                reason: PaneStateClosedReason::Exited,
+                ..
+            }] if *event_pane_id == pane_id
+        )),
+        response => panic!("natural exit must expose Closed at removal commit: {response:?}"),
+    }
+
+    pause.release.notify_one();
+    exiting.await.expect("natural exit task joins");
 }
 
 #[tokio::test]
@@ -350,8 +392,12 @@ async fn kill_during_lag_rebase_returns_current_snapshot_then_terminal_closed() 
     let lag = lag_cursor.await.expect("lag cursor task joins");
     let snapshot_revision = match lag {
         Response::PaneStateLag(response) => {
-            assert_eq!(response.snapshot.revision, closed_revision);
-            assert!(response.snapshot.revision >= response.resume_revision);
+            assert_eq!(
+                response.snapshot.revision,
+                closed_revision.saturating_sub(1),
+                "a closed subscription must rebase before its terminal event"
+            );
+            assert!(response.snapshot.revision < closed_revision);
             response.snapshot.revision
         }
         response => panic!("kill during lag must not return pane-not-found: {response:?}"),
@@ -359,6 +405,77 @@ async fn kill_during_lag_rebase_returns_current_snapshot_then_terminal_closed() 
     assert_killed_closed(
         read_cursor(&handler, 1031, lag_subscription, snapshot_revision).await,
         watched_pane_id,
+    );
+}
+
+#[tokio::test]
+async fn respawn_during_lag_rebase_does_not_snapshot_the_new_generation() {
+    let handler = Arc::new(RequestHandler::new());
+    let session = create_session(&handler, "a04-respawn-during-lag").await;
+    handler.wait_for_initial_panes_for_test().await;
+    let target = PaneTarget::with_window(session, 0, 0);
+    let (subscription, initial_revision, pane_id) =
+        subscribe(&handler, 1033, target.clone(), true).await;
+
+    for index in 0..=PANE_STATE_JOURNAL_CAPACITY {
+        handler.record_pane_state_change(
+            pane_id,
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: index.to_string(),
+                new: (index + 1).to_string(),
+            },
+        );
+    }
+    let respawned = handler
+        .handle(Request::RespawnPane(Box::new(RespawnPaneRequest {
+            target: target.clone(),
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: None,
+        })))
+        .await;
+    assert!(
+        matches!(respawned, Response::RespawnPane(_)),
+        "{respawned:?}"
+    );
+    let closed_revision = handler
+        .pane_state_journal
+        .lock()
+        .expect("pane-state journal lock")
+        .current_revision();
+
+    let changed = handler
+        .handle(Request::PaneOptionSet(PaneOptionSetRequest {
+            target: PaneTargetRef::slot(target),
+            name: "@new-generation".to_owned(),
+            value: Some("must-not-leak".to_owned()),
+            mode: SetOptionMode::Replace,
+            unset: false,
+        }))
+        .await;
+    assert!(matches!(changed, Response::PaneOptionSet(_)), "{changed:?}");
+
+    let snapshot_revision = match read_cursor(&handler, 1033, subscription, initial_revision).await
+    {
+        Response::PaneStateLag(response) => {
+            assert_eq!(
+                response.snapshot.revision,
+                closed_revision.saturating_sub(1)
+            );
+            assert!(
+                response.snapshot.options.is_empty(),
+                "lag snapshot must not expose options from the respawned generation"
+            );
+            response.snapshot.revision
+        }
+        response => panic!("expected lag rebase, got {response:?}"),
+    };
+    assert_killed_closed(
+        read_cursor(&handler, 1033, subscription, snapshot_revision).await,
+        pane_id,
     );
 }
 

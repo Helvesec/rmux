@@ -42,6 +42,124 @@ fn temp_dir(label: &str) -> PathBuf {
     path
 }
 
+#[cfg(unix)]
+fn run_release_ref_fixture(
+    fake_bin: &Path,
+    ref_type: &str,
+    ref_sha: &str,
+    peeled_type: &str,
+    peeled_sha: &str,
+    release_target: Option<&str>,
+) -> Output {
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    Command::new(repo_root().join("scripts/verify-release-ref.sh"))
+        .args([
+            "Helvesec/rmux",
+            "v0.9.0",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .env("PATH", path)
+        .env("FAKE_REF_TYPE", ref_type)
+        .env("FAKE_REF_SHA", ref_sha)
+        .env("FAKE_PEELED_TYPE", peeled_type)
+        .env("FAKE_PEELED_SHA", peeled_sha)
+        .env("FAKE_RELEASE_TARGET", release_target.unwrap_or_default())
+        .current_dir(repo_root())
+        .output()
+        .expect("run release ref verifier")
+}
+
+#[test]
+#[cfg(unix)]
+fn release_ref_verifier_peels_tags_and_rejects_identity_drift() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = temp_dir("release-ref-verifier");
+    let fake_bin = root.join("bin");
+    fs::create_dir_all(&fake_bin).expect("create fake bin");
+    let fake_gh = fake_bin.join("gh");
+    fs::write(
+        &fake_gh,
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+endpoint=''
+for argument in "$@"; do endpoint=$argument; done
+case "$endpoint" in
+  */git/ref/tags/*)
+    printf '{"object":{"type":"%s","sha":"%s"}}\n' "$FAKE_REF_TYPE" "$FAKE_REF_SHA"
+    ;;
+  */git/tags/*)
+    printf '{"object":{"type":"%s","sha":"%s"}}\n' "$FAKE_PEELED_TYPE" "$FAKE_PEELED_SHA"
+    ;;
+  */releases/tags/*)
+    if [[ -z ${FAKE_RELEASE_TARGET:-} ]]; then exit 1; fi
+    printf '{"tag_name":"v0.9.0","target_commitish":"%s"}\n' "$FAKE_RELEASE_TARGET"
+    ;;
+  *)
+    echo "unexpected endpoint: $endpoint" >&2
+    exit 2
+    ;;
+esac
+"#,
+    )
+    .expect("write fake gh");
+    let mut permissions = fs::metadata(&fake_gh)
+        .expect("fake gh metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_gh, permissions).expect("chmod fake gh");
+
+    let expected = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let tag_object = "1111111111111111111111111111111111111111";
+    let lightweight =
+        run_release_ref_fixture(&fake_bin, "commit", expected, "commit", expected, None);
+    assert!(lightweight.status.success(), "{}", stderr(&lightweight));
+
+    let annotated = run_release_ref_fixture(
+        &fake_bin,
+        "tag",
+        tag_object,
+        "commit",
+        expected,
+        Some(expected),
+    );
+    assert!(annotated.status.success(), "{}", stderr(&annotated));
+
+    let moved = run_release_ref_fixture(
+        &fake_bin,
+        "commit",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "commit",
+        expected,
+        None,
+    );
+    assert!(
+        !moved.status.success(),
+        "moved release tag must fail closed"
+    );
+    assert!(stderr(&moved).contains("expected"));
+
+    let wrong_release = run_release_ref_fixture(
+        &fake_bin,
+        "commit",
+        expected,
+        "commit",
+        expected,
+        Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+    );
+    assert!(
+        !wrong_release.status.success(),
+        "pre-existing release target drift must fail closed"
+    );
+    assert!(stderr(&wrong_release).contains("target_commitish"));
+
+    fs::remove_dir_all(root).expect("remove release ref fixture");
+}
+
 #[test]
 #[cfg(unix)]
 fn release_identity_separates_rc_tag_from_cargo_package_version() {
@@ -130,7 +248,8 @@ fn release_workflows_bind_perf_and_do_not_mask_snap_or_ctrl_failures() {
         .take(12)
         .any(|line| line.contains("continue-on-error")));
     assert!(release.contains("if-no-files-found: error"));
-    assert!(release.contains("RMUX_WINDOWS_CTRL_MATRIX_EVIDENCE_JSON"));
+    assert!(release.contains("rmux-windows-interactive"));
+    assert!(!release.contains("RMUX_WINDOWS_CTRL_MATRIX_EVIDENCE_JSON"));
     assert!(release.contains("\"-Rmux\", $releaseBin"));
     assert!(
         release.contains("$packageHelper = \"target/$env:TARGET/$env:PROFILE_DIR/rmux-full.exe\"")
@@ -144,7 +263,66 @@ fn release_workflows_bind_perf_and_do_not_mask_snap_or_ctrl_failures() {
     assert!(release.contains("\"--features\", \"tiny-cli\""));
     assert!(release.contains("needs.source-gates.outputs.is_prerelease != 'true'"));
     assert!(release.contains("release_args+=(--prerelease)"));
+    assert!(release.contains("--verify-tag"));
+    assert!(release.contains("--target \"$SOURCE_GIT_SHA\""));
+    assert!(
+        release.matches("scripts/verify-release-ref.sh").count() >= 6,
+        "release ref must be revalidated before and after mutable publication boundaries"
+    );
+    assert_eq!(
+        release
+            .matches("scripts/verify-release-tag-protection.sh")
+            .count(),
+        release.matches("scripts/verify-release-ref.sh").count(),
+        "every remote tag identity check must also require immutable v* tag rules"
+    );
+    let tag_protection = include_str!("../scripts/verify-release-tag-protection.sh");
+    for required in ["refs/tags/v*", "index(\"update\")", "index(\"deletion\")"] {
+        assert!(
+            tag_protection.contains(required),
+            "release tag protection gate lost {required}"
+        );
+    }
     assert!(release.contains("RPM-GPG-KEY-rmux-repository"));
+    assert_eq!(
+        release.matches("uses: actions/checkout@").count(),
+        6,
+        "every release source checkout must remain covered by this identity assertion"
+    );
+    assert_eq!(release.matches("ref: ${{ github.sha }}").count(), 1);
+    assert_eq!(release.matches("ref: ${{ env.SOURCE_GIT_SHA }}").count(), 5);
+    assert_eq!(
+        release
+            .matches("- name: Verify immutable source checkout")
+            .count(),
+        5
+    );
+    assert!(
+        !release.contains("ref: ${{ env.RELEASE_REF }}"),
+        "mutable release tags must never be used as checkout identities"
+    );
+}
+
+#[test]
+fn workflows_install_the_workspace_toolchain_instead_of_floating_stable() {
+    let ci = include_str!("../.github/workflows/ci.yml");
+    let release = include_str!("../.github/workflows/release.yml");
+
+    for (name, workflow, deliberate_other_toolchains) in
+        [("CI", ci, 1_usize), ("release", release, 0_usize)]
+    {
+        assert!(
+            !workflow.contains("toolchain: stable"),
+            "{name} installs components on floating stable even though rust-toolchain.toml pins 1.96.1"
+        );
+        let action_count = workflow.matches("uses: dtolnay/rust-toolchain@").count();
+        let workspace_pin_count = workflow.matches("toolchain: \"1.96.1\"").count();
+        assert_eq!(
+            workspace_pin_count + deliberate_other_toolchains,
+            action_count,
+            "every {name} rust-toolchain action must install the workspace pin; only the byte-reproducible WASM job may use its separate recorded compiler"
+        );
+    }
 }
 
 #[test]
@@ -345,7 +523,7 @@ fn rpm_repository_publishes_both_package_and_repodata_key_urls() {
     let gpg = tools.join("gpg");
     fs::write(
         &gpg,
-        "#!/bin/sh\nset -eu\nout=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --output ]; then out=$2; shift 2; else shift; fi\ndone\n[ -n \"$out\" ]\nprintf signature > \"$out\"\n",
+        "#!/bin/sh\nset -eu\ncase \" $* \" in\n  *\" --with-colons --fingerprint \"*)\n    last=\n    for arg in \"$@\"; do last=$arg; done\n    case $last in package-key) fpr=PACKAGEFINGERPRINT ;; repository-key) fpr=REPOSITORYFINGERPRINT ;; *) exit 1 ;; esac\n    printf 'fpr:::::::::%s:\\n' \"$fpr\"\n    exit 0\n    ;;\nesac\nout=\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = --output ]; then out=$2; shift 2; else shift; fi\ndone\n[ -n \"$out\" ]\nprintf signature > \"$out\"\n",
     )
     .expect("write fake gpg");
     make_executable(&gpg);
@@ -383,6 +561,34 @@ fn rpm_repository_publishes_both_package_and_repodata_key_urls() {
     ));
     assert!(config.contains("gpgcheck=1"));
     assert!(config.contains("repo_gpgcheck=1"));
+    fs::remove_dir_all(root).expect("remove temp directory");
+}
+
+#[test]
+#[cfg(unix)]
+fn rpm_repository_rejects_reusing_the_package_signing_key() {
+    let root = temp_dir("rpm-repo-same-key");
+    let input = root.join("input");
+    let output = root.join("output");
+    fs::create_dir_all(&input).expect("create RPM input directory");
+    fs::write(input.join("rmux-0.9.0-1.x86_64.rpm"), b"rpm").expect("write fake RPM");
+
+    let result = Command::new(repo_root().join("scripts/generate-rpm-repository.sh"))
+        .args(["--input-dir"])
+        .arg(&input)
+        .args(["--output-dir"])
+        .arg(&output)
+        .args([
+            "--rpm-signing-key",
+            "same-key",
+            "--repo-signing-key",
+            "same-key",
+        ])
+        .current_dir(repo_root())
+        .output()
+        .expect("run RPM repository generator");
+    assert!(!result.status.success());
+    assert!(stderr(&result).contains("signing keys must be distinct"));
     fs::remove_dir_all(root).expect("remove temp directory");
 }
 

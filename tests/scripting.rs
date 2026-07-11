@@ -23,6 +23,123 @@ fn foreground_run_shell_prints_stdout_like_tmux() -> Result<(), Box<dyn Error>> 
 }
 
 #[test]
+fn explicitly_targeted_run_shell_does_not_print_to_caller_like_tmux() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("run-shell-explicit-target-output")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let output = harness.run(&["run-shell", "-t", "alpha:0.0", "printf hidden; exit 7"])?;
+
+    assert_eq!(output.status.code(), Some(7));
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
+fn source_file_explicitly_targeted_run_shell_does_not_print_to_caller() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("source-run-shell-explicit-target-output")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let config = harness.tmpdir().join("targeted-run-shell.conf");
+    fs::write(
+        &config,
+        "run-shell -t alpha:0.0 'printf source-hidden; exit 6'\n",
+    )?;
+
+    let output = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
+
+    assert_eq!(output.status.code(), Some(6));
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).is_empty());
+    Ok(())
+}
+
+#[test]
+fn explicitly_targeted_run_shell_output_is_delivered_to_the_target_session(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("run-shell-target-status-delivery")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let mut attach =
+        AttachedSession::spawn(&harness, "alpha", TerminalSize { cols: 80, rows: 12 })?;
+    attach.wait_for_raw_mode(Duration::from_secs(5))?;
+    let _ = read_until_contains(attach.master_mut(), "[alpha]", Duration::from_secs(5))?;
+
+    let direct = harness.run(&[
+        "run-shell",
+        "-t",
+        "alpha:0.0",
+        "printf direct-target-visible",
+    ])?;
+    assert_success(&direct);
+    assert!(stdout(&direct).is_empty());
+    let _ = read_until_contains(
+        attach.master_mut(),
+        "direct-target-visible",
+        Duration::from_secs(5),
+    )?;
+
+    let config = harness.tmpdir().join("target-status-delivery.conf");
+    fs::write(
+        &config,
+        "run-shell -t alpha:0.0 'printf source-target-visible'\n",
+    )?;
+    let sourced = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
+    assert_success(&sourced);
+    assert!(stdout(&sourced).is_empty());
+    let _ = read_until_contains(
+        attach.master_mut(),
+        "source-target-visible",
+        Duration::from_secs(5),
+    )?;
+
+    attach.send_bytes(b"\x02d")?;
+    assert!(attach.wait_for_exit(Duration::from_secs(5))?.success());
+    Ok(())
+}
+
+#[test]
+fn targeted_run_shell_falls_back_to_the_caller_if_the_target_disappears(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("run-shell-target-disappears")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    for (session, source_file) in [("direct", false), ("sourced", true)] {
+        assert_success(&harness.run(&["new-session", "-d", "-s", session])?);
+        assert_success(&harness.run(&["split-window", "-d", "-t", session])?);
+        let target = format!("{session}:0.1");
+        let config = harness.tmpdir().join(format!("{session}-target-dies.conf"));
+        if source_file {
+            fs::write(
+                &config,
+                format!("run-shell -t {target} 'sleep 1; printf hello'\n"),
+            )?;
+        }
+
+        let mut command = harness.base_command();
+        if source_file {
+            command.args(["source-file", config.to_str().expect("utf-8 config path")]);
+        } else {
+            command.args(["run-shell", "-t", target.as_str(), "sleep 1; printf hello"]);
+        }
+        let caller = std::thread::spawn(move || command.output());
+        std::thread::sleep(Duration::from_millis(200));
+        assert_success(&harness.run(&["kill-pane", "-t", target.as_str()])?);
+        let output = caller
+            .join()
+            .map_err(|_| "run-shell caller thread panicked")??;
+
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(stdout(&output), "hello\n");
+        assert!(stderr(&output).is_empty());
+    }
+    Ok(())
+}
+
+#[test]
 fn run_shell_exports_tmux_env_matching_mux_socket() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("run-shell-tmux-env")?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -1834,6 +1951,29 @@ fn source_file_set_hook_accepts_compact_flag_clusters() -> Result<(), Box<dyn Er
     wait_for_option_value(&harness, "@compact-hook", "yes")?;
     wait_for_option_value(&harness, "@compact-target-hook", "yes")?;
 
+    Ok(())
+}
+
+#[test]
+fn source_file_hook_preserves_double_quotes_and_backslashes_exactly() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("source-hook-quote-round-trip")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let config = harness.tmpdir().join("hook-quotes.conf");
+    fs::write(
+        &config,
+        r#"set-hook -g after-new-window { set-buffer -b got 'a"b\\c' }
+"#,
+    )?;
+
+    assert_success(&harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha"])?);
+    let shown = harness.run(&["show-buffer", "-b", "got"])?;
+
+    assert_eq!(shown.status.code(), Some(0));
+    assert_eq!(stdout(&shown), r#"a"b\\c"#);
+    assert!(stderr(&shown).is_empty());
     Ok(())
 }
 

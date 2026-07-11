@@ -9,6 +9,8 @@ use rmux_proto::{
 
 use super::super::target_support::{pane_id_target, requester_environment_pane_id};
 use super::super::{format_client_uid, format_client_user, ListClientSnapshot, RequestHandler};
+#[cfg(windows)]
+use super::pane_deferred_wait::format_references_pane_pid;
 use crate::control_notifications::format_control_message_line;
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::pane_terminals::{session_not_found, HandlerState};
@@ -305,7 +307,9 @@ impl RequestHandler {
             active_attach.attached_count(&request.target)
         };
         #[cfg(windows)]
-        if format_references_pane_pid(request.format.as_deref()) {
+        if format_references_pane_pid(request.format.as_deref())
+            || format_references_pane_pid(request.filter.as_deref())
+        {
             self.wait_for_windows_deferred_list_pane_pids(
                 &request.target,
                 request.target_window_index,
@@ -349,132 +353,6 @@ impl RequestHandler {
         };
         Response::ListPanes(ListPanesResponse { output })
     }
-}
-
-#[cfg(windows)]
-const DEFERRED_PANE_PID_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-#[cfg(windows)]
-const DEFERRED_PANE_PID_POLL: std::time::Duration = std::time::Duration::from_millis(5);
-
-#[cfg(windows)]
-impl RequestHandler {
-    pub(in crate::handler) async fn wait_for_windows_deferred_list_pane_pids(
-        &self,
-        session_name: &rmux_proto::SessionName,
-        target_window_index: Option<u32>,
-    ) {
-        self.wait_for_windows_deferred_pane_pids_until(|| async {
-            let state = self.state.lock().await;
-            list_pane_scope_has_starting_pane(&state, session_name, target_window_index)
-        })
-        .await;
-    }
-
-    pub(in crate::handler) async fn wait_for_windows_deferred_list_session_pane_pids(&self) {
-        self.wait_for_windows_deferred_pane_pids_until(|| async {
-            let state = self.state.lock().await;
-            list_session_scope_has_starting_active_pane(&state)
-        })
-        .await;
-    }
-
-    pub(in crate::handler) async fn wait_for_windows_deferred_all_pane_pids(&self) {
-        self.wait_for_windows_deferred_pane_pids_until(|| async {
-            let state = self.state.lock().await;
-            state_has_starting_pane(&state)
-        })
-        .await;
-    }
-
-    async fn wait_for_windows_deferred_target_pane_pids(&self, target: &Target) {
-        self.wait_for_windows_deferred_pane_pids_until(|| async {
-            let state = self.state.lock().await;
-            target_has_starting_pane(&state, target)
-        })
-        .await;
-    }
-
-    async fn wait_for_windows_deferred_pane_pids_until<F, Fut>(&self, mut has_starting: F)
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = bool>,
-    {
-        let deadline = tokio::time::Instant::now() + DEFERRED_PANE_PID_WAIT;
-        while has_starting().await {
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                break;
-            }
-            tokio::time::sleep(DEFERRED_PANE_PID_POLL.min(deadline - now)).await;
-        }
-    }
-}
-
-#[cfg(windows)]
-pub(in crate::handler) fn format_references_pane_pid(format: Option<&str>) -> bool {
-    format.is_some_and(|format| format.contains("pane_pid"))
-}
-
-#[cfg(windows)]
-fn target_has_starting_pane(state: &HandlerState, target: &Target) -> bool {
-    match target {
-        Target::Session(session_name) => {
-            list_pane_scope_has_starting_pane(state, session_name, None)
-        }
-        Target::Window(target) => list_pane_scope_has_starting_pane(
-            state,
-            target.session_name(),
-            Some(target.window_index()),
-        ),
-        Target::Pane(target) => state.pane_is_starting_in_window(
-            target.session_name(),
-            target.window_index(),
-            target.pane_index(),
-        ),
-    }
-}
-
-#[cfg(windows)]
-fn list_session_scope_has_starting_active_pane(state: &HandlerState) -> bool {
-    state.sessions.iter().any(|(session_name, session)| {
-        let window_index = session.active_window_index();
-        session.window().active_pane().is_some_and(|pane| {
-            state.pane_is_starting_in_window(session_name, window_index, pane.index())
-        })
-    })
-}
-
-#[cfg(windows)]
-fn state_has_starting_pane(state: &HandlerState) -> bool {
-    state.sessions.iter().any(|(session_name, session)| {
-        session.windows().iter().any(|(window_index, window)| {
-            window.panes().iter().any(|pane| {
-                state.pane_is_starting_in_window(session_name, *window_index, pane.index())
-            })
-        })
-    })
-}
-
-#[cfg(windows)]
-fn list_pane_scope_has_starting_pane(
-    state: &HandlerState,
-    session_name: &rmux_proto::SessionName,
-    target_window_index: Option<u32>,
-) -> bool {
-    let Some(session) = state.sessions.session(session_name) else {
-        return false;
-    };
-    session
-        .windows()
-        .iter()
-        .filter(|(window_index, _)| {
-            target_window_index.is_none_or(|target| target == **window_index)
-        })
-        .any(|(window_index, window)| {
-            window.panes().iter().any(|pane| {
-                state.pane_is_starting_in_window(session_name, *window_index, pane.index())
-            })
-        })
 }
 
 fn display_message_client_is_control_only(error: &RmuxError) -> bool {

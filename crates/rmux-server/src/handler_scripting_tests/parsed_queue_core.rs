@@ -3,9 +3,13 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
+use crate::handler::scripting_support::{
+    CONTROL_QUEUE_INSERTED_COMMAND_LIMIT, CONTROL_QUEUE_STDOUT_LIMIT,
+};
 use crate::handler::ControlRegistration;
 use crate::outer_terminal::OuterTerminalContext;
 use rmux_os::identity::UserIdentity;
+use rmux_proto::SetBufferRequest;
 use tokio::sync::mpsc;
 
 #[tokio::test]
@@ -183,6 +187,66 @@ async fn detached_read_only_requester_rejects_mutating_queue_commands() {
             .to_string(),
         "server error: client is read-only"
     );
+}
+
+#[tokio::test]
+async fn control_queue_rejects_excessive_runtime_command_insertion() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_005;
+    let _access = handler.begin_detached_requester_access(requester_pid, true);
+    let inserted = "start-server ;".repeat(CONTROL_QUEUE_INSERTED_COMMAND_LIMIT + 1);
+    let parsed = CommandParser::new()
+        .parse(&format!("if-shell -F 1 '{inserted}'"))
+        .expect("dynamic command list parses as one initial command");
+
+    let result = handler
+        .execute_control_commands(requester_pid, parsed)
+        .await;
+
+    let error = result
+        .error
+        .expect("runtime insertion beyond the aggregate limit must fail");
+    assert!(
+        error.to_string().contains("inserted too many commands"),
+        "{error}"
+    );
+    assert_eq!(result.exit_status, Some(1));
+}
+
+#[tokio::test]
+async fn control_queue_bounds_aggregate_stdout_before_extension() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_006;
+    let _access = handler.begin_detached_requester_access(requester_pid, true);
+    let chunk = vec![b'x'; CONTROL_QUEUE_STDOUT_LIMIT / 2 + 1];
+    let response = handler
+        .handle(Request::SetBuffer(Box::new(SetBufferRequest {
+            name: Some("control-limit".to_owned()),
+            content: chunk.clone(),
+            append: false,
+            new_name: None,
+            set_clipboard: false,
+            target_client: None,
+        })))
+        .await;
+    assert!(matches!(response, Response::SetBuffer(_)), "{response:?}");
+    let parsed = CommandParser::new()
+        .parse("show-buffer -b control-limit ; show-buffer -b control-limit")
+        .expect("bounded output commands parse");
+
+    let result = handler
+        .execute_control_commands(requester_pid, parsed)
+        .await;
+
+    let error = result
+        .error
+        .expect("aggregate control stdout beyond the limit must fail");
+    assert!(error.to_string().contains("stdout exceeds"), "{error}");
+    assert_eq!(
+        result.stdout, chunk,
+        "the rejected output must not be appended"
+    );
+    assert_eq!(result.exit_status, Some(1));
 }
 
 #[tokio::test]

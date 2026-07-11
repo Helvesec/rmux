@@ -608,12 +608,15 @@ fn attach_target_for_session_with_prompt(
         Some(session_name),
         options.terminal_context.clone(),
     );
-    let pane_output = state.pane_output_for_target(
+    let pane_output_sender = state.pane_output_for_target(
         session_name,
         session.active_window_index(),
         session.active_pane_index(),
     )?;
-    let (pane_output_start_sequence, ()) = pane_output.capture_with_next_sequence(|| ());
+    // Reserve the live receiver at the same sequence boundary used by the
+    // render target. Output emitted before the transport upgrade is then
+    // replayable without retaining live-only passthroughs for detached panes.
+    let (pane_output_start_sequence, pane_output) = pane_output_sender.subscribe_live_from_now();
     let active_pane = session.window().active_pane().cloned();
     let pane_state = session
         .active_pane_id()
@@ -949,12 +952,14 @@ mod tests {
             )
             .await;
 
+        let pane_output = pane_output_channel();
+        let (pane_output_start_sequence, pane_output) = pane_output.subscribe_live_from_now();
         let target = AttachTarget {
             session_name: session_name.clone(),
             input_target: PaneTarget::new(session_name.clone(), 0),
             pane_master: None,
-            pane_output: pane_output_channel(),
-            pane_output_start_sequence: 0,
+            pane_output,
+            pane_output_start_sequence,
             render_frame: b"BASE".to_vec(),
             outer_terminal: OuterTerminal::resolve(
                 &OptionStore::default(),
@@ -1035,12 +1040,14 @@ mod tests {
             pane.id()
         };
 
+        let pane_output = pane_output_channel();
+        let (pane_output_start_sequence, pane_output) = pane_output.subscribe_live_from_now();
         let target = AttachTarget {
             session_name: beta.clone(),
             input_target: PaneTarget::new(beta.clone(), 0),
             pane_master: None,
-            pane_output: pane_output_channel(),
-            pane_output_start_sequence: 0,
+            pane_output,
+            pane_output_start_sequence,
             render_frame: b"BETA".to_vec(),
             outer_terminal: OuterTerminal::resolve(
                 &OptionStore::default(),

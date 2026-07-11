@@ -244,6 +244,8 @@ pub(crate) struct KilledPaneResult {
     pub(crate) session_destroyed: bool,
     pub(crate) removed_session_id: Option<u32>,
     pub(crate) removed_pane_ids: Vec<PaneId>,
+    pub(crate) affected_sessions: Vec<SessionName>,
+    pub(crate) destroyed_sessions: Vec<(SessionName, u32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

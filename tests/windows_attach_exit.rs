@@ -137,13 +137,18 @@ fn windows_attach_exit_emits_exited_banner() -> Result<(), Box<dyn Error>> {
     wait_for_needle_or_error(&mut attach, b">", SETUP_TIMEOUT)?;
     io.write_all(b"echo RMUX_EXIT_READY\r\n")?;
     wait_for_needle_or_error(&mut attach, b"RMUX_EXIT_READY", SETUP_TIMEOUT)?;
-    io.write_all(b"exit\r\n")?;
+    io.write_all(b"echo RMUX_FINAL_TAIL & exit\r\n")?;
 
     let (exited, output) = wait_for_needle_or_terminate(&mut attach, b"[exited]", EXIT_TIMEOUT)?;
     terminate_spawned(&mut attach);
     assert!(
         exited,
         "attached Windows exit must print [exited]; observed output: {}",
+        escaped_output(&output)
+    );
+    assert!(
+        output_contains(&output, b"RMUX_FINAL_TAIL"),
+        "attached Windows exit must drain final ConPTY output before [exited]; observed output: {}",
         escaped_output(&output)
     );
 

@@ -214,8 +214,9 @@ impl RequestHandler {
             response,
             queued_pane_exited,
             queued_session_closed,
-            session_destroyed,
-            removed_session,
+            extra_session_closed,
+            affected_sessions,
+            destroyed_sessions,
             removed_subscription_keys,
             removed_pane_ids,
             layout_window,
@@ -233,6 +234,8 @@ impl RequestHandler {
                 .unwrap_or_default();
             match state.kill_pane_with_options(target.clone(), request.kill_all_except) {
                 Ok(result) => {
+                    let affected_sessions = result.affected_sessions.clone();
+                    let destroyed_sessions = result.destroyed_sessions.clone();
                     let queued_session = if result.session_destroyed {
                         let _ = state.hooks.remove_session(&session_name);
                         result.removed_session_id.map(|session_id| {
@@ -254,15 +257,27 @@ impl RequestHandler {
                         let _ = state.hooks.remove_pane(&target);
                         None
                     };
+                    let extra_session_closed = destroyed_sessions
+                        .iter()
+                        .filter(|(destroyed_session, _)| destroyed_session != &session_name)
+                        .map(|(destroyed_session, session_id)| {
+                            prepare_lifecycle_event(
+                                &mut state,
+                                &LifecycleEvent::SessionClosed {
+                                    session_name: destroyed_session.clone(),
+                                    session_id: Some(*session_id),
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>();
                     self.record_panes_closed_as_killed(&result.removed_pane_ids);
                     (
                         Response::KillPane(result.response),
                         None,
                         queued_session,
-                        result.session_destroyed,
-                        result
-                            .removed_session_id
-                            .map(|session_id| (session_name.clone(), SessionId::new(session_id))),
+                        extra_session_closed,
+                        affected_sessions,
+                        destroyed_sessions,
                         removed_subscription_keys,
                         result.removed_pane_ids,
                         layout_window,
@@ -272,8 +287,9 @@ impl RequestHandler {
                     Response::Error(ErrorResponse { error }),
                     None,
                     None,
-                    false,
-                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
                     Vec::new(),
                     Vec::new(),
                     layout_window,
@@ -281,7 +297,12 @@ impl RequestHandler {
             }
         };
 
-        self.prune_web_session(removed_session);
+        for (destroyed_session, session_id) in &destroyed_sessions {
+            self.prune_web_session(Some((
+                destroyed_session.clone(),
+                SessionId::new(*session_id),
+            )));
+        }
 
         if !removed_pane_ids.is_empty() {
             self.forget_pane_snapshot_coalescers(&removed_pane_ids);
@@ -292,27 +313,38 @@ impl RequestHandler {
         if let Some(event) = queued_session_closed {
             self.emit_prepared(event);
         }
+        for event in extra_session_closed {
+            self.emit_prepared(event);
+        }
         if matches!(response, Response::KillPane(_)) {
             self.cleanup_pane_output_subscriptions(&removed_subscription_keys)
                 .await;
-            if session_destroyed {
-                self.remove_session_leases(std::slice::from_ref(&session_name));
-                self.exit_attached_session(&session_name).await;
-                self.cancel_session_silence_timers(&session_name).await;
-                self.refresh_control_session(&session_name).await;
-                let _ = self.queue_shutdown_if_server_empty().await;
-            } else {
-                self.sync_session_silence_timers(&session_name).await;
-                if let Response::KillPane(success) = &response {
-                    if !success.window_destroyed {
-                        self.emit(LifecycleEvent::WindowLayoutChanged {
-                            target: WindowTarget::with_window(session_name.clone(), layout_window),
-                        })
-                        .await;
-                    }
+            let destroyed_names = destroyed_sessions
+                .iter()
+                .map(|(destroyed_session, _)| destroyed_session.clone())
+                .collect::<Vec<_>>();
+            self.remove_session_leases(&destroyed_names);
+            for affected_session in affected_sessions {
+                if destroyed_names.contains(&affected_session) {
+                    self.exit_attached_session(&affected_session).await;
+                    self.cancel_session_silence_timers(&affected_session).await;
+                    self.refresh_control_session(&affected_session).await;
+                } else {
+                    self.sync_session_silence_timers(&affected_session).await;
+                    self.dismiss_mode_tree_for_session(&affected_session).await;
+                    self.refresh_attached_session(&affected_session).await;
                 }
-                self.dismiss_mode_tree_for_session(&session_name).await;
-                self.refresh_attached_session(&session_name).await;
+            }
+            if !destroyed_names.is_empty() {
+                let _ = self.queue_shutdown_if_server_empty().await;
+            }
+            if let Response::KillPane(success) = &response {
+                if !success.window_destroyed {
+                    self.emit(LifecycleEvent::WindowLayoutChanged {
+                        target: WindowTarget::with_window(session_name.clone(), layout_window),
+                    })
+                    .await;
+                }
             }
         }
 

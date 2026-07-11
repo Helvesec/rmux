@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmux_proto::{
-    PaneTargetRef, RmuxError, SessionId, SessionName, WebShareScope, WebShareSummary,
+    PaneTarget, PaneTargetRef, RmuxError, SessionId, SessionName, WebShareScope, WebShareSummary,
     WebShareUrlOptions, WebTerminalPalette,
 };
 use serde::Serialize;
@@ -181,6 +181,33 @@ impl WebShareTarget {
         match self {
             Self::Pane(target) => WebShareScope::Pane(target.clone()),
             Self::Session(target) => WebShareScope::Session(target.name.clone()),
+        }
+    }
+
+    pub(crate) fn rename_session(
+        &mut self,
+        old_name: &SessionName,
+        new_name: &SessionName,
+        session_id: SessionId,
+    ) {
+        match self {
+            Self::Pane(PaneTargetRef::Id {
+                session_name,
+                pane_id,
+            }) if session_name == old_name => {
+                *self = Self::Pane(PaneTargetRef::by_id(new_name.clone(), *pane_id));
+            }
+            Self::Pane(PaneTargetRef::Slot(target)) if target.session_name() == old_name => {
+                *self = Self::Pane(PaneTargetRef::slot(PaneTarget::with_window(
+                    new_name.clone(),
+                    target.window_index(),
+                    target.pane_index(),
+                )));
+            }
+            Self::Session(target) if target.id() == session_id => {
+                target.name = new_name.clone();
+            }
+            Self::Pane(_) | Self::Session(_) => {}
         }
     }
 }

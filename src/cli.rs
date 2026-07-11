@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 #[path = "cli/alias_fallback.rs"]
 mod alias_fallback;
+#[path = "cli/attach_transport.rs"]
+mod attach_transport;
 #[path = "cli/automation/mod.rs"]
 mod automation;
 #[path = "cli/buffer_commands.rs"]
@@ -76,7 +78,8 @@ use rmux_client::{
 
 use crate::cli_args::parse;
 use crate::cli_response::{expect_command_output, expect_command_success};
-use client_commands::{attach_with_connection, run_switch_client_on_connection};
+use attach_transport::attach_with_connection;
+use client_commands::run_switch_client_on_connection;
 use client_commands::{
     client_terminal_context_from_cli, optional_client_flags, run_control_mode, run_detach_client,
     run_list_clients, run_refresh_client, run_suspend_client, run_switch_client,

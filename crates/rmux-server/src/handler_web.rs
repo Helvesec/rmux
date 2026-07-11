@@ -108,12 +108,21 @@ impl RequestHandler {
                     Err(error) => return Response::Error(ErrorResponse { error }),
                 };
                 let expiry_kill_target = request.expiry_kill_target();
-                match self.web_shares.create(request) {
+                let created = {
+                    let state = self.state.lock().await;
+                    if let Err(error) = validate_resolved_web_target(&state, request.target()) {
+                        return Response::Error(ErrorResponse { error });
+                    }
+                    self.web_shares.create(request)
+                };
+                match created {
                     Ok(created) => {
+                        let revoke_rx = self.web_shares.expiry_revoke_receiver(&created.share_id);
                         self.spawn_web_share_expiry_task(
                             created.share_id.clone(),
                             created.expires_at_unix,
                             expiry_kill_target,
+                            revoke_rx,
                         );
                         Ok(rmux_proto::WebShareResponse::Created(created))
                     }
@@ -155,6 +164,20 @@ impl RequestHandler {
         if let Some((name, id)) = removed {
             self.web_shares.remove_targets_for_sessions(&[(name, id)]);
         }
+    }
+
+    pub(in crate::handler) fn prune_web_panes(&self, pane_ids: &[PaneId]) {
+        self.web_shares.remove_targets_for_panes(pane_ids);
+    }
+
+    pub(in crate::handler) fn rekey_web_session(
+        &self,
+        old_name: &SessionName,
+        new_name: &SessionName,
+        session_id: SessionId,
+    ) {
+        self.web_shares
+            .rename_session_targets(old_name, new_name, session_id);
     }
 
     async fn open_web_share_access(
@@ -736,17 +759,21 @@ impl RequestHandler {
         share_id: String,
         expires_at_unix: Option<u64>,
         kill_target: Option<WebSessionTarget>,
+        revoke_rx: Option<watch::Receiver<Option<crate::web::WebShareRevokeReason>>>,
     ) {
-        if expires_at_unix.is_none() {
+        let (Some(_), Some(revoke_rx)) = (expires_at_unix, revoke_rx) else {
             return;
-        }
+        };
         let handler = self.clone();
         tokio::spawn(async move {
             // The wire response exposes whole Unix seconds, but the registry
             // retains the exact SystemTime deadline. Poll that exact deadline
             // atomically with record presence so rounding cannot leave an
             // expired share unenforced and stopping a share cannot leak a task.
-            let Some(expired) = handler.wait_for_web_share_expiry(&share_id).await else {
+            let Some(expired) = handler
+                .wait_for_web_share_expiry(&share_id, revoke_rx)
+                .await
+            else {
                 return;
             };
             tracing::info!(share_id = %expired.share_id, "web_share_expired");
@@ -766,12 +793,20 @@ impl RequestHandler {
     async fn wait_for_web_share_expiry(
         &self,
         share_id: &str,
+        mut revoke_rx: watch::Receiver<Option<crate::web::WebShareRevokeReason>>,
     ) -> Option<crate::web::ExpiredWebShare> {
         loop {
             match self.web_shares.poll_expiry(share_id) {
                 WebShareExpiryPoll::Expired(expired) => return Some(expired),
                 WebShareExpiryPoll::Pending(deadline) => {
-                    tokio::time::sleep(duration_until(deadline)).await;
+                    tokio::select! {
+                        () = tokio::time::sleep(duration_until(deadline)) => {}
+                        changed = revoke_rx.changed() => {
+                            if changed.is_err() {
+                                return None;
+                            }
+                        }
+                    }
                 }
                 WebShareExpiryPoll::Gone => return None,
             }
@@ -894,6 +929,20 @@ impl RequestHandler {
         Err(RmuxError::Server(
             "failed to allocate web attach client id".to_owned(),
         ))
+    }
+}
+
+fn validate_resolved_web_target(
+    state: &crate::pane_terminals::HandlerState,
+    target: &WebShareTarget,
+) -> Result<(), RmuxError> {
+    match target {
+        WebShareTarget::Pane(target) => resolve_pane_target_ref(state, target).map(|_| ()),
+        WebShareTarget::Session(target) => state
+            .sessions
+            .session_by_id(target.id())
+            .map(|_| ())
+            .ok_or_else(|| session_not_found_web(target.name())),
     }
 }
 

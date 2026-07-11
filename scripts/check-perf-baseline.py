@@ -16,6 +16,7 @@ REQUIRED_TARGETS = {
     "status_format_heavy",
     "hook_storm",
     "daemon_churn",
+    "cold_path_size",
 }
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 FINGERPRINT_RE = re.compile(r"^[0-9A-Za-z._:-]{8,128}$")
@@ -67,10 +68,25 @@ def validate(path: Path, expected_platform: str | None) -> int:
         if target.get("status") != "collected":
             return fail(f"{path}: target {name} is not collected")
         source_metric = str(target.get("source_metric", ""))
-        if source_metric not in metric_names:
+        if source_metric == "binary.size_bytes":
+            source_binary = source.get("binary")
+            source_size = source_binary.get("size_bytes") if isinstance(source_binary, dict) else None
+            if isinstance(source_size, bool) or not isinstance(source_size, int) or source_size <= 0:
+                return fail(f"{path}: target {name} points to missing source binary.size_bytes")
+        elif source_metric not in metric_names:
             return fail(
                 f"{path}: target {name} points to missing source metric {source_metric!r}"
             )
+
+    source_layout = source.get("layout")
+    if not isinstance(source_layout, dict) or source_layout.get("schema") != 1:
+        return fail(f"{path}: source artifact is missing schema-1 release layout identity")
+    wrapper_binary = payload.get("binary")
+    source_binary = source.get("binary")
+    if not isinstance(wrapper_binary, dict) or not isinstance(source_binary, dict):
+        return fail(f"{path}: missing baseline/source binary identity")
+    if wrapper_binary.get("size_bytes") != source_binary.get("size_bytes"):
+        return fail(f"{path}: baseline binary size does not match source public binary")
 
     versions = payload.get("versions")
     if not isinstance(versions, dict) or not versions.get("rmux") or not versions.get("tmux"):

@@ -378,6 +378,8 @@ async fn forward_attach_emits_stop_sequence_when_processing_errors() {
     let outer_terminal =
         OuterTerminal::resolve(&OptionStore::default(), OuterTerminalContext::default());
     let expected_stop = outer_terminal.attach_stop_sequence();
+    let pane_output = pane_output_channel();
+    let (pane_output_start_sequence, pane_output) = pane_output.subscribe_live_from_now();
     let target = AttachTarget {
         session_name: SessionName::new("alpha").expect("valid session name"),
         input_target: PaneTarget::with_window(
@@ -386,8 +388,8 @@ async fn forward_attach_emits_stop_sequence_when_processing_errors() {
             0,
         ),
         pane_master: Some(pane_master),
-        pane_output: pane_output_channel(),
-        pane_output_start_sequence: 0,
+        pane_output,
+        pane_output_start_sequence,
         render_frame: Vec::new(),
         outer_terminal,
         cursor_style: 0,
@@ -633,12 +635,13 @@ fn test_attach_target_with_protocols(
 ) -> AttachTarget {
     let pty = PtyPair::open().expect("open pty pair");
     let pane_master = pty.into_master();
+    let (pane_output_start_sequence, pane_output) = pane_output.subscribe_live_from_now();
     AttachTarget {
         session_name: session_name.clone(),
         input_target: PaneTarget::with_window(session_name.clone(), 0, 0),
         pane_master: Some(pane_master),
         pane_output,
-        pane_output_start_sequence: 0,
+        pane_output_start_sequence,
         render_frame: render_frame.to_vec(),
         outer_terminal: OuterTerminal::resolve(
             &OptionStore::default(),
@@ -1062,6 +1065,74 @@ async fn forward_attach_exited_control_wins_over_closing_shutdown() {
 }
 
 #[tokio::test]
+async fn forward_attach_exited_control_drains_final_output_and_passthrough_before_banner() {
+    let handler = Arc::new(RequestHandler::new());
+    let session_name = SessionName::new("exit-drain").expect("valid session name");
+    let (stream, mut peer) = tokio::net::UnixStream::pair().expect("attach stream pair");
+    let (_shutdown_tx, shutdown_rx) = watch::channel(());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let pane_output = pane_output_channel();
+    let live_input = LiveAttachInputContext {
+        handler,
+        attach_pid: std::process::id(),
+    };
+
+    let attach_task = tokio::spawn(forward_attach(
+        stream,
+        test_attach_target_with_output(&session_name, b"BASE-0", None, pane_output.clone(), true),
+        Vec::new(),
+        shutdown_rx,
+        control_rx,
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicU64::new(0)),
+        live_input,
+        false,
+    ));
+
+    let _initial = read_attach_data_until(&mut peer, b"BASE-0").await;
+    #[cfg(windows)]
+    {
+        control_tx
+            .send(AttachControl::Exited)
+            .expect("send exited control");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let _ = pane_output.send_for_generation_with_passthroughs(
+        None,
+        b"FINAL_TAIL".to_vec(),
+        vec![TerminalPassthrough::kitty_graphics(
+            0,
+            0,
+            b"Gf=100;TAIL".to_vec(),
+        )],
+    );
+    let _ = pane_output.send_for_generation(None, Vec::new());
+    #[cfg(not(windows))]
+    control_tx
+        .send(AttachControl::Exited)
+        .expect("send exited control");
+
+    let exited = read_attach_data_until(&mut peer, b"[exited]\r\n").await;
+    let tail = exited
+        .windows(b"FINAL_TAIL".len())
+        .position(|window| window == b"FINAL_TAIL")
+        .expect("final pane output must be delivered");
+    let passthrough = exited
+        .windows(b"\x1b_Gf=100;TAIL\x1b\\".len())
+        .position(|window| window == b"\x1b_Gf=100;TAIL\x1b\\")
+        .expect("final passthrough must be delivered");
+    let banner = exited
+        .windows(b"[exited]\r\n".len())
+        .position(|window| window == b"[exited]\r\n")
+        .expect("exit banner must be delivered");
+    assert!(tail < banner);
+    assert!(passthrough < banner);
+
+    assert!(attach_task.await.expect("attach task join").is_ok());
+}
+
+#[tokio::test]
 async fn forward_attach_plain_refresh_does_not_clear_the_screen() {
     let handler = Arc::new(RequestHandler::new());
     let session_name = SessionName::new("alpha").expect("valid session name");
@@ -1307,12 +1378,14 @@ async fn forward_attach_emits_overlay_control_frames() {
 
     let pty = PtyPair::open().expect("open pty pair");
     let pane_master = pty.into_master();
+    let pane_output = pane_output_channel();
+    let (pane_output_start_sequence, pane_output) = pane_output.subscribe_live_from_now();
     let target = AttachTarget {
         session_name: session_name.clone(),
         input_target: PaneTarget::with_window(session_name.clone(), 0, 0),
         pane_master: Some(pane_master),
-        pane_output: pane_output_channel(),
-        pane_output_start_sequence: 0,
+        pane_output,
+        pane_output_start_sequence,
         render_frame: Vec::new(),
         outer_terminal: OuterTerminal::resolve(
             &OptionStore::default(),

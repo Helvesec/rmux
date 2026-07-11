@@ -1,5 +1,59 @@
 use super::*;
 
+#[cfg(unix)]
+fn quiet_kill_session_command() -> Vec<String> {
+    ["/bin/sh", "-c", "sleep 60"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(windows)]
+fn quiet_kill_session_command() -> Vec<String> {
+    let system_root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+    let cmd = std::path::PathBuf::from(system_root)
+        .join("System32")
+        .join("cmd.exe");
+    vec![
+        cmd.to_string_lossy().into_owned(),
+        "/d".to_owned(),
+        "/q".to_owned(),
+        "/c".to_owned(),
+        "ping -n 120 127.0.0.1 >NUL".to_owned(),
+    ]
+}
+
+async fn create_quiet_kill_session(handler: &RequestHandler, name: &str) -> SessionName {
+    let session = session_name(name);
+    let response = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(session.clone()),
+            working_directory: None,
+            detached: true,
+            size: None,
+            environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(quiet_kill_session_command()),
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))
+        .await;
+    assert!(matches!(response, Response::NewSession(_)));
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session.clone(), 0))
+        .await;
+    session
+}
+
 #[tokio::test]
 async fn kill_session_is_idempotent_for_missing_sessions() {
     let handler = RequestHandler::new();
@@ -94,22 +148,11 @@ async fn kill_session_all_except_target_preserves_only_the_resolved_target() {
 #[tokio::test]
 async fn kill_session_clear_alerts_preserves_the_resolved_session() {
     let handler = RequestHandler::new();
-    let created = handler
-        .handle(Request::NewSession(NewSessionRequest {
-            session_name: session_name("alpha"),
-            detached: true,
-            size: None,
-            environment: None,
-        }))
-        .await;
-    assert!(matches!(created, Response::NewSession(_)));
+    let alpha = create_quiet_kill_session(&handler, "alpha").await;
 
     {
         let mut state = handler.state.lock().await;
-        let session = state
-            .sessions
-            .session_mut(&session_name("alpha"))
-            .expect("session exists");
+        let session = state.sessions.session_mut(&alpha).expect("session exists");
         session
             .window_at_mut(0)
             .expect("window exists")
@@ -132,10 +175,7 @@ async fn kill_session_clear_alerts_preserves_the_resolved_session() {
     );
 
     let state = handler.state.lock().await;
-    let session = state
-        .sessions
-        .session(&session_name("alpha"))
-        .expect("session survives");
+    let session = state.sessions.session(&alpha).expect("session survives");
     assert_eq!(
         session.window_at(0).expect("window exists").alert_flags(),
         rmux_core::AlertFlags::empty()

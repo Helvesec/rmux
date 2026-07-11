@@ -156,9 +156,29 @@ impl ParsedCommands {
     pub fn to_tmux_binding_string(&self) -> String {
         self.commands
             .iter()
-            .map(ParsedCommand::to_tmux_string)
+            .map(ParsedCommand::to_reparse_string)
             .collect::<Vec<_>>()
             .join(" \\; ")
+    }
+
+    /// Converts the parsed commands to a lossless command string that can be
+    /// parsed again without applying display-only quote escaping twice.
+    #[must_use]
+    pub fn to_tmux_reparse_string(&self) -> String {
+        let mut rendered = String::new();
+        let mut previous_line = None;
+        for command in &self.commands {
+            if !rendered.is_empty() {
+                if previous_line.is_some_and(|line| line != command.line()) {
+                    rendered.push_str(" ;; ");
+                } else {
+                    rendered.push_str(" ; ");
+                }
+            }
+            rendered.push_str(&command.to_reparse_string());
+            previous_line = Some(command.line());
+        }
+        rendered
     }
 }
 
@@ -247,6 +267,17 @@ impl ParsedCommand {
             .collect::<Vec<_>>()
             .join(" ")
     }
+
+    fn to_reparse_string(&self) -> String {
+        std::iter::once(self.name.clone())
+            .chain(
+                self.arguments
+                    .iter()
+                    .map(CommandArgument::to_reparse_string),
+            )
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 }
 
 /// A parsed command argument.
@@ -275,6 +306,22 @@ impl CommandArgument {
             Self::String(value) => escape_argument(value),
             Self::Commands(commands) => format!("{{ {} }}", commands.to_tmux_string()),
         }
+    }
+
+    fn to_reparse_string(&self) -> String {
+        match self {
+            Self::String(value) => escape_argument_for_reparse(value),
+            Self::Commands(commands) => {
+                format!("{{ {} }}", commands.to_tmux_reparse_string())
+            }
+        }
+    }
+
+    /// Converts this argument to a lossless representation for an internal
+    /// parse-execute bridge.
+    #[must_use]
+    pub fn to_tmux_reparse_string(&self) -> String {
+        self.to_reparse_string()
     }
 }
 
@@ -833,6 +880,15 @@ pub(crate) fn escape_argument(value: &str) -> String {
     }
 
     format!("\"{}\"", escape_double_quoted_argument(value))
+}
+
+fn escape_argument_for_reparse(value: &str) -> String {
+    let single_quoted_display =
+        value.contains('"') && !value.chars().any(argument_needs_double_quotes);
+    if single_quoted_display && value.chars().any(|ch| ch == '\\' || ch.is_ascii_control()) {
+        return format!("\"{}\"", escape_double_quoted_argument(value));
+    }
+    escape_argument(value)
 }
 
 fn is_single_char_escaped_argument(value: &str) -> bool {

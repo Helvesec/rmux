@@ -52,7 +52,7 @@ jobs:
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ env.RELEASE_REF }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Resolve release identity
@@ -76,7 +76,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
-          toolchain: stable
+          toolchain: "1.96.1"
           components: clippy, rustfmt
 
       - name: Fetch locked dependencies
@@ -136,6 +136,8 @@ jobs:
 
   build:
     name: Build ${{ matrix.target }}
+    needs:
+      - source-gates
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -161,13 +163,14 @@ jobs:
             platform-label: macos-aarch64
             binary: rmux
             archive: tar.gz
-          - os: windows-latest
+          - os: [self-hosted, Windows, X64, rmux-windows-interactive]
             target: x86_64-pc-windows-msvc
             platform-label: windows-x86_64
             binary: rmux.exe
             archive: zip
     env:
       RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+      SOURCE_GIT_SHA: ${{ needs.source-gates.outputs.source_git_sha }}
       TARGET: ${{ matrix.target }}
       PLATFORM_LABEL: ${{ matrix.platform-label }}
       BINARY: ${{ matrix.binary }}
@@ -192,8 +195,12 @@ jobs:
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ env.RELEASE_REF }}
+          ref: ${{ env.SOURCE_GIT_SHA }}
           persist-credentials: false
+
+      - name: Verify immutable source checkout
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_GIT_SHA"
 
       - name: Resolve release identity
         shell: bash
@@ -205,7 +212,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
-          toolchain: stable
+          toolchain: "1.96.1"
           components: clippy
           targets: ${{ matrix.target }}
 
@@ -277,7 +284,6 @@ jobs:
         shell: pwsh
         env:
           RMUX_EXPECTED_GIT_SHA: ${{ github.sha }}
-          RMUX_WINDOWS_CTRL_MATRIX_EVIDENCE_JSON: ${{ secrets.RMUX_WINDOWS_CTRL_MATRIX_EVIDENCE_JSON }}
         run: |
           $ErrorActionPreference = "Stop"
           $env:CARGO_INCREMENTAL = "0"
@@ -355,16 +361,6 @@ jobs:
             "-OutDir", "target/windows-ctrl-matrix",
             "-ExpectedGitSha", $env:RMUX_EXPECTED_GIT_SHA
           )
-          if (-not [string]::IsNullOrWhiteSpace($env:RMUX_WINDOWS_CTRL_MATRIX_EVIDENCE_JSON)) {
-            New-Item -ItemType Directory -Force -Path target/windows-ctrl-matrix | Out-Null
-            $manualEvidence = Join-Path $env:RUNNER_TEMP "rmux-windows-ctrl-matrix-evidence.json"
-            [System.IO.File]::WriteAllText(
-              $manualEvidence,
-              $env:RMUX_WINDOWS_CTRL_MATRIX_EVIDENCE_JSON,
-              [System.Text.UTF8Encoding]::new($false)
-            )
-            $ctrlArgs += @("-EvidencePath", $manualEvidence)
-          }
           Run "./scripts/windows_ctrl_matrix.ps1" $ctrlArgs
           if (-not (Test-Path -LiteralPath target/windows-ctrl-matrix/portable-smoke.evidence.json -PathType Leaf)) {
             throw "Windows Ctrl matrix produced no passing SHA-bound evidence"
@@ -478,6 +474,7 @@ jobs:
             snap-arch: arm64
     env:
       RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+      SOURCE_GIT_SHA: ${{ needs.source-gates.outputs.source_git_sha }}
     steps:
       - name: Validate release ref
         shell: bash
@@ -497,8 +494,12 @@ jobs:
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ env.RELEASE_REF }}
+          ref: ${{ env.SOURCE_GIT_SHA }}
           persist-credentials: false
+
+      - name: Verify immutable source checkout
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_GIT_SHA"
 
       - name: Build snap
         id: snapcraft
@@ -537,8 +538,12 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ env.RELEASE_REF }}
+          ref: ${{ env.SOURCE_GIT_SHA }}
           persist-credentials: false
+
+      - name: Verify immutable source checkout
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_GIT_SHA"
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -620,28 +625,26 @@ jobs:
           RMUX_RPM_REPO_GPG_KEY: ${{ secrets.RMUX_RPM_REPO_GPG_KEY }}
         run: |
           missing=0
-          for name in RMUX_APT_GPG_PRIVATE_KEY RMUX_APT_GPG_KEY RMUX_RPM_GPG_PRIVATE_KEY RMUX_RPM_GPG_KEY; do
+          for name in RMUX_APT_GPG_PRIVATE_KEY RMUX_APT_GPG_KEY RMUX_RPM_GPG_PRIVATE_KEY RMUX_RPM_GPG_KEY RMUX_RPM_REPO_GPG_PRIVATE_KEY RMUX_RPM_REPO_GPG_KEY; do
             if [ -z "${!name:-}" ]; then
               echo "Missing required secret: $name" >&2
               missing=1
             fi
           done
-          rpm_repo_key="${RMUX_RPM_REPO_GPG_KEY:-$RMUX_RPM_GPG_KEY}"
-          if [ "$rpm_repo_key" != "$RMUX_RPM_GPG_KEY" ] && [ -z "${RMUX_RPM_REPO_GPG_PRIVATE_KEY:-}" ]; then
-            echo "Missing required secret: RMUX_RPM_REPO_GPG_PRIVATE_KEY" >&2
-            missing=1
-          fi
           [ "$missing" -eq 0 ] || exit 1
 
           install -m 700 -d ~/.gnupg
           printf '%s\n' "$RMUX_APT_GPG_PRIVATE_KEY" | gpg --batch --import
           printf '%s\n' "$RMUX_RPM_GPG_PRIVATE_KEY" | gpg --batch --import
-          if [ -n "${RMUX_RPM_REPO_GPG_PRIVATE_KEY:-}" ]; then
-            printf '%s\n' "$RMUX_RPM_REPO_GPG_PRIVATE_KEY" | gpg --batch --import
-          fi
+          printf '%s\n' "$RMUX_RPM_REPO_GPG_PRIVATE_KEY" | gpg --batch --import
           gpg --batch --list-secret-keys "$RMUX_APT_GPG_KEY" >/dev/null
           gpg --batch --list-secret-keys "$RMUX_RPM_GPG_KEY" >/dev/null
-          gpg --batch --list-secret-keys "$rpm_repo_key" >/dev/null
+          gpg --batch --list-secret-keys "$RMUX_RPM_REPO_GPG_KEY" >/dev/null
+          rpm_fingerprint="$(gpg --batch --with-colons --fingerprint "$RMUX_RPM_GPG_KEY" | awk -F: '$1 == "fpr" { print $10; exit }')"
+          repo_fingerprint="$(gpg --batch --with-colons --fingerprint "$RMUX_RPM_REPO_GPG_KEY" | awk -F: '$1 == "fpr" { print $10; exit }')"
+          [ -n "$rpm_fingerprint" ] || { echo "Unable to resolve RMUX_RPM_GPG_KEY fingerprint" >&2; exit 1; }
+          [ -n "$repo_fingerprint" ] || { echo "Unable to resolve RMUX_RPM_REPO_GPG_KEY fingerprint" >&2; exit 1; }
+          [ "$rpm_fingerprint" != "$repo_fingerprint" ] || { echo "RPM package and repository signing keys must be distinct" >&2; exit 1; }
 
       - name: Generate Homebrew formula
         shell: bash
@@ -718,7 +721,7 @@ jobs:
         run: |
           : "${RMUX_APT_GPG_KEY:?missing RMUX_APT_GPG_KEY}"
           : "${RMUX_RPM_GPG_KEY:?missing RMUX_RPM_GPG_KEY}"
-          rpm_repo_key="${RMUX_RPM_REPO_GPG_KEY:-$RMUX_RPM_GPG_KEY}"
+          : "${RMUX_RPM_REPO_GPG_KEY:?missing RMUX_RPM_REPO_GPG_KEY}"
           mkdir -p target/package-repositories
           scripts/generate-apt-repository.sh \
             --input-dir release-assets \
@@ -735,10 +738,10 @@ jobs:
             --gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux \
             --repo-gpg-key-url https://packages.rmux.io/rpm/RPM-GPG-KEY-rmux-repository \
             --rpm-signing-key "$RMUX_RPM_GPG_KEY" \
-            --repo-signing-key "$rpm_repo_key"
+            --repo-signing-key "$RMUX_RPM_REPO_GPG_KEY"
           gpg --armor --export "$RMUX_APT_GPG_KEY" > target/package-repositories/debian/rmux.asc
           gpg --armor --export "$RMUX_RPM_GPG_KEY" > target/package-repositories/rpm/RPM-GPG-KEY-rmux
-          gpg --armor --export "$rpm_repo_key" > target/package-repositories/rpm/RPM-GPG-KEY-rmux-repository
+          gpg --armor --export "$RMUX_RPM_REPO_GPG_KEY" > target/package-repositories/rpm/RPM-GPG-KEY-rmux-repository
           test -f target/package-repositories/debian/rmux.asc
           test -f target/package-repositories/debian/dists/stable/Release
           test -f target/package-repositories/debian/dists/stable/InRelease
@@ -765,10 +768,14 @@ jobs:
         shell: bash
         run: |
           tag="$RELEASE_REF"
+          scripts/verify-release-tag-protection.sh "$GITHUB_REPOSITORY"
+          scripts/verify-release-ref.sh "$GITHUB_REPOSITORY" "$tag" "$SOURCE_GIT_SHA"
           if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             release_args=(
               "$tag"
               --repo "$GITHUB_REPOSITORY"
+              --verify-tag
+              --target "$SOURCE_GIT_SHA"
               --title "$tag"
               --draft
               --notes "RMUX $PACKAGE_VERSION binary release identity $RELEASE_VERSION."
@@ -792,7 +799,11 @@ jobs:
             echo "No release assets found" >&2
             exit 1
           fi
+          scripts/verify-release-tag-protection.sh "$GITHUB_REPOSITORY"
+          scripts/verify-release-ref.sh "$GITHUB_REPOSITORY" "$tag" "$SOURCE_GIT_SHA"
           gh release upload "$tag" --repo "$GITHUB_REPOSITORY" "${assets[@]}" --clobber
+          scripts/verify-release-tag-protection.sh "$GITHUB_REPOSITORY"
+          scripts/verify-release-ref.sh "$GITHUB_REPOSITORY" "$tag" "$SOURCE_GIT_SHA"
 
       - name: Deploy Linux package repositories
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) && needs.source-gates.outputs.is_prerelease != 'true' }}
@@ -802,6 +813,8 @@ jobs:
           RMUX_PACKAGE_REPO: Helvesec/rmux-packages
           RMUX_PACKAGE_REPO_BRANCH: main
         run: |
+          scripts/verify-release-tag-protection.sh "$GITHUB_REPOSITORY"
+          scripts/verify-release-ref.sh "$GITHUB_REPOSITORY" "$RELEASE_REF" "$SOURCE_GIT_SHA"
           : "${RMUX_PACKAGE_REPO_TOKEN:?missing RMUX_PACKAGE_REPO_TOKEN}"
           : "${RMUX_PACKAGE_REPO:?missing RMUX_PACKAGE_REPO}"
           : "${RMUX_PACKAGE_REPO_BRANCH:?missing RMUX_PACKAGE_REPO_BRANCH}"
@@ -875,7 +888,16 @@ jobs:
       - name: Publish GitHub release
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.skip_external_package_publish) }}
         shell: bash
-        run: gh release edit "$RELEASE_REF" --repo "$GITHUB_REPOSITORY" --draft=false
+        run: |
+          scripts/verify-release-tag-protection.sh "$GITHUB_REPOSITORY"
+          scripts/verify-release-ref.sh "$GITHUB_REPOSITORY" "$RELEASE_REF" "$SOURCE_GIT_SHA"
+          gh release edit "$RELEASE_REF" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --target "$SOURCE_GIT_SHA" \
+            --draft=false
+          scripts/verify-release-tag-protection.sh "$GITHUB_REPOSITORY"
+          scripts/verify-release-ref.sh "$GITHUB_REPOSITORY" "$RELEASE_REF" "$SOURCE_GIT_SHA"
 
   publish-snap:
     name: Publish Snap ${{ matrix.snap-arch }} candidate
@@ -948,6 +970,7 @@ jobs:
     env:
       RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
       PACKAGE_VERSION: ${{ needs.source-gates.outputs.package_version }}
+      SOURCE_GIT_SHA: ${{ needs.source-gates.outputs.source_git_sha }}
     steps:
       - name: Validate release ref
         shell: pwsh
@@ -959,8 +982,16 @@ jobs:
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ env.RELEASE_REF }}
+          ref: ${{ env.SOURCE_GIT_SHA }}
           persist-credentials: false
+
+      - name: Verify immutable source checkout
+        shell: pwsh
+        run: |
+          $actual = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne $env:SOURCE_GIT_SHA) {
+            throw "checked-out source does not match SOURCE_GIT_SHA"
+          }
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
@@ -1014,6 +1045,7 @@ jobs:
     env:
       RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
       PACKAGE_VERSION: ${{ needs.source-gates.outputs.package_version }}
+      SOURCE_GIT_SHA: ${{ needs.source-gates.outputs.source_git_sha }}
       CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
     steps:
       - name: Validate release ref
@@ -1026,8 +1058,16 @@ jobs:
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
-          ref: ${{ env.RELEASE_REF }}
+          ref: ${{ env.SOURCE_GIT_SHA }}
           persist-credentials: false
+
+      - name: Verify immutable source checkout
+        shell: pwsh
+        run: |
+          $actual = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne $env:SOURCE_GIT_SHA) {
+            throw "checked-out source does not match SOURCE_GIT_SHA"
+          }
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:

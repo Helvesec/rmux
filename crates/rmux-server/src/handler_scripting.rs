@@ -1,12 +1,12 @@
 use rmux_core::{
-    command_parser::{CommandParseError, ParsedCommand, ParsedCommands},
+    command_parser::{CommandArgument, CommandParseError, ParsedCommand, ParsedCommands},
     command_queue::CommandQueue,
     LifecycleEvent, PaneGeometry, ENVIRON_HIDDEN,
 };
 use rmux_proto::request::Request;
 use rmux_proto::{
-    CommandOutput, PaneTarget, ResizePaneAdjustment, ResizePaneRequest, Response, RmuxError,
-    ScopeSelector, Target,
+    CommandOutput, DisplayMessageRequest, PaneTarget, ResizePaneAdjustment, ResizePaneRequest,
+    Response, RmuxError, ScopeSelector, Target,
 };
 use std::collections::VecDeque;
 
@@ -105,6 +105,8 @@ use self::targets::{
 use super::target_support::requester_environment_pane_id;
 
 const SOURCE_FILE_NESTING_LIMIT: usize = 50;
+pub(in crate::handler) const CONTROL_QUEUE_INSERTED_COMMAND_LIMIT: usize = 1024;
+pub(in crate::handler) const CONTROL_QUEUE_STDOUT_LIMIT: usize = 4 * 1024 * 1024;
 
 impl RequestHandler {
     #[cfg(test)]
@@ -257,8 +259,9 @@ impl RequestHandler {
         let mut source_file_errors = Vec::new();
         let mut execution_errors = Vec::new();
         let mut exit_status = None;
+        let mut inserted_command_count = 0_usize;
 
-        while let Some(item) = queue.pop_front() {
+        'command_queue: while let Some(item) = queue.pop_front() {
             let item_context = contexts
                 .pop_front()
                 .expect("queue item context must stay aligned");
@@ -272,7 +275,12 @@ impl RequestHandler {
                     source_file_error,
                     exit_status: action_exit_status,
                 }) => {
-                    stdout.extend_from_slice(output.stdout());
+                    if let Err(error) = append_queue_stdout(&mut stdout, output.stdout(), mode) {
+                        execution_errors.push(error.clone());
+                        errors.push(error);
+                        exit_status = Some(1);
+                        break 'command_queue;
+                    }
                     if let Some(status) = action_exit_status {
                         exit_status = Some(status);
                     }
@@ -311,7 +319,13 @@ impl RequestHandler {
                     exit_status: action_exit_status,
                 }) => {
                     if let Some(output) = output {
-                        stdout.extend_from_slice(output.stdout());
+                        if let Err(error) = append_queue_stdout(&mut stdout, output.stdout(), mode)
+                        {
+                            execution_errors.push(error.clone());
+                            errors.push(error);
+                            exit_status = Some(1);
+                            break 'command_queue;
+                        }
                     }
                     if let Some(status) = action_exit_status {
                         exit_status = Some(status);
@@ -324,6 +338,22 @@ impl RequestHandler {
                         execution_errors.push(error.clone());
                         errors.push(error);
                     }
+                    let inserted = batches.iter().fold(0_usize, |count, (commands, _)| {
+                        count.saturating_add(parsed_command_count(commands))
+                    });
+                    let next_inserted_count = inserted_command_count.saturating_add(inserted);
+                    if mode == QueueMode::Control
+                        && next_inserted_count > CONTROL_QUEUE_INSERTED_COMMAND_LIMIT
+                    {
+                        let error = RmuxError::Server(format!(
+                            "control command queue inserted too many commands: {next_inserted_count} (maximum {CONTROL_QUEUE_INSERTED_COMMAND_LIMIT})"
+                        ));
+                        execution_errors.push(error.clone());
+                        errors.push(error);
+                        exit_status = Some(1);
+                        break 'command_queue;
+                    }
+                    inserted_command_count = next_inserted_count;
                     for (commands, context) in batches.into_iter().rev() {
                         if let Err(error) = self
                             .apply_parse_time_assignments(requester_pid, &commands)
@@ -451,6 +481,10 @@ impl RequestHandler {
                 exit_status: None,
             }),
             QueueInvocation::Request(request) => {
+                let explicit_target_run_shell = match &request {
+                    Request::RunShell(request) => request.target.clone(),
+                    _ => None,
+                };
                 let request = apply_queue_context_to_request(request, context);
                 let request = crate::server_access::apply_access_policy(request, can_write)?;
                 let request_for_hooks = request.clone();
@@ -461,6 +495,14 @@ impl RequestHandler {
                     context.client_name.clone(),
                 ))
                 .await;
+                let targeted_output_delivered = if let Some(target) =
+                    explicit_target_run_shell.as_ref()
+                {
+                    self.deliver_targeted_run_shell_output(requester_pid, target, &outcome.response)
+                        .await
+                } else {
+                    false
+                };
                 let inline_hook_names = inline_hooks
                     .iter()
                     .map(|pending| pending.hook)
@@ -475,7 +517,7 @@ impl RequestHandler {
                     &inline_hook_names,
                 )
                 .await;
-                match mode {
+                let action = match mode {
                     QueueMode::Detached => queue_action_from_response(outcome.response),
                     QueueMode::Control => {
                         self.control_queue_action_from_outcome(
@@ -485,6 +527,11 @@ impl RequestHandler {
                         )
                         .await
                     }
+                };
+                if targeted_output_delivered {
+                    action.map(QueueCommandAction::without_output)
+                } else {
+                    action
                 }
             }
             QueueInvocation::StartServer => Ok(QueueCommandAction::Normal {
@@ -554,6 +601,39 @@ impl RequestHandler {
         }
 
         result.map_err(|error| source_file_context_error(error, &command_for_hooks, context))
+    }
+
+    async fn deliver_targeted_run_shell_output(
+        &self,
+        requester_pid: u32,
+        target: &PaneTarget,
+        response: &Response,
+    ) -> bool {
+        let Response::RunShell(response) = response else {
+            return false;
+        };
+        let Some(output) = response.command_output() else {
+            return true;
+        };
+        let message = String::from_utf8_lossy(output.stdout())
+            .trim_end_matches(['\r', '\n'])
+            .replace('#', "##");
+        if message.is_empty() {
+            return true;
+        }
+        matches!(
+            self.handle_display_message(
+                requester_pid,
+                DisplayMessageRequest {
+                    target: Some(Target::Pane(target.clone())),
+                    print: false,
+                    message: Some(message),
+                    empty_target_context: false,
+                },
+            )
+            .await,
+            Response::DisplayMessage(_)
+        )
     }
 
     async fn apply_parse_time_assignments(
@@ -761,6 +841,38 @@ fn adjusted_mouse_y_value(event: &AttachedMouseEvent, y: u16) -> u16 {
         Some(0) if y >= event.status_lines => y.saturating_sub(event.status_lines),
         _ => y,
     }
+}
+
+fn append_queue_stdout(
+    stdout: &mut Vec<u8>,
+    bytes: &[u8],
+    mode: QueueMode,
+) -> Result<(), RmuxError> {
+    let next_len = stdout.len().saturating_add(bytes.len());
+    if mode == QueueMode::Control && next_len > CONTROL_QUEUE_STDOUT_LIMIT {
+        return Err(RmuxError::Server(format!(
+            "control command stdout exceeds {CONTROL_QUEUE_STDOUT_LIMIT} bytes"
+        )));
+    }
+    stdout.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn parsed_command_count(commands: &ParsedCommands) -> usize {
+    commands.commands().iter().fold(0_usize, |count, command| {
+        command
+            .arguments()
+            .iter()
+            .fold(
+                count.saturating_add(1),
+                |nested_count, argument| match argument {
+                    CommandArgument::Commands(nested) => {
+                        nested_count.saturating_add(parsed_command_count(nested))
+                    }
+                    CommandArgument::String(_) => nested_count,
+                },
+            )
+    })
 }
 
 fn aggregate_rmux_errors(errors: Vec<RmuxError>) -> Option<RmuxError> {

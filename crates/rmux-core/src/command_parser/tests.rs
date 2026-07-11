@@ -255,6 +255,23 @@ fn serializes_embedded_command_lists_with_escaped_separators() {
 }
 
 #[test]
+fn binding_serialization_is_lossless_for_double_quotes_backslashes_and_controls() {
+    for input in [
+        r#"set-buffer -b got 'a"b\\c'"#,
+        "set-buffer -b got 'quoted\"tab\there'",
+        "set-buffer -b got 'quoted\"line\nthere'",
+    ] {
+        let commands = CommandParser::new().parse(input).expect("command parses");
+        let serialized = commands.to_tmux_binding_string();
+        let reparsed = CommandParser::new()
+            .parse(&serialized)
+            .expect("binding serialization reparses");
+
+        assert_eq!(reparsed, commands, "serialized={serialized:?}");
+    }
+}
+
+#[test]
 fn serializes_arguments_with_tmux_quote_style() {
     for (input, expected) in [
         (

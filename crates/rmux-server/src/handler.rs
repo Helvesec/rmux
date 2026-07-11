@@ -219,6 +219,8 @@ pub(crate) struct RequestHandler {
     pane_state_lag_rebase_pause: Arc<StdMutex<Option<Arc<PaneStateLagRebasePause>>>>,
     #[cfg(test)]
     pane_option_journal_pause: Arc<StdMutex<Option<Arc<PaneOptionJournalPause>>>>,
+    #[cfg(test)]
+    pane_exit_commit_pause: Arc<StdMutex<Option<Arc<PaneExitCommitPause>>>>,
 }
 
 pub(crate) struct ConfigLoadingGuard {
@@ -281,6 +283,8 @@ impl Clone for RequestHandler {
             pane_state_lag_rebase_pause: self.pane_state_lag_rebase_pause.clone(),
             #[cfg(test)]
             pane_option_journal_pause: self.pane_option_journal_pause.clone(),
+            #[cfg(test)]
+            pane_exit_commit_pause: self.pane_exit_commit_pause.clone(),
         }
     }
 }
@@ -379,6 +383,8 @@ impl WeakRequestHandler {
             pane_state_lag_rebase_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             pane_option_journal_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            pane_exit_commit_pause: Arc::new(StdMutex::new(None)),
         })
     }
 }
@@ -407,6 +413,13 @@ struct PaneStateLagRebasePause {
 #[cfg(test)]
 #[derive(Debug, Default)]
 struct PaneOptionJournalPause {
+    reached: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct PaneExitCommitPause {
     reached: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -569,6 +582,8 @@ impl RequestHandler {
             pane_state_lag_rebase_pause: Arc::new(StdMutex::new(None)),
             #[cfg(test)]
             pane_option_journal_pause: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            pane_exit_commit_pause: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -802,9 +817,35 @@ impl RequestHandler {
     async fn pause_before_pane_option_journal(&self) {}
 
     #[cfg(test)]
+    fn install_pane_exit_commit_pause(&self) -> Arc<PaneExitCommitPause> {
+        let pause = Arc::new(PaneExitCommitPause::default());
+        *self
+            .pane_exit_commit_pause
+            .lock()
+            .expect("pane exit commit pause") = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_after_pane_exit_commit(&self) {
+        let pause = self
+            .pane_exit_commit_pause
+            .lock()
+            .expect("pane exit commit pause")
+            .take();
+        if let Some(pause) = pause {
+            pause.reached.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn pause_after_pane_exit_commit(&self) {}
+
+    #[cfg(test)]
     async fn wait_for_initial_panes_for_test(&self) {
         #[cfg(windows)]
-        self.wait_for_windows_deferred_all_pane_pids().await;
+        self.wait_for_windows_deferred_all_panes_ready().await;
     }
 }
 
@@ -907,3 +948,7 @@ mod pane_state_race_tests;
 #[cfg(test)]
 #[path = "handler_pane_alias_lifecycle_tests.rs"]
 mod pane_alias_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "handler_linked_pane_kill_tests.rs"]
+mod linked_pane_kill_tests;

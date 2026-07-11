@@ -367,6 +367,15 @@ impl PaneTargetRef {
             Self::Id { session_name, .. } => session_name,
         }
     }
+
+    /// Returns the stable pane identity when this selector is id-based.
+    #[must_use]
+    pub const fn pane_id(&self) -> Option<PaneId> {
+        match self {
+            Self::Slot(_) => None,
+            Self::Id { pane_id, .. } => Some(*pane_id),
+        }
+    }
 }
 
 impl From<PaneTarget> for PaneTargetRef {

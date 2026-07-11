@@ -5,7 +5,7 @@ use crate::daemon::ShutdownHandle;
 #[cfg(any(unix, windows))]
 use crate::handler::RequestHandler;
 #[cfg(any(unix, windows))]
-use rmux_core::command_parser::{ParsedCommand, ParsedCommands};
+use rmux_core::command_parser::{CommandArgument, ParsedCommand, ParsedCommands};
 #[cfg(any(unix, windows))]
 use rmux_ipc::LocalStream;
 use rmux_proto::SessionName;
@@ -321,21 +321,30 @@ pub(crate) async fn forward_control(
                         command_number: command_frame.number,
                         guard_flag: command_frame.guard_flag,
                         abort_on_eof,
-                        task: tokio::spawn(async move {
+                        task: Some(tokio::spawn(async move {
                             handler
                                 .execute_control_commands(requester_pid, commands)
                                 .await
-                        }),
+                        })),
                     });
                 }
                 Err(error) => {
                     output_queue.enqueue_stdout(format!("parse error: {error}").into_bytes());
-                    drain_ready_pane_events(
+                    if drain_ready_pane_events(
                         &mut pane_event_rx,
                         &mut output_queue,
                         &mut paused_panes,
                         flags,
-                    )?;
+                    )? {
+                        flush_output_queue(
+                            &mut output_queue,
+                            &mut write_half,
+                            flags,
+                            &mut paused_panes,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
                     output_queue.enqueue_line(
                         format_guard_line(
                             ControlGuardKind::Error,
@@ -417,12 +426,19 @@ pub(crate) async fn forward_control(
                 }
             }
             Some(event) = pane_event_rx.recv() => {
-                handle_pane_event(event, &mut output_queue, &mut paused_panes, flags)?;
+                let lagged =
+                    handle_pane_event(event, &mut output_queue, &mut paused_panes, flags)?;
                 flush_output_queue(&mut output_queue, &mut write_half, flags, &mut paused_panes).await?;
+                if lagged {
+                    return Ok(());
+                }
             }
             result = async {
                 match current_command.as_mut() {
-                    Some(command) => Some((&mut command.task).await),
+                    Some(command) => match command.task.as_mut() {
+                        Some(task) => Some(task.await),
+                        None => std::future::pending().await,
+                    },
                     None => std::future::pending().await,
                 }
             } => {
@@ -437,12 +453,21 @@ pub(crate) async fn forward_control(
                 if !result.stdout.is_empty() {
                     output_queue.enqueue_stdout(result.stdout);
                 }
-                drain_ready_pane_events(
+                if drain_ready_pane_events(
                     &mut pane_event_rx,
                     &mut output_queue,
                     &mut paused_panes,
                     flags,
-                )?;
+                )? {
+                    flush_output_queue(
+                        &mut output_queue,
+                        &mut write_half,
+                        flags,
+                        &mut paused_panes,
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 match result.error {
                     Some(error) => {
                         output_queue.enqueue_stdout(error.to_string().into_bytes());
@@ -476,10 +501,7 @@ pub(crate) async fn forward_control(
                 }
             }
             _ = tokio::task::yield_now(),
-                if input_closed
-                    && current_command
-                        .as_ref()
-                        .is_some_and(|command| command.abort_on_eof) =>
+                if input_closed && current_command.is_some() =>
             {
                 close_active_control_command_on_eof(
                     &mut current_command,
@@ -487,6 +509,8 @@ pub(crate) async fn forward_control(
                     &mut write_half,
                     flags,
                     &mut paused_panes,
+                    &handler,
+                    &lifecycle.shutdown_handle,
                 )
                 .await?;
                 return Ok(());
@@ -502,8 +526,10 @@ async fn close_active_control_command_on_eof(
     write_half: &mut WriteHalf<LocalStream>,
     flags: ControlClientFlags,
     paused_panes: &mut HashSet<u32>,
+    handler: &Arc<RequestHandler>,
+    shutdown_handle: &ShutdownHandle,
 ) -> io::Result<()> {
-    let Some(command) = current_command.take() else {
+    let Some(mut command) = current_command.take() else {
         return Ok(());
     };
     output_queue.enqueue_line(
@@ -517,6 +543,18 @@ async fn close_active_control_command_on_eof(
         false,
     );
     output_queue.enqueue_line(format_exit_line(None).into_bytes(), false);
+    if !command.abort_on_eof {
+        if let Some(task) = command.task.take() {
+            let handler = Arc::clone(handler);
+            let shutdown_handle = shutdown_handle.clone();
+            tokio::spawn(async move {
+                let _ = task.await;
+                if handler.request_shutdown_if_pending() {
+                    shutdown_handle.request_shutdown();
+                }
+            });
+        }
+    }
     drop(command);
     flush_output_queue(output_queue, write_half, flags, paused_panes).await
 }
@@ -556,12 +594,21 @@ async fn handle_server_event(
                 context.deferred.defer_notification(line);
                 return Ok(false);
             }
-            drain_ready_pane_events(
+            if drain_ready_pane_events(
                 context.pane_event_rx,
                 context.output_queue,
                 context.paused_panes,
                 *context.flags,
-            )?;
+            )? {
+                flush_output_queue(
+                    context.output_queue,
+                    context.write_half,
+                    *context.flags,
+                    context.paused_panes,
+                )
+                .await?;
+                return Ok(true);
+            }
             context
                 .output_queue
                 .enqueue_line(ensure_control_newline(line.into_bytes()), false);
@@ -691,24 +738,31 @@ struct ActiveControlCommand {
     command_number: u64,
     guard_flag: u8,
     abort_on_eof: bool,
-    task: JoinHandle<ControlCommandResult>,
+    task: Option<JoinHandle<ControlCommandResult>>,
 }
 
 #[cfg(any(unix, windows))]
 impl Drop for ActiveControlCommand {
     fn drop(&mut self) {
-        if !self.task.is_finished() {
-            self.task.abort();
+        if let Some(task) = self.task.as_ref() {
+            if !task.is_finished() {
+                task.abort();
+            }
         }
     }
 }
 
 #[cfg(any(unix, windows))]
 fn control_commands_abort_on_eof(commands: &ParsedCommands) -> bool {
-    let [command] = commands.commands() else {
-        return false;
-    };
+    commands.commands().iter().any(command_aborts_on_eof)
+}
+
+#[cfg(any(unix, windows))]
+fn command_aborts_on_eof(command: &ParsedCommand) -> bool {
     wait_for_command_aborts_on_eof(command)
+        || command.arguments().iter().any(|argument| {
+            matches!(argument, CommandArgument::Commands(commands) if control_commands_abort_on_eof(commands))
+        })
 }
 
 #[cfg(any(unix, windows))]
@@ -801,10 +855,9 @@ fn consume_control_eof_marker(
     queued_lines: &mut VecDeque<String>,
     queued_input_bytes: &mut usize,
 ) -> bool {
-    let Some(marker_index) = queued_lines
-        .iter()
-        .position(|line| line == CONTROL_STDIN_EOF_MARKER)
-    else {
+    let Some(marker_index) = queued_lines.iter().position(|line| {
+        line == CONTROL_STDIN_EOF_MARKER || line.ends_with(CONTROL_STDIN_EOF_MARKER)
+    }) else {
         return false;
     };
 
@@ -881,6 +934,65 @@ mod deferred_tests {
         assert!(deferred.notifications.is_empty());
         assert_eq!(deferred.notification_bytes, 0);
         assert!(deferred.exit_reason.is_some());
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod eof_command_tests {
+    use super::control_commands_abort_on_eof;
+    use rmux_core::command_parser::CommandParser;
+
+    #[test]
+    fn compound_and_nested_blocking_waits_abort_on_control_eof() {
+        for command in [
+            "display-message -p before ; wait-for never-signalled",
+            "if-shell -F 1 { wait-for never-signalled }",
+        ] {
+            let parsed = CommandParser::new()
+                .parse(command)
+                .unwrap_or_else(|error| panic!("{command:?} should parse: {error}"));
+            assert!(
+                control_commands_abort_on_eof(&parsed),
+                "blocking wait in {command:?} must be cancelled when the control client closes"
+            );
+        }
+
+        let signalling = CommandParser::new()
+            .parse("display-message -p before ; wait-for -S already-done")
+            .expect("signalling wait parses");
+        assert!(!control_commands_abort_on_eof(&signalling));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_eof_marker_tests {
+    use std::collections::VecDeque;
+
+    use super::{append_control_input, consume_control_eof_marker};
+    use rmux_proto::CONTROL_STDIN_EOF_MARKER;
+
+    #[test]
+    fn windows_eof_marker_discards_an_incomplete_command_prefix() {
+        let mut input_buffer = Vec::new();
+        let mut queued_lines = VecDeque::new();
+        let mut queued_bytes = 0;
+        let input = format!("display-message -p must-not-run{CONTROL_STDIN_EOF_MARKER}\n");
+        append_control_input(
+            &mut input_buffer,
+            &mut queued_lines,
+            &mut queued_bytes,
+            input.as_bytes(),
+        )
+        .expect("private EOF marker input parses");
+
+        assert!(consume_control_eof_marker(
+            &mut input_buffer,
+            &mut queued_lines,
+            &mut queued_bytes,
+        ));
+        assert!(queued_lines.is_empty());
+        assert_eq!(queued_bytes, 0);
+        assert!(input_buffer.is_empty());
     }
 }
 

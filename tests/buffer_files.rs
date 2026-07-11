@@ -5,6 +5,7 @@ mod common;
 use std::error::Error;
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::Stdio;
 
 use common::{assert_success, stderr, stdout, terminate_child, CliHarness};
@@ -327,6 +328,56 @@ fn save_buffer_replaces_existing_destination_file() -> Result<(), Box<dyn Error>
     ])?);
 
     assert_eq!(std::fs::read_to_string(&output_path)?, "fresh data");
+
+    terminate_child(daemon.child_mut())?;
+    Ok(())
+}
+
+#[test]
+fn save_buffer_preserves_existing_file_identity_metadata_and_links() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("save-buffer-existing-identity")?;
+    let mut daemon = harness.start_hidden_daemon()?;
+    let output_path = harness.tmpdir().join("output.txt");
+    let hard_link_path = harness.tmpdir().join("output-hard-link.txt");
+    let symlink_target = harness.tmpdir().join("symlink-target.txt");
+    let symlink_path = harness.tmpdir().join("output-symlink.txt");
+
+    fs::write(&output_path, "stale data")?;
+    fs::set_permissions(&output_path, fs::Permissions::from_mode(0o600))?;
+    fs::hard_link(&output_path, &hard_link_path)?;
+    let original = fs::metadata(&output_path)?;
+
+    assert_success(&harness.run(&["set-buffer", "-b", "saved", "fresh data"])?);
+    assert_success(&harness.run(&[
+        "save-buffer",
+        "-b",
+        "saved",
+        output_path.to_str().expect("utf-8 test path"),
+    ])?);
+
+    let replaced = fs::metadata(&output_path)?;
+    assert_eq!(replaced.ino(), original.ino());
+    assert_eq!(replaced.mode() & 0o777, 0o600);
+    assert_eq!(fs::read_to_string(&hard_link_path)?, "fresh data");
+
+    fs::write(&symlink_target, "target stale data")?;
+    fs::set_permissions(&symlink_target, fs::Permissions::from_mode(0o600))?;
+    std::os::unix::fs::symlink(&symlink_target, &symlink_path)?;
+    let target_inode = fs::metadata(&symlink_target)?.ino();
+    assert_success(&harness.run(&[
+        "save-buffer",
+        "-b",
+        "saved",
+        symlink_path.to_str().expect("utf-8 test path"),
+    ])?);
+
+    assert!(fs::symlink_metadata(&symlink_path)?
+        .file_type()
+        .is_symlink());
+    let updated_target = fs::metadata(&symlink_target)?;
+    assert_eq!(updated_target.ino(), target_inode);
+    assert_eq!(updated_target.mode() & 0o777, 0o600);
+    assert_eq!(fs::read_to_string(&symlink_target)?, "fresh data");
 
     terminate_child(daemon.child_mut())?;
     Ok(())

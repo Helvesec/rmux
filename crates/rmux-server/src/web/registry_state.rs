@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
+use rmux_core::PaneId;
 use rmux_proto::{SessionId, SessionName, WebShareSummary};
 
 use super::super::record::{
@@ -122,6 +123,47 @@ impl WebShareState {
             let _ = self.remove(&share_id, reason);
         }
         removed
+    }
+
+    pub(super) fn remove_targets_for_panes(
+        &mut self,
+        pane_ids: &[PaneId],
+        reason: WebShareRevokeReason,
+    ) -> u32 {
+        let share_ids = self
+            .records
+            .iter()
+            .filter(|(_, record)| {
+                matches!(
+                    &record.target,
+                    WebShareTarget::Pane(target)
+                        if target.pane_id().is_some_and(|pane_id| pane_ids.contains(&pane_id))
+                )
+            })
+            .map(|(share_id, _)| share_id.clone())
+            .collect::<Vec<_>>();
+        let removed = u32::try_from(share_ids.len()).unwrap_or(u32::MAX);
+        for share_id in share_ids {
+            let _ = self.remove(&share_id, reason);
+        }
+        removed
+    }
+
+    pub(super) fn rename_session_targets(
+        &mut self,
+        old_name: &SessionName,
+        new_name: &SessionName,
+        session_id: SessionId,
+    ) -> u32 {
+        let mut renamed = 0_u32;
+        for record in self.records.values_mut() {
+            let before = record.target.clone();
+            record.target.rename_session(old_name, new_name, session_id);
+            if record.target != before {
+                renamed = renamed.saturating_add(1);
+            }
+        }
+        renamed
     }
 
     pub(super) fn capability_by_token_id(&self, token_id: &str) -> Option<WebCapability> {

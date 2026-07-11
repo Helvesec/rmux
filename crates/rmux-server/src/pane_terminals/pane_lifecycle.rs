@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use rmux_core::{PaneId, Session};
@@ -24,6 +25,9 @@ mod preview;
 
 #[path = "pane_lifecycle/split.rs"]
 mod split;
+
+#[path = "pane_lifecycle/linked_kill.rs"]
+mod linked_kill;
 
 use preview::preview_kill_pane;
 
@@ -441,6 +445,14 @@ impl HandlerState {
                     && window.pane_count() == 1,
             )
         };
+        if !kill_all_except
+            && self.window_link_count(&session_name, target.window_index()) > 1
+            && previous_session
+                .window_at(target.window_index())
+                .is_some_and(|window| window.pane_count() == 1)
+        {
+            return self.kill_last_linked_pane(target, hook_context, pane_id);
+        }
         if remove_session {
             self.ensure_panes_exist(&session_name, &[pane_id])?;
             let current_runtime_owner = self.sessions.runtime_owner(&session_name);
@@ -464,12 +476,36 @@ impl HandlerState {
                 session_destroyed: true,
                 removed_session_id: Some(removed_session.id().as_u32()),
                 removed_pane_ids,
+                affected_sessions: vec![session_name.clone()],
+                destroyed_sessions: vec![(session_name, removed_session.id().as_u32())],
             });
         }
 
-        let runtime_session_name = self.runtime_session_name(&session_name);
+        let window_index = target.window_index();
+        let runtime_session_name =
+            self.runtime_session_name_for_window(&session_name, window_index);
+        let linked_slots = self.window_link_slots_for(&session_name, window_index);
+        let before_pane_options = if linked_slots.len() > 1 {
+            self.window_linked_session_family_list(&session_name, window_index)
+                .into_iter()
+                .map(|linked_session| {
+                    let snapshot = if linked_session == session_name {
+                        before_pane_options.clone()
+                    } else {
+                        self.pane_option_slots_for_session(&linked_session)?
+                    };
+                    Ok((linked_session, snapshot))
+                })
+                .collect::<Result<Vec<_>, RmuxError>>()?
+        } else {
+            vec![(session_name.clone(), before_pane_options)]
+        };
         let preview_outcome = preview_kill_pane(&self.sessions, &target, kill_all_except)?;
-        self.ensure_panes_exist(&session_name, preview_outcome.removed_pane_ids())?;
+        self.ensure_window_panes_exist(
+            &session_name,
+            window_index,
+            preview_outcome.removed_pane_ids(),
+        )?;
 
         let committed_outcome = {
             let session = self
@@ -484,18 +520,32 @@ impl HandlerState {
         };
         debug_assert_eq!(committed_outcome, preview_outcome);
         let removed_pane_ids = committed_outcome.removed_pane_ids().to_vec();
-        for pane_id in committed_outcome.removed_pane_ids() {
-            self.clear_marked_pane_if_id(*pane_id);
-        }
 
-        let mut removed_terminals = match self
-            .terminals
-            .remove_pane_batch(&runtime_session_name, committed_outcome.removed_pane_ids())
-        {
-            Ok(removed_terminals) => removed_terminals,
-            Err(error) => {
-                self.replace_session(&session_name, previous_session)?;
-                return Err(error);
+        #[cfg(windows)]
+        let terminal_pane_ids = committed_outcome
+            .removed_pane_ids()
+            .iter()
+            .copied()
+            .filter(|pane_id| {
+                self.terminals
+                    .ensure_panes_exist(&runtime_session_name, &[*pane_id])
+                    .is_ok()
+            })
+            .collect::<Vec<_>>();
+        #[cfg(not(windows))]
+        let terminal_pane_ids = committed_outcome.removed_pane_ids().to_vec();
+        let mut removed_terminals = if terminal_pane_ids.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            match self
+                .terminals
+                .remove_pane_batch(&runtime_session_name, &terminal_pane_ids)
+            {
+                Ok(removed_terminals) => removed_terminals,
+                Err(error) => {
+                    self.replace_session(&session_name, previous_session)?;
+                    return Err(error);
+                }
             }
         };
         let mut removed_outputs =
@@ -504,6 +554,7 @@ impl HandlerState {
         if let Err(error) = self.resize_terminals(&session_name) {
             self.restore_session_and_panes_after_resize_error(
                 &session_name,
+                &runtime_session_name,
                 previous_session,
                 removed_terminals,
                 removed_outputs,
@@ -511,13 +562,34 @@ impl HandlerState {
             )?;
             return Err(error);
         }
+        for pane_id in committed_outcome.removed_pane_ids() {
+            self.clear_marked_pane_if_id(*pane_id);
+        }
+        #[cfg(windows)]
+        for pane_id in committed_outcome.removed_pane_ids() {
+            let _ = self.cancel_starting_pane(&runtime_session_name, *pane_id);
+        }
         removed_outputs.abort_output_readers();
         terminate_removed_terminals(&mut removed_terminals);
         self.remove_pane_lifecycles(committed_outcome.removed_pane_ids());
 
-        self.synchronize_session_group_from(&session_name)?;
+        let affected_sessions = if committed_outcome.window_destroyed() {
+            self.synchronize_session_group_from(&session_name)?;
+            vec![session_name.clone()]
+        } else {
+            self.synchronize_linked_window_from_slot(&session_name, window_index)?;
+            let mut synchronized_sessions = HashSet::new();
+            for slot in linked_slots {
+                if synchronized_sessions.insert(slot.session_name.clone()) {
+                    self.synchronize_session_group_from(&slot.session_name)?;
+                }
+            }
+            self.window_linked_session_family_list(&session_name, window_index)
+        };
         self.sync_pane_lifecycle_dimensions_for_session(&session_name);
-        self.rekey_pane_options_after_session_change(&before_pane_options, &session_name)?;
+        for (affected_session, before) in before_pane_options {
+            self.rekey_pane_options_after_session_change(&before, &affected_session)?;
+        }
 
         if committed_outcome.window_destroyed() {
             let _ = self
@@ -538,6 +610,8 @@ impl HandlerState {
             session_destroyed: false,
             removed_session_id: None,
             removed_pane_ids,
+            affected_sessions,
+            destroyed_sessions: Vec::new(),
         })
     }
 

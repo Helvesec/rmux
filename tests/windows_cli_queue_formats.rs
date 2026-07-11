@@ -141,6 +141,50 @@ fn deferred_pane_pid_is_ready_before_queued_format_evaluation() -> Result<(), Bo
 }
 
 #[test]
+fn deferred_pane_pid_is_ready_before_list_filters() -> Result<(), Box<dyn Error>> {
+    let harness = CrossPlatformHarness::new("windows-deferred-pane-pid-list-filter")?;
+
+    let panes = harness.stdout([
+        "new-session",
+        "-d",
+        "-s",
+        "filter-race",
+        ";",
+        "list-panes",
+        "-t",
+        "filter-race",
+        "-f",
+        "#{pane_pid}",
+        "-F",
+        "#{pane_pid}",
+    ])?;
+    assert!(
+        panes.trim().parse::<u32>().is_ok(),
+        "list-panes filtered out the deferred PID: {panes:?}"
+    );
+
+    let windows = harness.stdout([
+        "new-session",
+        "-d",
+        "-s",
+        "window-filter-race",
+        ";",
+        "list-windows",
+        "-t",
+        "window-filter-race",
+        "-f",
+        "#{pane_pid}",
+        "-F",
+        "#{pane_pid}",
+    ])?;
+    assert!(
+        windows.trim().parse::<u32>().is_ok(),
+        "list-windows filtered out the deferred PID: {windows:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn rejected_respawn_preserves_deferred_pane_queued_input() -> Result<(), Box<dyn Error>> {
     let harness = CrossPlatformHarness::new("windows-respawn-deferred-input-rollback")?;
     let marker = "RMUX_RESPAWN_REJECTED_QUEUED_INPUT_SURVIVES";

@@ -17,8 +17,6 @@ use crate::ClientError;
 mod action;
 #[path = "attach_windows/input.rs"]
 mod input;
-#[path = "attach_windows/lock_state.rs"]
-mod lock_state;
 #[path = "attach_windows/metrics.rs"]
 mod metrics;
 #[path = "attach_windows/output.rs"]
@@ -34,7 +32,7 @@ mod terminal;
 #[path = "attach/terminal_cleanup.rs"]
 mod terminal_cleanup;
 
-use lock_state::AttachLockState;
+use crate::attach_lock_state::AttachLockState;
 use screen::AttachScreenTracker;
 pub use terminal::{AttachError, RawTerminal, Result};
 

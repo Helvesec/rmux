@@ -11,9 +11,9 @@ use rmux_core::{events::SubscriptionLimits, PaneId};
 use rmux_proto::{
     encode_frame, ErrorResponse, KillSessionRequest, KillWindowRequest, LinkWindowRequest,
     MoveWindowRequest, MoveWindowTarget, NewSessionRequest, NewWindowRequest, OptionScopeSelector,
-    PaneKillRequest, PaneOptionSetRequest, PaneStateClosedReason, PaneStateCursorRequest,
-    PaneStateEventDto, PaneTarget, PaneTargetRef, Request, RespawnPaneRequest,
-    RespawnWindowRequest, Response, RmuxError, SelectPaneRequest, SessionName,
+    PaneKillRequest, PaneOptionGetRequest, PaneOptionSetRequest, PaneStateClosedReason,
+    PaneStateCursorRequest, PaneStateEventDto, PaneTarget, PaneTargetRef, Request,
+    RespawnPaneRequest, RespawnWindowRequest, Response, RmuxError, SelectPaneRequest, SessionName,
     SetOptionByNameRequest, SetOptionMode, SourceFileRequest, SplitDirection, SplitWindowRequest,
     SplitWindowTarget, SubscribePaneStateRequest, TerminalSize, UnlinkWindowRequest, WindowTarget,
 };
@@ -654,6 +654,62 @@ async fn pane_option_set_sdk_origin_emits_pane_state_option_event() {
 }
 
 #[tokio::test]
+async fn oversized_pane_option_response_fails_before_committing() {
+    let handler = RequestHandler::new();
+    let (session, _target, pane_id) =
+        create_session_with_pane(&handler, "pane-option-frame-preflight").await;
+    let target = PaneTargetRef::by_id(session, pane_id);
+    let first = "A".repeat(4_300_000);
+    let second = "B".repeat(4_300_000);
+
+    let response = handler
+        .handle(Request::PaneOptionSet(PaneOptionSetRequest {
+            target: target.clone(),
+            name: "@large".to_owned(),
+            value: Some(first.clone()),
+            mode: SetOptionMode::Replace,
+            unset: false,
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::PaneOptionSet(_)),
+        "{response:?}"
+    );
+
+    let response = handler
+        .handle(Request::PaneOptionSet(PaneOptionSetRequest {
+            target: target.clone(),
+            name: "@large".to_owned(),
+            value: Some(second),
+            mode: SetOptionMode::Replace,
+            unset: false,
+        }))
+        .await;
+    assert!(
+        matches!(
+            response,
+            Response::Error(ErrorResponse {
+                error: RmuxError::FrameTooLarge { .. }
+            })
+        ),
+        "{response:?}"
+    );
+
+    let response = handler
+        .handle(Request::PaneOptionGet(PaneOptionGetRequest {
+            target,
+            name: "@large".to_owned(),
+        }))
+        .await;
+    match response {
+        Response::PaneOptionGet(response) => {
+            assert_eq!(response.value.as_deref(), Some(first.as_str()))
+        }
+        response => panic!("pane option get failed: {response:?}"),
+    }
+}
+
+#[tokio::test]
 async fn pane_option_set_sdk_origin_records_option_event_when_resize_fails() {
     let handler = RequestHandler::new();
     let (session, target, pane_id) =
@@ -782,6 +838,120 @@ async fn oversized_title_history_rebases_to_a_frameable_snapshot() {
         }
         response => panic!("second oversized retained event must rebase: {response:?}"),
     }
+}
+
+#[tokio::test]
+async fn oversized_initial_option_snapshot_fails_without_leaking_subscription() {
+    let handler = RequestHandler::new();
+    let (_session, target, _pane_id) =
+        create_session_with_pane(&handler, "pane-state-large-option-initial").await;
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&target)
+        .await;
+    let response = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::Pane(target.clone()),
+            name: "@large-initial".to_owned(),
+            value: Some(
+                "x".repeat(super::pane_state_support::PANE_STATE_SNAPSHOT_OPTION_BYTE_LIMIT + 1),
+            ),
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: false,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    assert!(
+        matches!(response, Response::SetOptionByName(_)),
+        "{response:?}"
+    );
+
+    let response = handler
+        .handle_subscribe_pane_state(
+            986,
+            SubscribePaneStateRequest {
+                target: PaneTargetRef::slot(target.clone()),
+                include_title: false,
+                include_options: true,
+                include_foreground: false,
+            },
+        )
+        .await;
+    let Response::Error(ErrorResponse { error }) = response else {
+        panic!("oversized initial snapshot must fail explicitly: {response:?}");
+    };
+    assert!(
+        error.to_string().contains("snapshot options exceed"),
+        "{error}"
+    );
+
+    let response = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::Pane(target.clone()),
+            name: "@large-initial".to_owned(),
+            value: None,
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: true,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    assert!(
+        matches!(response, Response::SetOptionByName(_)),
+        "{response:?}"
+    );
+    let _subscription_id = subscribe(&handler, 986, target, false, true).await;
+}
+
+#[tokio::test]
+async fn oversized_lag_snapshot_closes_the_subscription_instead_of_looping() {
+    let handler = RequestHandler::new();
+    let (_session, target, _pane_id) =
+        create_session_with_pane(&handler, "pane-state-large-option-lag").await;
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&target)
+        .await;
+    let subscription_id = subscribe(&handler, 987, target.clone(), false, true).await;
+
+    let response = handler
+        .handle(Request::SetOptionByName(Box::new(SetOptionByNameRequest {
+            scope: OptionScopeSelector::Pane(target),
+            name: "@large-lag".to_owned(),
+            value: Some("y".repeat(PANE_STATE_JOURNAL_BYTE_CAPACITY + 1024)),
+            mode: SetOptionMode::Replace,
+            only_if_unset: false,
+            unset: false,
+            unset_pane_overrides: false,
+            format: false,
+            format_target: None,
+        })))
+        .await;
+    assert!(
+        matches!(response, Response::SetOptionByName(_)),
+        "{response:?}"
+    );
+
+    let response = read_cursor(&handler, 987, subscription_id, 0).await;
+    let Response::Error(ErrorResponse { error }) = response else {
+        panic!("oversized lag snapshot must fail explicitly: {response:?}");
+    };
+    assert!(
+        error.to_string().contains("snapshot options exceed"),
+        "{error}"
+    );
+
+    let response = read_cursor(&handler, 987, subscription_id, 0).await;
+    let Response::Error(ErrorResponse { error }) = response else {
+        panic!("failed lag snapshot must close its subscription: {response:?}");
+    };
+    assert_eq!(
+        error,
+        RmuxError::Server("subscription not found".to_owned())
+    );
 }
 
 #[tokio::test]

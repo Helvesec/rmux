@@ -32,7 +32,7 @@ use super::request_parse::parse_queue_invocation;
 use super::source_files::{
     default_config_paths, default_tmux_fallback_paths, source_inputs_for_path_with_diagnostics,
     source_parse_error_with_line_offset, LoadedSourceFile, ParsedSourceFileCommand, SourceInput,
-    SourceSyntax, SourcedParsedCommands,
+    SourceSyntax, SourcedParsedCommands, MAX_SOURCE_AGGREGATE_BYTES, MAX_SOURCE_MATCHED_FILES,
 };
 use super::targets::{
     active_session_target, queue_target_find_context, QueueTargetFindContextInput,
@@ -526,6 +526,8 @@ impl RequestHandler {
         }
 
         let mut loaded = LoadedSourceFile::default();
+        let mut matched_files = 0_usize;
+        let mut content_bytes = 0_usize;
 
         for path in &command.paths {
             let expanded_path = if command.expand_paths {
@@ -554,6 +556,18 @@ impl RequestHandler {
             if let Some(error) = read.error {
                 loaded.push_read_error(error);
             }
+            let next_matched_files = matched_files.saturating_add(read.matched_files);
+            let next_content_bytes = content_bytes.saturating_add(read.content_bytes);
+            if next_matched_files > MAX_SOURCE_MATCHED_FILES
+                || next_content_bytes > MAX_SOURCE_AGGREGATE_BYTES
+            {
+                loaded.push_read_error(RmuxError::Server(format!(
+                    "source-file command exceeds {MAX_SOURCE_MATCHED_FILES} matched files or {MAX_SOURCE_AGGREGATE_BYTES} aggregate bytes"
+                )));
+                break;
+            }
+            matched_files = next_matched_files;
+            content_bytes = next_content_bytes;
             let inputs = read.inputs;
             if !inputs.is_empty() {
                 loaded.record_loaded_files(inputs.len());

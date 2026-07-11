@@ -93,7 +93,8 @@ impl RequestHandler {
         registration: AttachRegistration,
     ) -> u64 {
         #[cfg(windows)]
-        self.wait_for_windows_deferred_all_pane_pids().await;
+        self.wait_for_windows_deferred_session_panes_ready(&session_name)
+            .await;
         let mut replaced_key_table = None;
         let attached_session_name = session_name.clone();
         let (client_size, active_window_index) = {

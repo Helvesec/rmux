@@ -5,11 +5,11 @@ use std::time::Duration;
 
 use rmux_core::{OptionMutationOutcome, PaneId};
 use rmux_proto::{
-    ErrorResponse, ForegroundStateDto, PaneForegroundStateResponse, PaneOptionEntry,
+    encode_frame, ErrorResponse, ForegroundStateDto, PaneForegroundStateResponse, PaneOptionEntry,
     PaneStateClosedReason, PaneStateCursorRequest, PaneStateCursorResponse, PaneStateLagResponse,
     PaneStateSnapshot, PaneStateSubscriptionId, PaneTarget, Response, RmuxError,
     SubscribePaneStateRequest, SubscribePaneStateResponse, UnsubscribePaneStateRequest,
-    UnsubscribePaneStateResponse,
+    UnsubscribePaneStateResponse, DEFAULT_MAX_DETACHED_FRAME_LENGTH,
 };
 
 use crate::foreground_probe::{
@@ -30,6 +30,8 @@ const PANE_STATE_WAIT_CAP: Duration = Duration::from_secs(25);
 const PANE_STATE_WAIT_CAP: Duration = Duration::from_millis(50);
 const FOREGROUND_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const FOREGROUND_MAX_PANES_PER_TICK: usize = 32;
+pub(super) const PANE_STATE_SNAPSHOT_OPTION_BYTE_LIMIT: usize =
+    DEFAULT_MAX_DETACHED_FRAME_LENGTH / 2;
 
 impl RequestHandler {
     fn lock_pane_state_journal(&self) -> MutexGuard<'_, PaneStateJournal> {
@@ -104,9 +106,18 @@ impl RequestHandler {
                 Ok(pane_id) => pane_id,
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
+            let generation = state
+                .pane_lifecycle(pane_id)
+                .map(|lifecycle| lifecycle.generation)
+                .unwrap_or_else(|| state.pane_output_generation(target.session_name(), pane_id));
             let mut journal = self.lock_pane_state_journal();
             let revision = journal.current_revision();
-            let subscription_id = match journal.subscribe(connection_id, pane_id, include) {
+            let subscription_id = match journal.subscribe_at_generation(
+                connection_id,
+                pane_id,
+                include,
+                Some(generation),
+            ) {
                 Ok(subscription_id) => subscription_id,
                 Err(error) => {
                     return Response::Error(ErrorResponse {
@@ -115,7 +126,13 @@ impl RequestHandler {
                 }
             };
             let (snapshot, foreground_seed) =
-                pane_state_snapshot_locked(&state, &target, pane_id, include, revision);
+                match pane_state_snapshot_locked(&state, &target, pane_id, include, revision) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        let _ = journal.unsubscribe(connection_id, subscription_id);
+                        return Response::Error(ErrorResponse { error });
+                    }
+                };
             (subscription_id, pane_id, snapshot, foreground_seed)
         };
 
@@ -124,15 +141,19 @@ impl RequestHandler {
             self.seed_foreground_state_cache(seed.pane_id(), seed.generation(), foreground.clone());
             snapshot.foreground = Some(foreground);
         }
-        if include.foreground {
-            self.start_foreground_watch_if_needed();
-        }
-
-        Response::SubscribePaneState(Box::new(SubscribePaneStateResponse {
+        let response = Response::SubscribePaneState(Box::new(SubscribePaneStateResponse {
             subscription_id,
             pane_id,
             snapshot,
-        }))
+        }));
+        if let Err(error) = ensure_pane_state_response_frameable(&response) {
+            self.remove_pane_state_subscription(connection_id, subscription_id);
+            return Response::Error(ErrorResponse { error });
+        }
+        if include.foreground {
+            self.start_foreground_watch_if_needed();
+        }
+        response
     }
 
     pub(in crate::handler) async fn handle_unsubscribe_pane_state(
@@ -233,13 +254,31 @@ impl RequestHandler {
                         .snapshot_for_subscription(connection_id, request.subscription_id)
                         .await
                     {
-                        Ok(snapshot) => Response::PaneStateLag(Box::new(PaneStateLagResponse {
-                            subscription_id: request.subscription_id,
-                            missed_from_revision,
-                            resume_revision,
-                            snapshot,
-                        })),
-                        Err(error) => Response::Error(ErrorResponse { error }),
+                        Ok(snapshot) => {
+                            let response = Response::PaneStateLag(Box::new(PaneStateLagResponse {
+                                subscription_id: request.subscription_id,
+                                missed_from_revision,
+                                resume_revision,
+                                snapshot,
+                            }));
+                            match ensure_pane_state_response_frameable(&response) {
+                                Ok(()) => response,
+                                Err(error) => {
+                                    self.remove_pane_state_subscription(
+                                        connection_id,
+                                        request.subscription_id,
+                                    );
+                                    Response::Error(ErrorResponse { error })
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.remove_pane_state_subscription(
+                                connection_id,
+                                request.subscription_id,
+                            );
+                            Response::Error(ErrorResponse { error })
+                        }
                     };
                 }
                 Err(message) => {
@@ -345,6 +384,7 @@ impl RequestHandler {
                 },
             );
         }
+        self.prune_web_panes(pane_ids);
     }
 
     fn start_foreground_watch_if_needed(&self) {
@@ -439,6 +479,17 @@ impl RequestHandler {
         self.pane_state_notify.notify_waiters();
     }
 
+    fn remove_pane_state_subscription(
+        &self,
+        connection_id: u64,
+        subscription_id: PaneStateSubscriptionId,
+    ) {
+        let _ = self
+            .lock_pane_state_journal()
+            .unsubscribe(connection_id, subscription_id);
+        self.pane_state_notify.notify_waiters();
+    }
+
     pub(in crate::handler) fn pane_state_has_title_subscriptions(&self) -> bool {
         self.lock_pane_state_journal().title_subscription_count() > 0
     }
@@ -462,16 +513,37 @@ impl RequestHandler {
                     .ok_or_else(|| RmuxError::Server("subscription not found".to_owned()))?;
                 (info, journal.current_revision())
             };
+            let closed_snapshot_revision = info
+                .closed
+                .then(|| info.closed_revision.unwrap_or(revision).saturating_sub(1));
 
             match pane_target_for_pane_id(&state, info.pane_id) {
+                Some(_)
+                    if info.closed
+                        && info.generation.is_some()
+                        && info.generation
+                            != state
+                                .pane_lifecycle(info.pane_id)
+                                .map(|lifecycle| lifecycle.generation) =>
+                {
+                    (
+                        PaneStateSnapshot {
+                            revision: closed_snapshot_revision.unwrap_or(revision),
+                            title: info.include.title.then(String::new),
+                            options: Vec::new(),
+                            foreground: None,
+                        },
+                        None,
+                    )
+                }
                 Some(target) => {
                     let (mut snapshot, foreground_seed) = pane_state_snapshot_locked(
                         &state,
                         &target,
                         info.pane_id,
                         info.include,
-                        revision,
-                    );
+                        closed_snapshot_revision.unwrap_or(revision),
+                    )?;
                     if info.closed {
                         snapshot.foreground = None;
                         (snapshot, None)
@@ -481,7 +553,7 @@ impl RequestHandler {
                 }
                 None if info.closed => (
                     PaneStateSnapshot {
-                        revision,
+                        revision: closed_snapshot_revision.unwrap_or(revision),
                         title: info.include.title.then(String::new),
                         options: Vec::new(),
                         foreground: None,
@@ -522,7 +594,7 @@ fn pane_state_snapshot_locked(
     pane_id: PaneId,
     include: PaneStateInclude,
     revision: u64,
-) -> (PaneStateSnapshot, Option<ForegroundProbeSeed>) {
+) -> Result<(PaneStateSnapshot, Option<ForegroundProbeSeed>), RmuxError> {
     let title = include.title.then(|| {
         state
             .pane_screen_state(target.session_name(), pane_id)
@@ -530,12 +602,21 @@ fn pane_state_snapshot_locked(
             .unwrap_or_default()
     });
     let options = if include.options {
-        state
-            .pane_explicit_option_entries(target)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(name, value)| PaneOptionEntry { name, value })
-            .collect()
+        let entries = state.pane_explicit_option_entries(target)?;
+        let mut option_bytes = 0_usize;
+        let mut options = Vec::with_capacity(entries.len());
+        for (name, value) in entries {
+            option_bytes = option_bytes
+                .saturating_add(name.len())
+                .saturating_add(value.len());
+            if option_bytes > PANE_STATE_SNAPSHOT_OPTION_BYTE_LIMIT {
+                return Err(RmuxError::Server(format!(
+                    "pane state snapshot options exceed {PANE_STATE_SNAPSHOT_OPTION_BYTE_LIMIT} bytes"
+                )));
+            }
+            options.push(PaneOptionEntry { name, value });
+        }
+        options
     } else {
         Vec::new()
     };
@@ -544,7 +625,7 @@ fn pane_state_snapshot_locked(
         .then(|| capture_foreground_probe_seed(state, target).ok())
         .flatten();
 
-    (
+    Ok((
         PaneStateSnapshot {
             revision,
             title,
@@ -552,7 +633,15 @@ fn pane_state_snapshot_locked(
             foreground: None,
         },
         foreground_seed,
-    )
+    ))
+}
+
+fn ensure_pane_state_response_frameable(response: &Response) -> Result<(), RmuxError> {
+    encode_frame(response).map(|_| ()).map_err(|error| {
+        RmuxError::Server(format!(
+            "pane state snapshot exceeds the {DEFAULT_MAX_DETACHED_FRAME_LENGTH}-byte detached frame limit: {error}"
+        ))
+    })
 }
 
 fn pane_id_for_target(state: &HandlerState, target: &PaneTarget) -> Result<PaneId, RmuxError> {

@@ -30,6 +30,7 @@ impl RequestHandler {
                 Err(error) => return Response::Error(ErrorResponse { error }),
             };
             let scope = OptionScopeSelector::Pane(target.clone());
+            let previous_options = state.options.clone();
             match state.options.set_by_name(
                 scope.clone(),
                 &request.name,
@@ -43,6 +44,19 @@ impl RequestHandler {
                     if let Err(error) =
                         synchronize_pane_option_aliases_for_outcome(&mut state, &outcome)
                     {
+                        state.options = previous_options;
+                        return Response::Error(ErrorResponse { error });
+                    }
+                    let successful_response =
+                        Response::PaneOptionSet(Box::new(PaneOptionSetResponse {
+                            pane_id,
+                            name: outcome.name.clone(),
+                            old_value: outcome.old_explicit.clone(),
+                            new_value: outcome.new_explicit.clone(),
+                            changed: outcome.changed,
+                        }));
+                    if let Err(error) = rmux_proto::encode_frame(&successful_response) {
+                        state.options = previous_options;
                         return Response::Error(ErrorResponse { error });
                     }
                     alerts_changed = outcome
@@ -75,13 +89,7 @@ impl RequestHandler {
                     } else {
                         refresh_session = Some(target.session_name().clone());
                         alert_scope = Some(scope);
-                        Response::PaneOptionSet(Box::new(PaneOptionSetResponse {
-                            pane_id,
-                            name: outcome.name,
-                            old_value: outcome.old_explicit,
-                            new_value: outcome.new_explicit,
-                            changed: outcome.changed,
-                        }))
+                        successful_response
                     };
                     self.pause_before_pane_option_journal().await;
                     for (pane_id, generation, outcome) in &pane_option_events {

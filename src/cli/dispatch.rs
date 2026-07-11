@@ -2,8 +2,13 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use rmux_client::connect;
-use rmux_proto::{ClientTerminalContext, CopyModeRequest, ErrorResponse, LayoutName, Response};
+use rmux_proto::{
+    ClientTerminalContext, CopyModeRequest, ErrorResponse, LayoutName, Response, Target,
+};
 
+use super::attach_transport::{
+    queued_attach_session_is_active, QueuedAttachSession, QueuedAttachSessionResult,
+};
 use super::automation::{
     run_broadcast_keys, run_collect_pane_output, run_expect_pane, run_find_panes,
     run_find_sessions, run_locator, run_pane_snapshot, run_stream_pane, run_wait_pane,
@@ -11,9 +16,7 @@ use super::automation::{
 };
 use super::buffer_commands::{run_load_buffer, run_save_buffer};
 use super::capture_pane::{capture_pane_request, send_capture_pane_request};
-use super::client_commands::{
-    run_attach_session, run_attach_session_queued, QueuedAttachSession, QueuedAttachSessionResult,
-};
+use super::client_commands::{run_attach_session, run_attach_session_queued};
 use super::command_inventory::run_list_commands;
 use super::command_runner::{
     finish_command_success, inherited_pane_target, run_command, run_command_resolved,
@@ -139,7 +142,14 @@ fn dispatch_commands(
         if command_exit_code != 0 {
             exit_code = command_exit_code;
         }
-        if command_is_detach_client || command_is_kill_server {
+        if command_is_detach_client
+            && queued_attach_active
+            && command_exit_code == 0
+            && !queued_attach_session_is_active(socket_path)?
+        {
+            queued_attach_session = None;
+        }
+        if command_is_kill_server {
             queued_attach_session = None;
         }
         if command_is_kill_server {
@@ -148,6 +158,12 @@ fn dispatch_commands(
             // Continuing would feed startup options to the tail and recreate
             // the daemon that this command just stopped.
             break;
+        }
+    }
+    if let Some(queued_attach_session) = queued_attach_session {
+        let attach_exit_code = queued_attach_session.run()?;
+        if attach_exit_code != 0 {
+            exit_code = attach_exit_code;
         }
     }
     Ok(exit_code)
@@ -703,10 +719,12 @@ fn run_shell_foreground(
     socket_path: &Path,
     args: crate::cli_args::RunShellArgs,
 ) -> Result<i32, ExitFailure> {
+    let explicit_target = args.target.is_some();
     let (command, arguments) = run_shell_command_and_arguments(args.command, args.as_commands)?;
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
     let target = resolve_run_shell_target(&mut connection, socket_path, args.target.as_ref())?;
+    let output_target = explicit_target.then(|| target.clone()).flatten();
     let response = connection
         .run_shell(
             command,
@@ -722,12 +740,59 @@ fn run_shell_foreground(
 
     match response {
         Response::RunShell(response) => {
-            if let Some(output) = response.command_output() {
-                write_command_output(output)?;
+            if let Some(target) = output_target {
+                if let Some(output) = response.command_output() {
+                    if matches!(
+                        deliver_targeted_run_shell_output(
+                            &mut connection,
+                            target,
+                            output.stdout(),
+                        )?,
+                        TargetedRunShellDelivery::Caller
+                    ) {
+                        write_command_output(output)?;
+                    }
+                }
+            } else {
+                if let Some(output) = response.command_output() {
+                    write_command_output(output)?;
+                }
             }
             Ok(response.exit_status().unwrap_or(0))
         }
         other => finish_command_success(other, "run-shell"),
+    }
+}
+
+enum TargetedRunShellDelivery {
+    Delivered,
+    Caller,
+}
+
+fn deliver_targeted_run_shell_output(
+    connection: &mut rmux_client::Connection,
+    target: rmux_proto::PaneTarget,
+    output: &[u8],
+) -> Result<TargetedRunShellDelivery, ExitFailure> {
+    let message = String::from_utf8_lossy(output)
+        .trim_end_matches(['\r', '\n'])
+        .replace('#', "##");
+    if message.is_empty() {
+        return Ok(TargetedRunShellDelivery::Delivered);
+    }
+    let response = connection
+        .display_message(Some(Target::Pane(target)), false, Some(message))
+        .map_err(ExitFailure::from_client)?;
+    match response {
+        Response::DisplayMessage(_) => Ok(TargetedRunShellDelivery::Delivered),
+        Response::Error(ErrorResponse {
+            error:
+                rmux_proto::RmuxError::InvalidTarget { .. }
+                | rmux_proto::RmuxError::SessionNotFound(_)
+                | rmux_proto::RmuxError::PaneNotFound { .. },
+        }) => Ok(TargetedRunShellDelivery::Caller),
+        response => finish_command_success(response, "display-message")
+            .map(|_| TargetedRunShellDelivery::Delivered),
     }
 }
 

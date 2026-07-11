@@ -20,7 +20,7 @@ use super::persistent_overlay::{
 use super::types::{AttachControl, AttachTarget, OpenAttachTarget, OverlayFrame};
 use super::wire::{
     emit_attach_bytes, emit_attach_message, emit_attach_stop, emit_detached_attach_stop,
-    emit_exited_attach_stop, emit_render_frame, open_attach_target,
+    emit_render_frame, open_attach_target,
 };
 
 pub(super) fn should_emit_overlay(
@@ -203,7 +203,6 @@ pub(super) async fn apply_pending_attach_controls(
                 ));
             }
             Ok(AttachControl::Exited) => {
-                emit_exited_attach_stop(stream, current_target).await?;
                 return Ok(PendingAttachAction::Exit(
                     AttachExitReason::AttachControlExited,
                 ));

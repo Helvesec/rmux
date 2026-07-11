@@ -92,22 +92,48 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 source "$repo_root/scripts/perf-provenance.sh"
 
+release_dir="${CARGO_TARGET_DIR:-target}/release"
+mkdir -p "$release_dir"
+release_dir="$(cd "$release_dir" && pwd)"
+cargo_binary="$release_dir/rmux"
+cargo_daemon="$release_dir/rmux-daemon"
 if [ -z "$binary" ]; then
-    binary="${CARGO_TARGET_DIR:-target}/release/rmux"
+    binary="$cargo_binary"
 fi
+mkdir -p "$(dirname "$binary")"
+binary="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"
+binary_dir="$(dirname "$binary")"
+helper_binary="$binary_dir/libexec/rmux/rmux"
+daemon_binary="$binary_dir/rmux-daemon"
 
 if [ "$skip_build" -eq 0 ]; then
-    cargo build --locked --release
+    cargo build --locked --release --package rmux --bin rmux
+    mkdir -p "$(dirname "$helper_binary")"
+    install -m 0755 "$cargo_binary" "$helper_binary"
+    cargo build --locked --release --package rmux --bin rmux-daemon
+    if [ "$daemon_binary" != "$cargo_daemon" ]; then
+        install -m 0755 "$cargo_daemon" "$daemon_binary"
+    fi
+    cargo build --locked --release --package rmux --features tiny-cli --bin rmux
+    if [ "$binary" != "$cargo_binary" ]; then
+        install -m 0755 "$cargo_binary" "$binary"
+    fi
 fi
 
 if [ ! -x "$binary" ]; then
     echo "rmux binary was not found or is not executable: $binary" >&2
     exit 1
 fi
-
-binary="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"
+if [ ! -x "$helper_binary" ]; then
+    echo "rmux private helper was not found or is not executable: $helper_binary" >&2
+    exit 1
+fi
+if [ ! -x "$daemon_binary" ]; then
+    echo "rmux daemon was not found or is not executable: $daemon_binary" >&2
+    exit 1
+fi
 case "$binary" in
-    */release/rmux) ;;
+    */release/rmux|*/release/*/rmux) ;;
     *)
         echo "perf bench requires the release-profile rmux binary, got: $binary" >&2
         exit 2
@@ -126,6 +152,11 @@ provenance_invocation="$RMUX_PERF_PROVENANCE_VALUE"
 binary_sha256="$RMUX_PERF_BINARY_SHA256"
 binary_version="$RMUX_PERF_BINARY_VERSION"
 build_mode="$RMUX_PERF_BUILD_MODE"
+binary_size_bytes="$(wc -c <"$binary" | tr -d ' ')"
+helper_binary_sha256="$(sha256_file "$helper_binary")"
+helper_binary_size_bytes="$(wc -c <"$helper_binary" | tr -d ' ')"
+daemon_binary_sha256="$(sha256_file "$daemon_binary")"
+daemon_binary_size_bytes="$(wc -c <"$daemon_binary" | tr -d ' ')"
 mkdir -p "$output_dir"
 
 metric_names=()
@@ -517,19 +548,19 @@ record_metric() {
     metric_samples+=("$(IFS=,; echo "${samples[*]}")")
 }
 
-record_metric "diagnose_json_cold" "null" sample_diagnose
+record_metric "diagnose_json_cold" "250" sample_diagnose
 record_metric "daemon_startup" "750" sample_daemon_startup
 record_metric "new_session_detached_sh" "500" sample_new_session_sh
 record_metric "split_window_detached_sh" "150" sample_split_window_sh
-record_metric "send_keys_detached_round_trip" "20" sample_send_keys
+record_metric "send_keys_detached_round_trip" "50" sample_send_keys
 record_metric "resize_pane_round_trip" "100" sample_resize_pane
-record_metric "pane_output_${line_count}_lines_ready" "null" sample_pane_output_ready
+record_metric "pane_output_${line_count}_lines_ready" "3000" sample_pane_output_ready
 record_metric "capture_pane_${line_count}_lines" "75" sample_capture_pane
-record_metric "attach_render_${line_count}_line_scrollback" "null" sample_attach_render
-record_metric "source_file_${source_command_count}_commands" "null" sample_source_file_large
-record_metric "status_format_heavy_expand" "null" sample_status_format_heavy
-record_metric "hook_storm_${hook_storm_events}_after_set_option" "null" sample_hook_storm
-record_metric "daemon_churn_${daemon_churn_cycles}_create_kill" "null" sample_daemon_churn
+record_metric "attach_render_${line_count}_line_scrollback" "1000" sample_attach_render
+record_metric "source_file_${source_command_count}_commands" "2000" sample_source_file_large
+record_metric "status_format_heavy_expand" "250" sample_status_format_heavy
+record_metric "hook_storm_${hook_storm_events}_after_set_option" "500" sample_hook_storm
+record_metric "daemon_churn_${daemon_churn_cycles}_create_kill" "5000" sample_daemon_churn
 
 timestamp="$(date -u +%Y%m%d-%H%M%S)"
 json_path="$output_dir/unix-$timestamp.json"
@@ -544,12 +575,17 @@ markdown_path="$output_dir/unix-$timestamp.txt"
         "$(json_string "$git_commit")" "$(json_string "$git_describe")"
     printf '  "environment": {"platform":%s,"machine":%s,"host_fingerprint":%s},\n' \
         "$(json_string "$platform")" "$(json_string "$machine")" "$(json_string "$host_fingerprint")"
-    printf '  "binary": {"path":%s,"sha256":%s,"version":%s,"configuration":"release"},\n' \
-        "$(json_string "$binary")" "$(json_string "$binary_sha256")" "$(json_string "$binary_version")"
+    printf '  "binary": {"path":%s,"sha256":%s,"size_bytes":%s,"version":%s,"configuration":"release"},\n' \
+        "$(json_string "$binary")" "$(json_string "$binary_sha256")" "$binary_size_bytes" "$(json_string "$binary_version")"
+    printf '  "layout": {"schema":1,"public":{"path":%s,"sha256":%s,"size_bytes":%s},"helper":{"path":%s,"sha256":%s,"size_bytes":%s},"daemon":{"path":%s,"sha256":%s,"size_bytes":%s}},\n' \
+        "$(json_string "$binary")" "$(json_string "$binary_sha256")" "$binary_size_bytes" \
+        "$(json_string "$helper_binary")" "$(json_string "$helper_binary_sha256")" "$helper_binary_size_bytes" \
+        "$(json_string "$daemon_binary")" "$(json_string "$daemon_binary_sha256")" "$daemon_binary_size_bytes"
     printf '  "provenance": {"generator":"scripts/perf-bench.sh","invocation":%s,"expected_git_commit":%s,"expected_platform":%s,"build_mode":%s},\n' \
         "$(json_string "$provenance_invocation")" "$(json_string "$expected_git_commit")" \
         "$(json_string "$expected_platform")" "$(json_string "$build_mode")"
-    printf '  "parameters": {"iterations":%s,"line_count":%s},\n' "$iterations" "$line_count"
+    printf '  "parameters": {"iterations":%s,"line_count":%s,"source_command_count":%s,"hook_storm_events":%s,"daemon_churn_cycles":%s},\n' \
+        "$iterations" "$line_count" "$source_command_count" "$hook_storm_events" "$daemon_churn_cycles"
     printf '  "metrics": [\n'
     for ((i = 0; i < ${#metric_names[@]}; i++)); do
         [ "$i" -gt 0 ] && printf ',\n'
@@ -566,6 +602,8 @@ markdown_path="$output_dir/unix-$timestamp.txt"
     printf '# RMUX Unix Performance Bench\n\n'
     printf -- '- Binary: `%s`\n' "$binary"
     printf -- '- Binary SHA-256: `%s`\n' "$binary_sha256"
+    printf -- '- Private helper SHA-256: `%s`\n' "$helper_binary_sha256"
+    printf -- '- Daemon SHA-256: `%s`\n' "$daemon_binary_sha256"
     printf -- '- Git commit: `%s`\n' "$git_commit"
     printf -- '- Provenance: `%s`\n' "$provenance_invocation"
     printf -- '- Iterations: `%s`\n' "$iterations"

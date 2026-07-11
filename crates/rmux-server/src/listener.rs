@@ -27,6 +27,9 @@ use crate::pane_io;
 use crate::server_access::apply_access_policy;
 use crate::socket_cleanup::SocketCleanup;
 
+const CONNECTION_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
+const DETACHED_RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Accept loop: spawns a per-connection task for each incoming client.
 pub(crate) async fn serve(
     mut listener: LocalListener,
@@ -149,9 +152,7 @@ pub(crate) async fn serve(
         Err(error) => warn!("startup config task failed: {error}"),
     }
 
-    while let Some(result) = connection_tasks.join_next().await {
-        log_connection_task_result(result);
-    }
+    drain_connection_tasks_for_shutdown(&mut connection_tasks).await;
     if let Err(error) = hook_task.await {
         warn!("lifecycle hook task failed: {error}");
     }
@@ -526,10 +527,36 @@ fn drain_finished_connection_tasks(tasks: &mut JoinSet<io::Result<()>>) {
     }
 }
 
+async fn drain_connection_tasks_for_shutdown(tasks: &mut JoinSet<io::Result<()>>) {
+    let graceful = async {
+        while let Some(result) = tasks.join_next().await {
+            log_connection_task_result(result);
+        }
+    };
+    if tokio::time::timeout(CONNECTION_SHUTDOWN_GRACE, graceful)
+        .await
+        .is_ok()
+    {
+        return;
+    }
+
+    warn!(
+        remaining = tasks.len(),
+        "aborting client connections that did not drain during daemon shutdown"
+    );
+    tasks.abort_all();
+    while let Some(result) = tasks.join_next().await {
+        log_connection_task_result(result);
+    }
+}
+
 fn log_connection_task_result(result: Result<io::Result<()>, JoinError>) {
     match result {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!("connection error: {error}"),
+        Err(error) if error.is_cancelled() => {
+            debug!("connection task cancelled during daemon shutdown")
+        }
         Err(error) => warn!("connection task failed: {error}"),
     }
 }
@@ -572,7 +599,17 @@ impl Connection {
 
     async fn write_response(&mut self, response: &Response) -> io::Result<()> {
         let frame = encode_response_frame(response).map_err(io::Error::other)?;
-        self.stream.write_all(&frame).await
+        tokio::time::timeout(
+            DETACHED_RESPONSE_WRITE_TIMEOUT,
+            self.stream.write_all(&frame),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "detached client did not drain the response",
+            )
+        })?
     }
 
     fn into_raw_parts(self) -> (LocalStream, Vec<u8>) {
@@ -619,6 +656,31 @@ mod tests {
                 error: RmuxError::FrameTooLarge { .. }
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn daemon_shutdown_aborts_a_non_reading_detached_response() -> io::Result<()> {
+        let (server, client) = LocalStream::pair()?;
+        let mut connection = Connection::new(server);
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async move {
+            connection
+                .write_response(&Response::Error(ErrorResponse {
+                    error: RmuxError::Server("x".repeat(7_000_000)),
+                }))
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            tasks.len(),
+            1,
+            "the unread response should still be blocked"
+        );
+        drain_connection_tasks_for_shutdown(&mut tasks).await;
+        assert!(tasks.is_empty());
+        drop(client);
+        Ok(())
     }
 
     #[tokio::test]

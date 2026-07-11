@@ -458,7 +458,9 @@ impl RequestHandler {
             active_attach.attached_count(&request.target)
         };
         #[cfg(windows)]
-        if format_references_pane_pid(request.format.as_deref()) {
+        if format_references_pane_pid(request.format.as_deref())
+            || format_references_pane_pid(request.filter.as_deref())
+        {
             self.wait_for_windows_deferred_all_pane_pids().await;
         }
         let state = self.state.lock().await;

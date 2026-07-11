@@ -8,6 +8,9 @@ mod pane_attached_key_dispatch;
 mod pane_broadcast;
 #[path = "handler_pane/by_id.rs"]
 mod pane_by_id;
+#[cfg(windows)]
+#[path = "handler_pane/deferred_wait.rs"]
+mod pane_deferred_wait;
 #[path = "handler_pane/display_panes.rs"]
 mod pane_display_panes;
 #[path = "handler_pane/inspection.rs"]
@@ -41,7 +44,7 @@ mod pane_windows_console_sequence;
 pub(super) use pane_attached_input::retain_partial_attached_control_input;
 pub(super) use pane_by_id::resolve_pane_target_ref;
 #[cfg(windows)]
-pub(in crate::handler) use pane_inspection::format_references_pane_pid;
+pub(in crate::handler) use pane_deferred_wait::format_references_pane_pid;
 pub(super) use pane_inspection::{
     attached_status_message_for_error, command_output_from_lines, display_time,
 };

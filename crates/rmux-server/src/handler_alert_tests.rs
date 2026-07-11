@@ -656,7 +656,11 @@ async fn pane_alert_event_sets_bell_and_activity_flags_and_emits_alert_hooks() {
 #[tokio::test]
 async fn pane_alert_callback_can_be_invoked_from_reader_thread() {
     let handler = RequestHandler::new();
-    let session = create_session(&handler, "alerts-reader-thread").await;
+    // Keep the real pane reader quiescent so this test observes only the
+    // callback invoked below. In particular, an interactive Windows shell can
+    // publish an initial title/activity event concurrently and consume the
+    // one-shot activity alert before the synthetic reader-thread event runs.
+    let session = create_quiet_session(&handler, "alerts-reader-thread").await;
     set_option(
         &handler,
         ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
@@ -698,8 +702,7 @@ async fn pane_alert_callback_can_be_invoked_from_reader_thread() {
     .join()
     .expect("reader-thread alert callback should not panic outside the Tokio runtime");
 
-    let event = recv_lifecycle(&mut lifecycle).await;
-    assert_eq!(event.hook_name, HookName::AlertActivity);
+    recv_lifecycle_hook(&mut lifecycle, HookName::AlertActivity).await;
 }
 
 #[tokio::test]
@@ -1335,7 +1338,7 @@ async fn pane_exit_callback_can_be_invoked_from_reader_thread() {
 #[tokio::test]
 async fn pane_alert_event_updates_automatic_window_name_without_disabling_auto_rename() {
     let handler = RequestHandler::new();
-    let session = create_session(&handler, "alerts-name").await;
+    let session = create_quiet_session(&handler, "alerts-name").await;
     set_option(
         &handler,
         ScopeSelector::Window(WindowTarget::with_window(session.clone(), 0)),
@@ -1390,7 +1393,7 @@ async fn pane_alert_event_updates_automatic_window_name_without_disabling_auto_r
 #[tokio::test]
 async fn pane_alert_event_respects_automatic_rename_off() {
     let handler = RequestHandler::new();
-    let session = create_session(&handler, "alerts-name-off").await;
+    let session = create_quiet_session(&handler, "alerts-name-off").await;
     let target = WindowTarget::with_window(session.clone(), 0);
     set_option(
         &handler,
@@ -1441,7 +1444,7 @@ async fn pane_alert_event_respects_automatic_rename_off() {
 #[tokio::test]
 async fn pane_alert_event_updates_grouped_session_window_names() {
     let handler = RequestHandler::new();
-    let alpha = create_session(&handler, "alerts-group-alpha").await;
+    let alpha = create_quiet_session(&handler, "alerts-group-alpha").await;
     let beta = session_name("alerts-group-beta");
     let response = handler
         .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {

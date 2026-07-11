@@ -611,7 +611,9 @@ fn request_waits_for_windows_deferred_panes(request: &Request) -> bool {
             | Request::KillServer(_)
             | Request::ShutdownIfIdle(_)
             | Request::KillPane(_)
+            | Request::PaneKill(_)
             | Request::RespawnPane(_)
+            | Request::PaneRespawn(_)
             | Request::LockServer(_)
             | Request::LockSession(_)
             | Request::LockClient(_)
@@ -692,11 +694,14 @@ fn supported_capabilities() -> Vec<&'static str> {
 
 #[cfg(all(test, windows))]
 mod windows_deferred_wait_tests {
+    use rmux_core::PaneId;
     use rmux_proto::request::{
-        KillPaneRequest, NewWindowRequest, Request, RespawnPaneRequest, SplitWindowExtRequest,
-        SplitWindowTargetActionRequest,
+        KillPaneRequest, NewWindowRequest, PaneKillRequest, PaneRespawnRequest, Request,
+        RespawnPaneRequest, SplitWindowExtRequest, SplitWindowTargetActionRequest,
     };
-    use rmux_proto::{PaneTarget, ProcessCommand, SessionName, SplitDirection, SplitWindowTarget};
+    use rmux_proto::{
+        PaneTarget, PaneTargetRef, ProcessCommand, SessionName, SplitDirection, SplitWindowTarget,
+    };
 
     use super::request_waits_for_windows_deferred_panes;
 
@@ -772,6 +777,25 @@ mod windows_deferred_wait_tests {
         }))
     }
 
+    fn pane_kill_by_id() -> Request {
+        Request::PaneKill(PaneKillRequest {
+            target: PaneTargetRef::by_id(session_name("bench"), PaneId::new(7)),
+            kill_all_except: false,
+        })
+    }
+
+    fn pane_respawn_by_id() -> Request {
+        Request::PaneRespawn(Box::new(PaneRespawnRequest {
+            target: PaneTargetRef::by_id(session_name("bench"), PaneId::new(7)),
+            kill: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: Some(ProcessCommand::Shell("exit 0".to_owned())),
+            keep_alive_on_exit: None,
+        }))
+    }
+
     #[test]
     fn detached_new_window_does_not_wait_for_windows_deferred_panes() {
         assert!(!request_waits_for_windows_deferred_panes(&new_window(true)));
@@ -781,6 +805,10 @@ mod windows_deferred_wait_tests {
     fn final_pane_lifecycle_mutations_do_not_wait_for_deferred_initial_spawn() {
         assert!(!request_waits_for_windows_deferred_panes(&kill_pane()));
         assert!(!request_waits_for_windows_deferred_panes(&respawn_pane()));
+        assert!(!request_waits_for_windows_deferred_panes(&pane_kill_by_id()));
+        assert!(!request_waits_for_windows_deferred_panes(
+            &pane_respawn_by_id()
+        ));
     }
 
     #[test]

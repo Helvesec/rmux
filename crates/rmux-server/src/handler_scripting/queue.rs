@@ -142,6 +142,37 @@ pub(in crate::handler) enum QueueCommandAction {
     },
 }
 
+impl QueueCommandAction {
+    pub(super) fn without_output(self) -> Self {
+        match self {
+            Self::Normal {
+                error,
+                source_file_error,
+                exit_status,
+                ..
+            } => Self::Normal {
+                output: None,
+                error,
+                source_file_error,
+                exit_status,
+            },
+            Self::InsertAfter {
+                batches,
+                error,
+                source_file_error,
+                exit_status,
+                ..
+            } => Self::InsertAfter {
+                batches,
+                output: None,
+                error,
+                source_file_error,
+                exit_status,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum QueueMode {
     Detached,

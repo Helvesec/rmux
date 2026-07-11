@@ -22,6 +22,36 @@ const NO_TOP_LEVEL_ARGS: &[&str] = &[];
 const INHERITED_RMUX: &str = r"C:\tmp\outer-rmux,123,0";
 const INHERITED_TMUX: &str = r"C:\tmp\outer-tmux,123,0";
 
+#[test]
+fn unrelated_starting_pane_does_not_block_a_stable_session_refresh() -> Result<(), Box<dyn Error>> {
+    let _serial_guard = windows_cli_serial::acquire("deferred-pane-session-scope")?;
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_rmux"));
+    let label = format!("win-deferred-scope-{}", std::process::id());
+    let _server = RmuxServerGuard::new(&binary, label.clone());
+
+    run_rmux(
+        &binary,
+        &label,
+        ["new-session", "-d", "-s", "alpha", "cmd.exe", "/D", "/K"],
+    )?;
+    wait_for_pane_pid(&binary, &label, "alpha", SETUP_TIMEOUT)?;
+
+    run_rmux(
+        &binary,
+        &label,
+        ["new-session", "-d", "-s", "beta", "cmd.exe", "/D", "/K"],
+    )?;
+    let started = Instant::now();
+    run_rmux(&binary, &label, ["select-pane", "-t", "alpha:0.0"])?;
+
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "a deferred pane in beta blocked alpha for {:?}",
+        started.elapsed()
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TerminalProfile {
     name: &'static str,
@@ -361,6 +391,27 @@ fn wait_for_attached_client_line(
         "timed out waiting for attached client; last stdout={last_stdout:?} stderr={last_stderr:?}"
     )
     .into())
+}
+
+fn wait_for_pane_pid(
+    binary: &Path,
+    label: &str,
+    session: &str,
+    timeout: Duration,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let output = run_rmux_output(
+            binary,
+            label,
+            ["list-panes", "-t", session, "-F", "#{pane_pid}"],
+        )?;
+        if output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!("timed out waiting for a pane pid in session {session}").into())
 }
 
 fn extract_control_payload_line(stdout: &[u8]) -> Option<String> {

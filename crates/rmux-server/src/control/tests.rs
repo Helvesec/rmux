@@ -6,6 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
 
+use super::subscriptions::{handle_pane_event, PaneEvent};
 use super::{
     append_control_input, ensure_control_newline, extract_complete_control_lines, forward_control,
     ActiveControlCommand, ControlCommandResult, ControlLifecycle, ControlOutputQueue,
@@ -115,6 +116,45 @@ fn enqueue_stdout_skips_empty_bytes() {
     queue.enqueue_stdout(Vec::new());
     assert_eq!(queue.blocks.len(), 0);
     assert_eq!(queue.buffered_bytes, 0);
+}
+
+#[tokio::test]
+async fn pane_output_lag_terminates_control_mode_explicitly() {
+    let mut queue = ControlOutputQueue::default();
+    let mut paused_panes = std::collections::HashSet::new();
+    let lagged = handle_pane_event(
+        PaneEvent::Lagged {
+            pane_id: 7,
+            expected_sequence: 2,
+            resume_sequence: 9,
+            missed_events: 7,
+        },
+        &mut queue,
+        &mut paused_panes,
+        Default::default(),
+    )
+    .expect("lag handling succeeds");
+    assert!(
+        lagged,
+        "a pane-output gap must be terminal for control mode"
+    );
+
+    let (mut writer, mut reader) = tokio::io::duplex(256);
+    super::flush_output_queue(
+        &mut queue,
+        &mut writer,
+        Default::default(),
+        &mut paused_panes,
+    )
+    .await
+    .expect("terminal lag frame flushes");
+    writer.shutdown().await.expect("writer closes");
+    let mut rendered = Vec::new();
+    reader
+        .read_to_end(&mut rendered)
+        .await
+        .expect("lag transcript reads");
+    assert_eq!(rendered, b"%exit too far behind\n");
 }
 
 #[tokio::test]
@@ -294,7 +334,7 @@ async fn eof_after_command_block_appends_exit() {
 }
 
 #[tokio::test]
-async fn eof_while_finite_control_command_is_pending_waits_for_completion() {
+async fn eof_detaches_finite_control_command_and_closes_immediately() {
     let handler = Arc::new(RequestHandler::new());
     let (server_stream, mut client_stream) = UnixStream::pair().expect("unix stream pair");
     let (_shutdown_tx, shutdown_rx) = watch::channel(());
@@ -302,15 +342,21 @@ async fn eof_while_finite_control_command_is_pending_waits_for_completion() {
     let closing = Arc::new(AtomicBool::new(false));
     let (shutdown_handle, _shutdown_request_rx) = ShutdownHandle::new();
     let _requester_access_guard = handler.begin_detached_requester_access(4242, true);
+    let marker = std::env::temp_dir().join(format!(
+        "rmux-control-eof-detached-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos()
+    ));
+    let command = format!("run-shell 'sleep 1; printf done > {}'\n", marker.display());
 
     let control_task = tokio::spawn(forward_control(
         server_stream,
         Arc::clone(&handler),
         4242,
-        ControlUpgradeInput::new(
-            b"if-shell 'sleep 0.2; true' 'display-message -p ok'\n".to_vec(),
-            1,
-        ),
+        ControlUpgradeInput::new(command.into_bytes(), 1),
         shutdown_rx,
         server_event_rx,
         ControlLifecycle {
@@ -337,9 +383,15 @@ async fn eof_while_finite_control_command_is_pending_waits_for_completion() {
         .expect("client write half closes");
 
     let mut remaining = Vec::new();
-    read_control_to_end(&mut client_stream, &mut remaining).await;
-    control_task
+    tokio::time::timeout(
+        Duration::from_millis(500),
+        read_control_to_end(&mut client_stream, &mut remaining),
+    )
+    .await
+    .expect("control EOF must not wait for the foreground shell job");
+    tokio::time::timeout(Duration::from_millis(500), control_task)
         .await
+        .expect("forward control exits before the shell job")
         .expect("forward control task joins")
         .expect("forward control succeeds");
 
@@ -348,12 +400,8 @@ async fn eof_while_finite_control_command_is_pending_waits_for_completion() {
         String::from_utf8(remaining).expect("utf-8 control stream")
     );
     assert!(
-        rendered.contains("ok\n"),
-        "finite pending command should still emit stdout after EOF: {rendered:?}"
-    );
-    assert!(
         rendered.contains("%end "),
-        "finite pending command should close with %end after EOF: {rendered:?}"
+        "EOF must close the pending command guard: {rendered:?}"
     );
     assert!(
         !rendered.contains("%error "),
@@ -361,8 +409,21 @@ async fn eof_while_finite_control_command_is_pending_waits_for_completion() {
     );
     assert!(
         rendered.ends_with("%exit\n"),
-        "finite pending command should append bare exit after completion: {rendered:?}"
+        "EOF must terminate control mode immediately: {rendered:?}"
     );
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !marker.is_file() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("detached foreground shell job still completes server-side");
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("read detached shell marker"),
+        "done"
+    );
+    let _ = std::fs::remove_file(marker);
 }
 
 #[tokio::test]
@@ -762,7 +823,7 @@ async fn dropping_active_control_command_aborts_inflight_task() {
         command_number: 1,
         guard_flag: 0,
         abort_on_eof: true,
-        task,
+        task: Some(task),
     });
 
     for _ in 0..50 {

@@ -1,7 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use rmux_core::{encode_paste_bytes, LifecycleEvent, ScreenCaptureRange};
 use rmux_proto::{
@@ -26,7 +25,6 @@ use list::{
     command_output_from_lines, render_list_buffer_line, sort_buffer_entries, BufferSortOrder,
 };
 
-static SAVE_BUFFER_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 impl RequestHandler {
     pub(super) async fn handle_set_buffer(
         &self,
@@ -294,7 +292,7 @@ impl RequestHandler {
         let save_result = if request.append {
             append_buffer_to_path(&resolved_path, &content)
         } else {
-            save_buffer_atomically(&resolved_path, &content)
+            save_buffer_to_path(&resolved_path, &content)
         };
         match save_result {
             Ok(()) => Response::SaveBuffer(SaveBufferResponse { buffer_name }),
@@ -503,28 +501,13 @@ fn resolve_buffer_path(path: &str, cwd: Option<&Path>) -> PathBuf {
     }
 }
 
-fn save_buffer_atomically(destination: &Path, content: &[u8]) -> io::Result<()> {
-    let parent = destination
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let (mut temp_file, temp_path) = create_save_buffer_temp_file(parent, destination)?;
-
-    let write_result = (|| {
-        temp_file.write_all(content)?;
-        temp_file.sync_all()
-    })();
-    if let Err(error) = write_result {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
-    }
-
-    if let Err(error) = fs::rename(&temp_path, destination) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
-    }
-
-    Ok(())
+fn save_buffer_to_path(destination: &Path, content: &[u8]) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(destination)?;
+    file.write_all(content)
 }
 
 fn append_buffer_to_path(destination: &Path, content: &[u8]) -> io::Result<()> {
@@ -533,40 +516,6 @@ fn append_buffer_to_path(destination: &Path, content: &[u8]) -> io::Result<()> {
         .append(true)
         .open(destination)?;
     file.write_all(content)
-}
-
-fn create_save_buffer_temp_file(
-    parent: &Path,
-    destination: &Path,
-) -> io::Result<(std::fs::File, PathBuf)> {
-    let destination_name = destination
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "buffer".to_owned());
-
-    for _ in 0..128 {
-        let temp_id = SAVE_BUFFER_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let temp_path = parent.join(format!(
-            ".{destination_name}.rmux-save-buffer-{temp_id:016x}.tmp"
-        ));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-        {
-            Ok(file) => return Ok((file, temp_path)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        format!(
-            "failed to allocate a temporary file alongside '{}'",
-            destination.display()
-        ),
-    ))
 }
 
 fn render_paste_payload(content: &[u8], request: &rmux_proto::PasteBufferRequest) -> Vec<u8> {

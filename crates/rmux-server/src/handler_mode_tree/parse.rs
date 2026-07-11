@@ -323,7 +323,7 @@ fn join_command_arguments(
     }
     Ok(args
         .drain(..)
-        .map(|argument| argument.to_tmux_string())
+        .map(|argument| argument.to_tmux_reparse_string())
         .collect::<Vec<_>>()
         .join(" "))
 }

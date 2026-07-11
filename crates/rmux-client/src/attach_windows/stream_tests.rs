@@ -10,8 +10,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use super::super::action::{run_attach_action, AttachActionExecutor};
-use super::super::lock_state::AttachLockState;
 use super::*;
+use crate::attach_lock_state::AttachLockState;
 
 #[tokio::test]
 async fn lock_request_runs_action_and_sends_unlock() -> Result<(), Box<dyn std::error::Error>> {
@@ -999,7 +999,7 @@ async fn mouse_all_sequences_toggle_windows_console_mouse_actions(
 }
 
 #[tokio::test]
-async fn split_detached_banner_marks_stream_stopped_before_eof(
+async fn literal_exit_banners_do_not_end_the_attach_stream(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut scenario = AttachScenario::new(RecordingActions::default());
     let mut server = scenario.take_server();
@@ -1015,10 +1015,27 @@ async fn split_detached_banner_marks_stream_stopped_before_eof(
         AttachMessage::Data(DETACHED_BANNER_PREFIX[split..].to_vec()),
     )
     .await?;
+    write_server_message(&mut server, AttachMessage::Data(EXITED_BANNER.to_vec())).await?;
+    write_server_message(&mut server, AttachMessage::Data(b"still-attached".to_vec())).await?;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !scenario.client.is_finished(),
+        "pane bytes that resemble RMUX banners must not terminate attach"
+    );
+
+    write_server_message(
+        &mut server,
+        AttachMessage::Data(ALT_SCREEN_EXIT_FALLBACK.to_vec()),
+    )
+    .await?;
     drop(server);
 
     let output = scenario.join().await?;
-    assert_eq!(output, DETACHED_BANNER_PREFIX);
+    let mut expected = DETACHED_BANNER_PREFIX.to_vec();
+    expected.extend_from_slice(EXITED_BANNER);
+    expected.extend_from_slice(b"still-attached");
+    expected.extend_from_slice(ALT_SCREEN_EXIT_FALLBACK);
+    assert_eq!(output, expected);
     Ok(())
 }
 

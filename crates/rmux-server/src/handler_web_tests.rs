@@ -5,7 +5,8 @@ use rmux_proto::{encode_attach_message, AttachMessage};
 use rmux_proto::{
     CreateWebShareRequest, KillPaneRequest, KillSessionRequest, ListWebSharesRequest,
     NewSessionRequest, PaneTarget, RenameSessionRequest, Request, Response, SessionName,
-    SplitDirection, SplitWindowRequest, SplitWindowTarget, TerminalSize, WebShareScope,
+    SplitDirection, SplitWindowRequest, SplitWindowTarget, StopWebShareRequest, TerminalSize,
+    WebShareScope,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::time::{sleep, timeout, Duration, Instant};
@@ -148,6 +149,72 @@ async fn web_share_create_resolves_slot_target_to_stable_pane_id() {
         .as_deref()
         .expect("spectator URL")
         .contains("#e=wss://share.example/share&t="));
+}
+
+#[tokio::test]
+async fn stopped_ttl_share_wakes_its_expiry_waiter() {
+    let handler = RequestHandler::new();
+    let session_name = new_session(&handler, "ttl-stop-wakeup").await;
+    let created = create_share(
+        &handler,
+        CreateWebShareRequest {
+            ttl_seconds: Some(7 * 24 * 60 * 60),
+            ..share_request(WebShareScope::Session(session_name))
+        },
+    )
+    .await;
+    let mut revoke_rx = handler
+        .web_shares
+        .expiry_revoke_receiver(&created.share_id)
+        .expect("TTL share has an expiry cancellation receiver");
+
+    let stopped = handler
+        .handle(Request::WebShare(Box::new(WebShareRequest::Stop(
+            StopWebShareRequest {
+                share_id: created.share_id,
+            },
+        ))))
+        .await;
+    assert!(matches!(
+        stopped,
+        Response::WebShare(response)
+            if matches!(response.as_ref(), rmux_proto::WebShareResponse::Stopped(stopped) if stopped.stopped)
+    ));
+    timeout(Duration::from_millis(100), revoke_rx.changed())
+        .await
+        .expect("stopping the share must wake the seven-day expiry waiter")
+        .expect("revoke sender remains valid through notification");
+    assert_eq!(
+        *revoke_rx.borrow(),
+        Some(crate::web::WebShareRevokeReason::StoppedByOwner)
+    );
+}
+
+#[tokio::test]
+async fn tunnel_completion_revalidation_rejects_a_removed_target() {
+    let handler = RequestHandler::new();
+    let session_name = new_session(&handler, "web-stale-target").await;
+    let resolved = handler
+        .resolve_create_web_share(share_request(WebShareScope::Pane(
+            PaneTarget::new(session_name.clone(), 0).into(),
+        )))
+        .await
+        .expect("initial target resolves");
+
+    let killed = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: session_name,
+            kill_all_except_target: false,
+            clear_alerts: false,
+            kill_group: false,
+        }))
+        .await;
+    assert!(matches!(killed, Response::KillSession(_)));
+
+    let state = handler.state.lock().await;
+    assert!(validate_resolved_web_target(&state, resolved.target()).is_err());
+    drop(state);
+    assert!(list_shares(&handler).await.is_empty());
 }
 
 #[tokio::test]
@@ -412,6 +479,83 @@ async fn killing_last_pane_prunes_web_session_share() {
         .err()
         .expect("old share must not attach after the session was destroyed");
     assert!(error.to_string().contains("does not exist"));
+}
+
+#[tokio::test]
+async fn killing_one_shared_pane_revokes_only_its_stable_share() {
+    let handler = RequestHandler::new();
+    let session_name = new_session(&handler, "web-pane-kill").await;
+    assert!(matches!(
+        handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(session_name.clone()),
+                direction: SplitDirection::Horizontal,
+                before: false,
+                environment: None,
+            }))
+            .await,
+        Response::SplitWindow(_)
+    ));
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&session_name)
+            .expect("session exists")
+            .window()
+            .pane(1)
+            .expect("second pane exists")
+            .id()
+    };
+    let created = create_share(
+        &handler,
+        share_request(WebShareScope::Pane(PaneTargetRef::by_id(
+            session_name.clone(),
+            pane_id,
+        ))),
+    )
+    .await;
+    let token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
+
+    let killed = handler
+        .handle(Request::KillPane(KillPaneRequest {
+            target: PaneTarget::with_window(session_name, 0, 1),
+            kill_all_except: false,
+        }))
+        .await;
+    assert!(matches!(killed, Response::KillPane(_)));
+    assert!(list_shares(&handler).await.is_empty());
+    assert!(handler.open_web_share(&token, None).await.is_err());
+}
+
+#[tokio::test]
+async fn renaming_session_rekeys_stable_pane_share() {
+    let handler = RequestHandler::new();
+    let session_name = new_session(&handler, "web-pane-old").await;
+    let renamed = SessionName::new("web-pane-new").expect("valid session name");
+    let created = create_share(
+        &handler,
+        share_request(WebShareScope::Pane(
+            PaneTarget::new(session_name.clone(), 0).into(),
+        )),
+    )
+    .await;
+    let token = token_from_url(created.spectator_url.as_deref().expect("spectator URL"));
+
+    let response = handler
+        .handle(Request::RenameSession(RenameSessionRequest {
+            target: session_name,
+            new_name: renamed.clone(),
+        }))
+        .await;
+    assert!(matches!(response, Response::RenameSession(_)));
+    let shares = list_shares(&handler).await;
+    assert!(matches!(
+        shares.as_slice(),
+        [share]
+            if matches!(&share.scope, WebShareScope::Pane(target) if target.session_name() == &renamed)
+    ));
+    assert!(handler.open_web_share(&token, None).await.is_ok());
 }
 
 #[tokio::test]

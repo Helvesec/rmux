@@ -1,30 +1,18 @@
 use std::ffi::OsStr;
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
-use rmux_client::attach_terminal_with_initial_bytes;
-#[cfg(unix)]
-use rmux_client::attach_terminal_with_initial_bytes_and_resize_geometry;
-#[cfg(windows)]
-use rmux_client::attach_terminal_with_initial_bytes_and_windows_console_key;
-#[cfg(unix)]
-use rmux_client::AttachError;
 use rmux_client::{
-    connect, detect_context, drive_control_mode, AttachTransition, ClientContext, ClientError,
-    Connection, ControlTransition,
+    connect, detect_context, drive_control_mode, ClientContext, Connection, ControlTransition,
 };
 use rmux_proto::request::{
-    AttachSessionExt2Request, AttachSessionExt3Request, DetachClientExtRequest, ListClientsRequest,
-    RefreshClientRequest, SuspendClientRequest, SwitchClientExt3Request,
+    AttachSessionExt2Request, DetachClientExtRequest, ListClientsRequest, RefreshClientRequest,
+    SuspendClientRequest, SwitchClientExt3Request,
 };
-#[cfg(windows)]
-use rmux_proto::CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY;
-use rmux_proto::{
-    ClientTerminalContext, ControlMode, ErrorResponse, Response, CAPABILITY_ATTACH_RENDER,
-    CAPABILITY_ATTACH_RESIZE_GEOMETRY,
-};
+use rmux_proto::{ClientTerminalContext, ControlMode, ErrorResponse, Response};
 
+use super::attach_transport::{
+    attach_with_connection, begin_queued_attach, QueuedAttachSessionResult,
+};
 use super::json_output::{list_clients_json_format, write_list_clients_json};
 use super::{
     connect_with_startserver, current_terminal_size, expect_command_success,
@@ -62,15 +50,6 @@ struct PreparedAttachSession {
     nested_toggle_read_only: bool,
 }
 
-pub(super) struct QueuedAttachSession {
-    _connection: Connection,
-}
-
-pub(super) enum QueuedAttachSessionResult {
-    Detached(Box<QueuedAttachSession>),
-    Completed(i32),
-}
-
 pub(super) fn run_attach_session(
     args: AttachSessionArgs,
     socket_path: &Path,
@@ -101,24 +80,12 @@ pub(super) fn run_attach_session_queued(
         return run_nested_attach_session_as_switch_client(prepared)
             .map(QueuedAttachSessionResult::Completed);
     }
-    if !stdin_can_attach_terminal() {
-        return Err(ExitFailure::new(1, "open terminal failed: not a terminal"));
-    }
-
     let PreparedAttachSession {
-        mut connection,
+        connection,
         request,
         ..
     } = prepared;
-    let response = connection
-        .attach_session_with_target_spec_detached(request)
-        .map_err(ExitFailure::from_client)?;
-    expect_command_success(response, "attach-session")?;
-    Ok(QueuedAttachSessionResult::Detached(Box::new(
-        QueuedAttachSession {
-            _connection: connection,
-        },
-    )))
+    begin_queued_attach(connection, request)
 }
 
 fn prepare_attach_session(
@@ -417,98 +384,6 @@ pub(super) fn run_suspend_client(
             target_client: args.target_client,
         })
     })
-}
-
-pub(super) fn attach_with_connection(
-    mut connection: Connection,
-    request: AttachSessionExt2Request,
-) -> Result<i32, ExitFailure> {
-    let attach_resize_geometry = connection
-        .supports_capability(CAPABILITY_ATTACH_RESIZE_GEOMETRY)
-        .map_err(ExitFailure::from_client)?;
-    let attach_render = connection
-        .supports_capability(CAPABILITY_ATTACH_RENDER)
-        .map_err(ExitFailure::from_client)?;
-    #[cfg(windows)]
-    let attach_windows_console_key = connection
-        .supports_capability(CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY)
-        .map_err(ExitFailure::from_client)?;
-    let mut attach_capabilities = Vec::new();
-    if attach_render {
-        attach_capabilities.push(CAPABILITY_ATTACH_RENDER.to_owned());
-    }
-    #[cfg(windows)]
-    if attach_windows_console_key {
-        attach_capabilities.push(CAPABILITY_ATTACH_WINDOWS_CONSOLE_KEY.to_owned());
-    }
-    let transition = if !attach_capabilities.is_empty() {
-        connection
-            .begin_attach_with_capabilities(AttachSessionExt3Request::from_ext2(
-                request,
-                attach_capabilities,
-            ))
-            .map_err(ExitFailure::from_client)?
-    } else {
-        connection
-            .begin_attach_with_target_spec(request)
-            .map_err(ExitFailure::from_client)?
-    };
-    match transition {
-        AttachTransition::Upgraded(upgrade) => {
-            let (stream, initial_bytes) = upgrade.into_parts();
-            #[cfg(unix)]
-            {
-                if attach_resize_geometry {
-                    attach_terminal_with_initial_bytes_and_resize_geometry(stream, initial_bytes)
-                        .map_err(attach_terminal_exit_failure)?;
-                } else {
-                    attach_terminal_with_initial_bytes(stream, initial_bytes)
-                        .map_err(attach_terminal_exit_failure)?;
-                }
-            }
-            #[cfg(windows)]
-            {
-                let _ = attach_resize_geometry;
-                attach_terminal_with_initial_bytes_and_windows_console_key(
-                    stream,
-                    initial_bytes,
-                    attach_windows_console_key,
-                )
-                .map_err(attach_terminal_exit_failure)?;
-            }
-            Ok(0)
-        }
-        AttachTransition::Rejected(response) => {
-            expect_command_success(response, "attach-session")?;
-            Ok(0)
-        }
-    }
-}
-
-fn attach_terminal_exit_failure(error: ClientError) -> ExitFailure {
-    if attach_terminal_failed_because_stdio_is_not_terminal(&error) {
-        ExitFailure::new(1, "open terminal failed: not a terminal")
-    } else {
-        ExitFailure::from_client(error)
-    }
-}
-
-fn stdin_can_attach_terminal() -> bool {
-    std::io::stdin().is_terminal()
-}
-
-#[cfg(unix)]
-fn attach_terminal_failed_because_stdio_is_not_terminal(error: &ClientError) -> bool {
-    matches!(
-        error,
-        ClientError::Attach(AttachError::Termios(errno))
-            if matches!(errno.raw_os_error(), libc::ENOTTY | libc::ENODEV)
-    )
-}
-
-#[cfg(windows)]
-fn attach_terminal_failed_because_stdio_is_not_terminal(_error: &ClientError) -> bool {
-    false
 }
 
 pub(super) fn optional_client_flags(flags: Vec<String>) -> Option<Vec<String>> {

@@ -128,6 +128,18 @@ if [ -n "$repo_gpg_key_url" ]; then
   case "$repo_gpg_key_url" in http://*|https://*) ;; *) die "--repo-gpg-key-url must be an http(s) URL" ;; esac
 fi
 
+if [ -n "$rpm_signing_key" ] && [ -n "$repo_signing_key" ]; then
+  [ "$rpm_signing_key" != "$repo_signing_key" ] || \
+    die "RPM package and repository signing keys must be distinct"
+  need gpg
+  rpm_fingerprint="$(gpg --batch --with-colons --fingerprint "$rpm_signing_key" | awk -F: '$1 == "fpr" { print $10; exit }')"
+  repo_fingerprint="$(gpg --batch --with-colons --fingerprint "$repo_signing_key" | awk -F: '$1 == "fpr" { print $10; exit }')"
+  [ -n "$rpm_fingerprint" ] || die "unable to resolve RPM package signing key fingerprint"
+  [ -n "$repo_fingerprint" ] || die "unable to resolve RPM repository signing key fingerprint"
+  [ "$rpm_fingerprint" != "$repo_fingerprint" ] || \
+    die "RPM package and repository signing keys must be distinct"
+fi
+
 repo_tool="$(createrepo_cmd)"
 input_dir="$(cd "$input_dir" && pwd)"
 output_dir="$(mkdir -p "$output_dir" && cd "$output_dir" && pwd)"

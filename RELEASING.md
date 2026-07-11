@@ -29,12 +29,14 @@ of the process, but this file defines the order and the gates.
 4. Keep outside contributor commits as their own commits when they should appear
    as contributors. Squash only project-maintainer cleanup commits that do not
    need separate attribution.
-5. Verify every commit has the intended author, committer, subject, DCO trailer,
-   and no automation attribution:
+5. Verify every commit has the intended author, committer, and subject. Preserve
+   intentional external authors. Maintainer commits use
+   `Sidney Sissaoui <shideneyu@gmail.com>` and do not add `Signed-off-by:`
+   trailers. `.mailmap` canonicalizes legacy local automation identity:
 
    ```sh
-   git log --format=fuller origin/main..HEAD
-   git log --format='%H%n%an <%ae>%n%cn <%ce>%n%s%n%b' origin/main..HEAD
+   git log --use-mailmap --format=fuller origin/main..HEAD
+   git log --use-mailmap --format='%H%n%aN <%aE>%n%cN <%cE>%n%s%n%b' origin/main..HEAD
    ```
 
 6. Review all changed files before any tag is created:
@@ -102,23 +104,20 @@ scripts/no-debug-assert-side-effects.sh
 RMUX_PERF_AUTO_CURRENT=1 scripts/release-review-gate.sh
 ```
 
-The perf comparator is enforced only on the machine that recorded the
-committed baseline: baselines and current runs carry a hashed
-`host_fingerprint` (from `/etc/machine-id` or the hostname, never stored in
-clear), and the gate compares timings only when the fingerprints match. Any
-other host — GitHub hosted runners included — reports an explicit
-`perf-comparator=skipped-host-mismatch` line (a `::warning::` annotation in
-CI) instead of failing on cross-machine noise or silently passing on it.
+The release workflow enforces portable absolute budgets on every runner. Owner
+machines may additionally compare against their committed same-host baseline;
+baselines and current runs carry a hashed `host_fingerprint` (from
+`/etc/machine-id` or the hostname, never stored in clear).
 Darwin uses `benches/perf/baselines/release-0.9.0.json`; Linux requires
 `benches/perf/baselines/release-0.9.0-linux.json` recorded with
 `scripts/perf-baseline.sh` on the Linux release machine before the release
 gate can pass there, and a Linux baseline without a fingerprint fails closed.
-Platforms without a committed same-class baseline report
-`perf-comparator=skipped-no-<platform>-baseline`. Before tagging, the perf
-gate must have run green on each release machine that owns a baseline. The Windows
-ctrl-matrix portable smoke likewise cannot run in a
-non-interactive CI session: CI reports an explicit skip warning and the
-smoke must be run manually on an interactive Windows session before tagging.
+Before tagging, the perf gate must have run green on each release machine that
+owns a baseline. The Windows x86_64 release matrix requires a logged-on,
+interactive self-hosted runner carrying the labels `self-hosted`, `Windows`,
+`X64`, and `rmux-windows-interactive`. That job builds, Ctrl-tests, and packages
+the same SHA-256-bound binaries; hosted session-0 evidence and evidence copied
+from another build are not accepted.
 
 If release packaging, Web Share, or the site changed, also run the matching
 package and WASM provenance gates before tagging. For the WebSocket fuzz target,

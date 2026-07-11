@@ -9,6 +9,8 @@ use rmux_proto::{PaneTarget, RmuxError, SourceFileRequest};
 use super::aggregate_rmux_errors;
 
 const MAX_SOURCE_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
+pub(super) const MAX_SOURCE_MATCHED_FILES: usize = 256;
+pub(super) const MAX_SOURCE_AGGREGATE_BYTES: usize = 32 * 1024 * 1024;
 const DISABLE_TMUX_FALLBACK_ENV: &str = "RMUX_DISABLE_TMUX_FALLBACK";
 
 #[derive(Debug, Default)]
@@ -73,6 +75,8 @@ pub(super) struct SourceInput {
 pub(super) struct SourcePathRead {
     pub(super) inputs: Vec<SourceInput>,
     pub(super) error: Option<RmuxError>,
+    pub(super) matched_files: usize,
+    pub(super) content_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,6 +354,8 @@ pub(super) fn source_inputs_for_path_with_diagnostics(
                 contents: String::new(),
             }],
             error: None,
+            matched_files: 1,
+            content_bytes: 0,
         });
     }
 
@@ -361,6 +367,8 @@ pub(super) fn source_inputs_for_path_with_diagnostics(
                 contents: String::new(),
             }],
             error: None,
+            matched_files: 1,
+            content_bytes: 0,
         });
     }
 
@@ -370,40 +378,45 @@ pub(super) fn source_inputs_for_path_with_diagnostics(
                 "source-file - requires client stdin".to_owned(),
             ));
         };
+        reserve_source_contents(0, stdin.len(), path)?;
         return Ok(SourcePathRead {
             inputs: vec![SourceInput {
                 current_file: "-".to_owned(),
                 contents: stdin.to_owned(),
             }],
             error: None,
+            matched_files: 1,
+            content_bytes: stdin.len(),
         });
     }
 
     let pattern = glob_pattern_for_source_path(path, cwd);
     let has_glob_metachars = source_path_has_glob_metachars(path);
-    let entries = glob::glob(&pattern)
-        .map_err(|error| RmuxError::Server(format!("invalid source-file glob '{path}': {error}")))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| RmuxError::Server(format!("source-file glob failed: {error}")))?;
-
-    if entries.is_empty() {
-        if quiet {
-            return Ok(SourcePathRead {
-                inputs: Vec::new(),
-                error: None,
-            });
-        }
-        return Err(no_such_source_file(path));
-    }
+    let entries = glob::glob(&pattern).map_err(|error| {
+        RmuxError::Server(format!("invalid source-file glob '{path}': {error}"))
+    })?;
 
     let mut inputs = Vec::new();
     let mut errors = Vec::new();
+    let mut matched_files = 0_usize;
+    let mut aggregate_bytes = 0_usize;
     for entry in entries {
+        let entry = entry
+            .map_err(|error| RmuxError::Server(format!("source-file glob failed: {error}")))?;
+        matched_files = matched_files.saturating_add(1);
+        if matched_files > MAX_SOURCE_MATCHED_FILES {
+            return Err(RmuxError::Server(format!(
+                "source-file glob '{path}' matched too many files (maximum {MAX_SOURCE_MATCHED_FILES})"
+            )));
+        }
         match read_source_entry(&entry, read_policy) {
-            Ok(contents) => inputs.push(SourceInput {
-                current_file: source_entry_display_path(&entry),
-                contents,
-            }),
+            Ok(contents) => {
+                aggregate_bytes = reserve_source_contents(aggregate_bytes, contents.len(), path)?;
+                inputs.push(SourceInput {
+                    current_file: source_entry_display_path(&entry),
+                    contents,
+                });
+            }
             Err(error) if quiet && error.kind() == io::ErrorKind::NotFound => {}
             Err(_) if read_policy == SourceReadPolicy::BestEffort => {}
             Err(error) if has_glob_metachars => {
@@ -415,10 +428,38 @@ pub(super) fn source_inputs_for_path_with_diagnostics(
         }
     }
 
+    if matched_files == 0 {
+        if quiet {
+            return Ok(SourcePathRead {
+                inputs: Vec::new(),
+                error: None,
+                matched_files: 0,
+                content_bytes: 0,
+            });
+        }
+        return Err(no_such_source_file(path));
+    }
+
     Ok(SourcePathRead {
         inputs,
         error: aggregate_rmux_errors(errors),
+        matched_files,
+        content_bytes: aggregate_bytes,
     })
+}
+
+fn reserve_source_contents(
+    current: usize,
+    additional: usize,
+    path: &str,
+) -> Result<usize, RmuxError> {
+    let next = current.saturating_add(additional);
+    if next > MAX_SOURCE_AGGREGATE_BYTES {
+        return Err(RmuxError::Server(format!(
+            "source-file input '{path}' exceeds {MAX_SOURCE_AGGREGATE_BYTES} aggregate bytes"
+        )));
+    }
+    Ok(next)
 }
 
 fn source_path_has_glob_metachars(path: &str) -> bool {
@@ -840,6 +881,42 @@ mod tests {
             error.to_string().contains("Input/output error"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn source_file_glob_rejects_excessive_match_count() {
+        let root = temp_source_path("glob-match-limit");
+        std::fs::create_dir(&root).expect("create glob match root");
+        for index in 0..=super::MAX_SOURCE_MATCHED_FILES {
+            std::fs::write(root.join(format!("{index:04}.conf")), b"").expect("write glob match");
+        }
+
+        let error = source_inputs_for_path(
+            &format!("{}/*.conf", root.to_string_lossy()),
+            None,
+            false,
+            None,
+            SourceReadPolicy::Strict,
+        )
+        .expect_err("glob match count beyond the cap must fail");
+        std::fs::remove_dir_all(&root).expect("remove glob match root");
+
+        assert!(
+            error.to_string().contains("matched too many files"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn source_file_aggregate_content_limit_fails_before_retention() {
+        assert_eq!(
+            super::reserve_source_contents(super::MAX_SOURCE_AGGREGATE_BYTES - 1, 1, "*.conf")
+                .expect("exact aggregate limit is accepted"),
+            super::MAX_SOURCE_AGGREGATE_BYTES
+        );
+        let error = super::reserve_source_contents(super::MAX_SOURCE_AGGREGATE_BYTES, 1, "*.conf")
+            .expect_err("aggregate content over the cap must fail");
+        assert!(error.to_string().contains("aggregate bytes"), "{error}");
     }
 
     #[cfg(unix)]

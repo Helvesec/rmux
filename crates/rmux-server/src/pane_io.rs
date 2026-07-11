@@ -1,4 +1,6 @@
 #[cfg(any(unix, windows))]
+use rmux_core::TerminalPassthrough;
+#[cfg(any(unix, windows))]
 use rmux_proto::{AttachFrameDecoder, AttachMessage};
 #[cfg(any(unix, windows))]
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
@@ -16,6 +18,8 @@ use tokio::time::{Duration, Instant};
 const READ_BUFFER_SIZE: usize = 64 * 1024;
 #[cfg(any(unix, windows))]
 const ATTACH_INTERACTIVE_OUTPUT_WINDOW: Duration = Duration::from_millis(250);
+#[cfg(windows)]
+const ATTACH_EXIT_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(any(unix, windows))]
 const ATTACH_INPUT_STACK_PAYLOAD: usize = 1024;
 #[cfg(unix)]
@@ -197,6 +201,13 @@ pub(crate) async fn forward_attach(
             .await?
             {
                 PendingAttachAction::Exit(reason) => {
+                    finish_pending_attach_exit(
+                        reason,
+                        &stream,
+                        &mut current_target,
+                        &mut deferred_passthroughs,
+                    )
+                    .await?;
                     log_attach_exit(&live_input, &current_target, reason);
                     return Ok(());
                 }
@@ -310,6 +321,13 @@ pub(crate) async fn forward_attach(
             .await?
             {
                 PendingAttachAction::Exit(reason) => {
+                    finish_pending_attach_exit(
+                        reason,
+                        &stream,
+                        &mut current_target,
+                        &mut deferred_passthroughs,
+                    )
+                    .await?;
                     log_attach_exit(&live_input, &current_target, reason);
                     return Ok(());
                 }
@@ -394,6 +412,13 @@ pub(crate) async fn forward_attach(
                             .await?
                             {
                                 PendingAttachAction::Exit(reason) => {
+                                    finish_pending_attach_exit(
+                                        reason,
+                                        &stream,
+                                        &mut current_target,
+                                        &mut deferred_passthroughs,
+                                    )
+                                    .await?;
                                     log_attach_exit(&live_input, &current_target, reason);
                                     return Ok(());
                                 }
@@ -459,6 +484,13 @@ pub(crate) async fn forward_attach(
                     .await?
                     {
                         PendingAttachAction::Exit(reason) => {
+                            finish_pending_attach_exit(
+                                reason,
+                                &stream,
+                                &mut current_target,
+                                &mut deferred_passthroughs,
+                            )
+                            .await?;
                             log_attach_exit(&live_input, &current_target, reason);
                             return Ok(());
                         }
@@ -624,6 +656,13 @@ pub(crate) async fn forward_attach(
                     .await?
                     {
                         PendingAttachAction::Exit(reason) => {
+                            finish_pending_attach_exit(
+                                reason,
+                                &stream,
+                                &mut current_target,
+                                &mut deferred_passthroughs,
+                            )
+                            .await?;
                             log_attach_exit(&live_input, &current_target, reason);
                             return Ok(());
                         }
@@ -742,12 +781,18 @@ pub(crate) async fn forward_attach(
                             return Ok(());
                         }
                         Some(AttachControl::Exited) => {
+                            finish_pending_attach_exit(
+                                AttachExitReason::AttachControlExited,
+                                &stream,
+                                &mut current_target,
+                                &mut deferred_passthroughs,
+                            )
+                            .await?;
                             log_attach_exit(
                                 &live_input,
                                 &current_target,
                                 AttachExitReason::AttachControlExited,
                             );
-                            let _ = emit_exited_attach_stop(&stream, &current_target).await;
                             return Ok(());
                         }
                         Some(AttachControl::DetachKill) => {
@@ -1068,6 +1113,13 @@ pub(crate) async fn forward_attach(
                     .await?
                     {
                         PendingAttachAction::Exit(reason) => {
+                            finish_pending_attach_exit(
+                                reason,
+                                &stream,
+                                &mut current_target,
+                                &mut deferred_passthroughs,
+                            )
+                            .await?;
                             log_attach_exit(&live_input, &current_target, reason);
                             return Ok(());
                         }
@@ -1259,6 +1311,111 @@ fn log_attach_exit(
     reason: AttachExitReason,
 ) {
     record_attach_exit(live_input.attach_pid, &current_target.session_name, reason);
+}
+
+#[cfg(any(unix, windows))]
+async fn finish_pending_attach_exit(
+    reason: AttachExitReason,
+    stream: &AttachTransport,
+    current_target: &mut types::OpenAttachTarget,
+    deferred_passthroughs: &mut Vec<TerminalPassthrough>,
+) -> io::Result<()> {
+    if reason != AttachExitReason::AttachControlExited {
+        return Ok(());
+    }
+
+    let mut output_bytes = Vec::new();
+    let mut passthroughs = Vec::new();
+    let mut saw_gap = false;
+    if let Some(mut pane_output) = current_target.pane_output.take() {
+        #[cfg(not(windows))]
+        while let Some(item) = pane_output.try_recv() {
+            if collect_final_attach_output_item(
+                item,
+                &mut pane_output,
+                &mut output_bytes,
+                &mut passthroughs,
+                &mut saw_gap,
+            ) {
+                break;
+            }
+        }
+        #[cfg(windows)]
+        {
+            let deadline = Instant::now() + ATTACH_EXIT_OUTPUT_DRAIN_TIMEOUT;
+            loop {
+                let item = match pane_output.try_recv() {
+                    Some(item) => item,
+                    None => match tokio::time::timeout_at(deadline, pane_output.recv()).await {
+                        Ok(item) => item,
+                        Err(_) => break,
+                    },
+                };
+                if collect_final_attach_output_item(
+                    item,
+                    &mut pane_output,
+                    &mut output_bytes,
+                    &mut passthroughs,
+                    &mut saw_gap,
+                ) {
+                    break;
+                }
+            }
+        }
+    }
+
+    let output_forwarded = !output_bytes.is_empty()
+        && try_forward_plain_output(stream, current_target, &output_bytes).await?;
+    let require_final_render = saw_gap || (!output_bytes.is_empty() && !output_forwarded);
+    if require_final_render {
+        match current_target
+            .live_pane
+            .as_mut()
+            .map(|pane| pane.render_frame_from_transcript(true))
+        {
+            Some(PaneRenderDelta::Incremental(frame)) => {
+                emit_live_render_frame(stream, current_target, &frame, false).await?;
+            }
+            Some(PaneRenderDelta::RequiresFullRefresh) | None => {
+                emit_attach_bytes(stream, &output_bytes).await?;
+            }
+        }
+    }
+
+    let passthrough_frame = take_passthrough_frame_with_live_passthroughs(
+        current_target,
+        deferred_passthroughs,
+        passthroughs,
+    );
+    emit_attach_bytes(stream, &passthrough_frame).await?;
+    emit_exited_attach_stop(stream, current_target).await
+}
+
+#[cfg(any(unix, windows))]
+fn collect_final_attach_output_item(
+    item: rmux_core::events::OutputCursorItem,
+    pane_output: &mut types::PaneOutputReceiver,
+    output_bytes: &mut Vec<u8>,
+    passthroughs: &mut Vec<TerminalPassthrough>,
+    saw_gap: &mut bool,
+) -> bool {
+    match collect_attach_output_batch(item, Some(pane_output)) {
+        AttachOutputBatch::Closed => true,
+        AttachOutputBatch::Gap => {
+            *saw_gap = true;
+            false
+        }
+        AttachOutputBatch::Events {
+            bytes,
+            passthroughs: batch_passthroughs,
+            close_after_render,
+            sustained: _,
+        } => {
+            output_bytes.extend_from_slice(&bytes);
+            passthroughs.extend(batch_passthroughs);
+            close_after_render
+        }
+    }
 }
 
 #[cfg(any(unix, windows))]

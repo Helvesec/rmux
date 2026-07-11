@@ -1,45 +1,46 @@
 use std::sync::{Condvar, Mutex};
 
 #[derive(Debug, Default)]
-pub(super) struct AttachLockState {
+pub(crate) struct AttachLockState {
     inner: Mutex<State>,
     changed: Condvar,
 }
 
 impl AttachLockState {
-    pub(super) fn lock(&self) {
+    pub(crate) fn lock(&self) {
         let mut state = self.inner.lock().expect("attach lock state poisoned");
         state.locked = true;
         self.changed.notify_all();
     }
 
-    pub(super) fn unlock(&self) {
+    pub(crate) fn unlock(&self) {
         let mut state = self.inner.lock().expect("attach lock state poisoned");
         state.locked = false;
         self.changed.notify_all();
     }
 
-    pub(super) fn close(&self) {
+    pub(crate) fn close(&self) {
         let mut state = self.inner.lock().expect("attach lock state poisoned");
         state.closed = true;
         self.changed.notify_all();
     }
 
-    pub(super) fn is_locked(&self) -> bool {
+    pub(crate) fn is_locked(&self) -> bool {
         self.inner
             .lock()
             .expect("attach lock state poisoned")
             .locked
     }
 
-    pub(super) fn is_closed(&self) -> bool {
+    #[cfg(windows)]
+    pub(crate) fn is_closed(&self) -> bool {
         self.inner
             .lock()
             .expect("attach lock state poisoned")
             .closed
     }
 
-    pub(super) fn begin_input_read(&self) -> bool {
+    pub(crate) fn begin_input_read(&self) -> bool {
         let mut state = self.inner.lock().expect("attach lock state poisoned");
         if state.closed || state.locked {
             return false;
@@ -48,13 +49,13 @@ impl AttachLockState {
         true
     }
 
-    pub(super) fn finish_input_read(&self) {
+    pub(crate) fn finish_input_read(&self) {
         let mut state = self.inner.lock().expect("attach lock state poisoned");
         state.input_read_active = false;
         self.changed.notify_all();
     }
 
-    pub(super) fn wait_until_input_idle(&self) {
+    pub(crate) fn wait_until_input_idle(&self) {
         let mut state = self.inner.lock().expect("attach lock state poisoned");
         while state.input_read_active && !state.closed {
             state = self
@@ -64,7 +65,8 @@ impl AttachLockState {
         }
     }
 
-    pub(super) fn wait_while_locked(&self) {
+    #[cfg(windows)]
+    pub(crate) fn wait_while_locked(&self) {
         let mut state = self.inner.lock().expect("attach lock state poisoned");
         while state.locked && !state.closed {
             state = self
@@ -74,7 +76,8 @@ impl AttachLockState {
         }
     }
 
-    pub(super) fn wait_until_closed(&self) {
+    #[cfg(windows)]
+    pub(crate) fn wait_until_closed(&self) {
         let mut state = self.inner.lock().expect("attach lock state poisoned");
         while !state.closed {
             state = self

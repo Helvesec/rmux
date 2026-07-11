@@ -892,16 +892,22 @@ impl RequestHandler {
         &self,
         request: rmux_proto::RenameSessionRequest,
     ) -> Response {
-        let session_name = {
+        let (session_name, session_id) = {
             let state = self.state.lock().await;
-            match resolve_existing_session_target(
+            let session_name = match resolve_existing_session_target(
                 &state.sessions,
                 "rename-session",
                 &request.target,
             ) {
                 Ok(session_name) => session_name,
                 Err(error) => return Response::Error(ErrorResponse { error }),
-            }
+            };
+            let session_id = state
+                .sessions
+                .session(&session_name)
+                .expect("resolved session must exist")
+                .id();
+            (session_name, session_id)
         };
         let new_name = request.new_name;
         if session_name == new_name {
@@ -918,6 +924,7 @@ impl RequestHandler {
 
             match state.rename_session(&session_name, &new_name) {
                 Ok(()) => {
+                    self.rekey_web_session(&session_name, &new_name, session_id);
                     let mut active_attach = self.active_attach.lock().await;
                     active_attach.rename_session(&session_name, &new_name);
                     drop(active_attach);

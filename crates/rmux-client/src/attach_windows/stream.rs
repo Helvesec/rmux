@@ -29,12 +29,11 @@ use windows_sys::Win32::System::Threading::{
 use crate::ClientError;
 
 use super::action::{AttachAction, AttachActionOutcome};
-use super::lock_state::AttachLockState;
 use super::metrics::AttachMetricsRecorder;
-use super::screen::{
-    contains_subslice, AttachScreenTracker, AttachStopDetector, ALT_SCREEN_EXIT_FALLBACK,
-    DETACHED_BANNER_PREFIX, EXITED_BANNER,
-};
+use super::screen::{AttachScreenTracker, AttachStopDetector};
+#[cfg(test)]
+use super::screen::{ALT_SCREEN_EXIT_FALLBACK, DETACHED_BANNER_PREFIX, EXITED_BANNER};
+use crate::attach_lock_state::AttachLockState;
 
 const ATTACH_OUTPUT_QUEUE_CAPACITY: usize = 64;
 const ATTACH_OUTPUT_PENDING_MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -114,7 +113,6 @@ where
             &mut decoder,
             &mut output,
             DrainContext {
-                screen_tracker: &screen_tracker,
                 stop_detector: &mut stop_detector,
                 mouse_tracker: &mut mouse_tracker,
                 action_tx: &action_tx,
@@ -256,7 +254,6 @@ fn drain_attach_messages(
     context: DrainContext<'_>,
 ) -> std::result::Result<(), ClientError> {
     let DrainContext {
-        screen_tracker,
         stop_detector,
         mouse_tracker,
         action_tx,
@@ -268,12 +265,6 @@ fn drain_attach_messages(
         match message {
             AttachMessage::Data(bytes) => {
                 metrics.observe_data_frame(&bytes);
-                if contains_subslice(&bytes, ALT_SCREEN_EXIT_FALLBACK)
-                    || contains_subslice(&bytes, DETACHED_BANNER_PREFIX)
-                    || contains_subslice(&bytes, EXITED_BANNER)
-                {
-                    screen_tracker.mark_stopped();
-                }
                 stop_detector.observe(&bytes);
                 if let Some(enabled) = mouse_tracker.observe(&bytes) {
                     send_attach_action(action_tx, AttachAction::MouseInputEnabled(enabled))?;
@@ -285,12 +276,6 @@ fn drain_attach_messages(
             }
             AttachMessage::Render(bytes) => {
                 metrics.observe_data_frame(&bytes);
-                if contains_subslice(&bytes, ALT_SCREEN_EXIT_FALLBACK)
-                    || contains_subslice(&bytes, DETACHED_BANNER_PREFIX)
-                    || contains_subslice(&bytes, EXITED_BANNER)
-                {
-                    screen_tracker.mark_stopped();
-                }
                 stop_detector.observe(&bytes);
                 if let Some(enabled) = mouse_tracker.observe(&bytes) {
                     send_attach_action(action_tx, AttachAction::MouseInputEnabled(enabled))?;
@@ -1081,7 +1066,6 @@ impl AttachAsyncChannels {
 }
 
 struct DrainContext<'context> {
-    screen_tracker: &'context AttachScreenTracker,
     stop_detector: &'context mut AttachStopDetector,
     mouse_tracker: &'context mut WindowsConsoleMouseTracker,
     action_tx: &'context std_mpsc::Sender<AttachAction>,

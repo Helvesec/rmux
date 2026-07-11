@@ -103,7 +103,7 @@ fn windows_release_gate_runs_ctrl_matrix_and_nonempty_cargo_filters() {
         r#"Run "./scripts/assert-cargo-filter-nonempty.ps1" @("1", "--", "test", "-p", "rmux", "--locked", "--test", "windows_cli_queue_formats")"#,
         r#"Run "./scripts/windows_ctrl_matrix.ps1" $ctrlArgs"#,
         r#""-ExpectedGitSha", $env:RMUX_EXPECTED_GIT_SHA"#,
-        "RMUX_WINDOWS_CTRL_MATRIX_EVIDENCE_JSON",
+        "rmux-windows-interactive",
         "portable-smoke.evidence.json",
         "rmux-windows-release-binaries",
         "-ReuseReleaseBinaries",
@@ -117,6 +117,7 @@ fn windows_release_gate_runs_ctrl_matrix_and_nonempty_cargo_filters() {
             "Windows release workflow lost required Lot 7 gate snippet {required:?}"
         );
     }
+    assert!(!workflow.contains("RMUX_WINDOWS_CTRL_MATRIX_EVIDENCE_JSON"));
 
     assert!(
         gate.contains("assert-cargo-filter-nonempty.ps1")

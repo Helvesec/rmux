@@ -132,6 +132,69 @@ fn queued_attach_session_runs_intermediate_commands_before_detach() -> TestResul
 }
 
 #[test]
+fn queued_detach_all_other_clients_keeps_requester_attached() -> TestResult<()> {
+    let harness = CliHarness::new("queued-attach-detach-others")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+
+    let mut attach = AttachedSession::spawn_command(
+        &harness,
+        &["attach-session", "-t", "alpha", ";", "detach-client", "-a"],
+        TerminalSize::new(80, 24),
+    )?;
+
+    attach.wait_for_raw_mode(IO_TIMEOUT)?;
+    let _ = read_until_contains(attach.master_mut(), "[alpha]", IO_TIMEOUT)?;
+    assert!(
+        attach.child_mut().try_wait()?.is_none(),
+        "detach-client -a must preserve the queued attach requester"
+    );
+    attach.send_bytes(b"\x02d")?;
+    assert!(attach.wait_for_exit(IO_TIMEOUT)?.success());
+    Ok(())
+}
+
+#[test]
+fn queued_targeted_detach_of_another_client_keeps_requester_attached() -> TestResult<()> {
+    let harness = CliHarness::new("queued-attach-detach-other-target")?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let mut other = AttachedSession::spawn_command(
+        &harness,
+        &["attach-session", "-t", "alpha"],
+        TerminalSize::new(80, 24),
+    )?;
+    other.wait_for_raw_mode(IO_TIMEOUT)?;
+    let other_pid = other.child_mut().id().to_string();
+
+    let mut requester = AttachedSession::spawn_command(
+        &harness,
+        &[
+            "attach-session",
+            "-t",
+            "alpha",
+            ";",
+            "detach-client",
+            "-t",
+            &other_pid,
+        ],
+        TerminalSize::new(80, 24),
+    )?;
+
+    requester.wait_for_raw_mode(IO_TIMEOUT)?;
+    let _ = read_until_contains(requester.master_mut(), "[alpha]", IO_TIMEOUT)?;
+    assert!(
+        requester.child_mut().try_wait()?.is_none(),
+        "targeting another client must not discard the queued requester upgrade"
+    );
+    assert!(
+        other.wait_for_exit(IO_TIMEOUT)?.success(),
+        "the explicitly targeted client should detach"
+    );
+    requester.send_bytes(b"\x02d")?;
+    assert!(requester.wait_for_exit(IO_TIMEOUT)?.success());
+    Ok(())
+}
+
+#[test]
 fn queued_attach_session_kill_server_stops_attached_server() -> TestResult<()> {
     let harness = CliHarness::new("queued-attach-kill-server")?;
     assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
