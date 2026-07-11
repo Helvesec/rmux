@@ -11,8 +11,9 @@ use std::time::Duration;
 
 use rmux_proto::{
     encode_frame, ClearHistoryRequest, FrameDecoder, HasSessionRequest, KillPaneRequest,
-    LinkWindowRequest, ListPanesRequest, NewWindowRequest, PaneTarget, Request,
-    ResizeWindowRequest, Response, SendKeysRequest, WindowTarget,
+    LinkWindowRequest, ListPanesRequest, NewWindowRequest, OptionName, PaneTarget, Request,
+    ResizeWindowRequest, Response, ScopeSelector, SendKeysRequest, SetOptionMode, SetOptionRequest,
+    WindowTarget,
 };
 use rmux_sdk::{EnsureSession, PaneProcessState, PaneRef, PaneSnapshot, RmuxBuilder, SessionName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -101,6 +102,94 @@ async fn pane_id_info_and_snapshot_resolve_through_daemon_for_live_and_stale_slo
         unknown_session_pane.snapshot().await?,
         PaneSnapshot::default()
     );
+
+    harness.finish().await
+}
+
+// Regression guard for the by-slot index mismatch under a non-zero base-index: an
+// index/slot handle (`session.pane(w, p)`) must resolve the real live pane even
+// when the daemon runs with a non-zero `base-index`/`pane-base-index`, instead of
+// silently degrading to a blank `PaneSnapshot::default()` (revision 0). Before the
+// fix, a slot handle snapshot went to the by-slot endpoint, which resolves
+// `PaneTarget.pane_index` as a *raw* pane index. Under pane-base-index 1 the live
+// pane's visible index (1) differs from its raw index (0), so the by-slot lookup
+// missed and the snapshot degraded to the blank stale default, while the by-id
+// discovery path (which maps the stable pane id back to the raw index inside the
+// daemon) returned real content.
+#[tokio::test]
+async fn index_pane_handle_resolves_live_pane_under_nonzero_base_index() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("pane-base-index").await?;
+    let rmux = harness.rmux();
+
+    // Set base-index/pane-base-index globally *before* creating the session so the
+    // session's sole window is keyed at daemon index 1 and its pane is reported at
+    // pane index 1 (base-adjusted), exactly the environment that triggered the bug.
+    raw_set_global_option(harness.socket_path(), OptionName::BaseIndex, "1").await?;
+    raw_set_global_option(harness.socket_path(), OptionName::PaneBaseIndex, "1").await?;
+
+    let alpha = session_name("sdkpanebaseidx");
+    let session = EnsureSession::named(alpha.clone())
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+
+    // The by-id discovery path has always resolved correctly (it matches on the
+    // base-index-independent stable pane id). Use it as the source of truth for the
+    // live pane's identity and content.
+    let by_id = rmux.find_panes().session(alpha.as_str()).one().await?;
+    let by_id_id = by_id.id().await?.expect("discovered pane is listed");
+    let by_id_snapshot = by_id.snapshot().await?;
+    assert_ne!(
+        by_id_snapshot.revision, 0,
+        "by-id handle must observe the live pane"
+    );
+
+    // The literal daemon-reported indices under base-index 1 / pane-base-index 1.
+    let by_slot = session.pane(1, 1);
+    assert_eq!(by_slot.target(), &PaneRef::new(alpha.clone(), 1, 1));
+
+    let by_slot_id = by_slot
+        .id()
+        .await?
+        .expect("index handle must resolve the live pane under non-zero base-index");
+    assert_eq!(
+        by_slot_id, by_id_id,
+        "the index/slot handle must resolve to the same live pane as the by-id path"
+    );
+
+    let by_slot_snapshot = by_slot.snapshot().await?;
+    assert_ne!(
+        by_slot_snapshot.revision, 0,
+        "index handle snapshot must not be the blank stale-slot default"
+    );
+    assert_eq!(
+        (by_slot_snapshot.cols, by_slot_snapshot.rows),
+        (by_id_snapshot.cols, by_id_snapshot.rows),
+        "index and by-id snapshots must describe the same live pane grid"
+    );
+    assert_eq!(
+        by_slot_snapshot.visible_text(),
+        by_id_snapshot.visible_text(),
+        "the index/slot snapshot content must match the by-id snapshot for the same pane"
+    );
+
+    // *Literal* index semantics are preserved (tmux-like): under base-index 1 no
+    // window is keyed at literal index 0, so `pane(0, 0)` genuinely addresses an
+    // absent slot and must still yield the documented stale default. The fix
+    // resolves real panes at their base-adjusted indices; it does not reinterpret
+    // `(0, 0)` as "first window / first pane".
+    let literal_absent = session.pane(0, 0);
+    assert_eq!(literal_absent.id().await?, None);
+    assert_eq!(literal_absent.snapshot().await?, PaneSnapshot::default());
+    assert_eq!(literal_absent.snapshot().await?.revision, 0);
+
+    // A genuinely-absent slot must still yield the documented stale default,
+    // protecting the contract exercised by the stale-slot assertions above.
+    let genuinely_absent = session.pane(9, 9);
+    assert_eq!(genuinely_absent.id().await?, None);
+    assert_eq!(genuinely_absent.snapshot().await?, PaneSnapshot::default());
+    assert_eq!(genuinely_absent.snapshot().await?.revision, 0);
 
     harness.finish().await
 }
@@ -400,6 +489,23 @@ async fn raw_first_pane_id(
                 .ok_or_else(|| "list-panes returned no rows".into())
         }
         response => Err(format!("unexpected list-panes response: {response:?}").into()),
+    }
+}
+
+async fn raw_set_global_option(socket_path: &Path, option: OptionName, value: &str) -> TestResult {
+    match framed_request(
+        socket_path,
+        Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option,
+            value: value.to_owned(),
+            mode: SetOptionMode::Replace,
+        }),
+    )
+    .await?
+    {
+        Response::SetOption(_) => Ok(()),
+        response => Err(format!("unexpected set-option response: {response:?}").into()),
     }
 }
 
