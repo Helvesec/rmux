@@ -488,7 +488,13 @@ async fn expect_visible_text_timeout_includes_last_snapshot() -> TestResult {
                     }))
                     .await?;
                 }
-                Request::PaneSnapshot(_) => {
+                Request::Handshake(_) => {
+                    peer.write_response(Response::Handshake(
+                        rmux_proto::HandshakeResponse::current(),
+                    ))
+                    .await?;
+                }
+                Request::PaneSnapshotRef(_) => {
                     peer.write_response(Response::PaneSnapshot(snapshot_response(
                         "last visible screen",
                         7,
@@ -651,11 +657,21 @@ async fn expect_list_panes(peer: &mut Peer) -> TestResult {
 }
 
 async fn expect_snapshot(peer: &mut Peer, text: &str, revision: u64) -> TestResult {
-    let request = peer.expect_request().await?;
-    let Request::PaneSnapshot(request) = request else {
-        panic!("snapshot wait must capture pane text, got {request:?}");
+    // Slot snapshots probe capabilities once per transport and then route
+    // through the pane id resolved by the preceding list (issue #94).
+    let mut request = peer.expect_request().await?;
+    if matches!(request, Request::Handshake(_)) {
+        peer.write_response(Response::Handshake(rmux_proto::HandshakeResponse::current()))
+            .await?;
+        request = peer.expect_request().await?;
+    }
+    let Request::PaneSnapshotRef(request) = request else {
+        panic!("snapshot wait must capture pane text by id, got {request:?}");
     };
-    assert_eq!(request.target, target().to_proto());
+    assert_eq!(
+        request.target,
+        rmux_proto::PaneTargetRef::by_id(session_name(), rmux_proto::PaneId::new(1)),
+    );
 
     peer.write_response(Response::PaneSnapshot(snapshot_response(text, revision)))
         .await

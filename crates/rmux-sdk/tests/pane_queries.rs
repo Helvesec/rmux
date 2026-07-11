@@ -762,3 +762,125 @@ fn compact_label(label: &str) -> String {
         compact
     }
 }
+
+#[tokio::test]
+async fn issue_94_reporter_flow_slot_snapshot_sees_live_content() -> TestResult {
+    // Exact reporter flow from issue #94: CreateOrReuse detached session with
+    // an explicit size, working directory, and a shell that produces output;
+    // then a fresh session handle and an index-based pane handle. The slot
+    // snapshot must expose the live pane like by-id resolution does, not the
+    // stale-slot default.
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("issue94-reporter-flow").await?;
+    let rmux = harness.rmux();
+    let name = session_name("sdkissue94");
+    EnsureSession::named(name.clone())
+        .policy(rmux_sdk::EnsureSessionPolicy::CreateOrReuse)
+        .detached(true)
+        .size(rmux_sdk::TerminalSizeSpec::new(500, 50))
+        .working_directory("/tmp")
+        .shell("printf 'ISSUE94_CONTENT\\n'; exec sh")
+        .ensure(&rmux)
+        .await?;
+
+    let session = rmux.session(name.clone()).await?;
+    let by_id = rmux.find_panes().session(name.clone()).one().await?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let snap = by_id.snapshot().await?;
+        if snap.visible_text().contains("ISSUE94_CONTENT") {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("pane never showed ISSUE94_CONTENT via by-id".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let slot_pane = session.pane(0, 0);
+    assert!(
+        slot_pane.exists().await?,
+        "slot handle (0, 0) must resolve the live pane"
+    );
+    let snap = slot_pane.snapshot().await?;
+    assert!(
+        snap.revision >= 1,
+        "slot snapshot must be live, got revision {}",
+        snap.revision
+    );
+    assert!(
+        snap.visible_text().contains("ISSUE94_CONTENT"),
+        "slot snapshot must expose the live content"
+    );
+
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn issue_94_slot_handles_resolve_visible_indexes_under_base_index_one() -> TestResult {
+    // Recon companion for issue #94: with base-index 1 and pane-base-index 1,
+    // the user-facing slot coordinates are the visible ones — session.pane(1, 1)
+    // must resolve the live pane and session.pane(0, 0) must not exist.
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("issue94-base-index-one").await?;
+    let rmux = harness.rmux();
+    for (name, value, scope) in [
+        (
+            "base-index",
+            "1",
+            rmux_proto::OptionScopeSelector::SessionGlobal,
+        ),
+        (
+            "pane-base-index",
+            "1",
+            rmux_proto::OptionScopeSelector::WindowGlobal,
+        ),
+    ] {
+        match framed_request(
+            harness.socket_path(),
+            Request::SetOptionByName(Box::new(rmux_proto::SetOptionByNameRequest {
+                scope,
+                name: (*name).to_owned(),
+                value: Some((*value).to_owned()),
+                mode: rmux_proto::SetOptionMode::Replace,
+                only_if_unset: false,
+                unset: false,
+                unset_pane_overrides: false,
+                format: false,
+                format_target: None,
+            })),
+        )
+        .await?
+        {
+            Response::SetOptionByName(_) => {}
+            response => return Err(format!("set {name} failed: {response:?}").into()),
+        }
+    }
+
+    let name = session_name("sdkissue94base");
+    EnsureSession::named(name.clone())
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+    let session = rmux.session(name.clone()).await?;
+
+    let visible = session.pane(1, 1);
+    assert!(
+        visible.exists().await?,
+        "visible slot (1, 1) must resolve under base-index 1"
+    );
+    let snap = visible.snapshot().await?;
+    assert!(
+        snap.revision >= 1,
+        "visible slot snapshot must be live, got revision {}",
+        snap.revision
+    );
+
+    let raw = session.pane(0, 0);
+    assert!(
+        !raw.exists().await?,
+        "raw slot (0, 0) must not exist under base-index 1"
+    );
+
+    harness.finish().await
+}

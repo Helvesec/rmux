@@ -106,11 +106,23 @@ async fn pane_find_text_searches_fresh_rendered_snapshot() -> TestResult {
         let mut peer = accept_peer(&listener).await?;
         expect_list_panes(&mut peer).await?;
 
+        // Slot snapshots probe daemon capabilities and route through the
+        // pane id resolved by the list above, so raw slot resolution can no
+        // longer diverge from the visible indexes (issue #94).
         let request = peer.expect_request().await?;
-        let Request::PaneSnapshot(request) = request else {
-            panic!("find_text must capture a pane snapshot, got {request:?}");
+        let Request::Handshake(_) = request else {
+            panic!("slot snapshot must probe capabilities first, got {request:?}");
         };
-        assert_eq!(request.target, target().to_proto());
+        peer.write_response(Response::Handshake(rmux_proto::HandshakeResponse::current()))
+            .await?;
+        let request = peer.expect_request().await?;
+        let Request::PaneSnapshotRef(request) = request else {
+            panic!("find_text must capture the pane snapshot by id, got {request:?}");
+        };
+        assert_eq!(
+            request.target,
+            rmux_proto::PaneTargetRef::by_id(session_name(), rmux_proto::PaneId::new(1)),
+        );
         peer.write_response(Response::PaneSnapshot(snapshot_response()))
             .await?;
 

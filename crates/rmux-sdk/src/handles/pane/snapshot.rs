@@ -10,28 +10,47 @@ use rmux_proto::{
 use super::target::{is_already_closed_error, parse_error};
 
 pub(super) async fn pane_snapshot(pane: &Pane) -> Result<PaneSnapshot> {
-    if pane.id().await?.is_none() {
+    let Some(resolved_id) = pane.id().await? else {
         return Ok(PaneSnapshot::default());
-    }
+    };
 
     // The pane was listed at the start of this call, but the daemon can still
     // close it between the existence check and the snapshot endpoint round
     // trip. Treat the already-closed protocol errors emitted in that window as
     // a "vanished mid-snapshot" signal and degrade to a default snapshot,
     // while genuine transport or protocol errors still propagate.
-    match request_pane_snapshot(pane).await {
+    match request_pane_snapshot(pane, resolved_id).await {
         Ok(response) => snapshot_from_response(response),
         Err(error) if is_already_closed_error(&error, pane.target()) => Ok(PaneSnapshot::default()),
         Err(error) => Err(error),
     }
 }
 
-async fn request_pane_snapshot(pane: &Pane) -> Result<PaneSnapshotResponse> {
+async fn request_pane_snapshot(
+    pane: &Pane,
+    resolved_id: rmux_proto::PaneId,
+) -> Result<PaneSnapshotResponse> {
     let response = if pane.stable_id.is_some() {
         crate::capabilities::require(pane.transport(), &[CAPABILITY_SDK_PANE_BY_ID]).await?;
         pane.transport()
             .request(Request::PaneSnapshotRef(PaneSnapshotRefRequest {
                 target: pane.proto_target_ref(),
+            }))
+            .await?
+    } else if crate::capabilities::supports(pane.transport(), &[CAPABILITY_SDK_PANE_BY_ID]).await? {
+        // Slot handles address the visible (base-index adjusted) coordinates
+        // that list-panes reports, which is also what the id resolution above
+        // matched. The legacy PaneSnapshot slot endpoint resolves raw slot
+        // indexes instead, so under base-index/pane-base-index != 0 it reads
+        // a different (usually absent) pane and degrades to the stale-slot
+        // default snapshot (issue #94). Route through the pane id we just
+        // resolved whenever the daemon supports it.
+        pane.transport()
+            .request(Request::PaneSnapshotRef(PaneSnapshotRefRequest {
+                target: rmux_proto::PaneTargetRef::by_id(
+                    pane.target().session_name.clone(),
+                    resolved_id,
+                ),
             }))
             .await?
     } else {

@@ -28,6 +28,13 @@
   an intentional divergence in the
   [tmux divergence ledger entry C-D49](docs/compat/tmux-3.7-divergences.md)
   rather than claimed byte-identical on every CPU.
+- Resolves SDK index-based pane handles against the visible pane
+  coordinates that `list-panes` reports: slot snapshots now route through the
+  resolved stable pane id, so sessions using `base-index`/`pane-base-index`
+  no longer return silent all-blank revision-0 snapshots where by-id
+  resolution succeeds, backed by
+  [SDK pane query tests](crates/rmux-sdk/tests/pane_queries.rs) and the
+  [slot snapshot transport pin](crates/rmux-sdk/tests/extract.rs).
 - Paints copy-mode selections again: the default
   `copy-mode-selection-style` (`#{E:mode-style}`) now expands through the
   format engine instead of reaching the cell style parser as a raw template,
