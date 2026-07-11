@@ -1,6 +1,6 @@
 use super::*;
 
-async fn send_attached_copy_mode_command(
+pub(super) async fn send_attached_copy_mode_command(
     handler: &RequestHandler,
     target: &PaneTarget,
     tokens: &[&str],

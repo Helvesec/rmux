@@ -28,6 +28,27 @@
   an intentional divergence in the
   [tmux divergence ledger entry C-D49](docs/compat/tmux-3.7-divergences.md)
   rather than claimed byte-identical on every CPU.
+- Paints copy-mode selections again: the default
+  `copy-mode-selection-style` (`#{E:mode-style}`) now expands through the
+  format engine instead of reaching the cell style parser as a raw template,
+  which silently dropped every selection highlight, and the selected cells
+  compose fg/bg/attributes the way the pinned tmux 3.7b oracle does, backed
+  by
+  [selection overlay tests](crates/rmux-core/src/screen/tests.rs),
+  [renderer expansion tests](crates/rmux-server/src/renderer/tests.rs), and
+  [attached copy-mode render tests](crates/rmux-server/src/handler_attach_tests/copy_mode_render.rs).
+- Answers OSC 10/11/12 colour queries from the emulator so theme-detecting
+  TUIs render deterministically in detached sessions, recorded as RMUX
+  extension behavior in
+  [ledger entry C-D50](docs/compat/tmux-3.7-divergences.md) and backed by
+  [emulator reply tests](crates/rmux-core/src/input/tests/osc_dcs_misc.rs)
+  (contributed by @nymph-ai).
+- Ships a Windows installer that preserves the tiny/libexec package layout:
+  `install.ps1` in the release zip and `scripts/install-windows.ps1` verify
+  the release checksum, install the private helper before the public
+  dispatcher, and are exercised by the
+  [package verifier](scripts/verify-package-windows.ps1) (contributed by
+  @isacgalvao).
 - Matches the tmux 3.7b `set-option -U` scope matrix: plain `-U` unsets the
   session copy only, `-pU` the pane copy only, and `-wU` the window copy plus
   the window's pane overrides, replacing the previous RMUX-specific

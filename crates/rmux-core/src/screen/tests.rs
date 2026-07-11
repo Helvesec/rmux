@@ -91,6 +91,76 @@ fn selected_cell_tracking_is_cleared_when_selection_is_removed() {
 }
 
 #[test]
+fn selection_style_overlay_composes_like_tmux_screen_select_cell() {
+    use crate::input::GridAttr;
+
+    // Cell with its own colours and bold, as a shell prompt would have.
+    let mut screen = new_screen(10, 1, 10);
+    parse(&mut screen, b"\x1b[1;32mP\x1b[0m");
+    screen.mark_selected_row_range(0, 0, 0);
+
+    // Style with explicit fg/bg and no attributes (the default mode-style
+    // shape): fg/bg replace the cell's, and the cell's bold is dropped
+    // (tmux screen_select_cell keeps only charset when the style has no
+    // attributes).
+    screen.overlay_style_on_selected("fg=black,bg=yellow");
+    let cell = screen
+        .grid()
+        .visible_line(0)
+        .and_then(|line| line.cell(0))
+        .expect("cell 0");
+    assert_eq!(cell.fg(), 0, "selection fg replaces the cell fg");
+    assert_eq!(cell.bg(), 3, "selection bg replaces the cell bg");
+    assert_eq!(
+        cell.attr() & GridAttr::BRIGHT,
+        0,
+        "cell attributes are dropped when the selection style sets none"
+    );
+
+    // A complete style with its own attributes still applies them while
+    // dropping the cell's (oracle probe 2026-07-11: bg=red,fg=white,bold
+    // over plain text paints 37;41;1).
+    let mut screen = new_screen(10, 1, 10);
+    parse(&mut screen, b"\x1b[32mP\x1b[0m");
+    screen.mark_selected_row_range(0, 0, 0);
+    screen.overlay_style_on_selected("fg=white,bg=red,bold");
+    let cell = screen
+        .grid()
+        .visible_line(0)
+        .and_then(|line| line.cell(0))
+        .expect("cell 0");
+    assert_ne!(
+        cell.attr() & GridAttr::BRIGHT,
+        0,
+        "a complete style's own attributes apply to selected cells"
+    );
+
+    // Style leaving fg at default: the cell keeps its own fg, and a style
+    // attribute is unioned with the cell's remaining attributes.
+    let mut screen = new_screen(10, 1, 10);
+    parse(&mut screen, b"\x1b[1;32mP\x1b[0m");
+    screen.mark_selected_row_range(0, 0, 0);
+    screen.overlay_style_on_selected("bg=red,underscore");
+    let cell = screen
+        .grid()
+        .visible_line(0)
+        .and_then(|line| line.cell(0))
+        .expect("cell 0");
+    assert_eq!(cell.fg(), 2, "default selection fg inherits the cell fg");
+    assert_eq!(cell.bg(), 1, "selection bg replaces the cell bg");
+    assert_ne!(
+        cell.attr() & GridAttr::UNDERSCORE,
+        0,
+        "selection style attributes apply"
+    );
+    assert_ne!(
+        cell.attr() & GridAttr::BRIGHT,
+        0,
+        "cell attributes are unioned when the selection style sets some"
+    );
+}
+
+#[test]
 fn selection_style_overlay_consumes_selected_cell_markers() {
     let mut screen = new_screen(10, 2, 10);
     screen.mark_selected_row_range(0, 2, 4);

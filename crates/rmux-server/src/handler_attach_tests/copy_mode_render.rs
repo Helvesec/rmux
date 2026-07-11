@@ -146,7 +146,7 @@ async fn attached_mouse_drag_copy_mode_refresh_keeps_prompt_visible() {
     let mode_capture = {
         let response = handler
             .handle(Request::CapturePane(Box::new(CapturePaneRequest {
-                target,
+                target: target.clone(),
                 start: None,
                 end: None,
                 print: true,
@@ -188,9 +188,26 @@ async fn attached_mouse_drag_copy_mode_refresh_keeps_prompt_visible() {
         rendered_screen.contains("tester@RMUXHOST:~$"),
         "attached copy-mode mouse refresh should keep the prompt visible after replay, frame={frame:?} replay={rendered_screen:?}"
     );
+    // A drag start has no selected cells yet, so this frame may only carry
+    // the position indicator's mode-style. Extend the selection and require
+    // a second mode-style span: the indicator alone must not satisfy the
+    // selection-paint assertion (the previous form of this test passed even
+    // when selections were never painted, issue #90).
     assert!(
         frame.contains("\u{1b}[0;30;43m"),
-        "attached copy-mode mouse refresh should paint the selection with tmux mode-style, frame={frame:?}"
+        "attached copy-mode mouse refresh should style the position indicator, frame={frame:?}"
+    );
+    assert!(matches!(
+        super::copy_mode_keys::send_attached_copy_mode_command(&handler, &target, &["select-line"])
+            .await,
+        Response::SendKeys(_)
+    ));
+    let frame = recv_render_frame(&mut control_rx, "copy-mode selection refresh").await;
+    assert!(
+        frame.contains("\u{1b}[30m\u{1b}[43m"),
+        "extending the selection must paint selected cells with tmux mode-style; \
+         the position indicator's combined ESC[0;30;43m form alone must not \
+         satisfy this, frame={frame:?}"
     );
 }
 

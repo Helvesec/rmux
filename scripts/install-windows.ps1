@@ -8,7 +8,19 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# GitHub requires TLS 1.2+; Windows PowerShell 5.1 does not negotiate it by
+# default, which fails the release download with an opaque error.
+if ([System.Net.ServicePointManager]::SecurityProtocol -notmatch 'Tls12') {
+    [System.Net.ServicePointManager]::SecurityProtocol = `
+        [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+}
+
 function Fail([string]$Message) {
+    # Under `irm ... | iex` there is no script file and `exit` would close the
+    # user's interactive shell; throw instead so only the installer stops.
+    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        throw "rmux install: $Message"
+    }
     Write-Error "rmux install: $Message"
     exit 1
 }
@@ -126,10 +138,15 @@ function Install-PackageRoot([string]$PackageRoot, [string]$DestinationBin, [boo
         -Force `
         -LiteralPath (Join-Path $PackageRoot "libexec\rmux\rmux.exe") `
         -Destination (Join-Path $installRoot "libexec\rmux\rmux.exe")
+    # rmux-daemon.exe must sit next to the installed rmux.exe: the hidden-daemon
+    # resolver (rmux-client auto_start) only looks for it as a sibling of the
+    # running binary, matching the Unix installer's bin/rmux-daemon placement.
+    # Installing it in the parent left the shipped daemon unreachable, so every
+    # server fell back to re-exec'ing the tiny bin\rmux.exe as a blocked shim.
     Copy-Item `
         -Force `
         -LiteralPath (Join-Path $PackageRoot "rmux-daemon.exe") `
-        -Destination (Join-Path $installRoot "rmux-daemon.exe")
+        -Destination (Join-Path $installBin "rmux-daemon.exe")
     Copy-Tree (Join-Path $PackageRoot "share") (Join-Path $installRoot "share")
 
     foreach ($optional in @("README.md", "LICENSE-APACHE", "LICENSE-MIT", "rmux.1", "SHA256SUMS.txt")) {
@@ -214,6 +231,13 @@ try {
     }
 
     Install-PackageRoot $packageRoot $InstallDir (-not $NoVerify)
+    # Normalize the exit code the same way the local branch does with `exit 0`.
+    # The install succeeded, but Verify-InstalledLayout's `rmux --help` probe
+    # leaves $LASTEXITCODE at the usage exit code (1); a caller that trusts the
+    # exit code (as verify-package-windows.ps1 does) would misread success as
+    # failure. Reset without `exit`, which under `irm | iex` would close the
+    # user's shell on a successful install.
+    $global:LASTEXITCODE = 0
 } finally {
     Remove-Item -Recurse -Force -LiteralPath $tmp -ErrorAction SilentlyContinue
 }

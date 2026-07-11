@@ -391,3 +391,30 @@ Inventory impact: format rendering remains advertised, but compatibility
 claims for expression arithmetic must describe these undefined cases as RMUX's
 deterministic Linux-oracle behavior rather than byte-identical tmux behavior on
 every CPU.
+
+### C-D50: OSC 10/11/12 colour queries are answered from the emulator
+
+A pane program that queries the terminal's default colours (`OSC 10;?`,
+`OSC 11;?`, `OSC 12;?`) inside a detached tmux 3.7b session receives no
+answer at all (probed 2026-07-11: the query times out silently), so
+theme-detecting TUIs fall back to a guessed palette. RMUX answers these
+queries from the emulator on every pane, attached or detached, while tmux
+forwards them to the attached client's real terminal when one is present
+(probed 2026-07-11: the outer receives the query verbatim and its answer, if
+any, is relayed): RMUX instead reports the colour the application last set
+via the same OSC, and otherwise impersonates
+a conventional dark terminal (X11 rgb:cccc/cccc/cccc foreground and cursor
+on rgb:0000/0000/0000 background), overridable per daemon with
+`RMUX_DEFAULT_FOREGROUND`, `RMUX_DEFAULT_BACKGROUND`, and
+`RMUX_DEFAULT_CURSOR_COLOUR`. `OSC 110/111/112` resets restore those
+defaults. The impersonated answer is reported even to attached clients, whose
+real terminal colours the daemon does not currently know; answering with the
+attached client's true theme is a possible future refinement.
+
+Test/fixture: `crates/rmux-core/src/input/tests/osc_dcs_misc.rs` covers the
+query replies for all three slots with both terminators, the set-then-query
+round trip, and the reset behavior.
+
+Inventory impact: OSC colour handling remains advertised, but compatibility
+claims must describe query answering as an RMUX extension for
+theme-detection, not byte-identical tmux behavior.

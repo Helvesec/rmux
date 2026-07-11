@@ -251,3 +251,26 @@ fn osc_10_set_still_reaches_writer() {
     let (_p, w) = parse(b"\x1b]10;rgb:eeee/eeee/eeee\x1b\\");
     assert!(w.has_call("osc_fg_colour("));
 }
+
+#[test]
+fn osc_11_oversized_set_is_not_stored_so_queries_cannot_amplify() {
+    // An application sets a ~1 MiB "colour" and then floods queries in the
+    // same read batch. The oversized value must not be stored (it is not a
+    // colour), so each query answers the small default instead of reflecting
+    // megabytes: without the length bound reply_buf would balloon to ~100 MiB.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(b"\x1b]11;rgb:");
+    payload.extend(std::iter::repeat(b'A').take(1_000_000));
+    payload.extend_from_slice(b"\x1b\\");
+    for _ in 0..100 {
+        payload.extend_from_slice(b"\x1b]11;?\x07");
+    }
+    let (p, _w) = parse(&payload);
+    assert!(
+        p.reply_buf.len() < 100_000,
+        "reply buffer amplified to {} bytes",
+        p.reply_buf.len()
+    );
+    let replies = String::from_utf8_lossy(&p.reply_buf);
+    assert!(replies.contains("\x1b]11;rgb:0000/0000/0000\x07"));
+}

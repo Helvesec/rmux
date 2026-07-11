@@ -354,6 +354,66 @@ fn pane_render_uses_line_clear_for_unstyled_full_width_panes() {
 }
 
 #[test]
+fn pane_selection_overlay_style_expands_defaults_and_overrides() {
+    let size = TerminalSize { cols: 6, rows: 2 };
+    let session = Session::new(session_name("alpha"), size);
+    let pane = session.window().pane(0).expect("pane 0 exists");
+
+    // Default: copy-mode-selection-style is "#{E:mode-style}", which must
+    // expand through the format engine to the mode-style default instead of
+    // reaching the cell style parser as a raw template (issue #90).
+    let options = OptionStore::new();
+    let style = super::pane_screen::pane_selection_overlay_style(&session, &options, pane)
+        .expect("default selection style expands");
+    assert!(
+        style.contains("fg=black") && style.contains("bg=yellow"),
+        "default selection style must expand mode-style, got {style:?}"
+    );
+
+    // The default follows a changed mode-style.
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::ModeStyle,
+            "bg=blue,fg=white".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("set mode-style");
+    let style = super::pane_screen::pane_selection_overlay_style(&session, &options, pane)
+        .expect("inherited selection style expands");
+    assert!(
+        style.contains("bg=blue"),
+        "selection style must follow mode-style, got {style:?}"
+    );
+
+    // An explicit copy-mode-selection-style wins over mode-style.
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::ModeStyle,
+            "bg=blue,fg=white".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("set mode-style");
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::CopyModeSelectionStyle,
+            "bg=red".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("set copy-mode-selection-style");
+    let style = super::pane_screen::pane_selection_overlay_style(&session, &options, pane)
+        .expect("explicit selection style expands");
+    assert!(
+        style.contains("bg=red") && !style.contains("bg=blue"),
+        "explicit selection style must win, got {style:?}"
+    );
+}
+
+#[test]
 fn styled_pane_screen_borrows_when_no_overlay_is_needed() {
     let size = TerminalSize { cols: 6, rows: 2 };
     let session = Session::new(session_name("alpha"), size);

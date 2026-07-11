@@ -214,6 +214,17 @@ impl InputParser {
     /// Records an application-set OSC 10/11/12 colour so later queries
     /// round-trip the value.
     pub(crate) fn set_osc_colour(&mut self, slot: OscColourSlot, value: &str) {
+        // A stored colour is reflected verbatim to every later query, so bound
+        // it to a sane colour-spec length: otherwise a pane could set a huge
+        // (up to input-buffer-sized) value and then flood queries in one read
+        // batch, amplifying it into unbounded reply memory and OOM-ing the
+        // daemon. A real X11 / `rgb:` / `#rrggbb` spec is far shorter; longer
+        // values are not colours and are left unstored, so queries keep
+        // answering the prior or default value.
+        const OSC_COLOUR_MAX_LEN: usize = 64;
+        if value.len() > OSC_COLOUR_MAX_LEN {
+            return;
+        }
         self.osc_colours[slot.index()] = Some(value.to_owned());
     }
 

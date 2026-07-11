@@ -265,12 +265,16 @@ function AssertArchiveInstaller([string]$InstallScript, [string]$Root) {
     $installRoot = Join-Path $Root "installed-rmux"
     $installBin = Join-Path $installRoot "bin"
 
+    $global:LASTEXITCODE = 0
     & $InstallScript -InstallDir $installBin
-    if (-not $?) {
-        Fail "archive install.ps1 failed"
+    if ($LASTEXITCODE -ne 0) {
+        Fail "archive install.ps1 failed with exit code $LASTEXITCODE"
     }
 
-    foreach ($required in @("bin\rmux.exe", "libexec\rmux\rmux.exe", "rmux-daemon.exe", "share\rmux\artifact-metadata.json")) {
+    # rmux-daemon.exe is checked next to the installed rmux.exe (bin\), where the
+    # hidden-daemon resolver looks for it; checking it at the install root would
+    # pass even when the daemon is unreachable at runtime.
+    foreach ($required in @("bin\rmux.exe", "libexec\rmux\rmux.exe", "bin\rmux-daemon.exe", "share\rmux\artifact-metadata.json")) {
         if (-not (Test-Path -LiteralPath (Join-Path $installRoot $required) -PathType Leaf)) {
             Fail "install.ps1 did not install required file: $required"
         }

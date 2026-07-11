@@ -1,5 +1,5 @@
 use crate::grid::GridCellFlags;
-use crate::input::GridAttr;
+use crate::input::{GridAttr, COLOUR_DEFAULT, COLOUR_TERMINAL};
 use crate::style::{style_parse, Style, StyleCell};
 
 use super::Screen;
@@ -108,25 +108,40 @@ impl Screen {
                     continue;
                 }
 
-                let base = StyleCell {
-                    fg: cell.fg(),
-                    bg: cell.bg(),
-                    us: cell.us(),
-                    attr: cell.attr(),
-                };
+                // Selection composition, probed against the pinned tmux
+                // 3.7b oracle (2026-07-11): the style's fg/bg replace the
+                // cell's unless left at the default colour (the cell's
+                // colour shows through a partial style such as bg=red); a
+                // "complete" style that sets both fg and bg paints the
+                // selection uniformly, dropping the cell's attributes (the
+                // default fg=black,bg=yellow mode-style renders bold text
+                // unbolded), while a partial style keeps them, unioned with
+                // any attributes the style itself sets. "noattr" always
+                // drops them.
+                let base = StyleCell::default();
                 let mut style = Style::with_cell(base);
                 if style_parse(&mut style, &base, style_input).is_err() {
                     return;
                 }
 
-                let attr = if style.cell.attr & GridAttr::NOATTR != 0 {
-                    style.cell.attr & !GridAttr::NOATTR
+                let fg_set = !matches!(style.cell.fg, COLOUR_DEFAULT | COLOUR_TERMINAL);
+                let bg_set = !matches!(style.cell.bg, COLOUR_DEFAULT | COLOUR_TERMINAL);
+                let style_attr = style.cell.attr & !GridAttr::NOATTR;
+                let attr = if style.cell.attr & GridAttr::NOATTR != 0 || (fg_set && bg_set) {
+                    // Oracle probe 2026-07-11: a complete fg+bg style drops
+                    // the cell's attributes but still applies its own
+                    // (bg=red,fg=white,bold paints bold over plain text).
+                    style_attr | (cell.attr() & GridAttr::CHARSET)
                 } else {
-                    style.cell.attr
+                    style_attr | cell.attr()
                 };
                 cell.set_attr(attr);
-                cell.set_fg(style.cell.fg);
-                cell.set_bg(style.cell.bg);
+                if fg_set {
+                    cell.set_fg(style.cell.fg);
+                }
+                if bg_set {
+                    cell.set_bg(style.cell.bg);
+                }
                 cell.set_us(style.cell.us);
                 touched = true;
             }

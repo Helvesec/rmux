@@ -9,6 +9,8 @@ use rmux_core::{
 use rmux_proto::OptionName;
 
 use super::{cursor_position_bytes, visible_pane_geometry, StatusGeometry};
+use crate::format_runtime::RuntimeFormatContext;
+use rmux_core::formats::FormatContext;
 
 pub(crate) fn render_pane_screen(
     session: &Session,
@@ -142,6 +144,35 @@ fn final_pane_cursor_state(
     frame
 }
 
+/// Expanded `copy-mode-selection-style` for the pane, resolved through the
+/// option default (`#{E:mode-style}`) and the runtime format context — the
+/// same machinery as the copy-mode position indicator. Passing the raw
+/// option value into the cell style parser silently dropped the default
+/// template, leaving selections visually unhighlighted (issue #90).
+pub(crate) fn pane_selection_overlay_style(
+    session: &Session,
+    options: &OptionStore,
+    pane: &Pane,
+) -> Option<String> {
+    let value = options.resolve_for_pane(
+        session.name(),
+        session.active_window_index(),
+        pane.index(),
+        OptionName::CopyModeSelectionStyle,
+    )?;
+    let context = FormatContext::from_session(session)
+        .with_window(session.active_window_index(), session.window(), true, false)
+        .with_window_pane(session.window(), pane);
+    let runtime = RuntimeFormatContext::new(context)
+        .with_options(options)
+        .with_session(session)
+        .with_window(session.active_window_index(), session.window())
+        .with_pane(pane);
+    let style = super::apply_runtime_style_overlay(&Style::default(), Some(value), &runtime);
+    let rendered = rmux_core::style_tostring(&style);
+    (!rendered.is_empty() && rendered != "default").then_some(rendered)
+}
+
 pub(crate) fn styled_pane_screen<'a>(
     session: &Session,
     options: &OptionStore,
@@ -151,14 +182,7 @@ pub(crate) fn styled_pane_screen<'a>(
     let default_style = pane_default_style(session, options, pane);
     let selection_style = screen
         .has_selected_cells()
-        .then(|| {
-            options.resolve_for_pane(
-                session.name(),
-                session.active_window_index(),
-                pane.index(),
-                OptionName::CopyModeSelectionStyle,
-            )
-        })
+        .then(|| pane_selection_overlay_style(session, options, pane))
         .flatten();
     if default_style.is_none() && selection_style.is_none() {
         return Cow::Borrowed(screen);
@@ -169,7 +193,7 @@ pub(crate) fn styled_pane_screen<'a>(
         styled_screen.overlay_default_style(&style);
     }
     if let Some(style) = selection_style {
-        styled_screen.overlay_style_on_selected(style);
+        styled_screen.overlay_style_on_selected(&style);
     }
     Cow::Owned(styled_screen)
 }
