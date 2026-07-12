@@ -117,7 +117,6 @@ Quelques exemples courts de ce que RMUX permet de faire.
 | Plateforme / gestionnaire | Commande |
 | :--- | :--- |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/apple.svg"><img src="../install/apple-light.svg" width="28" alt="macOS"></picture> / Homebrew | `brew install rmux` |
-| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / installer | `irm https://rmux.io/install.ps1 \| iex` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / WinGet | `winget install rmux` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / Scoop | `scoop bucket add rmux https://github.com/Helvesec/scoop-rmux && scoop install rmux` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / Chocolatey | `choco install rmux` |
@@ -128,7 +127,12 @@ Quelques exemples courts de ce que RMUX permet de faire.
 
 Les téléchargements directs (`.tar.gz`, `.deb`, `.rpm`, `.zip`) sont disponibles dans la [GitHub Release v0.9.0](https://github.com/Helvesec/rmux/releases/tag/v0.9.0).
 
-Les gestionnaires de paquets peuvent avoir du retard pendant la revue des registres ; les téléchargements directs et les installateurs rmux.io suivent la release GitHub courante.
+Les gestionnaires de paquets peuvent avoir du retard pendant la revue des registres ; utilisez le téléchargement versionné de la GitHub Release tant qu'un gestionnaire n'est pas à jour.
+
+Sous Windows, extrayez l'intégralité du `.zip` et ajoutez la racine du paquet
+extrait au `PATH`. Conservez ensemble `rmux.exe`, `rmux-daemon.exe` et
+`libexec/rmux/rmux.exe` ; copier uniquement l'exécutable public ne constitue
+pas une installation valide.
 
 Pour les téléchargements Unix `.tar.gz`, lancez `./install.sh --prefix ~/.local`
 depuis l'archive extraite. L'installateur préserve le layout `bin/` et

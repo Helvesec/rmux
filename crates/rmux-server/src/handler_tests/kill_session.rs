@@ -54,6 +54,37 @@ async fn create_quiet_kill_session(handler: &RequestHandler, name: &str) -> Sess
     session
 }
 
+async fn create_grouped_kill_session(
+    handler: &RequestHandler,
+    name: &str,
+    group_target: &SessionName,
+) -> SessionName {
+    let session = session_name(name);
+    let response = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(session.clone()),
+            working_directory: None,
+            detached: true,
+            size: None,
+            environment: None,
+            group_target: Some(group_target.clone()),
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: None,
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))
+        .await;
+    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    session
+}
+
 #[tokio::test]
 async fn kill_session_is_idempotent_for_missing_sessions() {
     let handler = RequestHandler::new();
@@ -143,6 +174,83 @@ async fn kill_session_all_except_target_preserves_only_the_resolved_target() {
             Response::HasSession(rmux_proto::HasSessionResponse { exists })
         );
     }
+}
+
+#[tokio::test]
+async fn concurrent_group_owner_kills_rekey_live_subscription_to_final_owner() {
+    let handler = RequestHandler::new();
+    let owner = create_quiet_kill_session(&handler, "subscription-rekey-a").await;
+    let peer = create_grouped_kill_session(&handler, "subscription-rekey-b", &owner).await;
+    let survivor = create_grouped_kill_session(&handler, "subscription-rekey-c", &owner).await;
+    let pane_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&owner)
+            .and_then(rmux_core::Session::active_pane_id)
+            .expect("group owner has an active pane")
+    };
+    let subscribed = handler
+        .handle_subscribe_pane_output_ref(
+            4244,
+            rmux_proto::SubscribePaneOutputRefRequest {
+                target: rmux_proto::PaneTargetRef::by_id(owner.clone(), pane_id),
+                start: rmux_proto::PaneOutputSubscriptionStart::Now,
+            },
+        )
+        .await;
+    let Response::SubscribePaneOutput(subscribed) = subscribed else {
+        panic!("live grouped pane should accept subscription: {subscribed:?}");
+    };
+
+    let pause = handler.install_kill_session_subscription_rekey_pause(owner.clone());
+    let first_handler = handler.clone();
+    let first_owner = owner.clone();
+    let first = tokio::spawn(async move {
+        first_handler
+            .handle(Request::KillSession(KillSessionRequest {
+                target: first_owner,
+                kill_all_except_target: false,
+                clear_alerts: false,
+                kill_group: false,
+            }))
+            .await
+    });
+    pause.reached.notified().await;
+
+    let second_handler = handler.clone();
+    let second_peer = peer.clone();
+    let second = tokio::spawn(async move {
+        second_handler
+            .handle(Request::KillSession(KillSessionRequest {
+                target: second_peer,
+                kill_all_except_target: false,
+                clear_alerts: false,
+                kill_group: false,
+            }))
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !second.is_finished(),
+        "the next owner transfer must wait until the first subscription rekey commits"
+    );
+
+    pause.release.notify_one();
+    let first_response = first.await.expect("first kill-session task joins");
+    let second_response = second.await.expect("second kill-session task joins");
+    assert!(
+        matches!(first_response, Response::KillSession(_)),
+        "{first_response:?}"
+    );
+    assert!(
+        matches!(second_response, Response::KillSession(_)),
+        "{second_response:?}"
+    );
+    let subscription_key = handler
+        .pane_output_subscription_key_for_test(subscribed.subscription_id)
+        .expect("live subscription remains registered");
+    assert_eq!(subscription_key.runtime_session_name(), &survivor);
 }
 
 #[tokio::test]
@@ -531,6 +639,317 @@ async fn kill_session_all_except_target_does_not_request_shutdown_while_target_s
             .is_err(),
         "kill-session -a should not request shutdown while the target session remains"
     );
+}
+
+#[tokio::test]
+async fn kill_session_group_selectors_fail_closed_when_target_name_is_recreated() {
+    let handler = RequestHandler::new();
+    let alpha = create_quiet_kill_session(&handler, "kill-all-identity-alpha").await;
+    let beta = create_quiet_kill_session(&handler, "kill-all-identity-beta").await;
+    let gamma = create_quiet_kill_session(&handler, "kill-all-identity-gamma").await;
+    let beta_attach_pid = 41_001;
+    let (beta_control_tx, mut beta_control_rx) = mpsc::unbounded_channel();
+    let _beta_attach_id = handler
+        .register_attach(beta_attach_pid, beta.clone(), beta_control_tx)
+        .await;
+    let pause = handler.install_kill_session_selection_identity_pause(alpha.clone());
+
+    let kill_handler = handler.clone();
+    let kill_alpha = alpha.clone();
+    let kill_all_except = tokio::spawn(async move {
+        kill_handler
+            .handle(Request::KillSession(KillSessionRequest {
+                target: kill_alpha,
+                kill_all_except_target: true,
+                clear_alerts: false,
+                kill_group: false,
+            }))
+            .await
+    });
+
+    pause.reached.notified().await;
+    let killed = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: alpha.clone(),
+            kill_all_except_target: false,
+            clear_alerts: false,
+            kill_group: false,
+        }))
+        .await;
+    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
+    let recreated = create_quiet_kill_session(&handler, alpha.as_str()).await;
+    pause.release.notify_one();
+
+    let response = kill_all_except.await.expect("kill task joins");
+    assert_eq!(
+        response,
+        Response::Error(ErrorResponse {
+            error: RmuxError::SessionNotFound(alpha.to_string()),
+        })
+    );
+    for session in [recreated, beta, gamma] {
+        wait_for_session_state(&handler, session, true).await;
+    }
+    while let Ok(control) = beta_control_rx.try_recv() {
+        assert!(
+            !matches!(control, AttachControl::Exited),
+            "fail-closed kill-session -a must not exit a surviving victim client"
+        );
+    }
+    assert_eq!(
+        handler
+            .active_attach
+            .lock()
+            .await
+            .by_pid
+            .get(&beta_attach_pid)
+            .map(|active| active.session_name.clone()),
+        Some(session_name("kill-all-identity-beta"))
+    );
+
+    let handler = RequestHandler::new();
+    let alpha = create_quiet_kill_session(&handler, "kill-group-identity-alpha").await;
+    let beta = session_name("kill-group-identity-beta");
+    let grouped = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(beta.clone()),
+            working_directory: None,
+            detached: true,
+            size: None,
+            environment: None,
+            group_target: Some(alpha.clone()),
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: None,
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))
+        .await;
+    assert!(matches!(grouped, Response::NewSession(_)), "{grouped:?}");
+    let keeper = create_quiet_kill_session(&handler, "kill-group-identity-keeper").await;
+    let beta_attach_pid = 41_002;
+    let (beta_control_tx, mut beta_control_rx) = mpsc::unbounded_channel();
+    let _beta_attach_id = handler
+        .register_attach(beta_attach_pid, beta.clone(), beta_control_tx)
+        .await;
+    let pause = handler.install_kill_session_selection_identity_pause(alpha.clone());
+
+    let kill_handler = handler.clone();
+    let kill_alpha = alpha.clone();
+    let kill_group = tokio::spawn(async move {
+        kill_handler
+            .handle(Request::KillSession(KillSessionRequest {
+                target: kill_alpha,
+                kill_all_except_target: false,
+                clear_alerts: false,
+                kill_group: true,
+            }))
+            .await
+    });
+
+    pause.reached.notified().await;
+    let killed = handler
+        .handle(Request::KillSession(KillSessionRequest {
+            target: alpha.clone(),
+            kill_all_except_target: false,
+            clear_alerts: false,
+            kill_group: false,
+        }))
+        .await;
+    assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
+    let recreated = create_quiet_kill_session(&handler, alpha.as_str()).await;
+    pause.release.notify_one();
+
+    let response = kill_group.await.expect("kill task joins");
+    assert_eq!(
+        response,
+        Response::Error(ErrorResponse {
+            error: RmuxError::SessionNotFound(alpha.to_string()),
+        })
+    );
+    for session in [recreated, beta, keeper] {
+        wait_for_session_state(&handler, session, true).await;
+    }
+    while let Ok(control) = beta_control_rx.try_recv() {
+        assert!(
+            !matches!(control, AttachControl::Exited),
+            "fail-closed kill-session -g must not exit a surviving group client"
+        );
+    }
+    assert_eq!(
+        handler
+            .active_attach
+            .lock()
+            .await
+            .by_pid
+            .get(&beta_attach_pid)
+            .map(|active| active.session_name.clone()),
+        Some(session_name("kill-group-identity-beta"))
+    );
+}
+
+#[tokio::test]
+async fn kill_session_group_selectors_follow_a_renamed_victim_identity() {
+    let handler = RequestHandler::new();
+    let alpha = create_quiet_kill_session(&handler, "kill-all-rename-alpha").await;
+    let beta = create_quiet_kill_session(&handler, "kill-all-rename-beta").await;
+    let gamma = create_quiet_kill_session(&handler, "kill-all-rename-gamma").await;
+    let renamed = session_name("kill-all-rename-delta");
+    let beta_attach_pid = 41_003;
+    let (beta_control_tx, mut beta_control_rx) = mpsc::unbounded_channel();
+    let _beta_attach_id = handler
+        .register_attach(beta_attach_pid, beta.clone(), beta_control_tx)
+        .await;
+    let pause = handler.install_kill_session_selection_identity_pause(alpha.clone());
+
+    let kill_handler = handler.clone();
+    let kill_alpha = alpha.clone();
+    let kill_all_except = tokio::spawn(async move {
+        kill_handler
+            .handle(Request::KillSession(KillSessionRequest {
+                target: kill_alpha,
+                kill_all_except_target: true,
+                clear_alerts: false,
+                kill_group: false,
+            }))
+            .await
+    });
+
+    pause.reached.notified().await;
+    let rename = handler
+        .handle(Request::RenameSession(RenameSessionRequest {
+            target: beta,
+            new_name: renamed.clone(),
+        }))
+        .await;
+    assert!(matches!(rename, Response::RenameSession(_)), "{rename:?}");
+    pause.release.notify_one();
+
+    let response = kill_all_except.await.expect("kill task joins");
+    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
+    wait_for_session_state(&handler, alpha, true).await;
+    wait_for_session_state(&handler, renamed, false).await;
+    wait_for_session_state(&handler, gamma, false).await;
+    let mut beta_exited = false;
+    while let Ok(control) = beta_control_rx.try_recv() {
+        beta_exited |= matches!(control, AttachControl::Exited);
+    }
+    assert!(
+        beta_exited,
+        "kill-session -a must exit the renamed victim client"
+    );
+    assert!(!handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .contains_key(&beta_attach_pid));
+
+    let handler = RequestHandler::new();
+    let alpha = create_quiet_kill_session(&handler, "kill-group-rename-alpha").await;
+    let beta = session_name("kill-group-rename-beta");
+    let grouped = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(beta.clone()),
+            working_directory: None,
+            detached: true,
+            size: None,
+            environment: None,
+            group_target: Some(alpha.clone()),
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: None,
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))
+        .await;
+    assert!(matches!(grouped, Response::NewSession(_)), "{grouped:?}");
+    let keeper = create_quiet_kill_session(&handler, "kill-group-rename-keeper").await;
+    let renamed = session_name("kill-group-rename-delta");
+    let beta_attach_pid = 41_004;
+    let (beta_control_tx, mut beta_control_rx) = mpsc::unbounded_channel();
+    let _beta_attach_id = handler
+        .register_attach(beta_attach_pid, beta.clone(), beta_control_tx)
+        .await;
+    let pause = handler.install_kill_session_selection_identity_pause(alpha.clone());
+
+    let kill_handler = handler.clone();
+    let kill_alpha = alpha.clone();
+    let kill_group = tokio::spawn(async move {
+        kill_handler
+            .handle(Request::KillSession(KillSessionRequest {
+                target: kill_alpha,
+                kill_all_except_target: false,
+                clear_alerts: false,
+                kill_group: true,
+            }))
+            .await
+    });
+
+    pause.reached.notified().await;
+    let rename = handler
+        .handle(Request::RenameSession(RenameSessionRequest {
+            target: beta,
+            new_name: renamed.clone(),
+        }))
+        .await;
+    assert!(matches!(rename, Response::RenameSession(_)), "{rename:?}");
+    pause.release.notify_one();
+
+    let response = kill_group.await.expect("kill task joins");
+    assert!(matches!(response, Response::KillSession(_)), "{response:?}");
+    wait_for_session_state(&handler, alpha, false).await;
+    wait_for_session_state(&handler, renamed, false).await;
+    wait_for_session_state(&handler, keeper, true).await;
+    let mut beta_exited = false;
+    while let Ok(control) = beta_control_rx.try_recv() {
+        beta_exited |= matches!(control, AttachControl::Exited);
+    }
+    assert!(
+        beta_exited,
+        "kill-session -g must exit the renamed group client"
+    );
+    assert!(!handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .contains_key(&beta_attach_pid));
+}
+
+async fn wait_for_session_state(
+    handler: &RequestHandler,
+    session_name: SessionName,
+    expected: bool,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let exists = handler
+            .handle(Request::HasSession(HasSessionRequest {
+                target: session_name.clone(),
+            }))
+            .await;
+        if exists == Response::HasSession(rmux_proto::HasSessionResponse { exists: expected }) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "session {session_name} did not reach exists={expected}; last response: {exists:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]

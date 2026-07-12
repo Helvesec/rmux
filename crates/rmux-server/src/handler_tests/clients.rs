@@ -328,6 +328,77 @@ async fn detach_client_target_session_detaches_control_clients() {
 }
 
 #[tokio::test]
+async fn detach_client_target_session_preserves_reregistered_attached_client() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("detach-target-generation-alpha");
+    let beta = session_name("detach-target-generation-beta");
+
+    for session_name in [&alpha, &beta] {
+        let response = handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session_name.clone(),
+                detached: true,
+                size: None,
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    }
+
+    let attach_pid = 91_347;
+    let (old_tx, _old_rx) = mpsc::unbounded_channel();
+    let old_id = handler
+        .register_attach(attach_pid, alpha.clone(), old_tx)
+        .await;
+    let pause = super::super::attach_support::install_attach_control_identity_pause(attach_pid);
+
+    let detach_handler = handler.clone();
+    let detach_alpha = alpha.clone();
+    let detach = tokio::spawn(async move {
+        detach_handler
+            .handle(Request::DetachClientExt(
+                rmux_proto::DetachClientExtRequest {
+                    target_client: None,
+                    all_other_clients: false,
+                    target_session: Some(detach_alpha),
+                    kill_on_detach: false,
+                    exec_command: None,
+                },
+            ))
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("detach reaches its final client identity check");
+    let (replacement_tx, mut replacement_rx) = mpsc::unbounded_channel();
+    let replacement_id = handler
+        .register_attach(attach_pid, beta.clone(), replacement_tx)
+        .await;
+    assert_ne!(replacement_id, old_id);
+    pause.release.notify_one();
+
+    assert_eq!(
+        detach.await.expect("detach task joins"),
+        Response::DetachClient(rmux_proto::DetachClientResponse)
+    );
+    assert!(matches!(
+        replacement_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    let active_attach = handler.active_attach.lock().await;
+    let replacement = active_attach
+        .by_pid
+        .get(&attach_pid)
+        .expect("replacement attach survives");
+    assert_eq!(replacement.id, replacement_id);
+    assert_eq!(replacement.session_name, beta);
+    assert!(!replacement
+        .closing
+        .load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
 async fn control_mode_attach_session_tracks_the_control_clients_session() {
     let handler = RequestHandler::new();
     let requester_pid = 301;

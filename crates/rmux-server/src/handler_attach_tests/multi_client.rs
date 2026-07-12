@@ -1165,6 +1165,7 @@ async fn register_sized_attach_with_flags(
         .register_attach_with_access(
             requester_pid,
             session.clone(),
+            None,
             AttachRegistration {
                 control_tx,
                 control_backlog: Arc::new(AtomicUsize::new(0)),
@@ -1179,7 +1180,8 @@ async fn register_sized_attach_with_flags(
                 client_size: Some(size),
             },
         )
-        .await;
+        .await
+        .expect("attach registration succeeds");
     handler
         .handle_attached_resize(requester_pid, size)
         .await

@@ -4,11 +4,12 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use rmux_proto::{
-    AttachShellCommand, AttachedKeystroke, KeyDispatched, OptionName, PaneTarget, TerminalSize,
+    AttachShellCommand, AttachedKeystroke, KeyDispatched, OptionName, PaneTarget, SessionId,
+    SessionName, TerminalSize,
 };
 use tokio::time::sleep;
 
-use super::RequestHandler;
+use super::{client_support::SwitchTargetSelection, RequestHandler};
 use crate::handler_support::attached_client_required;
 use crate::outer_terminal::{CursorScope, OuterTerminal, OuterTerminalContext};
 use crate::pane_io::{AttachControl, AttachTarget, LivePaneRender, OverlayFrame};
@@ -17,6 +18,60 @@ use crate::renderer;
 use crate::terminal::TerminalProfile;
 
 pub(super) const ATTACH_CONTROL_BACKLOG_LIMIT: usize = 64;
+
+#[derive(Default)]
+struct AttachControlIdentityExpectation {
+    attach_id: Option<u64>,
+    current_session_id: Option<SessionId>,
+    next_session: Option<(SessionName, SessionId)>,
+    target_selection: Option<SwitchTargetSelection>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(in crate::handler) struct AttachControlIdentityPause {
+    pub(in crate::handler) reached: tokio::sync::Notify,
+    pub(in crate::handler) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static ATTACH_CONTROL_IDENTITY_PAUSE: std::sync::Mutex<
+    Option<(u32, std::sync::Arc<AttachControlIdentityPause>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(in crate::handler) fn install_attach_control_identity_pause(
+    attach_pid: u32,
+) -> std::sync::Arc<AttachControlIdentityPause> {
+    let pause = std::sync::Arc::new(AttachControlIdentityPause::default());
+    *ATTACH_CONTROL_IDENTITY_PAUSE
+        .lock()
+        .expect("attach control identity pause lock") = Some((attach_pid, pause.clone()));
+    pause
+}
+
+#[cfg(test)]
+async fn pause_after_attach_control_identity_capture(attach_pid: u32) {
+    let pause = {
+        let mut installed = ATTACH_CONTROL_IDENTITY_PAUSE
+            .lock()
+            .expect("attach control identity pause lock");
+        let matches_pid = installed
+            .as_ref()
+            .is_some_and(|(paused_pid, _)| *paused_pid == attach_pid);
+        matches_pid.then(|| {
+            installed
+                .take()
+                .expect("matching pause remains installed")
+                .1
+        })
+    };
+    let Some(pause) = pause else {
+        return;
+    };
+    pause.reached.notify_one();
+    pause.release.notified().await;
+}
 
 #[path = "handler_attach/key_table.rs"]
 mod key_table;
@@ -30,10 +85,13 @@ mod resize_policy;
 mod state;
 
 pub(crate) use crate::client_flags::ClientFlags;
-pub(in crate::handler) use resize_policy::AttachedWindowSizePolicy;
+pub(in crate::handler) use resize_policy::{
+    surviving_attached_resize_targets, AttachedWindowSizePolicy,
+};
 pub(crate) use state::AttachRegistration;
 pub(super) use state::{
-    ActiveAttach, ActiveAttachState, DisplayPanesClientState, DisplayPanesLabel,
+    ActiveAttach, ActiveAttachIdentity, ActiveAttachState, DisplayPanesClientState,
+    DisplayPanesLabel,
 };
 
 impl RequestHandler {
@@ -79,9 +137,10 @@ impl RequestHandler {
             .map(|active| active.terminal_context.clone())
     }
 
-    pub(super) async fn terminal_context_and_size_for_attached_client(
+    pub(super) async fn terminal_context_and_size_for_attached_client_identity(
         &self,
         attach_pid: u32,
+        expected_attach_id: u64,
     ) -> Option<(
         OuterTerminalContext,
         TerminalSize,
@@ -90,15 +149,19 @@ impl RequestHandler {
         ClientFlags,
     )> {
         let active_attach = self.active_attach.lock().await;
-        active_attach.by_pid.get(&attach_pid).map(|active| {
-            (
-                active.terminal_context.clone(),
-                active.client_size,
-                active.client_pixels,
-                active.render_stream,
-                active.flags,
-            )
-        })
+        active_attach
+            .by_pid
+            .get(&attach_pid)
+            .filter(|active| active.id == expected_attach_id)
+            .map(|active| {
+                (
+                    active.terminal_context.clone(),
+                    active.client_size,
+                    active.client_pixels,
+                    active.render_stream,
+                    active.flags,
+                )
+            })
     }
 
     pub(super) async fn attached_session_name_for_command(
@@ -154,17 +217,169 @@ impl RequestHandler {
         attach_pid: u32,
         command: AttachControl,
         command_name: &str,
-        next_session_name: Option<rmux_proto::SessionName>,
     ) -> Result<rmux_proto::SessionName, rmux_proto::RmuxError> {
+        if matches!(command, AttachControl::Switch(_)) {
+            return Err(rmux_proto::RmuxError::Server(
+                "session switch requires a stable session identity".to_owned(),
+            ));
+        }
+        self.send_attach_control_with_expected_identity(
+            attach_pid,
+            command,
+            command_name,
+            AttachControlIdentityExpectation::default(),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn send_attach_control_for_session_identity(
+        &self,
+        attach_pid: u32,
+        command: AttachControl,
+        command_name: &str,
+        next_session_name: rmux_proto::SessionName,
+        expected_session_id: rmux_proto::SessionId,
+    ) -> Result<rmux_proto::SessionName, rmux_proto::RmuxError> {
+        self.send_attach_control_with_expected_identity(
+            attach_pid,
+            command,
+            command_name,
+            AttachControlIdentityExpectation {
+                next_session: Some((next_session_name, expected_session_id)),
+                ..AttachControlIdentityExpectation::default()
+            },
+        )
+        .await
+    }
+
+    pub(super) async fn send_attach_control_for_client_and_session_identity(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: u64,
+        command: AttachControl,
+        next_session_name: rmux_proto::SessionName,
+        expected_session_id: rmux_proto::SessionId,
+        target_selection: Option<SwitchTargetSelection>,
+    ) -> Result<rmux_proto::SessionName, rmux_proto::RmuxError> {
+        self.send_attach_control_with_expected_identity(
+            attach_pid,
+            command,
+            "switch-client",
+            AttachControlIdentityExpectation {
+                attach_id: Some(expected_attach_id),
+                next_session: Some((next_session_name, expected_session_id)),
+                target_selection,
+                ..AttachControlIdentityExpectation::default()
+            },
+        )
+        .await
+    }
+
+    pub(super) async fn send_attach_control_for_client_identity(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: u64,
+        command: AttachControl,
+        command_name: &str,
+    ) -> Result<rmux_proto::SessionName, rmux_proto::RmuxError> {
+        if matches!(command, AttachControl::Switch(_)) {
+            return Err(rmux_proto::RmuxError::Server(
+                "session switch requires a stable session identity".to_owned(),
+            ));
+        }
+        self.send_attach_control_with_expected_identity(
+            attach_pid,
+            command,
+            command_name,
+            AttachControlIdentityExpectation {
+                attach_id: Some(expected_attach_id),
+                ..AttachControlIdentityExpectation::default()
+            },
+        )
+        .await
+    }
+
+    pub(super) async fn send_attach_control_for_client_current_session_identity(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: u64,
+        expected_current_session_id: rmux_proto::SessionId,
+        command: AttachControl,
+        command_name: &str,
+    ) -> Result<rmux_proto::SessionName, rmux_proto::RmuxError> {
+        if matches!(command, AttachControl::Switch(_)) {
+            return Err(rmux_proto::RmuxError::Server(
+                "session switch requires a stable target session identity".to_owned(),
+            ));
+        }
+        self.send_attach_control_with_expected_identity(
+            attach_pid,
+            command,
+            command_name,
+            AttachControlIdentityExpectation {
+                attach_id: Some(expected_attach_id),
+                current_session_id: Some(expected_current_session_id),
+                ..AttachControlIdentityExpectation::default()
+            },
+        )
+        .await
+    }
+
+    async fn send_attach_control_with_expected_identity(
+        &self,
+        attach_pid: u32,
+        command: AttachControl,
+        command_name: &str,
+        identity: AttachControlIdentityExpectation,
+    ) -> Result<rmux_proto::SessionName, rmux_proto::RmuxError> {
+        let expected_attach_id = identity.attach_id;
+        let expected_current_session_id = identity.current_session_id;
+        let target_selection = identity.target_selection;
+        let (next_session_name, expected_next_session_id) = identity
+            .next_session
+            .map_or((None, None), |(name, session_id)| {
+                (Some(name), Some(session_id))
+            });
         let is_switch = matches!(command, AttachControl::Switch(_));
+        let next_session_id = if let Some(session_name) = next_session_name.as_ref() {
+            let state = self.state.lock().await;
+            let session_id = state
+                .sessions
+                .session(session_name)
+                .ok_or_else(|| rmux_proto::RmuxError::SessionNotFound(session_name.to_string()))?
+                .id();
+            if expected_next_session_id.is_some_and(|expected| expected != session_id) {
+                return Err(rmux_proto::RmuxError::SessionNotFound(
+                    session_name.to_string(),
+                ));
+            }
+            Some(session_id)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        pause_after_attach_control_identity_capture(attach_pid).await;
         let switch_changes_session = if is_switch {
-            self.attach_switch_changes_session(attach_pid, next_session_name.as_ref(), command_name)
-                .await?
+            self.attach_switch_changes_session(
+                attach_pid,
+                expected_attach_id,
+                next_session_name.as_ref(),
+                next_session_id,
+                command_name,
+            )
+            .await?
         } else {
             false
         };
         let mode_tree_refresh_sessions = if switch_changes_session {
-            self.dismiss_mode_tree(attach_pid).await?
+            match expected_attach_id {
+                Some(attach_id) => {
+                    self.dismiss_mode_tree_for_client_identity(attach_pid, attach_id)
+                        .await?
+                }
+                None => self.dismiss_mode_tree(attach_pid).await?,
+            }
         } else {
             Vec::new()
         };
@@ -176,18 +391,55 @@ impl RequestHandler {
                 | AttachControl::DetachKill
                 | AttachControl::DetachExecShellCommand(_)
         );
+        // Keep the model generation stable until the attached client has been
+        // updated. Otherwise a kill/recreate of the same session name between
+        // target construction and this assignment can bind the client to a
+        // stale target while recording the replacement session's name.
+        let mut state = self.state.lock().await;
+        if let (Some(session_name), Some(expected_session_id)) =
+            (next_session_name.as_ref(), next_session_id)
+        {
+            let current_session_id = state
+                .sessions
+                .session(session_name)
+                .map(rmux_core::Session::id);
+            if current_session_id != Some(expected_session_id) {
+                return Err(rmux_proto::RmuxError::SessionNotFound(
+                    session_name.to_string(),
+                ));
+            }
+        }
         let mut active_attach = self.active_attach.lock().await;
         let Some(active) = active_attach.by_pid.get_mut(&attach_pid) else {
             return Err(attached_client_required(command_name));
         };
+        if expected_attach_id.is_some_and(|expected| active.id != expected) {
+            return Err(attached_client_required(command_name));
+        }
+        if expected_current_session_id.is_some_and(|expected| active.session_id != expected) {
+            return Err(attached_client_required(command_name));
+        }
+        if let Some(selection) = target_selection.as_ref() {
+            if !is_switch {
+                return Err(rmux_proto::RmuxError::Server(
+                    "target selection requires a session switch".to_owned(),
+                ));
+            }
+            let session_name = next_session_name
+                .as_ref()
+                .expect("a switch target selection carries a session");
+            let session_id = next_session_id
+                .expect("a switch target selection carries a stable session identity");
+            selection.validate_for_session_identity(&state, session_name, session_id)?;
+        }
         let previous_session_name = active.session_name.clone();
         let mut overlay_to_terminate = None;
 
-        if is_switch
-            && next_session_name
-                .as_ref()
-                .is_some_and(|session_name| session_name != &active.session_name)
-        {
+        let switches_session_identity = next_session_name.as_ref().is_some_and(|session_name| {
+            session_name != &active.session_name
+                || next_session_id.is_some_and(|session_id| session_id != active.session_id)
+        });
+        if is_switch && switches_session_identity {
             overlay_to_terminate = reset_interactive_attach_state_for_session_switch(active);
         }
         let closing_control = matches!(
@@ -204,10 +456,13 @@ impl RequestHandler {
             );
         if render_stream_switch_refresh {
             if let Some(session_name) = next_session_name {
-                if session_name != active.session_name {
+                if switches_session_identity {
                     active.last_session = Some(active.session_name.clone());
+                    active.last_session_id = Some(active.session_id);
                 }
                 active.session_name = session_name;
+                active.session_id = next_session_id
+                    .expect("a session switch target must carry its stable identity");
             }
             if !active.render_refresh_pending {
                 active.render_refresh_pending = true;
@@ -217,9 +472,28 @@ impl RequestHandler {
                     return Err(attached_client_required(command_name));
                 }
             }
+            if let Some(selection) = target_selection.as_ref() {
+                selection
+                    .apply_to_state(&mut state)
+                    .expect("prevalidated switch selection remains applicable while locked");
+            }
+            if expected_attach_id.is_some() {
+                state
+                    .sessions
+                    .session_mut(&active.session_name)
+                    .expect("switch target stayed locked across the attached client update")
+                    .touch_attached();
+            }
             drop(active_attach);
+            drop(state);
             if clear_prompt {
-                self.clear_prompt_for_attach(attach_pid).await;
+                match expected_attach_id {
+                    Some(attach_id) => {
+                        self.clear_prompt_for_attach_identity(attach_pid, attach_id)
+                            .await;
+                    }
+                    None => self.clear_prompt_for_attach(attach_pid).await,
+                }
             }
             for session_name in mode_tree_refresh_sessions {
                 self.refresh_attached_session(&session_name).await;
@@ -257,19 +531,41 @@ impl RequestHandler {
             self.bump_active_attach_epoch();
             return Err(attached_client_required(command_name));
         }
+        if let Some(selection) = target_selection.as_ref() {
+            selection
+                .apply_to_state(&mut state)
+                .expect("prevalidated switch selection remains applicable while locked");
+        }
         if closing_control {
             active.closing.store(true, Ordering::SeqCst);
         }
         if let Some(session_name) = next_session_name {
-            if session_name != active.session_name {
+            if switches_session_identity {
                 active.last_session = Some(active.session_name.clone());
+                active.last_session_id = Some(active.session_id);
             }
             active.session_name = session_name;
+            active.session_id =
+                next_session_id.expect("a session switch target must carry its stable identity");
+        }
+        if is_switch && expected_attach_id.is_some() {
+            state
+                .sessions
+                .session_mut(&active.session_name)
+                .expect("switch target stayed locked across the attached client update")
+                .touch_attached();
         }
         drop(active_attach);
+        drop(state);
 
         if clear_prompt {
-            self.clear_prompt_for_attach(attach_pid).await;
+            match expected_attach_id {
+                Some(attach_id) => {
+                    self.clear_prompt_for_attach_identity(attach_pid, attach_id)
+                        .await;
+                }
+                None => self.clear_prompt_for_attach(attach_pid).await,
+            }
         }
         for session_name in mode_tree_refresh_sessions {
             self.refresh_attached_session(&session_name).await;
@@ -282,7 +578,9 @@ impl RequestHandler {
     async fn attach_switch_changes_session(
         &self,
         attach_pid: u32,
+        expected_attach_id: Option<u64>,
         next_session_name: Option<&rmux_proto::SessionName>,
+        next_session_id: Option<rmux_proto::SessionId>,
         command_name: &str,
     ) -> Result<bool, rmux_proto::RmuxError> {
         let Some(next_session_name) = next_session_name else {
@@ -293,39 +591,55 @@ impl RequestHandler {
             .by_pid
             .get(&attach_pid)
             .ok_or_else(|| attached_client_required(command_name))?;
-        Ok(next_session_name != &active.session_name)
+        if expected_attach_id.is_some_and(|expected| active.id != expected) {
+            return Err(attached_client_required(command_name));
+        }
+        Ok(next_session_name != &active.session_name
+            || next_session_id.is_some_and(|session_id| session_id != active.session_id))
     }
 
-    pub(super) async fn exit_attached_session(&self, session_name: &rmux_proto::SessionName) {
-        self.close_attached_session(session_name, || AttachControl::Exited)
+    pub(super) async fn exit_attached_session_identity(
+        &self,
+        session_name: &rmux_proto::SessionName,
+        session_id: rmux_proto::SessionId,
+    ) {
+        self.close_attached_session(session_name, session_id, || AttachControl::Exited)
             .await;
     }
 
     async fn close_attached_session<F>(
         &self,
         session_name: &rmux_proto::SessionName,
+        session_id: rmux_proto::SessionId,
         mut control: F,
     ) where
         F: FnMut() -> AttachControl,
     {
         let mut overlay_jobs = Vec::new();
+        let mut removed_pids = Vec::new();
         let mut active_attach = self.active_attach.lock().await;
         for active in active_attach.by_pid.values_mut() {
-            if active.last_session.as_ref() == Some(session_name) {
+            if active.last_session.as_ref() == Some(session_name)
+                && active.last_session_id == Some(session_id)
+            {
                 active.last_session = None;
+                active.last_session_id = None;
             }
         }
-        active_attach.by_pid.retain(|_, active| {
-            if &active.session_name != session_name {
+        active_attach.by_pid.retain(|pid, active| {
+            if &active.session_name != session_name || active.session_id != session_id {
                 return true;
             }
 
             overlay_jobs.push(active.overlay.take());
+            removed_pids.push(*pid);
             let _ = active.control_tx.send(control());
             active.closing.store(true, Ordering::SeqCst);
             false
         });
-        active_attach.forget_session_windows(session_name);
+        for pid in removed_pids {
+            active_attach.forget_attached_client_windows(pid);
+        }
         drop(active_attach);
         self.bump_active_attach_epoch();
         for overlay in overlay_jobs {
@@ -489,20 +803,33 @@ pub(super) fn attach_target_for_session(
             terminal_context,
             render_size: None,
             window_index: None,
+            selection: None,
             master: AttachTargetMaster::Clone,
             socket_path,
         },
     )
 }
 
-#[cfg(feature = "web")]
-pub(super) fn attach_render_target_for_session(
+pub(super) fn attach_target_for_session_switch(
     state: &HandlerState,
     session_name: &rmux_proto::SessionName,
     attached_count: usize,
     terminal_context: &OuterTerminalContext,
     socket_path: &Path,
+    render_stream: bool,
+    selection: Option<&SwitchTargetSelection>,
 ) -> Result<AttachTarget, rmux_proto::RmuxError> {
+    #[cfg(feature = "web")]
+    let master = if render_stream {
+        AttachTargetMaster::Omit
+    } else {
+        AttachTargetMaster::Clone
+    };
+    #[cfg(not(feature = "web"))]
+    let master = {
+        let _ = render_stream;
+        AttachTargetMaster::Clone
+    };
     attach_target_for_session_with_prompt(
         state,
         session_name,
@@ -513,7 +840,8 @@ pub(super) fn attach_render_target_for_session(
             terminal_context,
             render_size: None,
             window_index: None,
-            master: AttachTargetMaster::Omit,
+            selection,
+            master,
             socket_path,
         },
     )
@@ -538,6 +866,7 @@ pub(super) fn attach_render_target_for_session_window(
             terminal_context,
             render_size: None,
             window_index,
+            selection: None,
             master: AttachTargetMaster::Omit,
             socket_path,
         },
@@ -560,6 +889,7 @@ pub(super) fn attach_render_target_for_session_with_prompt(
             terminal_context: request.terminal_context,
             render_size: request.render_size,
             window_index: None,
+            selection: None,
             master: AttachTargetMaster::Omit,
             socket_path: request.socket_path,
         },
@@ -586,6 +916,7 @@ struct AttachTargetRenderOptions<'a> {
     terminal_context: &'a OuterTerminalContext,
     render_size: Option<TerminalSize>,
     window_index: Option<u32>,
+    selection: Option<&'a SwitchTargetSelection>,
     master: AttachTargetMaster,
     socket_path: &'a Path,
 }
@@ -600,14 +931,13 @@ fn attach_target_for_session_with_prompt(
         .sessions
         .session(session_name)
         .ok_or_else(|| session_not_found(session_name))?;
-    let session =
-        attach_render_session(canonical_session, options.render_size, options.window_index);
+    let session = attach_render_session(
+        canonical_session,
+        options.render_size,
+        options.window_index,
+        options.selection,
+    )?;
     let session = session.as_ref();
-    let outer_terminal = OuterTerminal::resolve_for_session(
-        &state.options,
-        Some(session_name),
-        options.terminal_context.clone(),
-    );
     let pane_output_sender = state.pane_output_for_target(
         session_name,
         session.active_window_index(),
@@ -621,6 +951,23 @@ fn attach_target_for_session_with_prompt(
     let pane_state = session
         .active_pane_id()
         .and_then(|pane_id| state.pane_screen_state(session_name, pane_id));
+    // A kept-dead pane retains its transcript for capture and rendering, but
+    // no live application remains to consume outer mouse reports. Do not let
+    // stale DECSET 1000/1002/1003 bits from that transcript keep the client's
+    // terminal in mouse-tracking mode after remain-on-exit refreshes it.
+    let active_pane_mouse_mode = active_pane.as_ref().map_or(0, |pane| {
+        if state.pane_is_dead(session_name, pane.id()) {
+            0
+        } else {
+            pane_state.as_ref().map_or(0, |pane_state| pane_state.mode)
+        }
+    });
+    let outer_terminal = OuterTerminal::resolve_for_session(
+        &state.options,
+        Some(session_name),
+        options.terminal_context.clone(),
+    )
+    .with_active_pane_mouse_mode(active_pane_mouse_mode);
     let cursor_scope = match options.prompt {
         Some(prompt) if prompt.command_prompt => CursorScope::CommandPrompt,
         Some(_) => CursorScope::Prompt,
@@ -746,15 +1093,8 @@ fn attach_target_for_session_with_prompt(
         terminal_passthrough_allowed && outer_terminal.supports_kitty_graphics();
     let sixel_passthrough = terminal_passthrough_allowed && outer_terminal.supports_sixel();
 
-    let input_target = PaneTarget::with_window(
-        session_name.clone(),
-        session.active_window_index(),
-        active_pane.as_ref().map_or(0, rmux_core::Pane::index),
-    );
-
     Ok(AttachTarget {
         session_name: session_name.clone(),
-        input_target,
         pane_master: match options.master {
             AttachTargetMaster::Clone if !active_pane_is_starting => {
                 Some(state.active_pane_master(session_name)?)
@@ -790,24 +1130,35 @@ pub(super) fn sized_session(
     Cow::Owned(resized)
 }
 
-fn attach_render_session(
-    session: &rmux_core::Session,
+fn attach_render_session<'a>(
+    session: &'a rmux_core::Session,
     size: Option<TerminalSize>,
     window_index: Option<u32>,
-) -> Cow<'_, rmux_core::Session> {
+    selection: Option<&SwitchTargetSelection>,
+) -> Result<Cow<'a, rmux_core::Session>, rmux_proto::RmuxError> {
     let sized = sized_session(session, size);
+    if let Some(selection) = selection {
+        if selection.session_name() != session.name() {
+            return Err(rmux_proto::RmuxError::Server(
+                "switch render selection changed sessions before commit".to_owned(),
+            ));
+        }
+        let mut selected = sized.into_owned();
+        selection.apply_to_session(&mut selected)?;
+        return Ok(Cow::Owned(selected));
+    }
     let Some(window_index) = window_index else {
-        return sized;
+        return Ok(sized);
     };
     if sized.active_window_index() == window_index || !sized.windows().contains_key(&window_index) {
-        return sized;
+        return Ok(sized);
     }
 
     let mut selected = sized.into_owned();
     selected
         .select_window(window_index)
         .expect("selected web render window was validated above");
-    Cow::Owned(selected)
+    Ok(Cow::Owned(selected))
 }
 
 fn pane_passthrough_enabled(
@@ -866,13 +1217,18 @@ pub(super) fn option_affects_attached_rendering(option: rmux_proto::OptionName) 
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use rmux_core::{command_parser::CommandParser, OptionStore, PaneGeometry};
     use rmux_os::identity::UserIdentity;
-    use rmux_proto::{NewSessionRequest, PaneTarget, Request, Response, SessionName, TerminalSize};
+    use rmux_proto::{
+        KillSessionRequest, NewSessionRequest, OptionName, Request, Response, ScopeSelector,
+        SessionName, SetOptionMode, TerminalSize,
+    };
     use tokio::sync::mpsc;
 
     use super::{
+        attach_target_for_session, install_attach_control_identity_pause,
         reset_interactive_attach_state_for_session_switch, ActiveAttach, AttachRegistration,
         RequestHandler, ATTACH_CONTROL_BACKLOG_LIMIT,
     };
@@ -887,6 +1243,7 @@ mod tests {
     async fn attach_control_backlog_limit_removes_slow_client() {
         let handler = RequestHandler::new();
         let session_name = SessionName::new("alpha").expect("valid session name");
+        create_test_session(&handler, &session_name).await;
         let (control_tx, _control_rx) = mpsc::unbounded_channel();
         let control_backlog = Arc::new(AtomicUsize::new(ATTACH_CONTROL_BACKLOG_LIMIT));
         let uid = current_owner_uid();
@@ -895,6 +1252,7 @@ mod tests {
             .register_attach_with_access(
                 77,
                 session_name.clone(),
+                None,
                 AttachRegistration {
                     control_tx,
                     control_backlog: control_backlog.clone(),
@@ -909,10 +1267,11 @@ mod tests {
                     client_size: Some(TerminalSize { cols: 80, rows: 24 }),
                 },
             )
-            .await;
+            .await
+            .expect("attach registration succeeds");
 
         let error = handler
-            .send_attach_control(77, AttachControl::Refresh, "refresh-client", None)
+            .send_attach_control(77, AttachControl::Refresh, "refresh-client")
             .await
             .expect_err("overloaded attach client should reject refresh");
 
@@ -928,6 +1287,7 @@ mod tests {
     async fn render_stream_refresh_substitution_does_not_advance_render_generation() {
         let handler = RequestHandler::new();
         let session_name = SessionName::new("alpha").expect("valid session name");
+        create_test_session(&handler, &session_name).await;
         let (control_tx, mut control_rx) = mpsc::unbounded_channel();
         let control_backlog = Arc::new(AtomicUsize::new(0));
         let uid = current_owner_uid();
@@ -936,6 +1296,7 @@ mod tests {
             .register_attach_with_access(
                 77,
                 session_name.clone(),
+                None,
                 AttachRegistration {
                     control_tx,
                     control_backlog: control_backlog.clone(),
@@ -950,13 +1311,13 @@ mod tests {
                     client_size: Some(TerminalSize { cols: 80, rows: 24 }),
                 },
             )
-            .await;
+            .await
+            .expect("attach registration succeeds");
 
         let pane_output = pane_output_channel();
         let (pane_output_start_sequence, pane_output) = pane_output.subscribe_live_from_now();
         let target = AttachTarget {
             session_name: session_name.clone(),
-            input_target: PaneTarget::new(session_name.clone(), 0),
             pane_master: None,
             pane_output,
             pane_output_start_sequence,
@@ -973,13 +1334,15 @@ mod tests {
             persistent_overlay_state_id: None,
             live_pane: None,
         };
+        let target_session_id = test_session_id(&handler, &session_name).await;
 
         handler
-            .send_attach_control(
+            .send_attach_control_for_session_identity(
                 77,
                 AttachControl::switch(target),
                 "switch-client",
-                Some(session_name.clone()),
+                session_name.clone(),
+                target_session_id,
             )
             .await
             .expect("render-stream refresh substitution should be accepted");
@@ -1044,7 +1407,6 @@ mod tests {
         let (pane_output_start_sequence, pane_output) = pane_output.subscribe_live_from_now();
         let target = AttachTarget {
             session_name: beta.clone(),
-            input_target: PaneTarget::new(beta.clone(), 0),
             pane_master: None,
             pane_output,
             pane_output_start_sequence,
@@ -1061,13 +1423,15 @@ mod tests {
             persistent_overlay_state_id: None,
             live_pane: None,
         };
+        let target_session_id = test_session_id(&handler, &beta).await;
 
         handler
-            .send_attach_control(
+            .send_attach_control_for_session_identity(
                 77,
                 AttachControl::switch(target),
                 "switch-client",
-                Some(beta),
+                beta,
+                target_session_id,
             )
             .await
             .expect("session switch succeeds");
@@ -1090,6 +1454,251 @@ mod tests {
         assert!(active.mode_tree_frame.is_none());
     }
 
+    #[tokio::test]
+    async fn session_switch_fails_closed_when_target_name_is_recreated_after_capture() {
+        let handler = RequestHandler::new();
+        let alpha = SessionName::new("switch-identity-alpha").expect("valid session name");
+        let beta = SessionName::new("switch-identity-beta").expect("valid session name");
+        create_test_session(&handler, &alpha).await;
+        create_test_session(&handler, &beta).await;
+
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        handler
+            .register_attach(91_337, alpha.clone(), control_tx)
+            .await;
+        let alpha_id = handler
+            .active_attach
+            .lock()
+            .await
+            .by_pid
+            .get(&91_337)
+            .expect("attach exists")
+            .session_id;
+
+        let pane_output = pane_output_channel();
+        let (pane_output_start_sequence, pane_output) = pane_output.subscribe_live_from_now();
+        let target = AttachTarget {
+            session_name: beta.clone(),
+            pane_master: None,
+            pane_output,
+            pane_output_start_sequence,
+            render_frame: b"BETA".to_vec(),
+            outer_terminal: OuterTerminal::resolve(
+                &OptionStore::default(),
+                OuterTerminalContext::default(),
+            ),
+            cursor_style: 0,
+            active_pane_geometry: PaneGeometry::new(0, 0, 80, 24),
+            raw_passthrough: false,
+            kitty_graphics_passthrough: false,
+            sixel_passthrough: false,
+            persistent_overlay_state_id: None,
+            live_pane: None,
+        };
+        let target_session_id = test_session_id(&handler, &beta).await;
+        let pause = install_attach_control_identity_pause(91_337);
+        let switch_handler = handler.clone();
+        let switch_beta = beta.clone();
+        let switch = tokio::spawn(async move {
+            switch_handler
+                .send_attach_control_for_session_identity(
+                    91_337,
+                    AttachControl::switch(target),
+                    "switch-client",
+                    switch_beta,
+                    target_session_id,
+                )
+                .await
+        });
+
+        pause.reached.notified().await;
+        let killed = handler
+            .handle(Request::KillSession(KillSessionRequest {
+                target: beta.clone(),
+                kill_all_except_target: false,
+                clear_alerts: false,
+                kill_group: false,
+            }))
+            .await;
+        assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
+        create_test_session(&handler, &beta).await;
+        pause.release.notify_one();
+
+        assert_eq!(
+            switch.await.expect("switch task joins"),
+            Err(rmux_proto::RmuxError::SessionNotFound(beta.to_string()))
+        );
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach.by_pid.get(&91_337).expect("attach survives");
+        assert_eq!(
+            (&active.session_name, active.session_id),
+            (&alpha, alpha_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_detach_skips_same_attach_generation_after_session_switch() {
+        let handler = RequestHandler::new();
+        let alpha = SessionName::new("detach-current-alpha").expect("valid session name");
+        let beta = SessionName::new("detach-current-beta").expect("valid session name");
+        create_test_session(&handler, &alpha).await;
+        create_test_session(&handler, &beta).await;
+
+        let attach_pid = 91_341;
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let attach_id = handler
+            .register_attach(attach_pid, alpha.clone(), control_tx)
+            .await;
+        let terminal_context = handler
+            .terminal_context_for_attached_client(attach_pid)
+            .await
+            .expect("attach terminal context exists");
+        let (alpha_id, beta_id, beta_target) = {
+            let state = handler.state.lock().await;
+            let alpha_id = state.sessions.session(&alpha).expect("alpha exists").id();
+            let beta_id = state.sessions.session(&beta).expect("beta exists").id();
+            let beta_target = attach_target_for_session(
+                &state,
+                &beta,
+                1,
+                &terminal_context,
+                &handler.socket_path(),
+            )
+            .expect("beta target builds");
+            (alpha_id, beta_id, beta_target)
+        };
+
+        let pause = install_attach_control_identity_pause(attach_pid);
+        let detach_handler = handler.clone();
+        let detach_alpha = alpha.clone();
+        let detach = tokio::spawn(async move {
+            detach_handler
+                .detach_other_attach_clients_for_session_identity(
+                    &detach_alpha,
+                    alpha_id,
+                    attach_pid + 1,
+                    false,
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), pause.reached.notified())
+            .await
+            .expect("detach reaches the final identity check");
+        assert_eq!(
+            handler
+                .send_attach_control_for_client_and_session_identity(
+                    attach_pid,
+                    attach_id,
+                    AttachControl::switch(beta_target),
+                    beta.clone(),
+                    beta_id,
+                    None,
+                )
+                .await
+                .expect("concurrent switch succeeds"),
+            alpha
+        );
+        pause.release.notify_one();
+        detach
+            .await
+            .expect("detach task joins")
+            .expect("original session remains available");
+
+        let mut saw_switch = false;
+        while let Ok(control) = control_rx.try_recv() {
+            match control {
+                AttachControl::Switch(_) => saw_switch = true,
+                AttachControl::Detach | AttachControl::DetachKill => {
+                    panic!("stale detach must not reach the switched client")
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_switch,
+            "the production switch control must be delivered"
+        );
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&attach_pid)
+            .expect("switched attach survives");
+        assert_eq!(active.id, attach_id);
+        assert_eq!((&active.session_name, active.session_id), (&beta, beta_id));
+        assert!(!active.closing.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn session_switch_rejects_target_built_for_replaced_session_identity() {
+        let handler = RequestHandler::new();
+        let alpha = SessionName::new("switch-built-alpha").expect("valid session name");
+        let beta = SessionName::new("switch-built-beta").expect("valid session name");
+        create_test_session(&handler, &alpha).await;
+        create_test_session(&handler, &beta).await;
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        handler
+            .register_attach(91_339, alpha.clone(), control_tx)
+            .await;
+        let terminal_context = handler
+            .terminal_context_for_attached_client(91_339)
+            .await
+            .expect("attach terminal context exists");
+        let (target, target_session_id) = {
+            let state = handler.state.lock().await;
+            let target_session_id = state.sessions.session(&beta).expect("old beta exists").id();
+            let target = attach_target_for_session(
+                &state,
+                &beta,
+                1,
+                &terminal_context,
+                &handler.socket_path(),
+            )
+            .expect("old beta target builds");
+            (target, target_session_id)
+        };
+
+        let killed = handler
+            .handle(Request::KillSession(KillSessionRequest {
+                target: beta.clone(),
+                kill_all_except_target: false,
+                clear_alerts: false,
+                kill_group: false,
+            }))
+            .await;
+        assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
+        create_test_session(&handler, &beta).await;
+
+        assert_eq!(
+            handler
+                .send_attach_control_for_session_identity(
+                    91_339,
+                    AttachControl::switch(target),
+                    "switch-client",
+                    beta.clone(),
+                    target_session_id,
+                )
+                .await,
+            Err(rmux_proto::RmuxError::SessionNotFound(beta.to_string()))
+        );
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let active_attach = handler.active_attach.lock().await;
+        assert_eq!(
+            active_attach
+                .by_pid
+                .get(&91_339)
+                .map(|active| active.session_name.clone()),
+            Some(alpha)
+        );
+    }
+
     #[test]
     fn session_switch_resets_stale_interactive_overlay_state() {
         let session_name = SessionName::new("alpha").expect("valid session name");
@@ -1099,7 +1708,9 @@ mod tests {
         let mut active = ActiveAttach {
             id: 1,
             session_name,
+            session_id: rmux_proto::SessionId::new(1),
             last_session: None,
+            last_session_id: None,
             flags: ClientFlags::default(),
             pan_window: Some(2),
             pan_ox: 3,
@@ -1153,5 +1764,149 @@ mod tests {
         assert_eq!(active.overlay_state_id, 14);
         assert_eq!(active.display_panes_state_id, 18);
         assert_eq!(active.render_generation, 5);
+    }
+
+    #[tokio::test]
+    async fn stale_session_cleanup_preserves_attach_for_recreated_identity() {
+        let handler = RequestHandler::new();
+        let session_name = SessionName::new("reused").expect("valid session name");
+        create_test_session(&handler, &session_name).await;
+        let old_session_id = handler
+            .state
+            .lock()
+            .await
+            .sessions
+            .session(&session_name)
+            .expect("session exists")
+            .id();
+        let (old_tx, mut old_rx) = mpsc::unbounded_channel();
+        let (new_tx, mut new_rx) = mpsc::unbounded_channel();
+        let _old_attach = handler
+            .register_attach(77, session_name.clone(), old_tx)
+            .await;
+        let _new_attach = handler
+            .register_attach(88, session_name.clone(), new_tx)
+            .await;
+        let new_session_id = rmux_proto::SessionId::new(old_session_id.as_u32() + 1);
+        handler
+            .active_attach
+            .lock()
+            .await
+            .by_pid
+            .get_mut(&88)
+            .expect("new attach exists")
+            .session_id = new_session_id;
+
+        handler
+            .exit_attached_session_identity(&session_name, old_session_id)
+            .await;
+
+        assert!(matches!(old_rx.try_recv(), Ok(AttachControl::Exited)));
+        assert!(matches!(
+            new_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let active_attach = handler.active_attach.lock().await;
+        assert!(!active_attach.by_pid.contains_key(&77));
+        assert_eq!(
+            active_attach
+                .by_pid
+                .get(&88)
+                .map(|active| active.session_id),
+            Some(new_session_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn finishing_stale_attach_does_not_destroy_recreated_unattached_session() {
+        let handler = RequestHandler::new();
+        let session_name = SessionName::new("attach-finish-reused").expect("valid session name");
+        create_test_session(&handler, &session_name).await;
+        let old_session_id = handler
+            .state
+            .lock()
+            .await
+            .sessions
+            .session(&session_name)
+            .expect("old session exists")
+            .id();
+        let killed = handler
+            .handle(Request::KillSession(KillSessionRequest {
+                target: session_name.clone(),
+                kill_all_except_target: false,
+                clear_alerts: false,
+                kill_group: false,
+            }))
+            .await;
+        assert!(matches!(killed, Response::KillSession(_)), "{killed:?}");
+        create_test_session(&handler, &session_name).await;
+        let new_session_id = {
+            let mut state = handler.state.lock().await;
+            let session_id = state
+                .sessions
+                .session(&session_name)
+                .expect("new session exists")
+                .id();
+            state
+                .options
+                .set(
+                    ScopeSelector::Session(session_name.clone()),
+                    OptionName::DestroyUnattached,
+                    "on".to_owned(),
+                    SetOptionMode::Replace,
+                )
+                .expect("destroy-unattached option is valid");
+            session_id
+        };
+        assert_ne!(new_session_id, old_session_id);
+        let (control_tx, _control_rx) = mpsc::unbounded_channel();
+        let attach_id = handler
+            .register_attach(91_338, session_name.clone(), control_tx)
+            .await;
+        handler
+            .active_attach
+            .lock()
+            .await
+            .by_pid
+            .get_mut(&91_338)
+            .expect("attach exists")
+            .session_id = old_session_id;
+
+        handler.finish_attach(91_338, attach_id).await;
+
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state
+                .sessions
+                .session(&session_name)
+                .map(rmux_core::Session::id),
+            Some(new_session_id)
+        );
+    }
+
+    async fn create_test_session(handler: &RequestHandler, session_name: &SessionName) {
+        let response = handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: session_name.clone(),
+                detached: true,
+                size: None,
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(response, Response::NewSession(_)));
+    }
+
+    async fn test_session_id(
+        handler: &RequestHandler,
+        session_name: &SessionName,
+    ) -> rmux_proto::SessionId {
+        handler
+            .state
+            .lock()
+            .await
+            .sessions
+            .session(session_name)
+            .expect("test session exists")
+            .id()
     }
 }

@@ -115,8 +115,8 @@ impl RequestHandler {
         client_name: Option<String>,
     ) -> HandleOutcome {
         match (request, client_name) {
-            (Request::RunShell(request), Some(client_name)) => HandleOutcome::response(
-                self.handle_run_shell_with_client_name(requester_pid, *request, Some(client_name))
+            (Request::RunShell(request), client_name) => HandleOutcome::response(
+                self.handle_run_shell_with_client_name(requester_pid, *request, client_name)
                     .await,
             ),
             (Request::IfShell(request), Some(client_name)) => HandleOutcome::response(
@@ -166,9 +166,10 @@ impl RequestHandler {
         #[cfg(windows)]
         self.wait_for_windows_deferred_request(&request).await;
 
+        let refresh_hook_identities = request_changes_hook_identity_aliases(&request);
         let command_name = request.command_name().to_owned();
         #[allow(unreachable_patterns)]
-        match request {
+        let outcome = match request {
             Request::NewSession(request) => {
                 HandleOutcome::response(self.handle_new_session(requester_pid, request).await)
             }
@@ -580,16 +581,97 @@ impl RequestHandler {
                     "{command_name} is only available through queued command dispatch"
                 )),
             })),
+        };
+        if refresh_hook_identities {
+            let mut state = self.state.lock().await;
+            super::prune_dead_hook_identities(&mut state);
         }
+        outcome
     }
+}
+
+fn request_changes_hook_identity_aliases(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::NewSession(_)
+            | Request::NewSessionExt(_)
+            | Request::KillSession(_)
+            | Request::RenameSession(_)
+            | Request::NewWindow(_)
+            | Request::KillWindow(_)
+            | Request::LinkWindow(_)
+            | Request::MoveWindow(_)
+            | Request::SwapWindow(_)
+            | Request::RotateWindow(_)
+            | Request::RespawnWindow(_)
+            | Request::SplitWindow(_)
+            | Request::SplitWindowExt(_)
+            | Request::SplitWindowTargetAction(_)
+            | Request::SwapPane(_)
+            | Request::JoinPane(_)
+            | Request::MovePane(_)
+            | Request::BreakPane(_)
+            | Request::RespawnPane(_)
+            | Request::KillPane(_)
+            | Request::PaneKill(_)
+            | Request::PaneRespawn(_)
+            | Request::UnlinkWindow(_)
+    )
 }
 
 #[cfg(windows)]
 impl RequestHandler {
     async fn wait_for_windows_deferred_request(&self, request: &Request) {
-        if request_waits_for_windows_deferred_panes(request) {
-            self.wait_for_windows_deferred_all_pane_pids().await;
+        if !request_waits_for_windows_deferred_panes(request) {
+            return;
         }
+        // Scope the wait to the request's own target so a still-starting pane in
+        // an unrelated session cannot block a targeted command — e.g. a
+        // select-pane on session alpha must not wait on session beta's deferred
+        // pane. Commands without a single determinable target keep the
+        // conservative wait across every session.
+        match request_deferred_wait_target(request) {
+            Some(target) => {
+                self.wait_for_windows_deferred_target_pane_pids(&target)
+                    .await
+            }
+            None => self.wait_for_windows_deferred_all_pane_pids().await,
+        }
+    }
+}
+
+// Single-pane commands whose deferred-pane wait can be scoped to just their
+// target pane's session. Commands that reference a second location (move-pane,
+// swap-pane) keep the conservative all-session wait so a still-starting
+// destination is not skipped.
+#[cfg(windows)]
+fn request_deferred_wait_target(request: &Request) -> Option<rmux_proto::Target> {
+    use rmux_proto::{PaneTargetRef, Target};
+    fn scope_from_ref(target: &PaneTargetRef) -> Target {
+        match target {
+            PaneTargetRef::Slot(pane) => Target::Pane(pane.clone()),
+            // The id-typed API cannot resolve `pane_id -> (window_index,
+            // pane_index)` without taking the state lock, so scope the wait
+            // to the pane's session — still much better than the all-session
+            // fallback the SDK path used before.
+            PaneTargetRef::Id { session_name, .. } => Target::Session(session_name.clone()),
+        }
+    }
+    match request {
+        Request::SelectPane(request) => Some(Target::Pane(request.target.clone())),
+        Request::SelectPaneAdjacent(request) => Some(Target::Pane(request.target.clone())),
+        Request::SelectPaneMark(request) => Some(Target::Pane(request.target.clone())),
+        Request::LastPane(request) => Some(Target::Window(request.target.clone())),
+        Request::ResizePane(request) => Some(Target::Pane(request.target.clone())),
+        // Request::ResizePaneTargetAction accepts an optional raw -t string;
+        // the parser hasn't resolved the requester's current pane at this
+        // layer, so keep the conservative wait to stay safe against a
+        // still-starting sibling.
+        Request::PaneResize(request) => Some(scope_from_ref(&request.target)),
+        Request::PaneSelect(request) => Some(scope_from_ref(&request.target)),
+        Request::PipePane(request) => Some(Target::Pane(request.target.clone())),
+        Request::PasteBuffer(request) => Some(Target::Pane(request.target.clone())),
+        _ => None,
     }
 }
 
@@ -614,6 +696,14 @@ fn request_waits_for_windows_deferred_panes(request: &Request) -> bool {
             | Request::PaneKill(_)
             | Request::RespawnPane(_)
             | Request::PaneRespawn(_)
+            | Request::SelectPane(_)
+            | Request::SelectPaneAdjacent(_)
+            | Request::SelectPaneMark(_)
+            | Request::LastPane(_)
+            | Request::SelectWindow(_)
+            | Request::NextWindow(_)
+            | Request::PreviousWindow(_)
+            | Request::LastWindow(_)
             | Request::LockServer(_)
             | Request::LockSession(_)
             | Request::LockClient(_)
@@ -696,11 +786,14 @@ fn supported_capabilities() -> Vec<&'static str> {
 mod windows_deferred_wait_tests {
     use rmux_core::PaneId;
     use rmux_proto::request::{
-        KillPaneRequest, NewWindowRequest, PaneKillRequest, PaneRespawnRequest, Request,
-        RespawnPaneRequest, SplitWindowExtRequest, SplitWindowTargetActionRequest,
+        KillPaneRequest, LastPaneRequest, LastWindowRequest, NewWindowRequest, NextWindowRequest,
+        PaneKillRequest, PaneRespawnRequest, PreviousWindowRequest, Request, RespawnPaneRequest,
+        SelectPaneAdjacentRequest, SelectPaneDirection, SelectPaneMarkRequest, SelectPaneRequest,
+        SelectWindowRequest, SplitWindowExtRequest, SplitWindowTargetActionRequest,
     };
     use rmux_proto::{
         PaneTarget, PaneTargetRef, ProcessCommand, SessionName, SplitDirection, SplitWindowTarget,
+        WindowTarget,
     };
 
     use super::request_waits_for_windows_deferred_panes;
@@ -796,6 +889,14 @@ mod windows_deferred_wait_tests {
         }))
     }
 
+    fn pane_target() -> PaneTarget {
+        PaneTarget::with_window(session_name("bench"), 0, 0)
+    }
+
+    fn window_target() -> WindowTarget {
+        WindowTarget::with_window(session_name("bench"), 0)
+    }
+
     #[test]
     fn detached_new_window_does_not_wait_for_windows_deferred_panes() {
         assert!(!request_waits_for_windows_deferred_panes(&new_window(true)));
@@ -809,6 +910,56 @@ mod windows_deferred_wait_tests {
         assert!(!request_waits_for_windows_deferred_panes(
             &pane_respawn_by_id()
         ));
+    }
+
+    #[test]
+    fn pane_and_window_selection_never_wait_for_unrelated_deferred_panes() {
+        let selection_requests = [
+            Request::SelectPane(Box::new(SelectPaneRequest {
+                target: pane_target(),
+                title: None,
+                input_disabled: None,
+                preserve_zoom: false,
+                style: None,
+            })),
+            Request::SelectPaneAdjacent(SelectPaneAdjacentRequest {
+                target: pane_target(),
+                direction: SelectPaneDirection::Right,
+                preserve_zoom: false,
+            }),
+            Request::SelectPaneMark(SelectPaneMarkRequest {
+                target: pane_target(),
+                clear: false,
+                title: None,
+            }),
+            Request::LastPane(LastPaneRequest {
+                target: window_target(),
+                preserve_zoom: false,
+                input_disabled: None,
+            }),
+            Request::SelectWindow(SelectWindowRequest {
+                target: window_target(),
+            }),
+            Request::NextWindow(NextWindowRequest {
+                target: session_name("bench"),
+                alerts_only: false,
+            }),
+            Request::PreviousWindow(PreviousWindowRequest {
+                target: session_name("bench"),
+                alerts_only: false,
+            }),
+            Request::LastWindow(LastWindowRequest {
+                target: session_name("bench"),
+            }),
+        ];
+
+        for request in selection_requests {
+            assert!(
+                !request_waits_for_windows_deferred_panes(&request),
+                "{} must not wait for unrelated deferred panes",
+                request.command_name()
+            );
+        }
     }
 
     #[test]

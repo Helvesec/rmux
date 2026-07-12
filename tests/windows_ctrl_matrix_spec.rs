@@ -91,6 +91,26 @@ fn windows_ctrl_matrix_implementation(script: &str) -> String {
 }
 
 #[test]
+fn platform_runtime_installs_clippy_before_running_the_windows_msvc_gate() {
+    let workflow = include_str!("../.github/workflows/ci.yml");
+    let platform_runtime = workflow
+        .split_once("\n  platform-runtime:\n")
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| suffix.split_once("\n  windows-cross:\n"))
+        .map(|(section, _)| section)
+        .expect("platform-runtime workflow section");
+
+    assert!(
+        platform_runtime.contains("toolchain: \"1.96.1\"\n          components: clippy"),
+        "platform-runtime must install cargo-clippy for windows-latest"
+    );
+    assert!(
+        platform_runtime.contains("cargo clippy --workspace --all-targets --locked -- -D warnings"),
+        "platform-runtime must keep the Windows MSVC clippy gate"
+    );
+}
+
+#[test]
 fn windows_release_gate_runs_ctrl_matrix_and_nonempty_cargo_filters() {
     let workflow = include_str!("../.github/workflows/release.yml");
     let gate = include_str!("../scripts/gate-windows-fast.ps1");

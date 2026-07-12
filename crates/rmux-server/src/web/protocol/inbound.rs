@@ -76,7 +76,11 @@ pub(crate) async fn handle_session_client_text(
         }
         ClientMessage::SelectPane { pane_id } if session.is_operator() => {
             handler
-                .web_session_select_pane(session.target(), PaneId::new(pane_id))
+                .web_session_select_pane(
+                    session.target(),
+                    session.attach_pid(),
+                    PaneId::new(pane_id),
+                )
                 .await
                 .map_err(|error| io::Error::other(error.to_string()))?;
             Ok(SessionClientTextOutcome::Snapshot)
@@ -106,14 +110,17 @@ pub(crate) async fn handle_session_client_text(
             Ok(SessionClientTextOutcome::Snapshot)
         }
         ClientMessage::KillPane if session.is_operator() => {
-            if let Err(error) = handler.web_session_kill_active_pane(session.target()).await {
+            if let Err(error) = handler
+                .web_session_kill_active_pane(session.target(), session.attach_pid())
+                .await
+            {
                 tracing::debug!(?error, "web session kill pane ignored");
             }
             Ok(SessionClientTextOutcome::Snapshot)
         }
         ClientMessage::SelectWindow { window_index } if session.is_operator() => {
             if let Err(error) = handler
-                .web_session_select_window(session.target(), window_index)
+                .web_session_select_window(session.target(), session.attach_pid(), window_index)
                 .await
             {
                 tracing::debug!(?error, "web session select window ignored");
@@ -141,7 +148,12 @@ pub(crate) async fn handle_session_client_text(
                 return Ok(SessionClientTextOutcome::None);
             }
             if let Err(error) = handler
-                .web_session_rename_window(session.target(), window_index, name)
+                .web_session_rename_window(
+                    session.target(),
+                    session.attach_pid(),
+                    window_index,
+                    name,
+                )
                 .await
             {
                 tracing::debug!(?error, "web session rename window ignored");
@@ -150,7 +162,7 @@ pub(crate) async fn handle_session_client_text(
         }
         ClientMessage::KillWindow { window_index } if session.is_operator() => {
             if let Err(error) = handler
-                .web_session_kill_window(session.target(), window_index)
+                .web_session_kill_window(session.target(), session.attach_pid(), window_index)
                 .await
             {
                 tracing::debug!(?error, "web session kill window ignored");
@@ -171,7 +183,7 @@ pub(crate) async fn handle_session_client_text(
             if session_logout_allowed(session.is_operator(), session.controls()) =>
         {
             handler
-                .web_session_logout(session.target())
+                .web_session_logout(session.target(), session.attach_pid())
                 .await
                 .map_err(|error| io::Error::other(error.to_string()))?;
             socket.write_close_code(1000, "session_closed").await?;
@@ -279,8 +291,12 @@ async fn send_pane_text(
         let _ = socket.write_close_code(4006, "invalid_utf8").await;
         return Ok(());
     };
+    let target = handler
+        .current_web_pane_target(pane.session_id(), pane.target())
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
     handler
-        .web_send_text(pane.target(), text.to_owned())
+        .web_send_text(&target, text.to_owned())
         .await
         .map_err(|error| io::Error::other(error.to_string()))
 }
@@ -308,8 +324,12 @@ async fn send_pane_key(
     let Some(key) = validate_key_token(socket, body).await? else {
         return Ok(());
     };
+    let target = handler
+        .current_web_pane_target(pane.session_id(), pane.target())
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
     handler
-        .web_send_key(pane.target(), key.to_owned())
+        .web_send_key(&target, key.to_owned())
         .await
         .map_err(|error| io::Error::other(error.to_string()))
 }
@@ -396,7 +416,12 @@ async fn resize_session_pane(
         return Ok(SessionOperatorBinaryOutcome::None);
     };
     if let Err(error) = handler
-        .web_session_resize_pane(session.target(), PaneId::new(pane_id), adjustment)
+        .web_session_resize_pane(
+            session.target(),
+            session.attach_pid(),
+            PaneId::new(pane_id),
+            adjustment,
+        )
         .await
     {
         tracing::debug!(?error, "web session pane resize ignored");

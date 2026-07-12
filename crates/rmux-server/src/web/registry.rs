@@ -102,7 +102,9 @@ impl ResolvedCreateWebShareRequest {
 impl From<CreateWebShareRequest> for ResolvedCreateWebShareRequest {
     fn from(request: CreateWebShareRequest) -> Self {
         let target = match &request.scope {
-            rmux_proto::WebShareScope::Pane(target) => WebShareTarget::pane(target.clone()),
+            rmux_proto::WebShareScope::Pane(target) => {
+                WebShareTarget::pane(target.clone(), rmux_proto::SessionId::new(0))
+            }
             rmux_proto::WebShareScope::Session(name) => {
                 WebShareTarget::session(name.clone(), rmux_proto::SessionId::new(0))
             }

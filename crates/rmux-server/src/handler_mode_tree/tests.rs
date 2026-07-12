@@ -100,3 +100,9 @@ mod tree_navigation;
 
 #[path = "tests/async_acceptance.rs"]
 mod async_acceptance;
+
+#[path = "tests/window_occurrence_identity.rs"]
+mod window_occurrence_identity;
+
+#[path = "tests/client_identity.rs"]
+mod client_identity;

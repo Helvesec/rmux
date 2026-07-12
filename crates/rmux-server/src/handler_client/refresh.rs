@@ -116,7 +116,6 @@ impl RequestHandler {
                     attach_pid,
                     AttachControl::Write(clipboard_query_sequence()),
                     "refresh-client",
-                    None,
                 )
                 .await;
         }
@@ -168,14 +167,17 @@ impl RequestHandler {
             self.wait_for_windows_deferred_all_pane_pids().await;
             let target = {
                 let mut state = self.state.lock().await;
-                match state.mutate_session_and_resize_terminals(session_name, |session| {
-                    session.touch_attached();
-                    session.resize_terminal(size);
-                    Ok(WindowTarget::with_window(
-                        session_name.clone(),
-                        session.active_window_index(),
-                    ))
-                }) {
+                match state.mutate_session_and_resize_active_window_terminal(
+                    session_name,
+                    |session| {
+                        session.touch_attached();
+                        session.resize_active_window_terminal(size);
+                        Ok(WindowTarget::with_window(
+                            session_name.clone(),
+                            session.active_window_index(),
+                        ))
+                    },
+                ) {
                     Ok(target) => target,
                     Err(error) => return Response::Error(ErrorResponse { error }),
                 }

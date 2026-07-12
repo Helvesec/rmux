@@ -75,6 +75,18 @@ async fn create_grouped_session(handler: &RequestHandler, name: &str, group_targ
     assert!(matches!(created, Response::NewSession(_)));
 }
 
+async fn enable_global_monitor_silence(handler: &RequestHandler) {
+    let response = handler
+        .handle(Request::SetOption(SetOptionRequest {
+            scope: ScopeSelector::Global,
+            option: OptionName::MonitorSilence,
+            value: "60".to_owned(),
+            mode: SetOptionMode::Replace,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetOption(_)), "{response:?}");
+}
+
 #[cfg(unix)]
 fn quiet_window_test_command() -> Vec<String> {
     ["/bin/sh", "-c", "sleep 60"]
@@ -134,6 +146,25 @@ async fn insert_window(handler: &RequestHandler, session_name: &SessionName, win
         .expect("window terminal insert succeeds");
 }
 
+async fn link_duplicate_window(
+    handler: &RequestHandler,
+    session_name: &SessionName,
+    source_index: u32,
+    destination_index: u32,
+) {
+    let response = handler
+        .handle(Request::LinkWindow(LinkWindowRequest {
+            source: WindowTarget::with_window(session_name.clone(), source_index),
+            target: WindowTarget::with_window(session_name.clone(), destination_index),
+            after: false,
+            before: false,
+            kill_destination: false,
+            detached: true,
+        }))
+        .await;
+    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
+}
+
 fn assert_refresh(control: AttachControl) {
     assert!(matches!(control, AttachControl::Switch(_)));
 }
@@ -166,8 +197,16 @@ mod listing_refresh;
 #[path = "handler_window_tests/move_window.rs"]
 mod move_window;
 
+#[path = "handler_window_tests/relative_group_transactions.rs"]
+mod relative_group_transactions;
+#[path = "handler_window_tests/relative_metadata.rs"]
+mod relative_metadata;
+
 #[path = "handler_window_tests/swap_rotate.rs"]
 mod swap_rotate;
+
+#[path = "handler_window_tests/silence_fanout.rs"]
+mod silence_fanout;
 
 #[path = "handler_window_tests/link_unlink.rs"]
 mod link_unlink;

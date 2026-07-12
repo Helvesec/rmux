@@ -1,4 +1,7 @@
 use super::*;
+use rmux_proto::{
+    BindKeyRequest, HookLifecycle, ListKeysRequest, SetBufferRequest, SetHookMutationRequest,
+};
 
 async fn set_command_alias(handler: &RequestHandler, alias: &str) {
     assert!(matches!(
@@ -60,4 +63,168 @@ async fn runtime_command_alias_option_drives_source_file_parser() {
             .stdout(),
         b"from-source"
     );
+}
+
+#[tokio::test]
+async fn runtime_command_alias_option_drives_hook_registration_parser() {
+    let handler = RequestHandler::new();
+    set_command_alias(&handler, "sbuf=set-buffer -b aliased").await;
+
+    let response = handler
+        .handle(Request::SetHookMutation(SetHookMutationRequest {
+            scope: ScopeSelector::Global,
+            hook: HookName::AfterSetBuffer,
+            command: Some("sbuf from-hook".to_owned()),
+            lifecycle: HookLifecycle::Persistent,
+            append: false,
+            unset: false,
+            run_immediately: false,
+            index: None,
+        }))
+        .await;
+    assert!(matches!(response, Response::SetHook(_)), "{response:?}");
+
+    let response = handler
+        .handle(Request::SetBuffer(Box::new(SetBufferRequest {
+            name: Some("origin".to_owned()),
+            content: b"origin".to_vec(),
+            append: false,
+            new_name: None,
+            set_clipboard: false,
+            target_client: None,
+        })))
+        .await;
+    assert!(matches!(response, Response::SetBuffer(_)), "{response:?}");
+
+    let output = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("aliased".to_owned()),
+        }))
+        .await;
+    assert_eq!(
+        output
+            .command_output()
+            .expect("hook-created aliased buffer output")
+            .stdout(),
+        b"from-hook"
+    );
+
+    let root = temp_root("command-alias-hook");
+    let config = root.join("hook.conf");
+    write_config(
+        &config,
+        "set-hook -g after-set-buffer 'sbuf from-source-hook'\n",
+    );
+    assert_eq!(
+        handler
+            .handle(source_file_request(
+                vec!["hook.conf".to_owned()],
+                Some(root)
+            ))
+            .await,
+        Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
+    );
+    let response = handler
+        .handle(Request::SetBuffer(Box::new(SetBufferRequest {
+            name: Some("source-origin".to_owned()),
+            content: b"origin".to_vec(),
+            append: false,
+            new_name: None,
+            set_clipboard: false,
+            target_client: None,
+        })))
+        .await;
+    assert!(matches!(response, Response::SetBuffer(_)), "{response:?}");
+    let output = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("aliased".to_owned()),
+        }))
+        .await;
+    assert_eq!(
+        output
+            .command_output()
+            .expect("source-hook-created aliased buffer output")
+            .stdout(),
+        b"from-source-hook"
+    );
+}
+
+async fn listed_root_bindings(handler: &RequestHandler) -> String {
+    let response = handler
+        .handle(Request::ListKeys(Box::new(ListKeysRequest {
+            table_name: Some("root".to_owned()),
+            first_only: false,
+            notes: false,
+            include_unnoted: true,
+            reversed: false,
+            format: None,
+            sort_order: None,
+            prefix: None,
+            key: None,
+        })))
+        .await;
+    let Response::ListKeys(response) = response else {
+        panic!("expected list-keys success, got {response:?}");
+    };
+    String::from_utf8(response.command_output().stdout().to_vec()).expect("list-keys utf8")
+}
+
+#[tokio::test]
+async fn runtime_command_alias_option_drives_binding_payload_parsers() {
+    let handler = RequestHandler::new();
+    set_command_alias(&handler, "sbuf=set-buffer -b aliased").await;
+
+    for (key, command) in [
+        (
+            "F10",
+            vec!["sbuf".to_owned(), "from-protocol-argv".to_owned()],
+        ),
+        ("F11", vec!["sbuf from-protocol-string".to_owned()]),
+    ] {
+        let response = handler
+            .handle(Request::BindKey(Box::new(BindKeyRequest {
+                table_name: "root".to_owned(),
+                key: key.to_owned(),
+                note: None,
+                repeat: false,
+                command: Some(command),
+            })))
+            .await;
+        assert!(matches!(response, Response::BindKey(_)), "{response:?}");
+    }
+
+    let parsed = handler
+        .parse_command_string_one_group("bind-key -T root F12 sbuf from-queue")
+        .await
+        .expect("queued bind-key parses");
+    handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("queued bind-key executes");
+
+    let root = temp_root("command-alias-bind-key");
+    let config = root.join("main.conf");
+    write_config(&config, "bind-key -T root F9 sbuf from-source-binding\n");
+    assert_eq!(
+        handler
+            .handle(source_file_request(
+                vec!["main.conf".to_owned()],
+                Some(root)
+            ))
+            .await,
+        Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
+    );
+
+    let bindings = listed_root_bindings(&handler).await;
+    for expected in [
+        "set-buffer -b aliased from-protocol-argv",
+        "set-buffer -b aliased from-protocol-string",
+        "set-buffer -b aliased from-queue",
+        "set-buffer -b aliased from-source-binding",
+    ] {
+        assert!(
+            bindings.contains(expected),
+            "missing canonical binding {expected:?} in {bindings:?}"
+        );
+    }
 }

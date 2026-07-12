@@ -499,6 +499,48 @@ fn classifies_assignments_and_hidden_assignments() {
 }
 
 #[test]
+fn hoists_nested_parse_time_assignments_in_lexical_order_and_reparses_losslessly() {
+    let commands = CommandParser::new()
+        .parse(
+            "OUTER=first ; if-shell -F 0 { FALSE_ONLY=no ; %hidden SECRET='two words' } { TRUE_ONLY=yes } ; set-hook -g after-new-window { HOOK=hooked ; if-shell -F 1 { DEEP=deep } } ; OUTER=last",
+        )
+        .expect("nested assignments parse");
+
+    assert_eq!(
+        commands
+            .assignments()
+            .iter()
+            .map(|assignment| (assignment.name(), assignment.value(), assignment.hidden()))
+            .collect::<Vec<_>>(),
+        [
+            ("OUTER", "first", false),
+            ("FALSE_ONLY", "no", false),
+            ("SECRET", "two words", true),
+            ("TRUE_ONLY", "yes", false),
+            ("HOOK", "hooked", false),
+            ("DEEP", "deep", false),
+            ("OUTER", "last", false),
+        ]
+    );
+    for command in commands.commands() {
+        for argument in command.arguments() {
+            if let CommandArgument::Commands(nested) = argument {
+                assert!(
+                    nested.assignments().is_empty(),
+                    "nested assignments must be owned by the parse root"
+                );
+            }
+        }
+    }
+
+    let rendered = commands.to_tmux_reparse_string();
+    let reparsed = CommandParser::new()
+        .parse(&rendered)
+        .expect("rendered assignments reparse");
+    assert_eq!(reparsed, commands, "lossless reparse string: {rendered}");
+}
+
+#[test]
 fn rejects_hidden_before_non_assignment() {
     assert_eq!(
         CommandParser::new()

@@ -12,7 +12,10 @@ use super::queue_parse::ParsedNewWindowCommand;
 use super::render_start_directory_template;
 use super::targets::NewWindowTargetIndex;
 use crate::format_runtime::render_runtime_template;
-use crate::handler::{client_environment_snapshot, client_spawn_environment, RequestHandler};
+use crate::handler::{
+    client_environment_snapshot, client_spawn_environment, prepare_lifecycle_event_if_enabled,
+    RequestHandler,
+};
 use crate::hook_runtime::{capture_inline_hooks, PendingInlineHookFormat};
 use crate::pane_terminals::{NewWindowOptions, WindowSpawnOptions};
 
@@ -103,8 +106,11 @@ impl RequestHandler {
         let client_environment = client_environment_snapshot(requester_pid);
         let spawn_environment = client_spawn_environment(client_environment.as_ref());
         let (response, inline_hooks) = capture_inline_hooks(async {
-            let response = {
+            let (response, linked_event) = {
                 let mut state = self.state.lock().await;
+                let timer_sessions = state.sessions.session_group_members(&target);
+                let timer_mutation =
+                    self.plan_window_mutation_silence_timers_locked(&state, timer_sessions);
                 let start_directory = match render_start_directory_template(
                     &state,
                     &Target::Session(target.clone()),
@@ -132,13 +138,42 @@ impl RequestHandler {
                         },
                     },
                 ) {
-                    Ok(response) => Response::NewWindow(response),
-                    Err(error) => Response::Error(ErrorResponse { error }),
+                    Ok(response) => {
+                        let mut timer_targets = Vec::new();
+                        for timer_session_name in state.sessions.session_group_members(&target) {
+                            let Some(session) = state.sessions.session(&timer_session_name) else {
+                                continue;
+                            };
+                            timer_targets.extend(session.windows().keys().copied().map(
+                                |window_index| {
+                                    WindowTarget::with_window(
+                                        timer_session_name.clone(),
+                                        window_index,
+                                    )
+                                },
+                            ));
+                        }
+                        self.apply_window_mutation_silence_timers_locked(
+                            &state,
+                            timer_mutation,
+                            Vec::new(),
+                            &[],
+                            timer_targets,
+                        );
+                        let linked_event = prepare_lifecycle_event_if_enabled(
+                            &mut state,
+                            &LifecycleEvent::WindowLinked {
+                                session_name: target.clone(),
+                                target: Some(response.target.clone()),
+                            },
+                        );
+                        (Response::NewWindow(response), linked_event)
+                    }
+                    Err(error) => (Response::Error(ErrorResponse { error }), None),
                 }
             };
 
             if matches!(response, Response::NewWindow(_)) {
-                self.sync_session_silence_timers(&target).await;
                 if let Response::NewWindow(success) = &response {
                     self.queue_inline_hook(
                         HookName::AfterNewWindow,
@@ -150,11 +185,10 @@ impl RequestHandler {
                         ))),
                         PendingInlineHookFormat::AfterCommand,
                     );
-                    self.emit(LifecycleEvent::WindowLinked {
-                        session_name: target.clone(),
-                        target: Some(success.target.clone()),
-                    })
-                    .await;
+                    if let Some(linked_event) = linked_event {
+                        self.pause_before_window_lifecycle_emit().await;
+                        self.emit_prepared(linked_event).await;
+                    }
                 }
                 self.refresh_attached_session(&target).await;
             }

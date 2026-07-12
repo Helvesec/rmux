@@ -49,7 +49,7 @@ fn build_tree_session(
     session_name: &SessionName,
     session: &Session,
 ) -> Result<Option<(ModeTreeItem, Vec<ModeTreeItem>)>, RmuxError> {
-    let session_id = session_item_id(session_name);
+    let session_item_key = session_item_id(session.id());
     let mut collected = Vec::new();
     let mut attached_count = attached_counts
         .iter()
@@ -67,7 +67,11 @@ fn build_tree_session(
     let mut windows = session.windows().iter().collect::<Vec<_>>();
     sort_windows(&mut windows, mode.sort_order, mode.reversed);
     for (window_index, window) in windows {
-        let window_id = window_item_id(session_name, *window_index);
+        let occurrence_id = state
+            .window_link_occurrence_id(session_name, *window_index)
+            .expect("live mode-tree windows have occurrence identities");
+        let window_item_key =
+            window_item_id(session.id(), *window_index, window.id(), occurrence_id);
         let mut pane_children = Vec::new();
         let mut pane_items = Vec::new();
         let mut panes = window.panes().iter().collect::<Vec<_>>();
@@ -88,23 +92,32 @@ fn build_tree_session(
             if !matches_mode_tree_filter(mode, &pane_line.1, pane_line.2.as_deref()) {
                 continue;
             }
-            let pane_id = pane_item_id(session_name, *window_index, pane.index());
-            pane_children.push(pane_id.clone());
+            let pane_item_key = pane_item_id(
+                session.id(),
+                *window_index,
+                window.id(),
+                occurrence_id,
+                pane.id(),
+            );
+            pane_children.push(pane_item_key.clone());
             pane_items.push(ModeTreeItem {
-                id: pane_id,
-                parent: Some(window_id.clone()),
+                id: pane_item_key,
+                parent: Some(window_item_key.clone()),
                 children: Vec::new(),
                 depth: 2,
                 line: pane_line.0,
                 search_text: pane_line.1,
                 preview: pane_line.3,
                 no_tag: false,
-                action: ModeTreeAction::TreeTarget {
-                    session_name: session_name.clone(),
-                    window_index: Some(*window_index),
-                    pane_index: Some(pane.index()),
-                    pane_id: Some(pane.id().as_u32()),
-                },
+                action: ModeTreeAction::pane_tree_target(
+                    session_name.clone(),
+                    session.id(),
+                    *window_index,
+                    window.id(),
+                    occurrence_id,
+                    pane.index(),
+                    pane.id(),
+                ),
             });
         }
 
@@ -116,20 +129,21 @@ fn build_tree_session(
             continue;
         }
         let window_item = ModeTreeItem {
-            id: window_id.clone(),
-            parent: Some(session_id.clone()),
+            id: window_item_key.clone(),
+            parent: Some(session_item_key.clone()),
             children: pane_children,
             depth: 1,
             line: window_line.0,
             search_text: window_line.1,
             preview: window_line.3,
             no_tag: false,
-            action: ModeTreeAction::TreeTarget {
-                session_name: session_name.clone(),
-                window_index: Some(*window_index),
-                pane_index: None,
-                pane_id: None,
-            },
+            action: ModeTreeAction::window_tree_target(
+                session_name.clone(),
+                session.id(),
+                *window_index,
+                window.id(),
+                occurrence_id,
+            ),
         };
         collected.push(window_item);
         collected.extend(pane_items);
@@ -144,11 +158,11 @@ fn build_tree_session(
 
     let children = collected
         .iter()
-        .filter(|item| item.parent.as_deref() == Some(session_id.as_str()))
+        .filter(|item| item.parent.as_deref() == Some(session_item_key.as_str()))
         .map(|item| item.id.clone())
         .collect::<Vec<_>>();
     let session_item = ModeTreeItem {
-        id: session_id,
+        id: session_item_key,
         parent: None,
         children,
         depth: 0,
@@ -156,12 +170,7 @@ fn build_tree_session(
         search_text: session_line.1,
         preview: session_line.3,
         no_tag: false,
-        action: ModeTreeAction::TreeTarget {
-            session_name: session_name.clone(),
-            window_index: None,
-            pane_index: None,
-            pane_id: None,
-        },
+        action: ModeTreeAction::session_tree_target(session_name.clone(), session.id()),
     };
 
     let mut all = vec![session_item.clone()];

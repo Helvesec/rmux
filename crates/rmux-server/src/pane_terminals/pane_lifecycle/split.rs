@@ -230,14 +230,16 @@ impl HandlerState {
             return Err(error);
         }
 
-        let sessions_to_synchronize = self
-            .window_link_slots_for(&session_name, window_index)
-            .into_iter()
-            .map(|slot| slot.session_name)
-            .collect::<Vec<_>>();
-        self.synchronize_linked_window_from_slot(&session_name, window_index)?;
-        for synchronized_session in sessions_to_synchronize {
-            self.synchronize_session_group_from(&synchronized_session)?;
+        let synchronized_sessions =
+            self.synchronize_window_alias_family_from_slot(&session_name, window_index)?;
+        let synchronized_source = self
+            .sessions
+            .session(&session_name)
+            .cloned()
+            .ok_or_else(|| session_not_found(&session_name))?;
+        self.synchronize_pane_alias_options_from_session(&synchronized_source)?;
+        for synchronized_session in synchronized_sessions {
+            self.sync_pane_lifecycle_dimensions_for_session(&synchronized_session);
         }
         self.record_pane_lifecycle_spawn(PaneLifecycleSpawn {
             session_id,

@@ -14,7 +14,10 @@ use rmux_proto::{
     LinkWindowRequest, ListPanesRequest, NewWindowRequest, PaneTarget, Request,
     ResizeWindowRequest, Response, SendKeysRequest, WindowTarget,
 };
-use rmux_sdk::{EnsureSession, PaneProcessState, PaneRef, PaneSnapshot, RmuxBuilder, SessionName};
+use rmux_sdk::{
+    EnsureSession, PaneProcessState, PaneRef, PaneSnapshot, PaneStateEvent, PaneStateEventsOptions,
+    RmuxBuilder, RmuxError, SessionName,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::time::Instant;
@@ -77,6 +80,24 @@ async fn pane_id_info_and_snapshot_resolve_through_daemon_for_live_and_stale_slo
     let stale_snapshot = stale.snapshot().await?;
     assert_eq!(stale_snapshot, PaneSnapshot::default());
     assert_eq!(stale_snapshot.revision, 0);
+    assert!(
+        stale.foreground_state_with_revision().await?.is_none(),
+        "a stale slot must not fall back to a raw protocol slot for foreground state"
+    );
+    let stale_events_error = match stale.state_events(PaneStateEventsOptions::default()).await {
+        Ok(_) => return Err("a stale slot unexpectedly opened a pane-state stream".into()),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            &stale_events_error,
+            RmuxError::Protocol {
+                source: rmux_proto::RmuxError::InvalidTarget { .. },
+                ..
+            }
+        ),
+        "a stale slot must fail closed before subscribing: {stale_events_error}"
+    );
 
     let stale_pane_in_window = session.pane(0, 99);
     assert_eq!(stale_pane_in_window.id().await?, None);
@@ -875,11 +896,127 @@ async fn issue_94_slot_handles_resolve_visible_indexes_under_base_index_one() ->
         "visible slot snapshot must be live, got revision {}",
         snap.revision
     );
+    let foreground = visible.foreground_state_with_revision().await?;
+    assert!(
+        foreground.is_some(),
+        "visible slot foreground query must resolve through its stable pane id"
+    );
+    let mut events = visible
+        .state_events(PaneStateEventsOptions::default())
+        .await?;
+    let initial = tokio::time::timeout(Duration::from_secs(5), events.next()).await??;
+    assert!(
+        matches!(initial, Some(PaneStateEvent::Snapshot { .. })),
+        "visible slot state-events stream must open with a snapshot: {initial:?}"
+    );
 
     let raw = session.pane(0, 0);
     assert!(
         !raw.exists().await?,
         "raw slot (0, 0) must not exist under base-index 1"
+    );
+    assert!(
+        raw.foreground_state_with_revision().await?.is_none(),
+        "an invisible raw slot must not address the live base-index-adjusted pane"
+    );
+    let raw_events_error =
+        match raw.state_events(PaneStateEventsOptions::default()).await {
+            Ok(_) => return Err(
+                "an invisible raw slot unexpectedly opened a pane-state stream under base-index 1"
+                    .into(),
+            ),
+            Err(error) => error,
+        };
+    assert!(
+        matches!(
+            &raw_events_error,
+            RmuxError::Protocol {
+                source: rmux_proto::RmuxError::InvalidTarget { .. },
+                ..
+            }
+        ),
+        "an invisible raw slot must fail closed before subscribing: {raw_events_error}"
+    );
+
+    harness.finish().await
+}
+
+#[tokio::test]
+async fn issue_85_foreground_change_reaches_the_event_stream_end_to_end() -> TestResult {
+    // Issue #85: a foreground process launched inside the pane's shell must
+    // surface as a ForegroundChanged event on the state_events stream and
+    // agree with the revision-carrying snapshot query, end to end across the
+    // daemon transport. (Unix-only flow: the probe reads the pty foreground
+    // process group; the Windows twin in pane_foreground_events_windows.rs
+    // pins that platform's root-process contract.)
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("pane-fg-events").await?;
+    let rmux = harness.rmux();
+    let alpha = session_name("sdkfgevents");
+    let session = EnsureSession::named(alpha.clone())
+        .create_only()
+        .ensure(&rmux)
+        .await?;
+    let pane = session.pane(0, 0);
+
+    let mut stream = pane
+        .state_events(PaneStateEventsOptions {
+            include_foreground: true,
+            ..PaneStateEventsOptions::default()
+        })
+        .await?;
+    let first = tokio::time::timeout(Duration::from_secs(30), stream.next())
+        .await
+        .map_err(|_| "timed out waiting for the initial pane-state snapshot")??;
+    assert!(
+        matches!(first, Some(PaneStateEvent::Snapshot { .. })),
+        "stream must open with a snapshot: {first:?}"
+    );
+
+    pane.send_text("sleep 120\n").await?;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let observed_revision = loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or("timed out waiting for a sleep ForegroundChanged event")?;
+        let event = tokio::time::timeout(remaining, stream.next())
+            .await
+            .map_err(|_| "timed out waiting for a sleep ForegroundChanged event")??
+            .ok_or("pane state stream ended before the foreground changed")?;
+        if let PaneStateEvent::ForegroundChanged {
+            revision,
+            new_state,
+            ..
+        } = event
+        {
+            if new_state
+                .command
+                .clone()
+                .unwrap_or_default()
+                .contains("sleep")
+            {
+                break revision;
+            }
+        }
+    };
+    assert!(
+        observed_revision > 0,
+        "foreground revision must be positive"
+    );
+
+    let (pane_id, query_revision, state) = pane
+        .foreground_state_with_revision()
+        .await?
+        .ok_or("live pane must report a foreground snapshot")?;
+    assert_eq!(Some(pane_id), pane.id().await?, "stable pane id matches");
+    assert!(
+        query_revision >= observed_revision,
+        "query revision {query_revision} must not precede the event revision {observed_revision}"
+    );
+    assert!(
+        state.command.clone().unwrap_or_default().contains("sleep"),
+        "queried foreground should still be sleep: {state:?}"
     );
 
     harness.finish().await

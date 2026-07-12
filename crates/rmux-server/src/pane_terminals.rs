@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::Path;
 #[cfg(test)]
@@ -57,10 +57,13 @@ mod pipes;
 mod rollback;
 #[path = "pane_terminals/session_mutation.rs"]
 mod session_mutation;
+pub(in crate::pane_terminals) use session_mutation::SessionTransferSnapshot;
 #[path = "pane_terminals/session_runtime.rs"]
 mod session_runtime;
 #[path = "pane_terminals/window_indices.rs"]
 mod window_indices;
+#[path = "pane_terminals/window_link_runtime.rs"]
+mod window_link_runtime;
 #[path = "pane_terminals/window_links.rs"]
 mod window_links;
 #[path = "pane_terminals_window.rs"]
@@ -72,7 +75,7 @@ use lifecycle_state::PaneLifecycleSpawn;
 pub(crate) use lifecycle_state::PaneLifecycleState;
 use marked_pane::MarkedPane;
 pub(in crate::pane_terminals) use pane_lifecycle::{
-    terminate_removed_terminals, PreparedWindowTerminal,
+    terminate_removed_terminals, LinkedWindowTransferRemovalPlan, PreparedWindowTerminal,
 };
 pub(crate) use pane_outputs::PaneExitMetadata;
 use pane_outputs::{AttachedSubmittedLine, PaneOutputSpawn, RemovedPaneOutputs};
@@ -82,6 +85,7 @@ use pane_pipe::PanePipeStore;
 use pane_terminal_store::PaneTerminalStore;
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use pane_transcripts::PaneCaptureRequest;
+pub(crate) use window_links::WindowLinkOccurrenceId;
 use window_links::{WindowLinkGroup, WindowLinkSlot};
 
 #[derive(Clone)]
@@ -217,7 +221,11 @@ pub(crate) struct HandlerState {
     auto_named_windows: HashSet<(SessionName, u32)>,
     window_link_groups: HashMap<u64, WindowLinkGroup>,
     window_link_slots: HashMap<WindowLinkSlot, u64>,
+    window_link_occurrences: HashMap<WindowLinkSlot, WindowLinkOccurrenceId>,
     next_window_link_group_id: u64,
+    next_window_link_occurrence_id: u64,
+    #[cfg(test)]
+    fail_link_window_after_attach: bool,
     #[cfg(unix)]
     pane_reader_runtime: Option<PaneReaderRuntime>,
 }
@@ -260,12 +268,14 @@ pub(crate) struct KilledWindowResult {
     pub(crate) response: KillWindowResponse,
     pub(crate) removed_windows: Vec<RemovedWindowHookContext>,
     pub(crate) removed_pane_ids: Vec<PaneId>,
+    pub(crate) reindexed_windows: Vec<(SessionName, BTreeMap<u32, u32>)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LinkedWindowResult {
     pub(crate) response: rmux_proto::LinkWindowResponse,
     pub(crate) removed_pane_ids: Vec<PaneId>,
+    pub(crate) reindexed_windows: BTreeMap<u32, u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -280,6 +290,8 @@ pub(crate) struct UnlinkedWindowResult {
     pub(crate) response: rmux_proto::UnlinkWindowResponse,
     pub(crate) removed_window: RemovedWindowHookContext,
     pub(crate) removed_pane_ids: Vec<PaneId>,
+    pub(crate) removed_timer_targets: Vec<WindowTarget>,
+    pub(crate) reindexed_windows: Vec<(SessionName, BTreeMap<u32, u32>)>,
 }
 
 impl HandlerState {
@@ -341,6 +353,14 @@ impl HandlerState {
                 self.attached_terminal_pixels.remove(session_name);
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attached_terminal_pixels_for_test(
+        &self,
+        session_name: &SessionName,
+    ) -> Option<TerminalPixels> {
+        self.attached_terminal_pixels.get(session_name).copied()
     }
 
     pub(crate) fn add_message(&mut self, message: impl Into<String>) {
@@ -426,7 +446,7 @@ fn pane_terminal_geometry_for_session(
     window_index: u32,
     geometry: PaneGeometry,
 ) -> PaneGeometry {
-    let content_rows = session_content_rows(session, options);
+    let content_rows = session_content_rows(session, options, window_index);
     visible_pane_content_geometry(
         options,
         session.name(),
@@ -436,8 +456,11 @@ fn pane_terminal_geometry_for_session(
     )
 }
 
-fn session_content_rows(session: &Session, options: &OptionStore) -> u16 {
-    let size = session.window().size();
+fn session_content_rows(session: &Session, options: &OptionStore, window_index: u32) -> u16 {
+    let size = session
+        .window_at(window_index)
+        .map(|window| window.size())
+        .unwrap_or_else(|| session.window().size());
     if size.cols == 0 || size.rows == 0 {
         return size.rows;
     }
@@ -487,7 +510,7 @@ mod tests {
                 SetOptionMode::Replace,
             )
             .expect("session status set succeeds");
-        assert_eq!(session_content_rows(&session, &state.options), 22);
+        assert_eq!(session_content_rows(&session, &state.options, 0), 22);
 
         state
             .options
@@ -498,7 +521,7 @@ mod tests {
                 SetOptionMode::Replace,
             )
             .expect("session status set succeeds");
-        assert_eq!(session_content_rows(&session, &state.options), 19);
+        assert_eq!(session_content_rows(&session, &state.options, 0), 19);
 
         state
             .options
@@ -509,7 +532,7 @@ mod tests {
                 SetOptionMode::Replace,
             )
             .expect("session status set succeeds");
-        assert_eq!(session_content_rows(&session, &state.options), 24);
+        assert_eq!(session_content_rows(&session, &state.options, 0), 24);
     }
 
     #[tokio::test]

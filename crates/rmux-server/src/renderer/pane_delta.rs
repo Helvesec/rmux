@@ -363,6 +363,7 @@ impl PaneRenderSnapshot {
         Some(would_scroll)
     }
 
+    #[cfg(test)]
     pub(crate) fn positioned_plain_echo_frame(&self, bytes: &[u8]) -> Option<Vec<u8>> {
         if bytes.is_empty() || !bytes.iter().all(|byte| matches!(*byte, b' '..=b'~')) {
             return None;

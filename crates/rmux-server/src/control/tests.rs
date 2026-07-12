@@ -8,16 +8,55 @@ use tokio::sync::{mpsc, watch};
 
 use super::subscriptions::{handle_pane_event, PaneEvent};
 use super::{
-    append_control_input, ensure_control_newline, extract_complete_control_lines, forward_control,
-    ActiveControlCommand, ControlCommandResult, ControlLifecycle, ControlOutputQueue,
-    ControlServerEvent, ControlUpgradeInput, CONTROL_SERVER_EVENT_CAPACITY, MAX_CONTROL_LINE_BYTES,
+    append_control_input, ensure_control_newline, extract_complete_control_lines,
+    forward_control as forward_control_identity, ActiveControlCommand, ControlCommandResult,
+    ControlLifecycle, ControlModeUpgrade, ControlOutputQueue, ControlServerEvent,
+    ControlUpgradeInput, CONTROL_SERVER_EVENT_CAPACITY, MAX_CONTROL_LINE_BYTES,
     MAX_QUEUED_CONTROL_LINES,
 };
 use crate::daemon::ShutdownHandle;
-use crate::handler::RequestHandler;
-use rmux_proto::{Request, Response, WaitForMode, WaitForRequest, WaitForResponse};
+use crate::handler::{ControlClientIdentity, RequestHandler};
+use crate::outer_terminal::OuterTerminalContext;
+use rmux_proto::{ControlMode, Request, Response, WaitForMode, WaitForRequest, WaitForResponse};
 
 const CONTROL_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn forward_control(
+    stream: UnixStream,
+    handler: Arc<RequestHandler>,
+    requester_pid: u32,
+    upgrade_input: ControlUpgradeInput,
+    shutdown: watch::Receiver<()>,
+    server_events: mpsc::Receiver<ControlServerEvent>,
+    lifecycle: ControlLifecycle,
+) -> std::io::Result<()> {
+    let (registration_tx, _registration_rx) =
+        mpsc::channel::<ControlServerEvent>(CONTROL_SERVER_EVENT_CAPACITY);
+    let control_id = handler
+        .register_control_with_closing(
+            requester_pid,
+            ControlModeUpgrade {
+                initial_command_count: 0,
+                mode: ControlMode::Plain,
+                terminal_context: OuterTerminalContext::default(),
+            },
+            registration_tx,
+            Arc::clone(&lifecycle.closing),
+        )
+        .await;
+    let result = forward_control_identity(
+        stream,
+        Arc::clone(&handler),
+        ControlClientIdentity::new(requester_pid, control_id),
+        upgrade_input,
+        shutdown,
+        server_events,
+        lifecycle,
+    )
+    .await;
+    handler.finish_control(requester_pid, control_id).await;
+    result
+}
 
 #[test]
 fn extracts_complete_control_lines_from_buffer() {

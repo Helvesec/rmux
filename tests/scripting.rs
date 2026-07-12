@@ -4,6 +4,8 @@ mod common;
 
 use std::error::Error;
 use std::fs;
+use std::io::Write;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use common::{assert_success, read_until_contains, stderr, stdout, AttachedSession, CliHarness};
@@ -111,11 +113,28 @@ fn targeted_run_shell_falls_back_to_the_caller_if_the_target_disappears(
         assert_success(&harness.run(&["new-session", "-d", "-s", session])?);
         assert_success(&harness.run(&["split-window", "-d", "-t", session])?);
         let target = format!("{session}:0.1");
+        let original_pane_id = stdout(&harness.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            target.as_str(),
+            "#{pane_id}",
+        ])?);
+        let started = harness.tmpdir().join(format!("{session}-started"));
+        let release = harness.tmpdir().join(format!("{session}-release"));
+        let shell_command = format!(
+            "printf '%s' \"$RMUX_PANE\" > {}; while [ ! -f {} ]; do sleep 0.02; done; printf hello",
+            shell_quote(&started),
+            shell_quote(&release),
+        );
         let config = harness.tmpdir().join(format!("{session}-target-dies.conf"));
         if source_file {
             fs::write(
                 &config,
-                format!("run-shell -t {target} 'sleep 1; printf hello'\n"),
+                format!(
+                    "run-shell -t {target} {}\n",
+                    shell_quote_str(&shell_command)
+                ),
             )?;
         }
 
@@ -123,11 +142,16 @@ fn targeted_run_shell_falls_back_to_the_caller_if_the_target_disappears(
         if source_file {
             command.args(["source-file", config.to_str().expect("utf-8 config path")]);
         } else {
-            command.args(["run-shell", "-t", target.as_str(), "sleep 1; printf hello"]);
+            command.args(["run-shell", "-t", target.as_str(), shell_command.as_str()]);
         }
         let caller = std::thread::spawn(move || command.output());
-        std::thread::sleep(Duration::from_millis(200));
-        assert_success(&harness.run(&["kill-pane", "-t", target.as_str()])?);
+        if let Err(error) = wait_for_file_text(&started, original_pane_id.trim()) {
+            let _ = fs::write(&release, b"");
+            return Err(error);
+        }
+        let killed = run_concurrent_cli(&harness, &["kill-pane", "-t", target.as_str()]);
+        fs::write(&release, b"")?;
+        assert_success(&killed?);
         let output = caller
             .join()
             .map_err(|_| "run-shell caller thread panicked")??;
@@ -135,6 +159,242 @@ fn targeted_run_shell_falls_back_to_the_caller_if_the_target_disappears(
         assert_eq!(output.status.code(), Some(0));
         assert_eq!(stdout(&output), "hello\n");
         assert!(stderr(&output).is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn targeted_run_shell_does_not_deliver_to_a_replacement_in_the_same_pane_slot(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("run-shell-target-replaced")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    for (session, source_file) in [("direct-reused", false), ("sourced-reused", true)] {
+        assert_success(&harness.run(&["new-session", "-d", "-s", session])?);
+        assert_success(&harness.run(&["split-window", "-d", "-t", session])?);
+        let target = format!("{session}:0.1");
+        let original_pane_id = stdout(&harness.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            target.as_str(),
+            "#{pane_id}",
+        ])?);
+        let started = harness.tmpdir().join(format!("{session}-started"));
+        let release = harness.tmpdir().join(format!("{session}-release"));
+        let shell_command = format!(
+            "printf '%s' \"$RMUX_PANE\" > {}; while [ ! -f {} ]; do sleep 0.02; done; printf replacement-safe",
+            shell_quote(&started),
+            shell_quote(&release),
+        );
+        let config = harness
+            .tmpdir()
+            .join(format!("{session}-target-reused.conf"));
+        if source_file {
+            fs::write(
+                &config,
+                format!(
+                    "run-shell -t {target} {}\n",
+                    shell_quote_str(&shell_command)
+                ),
+            )?;
+        }
+
+        let mut command = harness.base_command();
+        if source_file {
+            command.args(["source-file", config.to_str().expect("utf-8 config path")]);
+        } else {
+            command.args(["run-shell", "-t", target.as_str(), shell_command.as_str()]);
+        }
+        let caller = std::thread::spawn(move || command.output());
+        if let Err(error) = wait_for_file_text(&started, original_pane_id.trim()) {
+            let _ = fs::write(&release, b"");
+            return Err(error);
+        }
+        let killed = run_concurrent_cli(&harness, &["kill-pane", "-t", target.as_str()]);
+        let replacement = harness.run(&["split-window", "-d", "-t", session]);
+        let replacement_pane =
+            harness.run(&["display-message", "-p", "-t", target.as_str(), "#{pane_id}"]);
+        fs::write(&release, b"")?;
+
+        assert_success(&killed?);
+        assert_success(&replacement?);
+        let replacement_pane_id = stdout(&replacement_pane?);
+        assert_ne!(
+            replacement_pane_id, original_pane_id,
+            "replacement must have a distinct stable pane identity"
+        );
+        let output = caller
+            .join()
+            .map_err(|_| "run-shell caller thread panicked")??;
+
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(stdout(&output), "replacement-safe\n");
+        assert!(stderr(&output).is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn targeted_run_shell_follows_the_stable_pane_after_renumber_or_break() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("run-shell-target-renumbered")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    for (session, source_file, break_to_window) in [
+        ("direct-renumber", false, false),
+        ("sourced-renumber", true, false),
+        ("direct-broken", false, true),
+        ("sourced-broken", true, true),
+    ] {
+        assert_success(&harness.run(&["new-session", "-d", "-s", session])?);
+        assert_success(&harness.run(&["split-window", "-d", "-t", session])?);
+        let original_target = format!("{session}:0.1");
+        let original_pane_id = stdout(&harness.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            original_target.as_str(),
+            "#{pane_id}",
+        ])?);
+        let mut attach =
+            AttachedSession::spawn(&harness, session, TerminalSize { cols: 80, rows: 12 })?;
+        attach.wait_for_raw_mode(Duration::from_secs(5))?;
+        let _ = read_until_contains(
+            attach.master_mut(),
+            "tester@RMUXHOST",
+            Duration::from_secs(5),
+        )?;
+
+        let marker = harness.tmpdir().join(format!("{session}-started"));
+        let output_marker = format!("{session}-stable-output");
+        let shell_command = format!(
+            "printf '%s' \"$RMUX_PANE\" > {}; sleep 1; printf {}",
+            shell_quote(&marker),
+            shell_quote_str(&output_marker)
+        );
+        let config = harness
+            .tmpdir()
+            .join(format!("{session}-target-moved.conf"));
+        if source_file {
+            fs::write(
+                &config,
+                format!(
+                    "run-shell -t {original_target} {}\n",
+                    shell_quote_str(&shell_command)
+                ),
+            )?;
+        }
+
+        let mut command = harness.base_command();
+        if source_file {
+            command.args(["source-file", config.to_str().expect("utf-8 config path")]);
+        } else {
+            command.args([
+                "run-shell",
+                "-t",
+                original_target.as_str(),
+                shell_command.as_str(),
+            ]);
+        }
+        let caller = std::thread::spawn(move || command.output());
+        wait_for_file(&marker)?;
+        assert_eq!(fs::read_to_string(&marker)?, original_pane_id.trim());
+
+        let current_target = if break_to_window {
+            assert_success(&harness.run(&["break-pane", "-d", "-s", original_target.as_str()])?);
+            original_pane_id.trim().to_owned()
+        } else {
+            assert_success(&harness.run(&["kill-pane", "-t", &format!("{session}:0.0")])?);
+            format!("{session}:0.0")
+        };
+        let moved_pane_id = stdout(&harness.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            current_target.as_str(),
+            "#{pane_id}",
+        ])?);
+        assert_eq!(
+            moved_pane_id, original_pane_id,
+            "surviving pane must keep its stable identity after renumbering"
+        );
+
+        let output = caller
+            .join()
+            .map_err(|_| "run-shell caller thread panicked")??;
+        assert_eq!(output.status.code(), Some(0));
+        assert!(stdout(&output).is_empty());
+        assert!(stderr(&output).is_empty());
+        let _ = read_until_contains(attach.master_mut(), &output_marker, Duration::from_secs(5))?;
+
+        attach.send_bytes(b"\x02d")?;
+        assert!(attach.wait_for_exit(Duration::from_secs(5))?.success());
+    }
+    Ok(())
+}
+
+#[test]
+fn control_mode_targeted_run_shell_follows_the_stable_pane_after_move() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("control-run-shell-target-moved")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    for (session, break_to_window) in [("control-renumber", false), ("control-break", true)] {
+        assert_success(&harness.run(&["new-session", "-d", "-s", session])?);
+        assert_success(&harness.run(&["split-window", "-d", "-t", session])?);
+        let original_target = format!("{session}:0.1");
+        let marker = harness.tmpdir().join(format!("{session}-started"));
+        let completion = harness.tmpdir().join(format!("{session}-completed"));
+        let output_marker = format!("{session}-stable-output");
+        let shell_command = format!(
+            "touch {}; sleep 1; printf {}; touch {}",
+            shell_quote(&marker),
+            shell_quote_str(&output_marker),
+            shell_quote(&completion)
+        );
+        let mut attach =
+            AttachedSession::spawn(&harness, session, TerminalSize { cols: 80, rows: 12 })?;
+        attach.wait_for_raw_mode(Duration::from_secs(5))?;
+        let _ = read_until_contains(
+            attach.master_mut(),
+            "tester@RMUXHOST",
+            Duration::from_secs(5),
+        )?;
+
+        let mut command = harness.base_command();
+        let mut control = command
+            .arg("-C")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        writeln!(
+            control.stdin.as_mut().expect("control stdin"),
+            "run-shell -t {original_target} {}",
+            shell_quote_str(&shell_command)
+        )?;
+        wait_for_file(&marker)?;
+
+        if break_to_window {
+            assert_success(&harness.run(&["break-pane", "-d", "-s", original_target.as_str()])?);
+        } else {
+            assert_success(&harness.run(&["kill-pane", "-t", &format!("{session}:0.0")])?);
+        }
+        wait_for_file(&completion)?;
+
+        drop(control.stdin.take());
+        let output = control.wait_with_output()?;
+        assert_eq!(output.status.code(), Some(0));
+        assert!(stderr(&output).is_empty());
+        assert!(
+            !stdout(&output).contains(&output_marker),
+            "targeted output must not fall back into control-mode stdout"
+        );
+        let _ = read_until_contains(attach.master_mut(), &output_marker, Duration::from_secs(5))?;
+
+        attach.send_bytes(b"\x02d")?;
+        assert!(attach.wait_for_exit(Duration::from_secs(5))?.success());
     }
     Ok(())
 }
@@ -713,6 +973,66 @@ fn source_file_execution_errors_report_on_stderr_without_line_prefix() -> Result
     assert_eq!(output.status.code(), Some(1));
     assert!(stdout(&output).is_empty());
     assert_eq!(stderr(&output), "can't find session: missing\n");
+    Ok(())
+}
+
+#[test]
+fn source_file_break_between_group_aliases_with_multiple_panes_succeeds(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("source-file-grouped-break-multiple-panes")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "owner"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-t", "owner:0"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-t", "owner", "-s", "peer"])?);
+    let moved_pane_id =
+        stdout(&harness.run(&["display-message", "-p", "-t", "owner:0.1", "#{pane_id}"])?);
+    let config = harness.tmpdir().join("grouped-break.conf");
+    fs::write(&config, "break-pane -d -s owner:0.1 -t peer:1\n")?;
+
+    let output = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
+
+    assert_success(&output);
+    for target in ["owner:1.0", "peer:1.0"] {
+        assert_eq!(
+            stdout(&harness.run(&["display-message", "-p", "-t", target, "#{pane_id}",])?),
+            moved_pane_id,
+        );
+    }
+    let source_panes =
+        stdout(&harness.run(&["list-panes", "-t", "owner:0", "-F", "#{pane_id}"])?);
+    assert_eq!(source_panes.lines().count(), 1);
+    assert_ne!(source_panes, moved_pane_id);
+    Ok(())
+}
+
+#[test]
+fn source_file_break_last_pane_between_group_aliases_matches_tmux_rejection_without_mutation(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("source-file-grouped-break-last-pane-rejection")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "owner"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-t", "owner", "-s", "peer"])?);
+    let before = stdout(&harness.run(&[
+        "list-panes",
+        "-a",
+        "-F",
+        "#{session_name}:#{window_index}.#{pane_index}:#{pane_id}",
+    ])?);
+    let config = harness.tmpdir().join("grouped-break-last-pane.conf");
+    fs::write(&config, "break-pane -d -s owner:0.0 -t peer:1\n")?;
+
+    let output = harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?;
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty());
+    assert_eq!(stderr(&output), "sessions are grouped\n");
+    let after = stdout(&harness.run(&[
+        "list-panes",
+        "-a",
+        "-F",
+        "#{session_name}:#{window_index}.#{pane_index}:#{pane_id}",
+    ])?);
+    assert_eq!(after, before);
     Ok(())
 }
 
@@ -1930,6 +2250,515 @@ fn hook_surface_smoke_matches_supported_cli_behavior() -> Result<(), Box<dyn Err
 }
 
 #[test]
+fn cli_set_and_show_hook_without_scope_use_the_hooks_natural_window() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("hook-natural-window-cli")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "window-layout-changed",
+        "set-buffer -b natural-cli yes",
+    ])?);
+    let shown = harness.run(&["show-hooks", "window-layout-changed"])?;
+    assert_eq!(shown.status.code(), Some(0));
+    assert_eq!(
+        stdout(&shown),
+        "window-layout-changed[0] set-buffer -b natural-cli yes\n"
+    );
+
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:0"])?);
+    wait_for_buffer(&harness, "natural-cli", "yes")?;
+    Ok(())
+}
+
+#[test]
+fn source_file_set_hook_without_scope_uses_the_hooks_natural_window() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("hook-natural-window-source")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let config = harness.tmpdir().join("natural-window-hook.conf");
+    fs::write(
+        &config,
+        "set-hook window-layout-changed 'set-buffer -b natural-source yes'\n",
+    )?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["source-file", config.to_str().expect("utf-8 config")])?);
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:0"])?);
+    wait_for_buffer(&harness, "natural-source", "yes")?;
+    Ok(())
+}
+
+#[test]
+fn source_file_compact_hook_target_flags_resolve_active_targets() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("hook-compact-window-target")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let config = harness.tmpdir().join("compact-window-hook.conf");
+    fs::write(
+        &config,
+        "set-hook -wt1 window-layout-changed 'set-buffer -b compact-window yes'\n",
+    )?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:0"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:1"])?);
+    assert_success(&harness.run(&["select-window", "-t", "alpha:0"])?);
+    assert_success(&harness.run(&["select-pane", "-t", "alpha:0.0"])?);
+    assert_success(&harness.run(&["source-file", config.to_str().expect("utf-8 config")])?);
+
+    let active = harness.run(&["show-hooks", "-w", "-t", "alpha:0", "window-layout-changed"])?;
+    assert_eq!(
+        stdout(&active),
+        "window-layout-changed[0] set-buffer -b compact-window yes\n"
+    );
+    let inactive = harness.run(&["show-hooks", "-w", "-t", "alpha:1", "window-layout-changed"])?;
+    assert_eq!(inactive.status.code(), Some(0));
+    assert_eq!(stdout(&inactive), "");
+
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:0"])?);
+    wait_for_buffer(&harness, "compact-window", "yes")?;
+
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:1"])?);
+    assert_success(&harness.run(&["select-pane", "-t", "alpha:1.1"])?);
+    fs::write(
+        &config,
+        concat!(
+            "set-hook -ptalpha:1 pane-mode-changed 'set-buffer -b compact-pane yes'\n",
+            "show-hooks -ptalpha:1 pane-mode-changed\n",
+        ),
+    )?;
+    let sourced = harness.run(&["source-file", config.to_str().expect("utf-8 config")])?;
+    assert_eq!(sourced.status.code(), Some(0));
+    assert_eq!(
+        stdout(&sourced),
+        "pane-mode-changed[0] set-buffer -b compact-pane yes\n"
+    );
+    assert!(stderr(&sourced).is_empty());
+
+    let inactive = harness.run(&["show-hooks", "-p", "-t", "alpha:1.0", "pane-mode-changed"])?;
+    assert_eq!(inactive.status.code(), Some(0));
+    assert_eq!(stdout(&inactive), "");
+    let active = harness.run(&["show-hooks", "-p", "-t", "alpha:1.1", "pane-mode-changed"])?;
+    assert_eq!(
+        stdout(&active),
+        "pane-mode-changed[0] set-buffer -b compact-pane yes\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn attached_hook_targets_resolve_as_target_panes_across_entry_paths() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("hook-attached-target-pane")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-n", "foo"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:1", "-n", "paw"])?);
+
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-tfoo",
+        "session-renamed",
+        "display-message attached-session",
+    ])?);
+    let session = harness.run(&["show-hooks", "-talpha", "session-renamed"])?;
+    let session_by_window = harness.run(&["show-hooks", "-tfoo", "session-renamed"])?;
+    assert_eq!(session.status.code(), Some(0));
+    assert_eq!(session_by_window.status.code(), Some(0));
+    assert_eq!(
+        stdout(&session),
+        "session-renamed[0] display-message attached-session\n"
+    );
+    assert_eq!(stdout(&session_by_window), stdout(&session));
+
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-tfoo",
+        "window-layout-changed",
+        "set-buffer -b attached-direct yes",
+    ])?);
+    let direct = harness.run(&["show-hooks", "-tfoo", "window-layout-changed"])?;
+    assert_eq!(direct.status.code(), Some(0));
+    assert_eq!(
+        stdout(&direct),
+        "window-layout-changed[0] set-buffer -b attached-direct yes\n"
+    );
+
+    assert_success(&harness.run(&[
+        "if-shell",
+        "-F",
+        "1",
+        "set-hook -tpaw window-layout-changed 'set-buffer -b attached-queue yes'",
+    ])?);
+    let queued = harness.run(&["show-hooks", "-w", "-t", "alpha:1", "window-layout-changed"])?;
+    assert_eq!(queued.status.code(), Some(0));
+    assert_eq!(
+        stdout(&queued),
+        "window-layout-changed[0] set-buffer -b attached-queue yes\n"
+    );
+
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:0"])?);
+    wait_for_buffer(&harness, "attached-direct", "yes")?;
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:1"])?);
+    wait_for_buffer(&harness, "attached-queue", "yes")?;
+    Ok(())
+}
+
+#[test]
+fn explicit_window_hook_numeric_target_resolves_a_pane_in_the_current_window(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("hook-window-numeric-pane-target")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-n", "zero"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:0"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:1", "-n", "one"])?);
+    assert_success(&harness.run(&["select-window", "-t", "alpha:0"])?);
+    assert_success(&harness.run(&["select-pane", "-t", "alpha:0.0"])?);
+
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-w",
+        "-t1",
+        "window-layout-changed",
+        "display-message numeric-pane-target",
+    ])?);
+
+    let current = harness.run(&["show-hooks", "-w", "-t", "alpha:0", "window-layout-changed"])?;
+    assert_eq!(current.status.code(), Some(0));
+    assert_eq!(
+        stdout(&current),
+        "window-layout-changed[0] display-message numeric-pane-target\n"
+    );
+    let other = harness.run(&["show-hooks", "-w", "-t", "alpha:1", "window-layout-changed"])?;
+    assert_eq!(other.status.code(), Some(0));
+    assert_eq!(stdout(&other), "");
+
+    let numeric = harness.run(&["show-hooks", "-w", "-t1", "window-layout-changed"])?;
+    assert_eq!(numeric.status.code(), Some(0));
+    assert_eq!(stdout(&numeric), stdout(&current));
+    Ok(())
+}
+
+#[test]
+fn pane_hooks_use_window_scope_naturally_and_pane_scope_only_with_explicit_p(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("hook-pane-natural-window-scope")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:0"])?);
+    assert_success(&harness.run(&["select-pane", "-t", "alpha:0.1"])?);
+
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-talpha:0.1",
+        "pane-mode-changed[0]",
+        "display-message natural-target",
+    ])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "pane-mode-changed[2]",
+        "display-message natural-current",
+    ])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-p",
+        "-talpha:0.1",
+        "pane-mode-changed[1]",
+        "display-message explicit-pane",
+    ])?);
+
+    let window = harness.run(&["show-hooks", "-w", "-t", "alpha:0", "pane-mode-changed"])?;
+    assert_eq!(window.status.code(), Some(0));
+    assert_eq!(
+        stdout(&window),
+        concat!(
+            "pane-mode-changed[0] display-message natural-target\n",
+            "pane-mode-changed[2] display-message natural-current\n",
+        )
+    );
+    let natural = harness.run(&["show-hooks", "pane-mode-changed"])?;
+    assert_eq!(natural.status.code(), Some(0));
+    assert_eq!(stdout(&natural), stdout(&window));
+
+    let pane = harness.run(&["show-hooks", "-p", "-t", "alpha:0.1", "pane-mode-changed"])?;
+    assert_eq!(pane.status.code(), Some(0));
+    assert_eq!(
+        stdout(&pane),
+        "pane-mode-changed[1] display-message explicit-pane\n"
+    );
+    Ok(())
+}
+
+#[test]
+fn set_hook_run_immediately_dispatches_from_target_pane_regardless_of_scope_flags(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("hook-run-immediately-target-pane")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let config = harness.tmpdir().join("run-pane-hook.conf");
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&["split-window", "-d", "-t", "alpha:0"])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-w",
+        "-t",
+        "alpha:0",
+        "pane-mode-changed",
+        "set-buffer -b run-window window",
+    ])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-p",
+        "-t",
+        "alpha:0.1",
+        "pane-mode-changed",
+        "set-buffer -b run-pane pane",
+    ])?);
+
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-R",
+        "-g",
+        "-w",
+        "-p",
+        "-t",
+        "alpha:0.1",
+        "pane-mode-changed",
+    ])?);
+    wait_for_buffer(&harness, "run-pane", "pane")?;
+
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-u",
+        "-p",
+        "-t",
+        "alpha:0.1",
+        "pane-mode-changed",
+    ])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-R",
+        "-p",
+        "-t",
+        "alpha:0.1",
+        "pane-mode-changed",
+    ])?);
+    wait_for_buffer(&harness, "run-window", "window")?;
+
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-p",
+        "-t",
+        "alpha:0.1",
+        "pane-mode-changed",
+        "set-buffer -b run-source source",
+    ])?);
+    fs::write(&config, "set-hook -Rgwp -t alpha:0.1 pane-mode-changed\n")?;
+    assert_success(&harness.run(&["source-file", config.to_str().expect("utf-8 config")])?);
+    wait_for_buffer(&harness, "run-source", "source")?;
+    Ok(())
+}
+
+#[test]
+fn set_hook_run_immediately_missing_target_errors_product_divergence() -> Result<(), Box<dyn Error>>
+{
+    let harness = CliHarness::new("hook-run-missing-target")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let config = harness.tmpdir().join("run-missing-hook.conf");
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let direct = harness.run(&["set-hook", "-R", "-t", "missing", "pane-mode-changed"])?;
+    assert_eq!(direct.status.code(), Some(1));
+    assert!(stderr(&direct).contains("can't find pane"));
+
+    fs::write(&config, "set-hook -R -t missing pane-mode-changed\n")?;
+    let sourced = harness.run(&["source-file", config.to_str().expect("utf-8 config")])?;
+    assert_eq!(sourced.status.code(), Some(1));
+    assert!(stderr(&sourced).contains("can't find pane"));
+    Ok(())
+}
+
+#[test]
+fn set_hook_run_immediately_rejects_ignored_mutations_product_divergence(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("hook-run-rejects-ignored-fields")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let config = harness.tmpdir().join("run-invalid-hook.conf");
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    for arguments in [
+        vec!["set-hook", "-Ra", "pane-mode-changed"],
+        vec!["set-hook", "-Ru", "pane-mode-changed"],
+        vec!["set-hook", "-R", "pane-mode-changed[1]"],
+        vec![
+            "set-hook",
+            "-R",
+            "pane-mode-changed",
+            "display-message ignored",
+        ],
+    ] {
+        let output = harness.run(&arguments)?;
+        assert_eq!(output.status.code(), Some(1), "arguments: {arguments:?}");
+        assert!(
+            stderr(&output).contains("set-hook -R only accepts a hook name"),
+            "arguments: {arguments:?}, stderr: {:?}",
+            stderr(&output)
+        );
+    }
+
+    fs::write(
+        &config,
+        "set-hook -Rau pane-mode-changed 'display-message ignored'\n",
+    )?;
+    let sourced = harness.run(&["source-file", config.to_str().expect("utf-8 config")])?;
+    assert_eq!(sourced.status.code(), Some(1));
+    assert!(stderr(&sourced).contains("set-hook -R only accepts a hook name"));
+    Ok(())
+}
+
+#[test]
+fn show_hooks_without_a_hook_filter_uses_the_target_panes_session_scope(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("show-hooks-unfiltered-session-scope")?;
+    let _daemon = harness.start_hidden_daemon()?;
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-n", "foo"])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-tfoo",
+        "session-renamed",
+        "display-message session-sentinel",
+    ])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-w",
+        "-tfoo",
+        "window-layout-changed",
+        "display-message window-sentinel",
+    ])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-p",
+        "-tfoo",
+        "pane-mode-changed",
+        "display-message pane-sentinel",
+    ])?);
+
+    let shown = harness.run(&["show-hooks", "-tfoo"])?;
+    assert_eq!(shown.status.code(), Some(0));
+    let shown = stdout(&shown);
+    assert!(shown.contains("session-renamed[0] display-message session-sentinel\n"));
+    assert!(!shown.contains("window-sentinel"));
+    assert!(!shown.contains("pane-sentinel"));
+    Ok(())
+}
+
+#[test]
+fn set_hook_global_target_is_still_resolved_product_divergence() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("hook-global-target-resolution")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let config = harness.tmpdir().join("global-target-hook.conf");
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "existing"])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "-t",
+        "existing",
+        "session-renamed",
+        "display-message resolved-global",
+    ])?);
+
+    let missing = harness.run(&[
+        "set-hook",
+        "-g",
+        "-t",
+        "missing",
+        "session-renamed",
+        "display-message must-not-install",
+    ])?;
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(stderr(&missing).contains("can't find pane"));
+
+    fs::write(
+        &config,
+        "set-hook -g -t missing session-renamed 'display-message must-not-install'\n",
+    )?;
+    let missing_source = harness.run(&["source-file", config.to_str().expect("utf-8 config")])?;
+    assert_eq!(missing_source.status.code(), Some(1));
+    assert!(stderr(&missing_source).contains("can't find pane"));
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "ambiguous-one"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "ambiguous-two"])?);
+    let ambiguous = harness.run(&[
+        "set-hook",
+        "-g",
+        "-t",
+        "ambiguous",
+        "session-renamed",
+        "display-message must-not-install",
+    ])?;
+    assert_eq!(ambiguous.status.code(), Some(1));
+    assert!(stderr(&ambiguous).contains("ambiguous"));
+    Ok(())
+}
+
+#[test]
+fn filtered_global_show_hooks_normalize_scope_flags_by_hook_class() -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("hook-global-filtered-scope")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    let config = harness.tmpdir().join("global-filtered-show.conf");
+
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "session-renamed",
+        "display-message global-session",
+    ])?);
+    assert_success(&harness.run(&[
+        "set-hook",
+        "-g",
+        "window-layout-changed",
+        "display-message global-window",
+    ])?);
+
+    for flags in [["-g", "-w"], ["-g", "-p"]] {
+        let session = harness.run(&["show-hooks", flags[0], flags[1], "session-renamed"])?;
+        assert_eq!(
+            stdout(&session),
+            "session-renamed[0] display-message global-session\n"
+        );
+        let window = harness.run(&["show-hooks", flags[0], flags[1], "window-layout-changed"])?;
+        assert_eq!(
+            stdout(&window),
+            "window-layout-changed[0] display-message global-window\n"
+        );
+    }
+
+    fs::write(
+        &config,
+        concat!(
+            "show-hooks -gw session-renamed\n",
+            "show-hooks -gp window-layout-changed\n",
+        ),
+    )?;
+    let sourced = harness.run(&["source-file", config.to_str().expect("utf-8 config")])?;
+    assert_eq!(
+        stdout(&sourced),
+        concat!(
+            "session-renamed[0] display-message global-session\n",
+            "window-layout-changed[0] display-message global-window\n",
+        )
+    );
+    Ok(())
+}
+
+#[test]
 fn source_file_set_hook_accepts_compact_flag_clusters() -> Result<(), Box<dyn Error>> {
     let harness = CliHarness::new("set-hook-compact-flags")?;
     let _daemon = harness.start_hidden_daemon()?;
@@ -1974,6 +2803,47 @@ fn source_file_hook_preserves_double_quotes_and_backslashes_exactly() -> Result<
     assert_eq!(shown.status.code(), Some(0));
     assert_eq!(stdout(&shown), r#"a"b\\c"#);
     assert!(stderr(&shown).is_empty());
+    Ok(())
+}
+
+#[test]
+fn source_file_nested_assignments_apply_once_at_parse_time_across_all_command_blocks(
+) -> Result<(), Box<dyn Error>> {
+    let harness = CliHarness::new("source-nested-parse-time-assignments")?;
+    let _daemon = harness.start_hidden_daemon()?;
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha"])?);
+    let config = harness.tmpdir().join("nested-assignments.conf");
+    fs::write(
+        &config,
+        "set-hook -g after-new-window { HOOK_NESTED=hooked }\n\
+         if-shell -F 0 { FALSE_BRANCH=parsed }\n\
+         if-shell -F 1 { TRUE_BRANCH=parsed } { ELSE_BRANCH=parsed }\n",
+    )?;
+
+    assert_success(&harness.run(&["source-file", config.to_str().expect("utf-8 config path")])?);
+    for (name, value) in [
+        ("HOOK_NESTED", "hooked"),
+        ("FALSE_BRANCH", "parsed"),
+        ("TRUE_BRANCH", "parsed"),
+        ("ELSE_BRANCH", "parsed"),
+    ] {
+        let shown = harness.run(&["show-environment", "-g", name])?;
+        assert_eq!(shown.status.code(), Some(0));
+        assert!(stderr(&shown).is_empty());
+        assert_eq!(stdout(&shown), format!("{name}={value}\n"));
+    }
+
+    assert_success(&harness.run(&[
+        "set-environment",
+        "-g",
+        "HOOK_NESTED",
+        "changed-after-parse",
+    ])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha"])?);
+    let shown = harness.run(&["show-environment", "-g", "HOOK_NESTED"])?;
+    assert_eq!(shown.status.code(), Some(0));
+    assert!(stderr(&shown).is_empty());
+    assert_eq!(stdout(&shown), "HOOK_NESTED=changed-after-parse\n");
     Ok(())
 }
 
@@ -2299,6 +3169,37 @@ fn wait_for_file(path: &std::path::Path) -> Result<(), Box<dyn Error>> {
         std::thread::sleep(Duration::from_millis(20));
     }
     Err(format!("timed out waiting for {}", path.display()).into())
+}
+
+fn wait_for_file_text(path: &std::path::Path, expected: &str) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last = None;
+    while Instant::now() < deadline {
+        match fs::read_to_string(path) {
+            Ok(contents) if contents == expected => return Ok(()),
+            Ok(contents) => last = Some(contents),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Err(format!(
+        "timed out waiting for {} to contain {expected:?}; last={last:?}",
+        path.display()
+    )
+    .into())
+}
+
+fn run_concurrent_cli(
+    harness: &CliHarness,
+    arguments: &[&str],
+) -> Result<std::process::Output, Box<dyn Error>> {
+    // These lifecycle probes intentionally overlap a blocking run-shell request.
+    // The suite-wide CLI lock is for sequential probes and can delay this
+    // mutation until after the shell has completed under full-suite load.
+    let mut command = harness.base_command();
+    command.args(arguments).stdin(Stdio::null());
+    Ok(command.output()?)
 }
 
 fn wait_for_option_value(

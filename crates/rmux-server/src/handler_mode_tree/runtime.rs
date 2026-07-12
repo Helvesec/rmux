@@ -206,21 +206,6 @@ impl RequestHandler {
         }
     }
 
-    async fn active_mode_tree_session_name(
-        &self,
-        attach_pid: u32,
-    ) -> Result<Option<SessionName>, RmuxError> {
-        let active_attach = self.active_attach.lock().await;
-        let active = active_attach
-            .by_pid
-            .get(&attach_pid)
-            .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
-        Ok(active
-            .mode_tree
-            .as_ref()
-            .map(|mode| mode.session_name.clone()))
-    }
-
     pub(in crate::handler) async fn mode_tree_active(&self, attach_pid: u32) -> bool {
         let active_attach = self.active_attach.lock().await;
         active_attach
@@ -334,11 +319,38 @@ impl RequestHandler {
         &self,
         attach_pid: u32,
     ) -> Result<Vec<SessionName>, RmuxError> {
-        let Some(mode_session_name) = self.active_mode_tree_session_name(attach_pid).await? else {
-            return Ok(Vec::new());
-        };
+        self.dismiss_mode_tree_with_expected_identity(attach_pid, None)
+            .await
+    }
+
+    pub(in crate::handler) async fn dismiss_mode_tree_for_client_identity(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: u64,
+    ) -> Result<Vec<SessionName>, RmuxError> {
+        self.dismiss_mode_tree_with_expected_identity(attach_pid, Some(expected_attach_id))
+            .await
+    }
+
+    async fn dismiss_mode_tree_with_expected_identity(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: Option<u64>,
+    ) -> Result<Vec<SessionName>, RmuxError> {
         let removed = {
             let mut active_attach = self.active_attach.lock().await;
+            let active = active_attach
+                .by_pid
+                .get(&attach_pid)
+                .filter(|active| expected_attach_id.is_none_or(|expected| active.id == expected))
+                .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
+            let Some(mode_session_name) = active
+                .mode_tree
+                .as_ref()
+                .map(|mode| mode.session_name.clone())
+            else {
+                return Ok(Vec::new());
+            };
             let mut removed = None;
             for active in active_attach.by_pid.values_mut() {
                 if active.session_name != mode_session_name {

@@ -215,6 +215,20 @@ impl ClientPromptState {
         self.history_index = 0;
     }
 
+    fn insert_batched_text(&mut self, text: &str) -> bool {
+        const PER_EVENT_FLAGS: u8 =
+            PROMPT_FLAG_SINGLE | PROMPT_FLAG_NUMERIC | PROMPT_FLAG_INCREMENTAL | PROMPT_FLAG_KEY;
+        if text.is_empty() || self.flags & PER_EVENT_FLAGS != 0 {
+            return false;
+        }
+
+        let byte = byte_index_for_char(&self.buffer, self.cursor);
+        self.buffer.insert_str(byte, text);
+        self.cursor += text.chars().count();
+        self.history_index = 0;
+        true
+    }
+
     fn delete_left(&mut self) -> bool {
         if self.cursor == 0 {
             return false;

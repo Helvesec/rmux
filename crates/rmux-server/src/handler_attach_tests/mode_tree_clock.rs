@@ -104,6 +104,40 @@ async fn attached_compact_prefix_wq_uses_choose_tree_before_the_following_key() 
 }
 
 #[tokio::test]
+async fn attached_mode_tree_consumes_lone_escape_after_input_timeout() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let alpha = session_name("mode-tree-escape");
+    let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
+
+    let commands = handler
+        .parse_control_commands("choose-tree -Zw")
+        .await
+        .expect("choose-tree parses");
+    handler
+        .execute_parsed_commands_for_test(requester_pid, commands)
+        .await
+        .expect("choose-tree activates mode-tree");
+    assert_eq!(pane_mode_status(&handler, &alpha).await, "1:tree-mode::\n");
+
+    let mut pending_input = Vec::new();
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"\x1b")
+        .await
+        .expect("fragmented escape waits for the timeout");
+    assert_eq!(pending_input, b"\x1b");
+
+    let forwarded = handler
+        .flush_attached_pending_escape_input(requester_pid, &mut pending_input)
+        .await
+        .expect("escape timeout closes mode-tree");
+
+    assert!(!forwarded);
+    assert!(pending_input.is_empty());
+    assert_eq!(pane_mode_status(&handler, &alpha).await, "0:::\n");
+}
+
+#[tokio::test]
 async fn attached_compact_prefix_tq_uses_clock_mode_before_the_following_key() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();

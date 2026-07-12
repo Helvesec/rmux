@@ -7,7 +7,7 @@ use rmux_proto::{
     PaneSnapshotResponse, Request, Response, CAPABILITY_SDK_PANE_BY_ID,
 };
 
-use super::target::{is_already_closed_error, parse_error};
+use super::target::{is_already_closed_error, is_already_closed_pane_id_error, parse_error};
 
 pub(super) async fn pane_snapshot(pane: &Pane) -> Result<PaneSnapshot> {
     let Some(resolved_id) = pane.id().await? else {
@@ -21,7 +21,16 @@ pub(super) async fn pane_snapshot(pane: &Pane) -> Result<PaneSnapshot> {
     // while genuine transport or protocol errors still propagate.
     match request_pane_snapshot(pane, resolved_id).await {
         Ok(response) => snapshot_from_response(response),
-        Err(error) if is_already_closed_error(&error, pane.target()) => Ok(PaneSnapshot::default()),
+        Err(error)
+            if is_already_closed_error(&error, pane.target())
+                || is_already_closed_pane_id_error(
+                    &error,
+                    &pane.target().session_name,
+                    resolved_id,
+                ) =>
+        {
+            Ok(PaneSnapshot::default())
+        }
         Err(error) => Err(error),
     }
 }

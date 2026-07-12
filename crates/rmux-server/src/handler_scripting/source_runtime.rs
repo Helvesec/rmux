@@ -5,7 +5,7 @@ use rmux_core::{
         CommandArgument, CommandParseErrorKind, CommandParser, ParsedCommand, ParsedCommands,
         SOURCE_FILE_MAX_COMMAND_BYTES,
     },
-    parse_binding_command_tokens,
+    parse_binding_command_tokens_with_parser,
 };
 use rmux_proto::{
     CommandOutput, ErrorResponse, PaneTarget, Request, Response, RmuxError, SourceFileRequest,
@@ -416,6 +416,7 @@ impl RequestHandler {
                     batch.commands,
                     batch_context,
                     QueueMode::Detached,
+                    None,
                 )
                 .await;
             stdout.extend_from_slice(&result.stdout);
@@ -998,7 +999,11 @@ impl RequestHandler {
         context: &QueueExecutionContext,
         settings: SourceValidationSettings,
     ) -> Option<NestedValidationError> {
-        let commands = match parse_binding_command_tokens(tokens) {
+        let parser = {
+            let state = self.state.lock().await;
+            command_parser_from_state(&state)
+        };
+        let commands = match parse_binding_command_tokens_with_parser(&parser, tokens) {
             Ok(commands) => commands,
             Err(error) => {
                 return Some(NestedValidationError::needs_parent(RmuxError::Server(

@@ -15,8 +15,8 @@ mod tunnel;
 mod websocket;
 
 pub(crate) use record::{
-    WebSessionTarget, WebShareAccess, WebShareConnectionCounts, WebShareRevokeReason,
-    WebShareTarget,
+    WebPaneTarget, WebSessionTarget, WebShareAccess, WebShareConnectionCounts,
+    WebShareRevokeReason, WebShareTarget,
 };
 pub(crate) use registry::{
     ExpiredWebShare, ResolvedCreateWebShareRequest, WebShareExpiryPoll, WebShareRegistry,

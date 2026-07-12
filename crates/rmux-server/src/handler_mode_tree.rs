@@ -7,6 +7,8 @@ use super::RequestHandler;
 mod mode_tree_actions;
 #[path = "handler_mode_tree/build.rs"]
 mod mode_tree_build;
+#[path = "handler_mode_tree/client_actions.rs"]
+mod mode_tree_client_actions;
 #[path = "handler_mode_tree/customize_build.rs"]
 mod mode_tree_customize_build;
 #[path = "handler_mode_tree/filter.rs"]
@@ -33,6 +35,8 @@ mod mode_tree_selection;
 mod mode_tree_sort;
 #[path = "handler_mode_tree/tree_build.rs"]
 mod mode_tree_tree_build;
+#[path = "handler_mode_tree/tree_kill.rs"]
+mod mode_tree_tree_kill;
 
 use self::mode_tree_model::ModeTreeKind;
 pub(super) use self::mode_tree_model::{ModeTreeClientState, ParsedModeTreeCommand};

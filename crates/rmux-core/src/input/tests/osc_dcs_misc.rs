@@ -260,7 +260,7 @@ fn osc_11_oversized_set_is_not_stored_so_queries_cannot_amplify() {
     // megabytes: without the length bound reply_buf would balloon to ~100 MiB.
     let mut payload = Vec::new();
     payload.extend_from_slice(b"\x1b]11;rgb:");
-    payload.extend(std::iter::repeat(b'A').take(1_000_000));
+    payload.extend(std::iter::repeat_n(b'A', 1_000_000));
     payload.extend_from_slice(b"\x1b\\");
     for _ in 0..100 {
         payload.extend_from_slice(b"\x1b]11;?\x07");

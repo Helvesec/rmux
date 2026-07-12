@@ -1,6 +1,8 @@
 use rmux_core::command_parser::{CommandArgument, ParsedCommand, ParsedCommands};
 use rmux_proto::{DisplayPanesRequest, ErrorResponse, Response, RmuxError, SessionName, Target};
+use tokio::task::AbortHandle;
 
+use crate::hook_runtime::{current_hook_formats, hooks_disabled, with_hook_execution};
 use crate::mouse::AttachedMouseEvent;
 
 use super::super::super::{
@@ -18,6 +20,26 @@ pub(super) struct AttachedBindingCommandContext {
     pub(super) mouse_target: Option<Target>,
     pub(super) mouse_event: Option<AttachedMouseEvent>,
     pub(super) commands: ParsedCommands,
+}
+
+struct AbortAttachedBindingOnDrop(Option<AbortHandle>);
+
+impl AbortAttachedBindingOnDrop {
+    fn new(abort_handle: AbortHandle) -> Self {
+        Self(Some(abort_handle))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for AbortAttachedBindingOnDrop {
+    fn drop(&mut self) {
+        if let Some(abort_handle) = self.0.take() {
+            abort_handle.abort();
+        }
+    }
 }
 
 #[async_recursion::async_recursion]
@@ -91,10 +113,27 @@ pub(super) async fn execute_attached_binding_commands(
         return Ok(());
     }
 
-    match handler
-        .execute_parsed_commands(requester_pid, commands.clone(), context)
-        .await
-    {
+    // A binding can enter the full command-dispatch and renderer stack. Poll it
+    // as a separate Tokio task so the attach input stack unwinds before that
+    // work begins; awaiting the task preserves command order. Abort it if the
+    // attach request is cancelled instead of detaching work from its client.
+    let task_handler = handler.clone();
+    let task_commands = commands.clone();
+    let inherited_hook_formats = hooks_disabled().then(current_hook_formats);
+    let task = tokio::spawn(async move {
+        let execution = task_handler.execute_parsed_commands(requester_pid, task_commands, context);
+        match inherited_hook_formats {
+            Some(formats) => with_hook_execution(formats, execution).await,
+            None => execution.await,
+        }
+    });
+    let mut abort_on_drop = AbortAttachedBindingOnDrop::new(task.abort_handle());
+    let joined = task.await;
+    abort_on_drop.disarm();
+    let execution = joined
+        .map_err(|error| RmuxError::Server(format!("attached binding task failed: {error}")))?;
+
+    match execution {
         Ok(output) => {
             if attached_live_input && parsed_commands_open_attached_output(&commands) {
                 if let Err(error) = handler

@@ -235,6 +235,29 @@ impl RequestHandler {
         Ok(())
     }
 
+    pub(in crate::handler) async fn try_handle_prompt_text_deferred_refresh(
+        &self,
+        attach_pid: u32,
+        text: &str,
+        deferred_refresh: &mut bool,
+    ) -> Result<bool, RmuxError> {
+        let inserted = {
+            let mut active_attach = self.active_attach.lock().await;
+            let active = active_attach
+                .by_pid
+                .get_mut(&attach_pid)
+                .ok_or_else(|| RmuxError::Server("attached client disappeared".to_owned()))?;
+            active
+                .prompt
+                .as_mut()
+                .is_some_and(|prompt| prompt.insert_batched_text(text))
+        };
+        if inserted {
+            *deferred_refresh = true;
+        }
+        Ok(inserted)
+    }
+
     pub(in crate::handler) async fn flush_attached_prompt_refresh(
         &self,
         attach_pid: u32,
@@ -249,11 +272,30 @@ impl RequestHandler {
     }
 
     pub(in crate::handler) async fn clear_prompt_for_attach(&self, attach_pid: u32) {
+        self.clear_prompt_for_attach_with_expected_identity(attach_pid, None)
+            .await;
+    }
+
+    pub(in crate::handler) async fn clear_prompt_for_attach_identity(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: u64,
+    ) {
+        self.clear_prompt_for_attach_with_expected_identity(attach_pid, Some(expected_attach_id))
+            .await;
+    }
+
+    async fn clear_prompt_for_attach_with_expected_identity(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: Option<u64>,
+    ) {
         let finished = {
             let mut active_attach = self.active_attach.lock().await;
             active_attach
                 .by_pid
                 .get_mut(&attach_pid)
+                .filter(|active| expected_attach_id.is_none_or(|expected| active.id == expected))
                 .and_then(|active| active.prompt.take())
                 .map(|prompt| prompt.into_finished(PromptFinalizeKind::Cancel))
         };

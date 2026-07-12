@@ -207,6 +207,17 @@ impl Pane {
         }
     }
 
+    pub(crate) async fn resolved_proto_target_ref(
+        &self,
+    ) -> Result<Option<rmux_proto::PaneTargetRef>> {
+        if self.stable_id.is_some() {
+            return Ok(Some(self.proto_target_ref()));
+        }
+        Ok(self.id().await?.map(|pane_id| {
+            rmux_proto::PaneTargetRef::by_id(self.target.session_name.clone(), pane_id)
+        }))
+    }
+
     pub(crate) const fn is_stable_id(&self) -> bool {
         self.stable_id.is_some()
     }
@@ -450,10 +461,24 @@ impl Pane {
     }
 
     /// Returns best-effort foreground process state for this pane.
+    ///
+    /// Foreground changes are detected by a periodic daemon-side probe, so
+    /// values are best-effort and may lag the pane by around a second. Use
+    /// [`Pane::foreground_state_with_revision`] to order a snapshot against a
+    /// [`Pane::state_events`] stream.
     pub async fn foreground_state(&self) -> Result<Option<ForegroundState>> {
         foreground::foreground_state(self)
             .await
             .map(|state| state.map(|(_, _, foreground)| foreground))
+    }
+
+    /// Returns best-effort foreground process state together with the stable
+    /// pane id and the pane-state revision the snapshot was taken at, so
+    /// callers can order it against a [`Pane::state_events`] stream.
+    pub async fn foreground_state_with_revision(
+        &self,
+    ) -> Result<Option<(PaneId, u64, ForegroundState)>> {
+        foreground::foreground_state(self).await
     }
 
     /// Opens a long-poll stream of pane title, option, close, and optional foreground events.

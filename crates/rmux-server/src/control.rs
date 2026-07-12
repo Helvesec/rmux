@@ -3,7 +3,7 @@ pub(crate) use crate::control_mode::ControlModeUpgrade;
 #[cfg(any(unix, windows))]
 use crate::daemon::ShutdownHandle;
 #[cfg(any(unix, windows))]
-use crate::handler::RequestHandler;
+use crate::handler::{with_control_queue_identity, ControlClientIdentity, RequestHandler};
 #[cfg(any(unix, windows))]
 use rmux_core::command_parser::{CommandArgument, ParsedCommand, ParsedCommands};
 #[cfg(any(unix, windows))]
@@ -128,12 +128,39 @@ impl ControlUpgradeInput {
 pub(crate) async fn forward_control(
     stream: LocalStream,
     handler: Arc<RequestHandler>,
-    requester_pid: u32,
+    control_identity: ControlClientIdentity,
+    upgrade_input: ControlUpgradeInput,
+    shutdown: watch::Receiver<()>,
+    server_events: mpsc::Receiver<ControlServerEvent>,
+    lifecycle: ControlLifecycle,
+) -> io::Result<()> {
+    with_control_queue_identity(
+        control_identity,
+        forward_control_inner(
+            stream,
+            handler,
+            control_identity,
+            upgrade_input,
+            shutdown,
+            server_events,
+            lifecycle,
+        ),
+    )
+    .await
+}
+
+#[cfg(any(unix, windows))]
+async fn forward_control_inner(
+    stream: LocalStream,
+    handler: Arc<RequestHandler>,
+    control_identity: ControlClientIdentity,
     upgrade_input: ControlUpgradeInput,
     mut shutdown: watch::Receiver<()>,
     mut server_events: mpsc::Receiver<ControlServerEvent>,
     lifecycle: ControlLifecycle,
 ) -> io::Result<()> {
+    let requester_pid = control_identity.requester_pid();
+    let control_id = control_identity.control_id();
     let ControlUpgradeInput {
         buffered_bytes: initial_socket_bytes,
         initial_command_count,
@@ -323,7 +350,11 @@ pub(crate) async fn forward_control(
                         abort_on_eof,
                         task: Some(tokio::spawn(async move {
                             handler
-                                .execute_control_commands(requester_pid, commands)
+                                .execute_control_commands_identity(
+                                    requester_pid,
+                                    control_id,
+                                    commands,
+                                )
                                 .await
                         })),
                     });

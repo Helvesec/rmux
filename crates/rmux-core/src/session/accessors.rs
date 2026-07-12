@@ -1,10 +1,102 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use rmux_proto::{SessionName, TerminalSize};
 
 use super::{current_unix_timestamp, synchronized_active_window, Session, WindowIdAllocator};
-use crate::{AlertFlags, Pane, PaneId, SessionId, Window, WINLINK_ALERTFLAGS};
+use crate::{AlertFlags, Pane, PaneId, SessionId, Window, WindowId, WINLINK_ALERTFLAGS};
+
+fn window_index_for_id(
+    windows: &BTreeMap<u32, Window>,
+    window_id: WindowId,
+    preferred_index: u32,
+) -> Option<u32> {
+    if windows
+        .get(&preferred_index)
+        .is_some_and(|window| window.id() == window_id)
+    {
+        return Some(preferred_index);
+    }
+    let mut matches = windows
+        .iter()
+        .filter_map(|(window_index, window)| (window.id() == window_id).then_some(*window_index));
+    let only_match = matches.next()?;
+    matches.next().is_none().then_some(only_match)
+}
+
+fn remap_local_winlink_alert_flags(
+    previous_windows: &BTreeMap<u32, Window>,
+    previous_flags: &BTreeMap<u32, AlertFlags>,
+    synchronized_windows: &BTreeMap<u32, Window>,
+    source_flags: &BTreeMap<u32, AlertFlags>,
+    winlink_alert_map: Option<&BTreeMap<u32, u32>>,
+) -> BTreeMap<u32, AlertFlags> {
+    let mut synchronized_indices = BTreeMap::new();
+    let mut claimed = BTreeSet::new();
+
+    if let Some(winlink_alert_map) = winlink_alert_map {
+        for (&previous_index, previous_window) in previous_windows {
+            let Some(&next_index) = winlink_alert_map.get(&previous_index) else {
+                continue;
+            };
+            if synchronized_windows
+                .get(&next_index)
+                .is_some_and(|window| window.id() == previous_window.id())
+                && claimed.insert(next_index)
+            {
+                synchronized_indices.insert(previous_index, next_index);
+            }
+        }
+    }
+
+    // Reserve every surviving exact slot before falling back by WindowId. In
+    // particular, a removed duplicate alias must not steal the surviving
+    // alias's index merely because both aliases share one WindowId.
+    for (&previous_index, previous_window) in previous_windows {
+        if synchronized_indices.contains_key(&previous_index) {
+            continue;
+        }
+        if synchronized_windows
+            .get(&previous_index)
+            .is_some_and(|window| window.id() == previous_window.id())
+            && claimed.insert(previous_index)
+        {
+            synchronized_indices.insert(previous_index, previous_index);
+        }
+    }
+
+    for (&previous_index, previous_window) in previous_windows {
+        if synchronized_indices.contains_key(&previous_index) {
+            continue;
+        }
+        let next_index = synchronized_windows.iter().find_map(|(&index, window)| {
+            (window.id() == previous_window.id() && !claimed.contains(&index)).then_some(index)
+        });
+        if let Some(next_index) = next_index {
+            claimed.insert(next_index);
+            synchronized_indices.insert(previous_index, next_index);
+        }
+    }
+
+    let mut remapped = previous_flags
+        .iter()
+        .filter_map(|(&previous_index, &flags)| {
+            synchronized_indices
+                .get(&previous_index)
+                .copied()
+                .map(|next_index| (next_index, flags))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for &window_index in synchronized_windows.keys() {
+        remapped.entry(window_index).or_insert_with(|| {
+            source_flags
+                .get(&window_index)
+                .copied()
+                .unwrap_or_else(AlertFlags::empty)
+        });
+    }
+    remapped
+}
 
 impl Session {
     /// Returns the stable validated session name.
@@ -113,26 +205,131 @@ impl Session {
 
     /// Synchronizes shared grouped-session window state from the source session while preserving the local current window when possible.
     pub fn synchronize_group_from(&mut self, source: &Session) {
+        self.synchronize_group_from_with_optional_winlink_alert_map(source, None);
+    }
+
+    /// Synchronizes grouped windows by identity while applying an authoritative
+    /// permutation to peer-local winlink alert flags.
+    pub fn synchronize_group_from_with_winlink_alert_map(
+        &mut self,
+        source: &Session,
+        winlink_alert_map: &BTreeMap<u32, u32>,
+    ) {
+        self.synchronize_group_from_with_optional_winlink_alert_map(
+            source,
+            Some(winlink_alert_map),
+        );
+    }
+
+    fn synchronize_group_from_with_optional_winlink_alert_map(
+        &mut self,
+        source: &Session,
+        winlink_alert_map: Option<&BTreeMap<u32, u32>>,
+    ) {
         debug_assert_ne!(self.name, source.name);
         let previous_active = self.active_window;
         let previous_last = self.last_window;
+        let previous_active_window_id = self.window_at(previous_active).map(Window::id);
+        let previous_last_window_id = previous_last
+            .and_then(|window_index| self.window_at(window_index))
+            .map(Window::id);
 
-        self.windows = source.windows.clone();
-        self.winlink_alert_flags = source.winlink_alert_flags.clone();
-        self.next_pane_id = source.next_pane_id;
-        self.cwd = source.cwd.clone();
-
-        self.active_window =
-            synchronized_active_window(&self.windows, previous_active, previous_last);
-        self.last_window = previous_last
-            .filter(|window_index| {
-                *window_index != self.active_window && self.windows.contains_key(window_index)
+        let synchronized_active = previous_active_window_id
+            .and_then(|window_id| window_index_for_id(&source.windows, window_id, previous_active))
+            .unwrap_or_else(|| {
+                synchronized_active_window(&source.windows, previous_active, previous_last)
+            });
+        let synchronized_last = previous_last_window_id
+            .and_then(|window_id| {
+                window_index_for_id(
+                    &source.windows,
+                    window_id,
+                    previous_last.expect("last window id requires an index"),
+                )
             })
+            .filter(|window_index| *window_index != synchronized_active)
             .or_else(|| {
-                (previous_active != self.active_window
-                    && self.windows.contains_key(&previous_active))
+                (previous_active != synchronized_active
+                    && source.windows.contains_key(&previous_active))
                 .then_some(previous_active)
             });
+        self.synchronize_group_windows(
+            source,
+            synchronized_active,
+            synchronized_last,
+            winlink_alert_map,
+        );
+    }
+
+    /// Synchronizes grouped window state while remapping selected source slots explicitly.
+    pub fn synchronize_group_from_with_window_selection_map(
+        &mut self,
+        source: &Session,
+        index_map: &BTreeMap<u32, u32>,
+    ) {
+        self.synchronize_group_from_with_window_selection_and_winlink_alert_maps(
+            source, index_map, index_map,
+        );
+    }
+
+    /// Synchronizes grouped windows with independent maps for peer selection
+    /// and peer-local winlink alert flags.
+    pub fn synchronize_group_from_with_window_selection_and_winlink_alert_maps(
+        &mut self,
+        source: &Session,
+        window_selection_map: &BTreeMap<u32, u32>,
+        winlink_alert_map: &BTreeMap<u32, u32>,
+    ) {
+        debug_assert_ne!(self.name, source.name);
+        let previous_active = self.active_window;
+        let previous_last = self.last_window;
+        let synchronized_active = window_selection_map
+            .get(&previous_active)
+            .copied()
+            .unwrap_or(previous_active);
+        let synchronized_active = if source.windows.contains_key(&synchronized_active) {
+            synchronized_active
+        } else {
+            synchronized_active_window(&source.windows, previous_active, previous_last)
+        };
+        let synchronized_last = previous_last
+            .map(|window_index| {
+                window_selection_map
+                    .get(&window_index)
+                    .copied()
+                    .unwrap_or(window_index)
+            })
+            .filter(|window_index| {
+                *window_index != synchronized_active && source.windows.contains_key(window_index)
+            });
+        self.synchronize_group_windows(
+            source,
+            synchronized_active,
+            synchronized_last,
+            Some(winlink_alert_map),
+        );
+    }
+
+    fn synchronize_group_windows(
+        &mut self,
+        source: &Session,
+        active_window: u32,
+        last_window: Option<u32>,
+        winlink_alert_map: Option<&BTreeMap<u32, u32>>,
+    ) {
+        let synchronized_alert_flags = remap_local_winlink_alert_flags(
+            &self.windows,
+            &self.winlink_alert_flags,
+            &source.windows,
+            &source.winlink_alert_flags,
+            winlink_alert_map,
+        );
+        self.windows = source.windows.clone();
+        self.winlink_alert_flags = synchronized_alert_flags;
+        self.next_pane_id = source.next_pane_id;
+        self.cwd = source.cwd.clone();
+        self.active_window = active_window;
+        self.last_window = last_window;
     }
 
     /// Returns the session's active window.

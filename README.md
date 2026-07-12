@@ -116,7 +116,6 @@ Use `rmux -V` for the installed version.
 | Platform / manager | Command |
 | :--- | :--- |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/apple.svg"><img src="docs/install/apple-light.svg" width="28" alt="macOS"></picture> / Homebrew | `brew install rmux` |
-| <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/windows.svg"><img src="docs/install/windows-light.svg" width="28" alt="Windows"></picture> / installer | `irm https://rmux.io/install.ps1 \| iex` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/windows.svg"><img src="docs/install/windows-light.svg" width="28" alt="Windows"></picture> / WinGet | `winget install rmux` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/windows.svg"><img src="docs/install/windows-light.svg" width="28" alt="Windows"></picture> / Scoop | `scoop bucket add rmux https://github.com/Helvesec/scoop-rmux && scoop install rmux` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="docs/install/windows.svg"><img src="docs/install/windows-light.svg" width="28" alt="Windows"></picture> / Chocolatey | `choco install rmux` |
@@ -127,7 +126,12 @@ Use `rmux -V` for the installed version.
 
 Direct downloads (`.tar.gz`, `.deb`, `.rpm`, `.zip`) are available from the [v0.9.0 GitHub Release](https://github.com/Helvesec/rmux/releases/tag/v0.9.0).
 
-Package managers can lag while registries review new releases; direct downloads and the rmux.io installers track the current GitHub Release.
+Package managers can lag while registries review new releases; use the versioned
+GitHub Release download when a manager has not caught up yet.
+
+On Windows, extract the complete `.zip` and add the extracted package root to
+`PATH`. Keep `rmux.exe`, `rmux-daemon.exe`, and `libexec/rmux/rmux.exe`
+together; copying only the public executable is not a valid installation.
 
 For Unix `.tar.gz` downloads, run `./install.sh --prefix ~/.local` from the
 extracted archive. The installer preserves the required `bin/` and `libexec/`

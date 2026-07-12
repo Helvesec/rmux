@@ -172,6 +172,45 @@ async fn wait_for_text_succeeds_for_text_already_in_snapshot() -> TestResult {
 }
 
 #[tokio::test]
+async fn pane_snapshot_returns_default_when_resolved_pane_closes_before_fetch() -> TestResult {
+    let socket = TestSocket::new("snapshot-close-race")?;
+    let listener = UnixListener::bind(socket.path())?;
+    let server = tokio::spawn(async move {
+        let mut peer = accept_peer(&listener).await?;
+        expect_list_panes(&mut peer).await?;
+
+        let mut request = peer.expect_request().await?;
+        if matches!(request, Request::Handshake(_)) {
+            peer.write_response(Response::Handshake(HandshakeResponse::current()))
+                .await?;
+            request = peer.expect_request().await?;
+        }
+        let Request::PaneSnapshotRef(request) = request else {
+            panic!("snapshot must use the resolved pane id, got {request:?}");
+        };
+        let pane_id = rmux_proto::PaneId::new(1);
+        assert_eq!(
+            request.target,
+            rmux_proto::PaneTargetRef::by_id(session_name(), pane_id),
+        );
+        peer.write_response(Response::Error(rmux_proto::ErrorResponse {
+            error: rmux_proto::RmuxError::pane_not_found(session_name(), pane_id),
+        }))
+        .await?;
+        assert_peer_closed_without_request(&mut peer).await?;
+        TestResult::Ok(())
+    });
+
+    let pane = pane_for(socket.path(), Duration::from_secs(1)).await?;
+    let snapshot = pane.snapshot().await?;
+    assert_eq!(snapshot, rmux_sdk::PaneSnapshot::default());
+    assert_eq!(snapshot.revision, 0);
+    drop(pane);
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn wait_for_text_rejects_empty_needles_before_snapshot() -> TestResult {
     let socket = TestSocket::new("empty-text-wait")?;
     let listener = UnixListener::bind(socket.path())?;

@@ -12,53 +12,45 @@ use super::super::{
     RequestHandler,
 };
 use super::pane_io_encoding::{
-    encode_key_for_target, encode_mouse_for_target, prepare_attached_pane_input_writes,
-    write_attached_bytes_to_target_io, PaneInputWrite,
+    encode_mouse_for_target, prepare_attached_pane_input_writes, prepare_pane_input_write,
+    write_attached_bytes_to_target_io, PaneInputLiveness,
 };
-#[cfg(windows)]
-use super::pane_io_encoding::{
-    prepare_attached_pane_console_input_writes, should_emulate_windows_cmd_select_all,
-    should_route_windows_control_as_pty_bytes, windows_console_input_for_attached_key,
-    write_windows_console_input_action_to_target_io, PaneConsoleInputWrite,
-    WindowsConsoleInputAction,
+use super::pane_prompt_input::{
+    decode_prompt_input_event, is_extended_key_prefix, prompt_text_prefix_len,
 };
-use super::pane_prompt_input::{decode_prompt_input_event, is_extended_key_prefix};
 use super::{io_other, resolve_input_target, AttachedKeyDispatch};
 use crate::client_flags::ClientFlags;
+use crate::handler::overlay_support::AttachedOverlayInput;
 use crate::input_keys::{decode_extended_key, decode_mouse, ExtendedKeyDecode, MouseDecode};
 use crate::key_table::{decode_attached_key, AttachedKeyDecode};
 use crate::mouse::{classify_mouse_events, layout_for_session, ClassifiedMouseEvent};
 use crate::pane_io::{AttachControl, OverlayFrame};
 
 #[path = "attached_input/bracketed_paste.rs"]
-mod bracketed_paste;
+pub(super) mod bracketed_paste;
 #[path = "attached_input/kitty_graphics.rs"]
 mod kitty_graphics;
 #[path = "attached_input/live.rs"]
 mod live;
+#[path = "attached_input/synchronized.rs"]
+mod synchronized;
 #[path = "attached_input/terminal_response.rs"]
 mod terminal_response;
 
+use synchronized::{
+    prepare_attached_bracketed_paste_forwards, prepare_attached_key_forwards,
+    write_prepared_attached_pane_forwards,
+};
+
 const MAX_RETAINED_ATTACHED_CONTROL_INPUT: usize = DEFAULT_MAX_FRAME_LENGTH;
 
+#[derive(Clone, Copy)]
 enum AttachedPaneForward<'a> {
     EncodedKey(PhantomData<&'a ()>),
     #[cfg(windows)]
     WindowsConsoleKey {
         key: WindowsConsoleKeyEvent,
         bytes: &'a [u8],
-    },
-}
-
-enum PreparedAttachedPaneForward {
-    EncodedKey {
-        writes: Vec<PaneInputWrite>,
-        bytes: Vec<u8>,
-    },
-    #[cfg(windows)]
-    WindowsConsoleKey {
-        writes: Vec<PaneConsoleInputWrite>,
-        action: WindowsConsoleInputAction,
     },
 }
 
@@ -175,116 +167,99 @@ impl RequestHandler {
         }
         let prepared = {
             let mut state = self.state.lock().await;
-            match forward {
-                AttachedPaneForward::EncodedKey(_) => {
-                    let Some(encoded) =
-                        encode_attached_key_for_target(&state, &target, key).map_err(io_other)?
-                    else {
-                        return Ok(false);
-                    };
-                    let writes = prepare_attached_pane_input_writes(&mut state, &target, &encoded)
-                        .map_err(io_other)?;
-                    PreparedAttachedPaneForward::EncodedKey {
-                        writes,
-                        bytes: encoded,
-                    }
-                }
-                #[cfg(windows)]
-                AttachedPaneForward::WindowsConsoleKey {
-                    key: console_key,
-                    bytes,
-                } => {
-                    let route_raw = should_route_windows_control_as_pty_bytes(&state, &target, key);
-                    if should_emulate_windows_cmd_select_all(&state, &target, key) || route_raw {
-                        let Some(encoded) = encode_attached_key_for_target(&state, &target, key)
-                            .map_err(io_other)?
-                        else {
-                            return Ok(false);
-                        };
-                        let writes =
-                            prepare_attached_pane_input_writes(&mut state, &target, &encoded)
-                                .map_err(io_other)?;
-                        PreparedAttachedPaneForward::EncodedKey {
-                            writes,
-                            bytes: encoded,
-                        }
-                    } else {
-                        let action = windows_console_input_for_attached_key(
-                            &state,
-                            &target,
-                            key,
-                            console_key,
-                        );
-                        let writes = prepare_attached_pane_console_input_writes(
-                            &mut state, &target, bytes, action,
-                        )
-                        .map_err(io_other)?;
-                        PreparedAttachedPaneForward::WindowsConsoleKey { writes, action }
-                    }
-                }
-            }
+            prepare_attached_key_forwards(&mut state, &target, key, forward).map_err(io_other)?
         };
-        match prepared {
-            PreparedAttachedPaneForward::EncodedKey { writes, bytes } => {
-                for write in writes {
-                    write_attached_bytes_to_target_io(write, bytes.clone())
-                        .await
-                        .map_err(io_other)?;
-                }
-            }
-            #[cfg(windows)]
-            PreparedAttachedPaneForward::WindowsConsoleKey { writes, action } => {
-                for write in writes {
-                    write_windows_console_input_action_to_target_io(write, action)
-                        .await
-                        .map_err(io_other)?;
-                }
-            }
-        }
+        write_prepared_attached_pane_forwards(prepared)
+            .await
+            .map_err(io_other)?;
         Ok(false)
     }
 
-    #[async_recursion::async_recursion]
     async fn handle_attached_prompt_input(
         &self,
         attach_pid: u32,
         pending_input: &mut Vec<u8>,
         bytes: &[u8],
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<Vec<u8>>> {
+        // Overlays that decode input as keys (the command prompt here,
+        // mode-tree, display-panes, no-job popups) treat a paste as literal
+        // text. Strip embedded bracketed-paste markers before decoding —
+        // otherwise the leading ESC of ESC[200~ cancels the overlay and the
+        // pasted body leaks to the pane's shell. On Windows the attach client
+        // wraps a console-input burst in these markers (issue #92); on Unix a
+        // real terminal paste into an ?2004h attach hits the same class, so
+        // the strip runs on every platform. Scrub the CONCATENATED buffer so
+        // a marker whose bytes straddle the pending_input / bytes seam
+        // (delivered across two socket reads or attach-input frames) still
+        // collapses to nothing.
         pending_input.extend_from_slice(bytes);
+        let scrubbed = bracketed_paste::strip_bracketed_paste_markers(pending_input);
+        pending_input.clear();
+        pending_input.extend_from_slice(&scrubbed);
         let mut deferred_refresh = false;
+        let mut offset = 0;
+        let mut try_batched_text = true;
 
-        loop {
-            let Some((event, consumed)) = decode_prompt_input_event(pending_input) else {
+        while offset < pending_input.len() {
+            let slice = &pending_input[offset..];
+            if try_batched_text {
+                let text_len = prompt_text_prefix_len(slice);
+                if text_len > 0 {
+                    let text = std::str::from_utf8(&slice[..text_len])
+                        .expect("prompt text prefix is valid UTF-8");
+                    match self
+                        .try_handle_prompt_text_deferred_refresh(
+                            attach_pid,
+                            text,
+                            &mut deferred_refresh,
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            offset += text_len;
+                            continue;
+                        }
+                        Ok(false) => try_batched_text = false,
+                        Err(error) => {
+                            pending_input.drain(..offset);
+                            return Err(io_other(error));
+                        }
+                    }
+                }
+            }
+
+            let slice = &pending_input[offset..];
+            let Some((event, consumed)) = decode_prompt_input_event(slice) else {
+                pending_input.drain(..offset);
                 if deferred_refresh {
                     self.flush_attached_prompt_refresh(attach_pid)
                         .await
                         .map_err(io_other)?;
                 }
                 retain_partial_attached_control_input("prompt input", pending_input)?;
-                return Ok(());
+                return Ok(None);
             };
-            pending_input.drain(..consumed);
-            self.handle_prompt_event_deferred_refresh(attach_pid, event, &mut deferred_refresh)
+            offset += consumed;
+            if let Err(error) = self
+                .handle_prompt_event_deferred_refresh(attach_pid, event, &mut deferred_refresh)
                 .await
-                .map_err(io_other)?;
+            {
+                pending_input.drain(..offset);
+                return Err(io_other(error));
+            }
             if !self.prompt_active(attach_pid).await {
                 break;
             }
         }
 
+        pending_input.drain(..offset);
         if deferred_refresh && self.prompt_active(attach_pid).await {
             self.flush_attached_prompt_refresh(attach_pid)
                 .await
                 .map_err(io_other)?;
         }
 
-        if !pending_input.is_empty() {
-            let remaining = std::mem::take(pending_input);
-            Box::pin(self.handle_attached_live_input(attach_pid, pending_input, &remaining))
-                .await?;
-        }
-        Ok(())
+        Ok((!pending_input.is_empty()).then(|| std::mem::take(pending_input)))
     }
 
     async fn handle_attached_mode_tree_input(
@@ -292,8 +267,15 @@ impl RequestHandler {
         attach_pid: u32,
         pending_input: &mut Vec<u8>,
         bytes: &[u8],
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<Vec<u8>>> {
+        // See `handle_attached_prompt_input` for the paste-marker strip
+        // rationale — mode-tree also decodes input as keys. Strip the
+        // concatenated buffer so a marker straddling pending_input / bytes
+        // still collapses.
         pending_input.extend_from_slice(bytes);
+        let scrubbed = bracketed_paste::strip_bracketed_paste_markers(pending_input);
+        pending_input.clear();
+        pending_input.extend_from_slice(&scrubbed);
         let backspace = self.attached_backspace_byte().await;
         let mut offset = 0;
 
@@ -315,7 +297,7 @@ impl RequestHandler {
                     MouseDecode::Partial => {
                         pending_input.drain(..offset);
                         retain_partial_attached_control_input("mode-tree mouse", pending_input)?;
-                        return Ok(());
+                        return Ok(None);
                     }
                     MouseDecode::Invalid => {
                         offset += 1;
@@ -350,7 +332,7 @@ impl RequestHandler {
                             "mode-tree extended key",
                             pending_input,
                         )?;
-                        return Ok(());
+                        return Ok(None);
                     }
                     ExtendedKeyDecode::Invalid => {}
                 }
@@ -369,7 +351,7 @@ impl RequestHandler {
                 AttachedKeyDecode::Partial => {
                     pending_input.drain(..offset);
                     retain_partial_attached_control_input("mode-tree attached key", pending_input)?;
-                    return Ok(());
+                    return Ok(None);
                 }
                 AttachedKeyDecode::Invalid => {
                     let Some((event, consumed)) = decode_prompt_input_event(slice) else {
@@ -378,7 +360,7 @@ impl RequestHandler {
                             "mode-tree prompt input",
                             pending_input,
                         )?;
-                        return Ok(());
+                        return Ok(None);
                     };
                     offset += consumed;
                     let _ = self
@@ -393,12 +375,7 @@ impl RequestHandler {
         }
 
         pending_input.drain(..offset);
-        if !pending_input.is_empty() {
-            let remaining = std::mem::take(pending_input);
-            Box::pin(self.handle_attached_live_input(attach_pid, pending_input, &remaining))
-                .await?;
-        }
-        Ok(())
+        Ok((!pending_input.is_empty()).then(|| std::mem::take(pending_input)))
     }
 
     async fn handle_attached_live_mouse(
@@ -593,6 +570,44 @@ impl RequestHandler {
         Ok(())
     }
 
+    async fn write_attached_target_bytes(&self, attach_pid: u32, bytes: &[u8]) -> io::Result<()> {
+        if self.attached_client_input_is_read_only(attach_pid).await? {
+            return Ok(());
+        }
+
+        let target = self
+            .attached_input_target(attach_pid)
+            .await
+            .map_err(io_other)?;
+        let write = {
+            let mut state = self.state.lock().await;
+            prepare_pane_input_write(&mut state, &target, bytes, PaneInputLiveness::TolerateDead)
+                .map_err(io_other)?
+        };
+        write_attached_bytes_to_target_io(write, bytes.to_vec())
+            .await
+            .map_err(io_other)
+    }
+
+    async fn write_attached_bracketed_paste(&self, attach_pid: u32, body: &[u8]) -> io::Result<()> {
+        if self.attached_client_input_is_read_only(attach_pid).await? {
+            return Ok(());
+        }
+
+        let target = self
+            .attached_input_target(attach_pid)
+            .await
+            .map_err(io_other)?;
+        let prepared = {
+            let mut state = self.state.lock().await;
+            prepare_attached_bracketed_paste_forwards(&mut state, &target, body)
+                .map_err(io_other)?
+        };
+        write_prepared_attached_pane_forwards(prepared)
+            .await
+            .map_err(io_other)
+    }
+
     async fn attached_client_input_is_read_only(&self, attach_pid: u32) -> io::Result<bool> {
         let active_attach = self.active_attach.lock().await;
         let active = active_attach
@@ -611,7 +626,95 @@ impl RequestHandler {
             return Ok(false);
         }
 
+        // Match the live input path: a read-only client's retained input is
+        // discarded before any mode handling, so a client switched to
+        // read-only mid-retention cannot exit clock mode or cancel copy mode
+        // through the flush.
+        if self.attached_client_input_is_read_only(attach_pid).await? {
+            pending_input.clear();
+            return Ok(false);
+        }
+
+        if pending_input.first() == Some(&b'\x1b') && self.overlay_active(attach_pid).await {
+            return match self
+                .flush_attached_overlay_escape_input(attach_pid, pending_input)
+                .await?
+            {
+                AttachedOverlayInput::Consumed => Ok(false),
+                AttachedOverlayInput::Reroute(bytes) => {
+                    self.handle_attached_live_input_inner(attach_pid, pending_input, &bytes)
+                        .await
+                }
+            };
+        }
+
+        if pending_input.first() == Some(&b'\x1b') && self.mode_tree_active(attach_pid).await {
+            pending_input.drain(..1);
+            let escape = key_string_lookup_string("Escape")
+                .ok_or_else(|| io_other("Escape key is unavailable"))?;
+            self.handle_attached_mode_tree_key_or_prefix(
+                attach_pid,
+                escape,
+                PromptInputEvent::Escape,
+            )
+            .await?;
+            return if pending_input.is_empty() {
+                Ok(false)
+            } else {
+                let remaining = std::mem::take(pending_input);
+                self.handle_attached_live_input_inner(attach_pid, pending_input, &remaining)
+                    .await
+            };
+        }
+
+        if pending_input.starts_with(b"\x1b]") || pending_input.starts_with(b"\x1b_") {
+            // Ambiguous between a fragmented consumed terminal response or
+            // kitty graphics APC and the M-] / M-_ keystroke; the expired
+            // deadline resolves it as keyboard input. Dispatch through the
+            // live key path (key tables, copy mode, per-pane encoding)
+            // instead of the raw ESC handling below, which would treat the
+            // retained bytes as a bare Escape plus literal text.
+            return self
+                .flush_attached_consumed_osc_prefix(attach_pid, pending_input)
+                .await;
+        }
+
         let bytes = std::mem::take(pending_input);
+        if bytes.first() == Some(&b'\x1b') {
+            let target = self
+                .attached_input_target(attach_pid)
+                .await
+                .map_err(io_other)?;
+            let consumed_by_mode = if self
+                .target_is_in_clock_mode(&target)
+                .await
+                .map_err(io_other)?
+            {
+                self.exit_clock_mode(&target).await.map_err(io_other)?
+            } else {
+                self.handle_attached_copy_mode_key_event(
+                    attach_pid,
+                    target,
+                    PromptInputEvent::Escape,
+                )
+                .await
+                .map_err(io_other)?
+            };
+            if consumed_by_mode {
+                return if let Some(remaining) = bytes.get(1..).filter(|bytes| !bytes.is_empty()) {
+                    self.handle_attached_live_input_inner(attach_pid, pending_input, remaining)
+                        .await
+                } else {
+                    Ok(false)
+                };
+            }
+        }
+        if let AttachedKeyDecode::Matched { size, key } = decode_attached_key(&bytes, None) {
+            if size == bytes.len() {
+                let handled = self.handle_attached_live_key(attach_pid, key).await?;
+                return Ok(!handled);
+            }
+        }
         self.write_attached_bytes(attach_pid, &bytes).await?;
         pending_input.clear();
         Ok(true)
@@ -666,6 +769,21 @@ impl RequestHandler {
         Ok(mode)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn start_attached_input_capture_for_test(&self, target: &PaneTarget) {
+        let state = self.state.lock().await;
+        state.start_pane_input_capture_for_test(target);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn attached_input_capture_for_test(
+        &self,
+        target: &PaneTarget,
+    ) -> Option<Vec<u8>> {
+        let state = self.state.lock().await;
+        state.pane_input_capture_for_test(target)
+    }
+
     pub(in crate::handler) async fn attached_last_mouse_event(
         &self,
         attach_pid: u32,
@@ -677,7 +795,7 @@ impl RequestHandler {
             .and_then(|active| active.mouse.current_event.as_ref().map(|event| event.raw))
     }
 
-    async fn attached_backspace_byte(&self) -> Option<u8> {
+    pub(in crate::handler) async fn attached_backspace_byte(&self) -> Option<u8> {
         let state = self.state.lock().await;
         state
             .options
@@ -772,14 +890,6 @@ impl RequestHandler {
         frame.extend_from_slice(b"\x1b[0m\x1b[u");
         Some(frame)
     }
-}
-
-fn encode_attached_key_for_target(
-    state: &crate::pane_terminals::HandlerState,
-    target: &PaneTarget,
-    key: rmux_core::KeyCode,
-) -> Result<Option<Vec<u8>>, RmuxError> {
-    encode_key_for_target(state, target, key)
 }
 
 fn is_mouse_prefix(bytes: &[u8]) -> bool {

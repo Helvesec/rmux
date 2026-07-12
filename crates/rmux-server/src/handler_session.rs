@@ -9,12 +9,13 @@ use rmux_core::{
 use rmux_proto::request::NewSessionExtRequest;
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
-    ErrorResponse, KillSessionRequest, KillSessionResponse, ListSessionsResponse,
+    ErrorResponse, HookName, KillSessionRequest, KillSessionResponse, ListSessionsResponse,
     NewSessionResponse, OptionName, Response, RmuxError, ScopeSelector, SessionId, SessionName,
     WindowTarget,
 };
 
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
+use crate::hook_runtime::PendingInlineHookFormat;
 use crate::pane_terminals::InitialPaneSpawnOptions;
 #[cfg(windows)]
 use crate::pane_terminals::{CompletedDeferredInitialPane, DeferredInitialPaneSpawn, HandlerState};
@@ -42,6 +43,72 @@ const DEFERRED_INITIAL_PANE_READY_SETTLE: Duration = Duration::from_millis(100);
 // autostarted ConPTY console is safely isolated from the launching client.
 const DEFERRED_INITIAL_PANE_INPUT_GRACE: Duration = Duration::from_secs(2);
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(in crate::handler) struct RenameSessionIdentityPause {
+    pub(in crate::handler) reached: tokio::sync::Notify,
+    pub(in crate::handler) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static RENAME_SESSION_IDENTITY_PAUSE: std::sync::Mutex<
+    Option<(SessionName, std::sync::Arc<RenameSessionIdentityPause>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(in crate::handler) struct RenameSessionControlCommitPause {
+    pub(in crate::handler) reached: tokio::sync::Notify,
+    pub(in crate::handler) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static RENAME_SESSION_CONTROL_COMMIT_PAUSE: std::sync::Mutex<
+    Vec<(SessionName, std::sync::Arc<RenameSessionControlCommitPause>)>,
+> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(in crate::handler) struct KillSessionWebPrunePause {
+    pub(in crate::handler) reached: tokio::sync::Notify,
+    pub(in crate::handler) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static KILL_SESSION_WEB_PRUNE_PAUSE: std::sync::Mutex<
+    Option<(SessionName, std::sync::Arc<KillSessionWebPrunePause>)>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(in crate::handler) struct KillSessionSubscriptionRekeyPause {
+    pub(in crate::handler) reached: tokio::sync::Notify,
+    pub(in crate::handler) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static KILL_SESSION_SUBSCRIPTION_REKEY_PAUSE: std::sync::Mutex<
+    Option<(
+        SessionName,
+        std::sync::Arc<KillSessionSubscriptionRekeyPause>,
+    )>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(in crate::handler) struct KillSessionSelectionIdentityPause {
+    pub(in crate::handler) reached: tokio::sync::Notify,
+    pub(in crate::handler) release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+static KILL_SESSION_SELECTION_IDENTITY_PAUSE: std::sync::Mutex<
+    Vec<(
+        SessionName,
+        std::sync::Arc<KillSessionSelectionIdentityPause>,
+    )>,
+> = std::sync::Mutex::new(Vec::new());
+
 use client_environment::{
     new_session_client_environment, new_session_raw_client_environment,
     raw_environment_from_assignments,
@@ -49,6 +116,7 @@ use client_environment::{
 use list::{sort_list_sessions, ListSessionSnapshot};
 use options::resolve_session_creation_options;
 
+use super::attach_support::surviving_attached_resize_targets;
 #[cfg(windows)]
 use super::pane_support::format_references_pane_pid;
 use super::scripting_support::format_context_for_target;
@@ -60,6 +128,195 @@ use super::{
 };
 
 impl RequestHandler {
+    #[cfg(test)]
+    pub(in crate::handler) fn install_rename_session_control_commit_pause(
+        &self,
+        session_name: SessionName,
+    ) -> std::sync::Arc<RenameSessionControlCommitPause> {
+        let pause = std::sync::Arc::new(RenameSessionControlCommitPause::default());
+        let mut pauses = RENAME_SESSION_CONTROL_COMMIT_PAUSE
+            .lock()
+            .expect("rename-session control commit pause lock");
+        pauses.retain(|(paused_session, _)| paused_session != &session_name);
+        pauses.push((session_name, pause.clone()));
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_before_rename_session_control_commit(&self, session_name: &SessionName) {
+        let pause = RENAME_SESSION_CONTROL_COMMIT_PAUSE
+            .lock()
+            .expect("rename-session control commit pause lock")
+            .iter()
+            .find(|(paused_session, _)| paused_session == session_name)
+            .map(|(_, pause)| pause.clone());
+        let Some(pause) = pause else {
+            return;
+        };
+        pause.reached.notify_one();
+        pause.release.notified().await;
+        RENAME_SESSION_CONTROL_COMMIT_PAUSE
+            .lock()
+            .expect("rename-session control commit pause lock")
+            .retain(|(paused_session, current)| {
+                paused_session != session_name || !std::sync::Arc::ptr_eq(current, &pause)
+            });
+    }
+
+    #[cfg(test)]
+    pub(in crate::handler) fn install_kill_session_selection_identity_pause(
+        &self,
+        session_name: SessionName,
+    ) -> std::sync::Arc<KillSessionSelectionIdentityPause> {
+        let pause = std::sync::Arc::new(KillSessionSelectionIdentityPause::default());
+        let mut pauses = KILL_SESSION_SELECTION_IDENTITY_PAUSE
+            .lock()
+            .expect("kill-session selection identity pause lock");
+        pauses.retain(|(paused_session, _)| paused_session != &session_name);
+        pauses.push((session_name, pause.clone()));
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_after_kill_session_selection_identity_capture(
+        &self,
+        session_name: &SessionName,
+    ) {
+        let pause = KILL_SESSION_SELECTION_IDENTITY_PAUSE
+            .lock()
+            .expect("kill-session selection identity pause lock")
+            .iter()
+            .filter(|(paused_session, _)| paused_session == session_name)
+            .map(|(_, pause)| pause.clone())
+            .next();
+        let Some(pause) = pause else {
+            return;
+        };
+        pause.reached.notify_one();
+        pause.release.notified().await;
+        let mut installed = KILL_SESSION_SELECTION_IDENTITY_PAUSE
+            .lock()
+            .expect("kill-session selection identity pause lock");
+        installed.retain(|(paused_session, current)| {
+            paused_session != session_name || !std::sync::Arc::ptr_eq(current, &pause)
+        });
+    }
+
+    #[cfg(test)]
+    pub(in crate::handler) fn install_kill_session_subscription_rekey_pause(
+        &self,
+        session_name: SessionName,
+    ) -> std::sync::Arc<KillSessionSubscriptionRekeyPause> {
+        let pause = std::sync::Arc::new(KillSessionSubscriptionRekeyPause::default());
+        *KILL_SESSION_SUBSCRIPTION_REKEY_PAUSE
+            .lock()
+            .expect("kill-session subscription rekey pause lock") =
+            Some((session_name, pause.clone()));
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_before_kill_session_subscription_rekey(&self, session_name: &SessionName) {
+        let pause = KILL_SESSION_SUBSCRIPTION_REKEY_PAUSE
+            .lock()
+            .expect("kill-session subscription rekey pause lock")
+            .as_ref()
+            .filter(|(paused_session, _)| paused_session == session_name)
+            .map(|(_, pause)| pause.clone());
+        let Some(pause) = pause else {
+            return;
+        };
+        pause.reached.notify_one();
+        pause.release.notified().await;
+        let mut installed = KILL_SESSION_SUBSCRIPTION_REKEY_PAUSE
+            .lock()
+            .expect("kill-session subscription rekey pause lock");
+        if installed
+            .as_ref()
+            .is_some_and(|(_, current)| std::sync::Arc::ptr_eq(current, &pause))
+        {
+            installed.take();
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::handler) fn install_kill_session_web_prune_pause(
+        &self,
+        session_name: SessionName,
+    ) -> std::sync::Arc<KillSessionWebPrunePause> {
+        let pause = std::sync::Arc::new(KillSessionWebPrunePause::default());
+        *KILL_SESSION_WEB_PRUNE_PAUSE
+            .lock()
+            .expect("kill-session Web prune pause lock") = Some((session_name, pause.clone()));
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_before_kill_session_web_prune(
+        &self,
+        removed_sessions: &[(SessionName, SessionId)],
+    ) {
+        let pause = KILL_SESSION_WEB_PRUNE_PAUSE
+            .lock()
+            .expect("kill-session Web prune pause lock")
+            .as_ref()
+            .filter(|(paused_session, _)| {
+                removed_sessions
+                    .iter()
+                    .any(|(session_name, _)| session_name == paused_session)
+            })
+            .map(|(_, pause)| pause.clone());
+        let Some(pause) = pause else {
+            return;
+        };
+        pause.reached.notify_one();
+        pause.release.notified().await;
+        let mut installed = KILL_SESSION_WEB_PRUNE_PAUSE
+            .lock()
+            .expect("kill-session Web prune pause lock");
+        if installed
+            .as_ref()
+            .is_some_and(|(_, current)| std::sync::Arc::ptr_eq(current, &pause))
+        {
+            *installed = None;
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::handler) fn install_rename_session_identity_pause(
+        &self,
+        session_name: SessionName,
+    ) -> std::sync::Arc<RenameSessionIdentityPause> {
+        let pause = std::sync::Arc::new(RenameSessionIdentityPause::default());
+        *RENAME_SESSION_IDENTITY_PAUSE
+            .lock()
+            .expect("rename-session identity pause lock") = Some((session_name, pause.clone()));
+        pause
+    }
+
+    #[cfg(test)]
+    async fn pause_after_rename_session_identity_capture(&self, session_name: &SessionName) {
+        let pause = RENAME_SESSION_IDENTITY_PAUSE
+            .lock()
+            .expect("rename-session identity pause lock")
+            .as_ref()
+            .filter(|(paused_session, _)| paused_session == session_name)
+            .map(|(_, pause)| pause.clone());
+        let Some(pause) = pause else {
+            return;
+        };
+        pause.reached.notify_one();
+        pause.release.notified().await;
+        let mut installed = RENAME_SESSION_IDENTITY_PAUSE
+            .lock()
+            .expect("rename-session identity pause lock");
+        if installed.as_ref().is_some_and(|(paused_session, current)| {
+            paused_session == session_name && std::sync::Arc::ptr_eq(current, &pause)
+        }) {
+            *installed = None;
+        }
+    }
+
     pub(in crate::handler) async fn destroy_unattached_sessions_for_option_scope(
         &self,
         scope: &OptionScopeSelector,
@@ -74,14 +331,14 @@ impl RequestHandler {
 
     pub(in crate::handler) async fn destroy_unattached_sessions(
         &self,
-        mut candidates: Vec<SessionName>,
+        mut candidates: Vec<(SessionName, SessionId)>,
     ) {
-        candidates.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        candidates.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
         candidates.dedup();
 
-        for session_name in candidates {
+        for (session_name, session_id) in candidates {
             if !self
-                .session_should_destroy_when_unattached(&session_name)
+                .session_should_destroy_when_unattached(&session_name, session_id)
                 .await
             {
                 continue;
@@ -90,19 +347,30 @@ impl RequestHandler {
                 continue;
             }
             let _ = self
-                .handle_kill_session(KillSessionRequest {
-                    target: session_name,
-                    kill_all_except_target: false,
-                    clear_alerts: false,
-                    kill_group: false,
-                })
+                .handle_kill_session_identity(
+                    KillSessionRequest {
+                        target: session_name,
+                        kill_all_except_target: false,
+                        clear_alerts: false,
+                        kill_group: false,
+                    },
+                    session_id,
+                )
                 .await;
         }
+        self.refresh_hook_identity_aliases().await;
     }
 
-    async fn session_should_destroy_when_unattached(&self, session_name: &SessionName) -> bool {
+    async fn session_should_destroy_when_unattached(
+        &self,
+        session_name: &SessionName,
+        session_id: SessionId,
+    ) -> bool {
         let state = self.state.lock().await;
-        state.sessions.contains_session(session_name)
+        state
+            .sessions
+            .session(session_name)
+            .is_some_and(|session| session.id() == session_id)
             && state
                 .options
                 .resolve(Some(session_name), OptionName::DestroyUnattached)
@@ -169,32 +437,71 @@ impl RequestHandler {
 
         if request.attach_if_exists && request.group_target.is_none() {
             if let Some(existing) = request.session_name.as_ref() {
-                let session_exists = {
+                let existing_session_id = {
                     let state = self.state.lock().await;
-                    state.sessions.contains_session(existing)
+                    state.sessions.session(existing).map(rmux_core::Session::id)
                 };
-                if session_exists {
-                    let session_name = existing.clone();
+                if let Some(session_id) = existing_session_id {
+                    let mut session_name = existing.clone();
+                    self.pause_before_created_session_control_attach(&session_name)
+                        .await;
                     if !request.skip_environment_update {
                         let mut state = self.state.lock().await;
+                        let Some(current_name) =
+                            state.sessions.iter().find_map(|(name, session)| {
+                                (session.id() == session_id).then(|| name.clone())
+                            })
+                        else {
+                            return Response::Error(ErrorResponse {
+                                error: crate::pane_terminals::session_not_found(&session_name),
+                            });
+                        };
                         if let Some(client_environment) = client_environment.as_ref() {
                             update_environment_from_client(
                                 &mut state,
-                                &session_name,
+                                &current_name,
                                 client_environment,
                             );
                         }
+                        session_name = current_name;
                     }
                     if !request.detached
                         && (request.detach_other_clients || request.kill_other_clients)
                     {
-                        self.detach_other_attach_clients_for_session(
-                            &session_name,
+                        if let Err(error) = self
+                            .detach_other_attach_clients_for_session_identity(
+                                &session_name,
+                                session_id,
+                                requester_pid,
+                                request.kill_other_clients,
+                            )
+                            .await
+                        {
+                            return Response::Error(ErrorResponse { error });
+                        }
+                    }
+                    if self
+                        .prepare_created_session_control_attach(
                             requester_pid,
-                            request.kill_other_clients,
+                            &session_name,
+                            session_id,
+                        )
+                        .await
+                    {
+                        self.emit_for_session_identity(
+                            LifecycleEvent::ClientSessionChanged {
+                                session_name: session_name.clone(),
+                                client_name: Some(requester_pid.to_string()),
+                            },
+                            &session_name,
+                            session_id,
                         )
                         .await;
                     }
+                    self.queue_suppressed_inline_hook(
+                        HookName::AfterNewSession,
+                        PendingInlineHookFormat::AfterCommand,
+                    );
                     return Response::NewSession(NewSessionResponse {
                         session_name,
                         detached: false,
@@ -252,7 +559,7 @@ impl RequestHandler {
         let socket_path = self.socket_path();
         #[cfg(windows)]
         let mut deferred_initial_spawn = None;
-        let response = {
+        let (response, silence_template_session, created_session_id) = {
             let mut state = self.state.lock().await;
             let creation_options = resolve_session_creation_options(
                 &state.options,
@@ -380,6 +687,7 @@ impl RequestHandler {
                 .and_then(|template| state.sessions.session(template))
                 .cloned()
             {
+                state.synchronize_window_alias_options_from_session(&template_session);
                 if let Err(error) =
                     state.synchronize_pane_alias_options_from_session(&template_session)
                 {
@@ -444,11 +752,22 @@ impl RequestHandler {
                 }
             }
 
-            Response::NewSession(NewSessionResponse {
-                session_name,
-                detached,
-                output: None,
-            })
+            let created_session_id = state
+                .sessions
+                .session(&session_name)
+                .expect("newly created session must still exist")
+                .id();
+            let silence_template_session =
+                created_group.and_then(|created| created.template_session);
+            (
+                Response::NewSession(NewSessionResponse {
+                    session_name,
+                    detached,
+                    output: None,
+                }),
+                silence_template_session,
+                created_session_id,
+            )
         };
 
         let Response::NewSession(success) = &response else {
@@ -459,16 +778,31 @@ impl RequestHandler {
         if let Some(spawn) = deferred_initial_spawn {
             self.spawn_deferred_initial_pane(spawn);
         }
-        if !detached && (request.detach_other_clients || request.kill_other_clients) {
-            self.detach_other_attach_clients_for_session(
-                &session_name,
-                requester_pid,
-                request.kill_other_clients,
-            )
-            .await;
+        if !detached {
+            self.pause_before_created_session_control_attach(&session_name)
+                .await;
         }
-        self.finish_new_session_lifecycle(requester_pid, &session_name, detached)
-            .await;
+        if !detached && (request.detach_other_clients || request.kill_other_clients) {
+            if let Err(error) = self
+                .detach_other_attach_clients_for_session_identity(
+                    &session_name,
+                    created_session_id,
+                    requester_pid,
+                    request.kill_other_clients,
+                )
+                .await
+            {
+                return Response::Error(ErrorResponse { error });
+            }
+        }
+        self.finish_new_session_lifecycle(
+            requester_pid,
+            &session_name,
+            created_session_id,
+            silence_template_session.as_ref(),
+            detached,
+        )
+        .await;
 
         if !request.print_session_info {
             return response;
@@ -720,23 +1054,84 @@ impl RequestHandler {
         &self,
         request: rmux_proto::KillSessionRequest,
     ) -> Response {
-        let session_name = {
+        self.handle_kill_session_with_identity(request, None).await
+    }
+
+    pub(in crate::handler) async fn handle_kill_session_identity(
+        &self,
+        request: rmux_proto::KillSessionRequest,
+        session_id: SessionId,
+    ) -> Response {
+        self.handle_kill_session_with_identity(request, Some(session_id))
+            .await
+    }
+
+    async fn handle_kill_session_with_identity(
+        &self,
+        request: rmux_proto::KillSessionRequest,
+        expected_session_id: Option<SessionId>,
+    ) -> Response {
+        let (session_name, selected_session_id) = {
             let state = self.state.lock().await;
-            match resolve_existing_session_target(&state.sessions, "kill-session", &request.target)
-            {
-                Ok(session_name) => session_name,
-                Err(error) => return Response::Error(ErrorResponse { error }),
+            if let Some(session_id) = expected_session_id {
+                let Some(session) = state.sessions.session_by_id(session_id) else {
+                    return Response::Error(ErrorResponse {
+                        error: RmuxError::SessionNotFound(request.target.to_string()),
+                    });
+                };
+                let session_name = session.name().clone();
+                if let Err(error) = super::require_expected_session_identity(&state, &session_name)
+                {
+                    return Response::Error(ErrorResponse { error });
+                }
+                (session_name, session_id)
+            } else {
+                match resolve_existing_session_target(
+                    &state.sessions,
+                    "kill-session",
+                    &request.target,
+                ) {
+                    Ok(session_name) => {
+                        if let Err(error) =
+                            super::require_expected_session_identity(&state, &session_name)
+                        {
+                            return Response::Error(ErrorResponse { error });
+                        }
+                        let session_id = state
+                            .sessions
+                            .session(&session_name)
+                            .expect("resolved session must exist")
+                            .id();
+                        (session_name, session_id)
+                    }
+                    Err(error) => return Response::Error(ErrorResponse { error }),
+                }
             }
         };
 
         if request.clear_alerts {
-            let response = {
+            let (response, refresh_session_name) = {
                 let mut state = self.state.lock().await;
-                let Some(session) = state.sessions.session_mut(&session_name) else {
+                let current_session_name = if expected_session_id.is_some() {
+                    let Some(session) = state.sessions.session_by_id(selected_session_id) else {
+                        return Response::Error(ErrorResponse {
+                            error: RmuxError::SessionNotFound(session_name.to_string()),
+                        });
+                    };
+                    session.name().clone()
+                } else {
+                    session_name.clone()
+                };
+                let Some(session) = state.sessions.session_mut(&current_session_name) else {
                     return Response::Error(ErrorResponse {
-                        error: RmuxError::SessionNotFound(session_name.to_string()),
+                        error: RmuxError::SessionNotFound(current_session_name.to_string()),
                     });
                 };
+                if session.id() != selected_session_id {
+                    return Response::Error(ErrorResponse {
+                        error: RmuxError::SessionNotFound(current_session_name.to_string()),
+                    });
+                }
                 let window_indexes = session.windows().keys().copied().collect::<Vec<_>>();
                 for window_index in window_indexes {
                     if let Some(window) = session.window_at_mut(window_index) {
@@ -744,29 +1139,57 @@ impl RequestHandler {
                     }
                     let _ = session.clear_all_winlink_alert_flags(window_index);
                 }
-                Response::KillSession(KillSessionResponse { existed: true })
+                (
+                    Response::KillSession(KillSessionResponse { existed: true }),
+                    current_session_name,
+                )
             };
-            self.refresh_attached_session(&session_name).await;
-            self.refresh_control_session(&session_name).await;
+            self.refresh_attached_session(&refresh_session_name).await;
+            self.refresh_control_session(&refresh_session_name).await;
             return response;
         }
 
-        let sessions_to_remove = {
-            let state = self.state.lock().await;
-            if !state.sessions.contains_session(&session_name) {
+        #[cfg(test)]
+        if request.kill_all_except_target || request.kill_group {
+            self.pause_after_kill_session_selection_identity_capture(&session_name)
+                .await;
+        }
+
+        let (
+            response,
+            queued_lifecycle_events,
+            removed_pane_ids,
+            removed_sessions,
+            resize_window_ids,
+        ) = {
+            let mut state = self.state.lock().await;
+            let session_name = if expected_session_id.is_some() {
+                let Some(session) = state.sessions.session_by_id(selected_session_id) else {
+                    return Response::Error(ErrorResponse {
+                        error: RmuxError::SessionNotFound(session_name.to_string()),
+                    });
+                };
+                session.name().clone()
+            } else {
+                session_name.clone()
+            };
+            if state
+                .sessions
+                .session(&session_name)
+                .is_none_or(|session| session.id() != selected_session_id)
+            {
                 return Response::Error(ErrorResponse {
                     error: RmuxError::SessionNotFound(session_name.to_string()),
                 });
             }
-
-            if request.kill_all_except_target {
+            let sessions_to_remove = if request.kill_all_except_target {
                 let mut sessions = state
                     .sessions
                     .iter()
-                    .map(|(name, _)| name.clone())
-                    .filter(|name| name != &session_name)
+                    .map(|(name, session)| (name.clone(), session.id()))
+                    .filter(|(name, _)| name != &session_name)
                     .collect::<Vec<_>>();
-                sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+                sessions.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
                 sessions
             } else if request.kill_group {
                 let mut sessions = state.sessions.session_group_members(&session_name);
@@ -774,25 +1197,57 @@ impl RequestHandler {
                     sessions.push(session_name.clone());
                 }
                 sessions
+                    .into_iter()
+                    .filter_map(|name| {
+                        let id = state.sessions.session(&name)?.id();
+                        Some((name, id))
+                    })
+                    .collect()
             } else {
-                vec![session_name.clone()]
-            }
-        };
-
-        for session_name in &sessions_to_remove {
-            self.exit_attached_session(session_name).await;
-            self.cancel_session_silence_timers(session_name).await;
-        }
-
-        let (response, queued_lifecycle_events, removed_pane_ids, removed_sessions) = {
-            let mut state = self.state.lock().await;
+                vec![(session_name.clone(), selected_session_id)]
+            };
+            // Killing a grouped runtime-owner alias transfers the surviving
+            // pane runtimes to the next owner (remove_session_terminals
+            // renames terminals and pane outputs), which changes the
+            // (runtime owner, pane id) subscription keys. Capture every
+            // current key so the survivors can be rekeyed after the removal,
+            // like the pane-kill path does; a stale key would strand live
+            // pane-output subscriptions on a name that no longer streams.
+            let previous_subscription_keys = {
+                let mut keys = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                let pane_ids = state
+                    .sessions
+                    .iter()
+                    .flat_map(|(_, session)| {
+                        session
+                            .windows()
+                            .values()
+                            .flat_map(|window| window.panes().iter().map(rmux_core::Pane::id))
+                    })
+                    .collect::<Vec<_>>();
+                for pane_id in pane_ids {
+                    if !seen.insert(pane_id) {
+                        continue;
+                    }
+                    if let Some(key) = state.pane_output_subscription_key_for_pane_id(pane_id) {
+                        keys.push(key);
+                    }
+                }
+                keys
+            };
             let mut queued_events = Vec::new();
             let mut removed_pane_ids = Vec::new();
             let mut removed_sessions: Vec<(SessionName, SessionId)> = Vec::new();
+            let mut removed_window_ids = Vec::new();
             let mut response_error = None;
 
-            for session_name in &sessions_to_remove {
-                if !state.sessions.contains_session(session_name) {
+            for (session_name, session_id) in &sessions_to_remove {
+                if state
+                    .sessions
+                    .session(session_name)
+                    .is_none_or(|session| session.id() != *session_id)
+                {
                     continue;
                 }
                 let current_runtime_owner = state.sessions.runtime_owner(session_name);
@@ -808,12 +1263,25 @@ impl RequestHandler {
                 }
             }
 
-            for session_name in &sessions_to_remove {
+            for (session_name, session_id) in &sessions_to_remove {
+                if state
+                    .sessions
+                    .session(session_name)
+                    .is_none_or(|session| session.id() != *session_id)
+                {
+                    continue;
+                }
                 let current_runtime_owner = state.sessions.runtime_owner(session_name);
                 let next_runtime_owner = state.sessions.runtime_owner_transfer_target(session_name);
 
                 match state.sessions.remove_session(session_name) {
                     Ok(removed_session) => {
+                        removed_window_ids.extend(
+                            removed_session
+                                .windows()
+                                .values()
+                                .map(rmux_core::Window::id),
+                        );
                         removed_pane_ids.extend(session_pane_ids(&removed_session));
                         removed_sessions.push((session_name.clone(), removed_session.id()));
                         queued_events.push(prepare_lifecycle_event(
@@ -863,25 +1331,91 @@ impl RequestHandler {
             );
             let removed_pane_ids = state.pane_ids_no_longer_referenced(removed_pane_ids);
             self.record_panes_closed_as_killed(&removed_pane_ids);
-            (response, queued_events, removed_pane_ids, removed_sessions)
+            let mut subscription_rekeys = Vec::new();
+            for previous_key in previous_subscription_keys {
+                if removed_pane_ids.contains(&previous_key.pane_id()) {
+                    continue;
+                }
+                if let Some(current_key) = state
+                    .pane_output_subscription_key_for_pane_id(previous_key.pane_id())
+                    .filter(|current_key| current_key != &previous_key)
+                {
+                    subscription_rekeys.push((previous_key, current_key));
+                }
+            }
+            #[cfg(test)]
+            self.pause_before_kill_session_subscription_rekey(&session_name)
+                .await;
+            // Keep the state transition and subscription-key transition in
+            // one critical section. Otherwise concurrent owner transfers can
+            // apply A -> B after B -> C and strand records on B. Apply the
+            // committed rekeys even when a later multi-session removal makes
+            // the aggregate response an error.
+            self.rekey_pane_output_subscriptions(&subscription_rekeys);
+            (
+                response,
+                queued_events,
+                removed_pane_ids,
+                removed_sessions,
+                removed_window_ids,
+            )
         };
 
+        for (removed_session_name, removed_session_id) in &removed_sessions {
+            self.exit_attached_session_identity(removed_session_name, *removed_session_id)
+                .await;
+        }
+
+        #[cfg(test)]
+        self.pause_before_kill_session_web_prune(&removed_sessions)
+            .await;
         #[cfg(all(any(unix, windows), feature = "web"))]
-        self.web_shares
-            .remove_targets_for_sessions(&removed_sessions);
+        {
+            self.web_shares.remove_targets_for_panes(&removed_pane_ids);
+            self.web_shares
+                .remove_targets_for_sessions(&removed_sessions);
+        }
         #[cfg(not(all(any(unix, windows), feature = "web")))]
         let _ = &removed_sessions;
         if !removed_pane_ids.is_empty() {
             self.forget_pane_snapshot_coalescers(&removed_pane_ids);
         }
         for event in queued_lifecycle_events {
-            self.emit_prepared(event);
+            self.emit_prepared(event).await;
         }
+        self.remove_session_leases(&removed_sessions);
         let removed_session_names = removed_sessions
             .iter()
             .map(|(session_name, _)| session_name.clone())
             .collect::<Vec<_>>();
-        self.remove_session_leases(&removed_session_names);
+        for removed_session_name in &removed_session_names {
+            self.cancel_session_silence_timers(removed_session_name)
+                .await;
+        }
+        let (resize_targets, refresh_sessions) = {
+            let state = self.state.lock().await;
+            let resize_targets = surviving_attached_resize_targets(&state, resize_window_ids);
+            let mut refresh_sessions = resize_targets
+                .iter()
+                .flat_map(|target| {
+                    state.window_linked_session_family_list(
+                        target.session_name(),
+                        target.window_index(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            refresh_sessions.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            refresh_sessions.dedup();
+            (resize_targets, refresh_sessions)
+        };
+        for resize_target in resize_targets {
+            let _ = self
+                .reconcile_attached_window_size_and_emit(&resize_target)
+                .await;
+        }
+        for refresh_session in refresh_sessions {
+            self.refresh_attached_session(&refresh_session).await;
+        }
 
         let _ = self.queue_shutdown_if_server_empty().await;
 
@@ -909,13 +1443,24 @@ impl RequestHandler {
                 .id();
             (session_name, session_id)
         };
+        #[cfg(test)]
+        self.pause_after_rename_session_identity_capture(&session_name)
+            .await;
         let new_name = request.new_name;
         if session_name == new_name {
             return Response::RenameSession(rmux_proto::RenameSessionResponse { session_name });
         }
-        let mut renamed = false;
         let response = {
             let mut state = self.state.lock().await;
+            if state
+                .sessions
+                .session(&session_name)
+                .is_none_or(|session| session.id() != session_id)
+            {
+                return Response::Error(ErrorResponse {
+                    error: RmuxError::SessionNotFound(session_name.to_string()),
+                });
+            }
             if state.sessions.contains_session(&new_name) {
                 return Response::Error(ErrorResponse {
                     error: RmuxError::DuplicateSession(new_name.to_string()),
@@ -924,11 +1469,22 @@ impl RequestHandler {
 
             match state.rename_session(&session_name, &new_name) {
                 Ok(()) => {
+                    self.rekey_session_silence_timers_locked(
+                        &state,
+                        &session_name,
+                        &new_name,
+                        session_id,
+                    );
+                    self.rename_session_lease(&session_name, &new_name, session_id);
                     self.rekey_web_session(&session_name, &new_name, session_id);
                     let mut active_attach = self.active_attach.lock().await;
-                    active_attach.rename_session(&session_name, &new_name);
+                    active_attach.rename_session(&session_name, session_id, &new_name);
                     drop(active_attach);
-                    renamed = true;
+                    #[cfg(test)]
+                    self.pause_before_rename_session_control_commit(&session_name)
+                        .await;
+                    self.rename_control_session(&session_name, session_id, &new_name)
+                        .await;
                     Response::RenameSession(rmux_proto::RenameSessionResponse {
                         session_name: new_name.clone(),
                     })
@@ -936,17 +1492,12 @@ impl RequestHandler {
                 Err(error) => Response::Error(ErrorResponse { error }),
             }
         };
-
-        if renamed {
-            self.rename_control_session(&session_name, &new_name).await;
-            self.cancel_session_silence_timers(&session_name).await;
-        }
         if matches!(response, Response::RenameSession(_)) {
-            self.sync_session_silence_timers(&new_name).await;
-            self.emit(LifecycleEvent::SessionRenamed {
+            let event = LifecycleEvent::SessionRenamed {
                 session_name: new_name.clone(),
-            })
-            .await;
+            };
+            self.emit_for_session_identity(event, &new_name, session_id)
+                .await;
             self.refresh_attached_session(&new_name).await;
         }
 
@@ -1068,18 +1619,30 @@ fn deferred_initial_pane_ready_item(item: &rmux_core::events::OutputCursorItem) 
 fn destroy_unattached_candidate_sessions(
     state: &crate::pane_terminals::HandlerState,
     scope: &OptionScopeSelector,
-) -> Vec<SessionName> {
+) -> Vec<(SessionName, SessionId)> {
     match scope {
         OptionScopeSelector::ServerGlobal
         | OptionScopeSelector::SessionGlobal
         | OptionScopeSelector::WindowGlobal => state
             .sessions
             .iter()
-            .map(|(session_name, _)| session_name.clone())
+            .map(|(session_name, session)| (session_name.clone(), session.id()))
             .collect(),
-        OptionScopeSelector::Session(session_name) => vec![session_name.clone()],
-        OptionScopeSelector::Window(target) => vec![target.session_name().clone()],
-        OptionScopeSelector::Pane(target) => vec![target.session_name().clone()],
+        OptionScopeSelector::Session(session_name) => state
+            .sessions
+            .session(session_name)
+            .map(|session| vec![(session_name.clone(), session.id())])
+            .unwrap_or_default(),
+        OptionScopeSelector::Window(target) => state
+            .sessions
+            .session(target.session_name())
+            .map(|session| vec![(target.session_name().clone(), session.id())])
+            .unwrap_or_default(),
+        OptionScopeSelector::Pane(target) => state
+            .sessions
+            .session(target.session_name())
+            .map(|session| vec![(target.session_name().clone(), session.id())])
+            .unwrap_or_default(),
     }
 }
 

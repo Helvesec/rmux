@@ -4,10 +4,11 @@ use rmux_core::LifecycleEvent;
 use rmux_proto::{RmuxError, TerminalGeometry, TerminalSize};
 
 use super::pane_support::retain_partial_attached_control_input;
-use super::prompt_support::PromptInputEvent;
+use super::prompt_support::{decode_prompt_key, PromptInputEvent};
 use super::scripting_support::{QueueCommandAction, QueueExecutionContext};
 use super::RequestHandler;
 use crate::input_keys::{decode_mouse, MouseDecode};
+use crate::key_table::{decode_attached_key, AttachedKeyDecode};
 use crate::pane_io::{AttachControl, OverlayFrame};
 
 #[path = "handler_overlay/commands.rs"]
@@ -18,6 +19,18 @@ mod interactions;
 mod parse;
 pub(super) use parse::ParsedOverlayCommand;
 use parse::{parse_display_menu, parse_display_popup};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AttachedOverlayInput {
+    Consumed,
+    Reroute(Vec<u8>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachedOverlayRoute {
+    Menu(u64),
+    Popup { id: u64, job_backed: bool },
+}
 #[path = "handler_overlay/layout.rs"]
 mod layout;
 #[path = "handler_overlay/menu.rs"]
@@ -76,32 +89,55 @@ impl RequestHandler {
             .is_some_and(|active| active.overlay.is_some())
     }
 
+    async fn attached_overlay_route(&self, attach_pid: u32) -> Option<AttachedOverlayRoute> {
+        let active_attach = self.active_attach.lock().await;
+        active_attach
+            .by_pid
+            .get(&attach_pid)
+            .and_then(|active| active.overlay.as_ref())
+            .map(|overlay| match overlay {
+                ClientOverlayState::Menu(menu) => AttachedOverlayRoute::Menu(menu.id),
+                ClientOverlayState::Popup(popup) => popup.nested_menu.as_ref().map_or_else(
+                    || AttachedOverlayRoute::Popup {
+                        id: popup.id,
+                        job_backed: !popup.no_job && popup.job.is_some(),
+                    },
+                    |menu| AttachedOverlayRoute::Menu(menu.id),
+                ),
+            })
+    }
+
     pub(super) async fn handle_attached_overlay_input(
         &self,
         attach_pid: u32,
         pending_input: &mut Vec<u8>,
         bytes: &[u8],
-    ) -> io::Result<bool> {
+    ) -> io::Result<AttachedOverlayInput> {
         pending_input.extend_from_slice(bytes);
 
-        let overlay_kind = {
-            let active_attach = self.active_attach.lock().await;
-            active_attach
-                .by_pid
-                .get(&attach_pid)
-                .and_then(|active| active.overlay.as_ref())
-                .map(|overlay| match overlay {
-                    ClientOverlayState::Menu(_) => 0_u8,
-                    ClientOverlayState::Popup(popup) if popup.nested_menu.is_some() => 0_u8,
-                    ClientOverlayState::Popup(_) => 1_u8,
-                })
+        let Some(overlay_route) = self.attached_overlay_route(attach_pid).await else {
+            return Ok(AttachedOverlayInput::Reroute(std::mem::take(pending_input)));
         };
 
-        let Some(overlay_kind) = overlay_kind else {
-            return Ok(false);
-        };
+        // Menus and no-job popups decode bytes as keys. Strip a complete
+        // bracketed-paste envelope from the concatenated buffer before the
+        // leading ESC can close the overlay and reroute the body to the pane.
+        // Job-backed popups keep raw bytes for the child process's ?2004h path.
+        if matches!(
+            overlay_route,
+            AttachedOverlayRoute::Menu(_)
+                | AttachedOverlayRoute::Popup {
+                    job_backed: false,
+                    ..
+                }
+        ) {
+            let scrubbed = super::pane_support::strip_bracketed_paste_markers(pending_input);
+            pending_input.clear();
+            pending_input.extend_from_slice(&scrubbed);
+        }
 
-        if overlay_kind == 1 {
+        if matches!(overlay_route, AttachedOverlayRoute::Popup { .. }) {
+            let backspace = self.attached_backspace_byte().await;
             let mut offset = 0;
             while offset < pending_input.len() {
                 let slice = &pending_input[offset..];
@@ -119,22 +155,45 @@ impl RequestHandler {
                                 "popup overlay mouse",
                                 pending_input,
                             )?;
-                            return Ok(true);
+                            return Ok(AttachedOverlayInput::Consumed);
                         }
                         MouseDecode::Invalid => offset += 1,
                     }
+                    if self.attached_overlay_route(attach_pid).await != Some(overlay_route) {
+                        break;
+                    }
                     continue;
                 }
-                if self.handle_popup_raw_input(attach_pid, slice).await? {
-                    pending_input.clear();
-                    return Ok(true);
+                let consumed = match decode_attached_key(slice, backspace) {
+                    AttachedKeyDecode::Matched { size, .. } => size,
+                    AttachedKeyDecode::Partial => {
+                        pending_input.drain(..offset);
+                        retain_partial_attached_control_input(
+                            "popup overlay key input",
+                            pending_input,
+                        )?;
+                        return Ok(AttachedOverlayInput::Consumed);
+                    }
+                    AttachedKeyDecode::Invalid => slice.len(),
+                };
+                let raw = pending_input[offset..offset + consumed].to_vec();
+                if !self.handle_popup_raw_input(attach_pid, &raw).await? {
+                    break;
                 }
-                break;
+                offset += consumed;
+                if self.attached_overlay_route(attach_pid).await != Some(overlay_route) {
+                    break;
+                }
             }
-            pending_input.clear();
-            return Ok(true);
+            pending_input.drain(..offset);
+            return if pending_input.is_empty() {
+                Ok(AttachedOverlayInput::Consumed)
+            } else {
+                Ok(AttachedOverlayInput::Reroute(std::mem::take(pending_input)))
+            };
         }
 
+        let backspace = self.attached_backspace_byte().await;
         loop {
             if is_mouse_prefix(pending_input) {
                 let last_mouse = self.attached_last_mouse_event(attach_pid).await;
@@ -150,34 +209,94 @@ impl RequestHandler {
                     }
                     MouseDecode::Partial => {
                         retain_partial_attached_control_input("menu overlay mouse", pending_input)?;
-                        return Ok(true);
+                        return Ok(AttachedOverlayInput::Consumed);
                     }
                     MouseDecode::Invalid => {
                         pending_input.drain(..1);
                     }
                 }
-                if !self.overlay_active(attach_pid).await {
+                if self.attached_overlay_route(attach_pid).await != Some(overlay_route) {
                     break;
                 }
                 continue;
             }
-            let Some((event, consumed)) =
-                super::pane_support::decode_prompt_input_event(pending_input)
-            else {
-                retain_partial_attached_control_input("menu overlay prompt input", pending_input)?;
-                return Ok(true);
+            let (event, consumed) = match decode_attached_key(pending_input, backspace) {
+                AttachedKeyDecode::Matched { size, key } => {
+                    let event = if pending_input.first() == Some(&b'\x1b') {
+                        decode_prompt_key(key)
+                    } else {
+                        super::pane_support::decode_prompt_input_event(&pending_input[..size])
+                            .map(|(event, _)| event)
+                            .unwrap_or_else(|| decode_prompt_key(key))
+                    };
+                    (event, size)
+                }
+                AttachedKeyDecode::Partial => {
+                    retain_partial_attached_control_input(
+                        "menu overlay prompt input",
+                        pending_input,
+                    )?;
+                    return Ok(AttachedOverlayInput::Consumed);
+                }
+                AttachedKeyDecode::Invalid => {
+                    let Some(decoded) =
+                        super::pane_support::decode_prompt_input_event(pending_input)
+                    else {
+                        retain_partial_attached_control_input(
+                            "menu overlay prompt input",
+                            pending_input,
+                        )?;
+                        return Ok(AttachedOverlayInput::Consumed);
+                    };
+                    decoded
+                }
             };
             pending_input.drain(..consumed);
             let handled = self
                 .handle_menu_input_event(attach_pid, event)
                 .await
                 .map_err(io::Error::other)?;
-            if !handled || !self.overlay_active(attach_pid).await {
+            if !handled || self.attached_overlay_route(attach_pid).await != Some(overlay_route) {
                 break;
             }
         }
 
-        Ok(true)
+        if pending_input.is_empty() {
+            Ok(AttachedOverlayInput::Consumed)
+        } else {
+            Ok(AttachedOverlayInput::Reroute(std::mem::take(pending_input)))
+        }
+    }
+
+    pub(crate) async fn flush_attached_overlay_escape_input(
+        &self,
+        attach_pid: u32,
+        pending_input: &mut Vec<u8>,
+    ) -> io::Result<AttachedOverlayInput> {
+        let Some(overlay_route) = self.attached_overlay_route(attach_pid).await else {
+            return Ok(AttachedOverlayInput::Reroute(std::mem::take(pending_input)));
+        };
+        if pending_input.first() != Some(&b'\x1b') {
+            return Ok(AttachedOverlayInput::Reroute(std::mem::take(pending_input)));
+        }
+
+        pending_input.drain(..1);
+        match overlay_route {
+            AttachedOverlayRoute::Menu(_) => {
+                self.handle_menu_input_event(attach_pid, PromptInputEvent::Escape)
+                    .await
+                    .map_err(io::Error::other)?;
+            }
+            AttachedOverlayRoute::Popup { .. } => {
+                let _ = self.handle_popup_raw_input(attach_pid, b"\x1b").await?;
+            }
+        }
+
+        if pending_input.is_empty() {
+            Ok(AttachedOverlayInput::Consumed)
+        } else {
+            Ok(AttachedOverlayInput::Reroute(std::mem::take(pending_input)))
+        }
     }
 
     pub(crate) async fn handle_attached_resize(

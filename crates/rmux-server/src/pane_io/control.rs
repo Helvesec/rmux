@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use super::attach_transport::AttachTransport;
 use super::exit_log::AttachExitReason;
 use super::passthrough::render_passthroughs;
+use super::pending_escape::PendingEscapeFlush;
 use super::persistent_overlay::{
     accept_persistent_overlay_state, advance_persistent_overlay_state, clear_then_base_frame,
     defer_persistent_clear, discard_stale_persistent_overlays, is_stale_persistent_switch,
@@ -22,6 +23,43 @@ use super::wire::{
     emit_attach_bytes, emit_attach_message, emit_attach_stop, emit_detached_attach_stop,
     emit_render_frame, open_attach_target,
 };
+
+pub(super) struct PendingAttachInputState<'a> {
+    bytes: &'a mut Vec<u8>,
+    escape_flush: &'a mut PendingEscapeFlush,
+}
+
+impl<'a> PendingAttachInputState<'a> {
+    pub(super) fn new(bytes: &'a mut Vec<u8>, escape_flush: &'a mut PendingEscapeFlush) -> Self {
+        Self {
+            bytes,
+            escape_flush,
+        }
+    }
+
+    pub(super) fn clear_if_pane_source_changed(
+        &mut self,
+        current_target: &OpenAttachTarget,
+        next_target: &AttachTarget,
+    ) {
+        let same_pane_source = current_target
+            .pane_output
+            .as_ref()
+            .is_some_and(|current_output| {
+                current_output.shares_pane_source_with(&next_target.pane_output)
+            });
+        if same_pane_source {
+            return;
+        }
+
+        self.clear();
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.bytes.clear();
+        self.escape_flush.clear();
+    }
+}
 
 pub(super) fn should_emit_overlay(
     render_generation: u64,
@@ -183,6 +221,7 @@ pub(super) async fn apply_pending_attach_controls(
     persistent_overlay_visible: &mut bool,
     persistent_overlay_state_id: &mut Option<u64>,
     locked: &mut bool,
+    mut pending_input: Option<PendingAttachInputState<'_>>,
 ) -> io::Result<PendingAttachAction> {
     let Some(control_rx) = attach_controls else {
         return Ok(PendingAttachAction::Write);
@@ -247,6 +286,10 @@ pub(super) async fn apply_pending_attach_controls(
                 if is_stale_persistent_switch(*persistent_overlay_state_id, next_target.as_ref()) {
                     *render_generation = (*render_generation).saturating_add(switch_count);
                     continue;
+                }
+                if let Some(pending_input) = pending_input.as_mut() {
+                    pending_input
+                        .clear_if_pane_source_changed(current_target, next_target.as_ref());
                 }
                 *render_generation = (*render_generation).saturating_add(switch_count);
                 let pending_overlay = take_pending_persistent_overlay_for_state(
@@ -370,12 +413,18 @@ pub(super) async fn apply_pending_attach_controls(
                 emit_attach_bytes(stream, &bytes).await?;
             }
             Ok(AttachControl::LockShellCommand(command)) => {
+                if let Some(pending_input) = pending_input.as_mut() {
+                    pending_input.clear();
+                }
                 *locked = true;
                 emit_attach_stop(stream, current_target).await?;
                 emit_attach_message(stream, &AttachMessage::LockShellCommand(command)).await?;
                 should_drop_output = true;
             }
             Ok(AttachControl::Suspend) => {
+                if let Some(pending_input) = pending_input.as_mut() {
+                    pending_input.clear();
+                }
                 *locked = true;
                 emit_attach_stop(stream, current_target).await?;
                 emit_attach_message(stream, &AttachMessage::Suspend).await?;

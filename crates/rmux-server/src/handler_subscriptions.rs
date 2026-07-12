@@ -75,6 +75,18 @@ impl OutputSubscriptionState {
         self.draining_panes.remove(pane);
     }
 
+    fn rekey_pane(
+        &mut self,
+        previous: &PaneOutputSubscriptionKey,
+        current: PaneOutputSubscriptionKey,
+    ) {
+        let was_draining = self.draining_panes.remove(previous);
+        let _ = self.registry.rekey_pane(previous, current.clone());
+        if was_draining {
+            self.draining_panes.insert(current);
+        }
+    }
+
     fn begin_pane_drain(&mut self, pane: PaneOutputSubscriptionKey) -> bool {
         if !self.registry.contains_pane(&pane) {
             return false;
@@ -120,6 +132,19 @@ impl OutputSubscriptionState {
 }
 
 impl RequestHandler {
+    #[cfg(test)]
+    pub(in crate::handler) fn pane_output_subscription_key_for_test(
+        &self,
+        subscription_id: PaneOutputSubscriptionId,
+    ) -> Option<PaneOutputSubscriptionKey> {
+        self.subscriptions
+            .lock()
+            .expect("subscription registry mutex must not be poisoned")
+            .registry
+            .get(subscription_id)
+            .map(|record| record.pane().clone())
+    }
+
     pub(in crate::handler) async fn handle_subscribe_pane_output(
         &self,
         connection_id: u64,
@@ -362,6 +387,19 @@ impl RequestHandler {
             }
         }
         let _ = self.request_shutdown_if_pending();
+    }
+
+    pub(crate) fn rekey_pane_output_subscriptions(
+        &self,
+        rekeys: &[(PaneOutputSubscriptionKey, PaneOutputSubscriptionKey)],
+    ) {
+        let mut subscriptions = self
+            .subscriptions
+            .lock()
+            .expect("subscription registry mutex must not be poisoned");
+        for (previous, current) in rekeys {
+            subscriptions.rekey_pane(previous, current.clone());
+        }
     }
 
     pub(crate) async fn drain_exited_pane_output_subscriptions(

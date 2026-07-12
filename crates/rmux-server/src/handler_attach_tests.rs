@@ -177,6 +177,7 @@ async fn web_render_refreshes_are_marked_pending_before_building_switches() {
         .register_attach_with_access(
             77,
             session.clone(),
+            None,
             AttachRegistration {
                 control_tx,
                 control_backlog: Arc::new(AtomicUsize::new(0)),
@@ -191,7 +192,8 @@ async fn web_render_refreshes_are_marked_pending_before_building_switches() {
                 client_size: Some(TerminalSize { cols: 80, rows: 24 }),
             },
         )
-        .await;
+        .await
+        .expect("attach registration succeeds");
 
     handler.refresh_attached_session(&session).await;
     handler.refresh_attached_session(&session).await;
@@ -229,6 +231,7 @@ async fn refresh_attached_session_removes_clients_over_backlog_limit() {
         .register_attach_with_access(
             77,
             session.clone(),
+            None,
             AttachRegistration {
                 control_tx,
                 control_backlog: control_backlog.clone(),
@@ -243,7 +246,8 @@ async fn refresh_attached_session_removes_clients_over_backlog_limit() {
                 client_size: Some(TerminalSize { cols: 80, rows: 24 }),
             },
         )
-        .await;
+        .await
+        .expect("attach registration succeeds");
 
     handler.refresh_attached_session(&session).await;
 
@@ -854,8 +858,12 @@ mod attach_render;
 #[path = "handler_attach_tests/attached_prefix_lifecycle.rs"]
 mod attached_prefix_lifecycle;
 
+#[path = "handler_attach_tests/cleanup_identity.rs"]
+mod cleanup_identity;
 #[path = "handler_attach_tests/multi_client.rs"]
 mod multi_client;
+#[path = "handler_attach_tests/resize_selection_race.rs"]
+mod resize_selection_race;
 
 #[path = "handler_attach_tests/server_lifecycle.rs"]
 mod server_lifecycle;

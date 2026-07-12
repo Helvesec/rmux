@@ -55,6 +55,19 @@ pub(in crate::handler) fn decode_prompt_input_event(
     Some((event, 1))
 }
 
+pub(in crate::handler) fn prompt_text_prefix_len(bytes: &[u8]) -> usize {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match decode_prompt_input_event(&bytes[offset..]) {
+            Some((PromptInputEvent::Char(_), consumed)) if consumed > 0 => {
+                offset += consumed;
+            }
+            _ => break,
+        }
+    }
+    offset
+}
+
 pub(super) fn is_extended_key_prefix(bytes: &[u8]) -> bool {
     bytes.starts_with(b"\x1b[") && bytes.get(2).is_some_and(|byte| byte.is_ascii_digit())
 }
@@ -167,6 +180,17 @@ mod tests {
         let (event, consumed) = decode_prompt_input_event(&bytes).unwrap();
         assert_eq!(consumed, 1);
         assert!(matches!(event, PromptInputEvent::KeyName(_)));
+    }
+
+    #[test]
+    fn prompt_text_prefix_is_utf8_complete_and_stops_before_control_events() {
+        let text = "aé日本";
+        let mut bytes = text.as_bytes().to_vec();
+        bytes.extend_from_slice(b"\x1bTAIL");
+        assert_eq!(prompt_text_prefix_len(&bytes), text.len());
+
+        let partial = b"abc\xe6\x97";
+        assert_eq!(prompt_text_prefix_len(partial), 3);
     }
 
     #[test]

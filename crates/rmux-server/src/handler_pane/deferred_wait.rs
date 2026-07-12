@@ -19,6 +19,17 @@ impl RequestHandler {
         .await;
     }
 
+    pub(in crate::handler) async fn wait_for_windows_deferred_session_pane_pids(
+        &self,
+        session_name: &rmux_proto::SessionName,
+    ) {
+        self.wait_for_windows_deferred_panes_until(|| async {
+            let state = self.state.lock().await;
+            list_pane_scope_has_pending_pid(&state, session_name, None)
+        })
+        .await;
+    }
+
     pub(in crate::handler) async fn wait_for_windows_deferred_list_session_pane_pids(&self) {
         self.wait_for_windows_deferred_panes_until(|| async {
             let state = self.state.lock().await;

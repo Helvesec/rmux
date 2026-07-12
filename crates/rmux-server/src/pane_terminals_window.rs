@@ -19,7 +19,7 @@ mod window_movement;
 
 use super::{
     session_not_found, HandlerState, KilledWindowResult, NewWindowOptions, PreparedWindowTerminal,
-    RemovedWindowHookContext, RespawnWindowOptions,
+    RemovedWindowHookContext, RespawnWindowOptions, SessionTransferSnapshot,
 };
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 
@@ -70,26 +70,31 @@ impl HandlerState {
             .resolve(Some(session_name), OptionName::BaseIndex)
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(0);
+        let mutation_snapshot = SessionTransferSnapshot::capture(self);
         let pane_id = self.sessions.allocate_pane_id();
-        let (window_index, pane_id) = {
+        let session_mutation = (|| -> Result<_, RmuxError> {
             let session = self
                 .sessions
                 .session_mut(session_name)
                 .ok_or_else(|| session_not_found(session_name))?;
-            let (window_index, pane_id) = match target_window_index {
+            let (window_index, pane_id, index_map) = match target_window_index {
                 Some(window_index) => {
-                    if insert_at_target {
-                        session.make_room_for_window(window_index)?;
+                    let index_map = if insert_at_target {
+                        session.make_room_for_window(window_index)?
                     } else if session.window_at(window_index).is_some() {
                         return Err(RmuxError::Server(format!(
                             "create window failed: index {window_index} in use"
                         )));
-                    }
+                    } else {
+                        std::collections::BTreeMap::new()
+                    };
                     session.insert_window_with_initial_pane_with_id(window_index, size, pane_id)?;
-                    (window_index, pane_id)
+                    (window_index, pane_id, index_map)
                 }
                 None => {
-                    session.create_window_at_or_above_with_pane_id(size, base_index, pane_id)?
+                    let (window_index, pane_id) = session
+                        .create_window_at_or_above_with_pane_id(size, base_index, pane_id)?;
+                    (window_index, pane_id, std::collections::BTreeMap::new())
                 }
             };
             if let Some(name) = name {
@@ -98,11 +103,23 @@ impl HandlerState {
             if !detached {
                 session.select_window(window_index)?;
             }
-            (window_index, pane_id)
+            Ok((window_index, pane_id, index_map))
+        })();
+        let (window_index, pane_id, index_map) = match session_mutation {
+            Ok(result) => result,
+            Err(error) => {
+                mutation_snapshot.restore(self);
+                return Err(error);
+            }
         };
 
+        if let Err(error) = self.remap_session_group_window_metadata(session_name, &index_map) {
+            mutation_snapshot.restore(self);
+            return Err(error);
+        }
+
         if let Err(error) = self.insert_window_terminal(session_name, window_index, spawn) {
-            self.replace_session(session_name, previous_session)?;
+            mutation_snapshot.restore(self);
             return Err(error);
         }
         let target = WindowTarget::with_window(session_name.clone(), window_index);
@@ -116,7 +133,7 @@ impl HandlerState {
                 .and_then(|session| session.pane_id_in_window(window_index, 0)),
             Some(pane_id)
         );
-        self.synchronize_session_group_from(session_name)?;
+        self.synchronize_session_group_from_with_window_selection_map(session_name, &index_map)?;
         self.sync_pane_lifecycle_dimensions_for_session(session_name);
 
         Ok(NewWindowResponse { target })
@@ -208,8 +225,12 @@ impl HandlerState {
             }
         }
 
+        let mut reindexed_windows = Vec::new();
         for synchronized_session in &sessions_to_synchronize {
-            self.renumber_windows_if_enabled(synchronized_session)?;
+            let index_map = self.renumber_windows_if_enabled(synchronized_session)?;
+            if !index_map.is_empty() {
+                reindexed_windows.push((synchronized_session.clone(), index_map));
+            }
         }
         let active_window = self
             .sessions
@@ -227,6 +248,7 @@ impl HandlerState {
             },
             removed_windows,
             removed_pane_ids,
+            reindexed_windows,
         })
     }
 
@@ -262,7 +284,7 @@ impl HandlerState {
             target.window_index(),
         );
         self.clear_auto_named_window_family(target.session_name(), target.window_index());
-        self.synchronize_linked_window_family_from_slot(
+        self.synchronize_window_alias_family_from_slot(
             target.session_name(),
             target.window_index(),
         )?;

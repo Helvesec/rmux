@@ -1,6 +1,6 @@
 use rmux_core::formats::FormatContext;
 use rmux_core::{encode_paste_bytes, LifecycleEvent, Session, Window};
-use rmux_proto::{octal_escape, SessionName, WindowTarget};
+use rmux_proto::{octal_escape, SessionId, SessionName, WindowTarget};
 
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
 use crate::pane_terminals::HandlerState;
@@ -24,6 +24,7 @@ pub(crate) struct PreparedControlNotification {
 pub(crate) fn collect_control_notifications(
     state: &HandlerState,
     event: &LifecycleEvent,
+    event_session_identity: Option<SessionId>,
     clients: &[ControlClientSnapshot],
 ) -> Vec<PreparedControlNotification> {
     match event {
@@ -57,6 +58,7 @@ pub(crate) fn collect_control_notifications(
         } => client_session_changed_notifications(
             state,
             session_name,
+            event_session_identity,
             client_name.as_deref(),
             clients,
         ),
@@ -67,9 +69,7 @@ pub(crate) fn collect_control_notifications(
                 .map(|name| format!("%client-detached {name}")),
         ),
         LifecycleEvent::SessionRenamed { session_name } => {
-            let line = state
-                .sessions
-                .session(session_name)
+            let line = resolve_event_session(state, session_name, event_session_identity)
                 .map(|session| format!("%session-renamed {}", session_identity(session)));
             broadcast_line(clients, line)
         }
@@ -77,13 +77,15 @@ pub(crate) fn collect_control_notifications(
             broadcast_line(clients, Some("%sessions-changed".to_owned()))
         }
         LifecycleEvent::SessionWindowChanged { session_name } => {
-            let line = state.sessions.session(session_name).and_then(|session| {
-                session
-                    .window_at(session.active_window_index())
-                    .map(|window| {
-                        format!("%session-window-changed {} {}", session.id(), window.id())
-                    })
-            });
+            let line = resolve_event_session(state, session_name, event_session_identity).and_then(
+                |session| {
+                    session
+                        .window_at(session.active_window_index())
+                        .map(|window| {
+                            format!("%session-window-changed {} {}", session.id(), window.id())
+                        })
+                },
+            );
             broadcast_line(clients, line)
         }
         LifecycleEvent::PasteBufferChanged { buffer_name } => broadcast_line(
@@ -252,13 +254,14 @@ fn control_arg(value: &str) -> String {
 fn client_session_changed_notifications(
     state: &HandlerState,
     session_name: &SessionName,
+    session_id: Option<SessionId>,
     client_name: Option<&str>,
     clients: &[ControlClientSnapshot],
 ) -> Vec<PreparedControlNotification> {
     let Some(client_name) = client_name else {
         return Vec::new();
     };
-    let Some(session) = state.sessions.session(session_name) else {
+    let Some(session) = resolve_event_session(state, session_name, session_id) else {
         return Vec::new();
     };
     let switched_pid = client_name.parse::<u32>().ok();
@@ -275,6 +278,17 @@ fn client_session_changed_notifications(
             PreparedControlNotification { pid, line }
         })
         .collect()
+}
+
+fn resolve_event_session<'a>(
+    state: &'a HandlerState,
+    session_name: &SessionName,
+    session_id: Option<SessionId>,
+) -> Option<&'a Session> {
+    match session_id {
+        Some(session_id) => state.sessions.session_by_id(session_id),
+        None => state.sessions.session(session_name),
+    }
 }
 
 fn render_layout_change_line(state: &HandlerState, target: &WindowTarget) -> Option<(u32, String)> {

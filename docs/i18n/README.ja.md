@@ -117,7 +117,6 @@ RMUX を何に使えるかを示す短い例です。
 | プラットフォーム / マネージャー | コマンド |
 | :--- | :--- |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/apple.svg"><img src="../install/apple-light.svg" width="28" alt="macOS"></picture> / Homebrew | `brew install rmux` |
-| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / installer | `irm https://rmux.io/install.ps1 \| iex` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / WinGet | `winget install rmux` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / Scoop | `scoop bucket add rmux https://github.com/Helvesec/scoop-rmux && scoop install rmux` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / Chocolatey | `choco install rmux` |
@@ -128,7 +127,12 @@ RMUX を何に使えるかを示す短い例です。
 
 直接ダウンロード（`.tar.gz`、`.deb`、`.rpm`、`.zip`）は [v0.9.0 GitHub Release](https://github.com/Helvesec/rmux/releases/tag/v0.9.0) から利用できます。
 
-パッケージマネージャはレジストリ審査中に遅れることがあります。直接ダウンロードと rmux.io インストーラは現在の GitHub Release に追従します。
+パッケージマネージャはレジストリ審査中に遅れることがあります。更新が反映されるまでは、バージョンが固定された GitHub Release のダウンロードを使用してください。
+
+Windows では `.zip` 全体を展開し、展開したパッケージのルートを
+`PATH` に追加してください。`rmux.exe`、`rmux-daemon.exe`、
+`libexec/rmux/rmux.exe` は同じ配置のまま保持する必要があります。
+公開実行ファイルだけをコピーしても有効なインストールにはなりません。
 
 Unix の `.tar.gz` を直接ダウンロードした場合は、展開したアーカイブ内で
 `./install.sh --prefix ~/.local` を実行してください。このインストーラは、

@@ -12,7 +12,9 @@ use super::mode_tree_filter::matches_mode_tree_filter;
 use super::mode_tree_model::{
     ClientSnapshot, ModeTreeAction, ModeTreeBuild, ModeTreeClientState, ModeTreeItem, TreeDepth,
 };
-use super::mode_tree_order::{finalize_mode_tree, pane_item_id, session_item_id, window_item_id};
+use super::mode_tree_order::{
+    client_item_id, finalize_mode_tree, pane_item_id, session_item_id, window_item_id,
+};
 use super::mode_tree_render::mode_tree_list_rows;
 use super::mode_tree_selection::{clamp_scroll, ensure_selected_visible, normalize_selection};
 use super::mode_tree_sort::{sort_buffer_entries, sort_clients};
@@ -29,7 +31,10 @@ impl RequestHandler {
         attach_pid: u32,
     ) -> Result<ModeTreeBuild, RmuxError> {
         let client_snapshot = self.mode_tree_clients_snapshot().await;
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
+        if matches!(mode.kind, super::mode_tree_model::ModeTreeKind::Tree) {
+            state.ensure_live_window_link_occurrences();
+        }
         let active_attach = self.active_attach.lock().await;
         let active_control = self.active_control.lock().await;
         let current_attach_session = active_attach
@@ -98,6 +103,14 @@ impl RequestHandler {
             }
         };
 
+        // tmux parity: tags live on the rebuilt items, so a tag whose item no
+        // longer exists dies with the item. Without pruning, stale tagged ids
+        // make the tagged set non-empty while intersecting with no built
+        // item, which permanently disables the fallback-to-current-selection
+        // in selected_items — Enter and tree-kill silently do nothing after
+        // a tagged item is killed or its session is renamed.
+        mode.tagged.retain(|id| build.items.contains_key(id));
+
         if build.visible.is_empty() {
             mode.selected_id = None;
             mode.scroll = 0;
@@ -144,21 +157,29 @@ impl RequestHandler {
         if !matches!(mode.kind, super::mode_tree_model::ModeTreeKind::Tree) {
             return Ok(());
         }
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
+        state.ensure_live_window_link_occurrences();
         let mut sessions = state.sessions.iter().collect::<Vec<_>>();
         sessions.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
-        for (session_name, session) in sessions {
-            let session_id = session_item_id(session_name);
+        for (_, session) in sessions {
+            let session_item_key = session_item_id(session.id());
             match mode.tree_depth {
                 TreeDepth::Session => {}
                 TreeDepth::Window | TreeDepth::Pane => {
-                    mode.expanded.insert(session_id);
+                    mode.expanded.insert(session_item_key);
                 }
             }
             if matches!(mode.tree_depth, TreeDepth::Pane) {
-                for window_index in session.windows().keys() {
-                    mode.expanded
-                        .insert(window_item_id(session_name, *window_index));
+                for (window_index, window) in session.windows() {
+                    let occurrence_id = state
+                        .window_link_occurrence_id(session.name(), *window_index)
+                        .expect("live mode-tree windows have occurrence identities");
+                    mode.expanded.insert(window_item_id(
+                        session.id(),
+                        *window_index,
+                        window.id(),
+                        occurrence_id,
+                    ));
                 }
             }
         }
@@ -173,9 +194,9 @@ impl RequestHandler {
             .iter()
             .map(|(&pid, active)| ClientSnapshot {
                 pid,
+                attach_id: active.id,
                 session_name: Some(active.session_name.clone()),
                 label: attached_client_label(pid),
-                order: active.id,
                 activity: now,
                 width: active.client_size.cols,
                 height: active.client_size.rows,
@@ -321,7 +342,7 @@ pub(super) fn build_client_items(
         if !matches_mode_tree_filter(mode, &line, filter.as_deref()) {
             continue;
         }
-        let id = format!("client:{}", client.pid);
+        let id = client_item_id(client.pid, client.attach_id);
         let preview = client
             .session_name
             .as_ref()
@@ -358,6 +379,7 @@ pub(super) fn build_client_items(
                 no_tag: false,
                 action: ModeTreeAction::Client {
                     pid: client.pid,
+                    attach_id: client.attach_id,
                     control: false,
                 },
             },
@@ -417,13 +439,25 @@ fn mode_tree_default_selection(
     match mode.kind {
         super::mode_tree_model::ModeTreeKind::Tree => {
             let session = state.sessions.session(&mode.session_name)?;
+            let active_window_index = session.active_window_index();
+            let active_window = session.window_at(active_window_index)?;
+            let occurrence_id = state
+                .window_link_occurrence_id(session.name(), active_window_index)
+                .expect("live mode-tree windows have occurrence identities");
             let selected_id = match mode.tree_depth {
-                TreeDepth::Session => session_item_id(session.name()),
-                TreeDepth::Window => window_item_id(session.name(), session.active_window_index()),
+                TreeDepth::Session => session_item_id(session.id()),
+                TreeDepth::Window => window_item_id(
+                    session.id(),
+                    active_window_index,
+                    active_window.id(),
+                    occurrence_id,
+                ),
                 TreeDepth::Pane => pane_item_id(
-                    session.name(),
-                    session.active_window_index(),
-                    session.active_pane_index(),
+                    session.id(),
+                    active_window_index,
+                    active_window.id(),
+                    occurrence_id,
+                    active_window.active_pane()?.id(),
                 ),
             };
             build
@@ -432,11 +466,10 @@ fn mode_tree_default_selection(
                 .then_some(selected_id)
         }
         super::mode_tree_model::ModeTreeKind::Client => {
-            let selected_id = format!("client:{attach_pid}");
-            build
-                .items
-                .contains_key(&selected_id)
-                .then_some(selected_id)
+            build.items.values().find_map(|item| match item.action {
+                ModeTreeAction::Client { pid, .. } if pid == attach_pid => Some(item.id.clone()),
+                _ => None,
+            })
         }
         super::mode_tree_model::ModeTreeKind::Buffer
         | super::mode_tree_model::ModeTreeKind::Customize => build.visible.first().cloned(),

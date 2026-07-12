@@ -5,6 +5,9 @@ use crate::terminal::SessionBaseEnvironment;
 
 use super::{session_not_found, HandlerState};
 
+#[path = "session_runtime/group_sync.rs"]
+mod group_sync;
+
 fn pane_base_environment_with_starting_fallback(
     state: &HandlerState,
     runtime_session_name: &SessionName,
@@ -113,44 +116,6 @@ impl HandlerState {
             .map(|pane| pane.id())
     }
 
-    pub(crate) fn synchronize_session_group_from(
-        &mut self,
-        source_session_name: &SessionName,
-    ) -> Result<Vec<SessionName>, RmuxError> {
-        let source_session = self
-            .sessions
-            .session(source_session_name)
-            .cloned()
-            .ok_or_else(|| session_not_found(source_session_name))?;
-        let group_members = self.sessions.session_group_members(source_session_name);
-        if group_members.len() <= 1 {
-            return Ok(group_members);
-        }
-
-        let mut synchronized = Vec::with_capacity(group_members.len());
-        for member_name in group_members {
-            if member_name == *source_session_name {
-                synchronized.push(member_name);
-                continue;
-            }
-
-            let before_pane_options = self.pane_option_slots_for_session(&member_name)?;
-            {
-                let member = self
-                    .sessions
-                    .session_mut(&member_name)
-                    .ok_or_else(|| session_not_found(&member_name))?;
-                member.synchronize_group_from(&source_session);
-            }
-            self.rekey_pane_options_after_session_change(&before_pane_options, &member_name)?;
-            synchronized.push(member_name);
-        }
-
-        self.synchronize_pane_alias_options_from_session(&source_session)?;
-
-        Ok(synchronized)
-    }
-
     pub(crate) fn rename_session(
         &mut self,
         session_name: &SessionName,
@@ -217,10 +182,12 @@ impl HandlerState {
     ) -> Result<bool, RmuxError> {
         let Some(current_runtime_owner) = current_runtime_owner else {
             self.remove_window_link_session_slots(session_name);
+            let _ = self.attached_terminal_pixels.remove(session_name);
             return Ok(false);
         };
         if current_runtime_owner != session_name {
             self.remove_window_link_session_slots(session_name);
+            let _ = self.attached_terminal_pixels.remove(session_name);
             return Ok(true);
         }
 
@@ -228,8 +195,12 @@ impl HandlerState {
             self.terminals
                 .rename_session(session_name, next_runtime_owner)?;
             self.rename_runtime_session_state(session_name, next_runtime_owner)?;
-            self.rename_window_link_runtime_session(session_name, next_runtime_owner);
-            self.remove_window_link_session_slots(session_name);
+            let _ = self.attached_terminal_pixels.remove(session_name);
+            // Group peers share the removed owner's canonical winlink slots.
+            // Rekey those slots together with the runtime instead of
+            // detaching them, otherwise external aliases lose the surviving
+            // group's runtime mapping.
+            self.rename_window_link_session(session_name, next_runtime_owner);
             self.sync_pane_lifecycle_dimensions_for_session(next_runtime_owner);
             return Ok(true);
         }

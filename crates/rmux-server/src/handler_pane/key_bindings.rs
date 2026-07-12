@@ -1,7 +1,7 @@
 use rmux_core::{
     formats::FormatContext, key_code_lookup_bits, key_string_lookup_key, key_string_lookup_string,
-    parse_binding_command_tokens, KeyBindingDisplay, KeyBindingSortOrder, KEYC_NONE, KEYC_UNKNOWN,
-    LIST_KEYS_TEMPLATE,
+    parse_binding_command_tokens_with_parser, KeyBindingDisplay, KeyBindingSortOrder, KEYC_NONE,
+    KEYC_UNKNOWN, LIST_KEYS_TEMPLATE,
 };
 use rmux_proto::{
     BindKeyResponse, CommandOutput, ErrorResponse, ListKeysResponse, OptionName, Response,
@@ -10,6 +10,7 @@ use rmux_proto::{
 
 use super::{command_output_from_lines, RequestHandler};
 use crate::format_runtime::{render_runtime_template, RuntimeFormatContext};
+use crate::handler::scripting_support::command_parser_from_state;
 use crate::pane_terminals::HandlerState;
 
 impl RequestHandler {
@@ -25,8 +26,12 @@ impl RequestHandler {
                 });
             }
         };
+        let mut state = self.state.lock().await;
         let commands = match request.command.as_ref() {
-            Some(tokens) => match parse_binding_command_tokens(tokens) {
+            Some(tokens) => match parse_binding_command_tokens_with_parser(
+                &command_parser_from_state(&state),
+                tokens,
+            ) {
                 Ok(commands) => Some(commands),
                 Err(error) => {
                     return Response::Error(ErrorResponse {
@@ -38,7 +43,6 @@ impl RequestHandler {
         };
 
         let canonical_key = key_string_lookup_key(key_code_lookup_bits(key), false);
-        let mut state = self.state.lock().await;
         let updated = state.key_bindings.add_binding(
             &request.table_name,
             key,

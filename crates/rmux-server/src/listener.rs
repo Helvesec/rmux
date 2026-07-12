@@ -16,8 +16,8 @@ use tracing::{debug, warn};
 use crate::control::{self, ControlLifecycle, ControlServerEvent, ControlUpgradeInput};
 use crate::daemon::ShutdownHandle;
 use crate::handler::{
-    attach_support::AttachRegistration, ControlRegistration, DetachedRequestGuard, PreparedSdkWait,
-    RequestHandler,
+    attach_support::AttachRegistration, ControlClientIdentity, ControlRegistration,
+    DetachedRequestGuard, PreparedSdkWait, RequestHandler,
 };
 use crate::listener_options::ServeOptions;
 use crate::listener_signals::handle_server_signal;
@@ -65,6 +65,9 @@ pub(crate) async fn serve(
     ));
     handler.install_shutdown_handle(shutdown_handle.clone());
     handler.set_socket_path(&socket_path);
+    let lifecycle_events = handler
+        .take_lifecycle_dispatch_receiver()
+        .ok_or_else(|| io::Error::other("lifecycle dispatch receiver already active"))?;
     #[cfg(all(any(unix, windows), feature = "web"))]
     if web_required {
         handler
@@ -72,22 +75,21 @@ pub(crate) async fn serve(
             .await
             .map_err(|error| io::Error::new(io::ErrorKind::AddrNotAvailable, error.to_string()))?;
     }
+    let (connection_shutdown, connection_shutdown_rx) = watch::channel(());
+    let (hook_shutdown, hook_shutdown_rx) = oneshot::channel();
+    let mut connection_tasks = JoinSet::new();
+    let hook_handler = Arc::clone(&handler);
+    let hook_task = tokio::spawn(async move {
+        hook_handler
+            .consume_lifecycle_hooks(lifecycle_events, hook_shutdown_rx)
+            .await;
+    });
     let startup_guard = handler.start_config_loading();
     let startup_handler = Arc::clone(&handler);
     let startup_config = options.config_load;
     let startup_task = tokio::spawn(async move {
         startup_handler
             .load_startup_config_with_guard(startup_config, startup_guard)
-            .await;
-    });
-    let (connection_shutdown, connection_shutdown_rx) = watch::channel(());
-    let mut connection_tasks = JoinSet::new();
-    let hook_handler = Arc::clone(&handler);
-    let hook_events = handler.subscribe_lifecycle_events();
-    let hook_shutdown = connection_shutdown_rx.clone();
-    let hook_task = tokio::spawn(async move {
-        hook_handler
-            .consume_lifecycle_hooks(hook_events, hook_shutdown)
             .await;
     });
 
@@ -153,6 +155,8 @@ pub(crate) async fn serve(
     }
 
     drain_connection_tasks_for_shutdown(&mut connection_tasks).await;
+    handler.shutdown_wait_for();
+    let _ = hook_shutdown.send(());
     if let Err(error) = hook_task.await {
         warn!("lifecycle hook task failed: {error}");
     }
@@ -288,6 +292,7 @@ async fn serve_connection(
                         .register_attach_with_access(
                             requester.pid,
                             session_name.clone(),
+                            Some(attach.session_id),
                             AttachRegistration {
                                 control_tx: attach.control_tx,
                                 control_backlog: attach.control_backlog.clone(),
@@ -302,10 +307,19 @@ async fn serve_connection(
                                 client_size: attach.client_size,
                             },
                         )
-                        .await;
+                        .await
+                        .ok_or_else(|| {
+                            io::Error::other("attach session changed before registration")
+                        })?;
                     drop(detached_connection_guard);
                     drop(detached_request_guard.take());
-                    handler.emit_client_attached(requester.pid, session_name).await;
+                    handler
+                        .emit_client_attached_identity(
+                            requester.pid,
+                            session_name,
+                            attach.session_id,
+                        )
+                        .await;
                     let (stream, buffered_bytes) = conn.into_raw_parts();
                     if !buffered_bytes.is_empty() {
                         warn!(
@@ -358,7 +372,7 @@ async fn serve_connection(
                     let result = control::forward_control(
                         stream,
                         Arc::clone(&handler),
-                        requester.pid,
+                        ControlClientIdentity::new(requester.pid, control_id),
                         ControlUpgradeInput::new(buffered_bytes, initial_command_count),
                         shutdown,
                         server_event_rx,

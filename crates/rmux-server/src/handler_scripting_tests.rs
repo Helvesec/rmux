@@ -2,12 +2,16 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::control_support::{with_control_queue_identity, ControlClientIdentity};
 use super::RequestHandler;
+use crate::control::{ControlModeUpgrade, ControlServerEvent, CONTROL_SERVER_EVENT_CAPACITY};
 use crate::handler::scripting_support::QueueExecutionContext;
 use crate::hook_runtime::with_hook_execution;
+use crate::outer_terminal::OuterTerminalContext;
 use rmux_core::command_parser::CommandParser;
 use rmux_core::TargetFindContext;
 use rmux_proto::{
@@ -172,6 +176,79 @@ fn background_shell_test_timeout() -> std::time::Duration {
     {
         std::time::Duration::from_secs(2)
     }
+}
+
+async fn register_control_for_session(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    session_name: SessionName,
+) -> (u64, tokio::sync::mpsc::Receiver<ControlServerEvent>) {
+    let (event_tx, event_rx) =
+        tokio::sync::mpsc::channel::<ControlServerEvent>(CONTROL_SERVER_EVENT_CAPACITY);
+    let control_id = handler
+        .register_control_with_closing(
+            requester_pid,
+            ControlModeUpgrade {
+                initial_command_count: 0,
+                mode: rmux_proto::ControlMode::Plain,
+                terminal_context: OuterTerminalContext::default(),
+            },
+            event_tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+    handler
+        .set_control_session(requester_pid, Some(session_name))
+        .await
+        .expect("control session binds");
+    (control_id, event_rx)
+}
+
+async fn create_background_identity_session(handler: &RequestHandler, session_name: SessionName) {
+    let response = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+}
+
+async fn wait_for_background_waiter(handler: &RequestHandler, channel: &str) {
+    tokio::time::timeout(background_shell_test_timeout(), async {
+        loop {
+            if handler.wait_for_counts(channel).0 == 1 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("background command reaches its wait-for seam");
+}
+
+async fn release_background_waiter(handler: &RequestHandler, channel: &str) {
+    let response = handler.handle(wait_for(channel, WaitForMode::Signal)).await;
+    assert_eq!(response, Response::WaitFor(WaitForResponse));
+}
+
+async fn assert_sessions_survive_background_control_reuse(
+    handler: &RequestHandler,
+    original: &SessionName,
+    replacement: &SessionName,
+) {
+    wait_for_detached_request_count(handler, 0).await;
+    let state = handler.state.lock().await;
+    assert!(
+        state.sessions.contains_session(original),
+        "the stale background command must not mutate the original session"
+    );
+    assert!(
+        state.sessions.contains_session(replacement),
+        "the stale background command must not jump to the replacement registration"
+    );
 }
 
 #[cfg(unix)]

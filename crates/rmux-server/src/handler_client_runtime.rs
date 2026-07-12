@@ -16,7 +16,8 @@ use crate::terminal::{base_process_environment, base_process_environment_display
 
 use super::{
     attach_support::{self, ClientFlags},
-    control_support, option_value_u32, prompt_support, RequestHandler,
+    control_support::{self, current_control_queue_identity},
+    option_value_u32, prompt_support, RequestHandler,
 };
 
 #[path = "handler_client_runtime/list_clients.rs"]
@@ -47,6 +48,10 @@ impl RequestHandler {
     }
 
     pub(in crate::handler) async fn requester_can_write(&self, requester_pid: u32) -> bool {
+        if let Some(identity) = current_control_queue_identity(requester_pid) {
+            return self.control_queue_can_write(identity).await;
+        }
+
         {
             let active_attach = self.active_attach.lock().await;
             if let Some(active) = active_attach.by_pid.get(&requester_pid) {
@@ -165,12 +170,40 @@ impl RequestHandler {
         attach_pid: u32,
         session_name: &rmux_proto::SessionName,
     ) -> Result<(), RmuxError> {
+        self.refresh_attached_client_status_with_expected_identity(attach_pid, None, session_name)
+            .await
+    }
+
+    pub(crate) async fn refresh_attached_client_status_for_identity(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: u64,
+        session_name: &rmux_proto::SessionName,
+    ) -> Result<(), RmuxError> {
+        self.refresh_attached_client_status_with_expected_identity(
+            attach_pid,
+            Some(expected_attach_id),
+            session_name,
+        )
+        .await
+    }
+
+    async fn refresh_attached_client_status_with_expected_identity(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: Option<u64>,
+        session_name: &rmux_proto::SessionName,
+    ) -> Result<(), RmuxError> {
         let attached_count = self.attached_count(session_name).await;
         let (prompt, terminal_context, client_size, key_table) = {
             let active_attach = self.active_attach.lock().await;
             let active = active_attach
                 .by_pid
                 .get(&attach_pid)
+                .filter(|active| {
+                    expected_attach_id.is_none_or(|expected| active.id == expected)
+                        && &active.session_name == session_name
+                })
                 .ok_or_else(|| attached_client_required("refresh-client"))?;
             (
                 active
@@ -205,13 +238,21 @@ impl RequestHandler {
             );
             outer_terminal.wrap_render_frame(&frame)
         };
-        self.send_attach_control(
-            attach_pid,
-            AttachControl::Write(bytes),
-            "refresh-client",
-            None,
-        )
-        .await?;
+        match expected_attach_id {
+            Some(attach_id) => {
+                self.send_attach_control_for_client_identity(
+                    attach_pid,
+                    attach_id,
+                    AttachControl::Write(bytes),
+                    "refresh-client",
+                )
+                .await?;
+            }
+            None => {
+                self.send_attach_control(attach_pid, AttachControl::Write(bytes), "refresh-client")
+                    .await?;
+            }
+        }
         Ok(())
     }
 }
@@ -453,11 +494,30 @@ pub(in crate::handler) fn effective_client_terminal_context(
 ) -> rmux_proto::ClientTerminalContext {
     let mut client_terminal = client_terminal.clone();
     client_terminal.utf8 |= client_environment_infers_utf8(client_environment);
+    // Twin of src/client_terminal.rs: on Windows the daemon and its client are
+    // the same machine and rmux always drives the outer as VT, so advertise the
+    // base VT feature set for every attach — a VT outer reached without
+    // WT_SESSION otherwise never gets mouse reporting or bracketed paste
+    // enabled (issue #93). This is a server-side fallback for clients that do
+    // not self-advertise; a modern client already sends these.
+    #[cfg(windows)]
+    {
+        push_unique_terminal_feature(&mut client_terminal.terminal_features, "sync");
+        push_unique_terminal_feature(&mut client_terminal.terminal_features, "bpaste");
+        push_unique_terminal_feature(&mut client_terminal.terminal_features, "mouse");
+        // Clipboard (OSC 52): Windows Terminal handles it natively and any other
+        // VT outer ignores it, so advertise it for every Windows attach. Without
+        // an Ms template the daemon cannot forward a pane's OSC 52 to the outer
+        // under `set-clipboard on` (issue #91); the on-only relay gate keeps the
+        // `external` default from letting untrusted output drive the clipboard.
+        push_unique_terminal_feature(&mut client_terminal.terminal_features, "clipboard");
+    }
     if client_environment_is_windows_terminal(client_environment) {
         client_terminal.utf8 = true;
         push_unique_terminal_feature(&mut client_terminal.terminal_features, "sync");
         push_unique_terminal_feature(&mut client_terminal.terminal_features, "bpaste");
         push_unique_terminal_feature(&mut client_terminal.terminal_features, "mouse");
+        push_unique_terminal_feature(&mut client_terminal.terminal_features, "clipboard");
     }
     client_terminal
 }
@@ -619,7 +679,10 @@ mod tests {
         );
 
         assert!(context.utf8);
-        assert_eq!(context.terminal_features, vec!["sync", "bpaste", "mouse"]);
+        assert_eq!(
+            context.terminal_features,
+            vec!["sync", "bpaste", "mouse", "clipboard"]
+        );
     }
 
     #[test]
@@ -634,7 +697,32 @@ mod tests {
         );
 
         assert!(context.utf8);
-        assert_eq!(context.terminal_features, vec!["SYNC", "BPASTE", "MOUSE"]);
+        assert_eq!(
+            context.terminal_features,
+            vec!["SYNC", "BPASTE", "MOUSE", "clipboard"]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_vt_outer_without_windows_terminal_still_advertises_mouse_and_bpaste() {
+        // Issue #93 server twin: a Windows client on a VT outer that is not
+        // Windows Terminal (no WT_SESSION) must still have mouse + bracketed
+        // paste advertised so the daemon enables them on the outer. Before the
+        // fix an empty (non-WT) client environment added no features.
+        let environment = HashMap::from([("SYSTEMROOT".to_owned(), "C:\\Windows".to_owned())]);
+        let context = effective_client_terminal_context(
+            Some(&environment),
+            &ClientTerminalContext::default(),
+        );
+
+        for feature in ["sync", "bpaste", "mouse", "clipboard"] {
+            assert!(
+                context.terminal_features.iter().any(|f| f == feature),
+                "missing {feature} for non-WT Windows outer: {:?}",
+                context.terminal_features
+            );
+        }
     }
 
     #[cfg(windows)]

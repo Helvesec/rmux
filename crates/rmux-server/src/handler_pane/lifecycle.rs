@@ -7,6 +7,7 @@ use rmux_proto::{OptionName, PaneStateClosedReason, PaneTarget, RmuxError, Targe
 use super::super::{
     prepare_lifecycle_event, scripting_support::format_context_for_target, RequestHandler,
 };
+use super::pane_kill_effects::KillPaneLifecycleBatch;
 use crate::format_runtime::render_runtime_template;
 use crate::pane_io::{PaneExitCallback, PaneExitEvent, PaneOutputReceiver, PaneOutputSender};
 use crate::pane_state_journal::PaneStateChange;
@@ -25,7 +26,6 @@ enum PaneExitPlan {
         target: PaneTarget,
         prepare_dead: bool,
         pane_event: super::super::QueuedLifecycleEvent,
-        output: ExitedPaneOutput,
     },
     RemovePane {
         runtime_session_name: rmux_proto::SessionName,
@@ -36,18 +36,17 @@ enum PaneExitPlan {
         destroyed_sessions: Vec<(rmux_proto::SessionName, u32)>,
         removed_pane_ids: Vec<rmux_core::PaneId>,
         pane_event: super::super::QueuedLifecycleEvent,
-        window_event: Option<super::super::QueuedLifecycleEvent>,
-        session_events: Vec<super::super::QueuedLifecycleEvent>,
+        lifecycle_events: Vec<super::super::QueuedLifecycleEvent>,
         output: ExitedPaneOutput,
     },
     RemoveSession {
         runtime_session_name: rmux_proto::SessionName,
         session_name: rmux_proto::SessionName,
+        session_id: rmux_proto::SessionId,
         target: PaneTarget,
         removed_pane_ids: Vec<rmux_core::PaneId>,
         pane_event: super::super::QueuedLifecycleEvent,
-        window_event: super::super::QueuedLifecycleEvent,
-        session_event: super::super::QueuedLifecycleEvent,
+        lifecycle_events: Vec<super::super::QueuedLifecycleEvent>,
         output: ExitedPaneOutput,
     },
 }
@@ -68,14 +67,14 @@ impl ExitedPaneOutput {
         Self { receiver, sender }
     }
 
-    async fn ensure_eof(self, generation: Option<u64>, output_eof_published: bool) {
+    async fn ensure_eof(&mut self, generation: Option<u64>, output_eof_published: bool) {
         if output_eof_published {
             return;
         }
-        if wait_for_pane_output_eof(self.receiver).await {
+        if wait_for_pane_output_eof(self.receiver.take()).await {
             return;
         }
-        if let Some(sender) = self.sender {
+        if let Some(sender) = self.sender.as_ref() {
             let _ = sender.send_for_generation(generation, Vec::new());
         }
     }
@@ -107,6 +106,30 @@ impl RequestHandler {
     }
 
     pub(in crate::handler) async fn handle_pane_exit_event(&self, event: PaneExitEvent) {
+        // On Windows the child watcher may report exit before the ConPTY reader
+        // publishes its final bytes. Wait for that publication before draining
+        // coalesced alerts, otherwise a trailing OSC 52 can be queued after the
+        // pane has already been removed and will be discarded by the timer.
+        let mut output = {
+            let state = self.state.lock().await;
+            let Some(runtime_session_name) = state.resolve_pane_event_runtime_session(
+                &event.session_name,
+                event.pane_id,
+                event.generation,
+            ) else {
+                return;
+            };
+            ExitedPaneOutput::capture(&state, &runtime_session_name, event.pane_id)
+        };
+        if !event.output_eof_published() {
+            self.notify_pane_exit_output_drain_started();
+        }
+        output
+            .ensure_eof(event.generation, event.output_eof_published())
+            .await;
+        self.flush_pending_pane_alert_for_exit(event.pane_id, event.generation)
+            .await;
+        let mut output = Some(output);
         let mut attempts = 0;
         let plan = loop {
             let plan = {
@@ -124,8 +147,6 @@ impl RequestHandler {
                     return;
                 };
                 let was_dead = state.pane_is_dead(target.session_name(), event.pane_id);
-                let output =
-                    ExitedPaneOutput::capture(&state, &runtime_session_name, event.pane_id);
                 let metadata =
                     match state.observe_runtime_pane_exit(&runtime_session_name, event.pane_id) {
                         Ok(Some(metadata)) => Some(metadata),
@@ -158,7 +179,6 @@ impl RequestHandler {
                             target,
                             prepare_dead: !was_dead,
                             pane_event,
-                            output,
                         })
                     } else {
                         let Some(session) = state.sessions.session(target.session_name()) else {
@@ -170,9 +190,10 @@ impl RequestHandler {
                         let only_window_remaining = session.windows().len() == 1;
                         let only_pane_remaining = window.pane_count() == 1;
                         let linked_window = only_pane_remaining
-                            && state
-                                .window_link_count(target.session_name(), target.window_index())
-                                > 1;
+                            && state.window_linked_session_count(
+                                target.session_name(),
+                                target.window_index(),
+                            ) > 1;
                         let pane_id = window
                             .pane(target.pane_index())
                             .map(|pane| pane.id().as_u32())
@@ -180,22 +201,8 @@ impl RequestHandler {
                         let window_id = window.id();
                         let window_name = window.name().unwrap_or_default().to_owned();
                         let _ = (session, window);
-                        let window_event = if only_pane_remaining {
-                            Some(prepare_lifecycle_event(
-                                &mut state,
-                                &LifecycleEvent::WindowUnlinked {
-                                    session_name: target.session_name().clone(),
-                                    target: Some(WindowTarget::with_window(
-                                        target.session_name().clone(),
-                                        target.window_index(),
-                                    )),
-                                    window_id: Some(window_id.as_u32()),
-                                    window_name: Some(window_name.clone()),
-                                },
-                            ))
-                        } else {
-                            None
-                        };
+                        let lifecycle_batch =
+                            KillPaneLifecycleBatch::capture(&state, &target, false);
                         let pane_event = prepare_lifecycle_event(
                             &mut state,
                             &LifecycleEvent::PaneExited {
@@ -212,6 +219,8 @@ impl RequestHandler {
                             let next_runtime_owner = state
                                 .sessions
                                 .runtime_owner_transfer_target(target.session_name());
+                            let timer_mutation =
+                                self.plan_all_window_mutation_silence_timers_locked(&state);
                             let removed_session =
                                 match state.sessions.remove_session(target.session_name()) {
                                     Ok(removed_session) => removed_session,
@@ -224,16 +233,14 @@ impl RequestHandler {
                                         return;
                                     }
                                 };
-                            let session_event = prepare_lifecycle_event(
-                                &mut state,
-                                &LifecycleEvent::SessionClosed {
-                                    session_name: target.session_name().clone(),
-                                    session_id: Some(removed_session.id().as_u32()),
-                                },
-                            );
+                            let destroyed_sessions = vec![(
+                                target.session_name().clone(),
+                                removed_session.id().as_u32(),
+                            )];
+                            let lifecycle_events =
+                                lifecycle_batch.prepare_committed(&mut state, &destroyed_sessions);
                             let _ = state.options.remove_session(target.session_name());
                             let _ = state.environment.remove_session(target.session_name());
-                            let _ = state.hooks.remove_session(target.session_name());
                             if let Err(error) = state.remove_session_terminals(
                                 target.session_name(),
                                 current_runtime_owner.as_ref(),
@@ -257,20 +264,35 @@ impl RequestHandler {
                                 target.session_name().clone(),
                                 removed_session.id(),
                             )));
+                            self.apply_window_mutation_silence_timers_and_arm_all_locked(
+                                &state,
+                                timer_mutation,
+                                Vec::new(),
+                                &[],
+                            );
                             Some(PaneExitPlan::RemoveSession {
                                 runtime_session_name,
                                 session_name: target.session_name().clone(),
+                                session_id: removed_session.id(),
                                 target,
                                 removed_pane_ids: vec![event.pane_id],
                                 pane_event,
-                                window_event: window_event
-                                    .expect("last pane must unlink its window"),
-                                session_event,
-                                output,
+                                lifecycle_events,
+                                output: output
+                                    .take()
+                                    .expect("pane exit output is consumed by one committed plan"),
                             })
                         } else {
+                            let timer_mutation =
+                                self.plan_all_window_mutation_silence_timers_locked(&state);
                             match state.kill_pane(target.clone()) {
                                 Ok(result) => {
+                                    self.apply_window_mutation_silence_timers_and_arm_all_locked(
+                                        &state,
+                                        timer_mutation,
+                                        Vec::new(),
+                                        &[],
+                                    );
                                     if result.response.window_destroyed {
                                         let _ =
                                             state.hooks.remove_window(&WindowTarget::with_window(
@@ -288,19 +310,8 @@ impl RequestHandler {
                                         },
                                     );
                                     self.prune_web_panes(&result.removed_pane_ids);
-                                    let session_events = result
-                                        .destroyed_sessions
-                                        .iter()
-                                        .map(|(destroyed_session, session_id)| {
-                                            prepare_lifecycle_event(
-                                                &mut state,
-                                                &LifecycleEvent::SessionClosed {
-                                                    session_name: destroyed_session.clone(),
-                                                    session_id: Some(*session_id),
-                                                },
-                                            )
-                                        })
-                                        .collect::<Vec<_>>();
+                                    let lifecycle_events = lifecycle_batch
+                                        .prepare_committed(&mut state, &result.destroyed_sessions);
                                     for (destroyed_session, session_id) in
                                         &result.destroyed_sessions
                                     {
@@ -309,18 +320,23 @@ impl RequestHandler {
                                             rmux_core::SessionId::new(*session_id),
                                         )));
                                     }
+                                    let mut affected_sessions = result.affected_sessions;
+                                    state.expand_with_active_window_linked_session_families(
+                                        &mut affected_sessions,
+                                    );
                                     Some(PaneExitPlan::RemovePane {
                                         runtime_session_name,
                                         session_name: target.session_name().clone(),
                                         target,
                                         window_destroyed: result.response.window_destroyed,
-                                        affected_sessions: result.affected_sessions,
+                                        affected_sessions,
                                         destroyed_sessions: result.destroyed_sessions,
                                         removed_pane_ids: result.removed_pane_ids,
                                         pane_event,
-                                        window_event,
-                                        session_events,
-                                        output,
+                                        lifecycle_events,
+                                        output: output.take().expect(
+                                            "pane exit output is consumed by one committed plan",
+                                        ),
                                     })
                                 }
                                 Err(error) => {
@@ -349,6 +365,10 @@ impl RequestHandler {
             }
         };
 
+        {
+            let mut state = self.state.lock().await;
+            crate::handler::prune_dead_hook_identities(&mut state);
+        }
         self.pause_after_pane_exit_commit().await;
 
         match plan {
@@ -358,11 +378,7 @@ impl RequestHandler {
                 target,
                 prepare_dead,
                 pane_event,
-                output,
             } => {
-                output
-                    .ensure_eof(event.generation, event.output_eof_published())
-                    .await;
                 if prepare_dead {
                     self.prepare_kept_dead_pane_transcript(
                         &runtime_session_name,
@@ -379,7 +395,7 @@ impl RequestHandler {
                         reason: PaneStateClosedReason::DiedKept,
                     },
                 );
-                self.emit_prepared(pane_event);
+                self.emit_prepared(pane_event).await;
                 let session_names = if self.attached_count(target.session_name()).await == 0 {
                     let mut state = self.state.lock().await;
                     match apply_dead_pane_automatic_window_name(&mut state, &target) {
@@ -410,8 +426,7 @@ impl RequestHandler {
                 destroyed_sessions,
                 removed_pane_ids,
                 pane_event,
-                window_event,
-                session_events,
+                lifecycle_events,
                 output,
             } => {
                 self.retain_removed_pane_output(
@@ -420,18 +435,12 @@ impl RequestHandler {
                     &target,
                     &output,
                 );
-                output
-                    .ensure_eof(event.generation, event.output_eof_published())
-                    .await;
                 self.forget_pane_snapshot_coalescers(&removed_pane_ids);
                 self.cleanup_exited_pane_output_subscription(&runtime_session_name, event.pane_id)
                     .await;
-                self.emit_prepared(pane_event);
-                if let Some(window_event) = window_event {
-                    self.emit_prepared(window_event);
-                }
-                for session_event in session_events {
-                    self.emit_prepared(session_event);
+                self.emit_prepared(pane_event).await;
+                for lifecycle_event in lifecycle_events {
+                    self.emit_prepared(lifecycle_event).await;
                 }
                 if !window_destroyed {
                     self.emit(LifecycleEvent::WindowLayoutChanged {
@@ -446,17 +455,36 @@ impl RequestHandler {
                     .iter()
                     .map(|(destroyed_session, _)| destroyed_session.clone())
                     .collect::<Vec<_>>();
-                self.remove_session_leases(&destroyed_names);
+                let destroyed_identities = destroyed_sessions
+                    .iter()
+                    .map(|(session_name, session_id)| {
+                        (
+                            session_name.clone(),
+                            rmux_proto::SessionId::new(*session_id),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                self.remove_session_leases(&destroyed_identities);
+                for affected_session in &affected_sessions {
+                    if let Some((_, session_id)) = destroyed_identities
+                        .iter()
+                        .find(|(session_name, _)| session_name == affected_session)
+                    {
+                        self.exit_attached_session_identity(affected_session, *session_id)
+                            .await;
+                        self.cancel_session_silence_timers(affected_session).await;
+                        self.refresh_control_session(affected_session).await;
+                    }
+                }
                 for affected_session in affected_sessions {
                     if destroyed_names.contains(&affected_session) {
-                        self.exit_attached_session(&affected_session).await;
-                        self.cancel_session_silence_timers(&affected_session).await;
-                        self.refresh_control_session(&affected_session).await;
-                    } else {
-                        self.sync_session_silence_timers(&affected_session).await;
-                        self.refresh_attached_session(&affected_session).await;
-                        self.refresh_control_session(&affected_session).await;
+                        continue;
                     }
+                    let _ = self
+                        .reconcile_attached_session_size_and_emit(&affected_session)
+                        .await;
+                    self.refresh_attached_session(&affected_session).await;
+                    self.refresh_control_session(&affected_session).await;
                 }
                 if !destroyed_names.is_empty() {
                     let _ = self.request_shutdown_if_server_empty().await;
@@ -465,11 +493,11 @@ impl RequestHandler {
             PaneExitPlan::RemoveSession {
                 runtime_session_name,
                 session_name,
+                session_id,
                 target,
                 removed_pane_ids,
                 pane_event,
-                window_event,
-                session_event,
+                lifecycle_events,
                 output,
             } => {
                 self.retain_removed_pane_output(
@@ -478,18 +506,20 @@ impl RequestHandler {
                     &target,
                     &output,
                 );
-                self.remove_session_leases(std::slice::from_ref(&session_name));
-                output
-                    .ensure_eof(event.generation, event.output_eof_published())
-                    .await;
+                self.remove_session_leases(std::slice::from_ref(&(
+                    session_name.clone(),
+                    session_id,
+                )));
                 self.forget_pane_snapshot_coalescers(&removed_pane_ids);
                 self.cleanup_exited_pane_output_subscription(&runtime_session_name, event.pane_id)
                     .await;
-                self.exit_attached_session(&session_name).await;
+                self.exit_attached_session_identity(&session_name, session_id)
+                    .await;
                 self.cancel_session_silence_timers(&session_name).await;
-                self.emit_prepared(pane_event);
-                self.emit_prepared(window_event);
-                self.emit_prepared(session_event);
+                self.emit_prepared(pane_event).await;
+                for lifecycle_event in lifecycle_events {
+                    self.emit_prepared(lifecycle_event).await;
+                }
                 self.refresh_control_session(&session_name).await;
                 let _ = self.request_shutdown_if_server_empty().await;
             }
@@ -758,7 +788,7 @@ mod tests {
             .expect("matching generation should accept EOF marker");
 
         let receiver = sender.subscribe();
-        let output = ExitedPaneOutput {
+        let mut output = ExitedPaneOutput {
             receiver: Some(receiver),
             sender: Some(sender),
         };

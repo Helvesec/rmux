@@ -683,6 +683,91 @@ async fn send_keys_k_dispatches_prefix_table_bindings() {
 }
 
 #[tokio::test]
+async fn send_keys_k_binding_task_preserves_disabled_hook_context() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("hook-binding-alpha");
+    let requester_pid = std::process::id();
+
+    let created = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: alpha.clone(),
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let hook = handler
+        .handle(Request::SetHook(SetHookRequest {
+            scope: ScopeSelector::Global,
+            hook: HookName::AfterNewWindow,
+            command: "set-buffer -b nested-hook fired".to_owned(),
+            lifecycle: HookLifecycle::Persistent,
+        }))
+        .await;
+    assert!(matches!(hook, Response::SetHook(_)));
+    let bound = handler
+        .handle(Request::BindKey(Box::new(BindKeyRequest {
+            table_name: "prefix".to_owned(),
+            key: "x".to_owned(),
+            note: Some("create-with-hooks-disabled".to_owned()),
+            repeat: false,
+            command: Some(vec!["new-window".to_owned(), "-d".to_owned()]),
+        })))
+        .await;
+    assert!(matches!(bound, Response::BindKey(_)));
+
+    let dispatched = crate::hook_runtime::with_hook_execution(Vec::new(), async {
+        handler
+            .handle(Request::SendKeysExt(SendKeysExtRequest {
+                target: Some(PaneTarget::new(alpha.clone(), 0)),
+                keys: vec!["C-b".to_owned(), "x".to_owned()],
+                expand_formats: false,
+                hex: false,
+                literal: false,
+                dispatch_key_table: true,
+                copy_mode_command: false,
+                forward_mouse_event: false,
+                reset_terminal: false,
+                repeat_count: None,
+            }))
+            .await
+    })
+    .await;
+    assert_eq!(
+        dispatched,
+        Response::SendKeys(SendKeysResponse { key_count: 2 })
+    );
+
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state
+            .sessions
+            .session(&alpha)
+            .expect("session survives")
+            .windows()
+            .len(),
+        2,
+        "the attached binding still creates its requested window"
+    );
+    drop(state);
+    let shown = handler
+        .handle(Request::ShowBuffer(ShowBufferRequest {
+            name: Some("nested-hook".to_owned()),
+        }))
+        .await;
+    assert!(
+        matches!(shown, Response::Error(_)),
+        "hook command must stay disabled across the Tokio task boundary"
+    );
+}
+
+#[tokio::test]
 async fn switch_client_t_sets_custom_key_table_for_next_k_dispatch() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");

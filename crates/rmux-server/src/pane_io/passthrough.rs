@@ -16,6 +16,16 @@ pub(super) fn render_passthroughs(
         if !passthrough_enabled(target, passthrough.kind()) {
             continue;
         }
+        // Drop malformed OSC 52 writes rather than forward them verbatim to
+        // the outer — tmux 3.7b's input.c input_osc_52 validates first and a
+        // failed b64_pton returns before both paste_add and the outer echo.
+        // A raw copy would otherwise trip xterm allowWindowOps parsers with
+        // attacker-supplied payloads.
+        if passthrough.kind() == TerminalPassthroughKind::Clipboard
+            && !osc52_passthrough_is_valid_for_forward(passthrough)
+        {
+            continue;
+        }
         if passthrough_requires_cursor_position(passthrough.kind()) && !saved_cursor {
             frame.extend_from_slice(b"\x1b[s");
             saved_cursor = true;
@@ -38,6 +48,34 @@ fn passthrough_enabled(target: &OpenAttachTarget, kind: TerminalPassthroughKind)
         TerminalPassthroughKind::KittyGraphics => target.kitty_graphics_passthrough,
         TerminalPassthroughKind::Sixel => target.sixel_passthrough,
     }
+}
+
+/// A clipboard passthrough is safe to forward if it is either a query (`?`) —
+/// which many outers answer and rmux does not synthesize on its own — or a
+/// well-formed OSC 52 write whose base64 payload decodes. Anything else is
+/// dropped so a hostile payload cannot round-trip through the outer's OSC
+/// parser under an allowWindowOps quirk.
+fn osc52_passthrough_is_valid_for_forward(passthrough: &TerminalPassthrough) -> bool {
+    let Some(body) = passthrough.payload().strip_prefix(b"\x1b]52;") else {
+        return false;
+    };
+    let Some(body) = body
+        .strip_suffix(b"\x07")
+        .or_else(|| body.strip_suffix(b"\x1b\\"))
+    else {
+        return false;
+    };
+    let Some(separator) = body.iter().position(|byte| *byte == b';') else {
+        return false;
+    };
+    let payload = &body[separator + 1..];
+    if payload == b"?" {
+        return true;
+    }
+    if payload.is_empty() {
+        return false;
+    }
+    super::reader::osc52_payload_decodes(payload)
 }
 
 fn passthrough_requires_cursor_position(kind: TerminalPassthroughKind) -> bool {
@@ -66,8 +104,7 @@ fn append_cursor_position(
 #[cfg(test)]
 mod tests {
     use rmux_core::{OptionStore, PaneGeometry, TerminalPassthrough};
-    use rmux_proto::{OptionName, PaneTarget, ScopeSelector, SessionName, SetOptionMode};
-    use rmux_pty::PtyPair;
+    use rmux_proto::{OptionName, ScopeSelector, SessionName, SetOptionMode};
 
     use super::{append_cursor_position, render_passthroughs};
     use crate::outer_terminal::{OuterTerminal, OuterTerminalContext};
@@ -88,16 +125,9 @@ mod tests {
 
     #[test]
     fn render_passthroughs_wraps_kitty_apc_at_pane_cursor() {
-        let pty = PtyPair::open().expect("open pty pair");
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            input_target: PaneTarget::with_window(
-                SessionName::new("alpha").expect("valid session name"),
-                0,
-                0,
-            ),
-            pane_master: Some(pty.into_master()),
             predicted_echo: Default::default(),
             predicted_echo_started_at: None,
             pane_output: Some(pane_output.subscribe()),
@@ -129,16 +159,9 @@ mod tests {
 
     #[test]
     fn render_passthroughs_anchors_kitty_dimension_payloads_at_pane_cursor() {
-        let pty = PtyPair::open().expect("open pty pair");
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            input_target: PaneTarget::with_window(
-                SessionName::new("alpha").expect("valid session name"),
-                0,
-                0,
-            ),
-            pane_master: Some(pty.into_master()),
             predicted_echo: Default::default(),
             predicted_echo_started_at: None,
             pane_output: Some(pane_output.subscribe()),
@@ -173,16 +196,9 @@ mod tests {
 
     #[test]
     fn render_passthroughs_wraps_sixel_dcs_at_pane_cursor() {
-        let pty = PtyPair::open().expect("open pty pair");
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            input_target: PaneTarget::with_window(
-                SessionName::new("alpha").expect("valid session name"),
-                0,
-                0,
-            ),
-            pane_master: Some(pty.into_master()),
             predicted_echo: Default::default(),
             predicted_echo_started_at: None,
             pane_output: Some(pane_output.subscribe()),
@@ -210,16 +226,9 @@ mod tests {
 
     #[test]
     fn render_passthroughs_wraps_raw_payload_at_pane_cursor() {
-        let pty = PtyPair::open().expect("open pty pair");
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            input_target: PaneTarget::with_window(
-                SessionName::new("alpha").expect("valid session name"),
-                0,
-                0,
-            ),
-            pane_master: Some(pty.into_master()),
             predicted_echo: Default::default(),
             predicted_echo_started_at: None,
             pane_output: Some(pane_output.subscribe()),
@@ -252,24 +261,20 @@ mod tests {
     #[test]
     fn render_passthroughs_forwards_clipboard_without_cursor_motion() {
         let mut options = OptionStore::new();
+        // Relaying an application's inbound OSC 52 to the outer requires
+        // `set-clipboard on`; tmux gates it on set-clipboard == 2 and no longer
+        // forwards under the `external` default (input.c input_osc_52).
         options
             .set(
                 ScopeSelector::Global,
                 OptionName::SetClipboard,
-                "external".to_owned(),
+                "on".to_owned(),
                 SetOptionMode::Replace,
             )
             .expect("set-clipboard set succeeds");
-        let pty = PtyPair::open().expect("open pty pair");
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            input_target: PaneTarget::with_window(
-                SessionName::new("alpha").expect("valid session name"),
-                0,
-                0,
-            ),
-            pane_master: Some(pty.into_master()),
             predicted_echo: Default::default(),
             predicted_echo_started_at: None,
             pane_output: Some(pane_output.subscribe()),
@@ -295,20 +300,42 @@ mod tests {
             )],
         );
         assert_eq!(frame, b"\x1b]52;c;QQ==\x07");
+
+        // Malformed and empty OSC 52 writes must be dropped (validate-then-drop),
+        // matching tmux 3.7b's input.c input_osc_52. Under set-clipboard on the
+        // valid write above is forwarded, so use the same target here.
+        let frame = render_passthroughs(
+            &target,
+            &[TerminalPassthrough::clipboard(
+                b"\x1b]52;c;!!!\x07".to_vec(),
+            )],
+        );
+        assert!(
+            frame.is_empty(),
+            "malformed OSC 52 write must not be forwarded: {frame:?}"
+        );
+        let frame = render_passthroughs(
+            &target,
+            &[TerminalPassthrough::clipboard(b"\x1b]52;c;\x07".to_vec())],
+        );
+        assert!(
+            frame.is_empty(),
+            "empty OSC 52 payload must not be forwarded: {frame:?}"
+        );
+        // A pane-side query is still forwarded (documented C-D52 divergence
+        // until get-clipboard support lands).
+        let frame = render_passthroughs(
+            &target,
+            &[TerminalPassthrough::clipboard(b"\x1b]52;c;?\x07".to_vec())],
+        );
+        assert_eq!(frame, b"\x1b]52;c;?\x07");
     }
 
     #[test]
     fn render_passthroughs_is_empty_when_target_disables_passthrough() {
-        let pty = PtyPair::open().expect("open pty pair");
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            input_target: PaneTarget::with_window(
-                SessionName::new("alpha").expect("valid session name"),
-                0,
-                0,
-            ),
-            pane_master: Some(pty.into_master()),
             predicted_echo: Default::default(),
             predicted_echo_started_at: None,
             pane_output: Some(pane_output.subscribe()),
@@ -340,16 +367,9 @@ mod tests {
 
     #[test]
     fn render_passthroughs_filters_by_protocol_support() {
-        let pty = PtyPair::open().expect("open pty pair");
         let pane_output = pane_output_channel();
         let target = OpenAttachTarget {
             session_name: SessionName::new("alpha").expect("valid session name"),
-            input_target: PaneTarget::with_window(
-                SessionName::new("alpha").expect("valid session name"),
-                0,
-                0,
-            ),
-            pane_master: Some(pty.into_master()),
             predicted_echo: Default::default(),
             predicted_echo_started_at: None,
             pane_output: Some(pane_output.subscribe()),

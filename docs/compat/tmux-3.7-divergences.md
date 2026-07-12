@@ -418,3 +418,80 @@ round trip, and the reset behavior.
 Inventory impact: OSC colour handling remains advertised, but compatibility
 claims must describe query answering as an RMUX extension for
 theme-detection, not byte-identical tmux behavior.
+
+### C-D51: Windows bracketed paste is detected from console input bursts
+
+On Unix the outer terminal wraps a paste in bracketed-paste markers before rmux
+sees it, so the daemon keeps or strips them per the pane's paste mode with no
+ambiguity. The Windows attach client reads console input records
+(ReadConsoleInputW), where a pasted character is byte-for-byte identical to a
+typed one and a pasted newline arrives as `VK_RETURN` exactly like a typed
+Enter, with no per-record injected flag (probed against conhost 2026-07-11:
+pasting reaches the app as ordinary key-downs carrying their real virtual-key
+codes). RMUX therefore treats a single `ReadConsoleInputW` batch carrying two or
+more plain character key-downs, with no mouse or Control/Alt key, as a paste and
+wraps it in bracketed-paste markers; the daemon then keeps or strips them like a
+Unix paste. Markers embedded in the pasted content are stripped before wrapping
+so crafted clipboard data cannot break out of the envelope. This is a best-effort
+heuristic and a residual divergence: a single-character paste is not bracketed
+(indistinguishable from a keystroke); two or more genuine keystrokes — or a
+multi-character IME commit — that conhost happens to return in one batch are
+bracketed; and a paste larger than one `ReadConsoleInputW` batch (32 records,
+16 characters) is bracketed across batches using the input-buffer drain as the
+end signal, so a mid-paste buffer drain can split one paste into adjacent
+bracketed regions.
+
+Because this can wrap burst-delivered typed text, the daemon strips
+bracketed-paste markers before feeding input to the command prompt on Windows
+(`handle_attached_prompt_input`): the prompt treats a paste as literal text, so
+without stripping the leading `ESC` of `ESC[200~` would cancel the prompt and the
+body would leak to the pane's shell.
+
+Test/fixture: `crates/rmux-client/src/attach_windows/input.rs` unit tests cover
+the multi-character burst, the single-character passthrough, the cross-batch
+continuation, the Control-chord exclusion, and embedded-marker stripping; the
+`tests/windows_prompt_overlay_chain.rs` command-prompt chain covers the prompt
+marker stripping.
+
+Inventory impact: bracketed paste is advertised on Windows, but the detection is
+a documented best-effort heuristic rather than terminal-driven bracketing.
+
+### C-D52: Windows advertises OSC 52 clipboard; inbound clipboard queries are forwarded
+
+On Unix tmux advertises the clipboard (Ms) capability from terminfo. Windows has
+no terminfo, so rmux advertises the clipboard (OSC 52) capability for every
+Windows attach: Windows Terminal sets the system clipboard from OSC 52 natively
+and any other VT outer ignores the sequence. Without it the daemon has no Ms
+template and a pane's OSC 52 under set-clipboard on never reaches the outer
+(issue #91).
+
+Application clipboard writes stay gated on set-clipboard on exactly as tmux gates
+them (input.c input_osc_52 returns early unless set-clipboard == 2): under the
+`external` default an application's inbound OSC 52 creates no paste buffer and is
+not forwarded, so untrusted pane output cannot drive the system clipboard; under
+`on` the write is stored in a paste buffer (paste_add), forwarded to the outer,
+and fires the pane-set-clipboard hook. tmux's own selections (copy-mode yank and
+`set-buffer -w`) keep forwarding under `on` or `external`, and `set-buffer -w`
+forwards even under `off`, unchanged.
+
+Residual divergence: an application's inbound OSC 52 query (a request of the form
+ESC ] 52 ; c ; ? ) is handled per set-clipboard: under `on` it is forwarded to
+the outer terminal rather than answered from rmux's paste buffer per
+get-clipboard; under the `external` default and `off` it is dropped entirely
+(neither answered nor forwarded). tmux answers the query from the top buffer
+under the default get-clipboard buffer regardless of set-clipboard; honouring
+get-clipboard (none / buffer / external) for inbound pane queries is not yet
+implemented. Malformed OSC 52 writes and empty payloads are dropped rather than
+forwarded verbatim, matching tmux's validate-then-paste_add ordering. Clipboard
+writes — the subject of issue #91 — match tmux.
+
+Test/fixture: outer-terminal gate tests in
+`crates/rmux-server/src/outer_terminal/tests.rs`, client and daemon capability
+tests in `src/client_terminal.rs` and
+`crates/rmux-server/src/handler_client_runtime.rs`, decode and inbound-buffer
+tests in `crates/rmux-server/src/pane_io/reader.rs` and
+`crates/rmux-server/src/handler_alert_tests.rs`.
+
+Inventory impact: OSC 52 clipboard writes are advertised and honored on Windows
+under set-clipboard on; inbound clipboard queries remain a forward-to-outer
+approximation pending get-clipboard support.

@@ -33,6 +33,7 @@ impl RequestHandler {
             };
             mode
         };
+        let had_tagged_items_before_rebuild = !mode.tagged.is_empty();
         let build = self.build_mode_tree(&mut mode, attach_pid).await?;
         if build.visible.is_empty() {
             if matches!(
@@ -43,6 +44,14 @@ impl RequestHandler {
                 return Ok(true);
             }
             return Ok(false);
+        }
+        if had_tagged_items_before_rebuild
+            && mode.tagged.is_empty()
+            && event_uses_tagged_or_current_selection(&event, mode.kind)
+        {
+            self.store_mode_tree_state(attach_pid, mode).await?;
+            self.refresh_mode_tree_overlay_if_active(attach_pid).await?;
+            return Ok(true);
         }
 
         match event {
@@ -257,6 +266,20 @@ impl RequestHandler {
             }
         }
         Ok(false)
+    }
+}
+
+fn event_uses_tagged_or_current_selection(event: &PromptInputEvent, kind: ModeTreeKind) -> bool {
+    match event {
+        PromptInputEvent::Enter | PromptInputEvent::Char(':') => true,
+        PromptInputEvent::Char('p' | 'P') => matches!(kind, ModeTreeKind::Buffer),
+        PromptInputEvent::Char('d' | 'D' | 'x' | 'X') => {
+            matches!(kind, ModeTreeKind::Buffer | ModeTreeKind::Client)
+        }
+        PromptInputEvent::Char('s' | 'u') | PromptInputEvent::Ctrl('x') => {
+            matches!(kind, ModeTreeKind::Customize)
+        }
+        _ => false,
     }
 }
 

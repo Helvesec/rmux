@@ -11,11 +11,48 @@ impl RequestHandler {
         key_table_name: Option<String>,
         key_table_set_at: Option<Instant>,
     ) -> Result<(), rmux_proto::RmuxError> {
+        self.set_attached_key_table_with_expected_identity(
+            attach_pid,
+            None,
+            key_table_name,
+            key_table_set_at,
+        )
+        .await
+    }
+
+    pub(in crate::handler) async fn set_attached_key_table_for_client_identity(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: u64,
+        key_table_name: Option<String>,
+        key_table_set_at: Option<Instant>,
+    ) -> Result<(), rmux_proto::RmuxError> {
+        self.set_attached_key_table_with_expected_identity(
+            attach_pid,
+            Some(expected_attach_id),
+            key_table_name,
+            key_table_set_at,
+        )
+        .await
+    }
+
+    async fn set_attached_key_table_with_expected_identity(
+        &self,
+        attach_pid: u32,
+        expected_attach_id: Option<u64>,
+        key_table_name: Option<String>,
+        key_table_set_at: Option<Instant>,
+    ) -> Result<(), rmux_proto::RmuxError> {
         let (previous_key_table, session_name) = {
             let mut active_attach = self.active_attach.lock().await;
             let active = active_attach.by_pid.get_mut(&attach_pid).ok_or_else(|| {
                 rmux_proto::RmuxError::Server("attached client disappeared".to_owned())
             })?;
+            if expected_attach_id.is_some_and(|expected| active.id != expected) {
+                return Err(rmux_proto::RmuxError::Server(
+                    "attached client disappeared".to_owned(),
+                ));
+            }
             if active.key_table_name == key_table_name {
                 active.key_table_set_at = key_table_set_at.filter(|_| key_table_name.is_some());
                 return Ok(());
@@ -42,9 +79,20 @@ impl RequestHandler {
         // #{client_prefix} -- and any prefix-pressed indicator built on it --
         // only refreshes on the next key event, which is too late to show the
         // prefix while it is actually being held.
-        let _ = self
-            .refresh_attached_client_status(attach_pid, &session_name)
-            .await;
+        let _ = match expected_attach_id {
+            Some(attach_id) => {
+                self.refresh_attached_client_status_for_identity(
+                    attach_pid,
+                    attach_id,
+                    &session_name,
+                )
+                .await
+            }
+            None => {
+                self.refresh_attached_client_status(attach_pid, &session_name)
+                    .await
+            }
+        };
         Ok(())
     }
 

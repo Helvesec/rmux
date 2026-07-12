@@ -7,8 +7,8 @@ use rmux_core::{
 use rmux_proto::request::{Request, ResolveTargetType};
 use rmux_proto::types::OptionScopeSelector;
 use rmux_proto::{
-    ErrorResponse, OptionName, ResolveTargetResponse, Response, RmuxError, ScopeSelector, Target,
-    WindowTarget,
+    ErrorResponse, OptionName, PaneTarget, PaneTargetRef, ResolveTargetResponse, Response,
+    RmuxError, ScopeSelector, Target, WindowTarget,
 };
 
 use super::RequestHandler;
@@ -233,8 +233,10 @@ mod tests {
     use super::*;
     use crate::pane_io::AttachControl;
     use rmux_proto::{
-        NewSessionRequest, NewWindowRequest, PaneTarget, ResolveTargetRequest, Response,
-        SelectPaneRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget, Target,
+        HookLifecycle, HookName, KillPaneRequest, LinkWindowRequest, MoveWindowRequest,
+        MoveWindowTarget, NewSessionExtRequest, NewSessionRequest, NewWindowRequest,
+        PaneKillRequest, ResolveTargetRequest, Response, ScopeSelector, SelectPaneRequest,
+        SetHookRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget, Target,
         TerminalSize,
     };
 
@@ -430,6 +432,927 @@ mod tests {
             RequesterEnvironmentContext::default()
         );
     }
+
+    #[tokio::test]
+    async fn pane_kill_after_target_stays_in_the_addressed_detached_session() {
+        let handler = RequestHandler::new();
+        let alpha = session_name("after-pane-kill-alpha");
+        let zeta = session_name("after-pane-kill-zeta");
+        for session in [&alpha, &zeta] {
+            let response = handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await;
+            assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+        }
+        let split = handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(zeta.clone()),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+        let removed_pane_id = {
+            let state = handler.state.lock().await;
+            state
+                .sessions
+                .session(&zeta)
+                .and_then(|session| session.window_at(0))
+                .and_then(|window| window.pane(1))
+                .expect("second zeta pane exists")
+                .id()
+        };
+        let hook = handler
+            .handle(Request::SetHook(SetHookRequest {
+                scope: ScopeSelector::Session(zeta.clone()),
+                hook: HookName::AfterKillPane,
+                command: "set-buffer -a -b pane-kill-after local,".to_owned(),
+                lifecycle: HookLifecycle::Persistent,
+            }))
+            .await;
+        assert!(matches!(hook, Response::SetHook(_)), "{hook:?}");
+        let request = Request::PaneKill(PaneKillRequest {
+            target: PaneTargetRef::by_id(zeta.clone(), removed_pane_id),
+            kill_all_except: false,
+        });
+        let response = handler.handle(request.clone()).await;
+        assert!(matches!(response, Response::KillPane(_)), "{response:?}");
+
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state
+                .buffers
+                .show(Some("pane-kill-after"))
+                .expect("addressed session-local after-kill-pane hook ran")
+                .1,
+            b"local,"
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_kill_after_target_follows_a_surviving_real_winlink() {
+        let handler = RequestHandler::new();
+        let decoy = session_name("after-pane-kill-decoy");
+        let source = session_name("after-pane-kill-source");
+        let survivor = session_name("after-pane-kill-survivor");
+        for session in [&decoy, &source, &survivor] {
+            let response = handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await;
+            assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+        }
+        let pane_id = {
+            let state = handler.state.lock().await;
+            state
+                .sessions
+                .session(&source)
+                .and_then(|session| session.window_at(0))
+                .and_then(|window| window.pane(0))
+                .expect("source pane exists")
+                .id()
+        };
+        let linked = handler
+            .handle(Request::LinkWindow(LinkWindowRequest {
+                source: WindowTarget::with_window(source.clone(), 0),
+                target: WindowTarget::with_window(survivor.clone(), 1),
+                after: false,
+                before: false,
+                kill_destination: false,
+                detached: true,
+            }))
+            .await;
+        assert!(matches!(linked, Response::LinkWindow(_)), "{linked:?}");
+        handler.wait_for_initial_panes_for_test().await;
+
+        let hook = handler
+            .handle(Request::SetHook(SetHookRequest {
+                scope: ScopeSelector::Session(survivor.clone()),
+                hook: HookName::AfterKillPane,
+                command: "set-buffer -b pane-kill-survivor-target survivor".to_owned(),
+                lifecycle: HookLifecycle::Persistent,
+            }))
+            .await;
+        assert!(matches!(hook, Response::SetHook(_)), "{hook:?}");
+
+        let request = Request::PaneKill(PaneKillRequest {
+            target: PaneTargetRef::by_id(source.clone(), pane_id),
+            kill_all_except: false,
+        });
+        let response = handler.handle(request.clone()).await;
+        assert!(matches!(response, Response::KillPane(_)), "{response:?}");
+
+        let state = handler.state.lock().await;
+        assert!(state.sessions.session(&decoy).is_some());
+        assert!(state.sessions.session(&source).is_none());
+        assert!(state.sessions.session(&survivor).is_some());
+        assert_eq!(
+            state
+                .buffers
+                .show(Some("pane-kill-survivor-target"))
+                .expect("surviving session-local after-kill-pane hook ran")
+                .1,
+            b"survivor"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_pane_after_target_falls_back_to_a_surviving_affected_session() {
+        let handler = RequestHandler::new();
+        let source = session_name("after-kill-fallback-source");
+        let survivor = session_name("after-kill-fallback-survivor");
+        for session in [&source, &survivor] {
+            assert!(matches!(
+                handler
+                    .handle(Request::NewSession(NewSessionRequest {
+                        session_name: session.clone(),
+                        detached: true,
+                        size: Some(TerminalSize { cols: 80, rows: 24 }),
+                        environment: None,
+                    }))
+                    .await,
+                Response::NewSession(_)
+            ));
+        }
+        assert!(matches!(
+            handler
+                .handle(Request::LinkWindow(LinkWindowRequest {
+                    source: WindowTarget::with_window(source.clone(), 0),
+                    target: WindowTarget::with_window(survivor.clone(), 1),
+                    after: false,
+                    before: false,
+                    kill_destination: false,
+                    detached: true,
+                }))
+                .await,
+            Response::LinkWindow(_)
+        ));
+        handler.wait_for_initial_panes_for_test().await;
+        assert!(matches!(
+            handler
+                .handle(Request::SetHook(SetHookRequest {
+                    scope: ScopeSelector::Session(survivor.clone()),
+                    hook: HookName::AfterKillPane,
+                    command: "set-buffer -b kill-pane-affected-fallback survivor".to_owned(),
+                    lifecycle: HookLifecycle::Persistent,
+                }))
+                .await,
+            Response::SetHook(_)
+        ));
+
+        let response = handler
+            .handle(Request::KillPane(KillPaneRequest {
+                target: PaneTarget::with_window(source.clone(), 0, 0),
+                kill_all_except: false,
+            }))
+            .await;
+        assert!(matches!(response, Response::KillPane(_)), "{response:?}");
+
+        let state = handler.state.lock().await;
+        assert!(state.sessions.session(&source).is_none());
+        assert!(state.sessions.session(&survivor).is_some());
+        assert_eq!(
+            state
+                .buffers
+                .show(Some("kill-pane-affected-fallback"))
+                .expect("surviving affected session hook runs")
+                .1,
+            b"survivor"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_pane_after_target_uses_the_surviving_pane_in_the_same_window() {
+        let handler = RequestHandler::new();
+        let decoy = session_name("after-kill-pane-decoy");
+        let target_session = session_name("after-kill-pane-target");
+        for session in [&decoy, &target_session] {
+            let response = handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await;
+            assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+        }
+        let split = handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Session(target_session.clone()),
+                direction: SplitDirection::Vertical,
+                before: false,
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+        let surviving_target = PaneTarget::with_window(target_session.clone(), 0, 0);
+        let hook = handler
+            .handle(Request::SetHook(SetHookRequest {
+                scope: ScopeSelector::Pane(surviving_target.clone()),
+                hook: HookName::AfterKillPane,
+                command: "set-buffer -b kill-pane-survivor-target survivor".to_owned(),
+                lifecycle: HookLifecycle::Persistent,
+            }))
+            .await;
+        assert!(matches!(hook, Response::SetHook(_)), "{hook:?}");
+
+        let request = Request::KillPane(KillPaneRequest {
+            target: PaneTarget::with_window(target_session, 0, 1),
+            kill_all_except: false,
+        });
+        let response = handler.handle(request.clone()).await;
+        assert!(matches!(response, Response::KillPane(_)), "{response:?}");
+
+        let state = handler.state.lock().await;
+        assert!(state.sessions.session(&decoy).is_some());
+        assert_eq!(
+            state
+                .buffers
+                .show(Some("kill-pane-survivor-target"))
+                .expect("surviving pane-local after-kill-pane hook ran")
+                .1,
+            b"survivor"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_pane_after_target_ignores_a_reused_low_pane_slot() {
+        let handler = RequestHandler::new();
+        let session = session_name("after-kill-pane-reindex");
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                handler
+                    .handle(Request::SplitWindow(SplitWindowRequest {
+                        target: SplitWindowTarget::Session(session.clone()),
+                        direction: SplitDirection::Vertical,
+                        before: false,
+                        environment: None,
+                    }))
+                    .await,
+                Response::SplitWindow(_)
+            ));
+        }
+        assert!(matches!(
+            handler
+                .handle(Request::SelectPane(Box::new(SelectPaneRequest {
+                    target: PaneTarget::with_window(session.clone(), 0, 2),
+                    title: None,
+                    style: None,
+                    input_disabled: None,
+                    preserve_zoom: false,
+                })))
+                .await,
+            Response::SelectPane(_)
+        ));
+        let (active_pane_id, reused_slot_pane_id) = {
+            let state = handler.state.lock().await;
+            let window = state
+                .sessions
+                .session(&session)
+                .and_then(|session| session.window_at(0))
+                .expect("three-pane window exists");
+            (
+                window.pane(2).expect("active pane exists").id(),
+                window.pane(1).expect("middle pane exists").id(),
+            )
+        };
+        let response = handler
+            .handle(Request::SetHook(SetHookRequest {
+                scope: ScopeSelector::Session(session.clone()),
+                hook: HookName::AfterKillPane,
+                command: "set-option -p @after-kill-reindex active".to_owned(),
+                lifecycle: HookLifecycle::Persistent,
+            }))
+            .await;
+        assert!(matches!(response, Response::SetHook(_)), "{response:?}");
+
+        let (outcome, hooks) = handler
+            .dispatch_captured(
+                std::process::id(),
+                u64::from(std::process::id()),
+                Request::KillPane(KillPaneRequest {
+                    target: PaneTarget::with_window(session.clone(), 0, 0),
+                    kill_all_except: false,
+                }),
+            )
+            .await;
+        assert!(
+            matches!(outcome.response, Response::KillPane(_)),
+            "{:?}",
+            outcome.response
+        );
+        assert_eq!(hooks.len(), 1, "one exact after-kill-pane hook is queued");
+        assert_eq!(hooks[0].hook, HookName::AfterKillPane);
+        assert!(hooks[0].exact_pane_target.is_some());
+        let queued_slot = match hooks[0].current_target.as_ref() {
+            Some(Target::Pane(target)) => target.clone(),
+            other => panic!("expected queued pane target, got {other:?}"),
+        };
+
+        {
+            let state = handler.state.lock().await;
+            let window = state
+                .sessions
+                .session(&session)
+                .and_then(|session| session.window_at(0))
+                .expect("window survives");
+            assert_eq!(
+                window.active_pane().expect("active pane survives").id(),
+                active_pane_id
+            );
+            assert_eq!(
+                window.pane(0).expect("low slot is reused").id(),
+                reused_slot_pane_id
+            );
+        }
+
+        let split = handler
+            .handle(Request::SplitWindow(SplitWindowRequest {
+                target: SplitWindowTarget::Pane(PaneTarget::with_window(session.clone(), 0, 0)),
+                direction: SplitDirection::Vertical,
+                before: true,
+                environment: None,
+            }))
+            .await;
+        assert!(matches!(split, Response::SplitWindow(_)), "{split:?}");
+        let exact_target = {
+            let state = handler.state.lock().await;
+            let window = state
+                .sessions
+                .session(&session)
+                .and_then(|session| session.window_at(0))
+                .expect("window survives delayed reindex");
+            let pane = window
+                .panes()
+                .iter()
+                .find(|pane| pane.id() == active_pane_id)
+                .expect("exact pane survives delayed reindex");
+            PaneTarget::with_window(session.clone(), 0, pane.index())
+        };
+        assert_ne!(
+            exact_target, queued_slot,
+            "delayed split must reuse the queued slot"
+        );
+
+        handler
+            .run_inline_hooks(std::process::id(), hooks, None)
+            .await;
+
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state
+                .pane_explicit_option_value_by_name(&exact_target, "@after-kill-reindex")
+                .expect("exact pane option resolves")
+                .1,
+            Some("active".to_owned())
+        );
+        assert_eq!(
+            state
+                .pane_explicit_option_value_by_name(&queued_slot, "@after-kill-reindex")
+                .expect("queued-slot pane option resolves")
+                .1,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_all_except_after_target_keeps_the_stable_pane_for_all_entry_forms() {
+        for (label, request_kind) in [("cli", 0_u8), ("sdk-slot", 1), ("sdk-id", 2)] {
+            let handler = RequestHandler::new();
+            let session = session_name(&format!("after-kill-others-{label}"));
+            assert!(matches!(
+                handler
+                    .handle(Request::NewSession(NewSessionRequest {
+                        session_name: session.clone(),
+                        detached: true,
+                        size: Some(TerminalSize { cols: 80, rows: 24 }),
+                        environment: None,
+                    }))
+                    .await,
+                Response::NewSession(_)
+            ));
+            for _ in 0..2 {
+                assert!(matches!(
+                    handler
+                        .handle(Request::SplitWindow(SplitWindowRequest {
+                            target: SplitWindowTarget::Session(session.clone()),
+                            direction: SplitDirection::Vertical,
+                            before: false,
+                            environment: None,
+                        }))
+                        .await,
+                    Response::SplitWindow(_)
+                ));
+            }
+            let target = PaneTarget::with_window(session.clone(), 0, 1);
+            let pane_id = {
+                let state = handler.state.lock().await;
+                state
+                    .sessions
+                    .session(&session)
+                    .and_then(|session| session.window_at(0))
+                    .and_then(|window| window.pane(1))
+                    .expect("kept pane exists")
+                    .id()
+            };
+            let option = format!("@after-kill-others-{label}");
+            assert!(matches!(
+                handler
+                    .handle(Request::SetHook(SetHookRequest {
+                        scope: ScopeSelector::Session(session.clone()),
+                        hook: HookName::AfterKillPane,
+                        command: format!("set-option -p {option} hit"),
+                        lifecycle: HookLifecycle::Persistent,
+                    }))
+                    .await,
+                Response::SetHook(_)
+            ));
+            let request = match request_kind {
+                0 => Request::KillPane(KillPaneRequest {
+                    target,
+                    kill_all_except: true,
+                }),
+                1 => Request::PaneKill(PaneKillRequest {
+                    target: PaneTargetRef::slot(target),
+                    kill_all_except: true,
+                }),
+                _ => Request::PaneKill(PaneKillRequest {
+                    target: PaneTargetRef::by_id(session.clone(), pane_id),
+                    kill_all_except: true,
+                }),
+            };
+            let response = handler.handle(request).await;
+            assert!(matches!(response, Response::KillPane(_)), "{response:?}");
+
+            let state = handler.state.lock().await;
+            let window = state
+                .sessions
+                .session(&session)
+                .and_then(|session| session.window_at(0))
+                .expect("window survives kill-all-except");
+            assert_eq!(window.pane_count(), 1);
+            assert_eq!(window.pane(0).expect("kept pane survives").id(), pane_id);
+            assert_eq!(
+                state
+                    .pane_explicit_option_value_by_name(
+                        &PaneTarget::with_window(session.clone(), 0, 0),
+                        &option,
+                    )
+                    .expect("kept pane option resolves")
+                    .1,
+                Some("hit".to_owned())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_kill_slot_after_target_chooses_one_stable_real_winlink() {
+        let handler = RequestHandler::new();
+        let source = session_name("after-pane-slot-source");
+        let first = session_name("after-pane-slot-a");
+        let second = session_name("after-pane-slot-b");
+        for session in [&source, &first, &second] {
+            assert!(matches!(
+                handler
+                    .handle(Request::NewSession(NewSessionRequest {
+                        session_name: session.clone(),
+                        detached: true,
+                        size: Some(TerminalSize { cols: 80, rows: 24 }),
+                        environment: None,
+                    }))
+                    .await,
+                Response::NewSession(_)
+            ));
+        }
+        for survivor in [&first, &second] {
+            let response = handler
+                .handle(Request::LinkWindow(LinkWindowRequest {
+                    source: WindowTarget::with_window(source.clone(), 0),
+                    target: WindowTarget::with_window(survivor.clone(), 1),
+                    after: false,
+                    before: false,
+                    kill_destination: false,
+                    detached: true,
+                }))
+                .await;
+            assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
+        }
+        for (session, value) in [(&first, "first"), (&second, "second")] {
+            assert!(matches!(
+                handler
+                    .handle(Request::SetHook(SetHookRequest {
+                        scope: ScopeSelector::Session(session.clone()),
+                        hook: HookName::AfterKillPane,
+                        command: format!("set-option -p @after-pane-slot {value}"),
+                        lifecycle: HookLifecycle::Persistent,
+                    }))
+                    .await,
+                Response::SetHook(_)
+            ));
+        }
+
+        let (outcome, hooks) = handler
+            .dispatch_captured(
+                std::process::id(),
+                u64::from(std::process::id()),
+                Request::PaneKill(PaneKillRequest {
+                    target: PaneTargetRef::slot(PaneTarget::with_window(source.clone(), 0, 0)),
+                    kill_all_except: false,
+                }),
+            )
+            .await;
+        assert!(
+            matches!(outcome.response, Response::KillPane(_)),
+            "{:?}",
+            outcome.response
+        );
+        assert_eq!(hooks.len(), 1);
+        assert!(hooks[0].exact_pane_target.is_some());
+        assert_eq!(
+            hooks[0].current_target,
+            Some(Target::Pane(PaneTarget::with_window(first.clone(), 1, 0)))
+        );
+        let moved = handler
+            .handle(Request::MoveWindow(MoveWindowRequest {
+                source: Some(WindowTarget::with_window(first.clone(), 1)),
+                target: MoveWindowTarget::Window(WindowTarget::with_window(first.clone(), 5)),
+                renumber: false,
+                kill_destination: false,
+                detached: true,
+                after: false,
+                before: false,
+            }))
+            .await;
+        assert!(matches!(moved, Response::MoveWindow(_)), "{moved:?}");
+        handler
+            .run_inline_hooks(std::process::id(), hooks, None)
+            .await;
+
+        let state = handler.state.lock().await;
+        assert!(state.sessions.session(&source).is_none());
+        assert!(state.sessions.session(&first).is_some());
+        assert!(state.sessions.session(&second).is_some());
+        assert!(state
+            .sessions
+            .session(&first)
+            .and_then(|session| session.window_at(1))
+            .is_none());
+        assert_eq!(
+            state
+                .pane_explicit_option_value_by_name(
+                    &PaneTarget::with_window(first.clone(), 5, 0),
+                    "@after-pane-slot",
+                )
+                .expect("moved exact pane option resolves")
+                .1,
+            Some("first".to_owned())
+        );
+        assert_eq!(
+            state
+                .pane_explicit_option_value_by_name(
+                    &PaneTarget::with_window(second, 1, 0),
+                    "@after-pane-slot",
+                )
+                .expect("second winlink pane option resolves")
+                .1,
+            Some("first".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_kill_group_alias_after_target_follows_the_surviving_member() {
+        let handler = RequestHandler::new();
+        let owner = session_name("after-pane-group-owner");
+        let peer = session_name("after-pane-group-peer");
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: owner.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+        assert!(matches!(
+            handler
+                .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+                    session_name: Some(peer.clone()),
+                    working_directory: None,
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                    group_target: Some(owner.clone()),
+                    attach_if_exists: false,
+                    detach_other_clients: false,
+                    kill_other_clients: false,
+                    flags: None,
+                    window_name: None,
+                    print_session_info: false,
+                    print_format: None,
+                    command: None,
+                    process_command: None,
+                    client_environment: None,
+                    skip_environment_update: false,
+                })))
+                .await,
+            Response::NewSession(_)
+        ));
+        assert!(matches!(
+            handler
+                .handle(Request::SetHook(SetHookRequest {
+                    scope: ScopeSelector::Session(owner.clone()),
+                    hook: HookName::AfterKillPane,
+                    command: "set-buffer -b pane-group-owner owner".to_owned(),
+                    lifecycle: HookLifecycle::Persistent,
+                }))
+                .await,
+            Response::SetHook(_)
+        ));
+
+        let response = handler
+            .handle(Request::PaneKill(PaneKillRequest {
+                target: PaneTargetRef::slot(PaneTarget::with_window(peer.clone(), 0, 0)),
+                kill_all_except: false,
+            }))
+            .await;
+        assert!(matches!(response, Response::KillPane(_)), "{response:?}");
+
+        let state = handler.state.lock().await;
+        assert!(state.sessions.session(&peer).is_none());
+        assert!(state.sessions.session(&owner).is_some());
+        assert_eq!(
+            state
+                .buffers
+                .show(Some("pane-group-owner"))
+                .expect("surviving group member hook ran")
+                .1,
+            b"owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_kill_all_except_keeps_the_addressed_duplicate_winlink_index() {
+        let handler = RequestHandler::new();
+        let session = session_name("after-pane-duplicate-index");
+        assert!(matches!(
+            handler
+                .handle(Request::NewSession(NewSessionRequest {
+                    session_name: session.clone(),
+                    detached: true,
+                    size: Some(TerminalSize { cols: 80, rows: 24 }),
+                    environment: None,
+                }))
+                .await,
+            Response::NewSession(_)
+        ));
+        assert!(matches!(
+            handler
+                .handle(Request::LinkWindow(LinkWindowRequest {
+                    source: WindowTarget::with_window(session.clone(), 0),
+                    target: WindowTarget::with_window(session.clone(), 2),
+                    after: false,
+                    before: false,
+                    kill_destination: false,
+                    detached: true,
+                }))
+                .await,
+            Response::LinkWindow(_)
+        ));
+        assert!(matches!(
+            handler
+                .handle(Request::SetHook(SetHookRequest {
+                    scope: ScopeSelector::Session(session.clone()),
+                    hook: HookName::AfterKillPane,
+                    command: "set-option -p -F @after-duplicate-index '#{window_index}'".to_owned(),
+                    lifecycle: HookLifecycle::Persistent,
+                }))
+                .await,
+            Response::SetHook(_)
+        ));
+
+        let response = handler
+            .handle(Request::PaneKill(PaneKillRequest {
+                target: PaneTargetRef::slot(PaneTarget::with_window(session.clone(), 2, 0)),
+                kill_all_except: true,
+            }))
+            .await;
+        assert!(matches!(response, Response::KillPane(_)), "{response:?}");
+
+        let state = handler.state.lock().await;
+        assert_eq!(
+            state
+                .pane_explicit_option_value_by_name(
+                    &PaneTarget::with_window(session, 2, 0),
+                    "@after-duplicate-index",
+                )
+                .expect("duplicate winlink pane option resolves")
+                .1,
+            Some("2".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn after_kill_pane_exact_target_survives_duplicate_winlink_slot_aba() {
+        for (label, use_sdk) in [("cli", false), ("sdk", true)] {
+            let handler = RequestHandler::new();
+            let session = session_name(&format!("after-kill-occurrence-aba-{label}"));
+            assert!(matches!(
+                handler
+                    .handle(Request::NewSession(NewSessionRequest {
+                        session_name: session.clone(),
+                        detached: true,
+                        size: Some(TerminalSize { cols: 80, rows: 24 }),
+                        environment: None,
+                    }))
+                    .await,
+                Response::NewSession(_)
+            ));
+            assert!(matches!(
+                handler
+                    .handle(Request::SplitWindow(SplitWindowRequest {
+                        target: SplitWindowTarget::Session(session.clone()),
+                        direction: SplitDirection::Vertical,
+                        before: false,
+                        environment: None,
+                    }))
+                    .await,
+                Response::SplitWindow(_)
+            ));
+            assert!(matches!(
+                handler
+                    .handle(Request::LinkWindow(LinkWindowRequest {
+                        source: WindowTarget::with_window(session.clone(), 0),
+                        target: WindowTarget::with_window(session.clone(), 2),
+                        after: false,
+                        before: false,
+                        kill_destination: false,
+                        detached: true,
+                    }))
+                    .await,
+                Response::LinkWindow(_)
+            ));
+            handler.wait_for_initial_panes_for_test().await;
+            let option = format!("@after-kill-occurrence-aba-{label}");
+            assert!(matches!(
+                handler
+                    .handle(Request::SetHook(SetHookRequest {
+                        scope: ScopeSelector::Session(session.clone()),
+                        hook: HookName::AfterKillPane,
+                        command: format!("set-option -g -F {option} '#{{window_index}}'"),
+                        lifecycle: HookLifecycle::Persistent,
+                    }))
+                    .await,
+                Response::SetHook(_)
+            ));
+
+            let target = PaneTarget::with_window(session.clone(), 2, 1);
+            let request = if use_sdk {
+                Request::PaneKill(PaneKillRequest {
+                    target: PaneTargetRef::slot(target),
+                    kill_all_except: false,
+                })
+            } else {
+                Request::KillPane(KillPaneRequest {
+                    target,
+                    kill_all_except: false,
+                })
+            };
+            let (outcome, hooks) = handler
+                .dispatch_captured(std::process::id(), u64::from(std::process::id()), request)
+                .await;
+            assert!(
+                matches!(outcome.response, Response::KillPane(_)),
+                "{:?}",
+                outcome.response
+            );
+            assert_eq!(hooks.len(), 1);
+            assert!(hooks[0]
+                .exact_pane_target
+                .is_some_and(|identity| identity.window_occurrence_id.is_some()));
+
+            assert!(matches!(
+                handler
+                    .handle(Request::MoveWindow(MoveWindowRequest {
+                        source: Some(WindowTarget::with_window(session.clone(), 2)),
+                        target: MoveWindowTarget::Window(WindowTarget::with_window(
+                            session.clone(),
+                            5,
+                        )),
+                        renumber: false,
+                        kill_destination: false,
+                        detached: true,
+                        after: false,
+                        before: false,
+                    }))
+                    .await,
+                Response::MoveWindow(_)
+            ));
+            assert!(matches!(
+                handler
+                    .handle(Request::LinkWindow(LinkWindowRequest {
+                        source: WindowTarget::with_window(session.clone(), 0),
+                        target: WindowTarget::with_window(session.clone(), 2),
+                        after: false,
+                        before: false,
+                        kill_destination: false,
+                        detached: true,
+                    }))
+                    .await,
+                Response::LinkWindow(_)
+            ));
+
+            handler
+                .run_inline_hooks(std::process::id(), hooks, None)
+                .await;
+
+            let state = handler.state.lock().await;
+            assert_eq!(
+                state.options.resolve_name(Some(&session), &option),
+                Some("5".to_owned()),
+                "exact hook follows the original winlink occurrence",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn last_pane_after_hook_without_a_survivor_is_fail_closed() {
+        for (label, use_sdk) in [("cli", false), ("sdk", true)] {
+            let handler = RequestHandler::new();
+            let source = session_name(&format!("after-last-pane-{label}-source"));
+            let decoy = session_name(&format!("after-last-pane-{label}-decoy"));
+            for session in [&source, &decoy] {
+                assert!(matches!(
+                    handler
+                        .handle(Request::NewSession(NewSessionRequest {
+                            session_name: session.clone(),
+                            detached: true,
+                            size: Some(TerminalSize { cols: 80, rows: 24 }),
+                            environment: None,
+                        }))
+                        .await,
+                    Response::NewSession(_)
+                ));
+            }
+            let buffer = format!("after-last-pane-{label}");
+            assert!(matches!(
+                handler
+                    .handle(Request::SetHook(SetHookRequest {
+                        scope: ScopeSelector::Global,
+                        hook: HookName::AfterKillPane,
+                        command: format!("set-buffer -a -b {buffer} unexpected,"),
+                        lifecycle: HookLifecycle::Persistent,
+                    }))
+                    .await,
+                Response::SetHook(_)
+            ));
+            let target = PaneTarget::with_window(source.clone(), 0, 0);
+            let request = if use_sdk {
+                Request::PaneKill(PaneKillRequest {
+                    target: PaneTargetRef::slot(target),
+                    kill_all_except: false,
+                })
+            } else {
+                Request::KillPane(KillPaneRequest {
+                    target,
+                    kill_all_except: false,
+                })
+            };
+            let response = handler.handle(request).await;
+            assert!(matches!(response, Response::KillPane(_)), "{response:?}");
+
+            let state = handler.state.lock().await;
+            assert!(state.sessions.session(&source).is_none());
+            assert!(state.sessions.session(&decoy).is_some());
+            assert!(
+                state.buffers.show(Some(&buffer)).is_err(),
+                "missing target must not fall back to the decoy session"
+            );
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -539,6 +1462,37 @@ pub(in crate::handler) fn fallback_current_target(
         })
 }
 
+fn pane_id_target_in_session(
+    sessions: &SessionStore,
+    session_name: &rmux_proto::SessionName,
+    pane_id: rmux_proto::PaneId,
+) -> Option<Target> {
+    let session = sessions.session(session_name)?;
+    let window_index = session.window_index_for_pane_id(pane_id)?;
+    let pane_index = session
+        .window_at(window_index)?
+        .panes()
+        .iter()
+        .find(|pane| pane.id() == pane_id)?
+        .index();
+    Some(Target::Pane(PaneTarget::with_window(
+        session_name.clone(),
+        window_index,
+        pane_index,
+    )))
+}
+
+fn pane_kill_request_target(sessions: &SessionStore, target: &PaneTargetRef) -> Option<Target> {
+    match target {
+        PaneTargetRef::Slot(target) => Some(Target::Pane(target.clone())),
+        PaneTargetRef::Id {
+            session_name,
+            pane_id,
+        } => pane_id_target_in_session(sessions, session_name, *pane_id)
+            .or_else(|| active_session_target(sessions, session_name)),
+    }
+}
+
 pub(in crate::handler) fn target_for_request_response(
     state: &crate::pane_terminals::HandlerState,
     request: &Request,
@@ -565,6 +1519,7 @@ pub(in crate::handler) fn target_for_request_response(
         Response::BreakPane(success) => Some(Target::Pane(success.target.clone())),
         Response::PipePane(success) => Some(Target::Pane(success.target.clone())),
         Response::RespawnPane(success) => Some(Target::Pane(success.target.clone())),
+        Response::KillPane(_) => None,
         Response::RenameSession(success) => {
             active_session_target(&state.sessions, &success.session_name)
         }
@@ -622,6 +1577,9 @@ pub(in crate::handler) fn target_for_request_response(
                 .map(|target| Target::Pane(target.clone()))
                 .or_else(|| fallback_current_target(state, attached_session)),
             Request::KillPane(request) => Some(Target::Pane(request.target.clone())),
+            Request::PaneKill(request) => {
+                pane_kill_request_target(&state.sessions, &request.target)
+            }
             Request::ResizePane(request) => Some(Target::Pane(request.target.clone())),
             Request::CapturePane(request) => Some(Target::Pane(request.target.clone())),
             Request::PaneSnapshot(request) => Some(Target::Pane(request.target.clone())),

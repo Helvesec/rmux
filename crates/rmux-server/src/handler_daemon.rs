@@ -81,8 +81,11 @@ impl RequestHandler {
             .lock()
             .expect("retained exited output mutex must not be poisoned")
             .clear();
+        // Shutdown hooks are accepted below and drained before the daemon exits. Close the
+        // wait-for store first so an accepted hook cannot block that drain indefinitely.
+        self.shutdown_wait_for();
         for event in queued_lifecycle_events {
-            self.emit_prepared(event);
+            self.emit_prepared(event).await;
         }
         self.queue_shutdown_request(PendingShutdownReason::KillServer);
         Response::KillServer(KillServerResponse)

@@ -1578,3 +1578,204 @@ async fn source_file_set_option_quiet_does_not_suppress_bad_values() {
         "later commands should still run after a recoverable command error"
     );
 }
+
+#[tokio::test]
+async fn source_file_grouped_new_window_insertion_preserves_and_arms_silence_timers() {
+    let handler = RequestHandler::new();
+    let owner =
+        create_quiet_source_timer_session(&handler, "source-new-window-timer-owner", None).await;
+    let response = handler
+        .handle(Request::LinkWindow(LinkWindowRequest {
+            source: WindowTarget::with_window(owner.clone(), 0),
+            target: WindowTarget::with_window(owner.clone(), 1),
+            after: false,
+            before: false,
+            kill_destination: false,
+            detached: true,
+        }))
+        .await;
+    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
+    let peer = create_quiet_source_timer_session(
+        &handler,
+        "source-new-window-timer-peer",
+        Some(owner.clone()),
+    )
+    .await;
+
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Global,
+                option: OptionName::MonitorSilence,
+                value: "60".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+
+    let base_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+    for (offset, target) in [&owner, &peer]
+        .into_iter()
+        .flat_map(|session_name| {
+            (0..=1).map(move |window_index| {
+                WindowTarget::with_window(session_name.clone(), window_index)
+            })
+        })
+        .enumerate()
+    {
+        handler.replace_silence_timer_deadline_for_test(
+            &target,
+            base_deadline + std::time::Duration::from_secs(offset as u64),
+        );
+    }
+
+    let before = {
+        let state = handler.state.lock().await;
+        let mut before = Vec::new();
+        for session_name in [&owner, &peer] {
+            let session = state.sessions.session(session_name).unwrap_or_else(|| {
+                panic!("group member {session_name} exists before source-file insertion")
+            });
+            for window_index in 0..=1 {
+                let target = WindowTarget::with_window(session_name.clone(), window_index);
+                let window_id = session
+                    .window_at(window_index)
+                    .expect("original alias exists")
+                    .id();
+                let timer = handler
+                    .silence_timer_snapshot_for_test(&target)
+                    .expect("original alias silence timer is armed");
+                before.push((
+                    session_name.clone(),
+                    session.id(),
+                    window_index,
+                    window_id,
+                    timer.1,
+                ));
+            }
+        }
+        before
+    };
+
+    let root = temp_root("grouped-new-window-silence-timers");
+    write_config(
+        &root.join("new-window.conf"),
+        &format!("new-window -b -d -t {owner}:0\n"),
+    );
+    let response = handler
+        .handle(source_file_request(
+            vec!["new-window.conf".to_owned()],
+            Some(root.clone()),
+        ))
+        .await;
+    fs::remove_dir_all(root).expect("remove grouped new-window config root");
+    assert_eq!(
+        response,
+        Response::SourceFile(rmux_proto::SourceFileResponse::no_output())
+    );
+
+    for (session_name, session_id, previous_index, window_id, deadline) in before {
+        let shifted_index = previous_index + 1;
+        let shifted = WindowTarget::with_window(session_name.clone(), shifted_index);
+        {
+            let state = handler.state.lock().await;
+            let session = state
+                .sessions
+                .session(&session_name)
+                .expect("group member survives source-file insertion");
+            assert_eq!(
+                session
+                    .window_at(shifted_index)
+                    .expect("original alias shifts")
+                    .id(),
+                window_id
+            );
+        }
+        assert_eq!(
+            handler
+                .silence_timer_snapshot_for_test(&shifted)
+                .expect("shifted source-file timer survives")
+                .1,
+            deadline,
+            "queued source-file insertion must preserve each alias deadline by ordinal"
+        );
+        let shifted_identity = handler
+            .silence_timer_identity_for_test(&shifted)
+            .expect("shifted source-file timer identity exists");
+        assert_eq!(
+            (shifted_identity.0, shifted_identity.1),
+            (session_id, window_id)
+        );
+    }
+
+    for session_name in [&owner, &peer] {
+        let inserted = WindowTarget::with_window(session_name.clone(), 0);
+        let inserted_identity = handler
+            .silence_timer_identity_for_test(&inserted)
+            .expect("inserted source-file group peer timer is armed");
+        let state = handler.state.lock().await;
+        let session = state
+            .sessions
+            .session(session_name)
+            .expect("group member exists after source-file insertion");
+        assert_eq!(inserted_identity.0, session.id());
+        assert_eq!(
+            inserted_identity.1,
+            session.window_at(0).expect("inserted window exists").id()
+        );
+    }
+}
+
+async fn create_quiet_source_timer_session(
+    handler: &RequestHandler,
+    name: &str,
+    group_target: Option<SessionName>,
+) -> SessionName {
+    let session = session_name(name);
+    let command = group_target
+        .is_none()
+        .then(quiet_source_timer_window_command);
+    let response = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(session.clone()),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+            group_target,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command,
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))
+        .await;
+    assert!(matches!(response, Response::NewSession(_)), "{response:?}");
+    session
+}
+
+#[cfg(unix)]
+fn quiet_source_timer_window_command() -> Vec<String> {
+    vec!["/bin/sh".to_owned(), "-c".to_owned(), "sleep 60".to_owned()]
+}
+
+#[cfg(windows)]
+fn quiet_source_timer_window_command() -> Vec<String> {
+    let system_root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+    let cmd = PathBuf::from(system_root).join("System32").join("cmd.exe");
+    vec![
+        cmd.to_string_lossy().into_owned(),
+        "/d".to_owned(),
+        "/q".to_owned(),
+        "/c".to_owned(),
+        "ping -n 120 127.0.0.1 >NUL".to_owned(),
+    ]
+}

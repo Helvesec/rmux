@@ -495,6 +495,16 @@ impl Session {
         }
     }
 
+    /// Updates the backing terminal size and recalculates only the active window geometry.
+    ///
+    /// Attached clients drive the size of the window they are currently viewing. Inactive
+    /// windows can have independent policies and may share a runtime with another session, so
+    /// resizing every window here would leak the active window's size into unrelated runtimes.
+    pub fn resize_active_window_terminal(&mut self, size: TerminalSize) {
+        self.terminal_size = size;
+        self.window_mut().set_size(size);
+    }
+
     fn resolve_window_target_mut(&mut self, window_index: u32) -> Result<&mut Window, RmuxError> {
         if !self.windows.contains_key(&window_index) {
             return Err(invalid_window_target(&self.name, window_index));

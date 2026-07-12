@@ -487,6 +487,41 @@ fn rss_fd_detector_uses_proc_identity_not_ps_awk_text_matching() {
     assert!(!script.contains("ps -eo pid=,args= | awk"));
 }
 
+#[test]
+fn public_readmes_do_not_advertise_unmanaged_windows_installer() {
+    for (path, readme) in [
+        ("README.md", include_str!("../README.md")),
+        (
+            "docs/i18n/README.fr.md",
+            include_str!("../docs/i18n/README.fr.md"),
+        ),
+        (
+            "docs/i18n/README.ja.md",
+            include_str!("../docs/i18n/README.ja.md"),
+        ),
+        (
+            "docs/i18n/README.zh-CN.md",
+            include_str!("../docs/i18n/README.zh-CN.md"),
+        ),
+    ] {
+        assert!(
+            !readme.contains("https://rmux.io/install.ps1"),
+            "{path} advertises an installer whose source and deployment are external"
+        );
+        for required in ["rmux.exe", "rmux-daemon.exe", "libexec/rmux/rmux.exe"] {
+            assert!(
+                readme.contains(required),
+                "{path} must preserve the Windows package component {required}"
+            );
+        }
+    }
+
+    let releasing = include_str!("../RELEASING.md");
+    assert!(releasing
+        .contains("The `rmux.io` install-script sources and deployment pipeline are not part of"));
+    assert!(releasing.contains("copying only `rmux.exe` is not valid"));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn rss_fd_detector_does_not_match_foreign_process_arguments() {

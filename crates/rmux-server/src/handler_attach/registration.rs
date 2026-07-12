@@ -69,6 +69,7 @@ impl RequestHandler {
         self.register_attach_with_access(
             requester_pid,
             session_name,
+            None,
             AttachRegistration {
                 control_tx,
                 control_backlog: Arc::new(AtomicUsize::new(0)),
@@ -84,30 +85,31 @@ impl RequestHandler {
             },
         )
         .await
+        .expect("test attach registration session must remain current")
     }
 
     pub(crate) async fn register_attach_with_access(
         &self,
         requester_pid: u32,
         session_name: rmux_proto::SessionName,
+        expected_session_id: Option<rmux_proto::SessionId>,
         registration: AttachRegistration,
-    ) -> u64 {
+    ) -> Option<u64> {
         #[cfg(windows)]
         self.wait_for_windows_deferred_session_panes_ready(&session_name)
             .await;
         let mut replaced_key_table = None;
         let attached_session_name = session_name.clone();
-        let (client_size, active_window_index) = {
-            let state = self.state.lock().await;
-            let session = state.sessions.session(&attached_session_name);
-            let active_window_index = session.map(rmux_core::Session::active_window_index);
-            let client_size = registration.client_size.unwrap_or_else(|| {
-                session
-                    .map(|session| session.window().size())
-                    .unwrap_or(super::super::DEFAULT_SESSION_SIZE)
-            });
-            (client_size, active_window_index)
-        };
+        let state = self.state.lock().await;
+        let session = state.sessions.session(&attached_session_name)?;
+        let session_id = session.id();
+        if expected_session_id.is_some_and(|expected| expected != session_id) {
+            return None;
+        }
+        let active_window_index = Some(session.active_window_index());
+        let client_size = registration
+            .client_size
+            .unwrap_or_else(|| session.window().size());
         let mut active_attach = self.active_attach.lock().await;
         let attach_id = active_attach.next_id;
         active_attach.next_id += 1;
@@ -118,7 +120,9 @@ impl RequestHandler {
             ActiveAttach {
                 id: attach_id,
                 session_name,
+                session_id,
                 last_session: None,
+                last_session_id: None,
                 flags: registration.flags,
                 pan_window: None,
                 pan_ox: 0,
@@ -172,6 +176,7 @@ impl RequestHandler {
             );
         }
         drop(active_attach);
+        drop(state);
         self.bump_active_attach_epoch();
 
         if let Some(table_name) = replaced_key_table {
@@ -186,7 +191,7 @@ impl RequestHandler {
         drop(state);
         self.refresh_clock_overlays_for_session(&attached_session_name)
             .await;
-        attach_id
+        Some(attach_id)
     }
 
     pub(crate) async fn finish_attach(&self, requester_pid: u32, attach_id: u64) {
@@ -202,7 +207,7 @@ impl RequestHandler {
                     .map(|active| {
                         let emit_detached = !active.closing.load(Ordering::SeqCst);
                         (
-                            Some(active.session_name),
+                            Some((active.session_name, active.session_id)),
                             active.key_table_name,
                             active.overlay,
                             emit_detached,
@@ -221,7 +226,7 @@ impl RequestHandler {
             let mut state = self.state.lock().await;
             state.key_bindings.unref_table(&table_name);
         }
-        if let Some(session_name) = removed_session {
+        if let Some((session_name, session_id)) = removed_session {
             if emit_detached {
                 self.emit(LifecycleEvent::ClientDetached {
                     session_name: session_name.clone(),
@@ -232,7 +237,8 @@ impl RequestHandler {
             if let Ok(Some(target)) = self.reconcile_attached_session_size(&session_name).await {
                 self.emit(LifecycleEvent::WindowResized { target }).await;
             }
-            self.destroy_unattached_sessions(vec![session_name]).await;
+            self.destroy_unattached_sessions(vec![(session_name, session_id)])
+                .await;
         }
     }
 }

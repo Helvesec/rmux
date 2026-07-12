@@ -4,10 +4,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use super::RequestHandler;
 use rmux_core::LifecycleEvent;
 use rmux_proto::{
-    ErrorResponse, HookLifecycle, HookName, NewSessionExtRequest, NewSessionRequest,
-    NewWindowRequest, OptionName, PaneTarget, ProcessCommand, Request, Response, RmuxError,
-    ScopeSelector, SessionName, SetEnvironmentRequest, SetHookRequest, SetOptionMode,
-    SetOptionRequest, ShowEnvironmentRequest, ShowOptionsRequest, TerminalSize,
+    ErrorResponse, HookLifecycle, HookName, MoveWindowRequest, MoveWindowTarget,
+    NewSessionExtRequest, NewSessionRequest, NewWindowRequest, OptionName, PaneTarget,
+    ProcessCommand, Request, Response, RmuxError, ScopeSelector, SessionName,
+    SetEnvironmentRequest, SetHookRequest, SetOptionMode, SetOptionRequest, ShowEnvironmentRequest,
+    ShowOptionsRequest, TerminalSize, WindowTarget,
 };
 
 fn session_name(value: &str) -> SessionName {
@@ -30,6 +31,32 @@ async fn create_session(handler: &RequestHandler, name: &str) {
             size: Some(TerminalSize { cols: 80, rows: 24 }),
             environment: None,
         }))
+        .await;
+
+    assert!(matches!(response, Response::NewSession(_)));
+}
+
+async fn create_grouped_session(handler: &RequestHandler, name: &str, group_target: &SessionName) {
+    let response = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(session_name(name)),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+            group_target: Some(group_target.clone()),
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: None,
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))
         .await;
 
     assert!(matches!(response, Response::NewSession(_)));
@@ -400,6 +427,238 @@ async fn session_closed_hooks_fire_before_session_scope_is_removed() {
 }
 
 #[tokio::test]
+async fn move_window_last_source_session_emits_lifecycle_hooks_in_tmux_3_7b_order() {
+    let handler = RequestHandler::new();
+    let source = session_name("move-lifecycle-source");
+    let destination = session_name("move-lifecycle-destination");
+    create_session(&handler, source.as_str()).await;
+    create_session(&handler, destination.as_str()).await;
+    let source_session_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&source)
+            .expect("source session exists")
+            .id()
+            .as_u32()
+    };
+    let hook_commands = [
+        (
+            HookName::WindowLinked,
+            "display-message global-window-linked",
+        ),
+        (
+            HookName::WindowUnlinked,
+            "display-message global-window-unlinked",
+        ),
+        (
+            HookName::SessionClosed,
+            "display-message global-session-closed",
+        ),
+    ];
+    for (hook, command) in hook_commands {
+        set_global_hook(&handler, hook, command).await;
+    }
+    let mut events = handler.subscribe_lifecycle_events();
+
+    let response = handler
+        .handle(Request::MoveWindow(MoveWindowRequest {
+            source: Some(WindowTarget::with_window(source.clone(), 0)),
+            target: MoveWindowTarget::Window(WindowTarget::with_window(destination.clone(), 1)),
+            renumber: false,
+            kill_destination: false,
+            detached: true,
+            after: false,
+            before: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
+
+    let lifecycle = std::iter::from_fn(|| events.try_recv().ok())
+        .filter(|event| {
+            matches!(
+                event.hook_name,
+                HookName::WindowLinked | HookName::WindowUnlinked | HookName::SessionClosed
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lifecycle
+            .iter()
+            .map(|event| event.hook_name)
+            .collect::<Vec<_>>(),
+        vec![
+            HookName::WindowLinked,
+            HookName::WindowUnlinked,
+            HookName::SessionClosed,
+        ],
+        "tmux 3.7b emits window-linked, window-unlinked, then session-closed"
+    );
+    assert!(matches!(
+        lifecycle.last().map(|event| &event.event),
+        Some(LifecycleEvent::SessionClosed {
+            session_name,
+            session_id: Some(actual_session_id),
+        }) if session_name == &source && *actual_session_id == source_session_id
+    ));
+    for (event, (_, command)) in lifecycle.iter().zip(hook_commands) {
+        assert_eq!(
+            event
+                .hooks
+                .iter()
+                .filter(|dispatch| dispatch.command() == command)
+                .count(),
+            1,
+            "global lifecycle hook must survive the source-session teardown"
+        );
+    }
+}
+
+#[tokio::test]
+async fn move_window_last_source_group_emits_tmux_3_7b_lifecycle_batch_order() {
+    let handler = RequestHandler::new();
+    let owner = session_name("move-group-lifecycle-owner");
+    let peer = session_name("move-group-lifecycle-peer");
+    let destination = session_name("move-group-lifecycle-destination");
+    create_session(&handler, owner.as_str()).await;
+    create_grouped_session(&handler, peer.as_str(), &owner).await;
+    create_session(&handler, destination.as_str()).await;
+    for (hook, command) in [
+        (HookName::WindowLinked, "display-message group-linked"),
+        (HookName::WindowUnlinked, "display-message group-unlinked"),
+        (HookName::SessionClosed, "display-message group-closed"),
+    ] {
+        set_global_hook(&handler, hook, command).await;
+    }
+    let mut events = handler.subscribe_lifecycle_events();
+
+    let response = handler
+        .handle(Request::MoveWindow(MoveWindowRequest {
+            source: Some(WindowTarget::with_window(peer.clone(), 0)),
+            target: MoveWindowTarget::Window(WindowTarget::with_window(destination.clone(), 1)),
+            renumber: false,
+            kill_destination: false,
+            detached: true,
+            after: false,
+            before: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
+
+    let lifecycle = std::iter::from_fn(|| events.try_recv().ok())
+        .filter_map(|event| match &event.event {
+            LifecycleEvent::WindowLinked { session_name, .. } => {
+                Some((HookName::WindowLinked, session_name.clone(), event.hooks))
+            }
+            LifecycleEvent::WindowUnlinked { session_name, .. } => {
+                Some((HookName::WindowUnlinked, session_name.clone(), event.hooks))
+            }
+            LifecycleEvent::SessionClosed { session_name, .. } => {
+                Some((HookName::SessionClosed, session_name.clone(), event.hooks))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lifecycle
+            .iter()
+            .map(|(hook, session_name, _)| (*hook, session_name.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (HookName::WindowLinked, destination),
+            (HookName::WindowUnlinked, peer.clone()),
+            (HookName::SessionClosed, owner.clone()),
+            (HookName::WindowUnlinked, owner.clone()),
+            (HookName::SessionClosed, peer.clone()),
+        ],
+        "tmux 3.7b emits one linked event, then the two grouped teardown pairs in this order"
+    );
+    for (hook, _, dispatches) in lifecycle {
+        let expected_command = match hook {
+            HookName::WindowLinked => "display-message group-linked",
+            HookName::WindowUnlinked => "display-message group-unlinked",
+            HookName::SessionClosed => "display-message group-closed",
+            _ => unreachable!("filtered lifecycle hook"),
+        };
+        assert_eq!(
+            dispatches
+                .iter()
+                .filter(|dispatch| dispatch.command() == expected_command)
+                .count(),
+            1,
+            "each grouped lifecycle event keeps its global hook dispatch"
+        );
+    }
+    let state = handler.state.lock().await;
+    assert!(state.sessions.session(&owner).is_none());
+    assert!(state.sessions.session(&peer).is_none());
+}
+
+#[tokio::test]
+async fn move_window_last_source_session_preserves_local_closed_hook_product_divergence() {
+    let handler = RequestHandler::new();
+    let source = session_name("move-local-hook-source");
+    let destination = session_name("move-local-hook-destination");
+    create_session(&handler, source.as_str()).await;
+    create_session(&handler, destination.as_str()).await;
+    let global_command = "display-message global-session-closed-fallback";
+    let local_command = "display-message local-session-closed";
+    set_global_hook(&handler, HookName::SessionClosed, global_command).await;
+    assert!(matches!(
+        handler
+            .handle(Request::SetHook(SetHookRequest {
+                scope: ScopeSelector::Session(source.clone()),
+                hook: HookName::SessionClosed,
+                command: local_command.to_owned(),
+                lifecycle: HookLifecycle::Persistent,
+            }))
+            .await,
+        Response::SetHook(_)
+    ));
+    let mut events = handler.subscribe_lifecycle_events();
+
+    let response = handler
+        .handle(Request::MoveWindow(MoveWindowRequest {
+            source: Some(WindowTarget::with_window(source.clone(), 0)),
+            target: MoveWindowTarget::Window(WindowTarget::with_window(destination, 1)),
+            renumber: false,
+            kill_destination: false,
+            detached: true,
+            after: false,
+            before: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
+
+    let closed = std::iter::from_fn(|| events.try_recv().ok())
+        .find(|event| {
+            matches!(
+                &event.event,
+                LifecycleEvent::SessionClosed { session_name, .. } if session_name == &source
+            )
+        })
+        .expect("move-window emits session-closed for the removed source session");
+    assert_eq!(
+        closed
+            .hooks
+            .iter()
+            .filter(|dispatch| dispatch.command() == local_command)
+            .count(),
+        1,
+        "RMUX preserves the source session hook before removing its scope"
+    );
+    assert_eq!(
+        closed
+            .hooks
+            .iter()
+            .filter(|dispatch| dispatch.command() == global_command)
+            .count(),
+        0,
+        "the explicit session hook continues to override the global fallback"
+    );
+}
+
+#[tokio::test]
 async fn kill_pane_does_not_synthesize_pane_exited_hook_like_tmux() {
     let handler = RequestHandler::new();
     create_session(&handler, "alpha").await;
@@ -508,6 +767,298 @@ async fn window_unlinked_hooks_keep_removed_window_name_and_id() {
         .show(Some("unlinked"))
         .expect("unlinked buffer exists");
     assert_eq!(String::from_utf8_lossy(content), "ok");
+}
+
+#[tokio::test]
+async fn kill_window_renumbered_unlinked_hook_keeps_removed_formats_and_active_target() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("kill-window-unlinked-target");
+    create_session(&handler, alpha.as_str()).await;
+    for (window_index, name) in [(1, "removed"), (2, "renumbered")] {
+        let response = handler
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                target: alpha.clone(),
+                name: Some(name.to_owned()),
+                detached: true,
+                start_directory: None,
+                environment: None,
+                command: None,
+                process_command: None,
+                target_window_index: Some(window_index),
+                insert_at_target: false,
+            })))
+            .await;
+        assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
+    }
+
+    let (active_window_id, removed_window_id, renumbered_window_id) = {
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&alpha).expect("alpha exists");
+        (
+            session.window_at(0).expect("active window exists").id(),
+            session.window_at(1).expect("removed window exists").id(),
+            session.window_at(2).expect("renumbered window exists").id(),
+        )
+    };
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Session(alpha.clone()),
+                option: OptionName::RenumberWindows,
+                value: "on".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+    set_global_hook(
+        &handler,
+        HookName::WindowUnlinked,
+        &format!(
+            "if-shell -F '#{{==:#{{window_id}} #{{hook_window}} #{{hook_window_name}},{active_window_id} {removed_window_id} removed}}' 'set-buffer -b kill-window-unlinked-target active-removed' 'set-buffer -b kill-window-unlinked-target wrong'"
+        ),
+    )
+    .await;
+
+    let response = handler
+        .handle(Request::KillWindow(rmux_proto::KillWindowRequest {
+            target: WindowTarget::with_window(alpha.clone(), 1),
+            kill_all_others: false,
+        }))
+        .await;
+    assert!(matches!(response, Response::KillWindow(_)), "{response:?}");
+
+    assert_eq!(
+        buffer_text(&handler, "kill-window-unlinked-target").await,
+        Some("active-removed".to_owned()),
+        "window-unlinked must target the active survivor while preserving the removed window formats"
+    );
+    let state = handler.state.lock().await;
+    let session = state.sessions.session(&alpha).expect("alpha survives");
+    assert_eq!(session.active_window_index(), 0);
+    assert_eq!(
+        session
+            .window_at(1)
+            .expect("old window 2 was renumbered")
+            .id(),
+        renumbered_window_id
+    );
+}
+
+#[tokio::test]
+async fn unlink_window_unlinked_hook_targets_the_surviving_window_alias() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("unlink-window-unlinked-source");
+    let keeper = session_name("unlink-window-unlinked-keeper");
+    create_session(&handler, alpha.as_str()).await;
+    create_session(&handler, keeper.as_str()).await;
+    let response = handler
+        .handle(Request::NewWindow(Box::new(NewWindowRequest {
+            target: alpha.clone(),
+            name: Some("linked".to_owned()),
+            detached: true,
+            start_directory: None,
+            environment: None,
+            command: None,
+            process_command: None,
+            target_window_index: Some(1),
+            insert_at_target: false,
+        })))
+        .await;
+    assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
+    let linked_window_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.window_at(1))
+            .expect("linked source exists")
+            .id()
+    };
+    let response = handler
+        .handle(Request::LinkWindow(rmux_proto::LinkWindowRequest {
+            source: WindowTarget::with_window(alpha.clone(), 1),
+            target: WindowTarget::with_window(keeper.clone(), 5),
+            after: false,
+            before: false,
+            kill_destination: false,
+            detached: true,
+        }))
+        .await;
+    assert!(matches!(response, Response::LinkWindow(_)), "{response:?}");
+    set_global_hook(
+        &handler,
+        HookName::WindowUnlinked,
+        &format!(
+            "if-shell -F '#{{==:#{{window_id}},{linked_window_id}}}' 'set-buffer -b unlink-window-unlinked-target alias' 'set-buffer -b unlink-window-unlinked-target wrong'"
+        ),
+    )
+    .await;
+
+    let response = handler
+        .handle(Request::UnlinkWindow(rmux_proto::UnlinkWindowRequest {
+            target: WindowTarget::with_window(alpha.clone(), 1),
+            kill_if_last: false,
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::UnlinkWindow(_)),
+        "{response:?}"
+    );
+
+    assert_eq!(
+        buffer_text(&handler, "unlink-window-unlinked-target").await,
+        Some("alias".to_owned()),
+        "window-unlinked must follow the stable window identity to its surviving alias"
+    );
+    let state = handler.state.lock().await;
+    assert!(state
+        .sessions
+        .session(&alpha)
+        .and_then(|session| session.window_at(1))
+        .is_none());
+    assert_eq!(
+        state
+            .sessions
+            .session(&keeper)
+            .and_then(|session| session.window_at(5))
+            .expect("surviving alias remains linked")
+            .id(),
+        linked_window_id
+    );
+}
+
+#[tokio::test]
+async fn unlink_window_kill_if_last_renumbered_hook_keeps_removed_formats_and_active_target() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("unlink-kill-unlinked-target");
+    create_session(&handler, alpha.as_str()).await;
+    for window_index in [1, 2] {
+        let response = handler
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                target: alpha.clone(),
+                name: Some(format!("window-{window_index}")),
+                detached: true,
+                start_directory: None,
+                environment: None,
+                command: None,
+                process_command: None,
+                target_window_index: Some(window_index),
+                insert_at_target: false,
+            })))
+            .await;
+        assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
+    }
+    let (active_window_id, removed_window_id) = {
+        let state = handler.state.lock().await;
+        let session = state.sessions.session(&alpha).expect("alpha exists");
+        (
+            session.window_at(0).expect("active window exists").id(),
+            session.window_at(1).expect("removed window exists").id(),
+        )
+    };
+    assert!(matches!(
+        handler
+            .handle(Request::SetOption(SetOptionRequest {
+                scope: ScopeSelector::Session(alpha.clone()),
+                option: OptionName::RenumberWindows,
+                value: "on".to_owned(),
+                mode: SetOptionMode::Replace,
+            }))
+            .await,
+        Response::SetOption(_)
+    ));
+    set_global_hook(
+        &handler,
+        HookName::WindowUnlinked,
+        &format!(
+            "if-shell -F '#{{==:#{{window_id}} #{{hook_window}} #{{hook_window_name}},{active_window_id} {removed_window_id} window-1}}' 'set-buffer -b unlink-kill-unlinked-target active-removed' 'set-buffer -b unlink-kill-unlinked-target wrong'"
+        ),
+    )
+    .await;
+
+    let response = handler
+        .handle(Request::UnlinkWindow(rmux_proto::UnlinkWindowRequest {
+            target: WindowTarget::with_window(alpha.clone(), 1),
+            kill_if_last: true,
+        }))
+        .await;
+    assert!(
+        matches!(response, Response::UnlinkWindow(_)),
+        "{response:?}"
+    );
+
+    assert_eq!(
+        buffer_text(&handler, "unlink-kill-unlinked-target").await,
+        Some("active-removed".to_owned()),
+        "destructive unlink must target the active survivor while preserving the removed window formats"
+    );
+}
+
+#[tokio::test]
+async fn relative_move_window_unlinked_hook_follows_the_moved_window_identity() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("relative-move-unlinked");
+    create_session(&handler, alpha.as_str()).await;
+    for (window_index, name) in [(1, "middle"), (2, "moved")] {
+        let response = handler
+            .handle(Request::NewWindow(Box::new(NewWindowRequest {
+                target: alpha.clone(),
+                name: Some(name.to_owned()),
+                detached: true,
+                start_directory: None,
+                environment: None,
+                command: None,
+                process_command: None,
+                target_window_index: Some(window_index),
+                insert_at_target: false,
+            })))
+            .await;
+        assert!(matches!(response, Response::NewWindow(_)), "{response:?}");
+    }
+    handler.wait_for_initial_panes_for_test().await;
+    let moved_window_id = {
+        let state = handler.state.lock().await;
+        state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.window_at(2))
+            .map(rmux_core::Window::id)
+            .expect("source window exists")
+    };
+    set_global_hook(
+        &handler,
+        HookName::WindowUnlinked,
+        &format!(
+            "if-shell -F '#{{==:#{{hook_window}} #{{window_index}} #{{window_id}},{} 0 {}}}' 'set-buffer -b relative-move-unlinked ok' 'set-buffer -b relative-move-unlinked bad'",
+            moved_window_id, moved_window_id
+        ),
+    )
+    .await;
+
+    let response = handler
+        .handle(Request::MoveWindow(MoveWindowRequest {
+            source: Some(WindowTarget::with_window(alpha.clone(), 2)),
+            target: MoveWindowTarget::Window(WindowTarget::with_window(alpha.clone(), 0)),
+            renumber: false,
+            kill_destination: false,
+            detached: true,
+            after: false,
+            before: true,
+        }))
+        .await;
+    assert!(matches!(response, Response::MoveWindow(_)), "{response:?}");
+
+    wait_for_buffer(&handler, "relative-move-unlinked", "ok").await;
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.window_at(0))
+            .map(rmux_core::Window::id),
+        Some(moved_window_id)
+    );
 }
 
 #[tokio::test]

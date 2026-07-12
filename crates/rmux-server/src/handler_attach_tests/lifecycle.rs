@@ -21,7 +21,7 @@ async fn attached_remain_on_exit_strips_the_submitted_exit_line_from_dead_pane_c
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
     let alpha = session_name("alpha");
-    let _control_rx = create_exit_attached_session(&handler, requester_pid, &alpha).await;
+    let mut control_rx = create_exit_attached_session(&handler, requester_pid, &alpha).await;
     let target = PaneTarget::new(alpha.clone(), 0);
 
     assert!(matches!(
@@ -36,12 +36,68 @@ async fn attached_remain_on_exit_strips_the_submitted_exit_line_from_dead_pane_c
         Response::SetOption(_)
     ));
     prepare_exit_prompt(&handler, &target).await;
+    handler
+        .active_attach
+        .lock()
+        .await
+        .by_pid
+        .get_mut(&requester_pid)
+        .expect("attached client remains registered")
+        .terminal_context = OuterTerminalContext::from_pairs(&[("TERM", "xterm-256color")]);
+    drain_attach_controls(&mut control_rx);
+    {
+        let mut state = handler.state.lock().await;
+        state
+            .append_bytes_to_pane_transcript_for_test(&alpha, 0, 0, b"\x1b[?1003h\x1b[?1006h")
+            .expect("live pane enables all-motion mouse tracking");
+    }
+    handler.refresh_attached_session(&alpha).await;
+    let tracking_target = recv_switch_target(&mut control_rx, "live pane mouse tracking").await;
+    let tracking_start = tracking_target.outer_terminal.attach_start_sequence();
+    assert!(
+        tracking_start
+            .windows(b"\x1b[?1003h".len())
+            .any(|window| window == b"\x1b[?1003h"),
+        "live pane tracking must reach the outer terminal"
+    );
 
     handler
         .handle_attached_live_input_for_test(requester_pid, ATTACHED_EXIT_INPUT)
         .await
         .expect("attached exit input");
     wait_for_dead_pane(&handler, &alpha, 0, 0).await;
+
+    let dead_target = take_switch_target(
+        recv_matching_attach_control(&mut control_rx, "kept-dead pane refresh", |control| {
+            matches!(control, AttachControl::Switch(_))
+        })
+        .await,
+    );
+    let dead_start = dead_target.outer_terminal.attach_start_sequence();
+    for enable in [b"\x1b[?1000h".as_slice(), b"\x1b[?1002h", b"\x1b[?1003h"] {
+        assert!(
+            !dead_start
+                .windows(enable.len())
+                .any(|window| window == enable),
+            "kept-dead pane must not re-enable outer mouse tracking: {dead_start:?}"
+        );
+    }
+    let transition = dead_target
+        .outer_terminal
+        .transition_sequence_from(&tracking_target.outer_terminal);
+    for disable in [
+        b"\x1b[?1003l".as_slice(),
+        b"\x1b[?1002l",
+        b"\x1b[?1000l",
+        b"\x1b[?1006l",
+    ] {
+        assert!(
+            transition
+                .windows(disable.len())
+                .any(|window| window == disable),
+            "kept-dead pane refresh must disable outer mouse tracking: {transition:?}"
+        );
+    }
 
     let deadline = tokio::time::Instant::now() + REMAIN_ON_EXIT_CAPTURE_SETTLE_TIMEOUT;
     let capture = loop {
@@ -161,10 +217,8 @@ async fn prepare_exit_prompt(handler: &RequestHandler, target: &PaneTarget) {
 async fn attached_keystroke_stub_returns_key_dispatched_ack() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, session_name("alpha"), control_tx)
-        .await;
+    let alpha = session_name("alpha");
+    let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
 
     let response = handler
         .handle_attached_keystroke(
@@ -182,10 +236,8 @@ async fn attached_keystroke_stub_returns_key_dispatched_ack() {
 async fn attached_keystroke_forwarded_ack_reports_not_consumed() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();
-    let (control_tx, _control_rx) = mpsc::unbounded_channel();
-    handler
-        .register_attach(requester_pid, session_name("alpha"), control_tx)
-        .await;
+    let alpha = session_name("alpha");
+    let _control_rx = create_attached_session(&handler, requester_pid, &alpha).await;
 
     let response = handler
         .handle_attached_keystroke(requester_pid, &AttachedKeystroke::new(b"a".to_vec()), false)

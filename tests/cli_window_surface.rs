@@ -20,11 +20,11 @@ fn list_windows_sort_activity_creation_and_global_index_match_tmux() -> Result<(
     let harness = CliHarness::new("list-windows-sort-order")?;
     let _daemon = harness.start_hidden_daemon()?;
 
-    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-n", "w0"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "alpha", "-n", "w0", "sleep 60"])?);
     std::thread::sleep(Duration::from_secs(1));
-    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:", "-n", "w1"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:", "-n", "w1", "sleep 60"])?);
     std::thread::sleep(Duration::from_secs(1));
-    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:", "-n", "w2"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:", "-n", "w2", "sleep 60"])?);
 
     let creation = harness.run(&[
         "list-windows",
@@ -53,11 +53,11 @@ fn list_windows_sort_activity_creation_and_global_index_match_tmux() -> Result<(
     assert_eq!(stdout(&activity), "2\n1\n0\n");
 
     std::thread::sleep(Duration::from_secs(1));
-    assert_success(&harness.run(&["new-session", "-d", "-s", "beta"])?);
+    assert_success(&harness.run(&["new-session", "-d", "-s", "beta", "sleep 60"])?);
     std::thread::sleep(Duration::from_secs(1));
-    assert_success(&harness.run(&["new-window", "-d", "-t", "beta:2"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "beta:2", "sleep 60"])?);
     std::thread::sleep(Duration::from_secs(1));
-    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:3"])?);
+    assert_success(&harness.run(&["new-window", "-d", "-t", "alpha:3", "sleep 60"])?);
 
     let all_indexes = harness.run(&[
         "list-windows",

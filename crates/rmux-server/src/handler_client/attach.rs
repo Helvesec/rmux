@@ -8,9 +8,10 @@ use tokio::sync::mpsc;
 
 use super::super::{
     attach_support::attach_target_for_session, client_environment_snapshot,
-    control_support::ManagedClient, effective_client_terminal_context, parse_client_flags,
-    update_environment_from_client, RequestHandler,
+    effective_client_terminal_context, parse_client_flags, update_environment_from_client,
+    RequestHandler,
 };
+use super::switching::SwitchManagedClientIdentity;
 use crate::outer_terminal::OuterTerminalContext;
 use crate::pane_io::HandleOutcome;
 
@@ -97,6 +98,10 @@ impl RequestHandler {
         };
         if let Some(target_spec) = request.target_spec.as_deref() {
             let current_session = self.current_session_candidate(requester_pid).await;
+            let current_session = match current_session {
+                Some(session_name) => self.switch_session_identity(session_name).await.ok(),
+                None => None,
+            };
             match self
                 .apply_switch_target(
                     target_spec,
@@ -106,7 +111,7 @@ impl RequestHandler {
                 )
                 .await
             {
-                Ok(next_session_name) => session_name = next_session_name,
+                Ok(next_session) => session_name = next_session.session_name,
                 Err(error) => {
                     return HandleOutcome::response(Response::Error(ErrorResponse { error }));
                 }
@@ -154,8 +159,17 @@ impl RequestHandler {
             return HandleOutcome::response(Response::Error(ErrorResponse { error }));
         }
         if let Some(client) = self.managed_client_for_pid(requester_pid).await {
-            if let ManagedClient::Attach(attach_pid) = client {
-                if let Err(error) = self.set_attached_client_flags(attach_pid, flags).await {
+            #[cfg(test)]
+            super::switching::pause_after_switch_target_identity_capture(&session_name).await;
+            if let SwitchManagedClientIdentity::Attach {
+                pid: attach_pid,
+                attach_id,
+            } = client
+            {
+                if let Err(error) = self
+                    .set_attached_client_flags(attach_pid, attach_id, flags)
+                    .await
+                {
                     return HandleOutcome::response(Response::Error(ErrorResponse { error }));
                 }
             } else if request.read_only || request.flags.is_some() {
@@ -178,8 +192,17 @@ impl RequestHandler {
             );
         }
         let attached_count = self.attached_count(&session_name).await.saturating_add(1);
-        let target = {
+        let (session_id, target) = {
             let state = self.state.lock().await;
+            let Some(session_id) = state
+                .sessions
+                .session(&session_name)
+                .map(rmux_core::Session::id)
+            else {
+                return HandleOutcome::response(Response::Error(ErrorResponse {
+                    error: RmuxError::SessionNotFound(session_name.to_string()),
+                }));
+            };
             match attach_target_for_session(
                 &state,
                 &session_name,
@@ -187,7 +210,7 @@ impl RequestHandler {
                 &terminal_context,
                 &self.socket_path(),
             ) {
-                Ok(target) => target,
+                Ok(target) => (session_id, target),
                 Err(error) => {
                     return HandleOutcome::response(Response::Error(ErrorResponse { error }));
                 }
@@ -196,14 +219,18 @@ impl RequestHandler {
 
         let (control_tx, control_rx) = mpsc::unbounded_channel();
 
-        HandleOutcome::attach(
-            Response::AttachSession(AttachSessionResponse { session_name }),
+        let upgrade = crate::pane_io::AttachSessionUpgrade::new(
+            session_id,
             target,
             control_tx,
             control_rx,
             flags,
             request.client_size,
             render_stream,
+        );
+        HandleOutcome::attach(
+            Response::AttachSession(AttachSessionResponse { session_name }),
+            upgrade,
         )
     }
 }

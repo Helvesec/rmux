@@ -1,7 +1,7 @@
 use rmux_core::{
     command_parser::{CommandArgument, CommandParseError, ParsedCommand, ParsedCommands},
     command_queue::CommandQueue,
-    LifecycleEvent, PaneGeometry, ENVIRON_HIDDEN,
+    PaneGeometry, PaneId, ENVIRON_HIDDEN,
 };
 use rmux_proto::request::Request;
 use rmux_proto::{
@@ -10,6 +10,9 @@ use rmux_proto::{
 };
 use std::collections::VecDeque;
 
+use super::control_support::{
+    current_control_queue_identity, with_control_queue_identity, ControlClientIdentity,
+};
 use super::RequestHandler;
 use crate::control::ControlCommandResult;
 use crate::mouse::{AttachedMouseEvent, MouseLocation};
@@ -149,7 +152,7 @@ impl RequestHandler {
         context: QueueExecutionContext,
     ) -> Result<CommandOutput, RmuxError> {
         let result = self
-            .execute_command_queue(requester_pid, commands, context, QueueMode::Detached)
+            .execute_command_queue(requester_pid, commands, context, QueueMode::Detached, None)
             .await;
         match result.error {
             Some(error) => Err(error),
@@ -157,9 +160,10 @@ impl RequestHandler {
         }
     }
 
-    pub(crate) async fn execute_control_commands(
+    pub(crate) async fn execute_control_commands_identity(
         &self,
         requester_pid: u32,
+        expected_control_id: u64,
         commands: ParsedCommands,
     ) -> ControlCommandResult {
         self.execute_command_queue(
@@ -167,8 +171,31 @@ impl RequestHandler {
             commands,
             QueueExecutionContext::without_caller_cwd(),
             QueueMode::Control,
+            Some(expected_control_id),
         )
         .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn execute_control_commands(
+        &self,
+        requester_pid: u32,
+        commands: ParsedCommands,
+    ) -> ControlCommandResult {
+        let expected_control_id = match self.control_queue_client_id(requester_pid).await {
+            Ok(control_id) => control_id,
+            Err(error) => {
+                return ControlCommandResult {
+                    stdout: Vec::new(),
+                    error: Some(error.clone()),
+                    source_file_error: None,
+                    execution_error: Some(error),
+                    exit_status: Some(1),
+                };
+            }
+        };
+        self.execute_control_commands_identity(requester_pid, expected_control_id, commands)
+            .await
     }
 
     pub(in crate::handler) async fn start_attached_prompt_binding_commands(
@@ -181,7 +208,7 @@ impl RequestHandler {
             return Ok(false);
         }
 
-        self.apply_parse_time_assignments(requester_pid, commands)
+        self.apply_parse_time_assignments(requester_pid, commands, None)
             .await?;
         let command = commands
             .commands()
@@ -239,9 +266,10 @@ impl RequestHandler {
         commands: ParsedCommands,
         context: QueueExecutionContext,
         mode: QueueMode,
+        expected_control_id: Option<u64>,
     ) -> ControlCommandResult {
         if let Err(error) = self
-            .apply_parse_time_assignments(requester_pid, &commands)
+            .apply_parse_time_assignments(requester_pid, &commands, expected_control_id)
             .await
         {
             return ControlCommandResult {
@@ -265,10 +293,24 @@ impl RequestHandler {
             let item_context = contexts
                 .pop_front()
                 .expect("queue item context must stay aligned");
-            match self
-                .execute_queued_command(requester_pid, item.command().clone(), &item_context, mode)
-                .await
-            {
+            let command_execution = self.execute_queued_command(
+                requester_pid,
+                item.command().clone(),
+                &item_context,
+                mode,
+                expected_control_id,
+            );
+            let command_action = match expected_control_id {
+                Some(control_id) => {
+                    with_control_queue_identity(
+                        ControlClientIdentity::new(requester_pid, control_id),
+                        command_execution,
+                    )
+                    .await
+                }
+                None => command_execution.await,
+            };
+            match command_action {
                 Ok(QueueCommandAction::Normal {
                     output: Some(output),
                     error,
@@ -356,7 +398,11 @@ impl RequestHandler {
                     inserted_command_count = next_inserted_count;
                     for (commands, context) in batches.into_iter().rev() {
                         if let Err(error) = self
-                            .apply_parse_time_assignments(requester_pid, &commands)
+                            .apply_parse_time_assignments(
+                                requester_pid,
+                                &commands,
+                                expected_control_id,
+                            )
                             .await
                         {
                             execution_errors.push(error.clone());
@@ -415,8 +461,16 @@ impl RequestHandler {
         command: ParsedCommand,
         context: &QueueExecutionContext,
         mode: QueueMode,
+        expected_control_id: Option<u64>,
     ) -> Result<QueueCommandAction, RmuxError> {
         let command_for_hooks = command.clone();
+        if mode == QueueMode::Control {
+            self.validate_control_queue_session_identity(
+                requester_pid,
+                expected_control_id.expect("control queues capture a client identity"),
+            )
+            .await?;
+        }
         let attached_session = self.current_session_candidate(requester_pid).await;
         let socket_path = self.socket_path();
         let requester_pane_id = context
@@ -485,6 +539,13 @@ impl RequestHandler {
                     Request::RunShell(request) => request.target.clone(),
                     _ => None,
                 };
+                let explicit_target_run_shell = match explicit_target_run_shell {
+                    Some(target) => self
+                        .pane_id_for_slot_target(&target)
+                        .await
+                        .map(|pane_id| (target, pane_id)),
+                    None => None,
+                };
                 let request = apply_queue_context_to_request(request, context);
                 let request = crate::server_access::apply_access_policy(request, can_write)?;
                 let request_for_hooks = request.clone();
@@ -495,14 +556,18 @@ impl RequestHandler {
                     context.client_name.clone(),
                 ))
                 .await;
-                let targeted_output_delivered = if let Some(target) =
-                    explicit_target_run_shell.as_ref()
-                {
-                    self.deliver_targeted_run_shell_output(requester_pid, target, &outcome.response)
+                let targeted_output_delivered =
+                    if let Some((target, pane_id)) = explicit_target_run_shell.as_ref() {
+                        self.deliver_targeted_run_shell_output(
+                            requester_pid,
+                            target,
+                            *pane_id,
+                            &outcome.response,
+                        )
                         .await
-                } else {
-                    false
-                };
+                    } else {
+                        false
+                    };
                 let inline_hook_names = inline_hooks
                     .iter()
                     .map(|pending| pending.hook)
@@ -522,6 +587,7 @@ impl RequestHandler {
                     QueueMode::Control => {
                         self.control_queue_action_from_outcome(
                             requester_pid,
+                            expected_control_id.expect("control queues capture a client identity"),
                             request_for_hooks,
                             outcome,
                         )
@@ -607,13 +673,17 @@ impl RequestHandler {
         &self,
         requester_pid: u32,
         target: &PaneTarget,
+        pane_id: PaneId,
         response: &Response,
     ) -> bool {
         let Response::RunShell(response) = response else {
             return false;
         };
         let Some(output) = response.command_output() else {
-            return true;
+            return self
+                .current_target_for_stable_pane(pane_id, Some(target.session_name()))
+                .await
+                .is_some();
         };
         let message = String::from_utf8_lossy(output.stdout())
             .trim_end_matches(['\r', '\n'])
@@ -622,8 +692,9 @@ impl RequestHandler {
             return true;
         }
         matches!(
-            self.handle_display_message(
+            self.handle_display_message_for_stable_pane(
                 requester_pid,
+                pane_id,
                 DisplayMessageRequest {
                     target: Some(Target::Pane(target.clone())),
                     print: false,
@@ -636,19 +707,53 @@ impl RequestHandler {
         )
     }
 
+    async fn pane_id_for_slot_target(&self, target: &PaneTarget) -> Option<PaneId> {
+        let state = self.state.lock().await;
+        state
+            .sessions
+            .session(target.session_name())
+            .and_then(|session| {
+                session.pane_id_in_window(target.window_index(), target.pane_index())
+            })
+    }
+
     async fn apply_parse_time_assignments(
         &self,
         requester_pid: u32,
         commands: &ParsedCommands,
+        expected_control_id: Option<u64>,
     ) -> Result<(), RmuxError> {
         if commands.assignments().is_empty() {
             return Ok(());
         }
-        if !self.requester_can_write(requester_pid).await {
-            return Err(RmuxError::Server("client is read-only".to_owned()));
-        }
 
-        let mut state = self.state.lock().await;
+        let expected_control_id = expected_control_id.or_else(|| {
+            current_control_queue_identity(requester_pid).map(ControlClientIdentity::control_id)
+        });
+        let (mut state, _active_control) = if let Some(control_id) = expected_control_id {
+            let state = self.state.lock().await;
+            let active_control = self.active_control.lock().await;
+            RequestHandler::validate_control_queue_identity_locked(
+                &state,
+                &active_control,
+                requester_pid,
+                control_id,
+            )?;
+            if !active_control
+                .by_pid
+                .get(&requester_pid)
+                .expect("validated control client remains registered while locked")
+                .can_write
+            {
+                return Err(RmuxError::Server("client is read-only".to_owned()));
+            }
+            (state, Some(active_control))
+        } else {
+            if !self.requester_can_write(requester_pid).await {
+                return Err(RmuxError::Server("client is read-only".to_owned()));
+            }
+            (self.state.lock().await, None)
+        };
         for assignment in commands.assignments() {
             state.environment.set_with_flags(
                 ScopeSelector::Global,
@@ -1017,10 +1122,12 @@ impl RequestHandler {
     async fn control_queue_action_from_outcome(
         &self,
         requester_pid: u32,
+        expected_control_id: u64,
         request: Request,
         outcome: crate::pane_io::HandleOutcome,
     ) -> Result<QueueCommandAction, RmuxError> {
-        if let Some(_attach) = outcome.attach {
+        let control_identity = ControlClientIdentity::new(requester_pid, expected_control_id);
+        if let Some(attach) = outcome.attach {
             if matches!(
                 request,
                 Request::AttachSession(_)
@@ -1033,32 +1140,27 @@ impl RequestHandler {
                         "attach-session upgrade requires an attach-session response".to_owned(),
                     ));
                 };
-                {
-                    let mut state = self.state.lock().await;
-                    if let Some(session) = state.sessions.session_mut(&response.session_name) {
-                        session.touch_attached();
-                    }
-                }
-                let _ = self
-                    .set_control_session(requester_pid, Some(response.session_name.clone()))
-                    .await?;
-                self.emit_client_attached(requester_pid, response.session_name.clone())
-                    .await;
+                let session_id = attach.session_id;
+                self.attach_control_session_for_queue(
+                    control_identity,
+                    &response.session_name,
+                    Some(session_id),
+                )
+                .await?;
+                self.emit_client_attached_identity(
+                    requester_pid,
+                    response.session_name.clone(),
+                    session_id,
+                )
+                .await;
             }
         }
 
         if matches!(request, Request::NewSession(_) | Request::NewSessionExt(_)) {
             if let Response::NewSession(response) = &outcome.response {
-                if !response.detached
-                    && self
-                        .attach_control_to_existing_session(requester_pid, &response.session_name)
-                        .await
-                {
-                    self.emit(LifecycleEvent::ClientSessionChanged {
-                        session_name: response.session_name.clone(),
-                        client_name: Some(requester_pid.to_string()),
-                    })
-                    .await;
+                if !response.detached {
+                    self.validate_control_session_for_queue(control_identity)
+                        .await?;
                 }
             }
         }
@@ -1074,3 +1176,7 @@ fn command_parse_error_to_rmux(error: CommandParseError) -> RmuxError {
 #[cfg(test)]
 #[path = "handler_scripting/config_path_tests.rs"]
 mod config_path_tests;
+
+#[cfg(test)]
+#[path = "handler_scripting/control_queue_identity_tests.rs"]
+mod control_queue_identity_tests;

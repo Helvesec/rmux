@@ -5,7 +5,7 @@ use rmux_proto::{OptionScopeSelector, PaneTarget, RmuxError, SessionName};
 
 use super::{session_not_found, HandlerState};
 
-pub(crate) type PaneSlotSnapshot = HashMap<PaneId, PaneTarget>;
+pub(crate) type PaneSlotSnapshot = HashMap<PaneId, Vec<PaneTarget>>;
 
 impl HandlerState {
     pub(crate) fn pane_alias_targets(&self, pane_id: PaneId) -> Vec<PaneTarget> {
@@ -58,7 +58,10 @@ impl HandlerState {
         &mut self,
         source: &Session,
     ) -> Result<(), RmuxError> {
-        let sources = pane_option_slots(source).into_values().collect::<Vec<_>>();
+        let sources = pane_option_slots(source)
+            .into_values()
+            .filter_map(|targets| targets.into_iter().next())
+            .collect::<Vec<_>>();
         for source in sources {
             self.synchronize_pane_alias_options_from_target(&source)?;
         }
@@ -137,19 +140,41 @@ impl HandlerState {
         self.rekey_pane_options_between_snapshots(before, &after)
     }
 
+    pub(crate) fn rekey_and_synchronize_pane_options_after_session_change(
+        &mut self,
+        before: &PaneSlotSnapshot,
+        session_name: &SessionName,
+    ) -> Result<(), RmuxError> {
+        self.rekey_pane_options_after_session_change(before, session_name)?;
+        let session = self
+            .sessions
+            .session(session_name)
+            .cloned()
+            .ok_or_else(|| session_not_found(session_name))?;
+        self.synchronize_pane_alias_options_from_session(&session)
+    }
+
     pub(crate) fn rekey_pane_options_between_snapshots(
         &mut self,
         before: &PaneSlotSnapshot,
         after: &PaneSlotSnapshot,
     ) -> Result<(), RmuxError> {
-        let mappings = before
-            .iter()
-            .filter_map(|(pane_id, source)| match after.get(pane_id) {
-                Some(target) if target != source => Some((source.clone(), Some(target.clone()))),
-                None => Some((source.clone(), None)),
-                Some(_) => None,
-            })
-            .collect::<Vec<_>>();
+        let mut mappings = Vec::new();
+        for (pane_id, sources) in before {
+            let targets = after.get(pane_id).map(Vec::as_slice).unwrap_or_default();
+            for (source, target) in sources.iter().zip(targets) {
+                if source != target {
+                    mappings.push((source.clone(), Some(target.clone())));
+                }
+            }
+            mappings.extend(
+                sources
+                    .iter()
+                    .skip(targets.len())
+                    .cloned()
+                    .map(|source| (source, None)),
+            );
+        }
         self.options.rekey_pane_overrides(&mappings)
     }
 }
@@ -169,16 +194,25 @@ fn pane_id_for_target(
 }
 
 fn pane_option_slots(session: &Session) -> PaneSlotSnapshot {
-    session
-        .windows()
-        .iter()
-        .flat_map(|(window_index, window)| {
-            window.panes().iter().map(move |pane| {
-                (
-                    pane.id(),
-                    PaneTarget::with_window(session.name().clone(), *window_index, pane.index()),
-                )
-            })
-        })
-        .collect()
+    let mut slots = PaneSlotSnapshot::new();
+    for (window_index, window) in session.windows() {
+        for pane in window.panes() {
+            slots
+                .entry(pane.id())
+                .or_default()
+                .push(PaneTarget::with_window(
+                    session.name().clone(),
+                    *window_index,
+                    pane.index(),
+                ));
+        }
+    }
+    for targets in slots.values_mut() {
+        targets.sort_by(|left, right| {
+            left.window_index()
+                .cmp(&right.window_index())
+                .then_with(|| left.pane_index().cmp(&right.pane_index()))
+        });
+    }
+    slots
 }

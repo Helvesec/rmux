@@ -18,6 +18,8 @@ pub(crate) const PANE_STATE_JOURNAL_CAPACITY: usize = 4096;
 pub(crate) const PANE_STATE_CURSOR_BATCH: usize = 256;
 pub(crate) const PANE_STATE_JOURNAL_BYTE_CAPACITY: usize = DEFAULT_MAX_DETACHED_FRAME_LENGTH / 2;
 
+type PaneGeneration = (PaneId, Option<u64>);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PaneStateInclude {
     pub(crate) title: bool,
@@ -131,6 +133,15 @@ impl EvictedPaneStateRevisions {
         }
         revision
     }
+
+    fn merge(self, other: Self) -> Self {
+        Self {
+            title: self.title.max(other.title),
+            options: self.options.max(other.options),
+            foreground: self.foreground.max(other.foreground),
+            closed: self.closed.max(other.closed),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,10 +162,11 @@ pub(crate) struct PaneStateJournal {
     next_subscription: u64,
     limits: SubscriptionLimits,
     records: VecDeque<PaneStateRecord>,
-    retained_record_counts: HashMap<PaneId, usize>,
-    evicted_revisions: HashMap<PaneId, EvictedPaneStateRevisions>,
+    retained_record_counts: HashMap<PaneGeneration, usize>,
+    evicted_revisions: HashMap<PaneGeneration, EvictedPaneStateRevisions>,
     subscriptions: HashMap<PaneStateSubscriptionId, PaneStateSubscription>,
     subscription_counts: HashMap<PaneId, usize>,
+    subscription_generation_counts: HashMap<PaneGeneration, usize>,
     closed_panes: HashSet<PaneId>,
     closed_pane_order: VecDeque<PaneId>,
 }
@@ -191,6 +203,7 @@ impl PaneStateJournal {
             evicted_revisions: HashMap::new(),
             subscriptions: HashMap::new(),
             subscription_counts: HashMap::new(),
+            subscription_generation_counts: HashMap::new(),
             closed_panes: HashSet::new(),
             closed_pane_order: VecDeque::new(),
         }
@@ -218,15 +231,18 @@ impl PaneStateJournal {
             .retained_bytes
             .saturating_add(retained_record_bytes(&record));
         self.records.push_back(record);
-        increment_count(&mut self.retained_record_counts, pane_id);
+        increment_generation_count(&mut self.retained_record_counts, (pane_id, generation));
         while self.records.len() > self.capacity || self.retained_bytes > self.byte_capacity {
             if let Some(record) = self.records.pop_front() {
                 self.retained_bytes = self
                     .retained_bytes
                     .saturating_sub(retained_record_bytes(&record));
-                decrement_count(&mut self.retained_record_counts, record.pane_id);
+                decrement_generation_count(
+                    &mut self.retained_record_counts,
+                    (record.pane_id, record.generation),
+                );
                 self.record_eviction(&record);
-                self.prune_evicted_revision_for(record.pane_id);
+                self.prune_evicted_revision_key((record.pane_id, record.generation));
             }
         }
         debug_assert!(self.retained_bytes <= self.byte_capacity);
@@ -235,16 +251,38 @@ impl PaneStateJournal {
 
     fn record_eviction(&mut self, record: &PaneStateRecord) {
         self.evicted_revisions
-            .entry(record.pane_id)
+            .entry((record.pane_id, record.generation))
             .or_default()
             .record(record);
     }
 
-    fn prune_evicted_revision_for(&mut self, pane_id: PaneId) {
-        if !self.retained_record_counts.contains_key(&pane_id)
-            && !self.subscription_counts.contains_key(&pane_id)
+    fn prune_evicted_revision_key(&mut self, key: PaneGeneration) {
+        if self.retained_record_counts.contains_key(&key)
+            || self.subscription_generation_counts.contains_key(&key)
         {
-            self.evicted_revisions.remove(&pane_id);
+            return;
+        }
+        let legacy_subscription = key.1.is_some()
+            && self
+                .subscription_generation_counts
+                .contains_key(&(key.0, None));
+        if let Some(evicted) = self.evicted_revisions.remove(&key) {
+            if legacy_subscription {
+                let aggregate = self.evicted_revisions.entry((key.0, None)).or_default();
+                *aggregate = aggregate.merge(evicted);
+            }
+        }
+    }
+
+    fn prune_evicted_revisions_for_pane(&mut self, pane_id: PaneId) {
+        let keys = self
+            .evicted_revisions
+            .keys()
+            .copied()
+            .filter(|(candidate, _)| *candidate == pane_id)
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.prune_evicted_revision_key(key);
         }
     }
 
@@ -321,6 +359,10 @@ impl PaneStateJournal {
             },
         );
         increment_count(&mut self.subscription_counts, pane_id);
+        increment_generation_count(
+            &mut self.subscription_generation_counts,
+            (pane_id, generation),
+        );
         Ok(id)
     }
 
@@ -479,8 +521,7 @@ impl PaneStateJournal {
             for record in self.records.iter().filter(|record| {
                 record.revision > after_revision
                     && closed_revision.is_none_or(|revision| record.revision <= revision)
-                    && record.pane_id == subscription.pane_id
-                    && record_matches_include(record, subscription.include)
+                    && record_matches_subscription(record, subscription)
             }) {
                 output.push(record_to_dto(record));
                 if output.len() >= limit {
@@ -528,9 +569,7 @@ impl PaneStateJournal {
         }
 
         for record in self.records.iter().filter(|record| {
-            record.revision > after_revision
-                && record.pane_id == subscription.pane_id
-                && record_matches_include(record, subscription.include)
+            record.revision > after_revision && record_matches_subscription(record, subscription)
         }) {
             output.push(record_to_dto(record));
             if output.len() >= limit {
@@ -556,8 +595,7 @@ impl PaneStateJournal {
         after_revision: u64,
     ) -> Option<PaneStateRead> {
         let evicted_revision = self
-            .evicted_revisions
-            .get(&subscription.pane_id)?
+            .evicted_revisions_for(subscription)
             .max_matching(subscription.include);
         if evicted_revision == 0 || after_revision >= evicted_revision {
             return None;
@@ -574,8 +612,7 @@ impl PaneStateJournal {
         after_revision: u64,
     ) -> Option<PaneStateRead> {
         let evicted_revision = self
-            .evicted_revisions
-            .get(&subscription.pane_id)?
+            .evicted_revisions_for(subscription)
             .max_matching_state_change(subscription.include);
         // The terminal Closed record is synthesized by read_after even after
         // eviction, so only evictions strictly before the close require a
@@ -623,8 +660,7 @@ impl PaneStateJournal {
             .find(|record| {
                 record.revision > after_revision
                     && upper_revision.is_none_or(|revision| record.revision <= revision)
-                    && record.pane_id == subscription.pane_id
-                    && record_matches_include(record, subscription.include)
+                    && record_matches_subscription(record, subscription)
             })
             .map_or_else(
                 || upper_revision.unwrap_or_else(|| self.next_revision.max(after_revision)),
@@ -638,8 +674,33 @@ impl PaneStateJournal {
     ) -> Option<PaneStateSubscription> {
         let subscription = self.subscriptions.remove(&subscription_id)?;
         decrement_count(&mut self.subscription_counts, subscription.pane_id);
-        self.prune_evicted_revision_for(subscription.pane_id);
+        decrement_generation_count(
+            &mut self.subscription_generation_counts,
+            (subscription.pane_id, subscription.generation),
+        );
+        self.prune_evicted_revisions_for_pane(subscription.pane_id);
         Some(subscription)
+    }
+
+    fn evicted_revisions_for(
+        &self,
+        subscription: &PaneStateSubscription,
+    ) -> EvictedPaneStateRevisions {
+        match subscription.generation {
+            Some(generation) => self
+                .evicted_revisions
+                .get(&(subscription.pane_id, Some(generation)))
+                .copied()
+                .unwrap_or_default(),
+            None => self
+                .evicted_revisions
+                .iter()
+                .filter(|((pane_id, _), _)| *pane_id == subscription.pane_id)
+                .fold(
+                    EvictedPaneStateRevisions::default(),
+                    |combined, (_, next)| combined.merge(*next),
+                ),
+        }
     }
 }
 
@@ -656,6 +717,19 @@ fn decrement_count(counts: &mut HashMap<PaneId, usize>, pane_id: PaneId) {
     }
 }
 
+fn increment_generation_count(counts: &mut HashMap<PaneGeneration, usize>, key: PaneGeneration) {
+    *counts.entry(key).or_insert(0) += 1;
+}
+
+fn decrement_generation_count(counts: &mut HashMap<PaneGeneration, usize>, key: PaneGeneration) {
+    if let Some(count) = counts.get_mut(&key) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            counts.remove(&key);
+        }
+    }
+}
+
 fn record_matches_include(record: &PaneStateRecord, include: PaneStateInclude) -> bool {
     match record.change {
         PaneStateChange::TitleChanged { .. } => include.title,
@@ -663,6 +737,17 @@ fn record_matches_include(record: &PaneStateRecord, include: PaneStateInclude) -
         PaneStateChange::ForegroundChanged { .. } => include.foreground,
         PaneStateChange::Closed { .. } => true,
     }
+}
+
+fn record_matches_subscription(
+    record: &PaneStateRecord,
+    subscription: &PaneStateSubscription,
+) -> bool {
+    record.pane_id == subscription.pane_id
+        && subscription
+            .generation
+            .is_none_or(|generation| record.generation == Some(generation))
+        && record_matches_include(record, subscription.include)
 }
 
 fn record_to_dto(record: &PaneStateRecord) -> PaneStateEventDto {
@@ -1125,7 +1210,10 @@ mod tests {
             },
         );
 
-        assert!(!journal.evicted_revisions.contains_key(&pane_id(1)));
+        assert!(!journal
+            .evicted_revisions
+            .keys()
+            .any(|(candidate, _)| *candidate == pane_id(1)));
         assert!(journal.evicted_revisions.is_empty());
     }
 
@@ -1160,7 +1248,7 @@ mod tests {
             },
         );
 
-        assert!(journal.evicted_revisions.contains_key(&pane_id(1)));
+        assert!(journal.evicted_revisions.contains_key(&(pane_id(1), None)));
         assert_eq!(
             journal.read_after(7, subscription, 0, 16, &mut Vec::new()),
             Ok(PaneStateRead::Lag {
@@ -1903,5 +1991,178 @@ mod tests {
                 "seed {seed}: cursor regressed after terminal Closed (I1)"
             );
         }
+    }
+
+    #[test]
+    fn generation_scoped_subscription_ignores_late_and_evicted_old_generation_events() {
+        let watched = pane_id(91);
+        let mut journal = PaneStateJournal::new(1);
+        let subscription = journal
+            .subscribe_at_generation(
+                7,
+                watched,
+                PaneStateInclude {
+                    title: true,
+                    options: false,
+                    foreground: false,
+                },
+                Some(2),
+            )
+            .expect("generation-scoped subscription");
+
+        journal.push(
+            watched,
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "old".to_owned(),
+                new: "stale".to_owned(),
+            },
+        );
+        journal.push(
+            pane_id(92),
+            Some(1),
+            PaneStateChange::TitleChanged {
+                old: "noise-old".to_owned(),
+                new: "noise-new".to_owned(),
+            },
+        );
+
+        let mut output = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, 0, 8, &mut output),
+            Ok(PaneStateRead::Ready {
+                next_revision: 2,
+                limited: false,
+                event_count: 0,
+            })
+        );
+        assert!(output.is_empty());
+
+        journal.push(
+            watched,
+            Some(2),
+            PaneStateChange::TitleChanged {
+                old: "current-old".to_owned(),
+                new: "current-new".to_owned(),
+            },
+        );
+        assert_eq!(
+            journal.read_after(7, subscription, 2, 8, &mut output),
+            Ok(PaneStateRead::Ready {
+                next_revision: 3,
+                limited: false,
+                event_count: 1,
+            })
+        );
+        assert!(matches!(
+            output.as_slice(),
+            [PaneStateEventDto::TitleChanged { new_title, .. }] if new_title == "current-new"
+        ));
+    }
+
+    #[test]
+    fn generation_scoped_subscription_ignores_retained_old_generation_option_events() {
+        let watched = pane_id(95);
+        let mut journal = PaneStateJournal::new(4);
+        let subscription = journal
+            .subscribe_at_generation(
+                7,
+                watched,
+                PaneStateInclude {
+                    title: false,
+                    options: true,
+                    foreground: false,
+                },
+                Some(2),
+            )
+            .expect("generation-scoped subscription");
+
+        journal.push(
+            watched,
+            Some(1),
+            PaneStateChange::OptionSet {
+                name: "@stale".to_owned(),
+                old: None,
+                new: "old-generation".to_owned(),
+            },
+        );
+        let mut output = Vec::new();
+        assert_eq!(
+            journal.read_after(7, subscription, 0, 8, &mut output),
+            Ok(PaneStateRead::Ready {
+                next_revision: 1,
+                limited: false,
+                event_count: 0,
+            })
+        );
+        assert!(output.is_empty());
+
+        journal.push(
+            watched,
+            Some(2),
+            PaneStateChange::OptionSet {
+                name: "@current".to_owned(),
+                old: None,
+                new: "current-generation".to_owned(),
+            },
+        );
+        assert_eq!(
+            journal.read_after(7, subscription, 1, 8, &mut output),
+            Ok(PaneStateRead::Ready {
+                next_revision: 2,
+                limited: false,
+                event_count: 1,
+            })
+        );
+        assert!(matches!(
+            output.as_slice(),
+            [PaneStateEventDto::OptionSet { name, new_value, .. }]
+                if name == "@current" && new_value == "current-generation"
+        ));
+    }
+
+    #[test]
+    fn legacy_subscription_compacts_evictions_across_many_generations() {
+        let watched = pane_id(93);
+        let noise = pane_id(94);
+        let mut journal = PaneStateJournal::new(1);
+        let _subscription = journal
+            .subscribe(
+                7,
+                watched,
+                PaneStateInclude {
+                    title: true,
+                    options: false,
+                    foreground: false,
+                },
+            )
+            .expect("legacy subscription");
+
+        for generation in 1..=100 {
+            journal.push(
+                watched,
+                Some(generation),
+                PaneStateChange::TitleChanged {
+                    old: generation.to_string(),
+                    new: (generation + 1).to_string(),
+                },
+            );
+            journal.push(
+                noise,
+                Some(generation),
+                PaneStateChange::TitleChanged {
+                    old: "noise".to_owned(),
+                    new: "noise-next".to_owned(),
+                },
+            );
+        }
+
+        let watched_keys = journal
+            .evicted_revisions
+            .keys()
+            .filter(|(pane_id, _)| *pane_id == watched)
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(watched_keys, vec![(watched, None)]);
     }
 }

@@ -71,10 +71,6 @@ impl LivePaneRender {
         self.snapshot.can_forward_plain_bytes(bytes)
     }
 
-    pub(crate) fn positioned_plain_echo_frame(&self, bytes: &[u8]) -> Option<Vec<u8>> {
-        self.snapshot.positioned_plain_echo_frame(bytes)
-    }
-
     pub(crate) fn positioned_plain_output_frame(&mut self, bytes: &[u8]) -> Option<Vec<u8>> {
         self.snapshot.positioned_plain_output_frame(bytes)
     }

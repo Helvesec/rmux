@@ -8,8 +8,9 @@ use crate::handler::scripting_support::{
 };
 use crate::handler::ControlRegistration;
 use crate::outer_terminal::OuterTerminalContext;
+use rmux_core::LifecycleEvent;
 use rmux_os::identity::UserIdentity;
-use rmux_proto::SetBufferRequest;
+use rmux_proto::{HookLifecycle, SetBufferRequest, SetHookRequest};
 use tokio::sync::mpsc;
 
 #[tokio::test]
@@ -34,7 +35,7 @@ async fn parsed_queue_assignments_apply_before_following_commands() {
 async fn read_only_control_rejects_parse_time_assignments() {
     let handler = RequestHandler::new();
     let requester_pid = 42_001;
-    register_read_only_control_client(&handler, requester_pid).await;
+    let _control_events = register_read_only_control_client(&handler, requester_pid).await;
     let parsed = CommandParser::new()
         .parse("FOO=bar list-sessions")
         .expect("commands parse");
@@ -55,12 +56,12 @@ async fn read_only_control_rejects_parse_time_assignments() {
 }
 
 #[tokio::test]
-async fn read_only_control_rejects_inserted_parse_time_assignments() {
+async fn read_only_control_rejects_nested_assignment_in_an_unselected_runtime_branch() {
     let handler = RequestHandler::new();
     let requester_pid = 42_002;
-    register_read_only_control_client(&handler, requester_pid).await;
+    let _control_events = register_read_only_control_client(&handler, requester_pid).await;
     let parsed = CommandParser::new()
-        .parse("if-shell -F 1 { FOO=bar list-sessions }")
+        .parse("if-shell -F 0 { FOO=bar list-sessions }")
         .expect("commands parse");
 
     let result = handler
@@ -79,10 +80,37 @@ async fn read_only_control_rejects_inserted_parse_time_assignments() {
 }
 
 #[tokio::test]
+async fn nested_assignments_apply_at_parse_time_across_runtime_branches_and_hooks() {
+    let handler = RequestHandler::new();
+    let parsed = CommandParser::new()
+        .parse(
+            "if-shell -F 0 { FALSE_BRANCH=parsed } { ELSE_BRANCH=parsed } ; set-hook -g after-new-window { HOOK_BODY=parsed }",
+        )
+        .expect("commands parse");
+
+    let output = handler
+        .execute_parsed_commands_for_test(std::process::id(), parsed)
+        .await
+        .expect("queue succeeds");
+
+    assert!(output.stdout().is_empty());
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.environment.global_value("FALSE_BRANCH"),
+        Some("parsed")
+    );
+    assert_eq!(
+        state.environment.global_value("ELSE_BRANCH"),
+        Some("parsed")
+    );
+    assert_eq!(state.environment.global_value("HOOK_BODY"), Some("parsed"));
+}
+
+#[tokio::test]
 async fn read_only_control_rejects_special_queue_invocations() {
     let handler = RequestHandler::new();
     let requester_pid = 42_003;
-    register_read_only_control_client(&handler, requester_pid).await;
+    let _control_events = register_read_only_control_client(&handler, requester_pid).await;
 
     for command in [
         "if-shell -F 1 { list-sessions }",
@@ -193,7 +221,7 @@ async fn detached_read_only_requester_rejects_mutating_queue_commands() {
 async fn control_queue_rejects_excessive_runtime_command_insertion() {
     let handler = RequestHandler::new();
     let requester_pid = 424_005;
-    let _access = handler.begin_detached_requester_access(requester_pid, true);
+    let _control_events = register_control_client(&handler, requester_pid, true).await;
     let inserted = "start-server ;".repeat(CONTROL_QUEUE_INSERTED_COMMAND_LIMIT + 1);
     let parsed = CommandParser::new()
         .parse(&format!("if-shell -F 1 '{inserted}'"))
@@ -217,7 +245,7 @@ async fn control_queue_rejects_excessive_runtime_command_insertion() {
 async fn control_queue_bounds_aggregate_stdout_before_extension() {
     let handler = RequestHandler::new();
     let requester_pid = 424_006;
-    let _access = handler.begin_detached_requester_access(requester_pid, true);
+    let _control_events = register_control_client(&handler, requester_pid, true).await;
     let chunk = vec![b'x'; CONTROL_QUEUE_STDOUT_LIMIT / 2 + 1];
     let response = handler
         .handle(Request::SetBuffer(Box::new(SetBufferRequest {
@@ -253,7 +281,7 @@ async fn control_queue_bounds_aggregate_stdout_before_extension() {
 async fn read_only_control_allows_list_panes_all_observation() {
     let handler = RequestHandler::new();
     let requester_pid = 42_004;
-    register_read_only_control_client(&handler, requester_pid).await;
+    let _control_events = register_read_only_control_client(&handler, requester_pid).await;
     let parsed = CommandParser::new()
         .parse("list-panes -a")
         .expect("commands parse");
@@ -297,8 +325,19 @@ async fn parsed_queue_lock_client_defaults_to_current_client() {
     assert!(output.stdout().is_empty());
 }
 
-async fn register_read_only_control_client(handler: &RequestHandler, requester_pid: u32) {
-    let (event_tx, _event_rx) = mpsc::channel::<ControlServerEvent>(CONTROL_SERVER_EVENT_CAPACITY);
+async fn register_read_only_control_client(
+    handler: &RequestHandler,
+    requester_pid: u32,
+) -> mpsc::Receiver<ControlServerEvent> {
+    register_control_client(handler, requester_pid, false).await
+}
+
+async fn register_control_client(
+    handler: &RequestHandler,
+    requester_pid: u32,
+    can_write: bool,
+) -> mpsc::Receiver<ControlServerEvent> {
+    let (event_tx, event_rx) = mpsc::channel::<ControlServerEvent>(CONTROL_SERVER_EVENT_CAPACITY);
     handler
         .register_control_with_access(
             requester_pid,
@@ -312,10 +351,11 @@ async fn register_read_only_control_client(handler: &RequestHandler, requester_p
                 closing: Arc::new(AtomicBool::new(false)),
                 uid: 1000,
                 user: UserIdentity::Uid(1000),
-                can_write: false,
+                can_write,
             },
         )
         .await;
+    event_rx
 }
 
 #[tokio::test]
@@ -595,6 +635,114 @@ async fn parsed_queue_resolves_session_only_new_window_targets_at_protocol_bound
             .expect("window exists")
             .name(),
         Some("logs")
+    );
+}
+
+#[tokio::test]
+async fn parsed_queue_new_window_prepares_linked_identity_before_same_slot_reuse() {
+    let handler = Arc::new(RequestHandler::new());
+    let alpha = session_name("queued-new-window-slot-reuse");
+    assert!(matches!(
+        handler
+            .handle(Request::NewSession(NewSessionRequest {
+                session_name: alpha.clone(),
+                detached: true,
+                size: Some(TerminalSize { cols: 80, rows: 24 }),
+                environment: None,
+            }))
+            .await,
+        Response::NewSession(_)
+    ));
+    let hook = handler
+        .handle(Request::SetHook(SetHookRequest {
+            scope: ScopeSelector::Global,
+            hook: HookName::WindowLinked,
+            command: "kill-window".to_owned(),
+            lifecycle: HookLifecycle::Persistent,
+        }))
+        .await;
+    assert!(matches!(hook, Response::SetHook(_)), "{hook:?}");
+    let mut events = handler.subscribe_lifecycle_events();
+    let pause = handler.install_window_lifecycle_emit_pause();
+    let parsed = CommandParser::new()
+        .parse("new-window -d -t queued-new-window-slot-reuse:1")
+        .expect("commands parse");
+
+    let queue_handler = Arc::clone(&handler);
+    let creating = tokio::spawn(async move {
+        queue_handler
+            .execute_parsed_commands_for_test(std::process::id(), parsed)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), pause.reached.notified())
+        .await
+        .expect("queued new-window reaches post-commit lifecycle pause");
+
+    let removed = handler
+        .handle_kill_window(KillWindowRequest {
+            target: WindowTarget::with_window(alpha.clone(), 1),
+            kill_all_others: false,
+        })
+        .await;
+    assert!(matches!(removed, Response::KillWindow(_)), "{removed:?}");
+    let replacement = handler
+        .handle_new_window(
+            std::process::id(),
+            NewWindowRequest {
+                target: alpha.clone(),
+                name: None,
+                detached: true,
+                start_directory: None,
+                environment: None,
+                command: None,
+                process_command: None,
+                target_window_index: Some(1),
+                insert_at_target: false,
+            },
+        )
+        .await;
+    assert!(
+        matches!(replacement, Response::NewWindow(_)),
+        "{replacement:?}"
+    );
+    let replacement_id = handler
+        .state
+        .lock()
+        .await
+        .sessions
+        .session(&alpha)
+        .and_then(|session| session.window_at(1))
+        .expect("replacement window exists")
+        .id();
+    while events.try_recv().is_ok() {}
+    pause.release.notify_one();
+    creating
+        .await
+        .expect("queued new-window task joins")
+        .expect("queue succeeds");
+
+    let event = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .expect("queued window-linked event arrives")
+            .expect("lifecycle sender remains open");
+        if matches!(
+            &event.event,
+            LifecycleEvent::WindowLinked { session_name, .. } if session_name == &alpha
+        ) {
+            break event;
+        }
+    };
+    handler.dispatch_lifecycle_hook(event).await;
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state
+            .sessions
+            .session(&alpha)
+            .and_then(|session| session.window_at(1))
+            .expect("replacement slot survives the destructive hook")
+            .id(),
+        replacement_id
     );
 }
 

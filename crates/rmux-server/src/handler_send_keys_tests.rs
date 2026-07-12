@@ -8,8 +8,8 @@ use rmux_proto::{
     ListPanesRequest, NewSessionExtRequest, NewSessionRequest, OptionName,
     PaneBroadcastInputRequest, PaneId, PaneTarget, PaneTargetRef, Request, Response, RmuxError,
     ScopeSelector, SelectPaneRequest, SendKeysExtRequest, SendKeysRequest, SendKeysResponse,
-    SendPrefixRequest, SendPrefixResponse, SetHookMutationRequest, SetOptionMode, SetOptionRequest,
-    ShowBufferRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget,
+    SendPrefixRequest, SendPrefixResponse, SetHookMutationRequest, SetHookRequest, SetOptionMode,
+    SetOptionRequest, ShowBufferRequest, SplitDirection, SplitWindowRequest, SplitWindowTarget,
     SwitchClientExtRequest, TerminalSize, UnbindKeyRequest, WindowTarget, DEFAULT_MAX_FRAME_LENGTH,
 };
 use std::time::Duration;
@@ -82,4 +82,63 @@ async fn create_send_keys_test_session(
         }))
         .await;
     assert!(matches!(created, Response::NewSession(_)));
+}
+
+// A pane command that stays alive but emits nothing to the transcript, so a
+// test that asserts on rendered content is not racing the real login shell's
+// prompt (cmd.exe prints `C:\Users\...`, bash prints `PS1`) into the same
+// cells the test wrote. Mirrors the quiet command used by the alert tests.
+#[cfg(unix)]
+fn quiet_pane_command() -> Vec<String> {
+    ["/bin/sh", "-c", "sleep 60"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(windows)]
+fn quiet_pane_command() -> Vec<String> {
+    let system_root =
+        std::env::var_os("SystemRoot").unwrap_or_else(|| std::ffi::OsString::from(r"C:\Windows"));
+    let cmd = std::path::PathBuf::from(system_root)
+        .join("System32")
+        .join("cmd.exe");
+    vec![
+        cmd.to_string_lossy().into_owned(),
+        "/d".to_owned(),
+        "/q".to_owned(),
+        "/c".to_owned(),
+        "ping -n 120 127.0.0.1 >NUL".to_owned(),
+    ]
+}
+
+// Like create_send_keys_test_session but the pane runs an inert, silent command
+// and we block until its terminal has finished starting, so a subsequent
+// transcript write is the only content in the pane.
+async fn create_quiet_mouse_session(handler: &RequestHandler, session: &rmux_proto::SessionName) {
+    let created = handler
+        .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
+            session_name: Some(session.clone()),
+            working_directory: None,
+            detached: true,
+            size: Some(TerminalSize { cols: 80, rows: 24 }),
+            environment: None,
+            group_target: None,
+            attach_if_exists: false,
+            detach_other_clients: false,
+            kill_other_clients: false,
+            flags: None,
+            window_name: None,
+            print_session_info: false,
+            print_format: None,
+            command: Some(quiet_pane_command()),
+            process_command: None,
+            client_environment: None,
+            skip_environment_update: false,
+        })))
+        .await;
+    assert!(matches!(created, Response::NewSession(_)));
+    handler
+        .wait_for_pane_startup_to_finish_for_test(&PaneTarget::new(session.clone(), 0))
+        .await;
 }

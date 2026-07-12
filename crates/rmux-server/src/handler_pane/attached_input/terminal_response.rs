@@ -2,6 +2,9 @@
 pub(super) enum TerminalResponseDecode {
     NotResponse,
     Partial,
+    PaneBound {
+        size: usize,
+    },
     Matched {
         size: usize,
         event: Option<TerminalControlEvent>,
@@ -16,11 +19,22 @@ pub(super) enum TerminalControlEvent {
     ClientDarkTheme,
 }
 
+#[cfg(test)]
 pub(super) fn decode_attached_terminal_control(
     input: &[u8],
     focus_passthrough: bool,
 ) -> TerminalResponseDecode {
-    match decode_osc_sequence(input) {
+    decode_attached_terminal_control_after_append(input, focus_passthrough, 0)
+}
+
+pub(super) fn decode_attached_terminal_control_after_append(
+    input: &[u8],
+    focus_passthrough: bool,
+    new_input_at: usize,
+) -> TerminalResponseDecode {
+    // `new_input_at` is the retained length before the current append. Each
+    // decoder backs up only as far as its split terminator requires.
+    match decode_osc_sequence(input, new_input_at) {
         TerminalResponseDecode::NotResponse => {}
         matched => return matched,
     }
@@ -32,26 +46,41 @@ pub(super) fn decode_attached_terminal_control(
         }
     }
 
-    decode_terminal_response(input)
+    decode_terminal_response_after_append(input, new_input_at)
 }
 
+#[cfg(test)]
 pub(super) fn decode_terminal_response(input: &[u8]) -> TerminalResponseDecode {
+    decode_terminal_response_after_append(input, 0)
+}
+
+fn decode_terminal_response_after_append(
+    input: &[u8],
+    new_input_at: usize,
+) -> TerminalResponseDecode {
     if !input.starts_with(b"\x1b[") {
         return TerminalResponseDecode::NotResponse;
     }
 
-    let Some(final_offset) = input[2..].iter().position(|byte| is_csi_final(*byte)) else {
+    let search_at = new_input_at.max(2).min(input.len());
+    let Some(final_offset) = input[search_at..]
+        .iter()
+        .position(|byte| is_csi_final(*byte))
+    else {
         return if is_plausible_terminal_response_prefix(input) {
             TerminalResponseDecode::Partial
         } else {
             TerminalResponseDecode::NotResponse
         };
     };
-    let final_index = final_offset + 2;
+    let final_index = search_at + final_offset;
     match input[final_index] {
         b'n' => matched(final_index + 1, decode_theme_report(input, final_index)),
         b'c' | b't' => matched(final_index + 1, None),
         b'y' if is_decrpm_response(input, final_index) => matched(final_index + 1, None),
+        b'R' => TerminalResponseDecode::PaneBound {
+            size: final_index + 1,
+        },
         _ => TerminalResponseDecode::NotResponse,
     }
 }
@@ -89,7 +118,7 @@ fn decode_theme_report(input: &[u8], final_index: usize) -> Option<TerminalContr
     }
 }
 
-fn decode_osc_sequence(input: &[u8]) -> TerminalResponseDecode {
+fn decode_osc_sequence(input: &[u8], new_input_at: usize) -> TerminalResponseDecode {
     if !input.starts_with(b"\x1b]") {
         return TerminalResponseDecode::NotResponse;
     }
@@ -100,6 +129,12 @@ fn decode_osc_sequence(input: &[u8]) -> TerminalResponseDecode {
         b"\x1b]12;",
         b"\x1b]52;",
     ];
+    if CONSUMED_OSC_PREFIXES
+        .iter()
+        .any(|prefix| input.len() < prefix.len() && prefix.starts_with(input))
+    {
+        return TerminalResponseDecode::Partial;
+    }
     if !CONSUMED_OSC_PREFIXES
         .iter()
         .any(|prefix| input.starts_with(prefix))
@@ -107,7 +142,7 @@ fn decode_osc_sequence(input: &[u8]) -> TerminalResponseDecode {
         return TerminalResponseDecode::NotResponse;
     }
 
-    let mut index = 2;
+    let mut index = new_input_at.saturating_sub(1).max(2).min(input.len());
     while index < input.len() {
         match input[index] {
             b'\x07' => return matched(index + 1, None),
@@ -133,8 +168,8 @@ fn is_csi_final(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_attached_terminal_control, decode_focus_event, decode_terminal_response,
-        TerminalControlEvent, TerminalResponseDecode,
+        decode_attached_terminal_control, decode_attached_terminal_control_after_append,
+        decode_focus_event, decode_terminal_response, TerminalControlEvent, TerminalResponseDecode,
     };
 
     #[test]
@@ -149,10 +184,10 @@ mod tests {
     }
 
     #[test]
-    fn leaves_cursor_position_response_for_pane() {
+    fn marks_cursor_position_response_as_pane_bound() {
         assert_eq!(
             decode_terminal_response(b"\x1b[12;40R"),
-            TerminalResponseDecode::NotResponse
+            TerminalResponseDecode::PaneBound { size: 8 }
         );
     }
 
@@ -273,14 +308,78 @@ mod tests {
     }
 
     #[test]
-    fn attached_terminal_control_preserves_alt_right_bracket_input() {
+    fn incremental_osc_search_finds_terminators_at_append_boundary() {
+        let bell_terminated = b"\x1b]52;c;AAAA\x07tail";
+        let bell_at = b"\x1b]52;c;AAAA".len();
+        assert_eq!(
+            decode_attached_terminal_control_after_append(bell_terminated, false, bell_at),
+            TerminalResponseDecode::Matched {
+                size: bell_at + 1,
+                event: None,
+            }
+        );
+
+        let string_terminated = b"\x1b]52;c;AAAA\x1b\\tail";
+        let terminator_at = b"\x1b]52;c;AAAA".len();
+        assert_eq!(
+            decode_attached_terminal_control_after_append(
+                string_terminated,
+                false,
+                terminator_at + 1,
+            ),
+            TerminalResponseDecode::Matched {
+                size: terminator_at + 2,
+                event: None,
+            }
+        );
+    }
+
+    #[test]
+    fn incremental_control_search_starts_at_the_append_boundary_overlap() {
+        // Earlier final bytes are impossible in retained partial state. They
+        // are sentinels that expose any scan which restarts before the cursor.
+        let osc = b"\x1b]52;c;old\x07padding-padding-new\x07tail";
+        let osc_new_input_at = b"\x1b]52;c;old\x07padding-padding-new".len();
+        assert_eq!(
+            decode_attached_terminal_control_after_append(osc, false, osc_new_input_at),
+            TerminalResponseDecode::Matched {
+                size: osc_new_input_at + 1,
+                event: None,
+            }
+        );
+
+        let csi = b"\x1b[?62;52cpadding-padding997;1n";
+        let csi_new_input_at = b"\x1b[?62;52cpadding-padding".len();
+        assert_eq!(
+            decode_attached_terminal_control_after_append(csi, false, csi_new_input_at),
+            TerminalResponseDecode::Matched {
+                size: csi.len(),
+                event: None,
+            }
+        );
+    }
+
+    #[test]
+    fn attached_terminal_control_retains_ambiguous_alt_right_bracket_prefix() {
         assert_eq!(
             decode_attached_terminal_control(b"\x1b]", false),
-            TerminalResponseDecode::NotResponse
+            TerminalResponseDecode::Partial
         );
         assert_eq!(
             decode_attached_terminal_control(b"\x1b]X\x07", false),
             TerminalResponseDecode::NotResponse
         );
+    }
+
+    #[test]
+    fn attached_terminal_control_retains_every_fragmented_osc52_prefix() {
+        let response = b"\x1b]52;c;AAAA\x07";
+        for split in 2..b"\x1b]52;".len() {
+            assert_eq!(
+                decode_attached_terminal_control(&response[..split], false),
+                TerminalResponseDecode::Partial,
+                "OSC52 prefix split at byte {split}"
+            );
+        }
     }
 }

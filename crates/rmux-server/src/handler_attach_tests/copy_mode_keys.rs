@@ -419,11 +419,18 @@ async fn attached_copy_mode_escape_exits_and_clears_mode_state() {
     );
     drain_attach_controls(&mut control_rx);
 
+    let mut pending_input = Vec::new();
     handler
-        .handle_attached_live_input_for_test(requester_pid, b"\x1b")
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"\x1b")
         .await
-        .expect("Escape exits copy-mode");
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        .expect("Escape prefix is retained until escape-time expires");
+    assert_eq!(pending_input, b"\x1b");
+    let forwarded = handler
+        .flush_attached_pending_escape_input(requester_pid, &mut pending_input)
+        .await
+        .expect("Escape timeout exits copy-mode");
+    assert!(!forwarded);
+    assert!(pending_input.is_empty());
 
     assert_eq!(pane_mode_status(&handler, &alpha).await, "0:::\n");
     let _ = recv_matching_attach_control(&mut control_rx, "Escape exit refresh", |control| {

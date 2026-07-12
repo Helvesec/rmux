@@ -4,6 +4,35 @@
 
 ### Compatibility
 
+- Enables outer mouse reporting when the active pane's application requests a
+  tracking mode (`?1000`/`?1002`/`?1003`), matching tmux: vim or htop over SSH
+  now receive mouse events with the `mouse` option off, and the outer enable
+  is dropped again when the pane resets its mode, backed by
+  [outer terminal mouse tests](crates/rmux-server/src/outer_terminal/tests.rs).
+- Resolves client-less `display-message` targets through the requester's
+  `TMUX_PANE`/`RMUX_PANE` environment ahead of any attached client's session,
+  pinned end to end (a real child process carrying the environment) by
+  [display-message requester tests](crates/rmux-server/src/handler_display_message_tests.rs).
+- Executes every command of a root mouse binding sequence
+  (`select-pane -t = \; run-shell ...`) from a live attach, including the
+  `run-shell` tail, backed by
+  [mouse binding sequence tests](crates/rmux-server/src/handler_send_keys_tests/live_attach.rs).
+  Note that `run-shell` executes in the daemon's working directory, so
+  relative redirection targets land there.
+- Adds `Pane::foreground_state_with_revision` to the Rust SDK so best-effort
+  foreground snapshots can be ordered against a `state_events` stream, and
+  pins the foreground event flow end to end with
+  [Unix stream tests](crates/rmux-sdk/tests/pane_queries.rs) and the
+  [Windows root-process contract test](crates/rmux-sdk/tests/pane_foreground_events_windows.rs).
+  Foreground detection is a periodic probe (about one second) and reports the
+  pane root process on Windows, labeled through the per-field sources.
+- Explains itself when `rmux claude` cannot attach interactively instead of
+  launching silently: a Git Bash/MSYS pty stdin gets a dedicated hint (the
+  Windows attach client needs a Win32 console), any other non-terminal stdin
+  reports the direct-launch fallback, and `RMUX_CLAUDE_DIRECT=1` keeps the
+  explicit direct launch quiet, backed by
+  [launcher detection tests](src/cli/claude_launcher.rs).
+
 - Matches tmux 3.7b format expansion, target resolution, and command parser
   precedence for the 0.9.0 compatibility surface, backed by
   [format oracle tests](tests/formats.rs),
@@ -50,6 +79,69 @@
   [ledger entry C-D50](docs/compat/tmux-3.7-divergences.md) and backed by
   [emulator reply tests](crates/rmux-core/src/input/tests/osc_dcs_misc.rs)
   (contributed by @nymph-ai).
+- Enables mouse reporting and bracketed paste on any VT outer terminal for a
+  Windows attach client, not only Windows Terminal: a session reached over a
+  non-`WT_SESSION` VT outer (OpenSSH-into-Windows, WezTerm, Alacritty, the VS
+  Code terminal) now drives the outer's mouse and bracketed-paste modes the
+  way tmux does on an xterm-like terminal, with no host-brand gating
+  (issue #93), backed by
+  [client capability tests](src/client_terminal.rs),
+  [daemon capability tests](crates/rmux-server/src/handler_client_runtime.rs),
+  and
+  [outer-terminal attach-sequence tests](crates/rmux-server/src/outer_terminal/tests.rs).
+- Fixes a Windows-only stall where `select-pane` blocked for up to two seconds:
+  the command waited for every session's panes to finish starting, so an
+  unrelated session's still-starting pane delayed it, and on a detached session
+  `select-pane` also waited on its own just-spawned pane with no client to draw.
+  Single-pane commands (`select-pane` and its directional / last-pane /
+  select-mark variants, plus `resize-pane`, `pipe-pane`, `paste-buffer`) now
+  scope that wait to their own target pane, and `select-pane` and every
+  sibling now skip the attached-client refresh entirely when no client is
+  attached to the session so a still-starting sibling cannot stall a detached
+  select or resize either. The dispatch-level cap is `DEFERRED_PANE_WAIT`
+  (10 s), reached only when the addressed pane genuinely never registers.
+  Backed by
+  [the deferred-pane session-scope test](tests/windows_terminal_matrix.rs).
+- Delivers OSC 52 clipboard writes from panes to the outer terminal on Windows:
+  under `set-clipboard on` an application's OSC 52 write now reaches the outer
+  terminal's clipboard and is stored in a paste buffer (kept for a detached
+  client, shown in `list-buffers`, and firing the pane-set-clipboard hook after
+  the buffer is stored so the hook can read the new content via
+  `#{buffer_sample}`), while the `external` default and `off` create nothing so
+  untrusted pane output cannot drive the clipboard — matching tmux's on-only
+  gate on application clipboard writes; `set-buffer -w` also reaches the outer
+  clipboard on Windows now. This advertises the clipboard (OSC 52) capability
+  for every Windows attach. Two behaviour changes ship on every platform so the
+  daemon matches the tmux 3.7b oracle exactly: under the `external` default a
+  pane's OSC 52 write no longer reaches the outer clipboard on Unix (tmux drops
+  external pane-origin OSC 52 writes; use `set -g set-clipboard on` to restore
+  forwarding to the outer and start creating paste buffers), and malformed or
+  empty-payload OSC 52 writes are validated then dropped instead of forwarded
+  verbatim. Recorded in
+  [tmux divergence ledger entry C-D52](docs/compat/tmux-3.7-divergences.md) and
+  backed by
+  [outer-terminal gate tests](crates/rmux-server/src/outer_terminal/tests.rs),
+  [client and daemon capability tests](src/client_terminal.rs), and
+  [inbound clipboard buffer tests](crates/rmux-server/src/handler_alert_tests.rs)
+  (issue #91).
+- Delivers bracketed paste to Windows attach panes: a paste into a pane that
+  enabled bracketed-paste mode now arrives wrapped in `ESC[200~`/`ESC[201~`
+  (and is stripped for a pane that did not), matching tmux, by detecting the
+  console-input burst a paste produces. Paste-marker stripping runs to a fixed
+  point and carries a small tail across `ReadConsoleInputW` batches so a
+  hostile clipboard cannot slip a live `ESC[201~` out of the paste envelope
+  either by reassembly or by straddling a batch boundary. AltGr characters
+  and the pure modifier key-downs classic conhost interleaves around shifted
+  content no longer defeat burst detection. The scrub is also applied on
+  every platform whenever a real terminal paste arrives while the command
+  prompt, mode-tree, no-job popup, menu, or display-panes overlay is open —
+  the leading `ESC` of `ESC[200~` used to close the overlay and leak the body
+  to the pane's shell on Unix and inside the Windows attach client alike.
+  The Windows-specific detection heuristic is recorded in
+  [tmux divergence ledger entry C-D51](docs/compat/tmux-3.7-divergences.md) and
+  backed by
+  [console input tests](crates/rmux-client/src/attach_windows/input.rs)
+  (issue #92).
 - Ships a Windows installer that preserves the tiny/libexec package layout:
   `install.ps1` in the release zip and `scripts/install-windows.ps1` verify
   the release checksum, install the private helper before the public

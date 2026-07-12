@@ -107,7 +107,8 @@ impl ParsedCommands {
         self.assignments.push(assignment);
     }
 
-    fn push_command(&mut self, command: ParsedCommand) {
+    fn push_command(&mut self, mut command: ParsedCommand) {
+        command.drain_nested_assignments_into(&mut self.assignments);
         self.commands.push(command);
     }
 
@@ -167,6 +168,19 @@ impl ParsedCommands {
     pub fn to_tmux_reparse_string(&self) -> String {
         let mut rendered = String::new();
         let mut previous_line = None;
+        for assignment in &self.assignments {
+            if !rendered.is_empty() {
+                rendered.push_str(" ; ");
+            }
+            if assignment.hidden() {
+                rendered.push_str("%hidden ");
+            }
+            rendered.push_str(&escape_argument_for_reparse(&format!(
+                "{}={}",
+                assignment.name(),
+                assignment.value()
+            )));
+        }
         for command in &self.commands {
             if !rendered.is_empty() {
                 if previous_line.is_some_and(|line| line != command.line()) {
@@ -249,6 +263,14 @@ impl ParsedCommand {
         for argument in &mut self.arguments {
             if let CommandArgument::Commands(commands) = argument {
                 commands.add_line_offset(offset);
+            }
+        }
+    }
+
+    fn drain_nested_assignments_into(&mut self, assignments: &mut Vec<EnvironmentAssignment>) {
+        for argument in &mut self.arguments {
+            if let CommandArgument::Commands(commands) = argument {
+                assignments.append(&mut commands.assignments);
             }
         }
     }

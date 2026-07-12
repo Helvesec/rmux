@@ -1,6 +1,7 @@
 use super::*;
 
 const LARGE_PASTE_TARGET_BYTES: usize = 64 * 1024;
+const ONE_MEBIBYTE: usize = 1024 * 1024;
 const CHUNK_PATTERN: &[usize] = &[1, 2, 4, 8, 3, 13, 89, 233, 1024, 7, 4096];
 
 #[tokio::test]
@@ -47,6 +48,45 @@ async fn live_attach_large_bracketed_paste_survives_irregular_chunks() {
 
     capture.finish(&handler, &alpha).await;
     capture.assert_contents(&handler, expected).await;
+}
+
+#[tokio::test]
+async fn live_attach_one_mebibyte_bracketed_paste_has_bounded_work() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("one-mebibyte-bracketed-paste");
+    let requester_pid = std::process::id();
+
+    create_send_keys_test_session(&handler, &alpha).await;
+    let (control_tx, _control_rx) = mpsc::unbounded_channel();
+    let _attach_id = handler
+        .register_attach(requester_pid, alpha.clone(), control_tx)
+        .await;
+
+    let body = vec![b'p'; ONE_MEBIBYTE];
+    let mut input = Vec::with_capacity(body.len() + 12);
+    input.extend_from_slice(b"\x1b[200~");
+    input.extend_from_slice(&body);
+    input.extend_from_slice(b"\x1b[201~");
+    let capture =
+        RawPaneInputProbe::start(&handler, &alpha, "one-mebibyte-bracketed-paste", body.len())
+            .await;
+
+    let mut pending_input = Vec::new();
+    tokio::time::timeout(
+        if cfg!(windows) {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(2)
+        },
+        handler.handle_attached_live_input(requester_pid, &mut pending_input, &input),
+    )
+    .await
+    .expect("one MiB bracketed paste must finish with bounded work")
+    .expect("one MiB bracketed paste succeeds");
+    assert!(pending_input.is_empty());
+
+    capture.finish(&handler, &alpha).await;
+    capture.assert_contents(&handler, &body).await;
 }
 
 fn bracketed_paste_body(bytes: &[u8]) -> &[u8] {

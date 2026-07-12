@@ -12,7 +12,6 @@ use super::menu::{
 };
 use super::mouse::{popup_handle_mouse, PopupMouseOutcome};
 use super::state::ClientOverlayState;
-use super::support::decode_prompt_key_guess;
 use crate::handler_support::attached_client_required;
 use crate::input_keys::{encode_mouse_event, MouseForwardEvent};
 use crate::renderer::OverlayRect;
@@ -262,15 +261,25 @@ impl RequestHandler {
             return Ok(false);
         }
 
+        // A no-job popup consumes bytes as keys (Escape closes, close_any_key
+        // closes on any input). A bracketed-paste envelope arriving here would
+        // otherwise let the leading ESC close the popup and leak the body to
+        // the underlying pane — so scrub markers when we're in the key-decoding
+        // mode. A job-backed popup forwards bytes verbatim to the child
+        // process (which handles its own ?2004h), so keep those raw.
+        let scrubbed = if popup.no_job || popup.job.is_none() {
+            Some(crate::handler::pane_support::strip_bracketed_paste_markers(
+                bytes,
+            ))
+        } else {
+            None
+        };
+        let bytes: &[u8] = scrubbed.as_deref().unwrap_or(bytes);
+
         if bytes.is_empty() {
             return Ok(true);
         }
-        if (bytes == b"\x1b"
-            || bytes == b"\x03"
-            || matches!(
-                decode_prompt_key_guess(bytes),
-                Some(PromptInputEvent::Escape | PromptInputEvent::Ctrl('c'))
-            ))
+        if (bytes == b"\x1b" || bytes == b"\x03")
             && ((!popup.close_on_exit && !popup.close_on_zero_exit) || popup.no_job)
         {
             self.clear_interactive_overlay(attach_pid, true)

@@ -417,7 +417,7 @@ impl RequestHandler {
         Ok(outcome.new_name().to_owned())
     }
 
-    async fn store_buffer(
+    pub(in crate::handler) async fn store_buffer(
         &self,
         name: Option<String>,
         content: Vec<u8>,
@@ -480,12 +480,7 @@ impl RequestHandler {
             return;
         };
         let _ = self
-            .send_attach_control(
-                attach_pid,
-                AttachControl::Write(payload),
-                command_name,
-                None,
-            )
+            .send_attach_control(attach_pid, AttachControl::Write(payload), command_name)
             .await;
     }
 }

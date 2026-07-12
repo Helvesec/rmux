@@ -2,7 +2,7 @@ use crate::handles::session::unexpected_response;
 use crate::{Pane, PaneId, Result};
 use rmux_proto::{
     ForegroundFieldSource, ForegroundSourcesDto, ForegroundStateDto, PaneForegroundStateRequest,
-    Request, Response, CAPABILITY_SDK_PANE_FOREGROUND,
+    Request, Response, CAPABILITY_SDK_PANE_BY_ID, CAPABILITY_SDK_PANE_FOREGROUND,
 };
 
 /// Source labels for best-effort foreground fields.
@@ -39,11 +39,18 @@ pub struct ForegroundState {
 pub(super) async fn foreground_state(
     pane: &Pane,
 ) -> Result<Option<(PaneId, u64, ForegroundState)>> {
-    crate::capabilities::require(pane.transport(), &[CAPABILITY_SDK_PANE_FOREGROUND]).await?;
+    let Some(target) = pane.resolved_proto_target_ref().await? else {
+        return Ok(None);
+    };
+    crate::capabilities::require(
+        pane.transport(),
+        &[CAPABILITY_SDK_PANE_FOREGROUND, CAPABILITY_SDK_PANE_BY_ID],
+    )
+    .await?;
     let response = pane
         .transport()
         .request(Request::PaneForegroundState(PaneForegroundStateRequest {
-            target: pane.proto_target_ref(),
+            target,
         }))
         .await?;
 

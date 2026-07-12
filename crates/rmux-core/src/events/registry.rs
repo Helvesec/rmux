@@ -286,6 +286,29 @@ impl SubscriptionRegistry {
         self.remove_ids(ids)
     }
 
+    /// Moves every live subscription from an old runtime owner key to the
+    /// same pane under its new runtime owner without changing subscription ids.
+    pub fn rekey_pane(
+        &mut self,
+        previous: &PaneOutputSubscriptionKey,
+        current: PaneOutputSubscriptionKey,
+    ) -> usize {
+        if previous == &current {
+            return self.by_pane.get(previous).map_or(0, HashSet::len);
+        }
+        let Some(ids) = self.by_pane.remove(previous) else {
+            return 0;
+        };
+        for id in &ids {
+            if let Some(record) = self.records.get_mut(id) {
+                record.pane = current.clone();
+            }
+        }
+        let count = ids.len();
+        self.by_pane.entry(current).or_default().extend(ids);
+        count
+    }
+
     /// Returns whether at least one live subscription targets `pane`.
     #[must_use]
     pub fn contains_pane(&self, pane: &PaneOutputSubscriptionKey) -> bool {
@@ -442,5 +465,39 @@ mod tests {
             .cleanup_stale(now + Duration::from_millis(20))
             .is_empty());
         assert!(registry.subscribe(1, pane(1), now).is_ok());
+    }
+
+    #[test]
+    fn runtime_owner_rekey_preserves_ids_and_all_registry_indexes() {
+        let mut registry = SubscriptionRegistry::default();
+        let now = Instant::now();
+        let previous = pane(7);
+        let current = PaneOutputSubscriptionKey::new(
+            SessionName::new("beta").expect("valid session"),
+            PaneId::new(7),
+        );
+        let first = registry
+            .subscribe(11, previous.clone(), now)
+            .expect("first subscription");
+        let second = registry
+            .subscribe(12, previous.clone(), now)
+            .expect("second subscription");
+
+        assert_eq!(registry.rekey_pane(&previous, current.clone()), 2);
+        assert!(!registry.contains_pane(&previous));
+        assert!(registry.contains_pane(&current));
+        assert_eq!(
+            registry.get(first.id()).map(OutputSubscriptionRecord::pane),
+            Some(&current)
+        );
+        assert_eq!(
+            registry
+                .get(second.id())
+                .map(OutputSubscriptionRecord::pane),
+            Some(&current)
+        );
+        assert_eq!(registry.remove_pane(&current).len(), 2);
+        assert!(registry.remove_connection(11).is_empty());
+        assert!(registry.remove_connection(12).is_empty());
     }
 }

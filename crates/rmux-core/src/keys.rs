@@ -1,9 +1,7 @@
 //! tmux-compatible key code parsing and key table storage.
 #![allow(clippy::unusual_byte_groupings)]
 
-use crate::command_parser::{
-    parse_command_string, CommandParseError, CommandParser, ParsedCommands,
-};
+use crate::command_parser::{CommandParseError, CommandParser, ParsedCommands};
 
 #[path = "keys/defaults.rs"]
 mod defaults;
@@ -478,10 +476,18 @@ fn maybe_append_flags(mut output: String, saved: KeyCode, with_flags: bool) -> S
 pub fn parse_binding_command_tokens(
     tokens: &[String],
 ) -> Result<ParsedCommands, CommandParseError> {
+    parse_binding_command_tokens_with_parser(&CommandParser::new(), tokens)
+}
+
+/// Parses a `bind-key` payload with the caller's environment and alias table.
+pub fn parse_binding_command_tokens_with_parser(
+    parser: &CommandParser,
+    tokens: &[String],
+) -> Result<ParsedCommands, CommandParseError> {
     if tokens.len() == 1 {
-        parse_command_string(&tokens[0])
+        parser.parse(&tokens[0])
     } else {
-        CommandParser::new().parse_arguments(tokens)
+        parser.parse_arguments(tokens)
     }
 }
 

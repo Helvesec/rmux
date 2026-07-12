@@ -1,64 +1,113 @@
-use rmux_proto::SessionName;
+use rmux_proto::{SessionId, SessionName};
 
+use super::{current_control_queue_identity, ControlClientIdentity};
 use crate::handler::RequestHandler;
+use crate::handler_support::attached_client_required;
 
 impl RequestHandler {
+    pub(in crate::handler) async fn validate_control_session_for_queue(
+        &self,
+        identity: ControlClientIdentity,
+    ) -> Result<(), rmux_proto::RmuxError> {
+        let state = self.state.lock().await;
+        let active_control = self.active_control.lock().await;
+        Self::validate_control_queue_identity_locked(
+            &state,
+            &active_control,
+            identity.requester_pid(),
+            identity.control_id(),
+        )?;
+        if active_control
+            .by_pid
+            .get(&identity.requester_pid())
+            .is_some_and(|active| active.session_name.is_some() && active.session_id.is_some())
+        {
+            return Ok(());
+        }
+        Err(attached_client_required("new-session"))
+    }
+
     pub(in crate::handler) async fn prepare_created_session_control_attach(
         &self,
         requester_pid: u32,
         session_name: &SessionName,
+        session_id: SessionId,
     ) -> bool {
-        if !self.is_control_client(requester_pid).await {
-            return false;
+        if let Some(identity) = current_control_queue_identity(requester_pid) {
+            let attached = match self
+                .attach_control_session_for_queue(identity, session_name, Some(session_id))
+                .await
+            {
+                Ok(attached) => attached,
+                Err(_) => return false,
+            };
+            if !attached {
+                return false;
+            }
+            if let Some(window_id) = self
+                .created_session_window_id(session_name, session_id)
+                .await
+            {
+                self.send_control_notification_to_queue(
+                    identity,
+                    format!("%window-add @{window_id}"),
+                )
+                .await;
+            }
+            return true;
         }
 
-        let window_id = {
-            let mut state = self.state.lock().await;
-            let Some(session) = state.sessions.session_mut(session_name) else {
+        let control_identity = {
+            let active_control = self.active_control.lock().await;
+            let Some(active) = active_control
+                .by_pid
+                .get(&requester_pid)
+                .filter(|active| !active.closing.load(std::sync::atomic::Ordering::SeqCst))
+            else {
                 return false;
             };
-            session.touch_attached();
-            session
-                .window_at(session.active_window_index())
-                .map(|window| window.id().as_u32())
+            ControlClientIdentity::new(requester_pid, active.id)
         };
-
-        if let Some(window_id) = window_id {
-            self.send_control_notification_to(requester_pid, format!("%window-add @{window_id}"))
-                .await;
-        }
-
-        self.set_control_session(requester_pid, Some(session_name.clone()))
+        if self
+            .set_control_session_for_client_identity(
+                requester_pid,
+                control_identity.control_id(),
+                session_name.clone(),
+                session_id,
+                None,
+            )
             .await
-            .is_ok()
+            .is_err()
+        {
+            return false;
+        }
+        if let Some(window_id) = self
+            .created_session_window_id(session_name, session_id)
+            .await
+        {
+            self.send_control_notification_to_queue(
+                control_identity,
+                format!("%window-add @{window_id}"),
+            )
+            .await;
+        }
+        true
     }
 
-    pub(in crate::handler) async fn attach_control_to_existing_session(
+    async fn created_session_window_id(
         &self,
-        requester_pid: u32,
         session_name: &SessionName,
-    ) -> bool {
-        if !self.is_control_client(requester_pid).await {
-            return false;
-        }
-        if self
-            .control_session_name(requester_pid)
-            .await
-            .as_ref()
-            .is_some_and(|current| current == session_name)
-        {
-            return false;
-        }
-
-        {
-            let mut state = self.state.lock().await;
-            if let Some(session) = state.sessions.session_mut(session_name) {
-                session.touch_attached();
-            }
-        }
-
-        self.set_control_session(requester_pid, Some(session_name.clone()))
-            .await
-            .is_ok()
+        session_id: SessionId,
+    ) -> Option<u32> {
+        let state = self.state.lock().await;
+        state
+            .sessions
+            .session(session_name)
+            .filter(|session| session.id() == session_id)
+            .and_then(|session| {
+                session
+                    .window_at(session.active_window_index())
+                    .map(|window| window.id().as_u32())
+            })
     }
 }

@@ -3,7 +3,7 @@ use super::info::{
     revision_from_details, LiveDetails,
 };
 use super::snapshot::{cell_from_wire, snapshot_from_response};
-use super::target::{is_already_closed_error, TargetSelector};
+use super::target::{is_already_closed_error, is_already_closed_pane_id_error, TargetSelector};
 use crate::{
     PaneAttributes, PaneColor, PaneId, PaneProcessState, PaneRef, RmuxError, TerminalSizeSpec,
 };
@@ -171,6 +171,32 @@ fn is_already_closed_error_ignores_invalid_target_for_other_slot() {
         reason: "pane index does not exist in session".to_owned(),
     });
     assert!(!is_already_closed_error(&foreign, &target));
+}
+
+#[test]
+fn pane_id_closed_error_matches_only_the_resolved_identity() {
+    let session_name = rmux_proto::SessionName::new("alpha").unwrap();
+    let pane_id = PaneId::new(7);
+    let exact = RmuxError::pane_not_found(session_name.clone(), pane_id);
+    assert!(is_already_closed_pane_id_error(
+        &exact,
+        &session_name,
+        pane_id
+    ));
+
+    let other_pane = RmuxError::pane_not_found(session_name.clone(), PaneId::new(8));
+    assert!(!is_already_closed_pane_id_error(
+        &other_pane,
+        &session_name,
+        pane_id
+    ));
+    let other_session = rmux_proto::SessionName::new("beta").unwrap();
+    let foreign = RmuxError::pane_not_found(other_session, pane_id);
+    assert!(!is_already_closed_pane_id_error(
+        &foreign,
+        &session_name,
+        pane_id
+    ));
 }
 
 #[test]

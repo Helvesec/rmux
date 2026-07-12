@@ -12,7 +12,7 @@ impl RequestHandler {
             .with_str("scope", "session")
             .with_str("session", session_name.as_str());
         #[cfg(windows)]
-        self.wait_for_windows_deferred_session_panes_ready(session_name)
+        self.wait_for_windows_deferred_session_pane_pids(session_name)
             .await;
         let removed_stale_clients = self
             .prune_stale_attached_clients_for_session(session_name)
@@ -22,12 +22,12 @@ impl RequestHandler {
                 .reconcile_attached_session_size_and_emit(session_name)
                 .await;
         }
-        let (refresh_contexts, mode_tree_pids, overlay_pids, stale_pids) = {
+        let (refresh_contexts, mode_tree_pids, overlay_pids, stale_clients) = {
             let mut active_attach = self.active_attach.lock().await;
             let mut refresh_contexts = Vec::new();
             let mut mode_tree_pids = Vec::new();
             let mut overlay_pids = Vec::new();
-            let mut stale_pids = Vec::new();
+            let mut stale_clients = Vec::new();
             for (pid, active) in &mut active_attach.by_pid {
                 if &active.session_name != session_name || active.suspended {
                     continue;
@@ -48,7 +48,7 @@ impl RequestHandler {
                     if !active.render_refresh_pending {
                         active.render_refresh_pending = true;
                         if !enqueue_tracked_render_control(active, AttachControl::Refresh) {
-                            stale_pids.push(*pid);
+                            stale_clients.push(active.identity(*pid));
                         }
                     }
                     continue;
@@ -66,10 +66,15 @@ impl RequestHandler {
                     active.key_table_name.clone(),
                 ));
             }
-            (refresh_contexts, mode_tree_pids, overlay_pids, stale_pids)
+            (
+                refresh_contexts,
+                mode_tree_pids,
+                overlay_pids,
+                stale_clients,
+            )
         };
         let removed_stale_clients = self
-            .remove_attached_clients_for_session(session_name, stale_pids)
+            .remove_attached_clients_for_session(session_name, stale_clients)
             .await;
         if !removed_stale_clients.is_empty() {
             let _ = self
@@ -116,7 +121,7 @@ impl RequestHandler {
 
         let mut target_by_pid = targets.into_iter().collect::<HashMap<_, _>>();
         let mut active_attach = self.active_attach.lock().await;
-        let mut stale_pids = Vec::new();
+        let mut stale_clients = Vec::new();
         for (pid, active) in &mut active_attach.by_pid {
             if &active.session_name != session_name || active.suspended {
                 continue;
@@ -127,12 +132,12 @@ impl RequestHandler {
             active.render_generation = active.render_generation.saturating_add(1);
             active.render_refresh_pending = false;
             if !enqueue_tracked_render_control(active, AttachControl::switch(target)) {
-                stale_pids.push(*pid);
+                stale_clients.push(active.identity(*pid));
             }
         }
         drop(active_attach);
         let removed_stale_clients = self
-            .remove_attached_clients_for_session(session_name, stale_pids)
+            .remove_attached_clients_for_session(session_name, stale_clients)
             .await;
         if !removed_stale_clients.is_empty() {
             let _ = self
@@ -160,21 +165,21 @@ impl RequestHandler {
         &self,
         session_name: &rmux_proto::SessionName,
     ) {
-        let stale_pids = {
+        let stale_clients = {
             let mut active_attach = self.active_attach.lock().await;
-            let mut stale_pids = Vec::new();
+            let mut stale_clients = Vec::new();
             for (pid, active) in &mut active_attach.by_pid {
                 if &active.session_name != session_name || active.suspended {
                     continue;
                 }
                 if !enqueue_tracked_interactive_input_control(active) {
-                    stale_pids.push(*pid);
+                    stale_clients.push(active.identity(*pid));
                 }
             }
-            stale_pids
+            stale_clients
         };
         let removed_stale_clients = self
-            .remove_attached_clients_for_session(session_name, stale_pids)
+            .remove_attached_clients_for_session(session_name, stale_clients)
             .await;
         if !removed_stale_clients.is_empty() {
             let _ = self
@@ -193,7 +198,7 @@ impl RequestHandler {
             .with_u64("attach_pid", u64::from(attach_pid))
             .with_str("session", session_name.as_str());
         #[cfg(windows)]
-        self.wait_for_windows_deferred_session_panes_ready(session_name)
+        self.wait_for_windows_deferred_session_pane_pids(session_name)
             .await;
         let attached_count = self.attached_count(session_name).await;
         let prompt = {
@@ -253,17 +258,18 @@ impl RequestHandler {
         }
 
         let mut active_attach = self.active_attach.lock().await;
-        let remove = match active_attach.by_pid.get_mut(&attach_pid) {
+        let stale_client = match active_attach.by_pid.get_mut(&attach_pid) {
             Some(active) if &active.session_name == session_name && !active.suspended => {
                 active.render_generation = active.render_generation.saturating_add(1);
-                !enqueue_tracked_render_control(active, AttachControl::switch(target))
+                (!enqueue_tracked_render_control(active, AttachControl::switch(target)))
+                    .then(|| active.identity(attach_pid))
             }
-            _ => false,
+            _ => None,
         };
         drop(active_attach);
-        if remove {
+        if let Some(stale_client) = stale_client {
             let removed_stale_clients = self
-                .remove_attached_clients_for_session(session_name, vec![attach_pid])
+                .remove_attached_clients_for_session(session_name, vec![stale_client])
                 .await;
             if !removed_stale_clients.is_empty() {
                 let _ = self
@@ -343,17 +349,18 @@ impl RequestHandler {
         }
 
         let mut active_attach = self.active_attach.lock().await;
-        let remove = match active_attach.by_pid.get_mut(&attach_pid) {
+        let stale_client = match active_attach.by_pid.get_mut(&attach_pid) {
             Some(active) if &active.session_name == session_name && !active.suspended => {
                 active.render_generation = active.render_generation.saturating_add(1);
-                !enqueue_tracked_render_control(active, AttachControl::switch(target))
+                (!enqueue_tracked_render_control(active, AttachControl::switch(target)))
+                    .then(|| active.identity(attach_pid))
             }
-            _ => false,
+            _ => None,
         };
         drop(active_attach);
-        if remove {
+        if let Some(stale_client) = stale_client {
             let removed_stale_clients = self
-                .remove_attached_clients_for_session(session_name, vec![attach_pid])
+                .remove_attached_clients_for_session(session_name, vec![stale_client])
                 .await;
             if !removed_stale_clients.is_empty() {
                 let _ = self

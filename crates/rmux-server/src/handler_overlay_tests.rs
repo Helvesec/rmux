@@ -1,4 +1,7 @@
-use super::super::{overlay_support::ClientOverlayState, RequestHandler};
+use super::super::{
+    overlay_support::{AttachedOverlayInput, ClientOverlayState},
+    RequestHandler,
+};
 use super::session_name;
 use crate::mouse::{layout_for_session, StatusRangeType};
 use crate::pane_io::AttachControl;
@@ -558,10 +561,15 @@ async fn popup_right_click_opens_nested_menu_and_escape_closes_layers() {
         assert!(popup.nested_menu.is_some());
     }
 
+    let mut pending_input = Vec::new();
     handler
-        .handle_attached_live_input_for_test(requester_pid, b"\x1b")
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"\x1b")
         .await
-        .expect("close nested menu");
+        .expect("retain nested menu Escape");
+    handler
+        .flush_attached_pending_escape_input(requester_pid, &mut pending_input)
+        .await
+        .expect("close nested menu after escape-time");
     {
         let active_attach = handler.active_attach.lock().await;
         let active = active_attach
@@ -575,15 +583,68 @@ async fn popup_right_click_opens_nested_menu_and_escape_closes_layers() {
     }
 
     handler
-        .handle_attached_live_input_for_test(requester_pid, b"\x1b")
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"\x1b")
         .await
-        .expect("close popup");
+        .expect("retain popup Escape");
+    handler
+        .flush_attached_pending_escape_input(requester_pid, &mut pending_input)
+        .await
+        .expect("close popup after escape-time");
     let active_attach = handler.active_attach.lock().await;
     let active = active_attach
         .by_pid
         .get(&requester_pid)
         .expect("attached client");
     assert!(active.overlay.is_none());
+}
+
+#[tokio::test]
+async fn nested_popup_menu_close_reroutes_same_chunk_tail_to_popup() {
+    let handler = RequestHandler::new();
+    let alpha = session_name("popup-menu-tail");
+    let requester_pid = std::process::id();
+    let _control_rx = create_attached_session(&handler, &alpha, requester_pid).await;
+
+    run_overlay_command(
+        &handler,
+        requester_pid,
+        r#"display-popup -N -T Popup -w 20 -h 6 -x C -y C"#,
+    )
+    .await;
+
+    let rect = {
+        let active_attach = handler.active_attach.lock().await;
+        let active = active_attach
+            .by_pid
+            .get(&requester_pid)
+            .expect("attached client");
+        let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_ref() else {
+            panic!("expected popup overlay");
+        };
+        popup.rect
+    };
+    handler
+        .handle_attached_live_input_for_test(requester_pid, &sgr_mouse(2, rect.x, rect.y))
+        .await
+        .expect("popup menu mouse");
+
+    let mut pending_input = Vec::new();
+    let outcome = handler
+        .handle_attached_overlay_input(requester_pid, &mut pending_input, b"\x03TAIL")
+        .await
+        .expect("nested menu closes");
+    assert_eq!(outcome, AttachedOverlayInput::Reroute(b"TAIL".to_vec()));
+    assert!(pending_input.is_empty());
+
+    let active_attach = handler.active_attach.lock().await;
+    let active = active_attach
+        .by_pid
+        .get(&requester_pid)
+        .expect("attached client");
+    let Some(ClientOverlayState::Popup(popup)) = active.overlay.as_ref() else {
+        panic!("popup should remain active");
+    };
+    assert!(popup.nested_menu.is_none());
 }
 
 #[tokio::test]

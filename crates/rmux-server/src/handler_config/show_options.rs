@@ -1,5 +1,5 @@
 use rmux_core::{HookBindingView, HookGlobalRoot, HookStore};
-use rmux_proto::{HookName, OptionScopeSelector, ShowOptionsRequest, WindowTarget};
+use rmux_proto::{HookName, OptionScopeSelector, ScopeSelector, ShowOptionsRequest, WindowTarget};
 
 use super::super::HandlerState;
 
@@ -53,22 +53,45 @@ fn render_hooks(
             filter,
             request,
         ),
-        OptionScopeSelector::Window(target) => render_local(
-            &state.hooks,
-            HookGlobalRoot::Window,
-            state.hooks.window_bindings_view(target, hook(filter)),
-            Vec::new(),
-            filter,
-            request,
-        ),
-        OptionScopeSelector::Pane(target) => {
-            let window =
-                WindowTarget::with_window(target.session_name().clone(), target.window_index());
+        OptionScopeSelector::Window(target) => {
+            let Ok(explicit) = super::super::hook_bindings_view(
+                state,
+                &ScopeSelector::Window(target.clone()),
+                hook(filter),
+            ) else {
+                return Vec::new();
+            };
             render_local(
                 &state.hooks,
                 HookGlobalRoot::Window,
-                state.hooks.pane_bindings_view(target, hook(filter)),
-                state.hooks.window_bindings_view(&window, hook(filter)),
+                explicit,
+                Vec::new(),
+                filter,
+                request,
+            )
+        }
+        OptionScopeSelector::Pane(target) => {
+            let window =
+                WindowTarget::with_window(target.session_name().clone(), target.window_index());
+            let Ok(explicit) = super::super::hook_bindings_view(
+                state,
+                &ScopeSelector::Pane(target.clone()),
+                hook(filter),
+            ) else {
+                return Vec::new();
+            };
+            let Ok(intermediate) = super::super::hook_bindings_view(
+                state,
+                &ScopeSelector::Window(window),
+                hook(filter),
+            ) else {
+                return Vec::new();
+            };
+            render_local(
+                &state.hooks,
+                HookGlobalRoot::Window,
+                explicit,
+                intermediate,
                 filter,
                 request,
             )

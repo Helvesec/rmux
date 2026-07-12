@@ -243,11 +243,17 @@ impl Session {
         )?;
 
         if source_window.pane_count() == 1 {
+            let source_alert_flags = self.winlink_alert_flags(source.window_index);
             let mut moved_window = self.remove_window_allowing_empty(source.window_index)?;
             moved_window.renumber_single_pane_to_zero();
             destination_session.insert_existing_window(destination_index, moved_window)?;
             if let Some(name) = options.name {
                 destination_session.rename_window(destination_index, name)?;
+            }
+            let _ = destination_session.clear_all_winlink_alert_flags(destination_index);
+            if !source_alert_flags.is_empty() {
+                let _ = destination_session
+                    .add_winlink_alert_flags(destination_index, source_alert_flags);
             }
             if !options.detached {
                 destination_session.select_window(destination_index)?;

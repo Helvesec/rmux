@@ -1,45 +1,108 @@
+use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::io;
-use std::sync::atomic::Ordering;
+use std::sync::{atomic::Ordering, Arc};
 
 use rmux_core::{input::mode, key_code_lookup_bits, LifecycleEvent};
 #[cfg(windows)]
 use rmux_core::{key_string_lookup_string, KEYC_CTRL, KEYC_IMPLIED_META, KEYC_META, KEYC_SHIFT};
 use rmux_proto::{AttachedKeystroke, PaneTarget, Response, WindowTarget};
-#[cfg(unix)]
-use rmux_pty::PtyMaster;
 #[cfg(windows)]
 use rmux_pty::WindowsConsoleKeyEvent;
 
-use super::super::super::{prompt_support::PromptInputEvent, RequestHandler};
+use super::super::super::RequestHandler;
+use super::super::decode_prompt_input_event;
 use super::super::io_other;
-#[cfg(unix)]
-use super::super::pane_io_encoding::is_dead_pane_write_error;
 use super::super::pane_io_encoding::{
     prepare_attached_pane_input_writes, write_attached_bytes_to_target_io,
 };
 use super::super::pane_prompt_input::{
     decode_utf8_char, is_extended_key_prefix, is_utf8_lead_byte, utf8_expected_len,
 };
-use super::bracketed_paste::{decode_bracketed_paste, BracketedPasteDecode};
-use super::kitty_graphics::{decode_kitty_graphics_apc, KittyGraphicsApcDecode};
+use super::bracketed_paste::{decode_bracketed_paste_after_append, BracketedPasteDecode};
+use super::kitty_graphics::{decode_kitty_graphics_apc_after_append, KittyGraphicsApcDecode};
 use super::terminal_response::{
-    decode_attached_terminal_control, decode_focus_event, TerminalControlEvent,
+    decode_attached_terminal_control_after_append, decode_focus_event, TerminalControlEvent,
     TerminalResponseDecode,
 };
 use super::{
     is_enter_key, is_mouse_prefix, resolve_input_target, retain_partial_attached_control_input,
 };
 use crate::client_flags::ClientFlags;
+use crate::handler::overlay_support::AttachedOverlayInput;
 use crate::input_keys::{decode_extended_key, decode_mouse, ExtendedKeyDecode, MouseDecode};
 use crate::key_table::{
     decode_attached_key, lookup_attached_key_table_binding, matches_prefix_key, session_option_key,
     AttachedKeyDecode, PREFIX_TABLE,
 };
 
-#[cfg(unix)]
-const DIRECT_CURRENT_PANE_INPUT_MAX_BYTES: usize = 16;
-
 pub(crate) type ActiveClientEmitCache = Option<(u64, WindowTarget)>;
+
+// Rerouting must re-evaluate attach state after hooks, mouse bindings, and prefix
+// commands. Keep each reroute suffix bounded so one maximum-size local frame
+// cannot turn those necessary copies into quadratic work.
+const ATTACHED_LIVE_REROUTE_CHUNK_BYTES: usize = 1024;
+
+enum AttachedLiveInputStep {
+    Complete(bool),
+    Reroute { bytes: Vec<u8>, forwarded: bool },
+}
+
+enum AttachedLiveChunkResult {
+    Complete(bool),
+    Rechunk { bytes: Vec<u8>, forwarded: bool },
+}
+
+struct AttachedLiveInputWork {
+    bytes: Arc<[u8]>,
+    start: usize,
+    end: usize,
+    windows_console_key: Option<rmux_proto::AttachedWindowsConsoleKey>,
+}
+
+impl AttachedLiveInputWork {
+    fn new(
+        bytes: Arc<[u8]>,
+        windows_console_key: Option<rmux_proto::AttachedWindowsConsoleKey>,
+    ) -> Self {
+        let end = bytes.len();
+        Self {
+            bytes,
+            start: 0,
+            end,
+            windows_console_key,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.end.saturating_sub(self.start)
+    }
+
+    fn split_at(&mut self, len: usize) -> Self {
+        let split = self.start.saturating_add(len).min(self.end);
+        let remaining = Self {
+            bytes: Arc::clone(&self.bytes),
+            start: split,
+            end: self.end,
+            windows_console_key: None,
+        };
+        self.end = split;
+        remaining
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[self.start..self.end]
+    }
+}
+
+fn take_attached_remaining_input(pending_input: &mut Vec<u8>, consumed: usize) -> Option<Vec<u8>> {
+    if consumed >= pending_input.len() {
+        return None;
+    }
+    let remaining = pending_input[consumed..].to_vec();
+    pending_input.clear();
+    Some(remaining)
+}
 
 impl RequestHandler {
     #[allow(dead_code)]
@@ -77,7 +140,7 @@ impl RequestHandler {
         .await
     }
 
-    #[async_recursion::async_recursion]
+    #[cfg(test)]
     pub(crate) async fn handle_attached_live_input(
         &self,
         attach_pid: u32,
@@ -111,7 +174,6 @@ impl RequestHandler {
         .await
     }
 
-    #[async_recursion::async_recursion]
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn handle_attached_live_input_inner(
         &self,
@@ -129,7 +191,39 @@ impl RequestHandler {
         .await
     }
 
-    #[async_recursion::async_recursion]
+    /// Flushes retained input that starts with the ambiguous `ESC ]` or
+    /// `ESC _` bytes once the escape deadline fires. Reaching the deadline
+    /// resolves the ambiguity between a fragmented consumed terminal
+    /// response (OSC 4/10/11/12/52), a kitty graphics APC (`ESC _G`), and
+    /// keyboard input in favor of the keyboard: dispatch M-] / M-_ through
+    /// the normal key path (key tables, copy mode, per-pane key encoding)
+    /// and reroute any accumulated body bytes as ordinary input. Writing the
+    /// raw bytes to the pane instead would start an unterminated OSC/APC
+    /// inside the pane's own parser and swallow subsequent input there.
+    pub(super) async fn flush_attached_consumed_osc_prefix(
+        &self,
+        attach_pid: u32,
+        pending_input: &mut Vec<u8>,
+    ) -> io::Result<bool> {
+        let bytes = std::mem::take(pending_input);
+        let backspace = self.attached_backspace_byte().await;
+        let AttachedKeyDecode::Matched { size, key } = decode_live_attached_key(&bytes, backspace)
+        else {
+            // `ESC ]` always decodes as M-]; keep the raw forward as a
+            // defensive fallback rather than dropping the input.
+            self.write_attached_bytes(attach_pid, &bytes).await?;
+            return Ok(true);
+        };
+        let handled = self.handle_attached_live_key(attach_pid, key).await?;
+        let mut forwarded = !handled;
+        if let Some(remaining) = bytes.get(size..).filter(|rest| !rest.is_empty()) {
+            forwarded |= self
+                .handle_attached_live_input_inner(attach_pid, pending_input, remaining)
+                .await?;
+        }
+        Ok(forwarded)
+    }
+
     async fn handle_attached_live_input_inner_cached(
         &self,
         attach_pid: u32,
@@ -147,7 +241,6 @@ impl RequestHandler {
         .await
     }
 
-    #[async_recursion::async_recursion]
     async fn handle_attached_live_input_inner_with_windows_console_key(
         &self,
         attach_pid: u32,
@@ -156,6 +249,159 @@ impl RequestHandler {
         windows_console_key: Option<rmux_proto::AttachedWindowsConsoleKey>,
         active_emit_cache: &mut ActiveClientEmitCache,
     ) -> io::Result<bool> {
+        if bytes.len() <= ATTACHED_LIVE_REROUTE_CHUNK_BYTES {
+            return match self
+                .handle_attached_live_input_chunk(
+                    attach_pid,
+                    pending_input,
+                    bytes,
+                    windows_console_key,
+                    active_emit_cache,
+                )
+                .await?
+            {
+                AttachedLiveChunkResult::Complete(forwarded) => Ok(forwarded),
+                AttachedLiveChunkResult::Rechunk { bytes, forwarded } => {
+                    self.handle_attached_live_input_work_queue(
+                        attach_pid,
+                        pending_input,
+                        AttachedLiveInputWork::new(Arc::from(bytes), None),
+                        forwarded,
+                        active_emit_cache,
+                    )
+                    .await
+                }
+            };
+        }
+
+        // Preserve one-shot fast-path semantics for a large printable line,
+        // including submitted-line tracking. Inputs that contain a prefix or
+        // terminal control fall back to bounded reroute chunks below.
+        if windows_console_key.is_none() {
+            if let Some(forwarded) = self
+                .try_forward_plain_attached_bytes_fast(
+                    attach_pid,
+                    pending_input,
+                    bytes,
+                    active_emit_cache,
+                )
+                .await?
+            {
+                return Ok(forwarded);
+            }
+        }
+
+        self.handle_attached_live_input_work_queue(
+            attach_pid,
+            pending_input,
+            AttachedLiveInputWork::new(Arc::from(bytes), windows_console_key),
+            false,
+            active_emit_cache,
+        )
+        .await
+    }
+
+    async fn handle_attached_live_input_work_queue(
+        &self,
+        attach_pid: u32,
+        pending_input: &mut Vec<u8>,
+        initial_work: AttachedLiveInputWork,
+        mut forwarded: bool,
+        active_emit_cache: &mut ActiveClientEmitCache,
+    ) -> io::Result<bool> {
+        let mut work_queue = VecDeque::from([initial_work]);
+        while let Some(mut work) = work_queue.pop_front() {
+            if work.len() > ATTACHED_LIVE_REROUTE_CHUNK_BYTES
+                && self
+                    .attached_live_input_can_use_reroute_chunks(attach_pid)
+                    .await?
+            {
+                let remaining = work.split_at(ATTACHED_LIVE_REROUTE_CHUNK_BYTES);
+                work_queue.push_front(remaining);
+            }
+
+            let windows_console_key = work.windows_console_key.take();
+            match self
+                .handle_attached_live_input_chunk(
+                    attach_pid,
+                    pending_input,
+                    work.as_bytes(),
+                    windows_console_key,
+                    active_emit_cache,
+                )
+                .await?
+            {
+                AttachedLiveChunkResult::Complete(step_forwarded) => {
+                    forwarded |= step_forwarded;
+                }
+                AttachedLiveChunkResult::Rechunk {
+                    bytes,
+                    forwarded: step_forwarded,
+                } => {
+                    forwarded |= step_forwarded;
+                    work_queue.push_front(AttachedLiveInputWork::new(Arc::from(bytes), None));
+                }
+            }
+        }
+        Ok(forwarded)
+    }
+
+    async fn handle_attached_live_input_chunk(
+        &self,
+        attach_pid: u32,
+        pending_input: &mut Vec<u8>,
+        bytes: &[u8],
+        mut windows_console_key: Option<rmux_proto::AttachedWindowsConsoleKey>,
+        active_emit_cache: &mut ActiveClientEmitCache,
+    ) -> io::Result<AttachedLiveChunkResult> {
+        let mut bytes = Cow::Borrowed(bytes);
+        let mut forwarded = false;
+
+        loop {
+            match self
+                .handle_attached_live_input_step(
+                    attach_pid,
+                    pending_input,
+                    bytes.as_ref(),
+                    windows_console_key.take(),
+                    active_emit_cache,
+                )
+                .await?
+            {
+                AttachedLiveInputStep::Complete(step_forwarded) => {
+                    return Ok(AttachedLiveChunkResult::Complete(
+                        forwarded | step_forwarded,
+                    ));
+                }
+                AttachedLiveInputStep::Reroute {
+                    bytes: remaining,
+                    forwarded: step_forwarded,
+                } => {
+                    forwarded |= step_forwarded;
+                    if remaining.len() > ATTACHED_LIVE_REROUTE_CHUNK_BYTES
+                        && self
+                            .attached_live_input_can_use_reroute_chunks(attach_pid)
+                            .await?
+                    {
+                        return Ok(AttachedLiveChunkResult::Rechunk {
+                            bytes: remaining,
+                            forwarded,
+                        });
+                    }
+                    bytes = Cow::Owned(remaining);
+                }
+            }
+        }
+    }
+
+    async fn handle_attached_live_input_step(
+        &self,
+        attach_pid: u32,
+        pending_input: &mut Vec<u8>,
+        bytes: &[u8],
+        windows_console_key: Option<rmux_proto::AttachedWindowsConsoleKey>,
+        active_emit_cache: &mut ActiveClientEmitCache,
+    ) -> io::Result<AttachedLiveInputStep> {
         #[cfg(not(windows))]
         let _ = windows_console_key;
         #[cfg(windows)]
@@ -177,35 +423,43 @@ impl RequestHandler {
                 )
                 .await?
             {
-                return Ok(forwarded);
+                return Ok(AttachedLiveInputStep::Complete(forwarded));
             }
         }
         if self.attached_client_input_is_read_only(attach_pid).await? {
             pending_input.clear();
-            return Ok(false);
+            return Ok(AttachedLiveInputStep::Complete(false));
         }
         self.clear_attached_focus_alerts(attach_pid).await;
         if self.prompt_active(attach_pid).await {
-            self.handle_attached_prompt_input(attach_pid, pending_input, bytes)
+            let remaining = self
+                .handle_attached_prompt_input(attach_pid, pending_input, bytes)
                 .await?;
-            return Ok(false);
+            return Ok(attached_mode_input_step(remaining));
         }
         if self.mode_tree_active(attach_pid).await {
-            self.handle_attached_mode_tree_input(attach_pid, pending_input, bytes)
+            let remaining = self
+                .handle_attached_mode_tree_input(attach_pid, pending_input, bytes)
                 .await?;
-            return Ok(false);
+            return Ok(attached_mode_input_step(remaining));
         }
-        if self.overlay_active(attach_pid).await
-            && self
+        if self.overlay_active(attach_pid).await {
+            return match self
                 .handle_attached_overlay_input(attach_pid, pending_input, bytes)
                 .await?
-        {
-            return Ok(false);
+            {
+                AttachedOverlayInput::Consumed => Ok(AttachedLiveInputStep::Complete(false)),
+                AttachedOverlayInput::Reroute(bytes) => Ok(AttachedLiveInputStep::Reroute {
+                    bytes,
+                    forwarded: false,
+                }),
+            };
         }
         if self.display_panes_active(attach_pid).await {
-            self.handle_attached_display_panes_input(attach_pid, pending_input, bytes)
+            let remaining = self
+                .handle_attached_display_panes_input(attach_pid, pending_input, bytes)
                 .await?;
-            return Ok(false);
+            return Ok(attached_mode_input_step(remaining));
         }
         let target = self
             .attached_input_target(attach_pid)
@@ -218,16 +472,71 @@ impl RequestHandler {
             .await
             .map_err(io_other)?
         {
+            let new_input_at = pending_input.len();
+            pending_input.extend_from_slice(bytes);
+            match decode_bracketed_paste_after_append(pending_input, new_input_at) {
+                BracketedPasteDecode::Matched { .. } => {
+                    let _ = self.exit_clock_mode(&target).await.map_err(io_other)?;
+                    return Ok(AttachedLiveInputStep::Reroute {
+                        bytes: std::mem::take(pending_input),
+                        forwarded: false,
+                    });
+                }
+                BracketedPasteDecode::Partial => {
+                    retain_partial_attached_control_input(
+                        "clock mode bracketed paste",
+                        pending_input,
+                    )?;
+                    return Ok(AttachedLiveInputStep::Complete(false));
+                }
+                BracketedPasteDecode::NotPaste => {}
+            }
+            if is_mouse_prefix(pending_input) {
+                let last_mouse = self.attached_last_mouse_event(attach_pid).await;
+                let consumed = match decode_mouse(pending_input, last_mouse) {
+                    MouseDecode::Matched { size, .. } | MouseDecode::Discard { size } => size,
+                    MouseDecode::Partial => {
+                        retain_partial_attached_control_input(
+                            "clock mode mouse input",
+                            pending_input,
+                        )?;
+                        return Ok(AttachedLiveInputStep::Complete(false));
+                    }
+                    MouseDecode::Invalid => 0,
+                };
+                if consumed > 0 {
+                    pending_input.drain(..consumed);
+                    let _ = self.exit_clock_mode(&target).await.map_err(io_other)?;
+                    let remaining =
+                        (!pending_input.is_empty()).then(|| std::mem::take(pending_input));
+                    return Ok(attached_mode_input_step(remaining));
+                }
+            }
+            let backspace = self.attached_backspace_byte().await;
+            let consumed = match decode_attached_key(pending_input, backspace) {
+                AttachedKeyDecode::Matched { size, .. } => size,
+                AttachedKeyDecode::Partial => {
+                    retain_partial_attached_control_input("clock mode input", pending_input)?;
+                    return Ok(AttachedLiveInputStep::Complete(false));
+                }
+                AttachedKeyDecode::Invalid => {
+                    let Some((_, consumed)) = decode_prompt_input_event(pending_input) else {
+                        retain_partial_attached_control_input("clock mode input", pending_input)?;
+                        return Ok(AttachedLiveInputStep::Complete(false));
+                    };
+                    consumed
+                }
+            };
+            pending_input.drain(..consumed);
             let _ = self.exit_clock_mode(&target).await.map_err(io_other)?;
-            pending_input.clear();
-            return Ok(false);
+            let remaining = (!pending_input.is_empty()).then(|| std::mem::take(pending_input));
+            return Ok(attached_mode_input_step(remaining));
         }
         let target_in_copy_mode = self
             .target_is_in_copy_mode(&target)
             .await
             .map_err(io_other)?;
         let target_mode = self.target_pane_mode(&target).await.map_err(io_other)?;
-        let target_bracketed_paste = target_mode & mode::MODE_BRACKETPASTE != 0;
         let target_focus_events = target_mode & mode::MODE_FOCUSON != 0;
         let backspace = self.attached_backspace_byte().await;
 
@@ -244,7 +553,7 @@ impl RequestHandler {
                         },
                     )
                     .await?;
-                return Ok(!handled);
+                return Ok(AttachedLiveInputStep::Complete(!handled));
             }
         }
 
@@ -264,28 +573,31 @@ impl RequestHandler {
                                 },
                             )
                             .await?;
-                        return Ok(!handled);
+                        return Ok(AttachedLiveInputStep::Complete(!handled));
                     }
                 }
             }
         }
 
         if pending_input.is_empty()
-            && !self.attached_prefix_table_active(attach_pid).await
+            && !self.attached_key_table_active(attach_pid).await
             && self
                 .dispatch_immediate_prefix_detach(attach_pid, &target, bytes, backspace)
                 .await?
         {
-            return Ok(false);
+            return Ok(AttachedLiveInputStep::Complete(false));
         }
 
+        let new_input_at = pending_input.len();
         pending_input.extend_from_slice(bytes);
         let mut raw_start = 0;
         let mut offset = 0;
+        let mut prefix_keys = None;
 
         while offset < pending_input.len() {
             let slice = &pending_input[offset..];
-            match decode_bracketed_paste(slice) {
+            let slice_new_input_at = new_input_at.saturating_sub(offset);
+            match decode_bracketed_paste_after_append(slice, slice_new_input_at) {
                 BracketedPasteDecode::Matched {
                     size,
                     body_start,
@@ -300,14 +612,11 @@ impl RequestHandler {
                         self.write_attached_bytes(attach_pid, &pending_input[raw_start..offset])
                             .await?;
                     }
-                    let payload = if target_bracketed_paste {
-                        &pending_input[offset..offset + size]
-                    } else {
-                        &pending_input[offset + body_start..offset + body_end]
-                    };
-                    if !payload.is_empty() {
-                        self.write_attached_bytes(attach_pid, payload).await?;
-                    }
+                    self.write_attached_bracketed_paste(
+                        attach_pid,
+                        &pending_input[offset + body_start..offset + body_end],
+                    )
+                    .await?;
                     forwarded_to_pane = true;
                     offset += size;
                     raw_start = offset;
@@ -321,18 +630,21 @@ impl RequestHandler {
                     }
                     pending_input.drain(..offset);
                     retain_partial_attached_control_input("live bracketed paste", pending_input)?;
-                    return Ok(forwarded_to_pane);
+                    return Ok(AttachedLiveInputStep::Complete(forwarded_to_pane));
                 }
                 BracketedPasteDecode::NotPaste => {}
             }
-            match decode_kitty_graphics_apc(slice) {
+            match decode_kitty_graphics_apc_after_append(slice, slice_new_input_at) {
                 KittyGraphicsApcDecode::Matched { size } => {
                     if raw_start < offset {
                         self.write_attached_bytes(attach_pid, &pending_input[raw_start..offset])
                             .await?;
                     }
-                    self.write_attached_bytes(attach_pid, &pending_input[offset..offset + size])
-                        .await?;
+                    self.write_attached_target_bytes(
+                        attach_pid,
+                        &pending_input[offset..offset + size],
+                    )
+                    .await?;
                     forwarded_to_pane = true;
                     offset += size;
                     raw_start = offset;
@@ -349,7 +661,7 @@ impl RequestHandler {
                         "live kitty graphics APC",
                         pending_input,
                     )?;
-                    return Ok(forwarded_to_pane);
+                    return Ok(AttachedLiveInputStep::Complete(forwarded_to_pane));
                 }
                 KittyGraphicsApcDecode::NotKittyGraphics => {}
             }
@@ -359,18 +671,31 @@ impl RequestHandler {
                         .await?;
                     forwarded_to_pane = true;
                 }
-                self.handle_attached_terminal_control_event(attach_pid, &target, event)
-                    .await;
                 if target_focus_events {
-                    self.write_attached_bytes(attach_pid, &pending_input[offset..offset + 3])
-                        .await?;
+                    self.write_attached_target_bytes(
+                        attach_pid,
+                        &pending_input[offset..offset + 3],
+                    )
+                    .await?;
                     forwarded_to_pane = true;
                 }
+                self.handle_attached_terminal_control_event(attach_pid, &target, event)
+                    .await;
                 offset += 3;
                 raw_start = offset;
+                if let Some(remaining) = take_attached_remaining_input(pending_input, raw_start) {
+                    return Ok(AttachedLiveInputStep::Reroute {
+                        bytes: remaining,
+                        forwarded: forwarded_to_pane,
+                    });
+                }
                 continue;
             }
-            match decode_attached_terminal_control(slice, target_focus_events) {
+            match decode_attached_terminal_control_after_append(
+                slice,
+                target_focus_events,
+                slice_new_input_at,
+            ) {
                 TerminalResponseDecode::Matched { size, event } => {
                     if raw_start < offset {
                         self.write_attached_bytes(attach_pid, &pending_input[raw_start..offset])
@@ -383,6 +708,31 @@ impl RequestHandler {
                     }
                     offset += size;
                     raw_start = offset;
+                    if event.is_some() {
+                        if let Some(remaining) =
+                            take_attached_remaining_input(pending_input, raw_start)
+                        {
+                            return Ok(AttachedLiveInputStep::Reroute {
+                                bytes: remaining,
+                                forwarded: forwarded_to_pane,
+                            });
+                        }
+                    }
+                    continue;
+                }
+                TerminalResponseDecode::PaneBound { size } => {
+                    if raw_start < offset {
+                        self.write_attached_bytes(attach_pid, &pending_input[raw_start..offset])
+                            .await?;
+                    }
+                    self.write_attached_target_bytes(
+                        attach_pid,
+                        &pending_input[offset..offset + size],
+                    )
+                    .await?;
+                    forwarded_to_pane = true;
+                    offset += size;
+                    raw_start = offset;
                     continue;
                 }
                 TerminalResponseDecode::Partial => {
@@ -393,7 +743,7 @@ impl RequestHandler {
                     }
                     pending_input.drain(..offset);
                     retain_partial_attached_control_input("live terminal response", pending_input)?;
-                    return Ok(forwarded_to_pane);
+                    return Ok(AttachedLiveInputStep::Complete(forwarded_to_pane));
                 }
                 TerminalResponseDecode::NotResponse => {}
             }
@@ -409,15 +759,23 @@ impl RequestHandler {
                         self.handle_attached_live_mouse(attach_pid, event).await?;
                         offset += size;
                         raw_start = offset;
+                        if let Some(remaining) =
+                            take_attached_remaining_input(pending_input, raw_start)
+                        {
+                            return Ok(AttachedLiveInputStep::Reroute {
+                                bytes: remaining,
+                                forwarded: forwarded_to_pane,
+                            });
+                        }
                     }
                     MouseDecode::Discard { size } => {
                         offset += size;
                         raw_start = offset;
                     }
                     MouseDecode::Partial => {
-                        pending_input.drain(..raw_start);
+                        pending_input.drain(..offset);
                         retain_partial_attached_control_input("live mouse", pending_input)?;
-                        return Ok(forwarded_to_pane);
+                        return Ok(AttachedLiveInputStep::Complete(forwarded_to_pane));
                     }
                     MouseDecode::Invalid => {
                         raw_start = offset;
@@ -471,17 +829,15 @@ impl RequestHandler {
                         }
                         offset += size;
                         raw_start = offset;
-                        if let Some(forwarded) = self
-                            .reroute_attached_remaining_input_if_mode_changed(
-                                attach_pid,
-                                pending_input,
-                                raw_start,
-                                active_emit_cache,
-                            )
-                            .await?
-                        {
-                            forwarded_to_pane |= forwarded;
-                            return Ok(forwarded_to_pane);
+                        if handled {
+                            if let Some(remaining) =
+                                take_attached_remaining_input(pending_input, raw_start)
+                            {
+                                return Ok(AttachedLiveInputStep::Reroute {
+                                    bytes: remaining,
+                                    forwarded: forwarded_to_pane,
+                                });
+                            }
                         }
                         if self.prompt_active(attach_pid).await {
                             break;
@@ -489,51 +845,61 @@ impl RequestHandler {
                         continue;
                     }
                     ExtendedKeyDecode::Partial => {
-                        pending_input.drain(..raw_start);
+                        pending_input.drain(..offset);
                         retain_partial_attached_control_input("live extended key", pending_input)?;
-                        return Ok(forwarded_to_pane);
+                        return Ok(AttachedLiveInputStep::Complete(forwarded_to_pane));
                     }
-                    ExtendedKeyDecode::Invalid => {}
+                    ExtendedKeyDecode::Invalid => {
+                        raw_start = offset;
+                    }
                 }
             }
-            let prefix_table_active = self.attached_prefix_table_active(attach_pid).await;
-            if slice
-                .first()
-                .is_some_and(|byte| byte.is_ascii() && !byte.is_ascii_control())
-                && !prefix_table_active
-                && !target_in_copy_mode
-            {
-                let matches_prefix = {
-                    let state = self.state.lock().await;
-                    first_byte_matches_prefix(slice, &target, &state)
-                };
-                if !matches_prefix {
-                    offset += 1;
-                    continue;
+            let key_table_active = self.attached_key_table_active(attach_pid).await;
+            if !key_table_active && !target_in_copy_mode {
+                let first = slice[0];
+                if !first.is_ascii_control() {
+                    let (prefix, prefix2) = match prefix_keys {
+                        Some(keys) => keys,
+                        None => {
+                            let state = self.state.lock().await;
+                            let keys = (
+                                session_option_key(
+                                    &state,
+                                    target.session_name(),
+                                    rmux_proto::OptionName::Prefix,
+                                ),
+                                session_option_key(
+                                    &state,
+                                    target.session_name(),
+                                    rmux_proto::OptionName::Prefix2,
+                                ),
+                            );
+                            prefix_keys = Some(keys);
+                            keys
+                        }
+                    };
+                    if first.is_ascii() {
+                        if !first_input_key_matches_prefix(slice, prefix, prefix2) {
+                            offset += 1;
+                            continue;
+                        }
+                    } else if let Some((character, size)) = decode_utf8_char(slice) {
+                        if !matches_prefix_key(character as rmux_core::KeyCode, prefix, prefix2) {
+                            offset += size;
+                            continue;
+                        }
+                    } else {
+                        if is_utf8_lead_byte(first) && slice.len() < utf8_expected_len(first) {
+                            pending_input.drain(..raw_start);
+                            retain_partial_attached_control_input("live utf-8", pending_input)?;
+                            return Ok(AttachedLiveInputStep::Complete(forwarded_to_pane));
+                        }
+                        offset += 1;
+                        continue;
+                    }
                 }
             }
-            if !prefix_table_active
-                && !target_in_copy_mode
-                && slice.first().is_some_and(|byte| !byte.is_ascii())
-            {
-                if let Some((_, size)) = decode_utf8_char(slice) {
-                    offset += size;
-                    continue;
-                }
-                if slice.first().copied().is_some_and(is_utf8_lead_byte)
-                    && slice.len()
-                        < utf8_expected_len(
-                            slice.first().copied().expect("slice has at least one byte"),
-                        )
-                {
-                    pending_input.drain(..raw_start);
-                    retain_partial_attached_control_input("live utf-8", pending_input)?;
-                    return Ok(forwarded_to_pane);
-                }
-                offset += 1;
-                continue;
-            }
-            match decode_attached_key(slice, backspace) {
+            match decode_live_attached_key(slice, backspace) {
                 AttachedKeyDecode::Matched { size, key } => {
                     if raw_start < offset && is_enter_key(key) {
                         self.record_attached_submitted_text(
@@ -577,17 +943,15 @@ impl RequestHandler {
                     }
                     offset += size;
                     raw_start = offset;
-                    if let Some(forwarded) = self
-                        .reroute_attached_remaining_input_if_mode_changed(
-                            attach_pid,
-                            pending_input,
-                            raw_start,
-                            active_emit_cache,
-                        )
-                        .await?
-                    {
-                        forwarded_to_pane |= forwarded;
-                        return Ok(forwarded_to_pane);
+                    if handled {
+                        if let Some(remaining) =
+                            take_attached_remaining_input(pending_input, raw_start)
+                        {
+                            return Ok(AttachedLiveInputStep::Reroute {
+                                bytes: remaining,
+                                forwarded: forwarded_to_pane,
+                            });
+                        }
                     }
                     if self.prompt_active(attach_pid).await {
                         break;
@@ -595,24 +959,9 @@ impl RequestHandler {
                     continue;
                 }
                 AttachedKeyDecode::Partial => {
-                    if target_in_copy_mode
-                        && slice == b"\x1b"
-                        && self
-                            .handle_attached_copy_mode_key_event(
-                                attach_pid,
-                                target.clone(),
-                                PromptInputEvent::Escape,
-                            )
-                            .await
-                            .map_err(io_other)?
-                    {
-                        offset += 1;
-                        raw_start = offset;
-                        continue;
-                    }
                     pending_input.drain(..raw_start);
                     retain_partial_attached_control_input("live attached key", pending_input)?;
-                    return Ok(forwarded_to_pane);
+                    return Ok(AttachedLiveInputStep::Complete(forwarded_to_pane));
                 }
                 AttachedKeyDecode::Invalid => {}
             }
@@ -622,14 +971,10 @@ impl RequestHandler {
         if self.prompt_active(attach_pid).await && raw_start < pending_input.len() {
             let remaining = pending_input[raw_start..].to_vec();
             pending_input.clear();
-            Box::pin(self.handle_attached_live_input_inner_cached(
-                attach_pid,
-                pending_input,
-                &remaining,
-                active_emit_cache,
-            ))
-            .await?;
-            return Ok(forwarded_to_pane);
+            return Ok(AttachedLiveInputStep::Reroute {
+                bytes: remaining,
+                forwarded: forwarded_to_pane,
+            });
         }
 
         if raw_start < pending_input.len() {
@@ -638,7 +983,7 @@ impl RequestHandler {
             forwarded_to_pane = true;
         }
         pending_input.clear();
-        Ok(forwarded_to_pane)
+        Ok(AttachedLiveInputStep::Complete(forwarded_to_pane))
     }
 
     async fn try_forward_plain_attached_bytes_fast(
@@ -671,7 +1016,7 @@ impl RequestHandler {
                     return Ok(None);
                 }
             }
-            if first_byte_matches_prefix(bytes, &target, &state) {
+            if input_contains_prefix(bytes, &target, &state) {
                 return Ok(None);
             }
             if let Some(submitted) = submitted_text_before_enter(bytes) {
@@ -710,132 +1055,6 @@ impl RequestHandler {
         Ok(Some(true))
     }
 
-    #[cfg(unix)]
-    pub(crate) async fn try_forward_plain_attached_bytes_to_current_pane_fast(
-        &self,
-        attach_pid: u32,
-        pending_input: &[u8],
-        bytes: &[u8],
-        target: &PaneTarget,
-        master: &PtyMaster,
-        active_emit_cache: &mut ActiveClientEmitCache,
-    ) -> io::Result<Option<bool>> {
-        if !is_direct_current_pane_fast_path_input(bytes)
-            || !pending_input.is_empty()
-            || !is_plain_attached_fast_path_input(bytes)
-        {
-            return Ok(None);
-        }
-
-        let Some(session_name) = self.fast_path_attached_session(attach_pid).await? else {
-            return Ok(None);
-        };
-        if &session_name != target.session_name() {
-            return Ok(None);
-        }
-
-        let clear_alerts_changed = {
-            let mut state = self.state.lock().await;
-            let resolved = resolve_input_target(&state, None, Some(target.session_name()))
-                .map_err(io_other)?;
-            if !same_pane_target(&resolved, target) {
-                return Ok(None);
-            }
-            if state.options.resolve_for_window(
-                target.session_name(),
-                target.window_index(),
-                rmux_proto::OptionName::SynchronizePanes,
-            ) == Some("on")
-            {
-                return Ok(None);
-            }
-            let pane_id = state
-                .sessions
-                .session(target.session_name())
-                .and_then(|session| session.window_at(target.window_index()))
-                .and_then(|window| window.pane(target.pane_index()))
-                .map(rmux_core::Pane::id)
-                .ok_or_else(|| {
-                    io_other(rmux_proto::RmuxError::invalid_target(
-                        target.to_string(),
-                        "pane index does not exist in session",
-                    ))
-                })?;
-            if state.pane_is_dead(target.session_name(), pane_id)
-                || state.pane_input_is_disabled(pane_id)
-            {
-                return Ok(None);
-            }
-            let transcript = state.transcript_handle(target).map_err(io_other)?;
-            {
-                let transcript = transcript
-                    .lock()
-                    .expect("pane transcript mutex must not be poisoned");
-                if transcript.copy_mode_state().is_some()
-                    || transcript.clock_mode_generation().is_some()
-                    || transcript.mode() & mode::MODE_MOUSE_ALL != 0
-                {
-                    return Ok(None);
-                }
-            }
-            if first_byte_matches_prefix(bytes, target, &state) {
-                return Ok(None);
-            }
-            state
-                .sessions
-                .session_mut(target.session_name())
-                .is_some_and(|session| session.clear_all_winlink_alert_flags(target.window_index()))
-        };
-
-        self.emit_attached_client_active_if_changed(attach_pid, target, active_emit_cache)
-            .await;
-        let written = match master.try_write_immediate(bytes) {
-            Ok(written) => written,
-            Err(error) if is_dead_pane_write_error(&error) => return Ok(Some(true)),
-            Err(error) => return Err(error),
-        };
-        match written {
-            written if written == bytes.len() => {
-                if clear_alerts_changed {
-                    let handler = self.clone();
-                    let refresh_session_name = session_name.clone();
-                    tokio::spawn(async move {
-                        handler
-                            .refresh_attached_session(&refresh_session_name)
-                            .await;
-                    });
-                }
-                Ok(Some(true))
-            }
-            0 => Ok(None),
-            written => {
-                let suffix = bytes[written..].to_vec();
-                let master = master.try_clone().map_err(io::Error::other)?;
-                let write_result = tokio::task::spawn_blocking(move || master.write_all(&suffix))
-                    .await
-                    .map_err(|error| {
-                        io::Error::other(format!("pane write task failed: {error}"))
-                    })?;
-                if let Err(error) = write_result {
-                    if is_dead_pane_write_error(&error) {
-                        return Ok(Some(true));
-                    }
-                    return Err(error);
-                }
-                if clear_alerts_changed {
-                    let handler = self.clone();
-                    let refresh_session_name = session_name.clone();
-                    tokio::spawn(async move {
-                        handler
-                            .refresh_attached_session(&refresh_session_name)
-                            .await;
-                    });
-                }
-                Ok(Some(true))
-            }
-        }
-    }
-
     async fn fast_path_attached_session(
         &self,
         attach_pid: u32,
@@ -853,20 +1072,37 @@ impl RequestHandler {
             || active.mode_tree.is_some()
             || active.overlay.is_some()
             || active.display_panes.is_some()
-            || active.key_table_name.as_deref() == Some(PREFIX_TABLE)
+            || active.key_table_name.is_some()
         {
             return Ok(None);
         }
         Ok(Some(active.session_name.clone()))
     }
 
-    async fn attached_prefix_table_active(&self, attach_pid: u32) -> bool {
+    async fn attached_live_input_can_use_reroute_chunks(
+        &self,
+        attach_pid: u32,
+    ) -> io::Result<bool> {
+        let active_attach = self.active_attach.lock().await;
+        let active = active_attach.by_pid.get(&attach_pid).ok_or_else(|| {
+            io_other(rmux_proto::RmuxError::Server(
+                "attached client disappeared".to_owned(),
+            ))
+        })?;
+        Ok(active.can_write
+            && !active.flags.contains(ClientFlags::READONLY)
+            && active.prompt.is_none()
+            && active.mode_tree.is_none()
+            && active.overlay.is_none()
+            && active.display_panes.is_none())
+    }
+
+    async fn attached_key_table_active(&self, attach_pid: u32) -> bool {
         let active_attach = self.active_attach.lock().await;
         active_attach
             .by_pid
             .get(&attach_pid)
-            .and_then(|active| active.key_table_name.as_deref())
-            == Some(PREFIX_TABLE)
+            .is_some_and(|active| active.key_table_name.is_some())
     }
 
     async fn emit_attached_client_active_if_changed(
@@ -922,36 +1158,36 @@ impl RequestHandler {
         let client_name = Some(attach_pid.to_string());
         match event {
             TerminalControlEvent::FocusIn => {
-                self.emit(LifecycleEvent::ClientFocusIn {
+                self.emit_and_wait(LifecycleEvent::ClientFocusIn {
                     session_name,
                     client_name,
                 })
                 .await;
-                self.emit(LifecycleEvent::PaneFocusIn {
+                self.emit_and_wait(LifecycleEvent::PaneFocusIn {
                     target: target.clone(),
                 })
                 .await;
             }
             TerminalControlEvent::FocusOut => {
-                self.emit(LifecycleEvent::PaneFocusOut {
+                self.emit_and_wait(LifecycleEvent::PaneFocusOut {
                     target: target.clone(),
                 })
                 .await;
-                self.emit(LifecycleEvent::ClientFocusOut {
+                self.emit_and_wait(LifecycleEvent::ClientFocusOut {
                     session_name,
                     client_name,
                 })
                 .await;
             }
             TerminalControlEvent::ClientLightTheme => {
-                self.emit(LifecycleEvent::ClientLightTheme {
+                self.emit_and_wait(LifecycleEvent::ClientLightTheme {
                     session_name,
                     client_name,
                 })
                 .await;
             }
             TerminalControlEvent::ClientDarkTheme => {
-                self.emit(LifecycleEvent::ClientDarkTheme {
+                self.emit_and_wait(LifecycleEvent::ClientDarkTheme {
                     session_name,
                     client_name,
                 })
@@ -1001,46 +1237,6 @@ impl RequestHandler {
             .await
     }
 
-    async fn reroute_attached_remaining_input_if_mode_changed(
-        &self,
-        attach_pid: u32,
-        pending_input: &mut Vec<u8>,
-        consumed: usize,
-        active_emit_cache: &mut ActiveClientEmitCache,
-    ) -> io::Result<Option<bool>> {
-        if consumed >= pending_input.len() {
-            return Ok(None);
-        }
-
-        let target = self
-            .attached_input_target(attach_pid)
-            .await
-            .map_err(io_other)?;
-        let interactive_mode_active = self.prompt_active(attach_pid).await
-            || self.attached_prefix_table_active(attach_pid).await
-            || self.mode_tree_active(attach_pid).await
-            || self.overlay_active(attach_pid).await
-            || self.display_panes_active(attach_pid).await
-            || self
-                .target_is_in_clock_mode(&target)
-                .await
-                .map_err(io_other)?;
-        if !interactive_mode_active {
-            return Ok(None);
-        }
-
-        let remaining = pending_input[consumed..].to_vec();
-        pending_input.clear();
-        let forwarded = Box::pin(self.handle_attached_live_input_inner_cached(
-            attach_pid,
-            pending_input,
-            &remaining,
-            active_emit_cache,
-        ))
-        .await?;
-        Ok(Some(forwarded))
-    }
-
     async fn dispatch_immediate_prefix_detach(
         &self,
         attach_pid: u32,
@@ -1051,7 +1247,7 @@ impl RequestHandler {
         let AttachedKeyDecode::Matched {
             size: prefix_size,
             key: prefix_key,
-        } = decode_attached_key(bytes, backspace)
+        } = decode_live_attached_key(bytes, backspace)
         else {
             return Ok(false);
         };
@@ -1062,7 +1258,7 @@ impl RequestHandler {
         let AttachedKeyDecode::Matched {
             size: command_size,
             key: command_key,
-        } = decode_attached_key(&bytes[prefix_size..], backspace)
+        } = decode_live_attached_key(&bytes[prefix_size..], backspace)
         else {
             return Ok(false);
         };
@@ -1108,6 +1304,16 @@ impl RequestHandler {
     }
 }
 
+fn attached_mode_input_step(remaining: Option<Vec<u8>>) -> AttachedLiveInputStep {
+    match remaining {
+        Some(bytes) => AttachedLiveInputStep::Reroute {
+            bytes,
+            forwarded: false,
+        },
+        None => AttachedLiveInputStep::Complete(false),
+    }
+}
+
 fn is_plain_attached_fast_path_input(bytes: &[u8]) -> bool {
     !bytes.is_empty()
         && bytes
@@ -1115,35 +1321,75 @@ fn is_plain_attached_fast_path_input(bytes: &[u8]) -> bool {
             .all(|byte| matches!(*byte, b'\r' | b'\n' | b' '..=b'~'))
 }
 
-#[cfg(unix)]
-fn is_direct_current_pane_fast_path_input(bytes: &[u8]) -> bool {
-    !bytes.is_empty()
-        && bytes.len() <= DIRECT_CURRENT_PANE_INPUT_MAX_BYTES
-        && bytes.iter().all(|byte| matches!(*byte, b' '..=b'~'))
+fn first_input_key_matches_prefix(
+    bytes: &[u8],
+    prefix: Option<rmux_core::KeyCode>,
+    prefix2: Option<rmux_core::KeyCode>,
+) -> bool {
+    let AttachedKeyDecode::Matched { key, .. } = decode_live_attached_key(bytes, None) else {
+        return false;
+    };
+    matches_prefix_key(key, prefix, prefix2)
 }
 
-fn first_byte_matches_prefix(
+fn decode_live_attached_key(input: &[u8], backspace: Option<u8>) -> AttachedKeyDecode {
+    match decode_attached_key(input, backspace) {
+        AttachedKeyDecode::Invalid => {
+            let Some(&first) = input.first() else {
+                return AttachedKeyDecode::Partial;
+            };
+            let (utf8, consumed_prefix, modifiers) = if first == b'\x1b' {
+                let Some(&second) = input.get(1) else {
+                    return AttachedKeyDecode::Partial;
+                };
+                if second.is_ascii() {
+                    return AttachedKeyDecode::Invalid;
+                }
+                (
+                    &input[1..],
+                    1,
+                    rmux_core::KEYC_META | rmux_core::KEYC_IMPLIED_META,
+                )
+            } else {
+                (input, 0, 0)
+            };
+            let Some(&utf8_first) = utf8.first() else {
+                return AttachedKeyDecode::Partial;
+            };
+            if let Some((character, size)) = decode_utf8_char(utf8) {
+                return AttachedKeyDecode::Matched {
+                    size: consumed_prefix + size,
+                    key: character as rmux_core::KeyCode | modifiers,
+                };
+            }
+            if is_utf8_lead_byte(utf8_first) && utf8.len() < utf8_expected_len(utf8_first) {
+                AttachedKeyDecode::Partial
+            } else {
+                AttachedKeyDecode::Invalid
+            }
+        }
+        decoded => decoded,
+    }
+}
+
+fn input_contains_prefix(
     bytes: &[u8],
     target: &PaneTarget,
     state: &crate::pane_terminals::HandlerState,
 ) -> bool {
-    let AttachedKeyDecode::Matched { key, .. } = decode_attached_key(bytes, None) else {
-        return false;
-    };
     let prefix = session_option_key(state, target.session_name(), rmux_proto::OptionName::Prefix);
     let prefix2 = session_option_key(
         state,
         target.session_name(),
         rmux_proto::OptionName::Prefix2,
     );
-    matches_prefix_key(key, prefix, prefix2)
-}
-
-#[cfg(unix)]
-fn same_pane_target(left: &PaneTarget, right: &PaneTarget) -> bool {
-    left.session_name() == right.session_name()
-        && left.window_index() == right.window_index()
-        && left.pane_index() == right.pane_index()
+    bytes.iter().enumerate().any(|(offset, _)| {
+        matches!(
+            decode_live_attached_key(&bytes[offset..], None),
+            AttachedKeyDecode::Matched { key, .. }
+                if matches_prefix_key(key, prefix, prefix2)
+        )
+    })
 }
 
 fn submitted_text_before_enter(bytes: &[u8]) -> Option<&[u8]> {
@@ -1151,6 +1397,41 @@ fn submitted_text_before_enter(bytes: &[u8]) -> Option<&[u8]> {
         .iter()
         .position(|byte| matches!(*byte, b'\r' | b'\n'))?;
     (enter > 0).then_some(&bytes[..enter])
+}
+
+#[cfg(test)]
+mod live_key_decode_tests {
+    use rmux_core::{key_code_lookup_bits, key_string_lookup_string, KEYC_IMPLIED_META, KEYC_META};
+
+    use super::{decode_live_attached_key, AttachedKeyDecode};
+
+    #[test]
+    fn meta_unicode_decodes_as_one_key_with_implied_meta() {
+        let AttachedKeyDecode::Matched { size, key } =
+            decode_live_attached_key(b"\x1b\xc3\xa9", None)
+        else {
+            panic!("Meta-é should decode as one attached key");
+        };
+        assert_eq!(size, 3);
+        assert_eq!(
+            key_code_lookup_bits(key),
+            key_code_lookup_bits(key_string_lookup_string("M-é").expect("Meta-é parses"))
+        );
+        assert_ne!(key & KEYC_META, 0);
+        assert_ne!(key & KEYC_IMPLIED_META, 0);
+    }
+
+    #[test]
+    fn meta_unicode_waits_for_every_utf8_byte() {
+        assert_eq!(
+            decode_live_attached_key(b"\x1b\xc3", None),
+            AttachedKeyDecode::Partial
+        );
+        assert!(matches!(
+            decode_live_attached_key(b"\x1b\xc3\xa9", None),
+            AttachedKeyDecode::Matched { size: 3, .. }
+        ));
+    }
 }
 
 #[cfg(windows)]

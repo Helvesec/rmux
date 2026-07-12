@@ -117,7 +117,6 @@ rmux web-share --help
 | 平台 / 管理器 | 命令 |
 | :--- | :--- |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/apple.svg"><img src="../install/apple-light.svg" width="28" alt="macOS"></picture> / Homebrew | `brew install rmux` |
-| <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / installer | `irm https://rmux.io/install.ps1 \| iex` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / WinGet | `winget install rmux` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / Scoop | `scoop bucket add rmux https://github.com/Helvesec/scoop-rmux && scoop install rmux` |
 | <picture><source media="(prefers-color-scheme: dark)" srcset="../install/windows.svg"><img src="../install/windows-light.svg" width="28" alt="Windows"></picture> / Chocolatey | `choco install rmux` |
@@ -128,7 +127,11 @@ rmux web-share --help
 
 直接下载（`.tar.gz`、`.deb`、`.rpm`、`.zip`）可在 [v0.9.0 GitHub Release](https://github.com/Helvesec/rmux/releases/tag/v0.9.0) 获取。
 
-包管理器在注册表审核新版本时可能会滞后；直接下载和 rmux.io 安装器会跟随当前 GitHub Release。
+包管理器在注册表审核新版本时可能会滞后；在管理器更新前，请使用固定版本的 GitHub Release 下载。
+
+在 Windows 上，请解压完整的 `.zip`，并将解压后的包根目录加入
+`PATH`。`rmux.exe`、`rmux-daemon.exe` 和 `libexec/rmux/rmux.exe`
+必须保持在同一包布局中；仅复制公开可执行文件并不是有效安装。
 
 对于 Unix `.tar.gz` 直接下载，请在解压后的归档目录中运行
 `./install.sh --prefix ~/.local`。该安装器会保留所需的 `bin/` 和

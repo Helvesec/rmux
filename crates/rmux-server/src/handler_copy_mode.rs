@@ -420,7 +420,7 @@ impl RequestHandler {
             return;
         };
         let _ = self
-            .send_attach_control(attach_pid, AttachControl::Write(payload), "copy-mode", None)
+            .send_attach_control(attach_pid, AttachControl::Write(payload), "copy-mode")
             .await;
     }
 

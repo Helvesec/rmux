@@ -65,6 +65,75 @@ fn parse_command(command: &str) -> rmux_core::command_parser::ParsedCommands {
 }
 
 #[tokio::test]
+async fn active_command_prompt_accepts_one_megabyte_frame_with_bounded_work() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let mut control_rx = create_attached_session(&handler, requester_pid, "prompt-bulk").await;
+    let parsed = parse_command("command-prompt -b -pbulk");
+    handler
+        .execute_parsed_commands_for_test(requester_pid, parsed)
+        .await
+        .expect("background command prompt starts");
+    let frame = recv_switch_frame_containing(&mut control_rx, "bulk ").await;
+    assert!(frame.contains("bulk "), "{frame}");
+
+    let input = vec![b'a'; 1_000_000];
+    timeout(
+        if cfg!(windows) {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(2)
+        },
+        handler.handle_attached_live_input_for_test(requester_pid, &input),
+    )
+    .await
+    .expect("one-megabyte prompt frame must have bounded processing work")
+    .expect("one-megabyte prompt input succeeds");
+
+    let prompt = handler
+        .attached_prompt_render(requester_pid)
+        .await
+        .expect("command prompt remains active");
+    assert_eq!(prompt.input.len(), input.len());
+    assert!(prompt.input.bytes().all(|byte| byte == b'a'));
+    handler.clear_prompt_for_attach(requester_pid).await;
+}
+
+#[tokio::test]
+async fn batched_prompt_text_preserves_split_utf8_at_the_input_boundary() {
+    let handler = RequestHandler::new();
+    let requester_pid = std::process::id();
+    let mut control_rx =
+        create_attached_session(&handler, requester_pid, "prompt-split-utf8").await;
+    let parsed = parse_command("command-prompt -b -pbulk");
+    handler
+        .execute_parsed_commands_for_test(requester_pid, parsed)
+        .await
+        .expect("background command prompt starts");
+    let _ = recv_switch_frame_containing(&mut control_rx, "bulk ").await;
+
+    let mut pending_input = Vec::new();
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"a\xe6\x97")
+        .await
+        .expect("partial prompt UTF-8 succeeds");
+    assert_eq!(pending_input, b"\xe6\x97");
+
+    handler
+        .handle_attached_live_input(requester_pid, &mut pending_input, b"\xa5b")
+        .await
+        .expect("completed prompt UTF-8 succeeds");
+    assert!(pending_input.is_empty());
+    let prompt = handler
+        .attached_prompt_render(requester_pid)
+        .await
+        .expect("command prompt remains active");
+    assert_eq!(prompt.input, "a日b");
+    assert_eq!(prompt.cursor, 3);
+    handler.clear_prompt_for_attach(requester_pid).await;
+}
+
+#[tokio::test]
 async fn command_prompt_renders_prompt_and_executes_substituted_command() {
     let handler = RequestHandler::new();
     let requester_pid = std::process::id();

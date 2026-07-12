@@ -223,9 +223,20 @@ Track pending external queues until each manager reports the target version.
 Update `rmux.io` only after the public install paths exist, or mark lagging
 package managers with a visible rollout note.
 
+The `rmux.io` install-script sources and deployment pipeline are not part of
+this repository. Treat `install.sh` and `install.ps1` as externally owned
+release artifacts: update them in their owning repository and verify the live
+bytes before advertising them here. In particular, the Windows installer must
+install the complete package layout (`rmux.exe`, `rmux-daemon.exe`, and
+`libexec/rmux/rmux.exe`); copying only `rmux.exe` is not valid. Until that live
+layout-aware installer is verified, repository documentation must direct
+Windows users to package managers or the versioned GitHub Release `.zip`.
+
 1. Update install commands, version text, docs, SEO snippets, and package-manager
    status.
-2. Keep the shell and PowerShell installers as the latest-version paths.
+2. Ask the external site owner to keep the shell and PowerShell installers as
+   latest-version paths; advertise them only after the live bytes pass the
+   public smoke matrix below.
 3. If Homebrew Core, WinGet, or Chocolatey are still under registry review, keep
    their commands visible only with a short status note such as
    `0.6.1 available; 0.7.0 rolling out`.

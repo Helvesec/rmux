@@ -5,15 +5,17 @@ use std::sync::OnceLock;
 use rmux_proto::AttachedWindowsConsoleKey;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Console::{
-    GetConsoleMode, ReadConsoleInputW, FROM_LEFT_1ST_BUTTON_PRESSED, FROM_LEFT_2ND_BUTTON_PRESSED,
-    FROM_LEFT_3RD_BUTTON_PRESSED, INPUT_RECORD, KEY_EVENT, KEY_EVENT_RECORD, LEFT_ALT_PRESSED,
-    LEFT_CTRL_PRESSED, MOUSE_EVENT, MOUSE_EVENT_RECORD, MOUSE_HWHEELED, MOUSE_MOVED, MOUSE_WHEELED,
-    RIGHTMOST_BUTTON_PRESSED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
+    GetConsoleMode, GetNumberOfConsoleInputEvents, ReadConsoleInputW, FROM_LEFT_1ST_BUTTON_PRESSED,
+    FROM_LEFT_2ND_BUTTON_PRESSED, FROM_LEFT_3RD_BUTTON_PRESSED, INPUT_RECORD, KEY_EVENT,
+    KEY_EVENT_RECORD, LEFT_ALT_PRESSED, LEFT_CTRL_PRESSED, MOUSE_EVENT, MOUSE_EVENT_RECORD,
+    MOUSE_HWHEELED, MOUSE_MOVED, MOUSE_WHEELED, RIGHTMOST_BUTTON_PRESSED, RIGHT_ALT_PRESSED,
+    RIGHT_CTRL_PRESSED, SHIFT_PRESSED,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F10, VK_F11, VK_F12, VK_F2, VK_F3,
-    VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_HOME, VK_INSERT, VK_LEFT, VK_NEXT, VK_PRIOR,
-    VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
+    VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F10, VK_F11, VK_F12,
+    VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_HOME, VK_INSERT, VK_LCONTROL,
+    VK_LEFT, VK_LMENU, VK_LSHIFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT,
+    VK_RMENU, VK_RSHIFT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 
 const ATTACH_INPUT_CHUNK_LIMIT: usize = 4096;
@@ -66,6 +68,15 @@ pub(super) struct ConsoleInputReader {
     handle: HANDLE,
     pending_high_surrogate: Option<u16>,
     last_mouse_button_state: u32,
+    /// True while a bracketed-paste run (opened by a detected paste burst) is
+    /// still being emitted across `ReadConsoleInputW` batches.
+    paste_open: bool,
+    /// Trailing bytes of the previous batch's stripped paste body that could
+    /// still form part of a bracketed-paste marker straddling the boundary.
+    /// Emitted with the next batch's body (and re-stripped as a whole) so a
+    /// hostile `\x1b[201~` spanning two batches cannot slip through per-batch
+    /// stripping. Only ever populated while `paste_open` is true.
+    paste_carryover: Vec<u8>,
 }
 
 impl ConsoleInputReader {
@@ -80,6 +91,8 @@ impl ConsoleInputReader {
             handle,
             pending_high_surrogate: None,
             last_mouse_button_state: 0,
+            paste_open: false,
+            paste_carryover: Vec::new(),
         })
     }
 
@@ -100,7 +113,7 @@ impl ConsoleInputReader {
             return Err(io::Error::last_os_error());
         }
 
-        let mut inputs = Vec::new();
+        let mut events = Vec::with_capacity(records_read as usize);
         for record in &records[..records_read as usize] {
             match u32::from(record.EventType) {
                 KEY_EVENT => {
@@ -108,34 +121,281 @@ impl ConsoleInputReader {
                         // SAFETY: EventType says this union currently contains a KEY_EVENT_RECORD.
                         record.Event.KeyEvent
                     };
-                    let event = ConsoleKeyEvent::from_win32(event);
-                    let bytes = encode_key_event(event, &mut self.pending_high_surrogate);
-                    if bytes.is_empty() {
-                        continue;
-                    }
-                    let input = windows_console_key_for_event(event, &bytes).map_or_else(
-                        || AttachInput::bytes(bytes.clone()),
-                        |key| {
-                            trace_windows_console_key(key, &bytes);
-                            AttachInput::with_windows_console_key(bytes.clone(), key)
-                        },
-                    );
-                    inputs.push(input);
+                    events.push(BatchEvent::Key(ConsoleKeyEvent::from_win32(event)));
                 }
                 MOUSE_EVENT => {
                     let event = unsafe {
                         // SAFETY: EventType says this union currently holds a MOUSE_EVENT_RECORD.
                         record.Event.MouseEvent
                     };
-                    for bytes in encode_mouse_event(event, &mut self.last_mouse_button_state) {
-                        inputs.push(AttachInput::bytes(bytes));
-                    }
+                    events.push(BatchEvent::Mouse(event));
                 }
                 _ => {}
             }
         }
-        Ok(inputs)
+
+        // A paste is injected into the console input buffer as one atomic burst,
+        // so a single ReadConsoleInputW returns every pasted character at once
+        // while interactive typing delivers one key per call. That burst is the
+        // only paste signal available in record mode: pasted characters carry
+        // their real virtual-key codes (a pasted "a" is byte-for-byte a typed
+        // "a") and a pasted newline arrives as VK_RETURN just like a typed Enter,
+        // so there is no per-record "injected" flag. If the buffer still holds
+        // events after this batch the paste continues into the next one.
+        let drained = self.console_input_drained();
+        Ok(encode_input_batch(
+            &events,
+            drained,
+            &mut self.paste_open,
+            &mut self.paste_carryover,
+            &mut self.pending_high_surrogate,
+            &mut self.last_mouse_button_state,
+        ))
     }
+
+    fn console_input_drained(&self) -> bool {
+        let mut pending = 0;
+        let ok = unsafe {
+            // SAFETY: `pending` is writable and `self.handle` is a live console input handle.
+            GetNumberOfConsoleInputEvents(self.handle, &mut pending)
+        };
+        ok != 0 && pending == 0
+    }
+}
+
+enum BatchEvent {
+    Key(ConsoleKeyEvent),
+    Mouse(MOUSE_EVENT_RECORD),
+}
+
+/// A pasted printable character — or a pasted newline, which reaches the console
+/// as `VK_RETURN` — is an unmodified key-down. Control and Alt chords are never
+/// part of a paste and force the normal per-key path, except for AltGr on
+/// European layouts (LEFT_CTRL|RIGHT_ALT) which is a legitimate paste
+/// character — the encoding paths themselves treat AltGr as text, so paste
+/// classification does too. Records with `unicode_char == 0` (pure modifier
+/// key-downs synthesized by classic conhost around shifted characters) do not
+/// count as text and are ignored here so they neither open nor close a paste.
+fn is_paste_text(event: &ConsoleKeyEvent) -> bool {
+    if !event.key_down || event.unicode_char == 0 {
+        return false;
+    }
+    let alt_gr = alt_gr_pressed(event.control_key_state);
+    let ctrl = ctrl_pressed(event.control_key_state) && !alt_gr;
+    let meta = meta_pressed(event.control_key_state) && !alt_gr;
+    !ctrl && !meta
+}
+
+/// A pure-modifier key-down (`unicode_char == 0`) — the shift/ctrl/alt records
+/// classic conhost interleaves with pasted printable keys — is neither paste
+/// text nor a "real" other key. Treating it as either would mis-classify a
+/// paste that contains uppercase letters (VK_SHIFT down/up bracket each
+/// shifted character) or a paste under AltGr (VK_LCONTROL down/up around each
+/// AltGr character). This keeps burst detection stable under any layout.
+fn is_pure_modifier_key_down(event: &ConsoleKeyEvent) -> bool {
+    event.key_down
+        && event.unicode_char == 0
+        && matches!(
+            event.virtual_key_code,
+            VK_SHIFT
+                | VK_CONTROL
+                | VK_MENU
+                | VK_LSHIFT
+                | VK_RSHIFT
+                | VK_LCONTROL
+                | VK_RCONTROL
+                | VK_LMENU
+                | VK_RMENU
+        )
+}
+
+/// Removes bracketed-paste markers embedded in pasted content before the burst
+/// is wrapped, so crafted clipboard data (a hostile copy button placing a raw
+/// `ESC[201~`) cannot break out of the paste envelope and inject live
+/// keystrokes into the pane, and a stray `ESC[200~` cannot nest a second
+/// envelope. This matches how terminals filter the delimiter out of a paste.
+///
+/// The scan iterates to a fixed point: content like `\x1b[20 + \x1b[201~ +
+/// 1~body` recombines into a live `\x1b[201~body` after a single-pass strip,
+/// which the client can no longer detect once the burst is wrapped. Looping
+/// until no marker was removed guarantees the returned text is free of both
+/// literal and reassembled markers.
+fn strip_embedded_paste_markers(text: &mut Vec<u8>) {
+    if text.len() < BRACKETED_PASTE_END.len().min(BRACKETED_PASTE_START.len()) {
+        return;
+    }
+    loop {
+        let before = text.len();
+        remove_all_subslices(text, BRACKETED_PASTE_END);
+        remove_all_subslices(text, BRACKETED_PASTE_START);
+        if text.len() == before {
+            return;
+        }
+    }
+}
+
+/// Returns the number of trailing bytes to keep behind when emitting a
+/// mid-envelope paste chunk, so a bracketed-paste marker whose bytes are split
+/// across the current and next batches cannot slip through per-batch stripping.
+///
+/// The tail is the longest suffix of `text` that is a proper prefix of either
+/// `\x1b[200~` or `\x1b[201~` (up to `marker_len - 1` bytes). If no marker
+/// prefix matches, we still hold back up to `marker_len - 1` bytes of a lone
+/// trailing ESC to guarantee at least the ESC of a future marker cannot escape
+/// carrying-over.
+fn marker_straddle_hold_len(text: &[u8]) -> usize {
+    // Both markers are 6 bytes and share the first 4 bytes (ESC [ 2 0). The
+    // fifth byte splits them (`0`|`1`) and the sixth is `~`, so any proper
+    // prefix of length 1..=5 is a common ambiguity except position 5 which is
+    // marker-specific. Walk from the longest possible prefix down.
+    let max_hold = BRACKETED_PASTE_START.len().saturating_sub(1);
+    for k in (1..=max_hold).rev() {
+        if text.len() < k {
+            continue;
+        }
+        let tail = &text[text.len() - k..];
+        if BRACKETED_PASTE_START.starts_with(tail) || BRACKETED_PASTE_END.starts_with(tail) {
+            return k;
+        }
+    }
+    0
+}
+
+fn remove_all_subslices(buf: &mut Vec<u8>, needle: &[u8]) {
+    if needle.is_empty() || buf.len() < needle.len() {
+        return;
+    }
+    let mut out = Vec::with_capacity(buf.len());
+    let mut index = 0;
+    while index < buf.len() {
+        if buf[index..].starts_with(needle) {
+            index += needle.len();
+        } else {
+            out.push(buf[index]);
+            index += 1;
+        }
+    }
+    *buf = out;
+}
+
+/// Wraps a detected paste burst in bracketed-paste markers so the daemon can
+/// keep or strip them per the pane's `?2004` mode, and otherwise encodes the
+/// batch key-by-key exactly as before. Pure over its explicit state so it can be
+/// unit-tested with the burst pattern conhost actually delivers.
+fn encode_input_batch(
+    events: &[BatchEvent],
+    drained: bool,
+    paste_open: &mut bool,
+    paste_carryover: &mut Vec<u8>,
+    pending_high_surrogate: &mut Option<u16>,
+    last_mouse_button_state: &mut u32,
+) -> Vec<AttachInput> {
+    let has_mouse = events
+        .iter()
+        .any(|event| matches!(event, BatchEvent::Mouse(_)));
+    let mut text_downs = 0usize;
+    let mut has_other_key = false;
+    for event in events {
+        if let BatchEvent::Key(key) = event {
+            if !key.key_down {
+                continue;
+            }
+            if is_pure_modifier_key_down(key) {
+                // Pure modifier records (VK_SHIFT down/up around shifted chars,
+                // VK_LCONTROL bracketing AltGr) are neither paste text nor a
+                // "real" other key — skip them so they neither block nor
+                // fabricate a burst.
+                continue;
+            }
+            if is_paste_text(key) {
+                text_downs += 1;
+            } else {
+                has_other_key = true;
+            }
+        }
+    }
+
+    // A fresh burst needs at least two pasted characters — a lone character is
+    // indistinguishable from a keystroke — while a run already open continues on
+    // any further pasted text until the input buffer drains.
+    let paste_text_only = !has_mouse && !has_other_key;
+    let is_paste = paste_text_only && (text_downs >= 2 || (*paste_open && text_downs >= 1));
+
+    let mut inputs = Vec::new();
+    if is_paste {
+        // Emit the markers and the pasted text as ONE keystroke per batch. If
+        // the open marker and the text were separate `AttachInput`s the daemon
+        // would process the plain-text keystroke through its fast input path
+        // (which bypasses the bracketed-paste decode), delivering the paste
+        // body to the pane without the markers.
+        let opening = !*paste_open;
+        *paste_open = true;
+        let mut payload = Vec::new();
+        if opening {
+            payload.extend_from_slice(BRACKETED_PASTE_START);
+        }
+        let mut text = std::mem::take(paste_carryover);
+        for event in events {
+            if let BatchEvent::Key(key) = event {
+                text.extend_from_slice(&encode_key_event(*key, pending_high_surrogate));
+            }
+        }
+        strip_embedded_paste_markers(&mut text);
+        if drained {
+            // Envelope closes with this batch — nothing more can straddle a
+            // boundary, so emit whatever is left as-is.
+            payload.extend_from_slice(&text);
+            payload.extend_from_slice(BRACKETED_PASTE_END);
+            *paste_open = false;
+        } else {
+            // A hostile `\x1b[201~` (or `\x1b[200~`) could straddle the batch
+            // boundary. Hold back a suffix long enough to see any marker whose
+            // last byte might arrive in the NEXT batch, and re-strip once we
+            // have both halves together.
+            let hold = marker_straddle_hold_len(&text);
+            let split = text.len() - hold;
+            payload.extend_from_slice(&text[..split]);
+            paste_carryover.extend_from_slice(&text[split..]);
+        }
+        if !payload.is_empty() {
+            inputs.push(AttachInput::bytes(payload));
+        }
+        return inputs;
+    }
+
+    if *paste_open {
+        // Flush any carry-over from the previous batch, re-stripped now that
+        // we know no continuation is coming.
+        let mut tail = std::mem::take(paste_carryover);
+        strip_embedded_paste_markers(&mut tail);
+        tail.extend_from_slice(BRACKETED_PASTE_END);
+        inputs.push(AttachInput::bytes(tail));
+        *paste_open = false;
+    }
+    for event in events {
+        match event {
+            BatchEvent::Key(key) => {
+                let bytes = encode_key_event(*key, pending_high_surrogate);
+                if bytes.is_empty() {
+                    continue;
+                }
+                let input = windows_console_key_for_event(*key, &bytes).map_or_else(
+                    || AttachInput::bytes(bytes.clone()),
+                    |console_key| {
+                        trace_windows_console_key(console_key, &bytes);
+                        AttachInput::with_windows_console_key(bytes.clone(), console_key)
+                    },
+                );
+                inputs.push(input);
+            }
+            BatchEvent::Mouse(mouse) => {
+                for bytes in encode_mouse_event(*mouse, last_mouse_button_state) {
+                    inputs.push(AttachInput::bytes(bytes));
+                }
+            }
+        }
+    }
+    inputs
 }
 
 // SGR mouse button codes (xterm). Modifiers are OR-ed in; drag adds 32.
@@ -672,7 +932,8 @@ fn marker_adjusted_end(bytes: &[u8], start: usize, end: usize, marker: &[u8]) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_input_chunks, encode_key_event, encode_mouse_event, windows_console_key_for_event,
+        attach_input_chunks, encode_input_batch, encode_key_event, encode_mouse_event,
+        strip_embedded_paste_markers, windows_console_key_for_event, AttachInput, BatchEvent,
         ConsoleKeyEvent, ATTACH_INPUT_CHUNK_LIMIT, BRACKETED_PASTE_END, BRACKETED_PASTE_START,
     };
     use windows_sys::Win32::System::Console::{
@@ -729,6 +990,235 @@ mod tests {
         attach_input_chunks(input)
             .map(<[u8]>::to_vec)
             .collect::<Vec<_>>()
+    }
+
+    fn batch_bytes(inputs: &[AttachInput]) -> Vec<u8> {
+        inputs
+            .iter()
+            .flat_map(|input| input.payload().to_vec())
+            .collect()
+    }
+
+    #[test]
+    fn multi_character_paste_burst_is_wrapped_in_bracketed_markers() {
+        // The record pattern conhost delivers for pasting "ab\r\ncd" (probed
+        // 2026-07-11): each character is a plain key-down carrying its real
+        // virtual-key code and the newline collapses to a single VK_RETURN,
+        // indistinguishable from typed input except that the whole run arrives
+        // in one ReadConsoleInputW batch.
+        let events = [
+            BatchEvent::Key(key_event('a' as u16, 'a' as u16, 0)),
+            BatchEvent::Key(key_event('b' as u16, 'b' as u16, 0)),
+            BatchEvent::Key(key_event(VK_RETURN, 0x0d, 0)),
+            BatchEvent::Key(key_event('c' as u16, 'c' as u16, 0)),
+            BatchEvent::Key(key_event('d' as u16, 'd' as u16, 0)),
+        ];
+        let mut paste_open = false;
+        let inputs = encode_input_batch(
+            &events,
+            true,
+            &mut paste_open,
+            &mut Vec::new(),
+            &mut None,
+            &mut 0,
+        );
+        let mut expected = Vec::new();
+        expected.extend_from_slice(BRACKETED_PASTE_START);
+        expected.extend_from_slice(b"ab\rcd");
+        expected.extend_from_slice(BRACKETED_PASTE_END);
+        assert_eq!(batch_bytes(&inputs), expected);
+        assert!(!paste_open, "a drained burst must close its bracket");
+    }
+
+    #[test]
+    fn single_typed_character_is_not_bracketed() {
+        // One character is indistinguishable from a keystroke, so it must reach
+        // the pane verbatim with no paste markers.
+        let events = [BatchEvent::Key(key_event('x' as u16, 'x' as u16, 0))];
+        let mut paste_open = false;
+        let inputs = encode_input_batch(
+            &events,
+            true,
+            &mut paste_open,
+            &mut Vec::new(),
+            &mut None,
+            &mut 0,
+        );
+        assert_eq!(batch_bytes(&inputs), b"x");
+        assert!(!paste_open);
+    }
+
+    #[test]
+    fn paste_burst_spanning_batches_keeps_the_bracket_open_until_drained() {
+        let mut paste_open = false;
+        let first = [
+            BatchEvent::Key(key_event('a' as u16, 'a' as u16, 0)),
+            BatchEvent::Key(key_event('b' as u16, 'b' as u16, 0)),
+        ];
+        let inputs = encode_input_batch(
+            &first,
+            false,
+            &mut paste_open,
+            &mut Vec::new(),
+            &mut None,
+            &mut 0,
+        );
+        let mut expected = Vec::new();
+        expected.extend_from_slice(BRACKETED_PASTE_START);
+        expected.extend_from_slice(b"ab");
+        assert_eq!(batch_bytes(&inputs), expected);
+        assert!(paste_open, "an undrained burst keeps the bracket open");
+
+        // A continuation batch (even a single trailing character), now drained.
+        let second = [BatchEvent::Key(key_event('c' as u16, 'c' as u16, 0))];
+        let inputs = encode_input_batch(
+            &second,
+            true,
+            &mut paste_open,
+            &mut Vec::new(),
+            &mut None,
+            &mut 0,
+        );
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"c");
+        expected.extend_from_slice(BRACKETED_PASTE_END);
+        assert_eq!(batch_bytes(&inputs), expected);
+        assert!(!paste_open);
+    }
+
+    #[test]
+    fn embedded_paste_markers_are_stripped_before_wrapping() {
+        // Crafted clipboard content carrying a raw ESC[201~ (or ESC[200~) must
+        // not break out of / nest the paste envelope.
+        let mut text = Vec::new();
+        text.extend_from_slice(b"X");
+        text.extend_from_slice(BRACKETED_PASTE_END);
+        text.extend_from_slice(b"Y");
+        text.extend_from_slice(BRACKETED_PASTE_START);
+        text.extend_from_slice(b"Z");
+        strip_embedded_paste_markers(&mut text);
+        assert_eq!(text, b"XYZ");
+    }
+
+    #[test]
+    fn fragmented_end_marker_is_stripped_to_a_fixed_point() {
+        // A hostile clipboard mixes a marker-shaped prefix, a full end marker,
+        // then bytes that would rejoin with the prefix. A single-pass strip
+        // removes only the middle marker and leaves the rejoined ESC[201~
+        // alive — the fix-point loop must fully collapse it.
+        let mut text = Vec::new();
+        text.extend_from_slice(b"\x1b[20");
+        text.extend_from_slice(BRACKETED_PASTE_END);
+        text.extend_from_slice(b"1~body");
+        strip_embedded_paste_markers(&mut text);
+        assert_eq!(text, b"body");
+    }
+
+    #[test]
+    fn straddling_end_marker_across_batches_is_neutralized_by_carryover() {
+        // A hostile ESC[201~ split across two batches must not slip through
+        // per-batch stripping: the second batch's continuation carries the
+        // first batch's tail forward and re-strips the reassembled bytes.
+        let mut paste_open = false;
+        let mut carryover: Vec<u8> = Vec::new();
+        let first = [
+            BatchEvent::Key(key_event('a' as u16, 'a' as u16, 0)),
+            BatchEvent::Key(key_event('b' as u16, 'b' as u16, 0)),
+            BatchEvent::Key(key_event(0x1b, 0x1b, 0)),
+            BatchEvent::Key(key_event('[' as u16, b'[' as u16, 0)),
+            BatchEvent::Key(key_event('2' as u16, b'2' as u16, 0)),
+        ];
+        let inputs = encode_input_batch(
+            &first,
+            false,
+            &mut paste_open,
+            &mut carryover,
+            &mut None,
+            &mut 0,
+        );
+        let first_bytes = batch_bytes(&inputs);
+        assert!(
+            paste_open,
+            "the burst must still be open — the mid-marker suffix should be held back"
+        );
+        assert!(
+            first_bytes.starts_with(BRACKETED_PASTE_START),
+            "opening marker should be present: {first_bytes:?}"
+        );
+        // The opening BRACKETED_PASTE_START itself begins with `\x1b[2`, so
+        // only the emitted BODY (after the opening marker) is checked: the
+        // held-back marker suffix must not have escaped into it.
+        let first_body = &first_bytes[BRACKETED_PASTE_START.len()..];
+        assert!(
+            !first_body.windows(3).any(|w| w == b"\x1b[2"),
+            "no marker prefix should escape after the opening marker: {first_bytes:?}"
+        );
+
+        // Second batch supplies the reassembled 01~ + payload while drained.
+        let second = [
+            BatchEvent::Key(key_event('0' as u16, b'0' as u16, 0)),
+            BatchEvent::Key(key_event('1' as u16, b'1' as u16, 0)),
+            BatchEvent::Key(key_event('~' as u16, b'~' as u16, 0)),
+            BatchEvent::Key(key_event('e' as u16, b'e' as u16, 0)),
+            BatchEvent::Key(key_event('v' as u16, b'v' as u16, 0)),
+            BatchEvent::Key(key_event('i' as u16, b'i' as u16, 0)),
+            BatchEvent::Key(key_event('l' as u16, b'l' as u16, 0)),
+        ];
+        let inputs = encode_input_batch(
+            &second,
+            true,
+            &mut paste_open,
+            &mut carryover,
+            &mut None,
+            &mut 0,
+        );
+        let combined: Vec<u8> = first_bytes
+            .iter()
+            .chain(batch_bytes(&inputs).iter())
+            .copied()
+            .collect();
+        assert!(!paste_open, "drained continuation must close the bracket");
+        // The reassembled bytes must not include a live end marker anywhere
+        // between the opening and the true closing marker.
+        let start = combined
+            .windows(BRACKETED_PASTE_START.len())
+            .position(|w| w == BRACKETED_PASTE_START)
+            .expect("opening marker present");
+        let last_end = combined
+            .windows(BRACKETED_PASTE_END.len())
+            .rposition(|w| w == BRACKETED_PASTE_END)
+            .expect("closing marker present");
+        let body = &combined[start + BRACKETED_PASTE_START.len()..last_end];
+        assert!(
+            !body
+                .windows(BRACKETED_PASTE_END.len())
+                .any(|w| w == BRACKETED_PASTE_END),
+            "reassembled end marker escaped the strip: body={body:?}"
+        );
+        assert!(carryover.is_empty(), "carryover should be flushed on drain");
+    }
+
+    #[test]
+    fn a_control_chord_in_the_batch_is_not_treated_as_paste() {
+        let events = [
+            BatchEvent::Key(key_event('a' as u16, 'a' as u16, 0)),
+            BatchEvent::Key(key_event('C' as u16, 0x03, LEFT_CTRL_PRESSED)),
+        ];
+        let mut paste_open = false;
+        let inputs = encode_input_batch(
+            &events,
+            true,
+            &mut paste_open,
+            &mut Vec::new(),
+            &mut None,
+            &mut 0,
+        );
+        let bytes = batch_bytes(&inputs);
+        assert!(
+            !bytes.starts_with(BRACKETED_PASTE_START),
+            "a batch containing a control chord must not be bracketed: {bytes:?}"
+        );
+        assert!(!paste_open);
     }
 
     #[test]

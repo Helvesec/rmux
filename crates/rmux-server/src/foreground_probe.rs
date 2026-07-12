@@ -48,7 +48,7 @@ pub(crate) fn capture_foreground_probe_seed(
         .ok_or_else(|| {
             RmuxError::invalid_target(target.to_string(), "pane index does not exist in session")
         })?;
-    let generation = state.pane_output_generation(target.session_name(), pane_id);
+    let generation = state.pane_output_generation_for_target(target, pane_id);
     let root_pid = state
         .pane_pid_in_window(
             target.session_name(),

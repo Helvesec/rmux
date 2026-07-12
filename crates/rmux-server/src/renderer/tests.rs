@@ -427,6 +427,52 @@ fn styled_pane_screen_borrows_when_no_overlay_is_needed() {
     ));
 }
 
+fn selected_cell_colours(
+    options: &OptionStore,
+) -> (rmux_core::input::Colour, rmux_core::input::Colour) {
+    let size = TerminalSize { cols: 6, rows: 2 };
+    let session = Session::new(session_name("alpha"), size);
+    let pane = session.window().pane(0).expect("pane 0 exists");
+    let mut screen = screen_with(b"D", size);
+    screen.mark_selected_row_range(0, 0, 0);
+
+    let styled = super::styled_pane_screen(&session, options, pane, &screen);
+    let mut colours = None;
+    assert!(styled.visit_visible_line_cells(0, 1, |cell| {
+        colours = Some((cell.fg(), cell.bg()));
+    }));
+    colours.expect("selected cell exists")
+}
+
+#[test]
+fn copy_mode_selection_style_default_expands_mode_style() {
+    assert_eq!(selected_cell_colours(&OptionStore::new()), (0, 3));
+}
+
+#[test]
+fn copy_mode_selection_style_tracks_mode_style_until_explicitly_overridden() {
+    let mut options = OptionStore::new();
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::ModeStyle,
+            "bg=magenta,fg=white".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("mode-style override succeeds");
+    assert_eq!(selected_cell_colours(&options), (7, 5));
+
+    options
+        .set(
+            ScopeSelector::Global,
+            OptionName::CopyModeSelectionStyle,
+            "bg=cyan,fg=red".to_owned(),
+            SetOptionMode::Replace,
+        )
+        .expect("copy-mode-selection-style override succeeds");
+    assert_eq!(selected_cell_colours(&options), (1, 6));
+}
+
 #[test]
 fn attach_render_golden_normal_idle_pane_is_byte_stable() {
     let size = TerminalSize { cols: 6, rows: 2 };

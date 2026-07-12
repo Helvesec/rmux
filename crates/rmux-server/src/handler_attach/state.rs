@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use rmux_core::KeyCode;
 use rmux_os::identity::UserIdentity;
-use rmux_proto::{PaneTarget, TerminalPixels, TerminalSize, WindowTarget};
+use rmux_proto::{PaneTarget, SessionId, TerminalPixels, TerminalSize, WindowTarget};
 use tokio::sync::mpsc;
 
 use super::super::mode_tree_support::ModeTreeClientState;
@@ -30,7 +30,9 @@ pub(in crate::handler) struct ActiveAttachState {
 pub(in crate::handler) struct ActiveAttach {
     pub(in crate::handler) id: u64,
     pub(in crate::handler) session_name: rmux_proto::SessionName,
+    pub(in crate::handler) session_id: SessionId,
     pub(in crate::handler) last_session: Option<rmux_proto::SessionName>,
+    pub(in crate::handler) last_session_id: Option<SessionId>,
     pub(in crate::handler) flags: ClientFlags,
     pub(in crate::handler) pan_window: Option<u32>,
     pub(in crate::handler) pan_ox: u32,
@@ -65,6 +67,41 @@ pub(in crate::handler) struct ActiveAttach {
     pub(in crate::handler) mode_tree_frame: Option<Vec<u8>>,
     pub(in crate::handler) overlay: Option<ClientOverlayState>,
     pub(in crate::handler) display_panes: Option<DisplayPanesClientState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::handler) struct ActiveAttachIdentity {
+    attach_pid: u32,
+    attach_id: u64,
+    session_id: SessionId,
+}
+
+impl ActiveAttachIdentity {
+    pub(in crate::handler) const fn attach_pid(self) -> u32 {
+        self.attach_pid
+    }
+
+    pub(in crate::handler) fn matches(
+        self,
+        attach_pid: u32,
+        session_name: &rmux_proto::SessionName,
+        active: &ActiveAttach,
+    ) -> bool {
+        self.attach_pid == attach_pid
+            && self.attach_id == active.id
+            && self.session_id == active.session_id
+            && &active.session_name == session_name
+    }
+}
+
+impl ActiveAttach {
+    pub(in crate::handler) const fn identity(&self, attach_pid: u32) -> ActiveAttachIdentity {
+        ActiveAttachIdentity {
+            attach_pid,
+            attach_id: self.id,
+            session_id: self.session_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,13 +150,16 @@ impl ActiveAttachState {
     pub(in crate::handler) fn rename_session(
         &mut self,
         session_name: &rmux_proto::SessionName,
+        session_id: SessionId,
         new_name: &rmux_proto::SessionName,
     ) {
         for active in self.by_pid.values_mut() {
-            if &active.session_name == session_name {
+            if &active.session_name == session_name && active.session_id == session_id {
                 active.session_name = new_name.clone();
             }
-            if active.last_session.as_ref() == Some(session_name) {
+            if active.last_session.as_ref() == Some(session_name)
+                && active.last_session_id == Some(session_id)
+            {
                 active.last_session = Some(new_name.clone());
             }
         }
@@ -145,13 +185,6 @@ impl ActiveAttachState {
             windows.retain(|_, pid| *pid != attach_pid);
             !windows.is_empty()
         });
-    }
-
-    pub(in crate::handler) fn forget_session_windows(
-        &mut self,
-        session_name: &rmux_proto::SessionName,
-    ) {
-        let _ = self.active_client_by_window.remove(session_name);
     }
 
     pub(in crate::handler) fn forget_window(&mut self, target: &WindowTarget) {
@@ -206,41 +239,40 @@ impl ActiveAttachState {
         }
     }
 
-    pub(in crate::handler) fn toggle_read_only(
+    pub(in crate::handler) fn toggle_read_only_for_identity(
         &mut self,
         attach_pid: u32,
+        expected_attach_id: u64,
     ) -> Result<ClientFlags, rmux_proto::RmuxError> {
-        let active = self.by_pid.get_mut(&attach_pid).ok_or_else(|| {
-            rmux_proto::RmuxError::Server("attached client disappeared".to_owned())
-        })?;
+        let active = self
+            .by_pid
+            .get_mut(&attach_pid)
+            .filter(|active| active.id == expected_attach_id)
+            .ok_or_else(|| {
+                rmux_proto::RmuxError::Server("attached client disappeared".to_owned())
+            })?;
         active.flags.toggle_read_only();
         Ok(active.flags)
     }
 
+    #[cfg(test)]
     pub(in crate::handler) fn last_session_for_client(
         &self,
         attach_pid: u32,
     ) -> Result<Option<rmux_proto::SessionName>, rmux_proto::RmuxError> {
-        self.by_pid
-            .get(&attach_pid)
-            .map(|active| active.last_session.clone())
-            .ok_or_else(|| rmux_proto::RmuxError::Server("attached client disappeared".to_owned()))
+        self.last_session_identity_for_client(attach_pid)
+            .map(|identity| identity.map(|(session_name, _)| session_name))
     }
 
-    pub(in crate::handler) fn attached_client_pids_for_session(
+    #[cfg(test)]
+    pub(in crate::handler) fn last_session_identity_for_client(
         &self,
-        session_name: &rmux_proto::SessionName,
-        except_pid: Option<u32>,
-    ) -> Vec<u32> {
-        let mut pids = self
-            .by_pid
-            .iter()
-            .filter_map(|(pid, active)| {
-                (&active.session_name == session_name && except_pid != Some(*pid)).then_some(*pid)
-            })
-            .collect::<Vec<_>>();
-        pids.sort_unstable();
-        pids
+        attach_pid: u32,
+    ) -> Result<Option<(rmux_proto::SessionName, SessionId)>, rmux_proto::RmuxError> {
+        self.by_pid
+            .get(&attach_pid)
+            .map(|active| active.last_session.clone().zip(active.last_session_id))
+            .ok_or_else(|| rmux_proto::RmuxError::Server("attached client disappeared".to_owned()))
     }
 
     pub(in crate::handler) fn attached_client_pids_except(&self, except_pid: u32) -> Vec<u32> {

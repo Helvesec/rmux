@@ -100,6 +100,8 @@ pub(super) fn run(invocation: ClaudeInvocation) -> Result<i32, ExitFailure> {
     if should_launch_attached() {
         return run_attached(invocation);
     }
+    #[cfg(any(unix, windows))]
+    report_unrequested_direct_launch();
     run_direct(invocation)
 }
 
@@ -298,6 +300,78 @@ fn remove_temporary_shim_dir(dir: &Path) {
 #[cfg(any(unix, windows))]
 fn should_launch_attached() -> bool {
     env::var_os(DIRECT_LAUNCH_ENV).is_none() && io::stdin().is_terminal()
+}
+
+/// Explains a fall-through to the direct launch path when the user did not
+/// ask for it. Claude's interactive UI needs a terminal; reaching this point
+/// means stdin was not recognized as one (issue #77: Git Bash/mintty ptys,
+/// VS Code tasks, plain pipes), and launching silently used to look like
+/// "rmux claude does nothing".
+#[cfg(any(unix, windows))]
+fn report_unrequested_direct_launch() {
+    if env::var_os(DIRECT_LAUNCH_ENV).is_some() {
+        return;
+    }
+    #[cfg(windows)]
+    if stdin_is_msys_pty() {
+        eprintln!(
+            "rmux claude: stdin is a Git Bash / MSYS pty, not a Windows console; \
+             the interactive claude UI cannot attach here. Run `rmux claude` from \
+             Windows Terminal, PowerShell, or cmd.exe (or prefix with `winpty`); \
+             set {DIRECT_LAUNCH_ENV}=1 to launch claude directly without a terminal."
+        );
+        return;
+    }
+    // Only address a human: scripted pipelines redirect stderr too, and a
+    // deliberate scripted direct launch should stay quiet without requiring
+    // the opt-in variable.
+    if io::stderr().is_terminal() {
+        eprintln!(
+            "rmux claude: stdin is not a terminal, so the interactive UI is skipped \
+             and claude is launched directly; run from a terminal, or set \
+             {DIRECT_LAUNCH_ENV}=1 to make the direct launch explicit."
+        );
+    }
+}
+
+/// Recognizes MSYS/Cygwin pseudo-terminals (the stdin Git Bash and mintty
+/// provide): named pipes called `\msys-<hex>-ptyN-{from,to}-master` or the
+/// `cygwin-` equivalent. Mirrors the detection git itself uses.
+#[cfg(windows)]
+fn stdin_is_msys_pty() -> bool {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::{FileNameInfo, GetFileInformationByHandleEx};
+
+    // FILE_NAME_INFO: a u32 byte length followed by the UTF-16 name.
+    let mut buffer = [0u8; 1024];
+    let handle = io::stdin().as_raw_handle();
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileNameInfo,
+            buffer.as_mut_ptr().cast(),
+            u32::try_from(buffer.len()).expect("buffer length fits in u32"),
+        )
+    };
+    if ok == 0 {
+        return false;
+    }
+    let name_bytes = u32::from_ne_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
+    let name_units = (name_bytes / 2).min((buffer.len() - 4) / 2);
+    let name = String::from_utf16_lossy(
+        &buffer[4..4 + name_units * 2]
+            .chunks_exact(2)
+            .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>(),
+    )
+    .to_ascii_lowercase();
+    is_msys_pty_pipe_name(&name)
+}
+
+#[cfg(windows)]
+fn is_msys_pty_pipe_name(name: &str) -> bool {
+    (name.contains("msys-") || name.contains("cygwin-")) && name.contains("-pty")
 }
 
 #[cfg(any(unix, windows))]
@@ -1525,6 +1599,33 @@ mod tests {
 
     #[cfg(windows)]
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(windows)]
+    #[test]
+    fn msys_pty_pipe_names_are_recognized() {
+        // Git Bash / mintty stdin (issue #77): MSYS and Cygwin pty pipes.
+        for name in [
+            r"\msys-dd50a72ab4668b33-pty0-from-master",
+            r"\msys-dd50a72ab4668b33-pty1-to-master",
+            r"\cygwin-e022582115c10879-pty4-from-master",
+        ] {
+            assert!(
+                super::is_msys_pty_pipe_name(&name.to_ascii_lowercase()),
+                "{name} must be detected as an MSYS pty"
+            );
+        }
+        for name in [
+            r"\pipe\rmux-daemon",
+            r"\msys-dd50a72ab4668b33-shared",
+            r"\some-pty-alike",
+            "",
+        ] {
+            assert!(
+                !super::is_msys_pty_pipe_name(&name.to_ascii_lowercase()),
+                "{name} must not be detected as an MSYS pty"
+            );
+        }
+    }
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()

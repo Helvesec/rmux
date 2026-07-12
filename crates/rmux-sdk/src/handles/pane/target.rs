@@ -1,7 +1,14 @@
-use crate::{PaneRef, RmuxError};
+use crate::{PaneId, PaneRef, RmuxError, SessionName};
 
 pub(super) fn parse_error(message: impl Into<String>) -> RmuxError {
     RmuxError::protocol(rmux_proto::RmuxError::Server(message.into()))
+}
+
+pub(super) fn stale_slot_error(target: &PaneRef) -> RmuxError {
+    RmuxError::protocol(rmux_proto::RmuxError::invalid_target(
+        target.to_proto().to_string(),
+        "pane index does not exist in session",
+    ))
 }
 
 pub(super) fn is_already_closed_error<T: TargetSelector>(error: &RmuxError, target: &T) -> bool {
@@ -18,6 +25,20 @@ pub(super) fn is_already_closed_error<T: TargetSelector>(error: &RmuxError, targ
 
 pub(crate) fn is_already_closed_pane_error(error: &RmuxError, target: &PaneRef) -> bool {
     is_already_closed_error(error, target)
+}
+
+pub(super) fn is_already_closed_pane_id_error(
+    error: &RmuxError,
+    session_name: &SessionName,
+    pane_id: PaneId,
+) -> bool {
+    matches!(
+        error,
+        RmuxError::PaneNotFound {
+            session_name: missing_session,
+            pane_id: missing_pane,
+        } if missing_session == session_name && *missing_pane == pane_id
+    )
 }
 
 pub(super) trait TargetSelector {

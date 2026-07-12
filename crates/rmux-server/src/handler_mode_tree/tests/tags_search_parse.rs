@@ -1,6 +1,36 @@
 use super::*;
 
 #[test]
+fn tree_item_keys_bind_to_stable_identities() {
+    use super::super::mode_tree_order::{pane_item_id, session_item_id, window_item_id};
+
+    let old_session = rmux_proto::SessionId::new(4);
+    let replacement_session = rmux_proto::SessionId::new(5);
+    let old_window = rmux_proto::WindowId::new(7);
+    let replacement_window = rmux_proto::WindowId::new(8);
+    let old_occurrence = crate::pane_terminals::WindowLinkOccurrenceId::new_for_test(13);
+    let replacement_occurrence = crate::pane_terminals::WindowLinkOccurrenceId::new_for_test(14);
+    let pane = rmux_proto::PaneId::new(11);
+
+    assert_ne!(
+        session_item_id(old_session),
+        session_item_id(replacement_session)
+    );
+    assert_ne!(
+        window_item_id(old_session, 3, old_window, old_occurrence),
+        window_item_id(old_session, 3, replacement_window, old_occurrence)
+    );
+    assert_ne!(
+        window_item_id(old_session, 3, old_window, old_occurrence),
+        window_item_id(old_session, 3, old_window, replacement_occurrence)
+    );
+    assert_ne!(
+        pane_item_id(old_session, 3, old_window, old_occurrence, pane),
+        pane_item_id(replacement_session, 3, old_window, old_occurrence, pane,)
+    );
+}
+
+#[test]
 fn toggle_tag_does_not_tag_no_tag_items() {
     let mut items = BTreeMap::new();
     items.insert(
@@ -262,6 +292,11 @@ fn selected_items_returns_tagged_or_selected() {
     mode.tagged.insert("c".to_owned());
     let items = selected_items(&mode, &build);
     assert_eq!(items.len(), 2);
+
+    // Stale tags are a no-op; they must not fall back to an unrelated selection.
+    mode.tagged.clear();
+    mode.tagged.insert("missing".to_owned());
+    assert!(selected_items(&mode, &build).is_empty());
 }
 
 #[test]
@@ -284,12 +319,10 @@ fn current_and_tagged_tree_kill_prompts_match_tmux_text() {
                     search_text: String::new(),
                     preview: Vec::new(),
                     no_tag: false,
-                    action: ModeTreeAction::TreeTarget {
-                        session_name: SessionName::new("alpha").expect("valid session"),
-                        window_index: None,
-                        pane_index: None,
-                        pane_id: None,
-                    },
+                    action: ModeTreeAction::session_tree_target(
+                        SessionName::new("alpha").expect("valid session"),
+                        rmux_proto::SessionId::new(1),
+                    ),
                 },
             ),
             (
@@ -303,12 +336,13 @@ fn current_and_tagged_tree_kill_prompts_match_tmux_text() {
                     search_text: String::new(),
                     preview: Vec::new(),
                     no_tag: false,
-                    action: ModeTreeAction::TreeTarget {
-                        session_name: SessionName::new("alpha").expect("valid session"),
-                        window_index: Some(3),
-                        pane_index: None,
-                        pane_id: None,
-                    },
+                    action: ModeTreeAction::window_tree_target(
+                        SessionName::new("alpha").expect("valid session"),
+                        rmux_proto::SessionId::new(1),
+                        3,
+                        rmux_proto::WindowId::new(7),
+                        crate::pane_terminals::WindowLinkOccurrenceId::new_for_test(13),
+                    ),
                 },
             ),
             (
@@ -322,12 +356,15 @@ fn current_and_tagged_tree_kill_prompts_match_tmux_text() {
                     search_text: String::new(),
                     preview: Vec::new(),
                     no_tag: false,
-                    action: ModeTreeAction::TreeTarget {
-                        session_name: SessionName::new("alpha").expect("valid session"),
-                        window_index: Some(3),
-                        pane_index: Some(1),
-                        pane_id: Some(42),
-                    },
+                    action: ModeTreeAction::pane_tree_target(
+                        SessionName::new("alpha").expect("valid session"),
+                        rmux_proto::SessionId::new(1),
+                        3,
+                        rmux_proto::WindowId::new(7),
+                        crate::pane_terminals::WindowLinkOccurrenceId::new_for_test(13),
+                        1,
+                        rmux_proto::PaneId::new(42),
+                    ),
                 },
             ),
         ]),

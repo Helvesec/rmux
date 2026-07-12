@@ -68,6 +68,51 @@ async fn background_if_shell_keeps_detached_write_access_after_response() {
 }
 
 #[tokio::test]
+async fn background_if_shell_request_rejects_a_reused_control_registration() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_106;
+    let original = session_name("if-shell-request-control-original");
+    let replacement = session_name("if-shell-request-control-replacement");
+    let wait_channel = "if-shell-request-control-registration-reuse";
+    create_background_identity_session(&handler, original.clone()).await;
+    create_background_identity_session(&handler, replacement.clone()).await;
+    let (original_control_id, original_events) =
+        register_control_for_session(&handler, requester_pid, original.clone()).await;
+
+    let response = with_control_queue_identity(
+        ControlClientIdentity::new(requester_pid, original_control_id),
+        handler.handle_if_shell(
+            requester_pid,
+            IfShellRequest {
+                condition: "1".to_owned(),
+                format_mode: true,
+                then_command: format!(
+                    "wait-for {wait_channel} ; kill-session -t {}",
+                    replacement.as_str()
+                ),
+                else_command: None,
+                target: None,
+                caller_cwd: None,
+                background: true,
+            },
+        ),
+    )
+    .await;
+    assert_eq!(
+        response,
+        Response::IfShell(rmux_proto::IfShellResponse::no_output())
+    );
+    wait_for_background_waiter(&handler, wait_channel).await;
+
+    let (_replacement_control_id, replacement_events) =
+        register_control_for_session(&handler, requester_pid, replacement.clone()).await;
+    release_background_waiter(&handler, wait_channel).await;
+
+    assert_sessions_survive_background_control_reuse(&handler, &original, &replacement).await;
+    drop((original_events, replacement_events));
+}
+
+#[tokio::test]
 async fn queued_background_if_shell_keeps_detached_write_access_after_response() {
     let handler = RequestHandler::new();
     use_platform_test_shell(&handler).await;
@@ -89,6 +134,38 @@ async fn queued_background_if_shell_keeps_detached_write_access_after_response()
     }
 
     wait_for_named_buffer(&handler, "bg-queued-if-shell", b"ok").await;
+}
+
+#[tokio::test]
+async fn queued_background_if_shell_rejects_a_reused_control_registration() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_107;
+    let original = session_name("if-shell-queue-control-original");
+    let replacement = session_name("if-shell-queue-control-replacement");
+    let wait_channel = "if-shell-queue-control-registration-reuse";
+    create_background_identity_session(&handler, original.clone()).await;
+    create_background_identity_session(&handler, replacement.clone()).await;
+    let (original_control_id, original_events) =
+        register_control_for_session(&handler, requester_pid, original.clone()).await;
+
+    let commands = CommandParser::new()
+        .parse(&format!(
+            "if-shell -b -F 1 {{ wait-for {wait_channel} ; kill-session -t {} }}",
+            replacement.as_str()
+        ))
+        .expect("background queued if-shell command parses");
+    let result = handler
+        .execute_control_commands_identity(requester_pid, original_control_id, commands)
+        .await;
+    assert!(result.error.is_none(), "{result:?}");
+    wait_for_background_waiter(&handler, wait_channel).await;
+
+    let (_replacement_control_id, replacement_events) =
+        register_control_for_session(&handler, requester_pid, replacement.clone()).await;
+    release_background_waiter(&handler, wait_channel).await;
+
+    assert_sessions_survive_background_control_reuse(&handler, &original, &replacement).await;
+    drop((original_events, replacement_events));
 }
 
 #[tokio::test]

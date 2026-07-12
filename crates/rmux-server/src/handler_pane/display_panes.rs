@@ -418,8 +418,19 @@ impl RequestHandler {
         attach_pid: u32,
         pending_input: &mut Vec<u8>,
         bytes: &[u8],
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<Vec<u8>>> {
+        // See `handle_attached_prompt_input` for the paste-marker strip
+        // rationale — display-panes decodes input as digit/letter keys and a
+        // bracketed-paste envelope would cancel the overlay and leak the body.
+        // The one-byte tmux prefix (e.g. C-b = 0x02) survives the strip so the
+        // prefix passthrough path still triggers. Strip the CONCATENATED
+        // buffer so a marker that straddles the pending_input / bytes seam
+        // still collapses.
+        use super::strip_bracketed_paste_markers;
         pending_input.extend_from_slice(bytes);
+        let scrubbed = strip_bracketed_paste_markers(pending_input);
+        pending_input.clear();
+        pending_input.extend_from_slice(&scrubbed);
         match self
             .display_panes_prefix_input(attach_pid, pending_input)
             .await
@@ -429,14 +440,11 @@ impl RequestHandler {
                 self.clear_display_panes_state(attach_pid, None, true)
                     .await
                     .map_err(io_other)?;
-                let remaining = std::mem::take(pending_input);
-                Box::pin(self.handle_attached_live_input(attach_pid, pending_input, &remaining))
-                    .await?;
-                return Ok(());
+                return Ok(Some(std::mem::take(pending_input)));
             }
             DisplayPanesPrefixInput::Partial => {
                 retain_partial_attached_control_input("display-panes prefix", pending_input)?;
-                return Ok(());
+                return Ok(None);
             }
             DisplayPanesPrefixInput::Other => {}
         }
@@ -444,7 +452,7 @@ impl RequestHandler {
         loop {
             let Some((event, consumed)) = decode_prompt_input_event(pending_input) else {
                 retain_partial_attached_control_input("display-panes prompt input", pending_input)?;
-                return Ok(());
+                return Ok(None);
             };
             pending_input.drain(..consumed);
             self.handle_display_panes_event(attach_pid, event)
@@ -455,12 +463,7 @@ impl RequestHandler {
             }
         }
 
-        if !pending_input.is_empty() {
-            let remaining = std::mem::take(pending_input);
-            Box::pin(self.handle_attached_live_input(attach_pid, pending_input, &remaining))
-                .await?;
-        }
-        Ok(())
+        Ok((!pending_input.is_empty()).then(|| std::mem::take(pending_input)))
     }
 
     async fn handle_display_panes_event(

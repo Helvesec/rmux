@@ -316,8 +316,6 @@ fn queue_target_spec_for_flag(
         spec.find_type = switch_client_target_find_type(value);
     } else if command_name == "set-option" && flag == 't' {
         spec.find_type = set_option_target_find_type(arguments);
-    } else if matches!(command_name, "set-hook" | "show-hooks") && flag == 't' {
-        spec.find_type = hook_target_find_type(value, arguments);
     }
     Some(spec)
 }
@@ -373,24 +371,6 @@ fn signed_window_index_target(value: &str) -> bool {
         return false;
     };
     rest.is_empty() || rest.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-fn hook_target_find_type(value: &str, arguments: &[String]) -> TargetFindType {
-    if arguments.iter().any(|arg| arg == "-p") {
-        TargetFindType::Pane
-    } else if arguments.iter().any(|arg| arg == "-w") || value == "." {
-        TargetFindType::Window
-    } else if value.starts_with('%') || value.rsplit_once('.').is_some() {
-        TargetFindType::Pane
-    } else if value.starts_with('@')
-        || value
-            .rsplit_once(':')
-            .is_some_and(|(_, rest)| !rest.is_empty())
-    {
-        TargetFindType::Window
-    } else {
-        TargetFindType::Session
-    }
 }
 
 pub(super) fn new_window_target_is_session(value: &str) -> bool {
@@ -461,6 +441,8 @@ fn queue_compact_bare_flags(command_name: &str) -> Option<&'static str> {
         "copy-mode" => Some("deHMSqu"),
         "join-pane" | "move-pane" => Some("bdfhv"),
         "send-keys" | "send" => Some("FHlKMRX"),
+        "set-hook" => Some("agpRuw"),
+        "show-hooks" => Some("gpw"),
         "split-window" => Some("bdfhIPvZP"),
         "swap-pane" => Some("dDUZ"),
         _ => None,

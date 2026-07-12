@@ -2,9 +2,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use rmux_client::connect;
-use rmux_proto::{
-    ClientTerminalContext, CopyModeRequest, ErrorResponse, LayoutName, Response, Target,
-};
+use rmux_proto::{ClientTerminalContext, CopyModeRequest, ErrorResponse, LayoutName, Response};
 
 use super::attach_transport::{
     queued_attach_session_is_active, QueuedAttachSession, QueuedAttachSessionResult,
@@ -657,8 +655,7 @@ fn dispatch(
             let (command, arguments) =
                 run_shell_command_and_arguments(args.command, args.as_commands)?;
             run_command_resolved(socket_path, "run-shell", move |connection| {
-                let target =
-                    resolve_run_shell_target(connection, socket_path, args.target.as_ref())?;
+                let target = resolve_run_shell_target(connection, args.target.as_ref())?;
                 connection
                     .run_shell(
                         command,
@@ -719,12 +716,10 @@ fn run_shell_foreground(
     socket_path: &Path,
     args: crate::cli_args::RunShellArgs,
 ) -> Result<i32, ExitFailure> {
-    let explicit_target = args.target.is_some();
     let (command, arguments) = run_shell_command_and_arguments(args.command, args.as_commands)?;
     let mut connection = connect(socket_path)
         .map_err(|error| ExitFailure::from_client_connect(socket_path, error))?;
-    let target = resolve_run_shell_target(&mut connection, socket_path, args.target.as_ref())?;
-    let output_target = explicit_target.then(|| target.clone()).flatten();
+    let target = resolve_run_shell_target(&mut connection, args.target.as_ref())?;
     let response = connection
         .run_shell(
             command,
@@ -740,59 +735,12 @@ fn run_shell_foreground(
 
     match response {
         Response::RunShell(response) => {
-            if let Some(target) = output_target {
-                if let Some(output) = response.command_output() {
-                    if matches!(
-                        deliver_targeted_run_shell_output(
-                            &mut connection,
-                            target,
-                            output.stdout(),
-                        )?,
-                        TargetedRunShellDelivery::Caller
-                    ) {
-                        write_command_output(output)?;
-                    }
-                }
-            } else {
-                if let Some(output) = response.command_output() {
-                    write_command_output(output)?;
-                }
+            if let Some(output) = response.command_output() {
+                write_command_output(output)?;
             }
             Ok(response.exit_status().unwrap_or(0))
         }
         other => finish_command_success(other, "run-shell"),
-    }
-}
-
-enum TargetedRunShellDelivery {
-    Delivered,
-    Caller,
-}
-
-fn deliver_targeted_run_shell_output(
-    connection: &mut rmux_client::Connection,
-    target: rmux_proto::PaneTarget,
-    output: &[u8],
-) -> Result<TargetedRunShellDelivery, ExitFailure> {
-    let message = String::from_utf8_lossy(output)
-        .trim_end_matches(['\r', '\n'])
-        .replace('#', "##");
-    if message.is_empty() {
-        return Ok(TargetedRunShellDelivery::Delivered);
-    }
-    let response = connection
-        .display_message(Some(Target::Pane(target)), false, Some(message))
-        .map_err(ExitFailure::from_client)?;
-    match response {
-        Response::DisplayMessage(_) => Ok(TargetedRunShellDelivery::Delivered),
-        Response::Error(ErrorResponse {
-            error:
-                rmux_proto::RmuxError::InvalidTarget { .. }
-                | rmux_proto::RmuxError::SessionNotFound(_)
-                | rmux_proto::RmuxError::PaneNotFound { .. },
-        }) => Ok(TargetedRunShellDelivery::Caller),
-        response => finish_command_success(response, "display-message")
-            .map(|_| TargetedRunShellDelivery::Delivered),
     }
 }
 
@@ -812,7 +760,6 @@ fn run_shell_command_and_arguments(
 
 fn resolve_run_shell_target(
     connection: &mut rmux_client::Connection,
-    socket_path: &Path,
     target: Option<&crate::cli_args::TargetSpec>,
 ) -> Result<Option<rmux_proto::PaneTarget>, ExitFailure> {
     match target {
@@ -820,7 +767,7 @@ fn resolve_run_shell_target(
             Ok(target) => Ok(Some(target)),
             Err(_) => Ok(None),
         },
-        None => inherited_pane_target(connection, socket_path),
+        None => Ok(None),
     }
 }
 

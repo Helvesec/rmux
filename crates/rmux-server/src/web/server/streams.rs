@@ -169,9 +169,15 @@ pub(super) async fn serve_pane_loop(
                 }
             }
             _ = alive_tick.tick() => {
-                if !handler.web_target_alive(pane.target()).await {
-                    notify_revoked_and_close(&outbound, WebShareRevokeReason::PaneGone).await?;
-                    return Ok(());
+                match handler
+                    .current_web_pane_target(pane.session_id(), pane.target())
+                    .await
+                {
+                    Ok(target) => pane.set_target(target),
+                    Err(_) => {
+                        notify_revoked_and_close(&outbound, WebShareRevokeReason::PaneGone).await?;
+                        return Ok(());
+                    }
                 }
                 send_viewer_count_if_changed(
                     &outbound,
@@ -229,7 +235,11 @@ async fn queue_fresh_pane_snapshot(
     outbound: &WebSocketOutbound,
     pane: &mut WebPaneStream,
 ) -> io::Result<OutboundQueueResult> {
-    let target = pane.target().clone();
+    let target = handler
+        .current_web_pane_target(pane.session_id(), pane.target())
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    pane.set_target(target.clone());
     let (snapshot, output) = handler
         .web_resnapshot(&target)
         .await

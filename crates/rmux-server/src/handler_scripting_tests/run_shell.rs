@@ -183,6 +183,38 @@ async fn background_run_shell_commands_keep_detached_write_access_after_response
 }
 
 #[tokio::test]
+async fn background_run_shell_commands_reject_a_reused_control_registration() {
+    let handler = RequestHandler::new();
+    let requester_pid = 424_105;
+    let original = session_name("run-shell-control-original");
+    let replacement = session_name("run-shell-control-replacement");
+    let wait_channel = "run-shell-control-registration-reuse";
+    create_background_identity_session(&handler, original.clone()).await;
+    create_background_identity_session(&handler, replacement.clone()).await;
+    let (original_control_id, original_events) =
+        register_control_for_session(&handler, requester_pid, original.clone()).await;
+
+    let commands = CommandParser::new()
+        .parse(&format!(
+            "run-shell -b -C 'wait-for {wait_channel} ; kill-session -t {}'",
+            replacement.as_str()
+        ))
+        .expect("background run-shell command parses");
+    let result = handler
+        .execute_control_commands_identity(requester_pid, original_control_id, commands)
+        .await;
+    assert!(result.error.is_none(), "{result:?}");
+    wait_for_background_waiter(&handler, wait_channel).await;
+
+    let (_replacement_control_id, replacement_events) =
+        register_control_for_session(&handler, requester_pid, replacement.clone()).await;
+    release_background_waiter(&handler, wait_channel).await;
+
+    assert_sessions_survive_background_control_reuse(&handler, &original, &replacement).await;
+    drop((original_events, replacement_events));
+}
+
+#[tokio::test]
 async fn background_run_shell_commands_still_emit_after_hooks_outside_hook_context() {
     let handler = RequestHandler::new();
     create_named_session(&handler, "run-shell-after-hooks").await;

@@ -165,11 +165,12 @@ pub(in crate::handler::scripting_support) fn parse_show_hooks(
         }
     }
 
-    let scope = resolve_show_hooks_scope(global, window, pane, target, sessions, find_context)?;
     let hook = args
         .optional()
         .map(|value| parse_hook_name(&value))
         .transpose()?;
+    let scope =
+        resolve_show_hooks_scope(global, window, pane, target, hook, sessions, find_context)?;
     args.no_extra("show-hooks")?;
 
     Ok(Request::ShowHooks(ShowHooksRequest {
@@ -284,6 +285,16 @@ fn resolve_hook_scope(request: HookScopeRequest<'_>) -> Result<ScopeSelector, Rm
         sessions,
         find_context,
     } = request;
+    if run_immediately {
+        let scope = match target {
+            Some(Target::Pane(target)) => ScopeSelector::Pane(target),
+            Some(target) => return Err(RmuxError::Server(format!("can't find pane: {target}"))),
+            None if sessions.is_empty() => ScopeSelector::Global,
+            None => ScopeSelector::Pane(implicit_pane_target(sessions, find_context, command)?),
+        };
+        rmux_core::validate_hook_registration(hook, &scope)?;
+        return Ok(scope);
+    }
     if window && pane {
         return Err(RmuxError::Server(format!(
             "{command} does not support combining -w and -p"
@@ -317,16 +328,13 @@ fn resolve_hook_scope(request: HookScopeRequest<'_>) -> Result<ScopeSelector, Rm
             command,
         )?)),
         (false, false, Some(target)) => resolve_natural_hook_scope(command, hook, target, sessions),
-        (false, false, None) if run_immediately && sessions.is_empty() => Ok(ScopeSelector::Global),
-        (false, false, None) if run_immediately => Ok(ScopeSelector::Session(
-            implicit_session_name(sessions, find_context, command)?,
-        )),
         (false, false, None) if sessions.is_empty() => Ok(ScopeSelector::Global),
-        (false, false, None) => Ok(ScopeSelector::Session(implicit_session_name(
-            sessions,
-            find_context,
+        (false, false, None) => resolve_natural_hook_scope(
             command,
-        )?)),
+            hook,
+            Target::Session(implicit_session_name(sessions, find_context, command)?),
+            sessions,
+        ),
         (true, true, _) => unreachable!("validated conflicting hook scope flags"),
     }?;
     rmux_core::validate_hook_registration(hook, &scope)?;
@@ -368,6 +376,7 @@ fn resolve_show_hooks_scope(
     window: bool,
     pane: bool,
     target: Option<Target>,
+    hook: Option<HookName>,
     sessions: &SessionStore,
     find_context: &TargetFindContext,
 ) -> Result<ScopeSelector, RmuxError> {
@@ -408,16 +417,27 @@ fn resolve_show_hooks_scope(
             find_context,
             "show-hooks",
         )?)),
-        (false, false, Some(Target::Session(session_name))) => {
-            Ok(ScopeSelector::Session(session_name))
-        }
-        (false, false, Some(Target::Window(target))) => Ok(ScopeSelector::Window(target)),
-        (false, false, Some(Target::Pane(target))) => Ok(ScopeSelector::Pane(target)),
-        (false, false, None) => Ok(ScopeSelector::Session(implicit_session_name(
-            sessions,
-            find_context,
-            "show-hooks",
-        )?)),
+        (false, false, Some(target)) => match hook {
+            Some(hook) => resolve_natural_hook_scope("show-hooks", hook, target, sessions),
+            None => Ok(match target {
+                Target::Session(session_name) => ScopeSelector::Session(session_name),
+                Target::Window(target) => ScopeSelector::Session(target.session_name().clone()),
+                Target::Pane(target) => ScopeSelector::Session(target.session_name().clone()),
+            }),
+        },
+        (false, false, None) => match hook {
+            Some(hook) => resolve_natural_hook_scope(
+                "show-hooks",
+                hook,
+                Target::Session(implicit_session_name(sessions, find_context, "show-hooks")?),
+                sessions,
+            ),
+            None => Ok(ScopeSelector::Session(implicit_session_name(
+                sessions,
+                find_context,
+                "show-hooks",
+            )?)),
+        },
         (true, true, _) => unreachable!("validated conflicting show-hooks scope flags"),
     }
 }

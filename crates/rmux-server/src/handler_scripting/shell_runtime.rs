@@ -1,3 +1,4 @@
+use std::future::Future;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 
@@ -7,8 +8,12 @@ use rmux_proto::{
     RunShellRequest, RunShellResponse, SessionName, Target,
 };
 
+use super::super::control_support::{
+    current_control_queue_identity, with_control_queue_identity, ControlClientIdentity,
+};
 #[cfg(windows)]
 use super::super::pane_support::format_references_pane_pid;
+use super::super::target_support::{pane_id_target, requester_environment_pane_id};
 use super::super::RequestHandler;
 use super::command_args::CommandListArgument;
 use super::format_context::{format_context_for_target_with_server_values, global_format_context};
@@ -22,23 +27,59 @@ use crate::format_runtime::render_runtime_template;
 use crate::hook_runtime::current_hook_formats;
 use crate::terminal::{SessionBaseEnvironment, TerminalProfile};
 
+async fn with_background_control_identity<T, F>(
+    identity: Option<ControlClientIdentity>,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    match identity {
+        Some(identity) => with_control_queue_identity(identity, future).await,
+        None => future.await,
+    }
+}
+
 impl RequestHandler {
     pub(in crate::handler) async fn handle_run_shell(
         &self,
         requester_pid: u32,
         request: RunShellRequest,
     ) -> Response {
-        self.handle_run_shell_with_client_name(requester_pid, request, None)
-            .await
+        let explicit_target = match request.target.as_ref() {
+            Some(target) => self
+                .pane_id_for_slot_target(target)
+                .await
+                .map(|pane_id| (target.clone(), pane_id)),
+            None => None,
+        };
+        let mut response = self
+            .handle_run_shell_with_client_name(requester_pid, request, None)
+            .await;
+        if let Some((target, pane_id)) = explicit_target {
+            if self
+                .deliver_targeted_run_shell_output(requester_pid, &target, pane_id, &response)
+                .await
+            {
+                if let Response::RunShell(response) = &mut response {
+                    response.output = None;
+                }
+            }
+        }
+        response
     }
 
     pub(in crate::handler) async fn handle_run_shell_with_client_name(
         &self,
         requester_pid: u32,
-        request: RunShellRequest,
+        mut request: RunShellRequest,
         client_name: Option<String>,
     ) -> Response {
+        if request.target.is_none() {
+            request.target = self.inherited_run_shell_target(requester_pid).await;
+        }
         if request.background {
+            let control_identity = current_control_queue_identity(requester_pid);
             if let Some(delay_seconds) = request.delay_seconds {
                 if let Err(error) = run_shell_delay_duration(delay_seconds.as_secs_f64()) {
                     return Response::Error(ErrorResponse { error });
@@ -59,11 +100,14 @@ impl RequestHandler {
                         .run_shell_task(requester_pid, request, client_name)
                         .await;
                 };
-                if hook_context_active {
-                    crate::hook_runtime::with_hook_execution(hook_formats, task).await;
-                } else {
-                    task.await;
-                }
+                with_background_control_identity(control_identity, async move {
+                    if hook_context_active {
+                        crate::hook_runtime::with_hook_execution(hook_formats, task).await;
+                    } else {
+                        task.await;
+                    }
+                })
+                .await;
             }) {
                 return Response::Error(ErrorResponse { error });
             }
@@ -93,6 +137,15 @@ impl RequestHandler {
         }
     }
 
+    async fn inherited_run_shell_target(&self, requester_pid: u32) -> Option<PaneTarget> {
+        let pane_id = requester_environment_pane_id(requester_pid, &self.socket_path())?;
+        let state = self.state.lock().await;
+        match pane_id_target(&state.sessions, pane_id) {
+            Some(Target::Pane(target)) => Some(target),
+            _ => None,
+        }
+    }
+
     pub(in crate::handler) async fn handle_if_shell(
         &self,
         requester_pid: u32,
@@ -109,6 +162,7 @@ impl RequestHandler {
         client_name: Option<String>,
     ) -> Response {
         if request.background {
+            let control_identity = current_control_queue_identity(requester_pid);
             let can_write = self.requester_can_write(requester_pid).await;
             let detached_request_guard = self.begin_detached_request();
             let requester_access_guard =
@@ -124,11 +178,14 @@ impl RequestHandler {
                         .if_shell_task(requester_pid, request, client_name)
                         .await;
                 };
-                if hook_context_active {
-                    crate::hook_runtime::with_hook_execution(hook_formats, task).await;
-                } else {
-                    task.await;
-                }
+                with_background_control_identity(control_identity, async move {
+                    if hook_context_active {
+                        crate::hook_runtime::with_hook_execution(hook_formats, task).await;
+                    } else {
+                        task.await;
+                    }
+                })
+                .await;
             }) {
                 return Response::Error(ErrorResponse { error });
             }
@@ -488,6 +545,7 @@ impl RequestHandler {
         context: &QueueExecutionContext,
     ) -> Result<QueueCommandAction, RmuxError> {
         if command.background {
+            let control_identity = current_control_queue_identity(requester_pid);
             let can_write = self.requester_can_write(requester_pid).await;
             let detached_request_guard = self.begin_detached_request();
             let requester_access_guard =
@@ -505,11 +563,14 @@ impl RequestHandler {
                         .execute_queued_if_shell_background(requester_pid, command, context)
                         .await;
                 };
-                if hook_context_active {
-                    crate::hook_runtime::with_hook_execution(hook_formats, task).await;
-                } else {
-                    task.await;
-                }
+                with_background_control_identity(control_identity, async move {
+                    if hook_context_active {
+                        crate::hook_runtime::with_hook_execution(hook_formats, task).await;
+                    } else {
+                        task.await;
+                    }
+                })
+                .await;
             }) {
                 return Ok(QueueCommandAction::Normal {
                     output: None,

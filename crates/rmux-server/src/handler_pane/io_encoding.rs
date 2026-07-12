@@ -985,6 +985,13 @@ pub(super) fn encode_key_for_target(
         return windows_cmd_select_all_sequence(state, target);
     }
 
+    let pane_mode = pane_input_mode(state, target)?;
+    let format =
+        ExtendedKeyFormat::parse(state.options.resolve(None, OptionName::ExtendedKeysFormat));
+    Ok(encode_key(pane_mode, format, key))
+}
+
+pub(super) fn pane_input_mode(state: &HandlerState, target: &PaneTarget) -> Result<u32, RmuxError> {
     let pane_id = state
         .sessions
         .session(target.session_name())
@@ -998,9 +1005,7 @@ pub(super) fn encode_key_for_target(
         .pane_screen_state(target.session_name(), pane_id)
         .map(|screen_state| screen_state.mode)
         .unwrap_or_default();
-    let format =
-        ExtendedKeyFormat::parse(state.options.resolve(None, OptionName::ExtendedKeysFormat));
-    Ok(encode_key(pane_mode, format, key))
+    Ok(pane_mode)
 }
 
 pub(super) fn encode_mouse_for_target(

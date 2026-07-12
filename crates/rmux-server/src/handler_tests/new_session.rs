@@ -179,7 +179,7 @@ async fn duplicate_new_session_returns_the_duplicate_session_error() {
 }
 
 #[tokio::test]
-async fn attach_if_exists_existing_session_reports_attach_semantics() {
+async fn attach_if_exists_reports_attach_semantics_without_new_session_hook() {
     let handler = RequestHandler::new();
     let alpha = session_name("alpha");
     let created = handler
@@ -191,6 +191,16 @@ async fn attach_if_exists_existing_session_reports_attach_semantics() {
         }))
         .await;
     assert!(matches!(created, Response::NewSession(_)));
+
+    let hook = handler
+        .handle(Request::SetHook(SetHookRequest {
+            scope: ScopeSelector::Global,
+            hook: HookName::AfterNewSession,
+            command: "set-environment -g ATTACH_EXISTING_HOOK ran".to_owned(),
+            lifecycle: HookLifecycle::Persistent,
+        }))
+        .await;
+    assert!(matches!(hook, Response::SetHook(_)), "{hook:?}");
 
     let reused = handler
         .handle(Request::NewSessionExt(Box::new(NewSessionExtRequest {
@@ -221,6 +231,29 @@ async fn attach_if_exists_existing_session_reports_attach_semantics() {
             detached: false,
             output: None,
         })
+    );
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.environment.global_value("ATTACH_EXISTING_HOOK"),
+        None,
+        "attaching an existing session must not emit after-new-session"
+    );
+    drop(state);
+
+    let fresh = handler
+        .handle(Request::NewSession(NewSessionRequest {
+            session_name: session_name("fresh-after-hook"),
+            detached: true,
+            size: None,
+            environment: None,
+        }))
+        .await;
+    assert!(matches!(fresh, Response::NewSession(_)), "{fresh:?}");
+    let state = handler.state.lock().await;
+    assert_eq!(
+        state.environment.global_value("ATTACH_EXISTING_HOOK"),
+        Some("ran"),
+        "creating a session must continue to emit after-new-session"
     );
 }
 

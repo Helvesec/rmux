@@ -54,9 +54,9 @@ pub use environment::{EnvironmentStore, ShowEnvironmentEntry, ENVIRON_HIDDEN};
 pub use formats::format_skip_delimiter;
 pub use grid::GridRenderOptions;
 pub use hooks::{
-    hook_global_root, hook_natural_scope_for_session_target, hook_natural_scope_for_target,
-    validate_hook_registration, validate_hook_scope, HookBindingView, HookDispatch, HookGlobalRoot,
-    HookSetOptions, HookStore,
+    hook_explicit_scope_for_target, hook_global_root, hook_natural_scope_for_session_target,
+    hook_natural_scope_for_target, validate_hook_registration, validate_hook_scope,
+    HookBindingView, HookDispatch, HookGlobalRoot, HookScopeIdentity, HookSetOptions, HookStore,
 };
 pub use identity::{PaneId, SessionId, SessionName, WindowId};
 pub use input::{
@@ -65,12 +65,12 @@ pub use input::{
 };
 pub use keys::{
     key_code_is_mouse_move, key_code_lookup_bits, key_code_to_bytes, key_string_lookup_key,
-    key_string_lookup_string, parse_binding_command_tokens, KeyBinding, KeyBindingDisplay,
-    KeyBindingSortOrder, KeyBindingStore, KeyBindingTable, KeyBindingTableRef, KeyCode, KEYC_ANY,
-    KEYC_BSPACE, KEYC_BUILD_MODIFIERS, KEYC_CTRL, KEYC_CURSOR, KEYC_DRAGGING, KEYC_IMPLIED_META,
-    KEYC_KEYPAD, KEYC_LITERAL, KEYC_MASK_FLAGS, KEYC_MASK_KEY, KEYC_MASK_MODIFIERS, KEYC_MASK_TYPE,
-    KEYC_META, KEYC_NONE, KEYC_SENT, KEYC_SHIFT, KEYC_UNKNOWN, KEYC_USER, KEYC_VI,
-    LIST_KEYS_TEMPLATE,
+    key_string_lookup_string, parse_binding_command_tokens,
+    parse_binding_command_tokens_with_parser, KeyBinding, KeyBindingDisplay, KeyBindingSortOrder,
+    KeyBindingStore, KeyBindingTable, KeyBindingTableRef, KeyCode, KEYC_ANY, KEYC_BSPACE,
+    KEYC_BUILD_MODIFIERS, KEYC_CTRL, KEYC_CURSOR, KEYC_DRAGGING, KEYC_IMPLIED_META, KEYC_KEYPAD,
+    KEYC_LITERAL, KEYC_MASK_FLAGS, KEYC_MASK_KEY, KEYC_MASK_MODIFIERS, KEYC_MASK_TYPE, KEYC_META,
+    KEYC_NONE, KEYC_SENT, KEYC_SHIFT, KEYC_UNKNOWN, KEYC_USER, KEYC_VI, LIST_KEYS_TEMPLATE,
 };
 pub use lifecycle::LifecycleEvent;
 pub use options::{
@@ -97,7 +97,7 @@ pub use terminal_passthrough::{TerminalPassthrough, TerminalPassthroughKind};
 pub use terminal_screen::TerminalScreen;
 pub use terminal_sequences::{alternate_screen_enter_sequence, alternate_screen_exit_sequence};
 pub use transcript::{ScreenCaptureRange, Transcript};
-pub use utf8::{text_width, truncate_to_width, Utf8Config};
+pub use utf8::{text_width, truncate_right_to_width, truncate_to_width, Utf8Config};
 pub use vis::encode_paste_bytes;
 pub use window::{
     AlertFlags, Window, WINDOW_ACTIVITY, WINDOW_ALERTFLAGS, WINDOW_BELL, WINDOW_SILENCE,

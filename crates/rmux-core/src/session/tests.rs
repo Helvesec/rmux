@@ -31,5 +31,8 @@ mod pane_transfer;
 #[path = "tests/store_sessions.rs"]
 mod store_sessions;
 
+#[path = "tests/group_sync.rs"]
+mod group_sync;
+
 #[path = "tests/pane_transfer_edge_cases.rs"]
 mod pane_transfer_edge_cases;

@@ -19,6 +19,8 @@ mod pane_inspection;
 mod pane_io_encoding;
 #[path = "handler_pane/key_bindings.rs"]
 mod pane_key_bindings;
+#[path = "handler_pane/kill_effects.rs"]
+mod pane_kill_effects;
 #[path = "handler_pane/layout.rs"]
 mod pane_layout;
 #[path = "handler_pane/lifecycle.rs"]
@@ -37,10 +39,15 @@ mod pane_send_keys;
 mod pane_snapshot;
 #[path = "handler_pane/split_effects.rs"]
 mod pane_split_effects;
+#[path = "handler_pane/timer_mutations.rs"]
+mod pane_timer_mutations;
+#[path = "handler_pane/transfer.rs"]
+mod pane_transfer;
 #[cfg(windows)]
 #[path = "handler_pane/windows_console_sequence.rs"]
 mod pane_windows_console_sequence;
 
+pub(in crate::handler) use pane_attached_input::bracketed_paste::strip_bracketed_paste_markers;
 pub(super) use pane_attached_input::retain_partial_attached_control_input;
 pub(super) use pane_by_id::resolve_pane_target_ref;
 #[cfg(windows)]

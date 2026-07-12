@@ -3,14 +3,14 @@ use std::borrow::Cow;
 use rmux_core::input::mode;
 use rmux_core::style::{Style, StyleCell};
 use rmux_core::{
-    text_width as tmux_text_width, GridRenderOptions, OptionStore, Pane, Screen,
-    ScreenCaptureRange, Session, Utf8Config,
+    formats::FormatContext, text_width as tmux_text_width, GridRenderOptions, OptionStore, Pane,
+    Screen, ScreenCaptureRange, Session, Utf8Config,
 };
 use rmux_proto::OptionName;
 
-use super::{cursor_position_bytes, visible_pane_geometry, StatusGeometry};
 use crate::format_runtime::RuntimeFormatContext;
-use rmux_core::formats::FormatContext;
+
+use super::{cursor_position_bytes, visible_pane_geometry, StatusGeometry};
 
 pub(crate) fn render_pane_screen(
     session: &Session,

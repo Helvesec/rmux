@@ -7,10 +7,11 @@ use crate::{Pane, PaneId, Result};
 use rmux_proto::{
     PaneOptionEntry as ProtoPaneOptionEntry, PaneStateCursorRequest, PaneStateEventDto,
     PaneStateSnapshot, PaneStateSubscriptionId, Request, Response, SubscribePaneStateRequest,
-    CAPABILITY_SDK_PANE_FOREGROUND, CAPABILITY_SDK_PANE_STATE_EVENTS,
+    CAPABILITY_SDK_PANE_BY_ID, CAPABILITY_SDK_PANE_FOREGROUND, CAPABILITY_SDK_PANE_STATE_EVENTS,
 };
 
 use super::foreground::ForegroundState;
+use super::target::stale_slot_error;
 
 pub use rmux_proto::PaneStateClosedReason;
 
@@ -140,19 +141,41 @@ pub struct PaneStateEventStream {
 
 impl PaneStateEventStream {
     pub(super) async fn open(pane: &Pane, options: PaneStateEventsOptions) -> Result<Self> {
+        let Some(target) = pane.resolved_proto_target_ref().await? else {
+            return Err(stale_slot_error(pane.target()));
+        };
         let timeout = crate::wait::resolved_wait_timeout(pane.configured_default_timeout());
         let cursor_transport = connect_transport_to_endpoint(pane.endpoint(), timeout).await?;
-        Self::open_with_cursor_transport(pane, options, cursor_transport).await
+        Self::open_with_cursor_transport_and_target(pane, options, cursor_transport, target).await
     }
 
+    #[cfg(test)]
     pub(super) async fn open_with_cursor_transport(
         pane: &Pane,
         options: PaneStateEventsOptions,
         cursor_transport: TransportClient,
     ) -> Result<Self> {
+        Self::open_with_cursor_transport_and_target(
+            pane,
+            options,
+            cursor_transport,
+            pane.proto_target_ref(),
+        )
+        .await
+    }
+
+    async fn open_with_cursor_transport_and_target(
+        pane: &Pane,
+        options: PaneStateEventsOptions,
+        cursor_transport: TransportClient,
+        target: rmux_proto::PaneTargetRef,
+    ) -> Result<Self> {
         let mut capabilities = vec![CAPABILITY_SDK_PANE_STATE_EVENTS];
         if options.include_foreground {
             capabilities.push(CAPABILITY_SDK_PANE_FOREGROUND);
+        }
+        if matches!(target, rmux_proto::PaneTargetRef::Id { .. }) {
+            capabilities.push(CAPABILITY_SDK_PANE_BY_ID);
         }
         crate::capabilities::require(pane.transport(), &capabilities).await?;
         crate::capabilities::require_with_handshake(
@@ -164,7 +187,7 @@ impl PaneStateEventStream {
 
         let response = cursor_transport
             .request(Request::SubscribePaneState(SubscribePaneStateRequest {
-                target: pane.proto_target_ref(),
+                target,
                 include_title: options.include_title,
                 include_options: options.include_options,
                 include_foreground: options.include_foreground,

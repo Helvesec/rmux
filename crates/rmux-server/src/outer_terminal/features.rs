@@ -11,7 +11,7 @@ use super::{
         DEFAULT_RXVT_UNICODE_FEATURES, DEFAULT_SE, DEFAULT_SS, DEFAULT_SWD, DEFAULT_SYNC,
         DEFAULT_TMUX_FEATURES, DEFAULT_TSL, DEFAULT_XTERM_FEATURES,
     },
-    OuterTerminal, OuterTerminalContext,
+    MouseTrackingMode, OuterTerminal, OuterTerminalContext,
 };
 
 impl OuterTerminal {
@@ -38,10 +38,18 @@ impl OuterTerminal {
                 options.resolve(None, OptionName::SetClipboard),
                 Some("on" | "external")
             ),
-            mouse_reporting_enabled: matches!(
-                options.resolve(session_name, OptionName::Mouse),
+            app_clipboard_writes_enabled: matches!(
+                options.resolve(None, OptionName::SetClipboard),
                 Some("on")
             ),
+            mouse_tracking_mode: if matches!(
+                options.resolve(session_name, OptionName::Mouse),
+                Some("on")
+            ) {
+                MouseTrackingMode::Button
+            } else {
+                MouseTrackingMode::Off
+            },
             ..Self::default()
         };
 

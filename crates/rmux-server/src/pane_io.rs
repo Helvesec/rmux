@@ -22,7 +22,7 @@ const ATTACH_INTERACTIVE_OUTPUT_WINDOW: Duration = Duration::from_millis(250);
 const ATTACH_EXIT_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(any(unix, windows))]
 const ATTACH_INPUT_STACK_PAYLOAD: usize = 1024;
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 const MAX_PREDICTED_LOCAL_ECHO_BYTES: usize = 16;
 #[cfg(unix)]
 const PREDICTED_LOCAL_ECHO_TIMEOUT: Duration = Duration::from_millis(250);
@@ -53,7 +53,7 @@ use attach_transport::{AttachTransport, TryAttachRead};
 use control::{
     apply_pending_attach_controls, coalesce_render_switches, recv_attach_control,
     redraw_after_persistent_overlay_state_advance, should_emit_overlay, switch_attach_target,
-    take_pending_live_passthroughs, PendingAttachAction,
+    take_pending_live_passthroughs, PendingAttachAction, PendingAttachInputState,
 };
 #[cfg(any(unix, windows))]
 use deferred_passthrough::{
@@ -90,9 +90,9 @@ pub(crate) use types::pane_output_channel_with_limits;
 pub(crate) use types::LiveAttachInputContext;
 #[cfg_attr(windows, allow(unused_imports))]
 pub(crate) use types::{
-    pane_output_channel, AttachControl, AttachTarget, HandleOutcome, OverlayFrame,
-    PaneAlertCallback, PaneAlertEvent, PaneExitCallback, PaneExitEvent, PaneOutputReceiver,
-    PaneOutputSender,
+    pane_output_channel, AttachControl, AttachSessionUpgrade, AttachTarget, HandleOutcome,
+    OverlayFrame, PaneAlertCallback, PaneAlertEvent, PaneExitCallback, PaneExitEvent,
+    PaneOutputReceiver, PaneOutputSender,
 };
 #[cfg(any(unix, windows))]
 use wire::{
@@ -197,6 +197,10 @@ pub(crate) async fn forward_attach(
                 &mut persistent_overlay_visible,
                 &mut persistent_overlay_state_id,
                 &mut locked,
+                Some(PendingAttachInputState::new(
+                    &mut pending_input,
+                    &mut pending_escape_flush,
+                )),
             )
             .await?
             {
@@ -317,6 +321,10 @@ pub(crate) async fn forward_attach(
                 &mut persistent_overlay_visible,
                 &mut persistent_overlay_state_id,
                 &mut locked,
+                Some(PendingAttachInputState::new(
+                    &mut pending_input,
+                    &mut pending_escape_flush,
+                )),
             )
             .await?
             {
@@ -408,6 +416,10 @@ pub(crate) async fn forward_attach(
                                 &mut persistent_overlay_visible,
                                 &mut persistent_overlay_state_id,
                                 &mut locked,
+                                Some(PendingAttachInputState::new(
+                                    &mut pending_input,
+                                    &mut pending_escape_flush,
+                                )),
                             )
                             .await?
                             {
@@ -480,6 +492,10 @@ pub(crate) async fn forward_attach(
                         &mut persistent_overlay_visible,
                         &mut persistent_overlay_state_id,
                         &mut locked,
+                        Some(PendingAttachInputState::new(
+                            &mut pending_input,
+                            &mut pending_escape_flush,
+                        )),
                     )
                     .await?
                     {
@@ -652,6 +668,10 @@ pub(crate) async fn forward_attach(
                         &mut persistent_overlay_visible,
                         &mut persistent_overlay_state_id,
                         &mut locked,
+                        Some(PendingAttachInputState::new(
+                            &mut pending_input,
+                            &mut pending_escape_flush,
+                        )),
                     )
                     .await?
                     {
@@ -768,6 +788,16 @@ pub(crate) async fn forward_attach(
                             &mut pending_input,
                         )
                         .await?;
+                    // Rerouting flushed remainder bytes can retain a fresh
+                    // ambiguous prefix (e.g. a second ESC ] inside the body);
+                    // re-arm its deadline now rather than waiting for the
+                    // next client read.
+                    sync_pending_escape_flush(
+                        &mut pending_escape_flush,
+                        &live_input,
+                        &pending_input,
+                    )
+                    .await;
                 }
                 control = recv_attach_control(&mut deferred_controls, attach_controls.as_mut(), &control_backlog) => {
                     match control {
@@ -859,8 +889,14 @@ pub(crate) async fn forward_attach(
                             }
                             close_pane_output_after_refresh = false;
                             render_generation = render_generation.saturating_add(switch_count);
-                            pending_input.clear();
-                            pending_escape_flush.clear();
+                            PendingAttachInputState::new(
+                                &mut pending_input,
+                                &mut pending_escape_flush,
+                            )
+                            .clear_if_pane_source_changed(
+                                &current_target,
+                                next_target.as_ref(),
+                            );
                             clear_deferred_passthroughs_if_target_changed(
                                 drop_live_output,
                                 &mut deferred_passthroughs,
@@ -1008,12 +1044,22 @@ pub(crate) async fn forward_attach(
                             emit_attach_bytes(&stream, &bytes).await?;
                         }
                         Some(AttachControl::LockShellCommand(command)) => {
+                            PendingAttachInputState::new(
+                                &mut pending_input,
+                                &mut pending_escape_flush,
+                            )
+                            .clear();
                             locked = true;
                             emit_attach_stop(&stream, &current_target).await?;
                             emit_attach_message(&stream, &AttachMessage::LockShellCommand(command))
                                 .await?;
                         }
                         Some(AttachControl::Suspend) => {
+                            PendingAttachInputState::new(
+                                &mut pending_input,
+                                &mut pending_escape_flush,
+                            )
+                            .clear();
                             locked = true;
                             emit_attach_stop(&stream, &current_target).await?;
                             emit_attach_message(&stream, &AttachMessage::Suspend).await?;
@@ -1109,6 +1155,10 @@ pub(crate) async fn forward_attach(
                         &mut persistent_overlay_visible,
                         &mut persistent_overlay_state_id,
                         &mut locked,
+                        Some(PendingAttachInputState::new(
+                            &mut pending_input,
+                            &mut pending_escape_flush,
+                        )),
                     )
                     .await?
                     {
@@ -1786,35 +1836,7 @@ async fn process_attach_data_payload(
         pending_input.clear();
         return Ok(false);
     }
-    #[cfg(windows)]
-    {
-        let _ = stream;
-        let _ = current_target;
-    }
-    #[cfg(unix)]
-    if let Some(current_target) = current_target {
-        if let Some(master) = current_target.pane_master.as_ref() {
-            if let Some(forwarded) = live_input
-                .handler
-                .try_forward_plain_attached_bytes_to_current_pane_fast(
-                    live_input.attach_pid,
-                    pending_input,
-                    bytes,
-                    &current_target.input_target,
-                    master,
-                    active_emit_cache,
-                )
-                .await?
-            {
-                if forwarded {
-                    let echo_enabled = master.local_echo_enabled().unwrap_or(false);
-                    maybe_emit_predicted_local_echo(stream, current_target, echo_enabled, bytes)
-                        .await?;
-                    return Ok(true);
-                }
-            }
-        }
-    }
+    let _ = (stream, current_target);
     live_input
         .handler
         .handle_attached_live_input_with_active_cache(
@@ -1826,42 +1848,12 @@ async fn process_attach_data_payload(
         .await
 }
 
-#[cfg(unix)]
-async fn maybe_emit_predicted_local_echo(
-    stream: &AttachTransport,
-    current_target: &mut types::OpenAttachTarget,
-    echo_enabled: bool,
-    bytes: &[u8],
-) -> io::Result<()> {
-    let prefix_len = predictable_local_echo_prefix_len(bytes);
-    expire_stale_predicted_echo(current_target);
-    if prefix_len == 0 || !current_target.predicted_echo.is_empty() || !echo_enabled {
-        return Ok(());
-    }
-    let bytes = &bytes[..prefix_len];
-
-    let Some(frame) = current_target.live_pane.as_ref().and_then(|pane| {
-        if pane.can_forward_plain_bytes(bytes) {
-            Some(bytes.to_vec())
-        } else {
-            pane.positioned_plain_echo_frame(bytes)
-        }
-    }) else {
-        return Ok(());
-    };
-
-    emit_attach_bytes(stream, &frame).await?;
-    current_target.predicted_echo.extend(bytes.iter().copied());
-    current_target.predicted_echo_started_at = Some(Instant::now());
-    Ok(())
-}
-
 #[cfg(all(test, unix))]
 fn is_predictable_local_echo(bytes: &[u8]) -> bool {
     predictable_local_echo_prefix_len(bytes) == bytes.len()
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 fn predictable_local_echo_prefix_len(bytes: &[u8]) -> usize {
     let printable_prefix = bytes
         .iter()
