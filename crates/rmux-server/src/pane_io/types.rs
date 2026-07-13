@@ -1114,7 +1114,7 @@ mod tests {
         let sender = pane_output_channel_with_limits(256, 64);
         let mut receiver = sender.subscribe_live_from_sequence(0);
 
-        for byte in [b'a', b'b', b'c'] {
+        for byte in *b"abc" {
             assert_eq!(sender.send(vec![byte]), u64::from(byte - b'a'));
         }
 
