@@ -32,6 +32,7 @@ Compatibility status values:
 | `source-file` preserves pane targets for `set-option -p -t session:win.pane ...` | `ISO required` | Fixed in the current working tree; config queue target inference now respects `set-option -p` | Rust scripting tests |
 | `join-pane -d -s <only-pane> -t target` moves the pane and removes the empty source session | `ISO required` | Fixed in the current working tree; covered by core and PTY integration tests | Rust unit/integration tests |
 | `split-window -d -t <non-active-pane>` does not change the active pane | `ISO required` | Fixed in the current working tree; detached split restores the previously active pane | Rust integration test |
+| Detached `new-window`/`split-window` without `-c` inherits the caller's working directory, not the session start directory | `ISO required` | Fixed in the current working tree; both commands fall back to the caller cwd when no `-c` is given, covered by a parametrized regression test | Rust integration test |
 | tmux regex-compatible wording for no-server errors | `Deferred` | Mostly aligned for reviewed paths, but wording should be probed per command before claiming byte-level compatibility | release-review smokes plus targeted probes |
 | tmux quirks that expose undefined state or unsafe behavior | `Do not copy tmux bug` | No standing entries yet; add a row with the exact tmux version and reproduction before relying on this status | document only |
 
