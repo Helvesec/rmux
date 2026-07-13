@@ -55,7 +55,11 @@ pub(in crate::cli) fn run_split_window(
         environment,
         command,
         process_command,
-        start_directory: args.start_directory,
+        // Match tmux: a detached split without an explicit `-c` inherits the
+        // caller's cwd, not the session's original start directory.
+        start_directory: args
+            .start_directory
+            .or_else(super::super::caller_current_working_directory),
         keep_alive_on_exit: stdin_to_empty_pane.then_some(true),
         detached: args.detached,
         size,
@@ -114,6 +118,13 @@ fn run_split_window_legacy_with_stdin(
         )?),
     };
     let size = args.size_spec();
+    // Match tmux: a detached split without an explicit `-c` inherits the
+    // caller's cwd, not the session's original start directory. Resolving it
+    // here also routes the request through the Ext variant below, since the
+    // plain `SplitWindow` request cannot carry a start directory.
+    let start_directory = args
+        .start_directory
+        .or_else(super::super::caller_current_working_directory);
     let environment = (!args.environment.is_empty()).then_some(args.environment);
     let command = (!args.command.is_empty()).then_some(args.command);
     let stdin_to_empty_pane = args.stdin && command.is_none();
@@ -132,7 +143,7 @@ fn run_split_window_legacy_with_stdin(
     };
     let response = if command.is_some()
         || process_command.is_some()
-        || args.start_directory.is_some()
+        || start_directory.is_some()
         || args.detached
         || size.is_some()
         || args.full_size
@@ -147,7 +158,7 @@ fn run_split_window_legacy_with_stdin(
                 environment,
                 command,
                 process_command,
-                start_directory: args.start_directory,
+                start_directory,
                 keep_alive_on_exit: stdin_to_empty_pane.then_some(true),
                 detached: args.detached,
                 size,

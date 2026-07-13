@@ -642,10 +642,6 @@ fn resolve_current_session(
     }
 }
 
-fn caller_current_working_directory() -> Option<std::path::PathBuf> {
-    std::env::current_dir().ok().filter(|path| path.is_dir())
-}
-
 pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<i32, ExitFailure> {
     let print_target = args.print_target;
     let print_format = args
@@ -725,7 +721,7 @@ pub(super) fn run_new_window(args: NewWindowArgs, socket_path: &Path) -> Result<
             // session's start directory. `new-session` already applies this
             // same fallback.
             args.start_directory
-                .or_else(caller_current_working_directory),
+                .or_else(super::caller_current_working_directory),
             (!args.command.is_empty()).then_some(args.command),
             insert_at_target,
         )

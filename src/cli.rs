@@ -117,6 +117,16 @@ use top_level::{
 
 const TMUX_COMPAT_OVERRIDE_ENV: &str = "RMUX_INTERNAL_INVOKED_AS_TMUX";
 
+/// The working directory of the process invoking the CLI command.
+///
+/// Used as the start-directory fallback for detached window/pane creation
+/// (`new-window`, `split-window`) so they match tmux, which inherits the
+/// *caller's* cwd rather than the session's original start directory when no
+/// explicit `-c` is given. `new-session` already applies the same fallback.
+pub(in crate::cli) fn caller_current_working_directory() -> Option<std::path::PathBuf> {
+    std::env::current_dir().ok().filter(|path| path.is_dir())
+}
+
 pub(crate) fn run<I, T>(args: I) -> Result<i32, ExitFailure>
 where
     I: IntoIterator<Item = T>,
