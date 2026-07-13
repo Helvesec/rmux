@@ -225,12 +225,10 @@ impl CopyModeState {
                         break;
                     }
                 }
-            } else {
-                if let Some(regex) = &regex {
-                    for matched in regex.find_iter(&map.text) {
-                        if let Some(result) = map.match_range(y, matched.start()..matched.end()) {
-                            self.search_results.push(result);
-                        }
+            } else if let Some(regex) = &regex {
+                for matched in regex.find_iter(&map.text) {
+                    if let Some(result) = map.match_range(y, matched.start()..matched.end()) {
+                        self.search_results.push(result);
                     }
                 }
             }

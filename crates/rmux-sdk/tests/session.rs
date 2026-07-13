@@ -188,6 +188,39 @@ async fn create_only_duplicate_is_error_but_attach_if_exists_reuses() -> TestRes
 }
 
 #[tokio::test]
+async fn concurrent_create_or_reuse_creates_one_named_session() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let harness = Harness::start("concurrent-create-or-reuse").await?;
+    let rmux = harness.rmux();
+    let name = session_name("sdkconcurrentreuse");
+
+    let first = EnsureSession::named(name.clone()).create_or_reuse();
+    let second = EnsureSession::named(name.clone()).create_or_reuse();
+    let (first, second) = tokio::join!(rmux.ensure_session(first), rmux.ensure_session(second));
+    let first = first?;
+    let second = second?;
+
+    assert_eq!(first.name(), &name);
+    assert_eq!(second.name(), &name);
+    assert_ne!(
+        first.was_created(),
+        second.was_created(),
+        "exactly one concurrent ensure must report creating the session"
+    );
+    assert_eq!(
+        raw_list_session_names(harness.socket_path())
+            .await?
+            .iter()
+            .filter(|candidate| *candidate == &name)
+            .count(),
+        1
+    );
+
+    rmux.shutdown().await?;
+    harness.wait().await
+}
+
+#[tokio::test]
 async fn reuse_only_policy_never_creates_sessions() -> TestResult {
     let _lock = LIVE_DAEMON_LOCK.lock().await;
     let harness = Harness::start("reuse-only").await?;

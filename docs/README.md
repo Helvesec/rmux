@@ -9,6 +9,8 @@ Repository docs:
 - [Architecture](ARCHITECTURE.md)
 - [Web Share](web-share.md)
 - [RMUX SDK](scripting-sdk.md)
+- [External adapter capability baseline (R-001)](adapter-capability-baseline.md)
+- [外部适配器能力基线（R-001，中文）](adapter-capability-baseline.zh-CN.md)
 - [Roadmap](ROADMAP.md)
 - [Security assurance case](assurance-case.md)
 - [tmux compatibility decisions](tmux-compat-decisions.md)

@@ -16,8 +16,6 @@
 //! All filesystem operations validate that the lock file, socket directory,
 //! and socket path itself are not symlinks before trusting them.
 
-#![cfg(unix)]
-
 use std::error::Error;
 use std::fmt;
 use std::future::Future;

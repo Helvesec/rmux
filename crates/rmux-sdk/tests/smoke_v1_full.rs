@@ -428,6 +428,118 @@ async fn warm_reconnect_keeps_existing_runtime() -> TestResult {
 }
 
 #[tokio::test]
+async fn adapter_baseline_observes_replacement_and_restart_boundaries() -> TestResult {
+    let _lock = LIVE_DAEMON_LOCK.lock().await;
+    let mut harness = Harness::start("adapter-baseline").await?;
+    let rmux = harness.rmux();
+    assert_eq!(
+        rmux.endpoint(),
+        &rmux_sdk::RmuxEndpoint::UnixSocket(harness.socket_path().to_path_buf())
+    );
+
+    let capabilities = rmux.capabilities().await?;
+    assert!(capabilities
+        .iter()
+        .any(|value| value == "protocol.capabilities"));
+    assert!(rmux.has_capability("sdk.pane.by_id").await?);
+
+    let name = session_name("sdkadapterbaseline");
+    let session = rmux
+        .ensure_session(
+            EnsureSession::named(name.clone())
+                .create_only()
+                .shell("printf 'RMUX_ADAPTER_OBSERVE_ONLY\\n'; exec sleep 60"),
+        )
+        .await?;
+    let pane = session.pane(0, 0);
+    let old_pane_id = pane.id().await?.expect("initial pane has a stable id");
+    let mut output = pane
+        .output_stream_starting_at(PaneOutputStart::Oldest)
+        .await?;
+    wait_for_output_marker(&mut output, b"RMUX_ADAPTER_OBSERVE_ONLY").await?;
+    pane.wait_for_text("RMUX_ADAPTER_OBSERVE_ONLY").await?;
+
+    let old_info = pane.info().await?;
+    let old_session_id = old_info.sessions[0].id;
+    let old_output_sequence = old_info
+        .pane(old_pane_id)
+        .expect("initial pane info is present")
+        .output_sequence;
+    assert!(old_output_sequence > 0);
+
+    let child = pane.split(SplitDirection::Down).await?;
+    let child_target = child.target().clone();
+    let child_id = child.id().await?.expect("split pane has a stable id");
+    let slot_observer = session.pane(child_target.window_index, child_target.pane_index);
+    let stable_observer = session.pane_by_id(child_id).await?;
+    assert!(matches!(
+        child.close().await?,
+        rmux_sdk::PaneCloseOutcome::Closed { .. }
+    ));
+    wait_for_pane_absent(&stable_observer).await?;
+
+    let replacement = pane.split(SplitDirection::Down).await?;
+    assert_eq!(replacement.target(), &child_target);
+    let replacement_id = replacement
+        .id()
+        .await?
+        .expect("replacement pane has a stable id");
+    assert_ne!(replacement_id, child_id);
+    assert_eq!(slot_observer.id().await?, Some(replacement_id));
+    assert_eq!(stable_observer.id().await?, None);
+
+    let socket_path = harness.socket_path().to_path_buf();
+    let rmux = harness.take_rmux()?;
+    let daemon_pid = wait_for_daemon_pid(&socket_path).await?;
+    send_signal(daemon_pid, "KILL")?;
+    wait_for_daemon_absent(&socket_path).await?;
+    drop(rmux);
+
+    let stream_error = timeout(DEFAULT_TIMEOUT, output.next())
+        .await
+        .map_err(|_| "old output stream did not terminate after daemon shutdown")?
+        .expect_err("old output stream must fail after daemon shutdown");
+    assert!(matches!(stream_error, RmuxError::Transport { .. }));
+    let handle_error = pane
+        .info()
+        .await
+        .expect_err("old pane handle must fail after daemon shutdown");
+    assert!(matches!(handle_error, RmuxError::Transport { .. }));
+
+    harness.restart().await?;
+    let restarted = harness.rmux();
+    assert!(restarted.list_sessions().await?.is_empty());
+    let recreated = restarted
+        .ensure_session(
+            EnsureSession::named(name)
+                .create_only()
+                .shell("exec sleep 60"),
+        )
+        .await?;
+    let recreated_pane = recreated.pane(0, 0);
+    let recreated_pane_id = recreated_pane
+        .id()
+        .await?
+        .expect("recreated pane has a stable id");
+    let recreated_info = recreated_pane.info().await?;
+
+    // Numeric identities and counters are scoped to one daemon epoch. A
+    // reconnecting adapter must rediscover objects instead of comparing ids
+    // from the previous process lifetime.
+    assert_eq!(recreated_info.sessions[0].id, old_session_id);
+    assert_eq!(recreated_pane_id, old_pane_id);
+    assert_eq!(
+        recreated_info
+            .pane(recreated_pane_id)
+            .expect("recreated pane info is present")
+            .output_sequence,
+        0
+    );
+
+    harness.finish().await
+}
+
+#[tokio::test]
 async fn sdk_autostarted_daemon_detaches_and_survives_terminal_signals() -> TestResult {
     let _lock = LIVE_DAEMON_LOCK.lock().await;
     let harness = Harness::start("daemon-signals").await?;
@@ -724,6 +836,20 @@ async fn wait_for_daemon_pid(socket_path: &Path) -> TestResult<u32> {
     }
 }
 
+async fn wait_for_daemon_absent(socket_path: &Path) -> TestResult {
+    let needle = socket_path.to_string_lossy().into_owned();
+    let deadline = Instant::now() + DEFAULT_TIMEOUT;
+    loop {
+        if daemon_pid_for_socket(&needle)?.is_none() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("daemon for {} remained alive", socket_path.display()).into());
+        }
+        sleep(Duration::from_millis(25)).await;
+    }
+}
+
 fn daemon_pid_for_socket(socket_needle: &str) -> TestResult<Option<u32>> {
     let output = Command::new("ps")
         .args(["-axo", "pid=,command="])
@@ -825,6 +951,22 @@ impl Harness {
         self.rmux
             .take()
             .ok_or_else(|| "harness rmux was already taken".into())
+    }
+
+    async fn restart(&mut self) -> TestResult {
+        if self.rmux.is_some() {
+            return Err("harness daemon must be shut down before restart".into());
+        }
+        let daemon_binary = rmux_binary()?.to_path_buf();
+        let _daemon_binary_env = EnvGuard::set(SDK_DAEMON_BINARY_ENV, daemon_binary.as_os_str());
+        let rmux = RmuxBuilder::new()
+            .unix_socket(&self.socket_path)
+            .default_timeout(DEFAULT_TIMEOUT)
+            .connect_or_start()
+            .await?;
+        assert_socket(&self.socket_path)?;
+        self.rmux = Some(rmux);
+        Ok(())
     }
 
     async fn finish(mut self) -> TestResult {
