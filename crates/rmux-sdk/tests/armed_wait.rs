@@ -866,7 +866,7 @@ fn compact_label(label: &str) -> String {
 
 fn printf_line_command(text: &str) -> String {
     let mut escaped = String::new();
-    for byte in text.bytes().chain([b'\n']) {
+    for byte in text.bytes().chain(*b"\n") {
         write!(&mut escaped, "\\{byte:03o}").expect("writing to String cannot fail");
     }
     format!("printf '{escaped}'")
